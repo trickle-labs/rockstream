@@ -13,9 +13,13 @@
 //!
 //! v0.38 adds the proactive scaling module: proactive splitter, worker drain
 //! coordinator, skew detector, virtual-bucket hasher, and cluster-pressure gauge.
+//!
+//! v0.39 adds the clone module: pipeline clone, blue/green plan replacement,
+//! compatible/incompatible schema workflows, and law-version upgrade path.
 
 pub mod bench;
 pub mod checkpoint;
+pub mod clone;
 pub mod epoch_coordinator;
 pub mod exchange;
 pub mod explain;
