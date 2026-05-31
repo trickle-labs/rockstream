@@ -92,6 +92,25 @@ pub enum FrontierPolicy {
     Stateless,
 }
 
+/// Descriptor returned by `LawBundle::gateway_combiner` for laws that support
+/// cross-shard partial aggregation pushdown at the gateway layer (DESIGN.md
+/// §12.3.1, §6.11).
+///
+/// When a law returns `Some(GatewayAggCombinerDesc)`, the gateway may push
+/// partial aggregation down to individual shards and merge the O(groups) partial
+/// results rather than streaming all O(view rows) to the coordinator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayAggCombinerDesc {
+    /// The law driving the partial aggregation.
+    pub law_id: MergeLawId,
+    /// Human-readable name for EXPLAIN output.
+    pub law_name: &'static str,
+    /// Whether the partial result is associative (required for safe pushdown).
+    pub is_associative: bool,
+    /// Whether the partial result is commutative (order of shards doesn't matter).
+    pub is_commutative: bool,
+}
+
 /// The core trait that all registered merge laws must implement.
 ///
 /// A `LawBundle` encapsulates the algebraic operations and metadata for a
@@ -141,6 +160,19 @@ pub trait LawBundle: Send + Sync + 'static {
     /// A reason if this law does NOT support merge-safe reads
     /// (i.e., read-modify-write cannot be avoided). Returns `None` if it does.
     fn not_merge_safe_reason(&self) -> Option<crate::explain::NotMergeSafeReason> {
+        None
+    }
+
+    /// Returns a descriptor for cross-shard partial aggregation pushdown at
+    /// the gateway layer (DESIGN.md §12.3.1, §6.11).
+    ///
+    /// Laws that support gateway-level combining return `Some(desc)`.  The
+    /// gateway uses this to push partial aggregation to shards and merge the
+    /// O(groups) results rather than streaming all O(view rows).
+    ///
+    /// Returns `None` for laws that cannot safely be partially combined (e.g.
+    /// non-associative or stateless pass-through laws).
+    fn gateway_combiner(&self) -> Option<GatewayAggCombinerDesc> {
         None
     }
 }
