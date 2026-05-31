@@ -7,8 +7,8 @@
 //! Wire format: 8 bytes, big-endian i64.
 
 use crate::merge_law::{
-    CompactionPolicy, DuplicatePolicy, FrontierPolicy, LawBundle, LawProperties, MergeLawClass,
-    MergeLawId, MergeLawVersion,
+    CompactionPolicy, DuplicatePolicy, FrontierPolicy, GatewayAggCombinerDesc, LawBundle,
+    LawProperties, MergeLawClass, MergeLawId, MergeLawVersion,
 };
 
 /// Well-known ID for `WeightAdd/v1`.
@@ -75,6 +75,17 @@ impl LawBundle for WeightAddV1 {
 
     fn is_identity(&self, value: &[u8]) -> bool {
         parse_weight(value).map(|w| w == 0).unwrap_or(false)
+    }
+
+    fn gateway_combiner(&self) -> Option<GatewayAggCombinerDesc> {
+        // WeightAdd is an abelian group: associative + commutative, so partial
+        // weight sums can be safely pushed to individual shards.
+        Some(GatewayAggCombinerDesc {
+            law_id: WEIGHT_ADD_ID,
+            law_name: "WeightAdd",
+            is_associative: true,
+            is_commutative: true,
+        })
     }
 }
 

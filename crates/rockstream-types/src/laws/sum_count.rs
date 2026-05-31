@@ -14,8 +14,8 @@
 //! - bytes [8..16] — i64 count value, big-endian
 
 use crate::merge_law::{
-    CompactionPolicy, DuplicatePolicy, FrontierPolicy, LawBundle, LawProperties, MergeLawClass,
-    MergeLawId, MergeLawVersion,
+    CompactionPolicy, DuplicatePolicy, FrontierPolicy, GatewayAggCombinerDesc, LawBundle,
+    LawProperties, MergeLawClass, MergeLawId, MergeLawVersion,
 };
 
 /// Well-known ID for `SumCount/v1`.
@@ -90,6 +90,17 @@ impl LawBundle for SumCountV1 {
         parse_sum_count(value)
             .map(|(s, c)| s == 0 && c == 0)
             .unwrap_or(false)
+    }
+
+    fn gateway_combiner(&self) -> Option<GatewayAggCombinerDesc> {
+        // SumCount is an abelian group: associative + commutative, so partial
+        // aggregation can be safely pushed to individual shards.
+        Some(GatewayAggCombinerDesc {
+            law_id: SUM_COUNT_ID,
+            law_name: "SumCount",
+            is_associative: true,
+            is_commutative: true,
+        })
     }
 }
 

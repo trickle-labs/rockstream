@@ -33,6 +33,10 @@ pub enum GatewayError {
     /// The connection pool has no available slots.
     #[error("connection pool exhausted: {0} active connections")]
     PoolExhausted(usize),
+
+    /// Partial aggregation combining failed (merge law returned an error).
+    #[error("partial aggregation merge error: {0}")]
+    PartialAggMergeError(String),
 }
 
 impl GatewayError {
@@ -45,6 +49,7 @@ impl GatewayError {
             Self::QueryTimeoutExceeded(_) => RS_2002,
             Self::RateLimitExceeded(_) => RS_2005,
             Self::PoolExhausted(_) => RS_2001,
+            Self::PartialAggMergeError(_) => RS_2001,
         }
     }
 }
