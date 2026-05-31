@@ -90,7 +90,7 @@ pub fn check_staleness(
 /// The notice follows the pattern used by Materialize / CockroachDB for
 /// staleness warnings:
 ///
-/// ```
+/// ```text
 /// NOTICE: session snapshot is 15 epochs behind the committed frontier (max_staleness_epochs=10); consider refreshing your connection.
 /// ```
 pub fn format_notice(status: &StalenessStatus, config: &MaxStalenessConfig) -> Option<String> {
