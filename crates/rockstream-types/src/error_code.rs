@@ -122,6 +122,12 @@ pub const RS_3604: ErrorCode = ErrorCode::new(3604);
 pub const RS_3605: ErrorCode = ErrorCode::new(3605);
 /// Worker drain deadline exceeded; worker self-fenced (v0.38).
 pub const RS_3606: ErrorCode = ErrorCode::new(3606);
+/// Schema change requires blue/green clone/backfill/flip; in-place apply rejected (v0.39).
+pub const RS_3607: ErrorCode = ErrorCode::new(3607);
+/// A blue/green clone operation is already in progress for this view (v0.39).
+pub const RS_3608: ErrorCode = ErrorCode::new(3608);
+/// Clone backfill lag exceeded the allowed threshold before flip (v0.39).
+pub const RS_3609: ErrorCode = ErrorCode::new(3609);
 // 4xxx: Connector
 /// Source connection failed.
 pub const RS_4001: ErrorCode = ErrorCode::new(4001);
@@ -183,6 +189,9 @@ pub fn description(code: ErrorCode) -> &'static str {
         3604 => "Worker drain in progress; new shard assignments rejected",
         3605 => "Shard load factor exceeds skew threshold; adaptive re-sharding scheduled",
         3606 => "Worker drain deadline exceeded; worker self-fenced",
+        3607 => "Schema change requires blue/green clone; in-place apply rejected",
+        3608 => "A blue/green clone operation is already in progress for this view",
+        3609 => "Clone backfill lag exceeded the allowed threshold before flip",
         4001 => "Source connection failed",
         4002 => "Sink write failed",
         5001 => "Incompatible storage format",
