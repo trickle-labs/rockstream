@@ -1,9 +1,9 @@
-//! Gateway error types (v0.42).
+//! Gateway error types (v0.43).
 
 use thiserror::Error;
 
 use rockstream_types::error_code::{
-    ErrorCode, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006,
+    ErrorCode, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2008,
 };
 
 /// Errors produced by the RockStream Postgres gateway.
@@ -52,6 +52,19 @@ pub enum GatewayError {
         /// Oldest retained epoch.
         oldest_retained: u64,
     },
+
+    /// A concurrent transaction committed to the same row before this
+    /// transaction could commit — the client must retry (RS-2008, v0.43).
+    #[error(
+        "optimistic conflict on table '{table}': a concurrent transaction \
+         committed at epoch {conflicting_epoch}"
+    )]
+    OptimisticConflict {
+        /// The table on which the conflict was detected.
+        table: String,
+        /// The epoch at which the conflicting transaction committed.
+        conflicting_epoch: u64,
+    },
 }
 
 impl GatewayError {
@@ -66,6 +79,7 @@ impl GatewayError {
             Self::PoolExhausted(_) => RS_2001,
             Self::PartialAggMergeError(_) => RS_2001,
             Self::HistoricalQueryBeyondRetention { .. } => RS_2006,
+            Self::OptimisticConflict { .. } => RS_2008,
         }
     }
 }
