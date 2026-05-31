@@ -114,6 +114,8 @@ pub const RS_2003: ErrorCode = ErrorCode::new(2003);
 pub const RS_2004: ErrorCode = ErrorCode::new(2004);
 /// Query rate limit exceeded; client is sending too many requests (v0.40).
 pub const RS_2005: ErrorCode = ErrorCode::new(2005);
+/// Historical query references an epoch before the checkpoint retention window (v0.42).
+pub const RS_2006: ErrorCode = ErrorCode::new(2006);
 
 // 3xxx: Merge / arrangement
 /// Merge operand malformed (fail-closed: never silently overwrites).
@@ -190,6 +192,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         2003 => "Unsupported isolation level",
         2004 => "Cannot drop inline view: dependent materialized views still exist",
         2005 => "Query rate limit exceeded",
+        2006 => "Historical query beyond checkpoint retention window",
         3003 => "Pipeline blocked: object store brownout, local buffer exhausted",
         3009 => "Merge operand malformed",
         3604 => "Worker drain in progress; new shard assignments rejected",
@@ -289,9 +292,9 @@ mod tests {
     fn all_codes_have_descriptions() {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
-            RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_3003, RS_4001,
-            RS_4002, RS_5001, RS_5002, RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603,
-            RS_1701, RS_1702, RS_1703,
+            RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_3003,
+            RS_4001, RS_4002, RS_5001, RS_5002, RS_5003, RS_1512, RS_1513, RS_3601, RS_3602,
+            RS_3603, RS_1701, RS_1702, RS_1703,
         ];
         for code in codes {
             assert_ne!(

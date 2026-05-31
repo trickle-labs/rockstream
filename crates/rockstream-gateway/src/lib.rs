@@ -1,4 +1,4 @@
-//! Query gateway service for RockStream (v0.41).
+//! Query gateway service for RockStream (v0.42).
 //!
 //! Serves the pgwire protocol for reading views with Postgres-compatible
 //! clients (psql, SQLAlchemy, JDBC).
@@ -26,12 +26,24 @@
 //! - [`rockstream_catalog`] — `rockstream_catalog.*` system schema virtual
 //!   tables: `merge_laws`, `epochs`, `pipelines`, `shards`, `audit_log`
 //!   (DESIGN.md §12.6.1); legacy `rockstream.*` prefix alias accepted through
-//!   v0.45.
+//!   the 0.45 release.
 //! - [`segment_cache`] — per-worker arrangement segment cache keyed by
 //!   `(shard_id, segment_id)` with LRU eviction and hit-ratio tracking
 //!   (DESIGN.md §5.4).
+//!
+//! # v0.42 deliverables
+//!
+//! - [`freshness`] — read-your-writes session (`ReadYourWritesSession`),
+//!   snapshot isolation modes (`IsolationMode`), and `wait_for` semantics.
+//! - [`subscribe`] — SUBSCRIBE cursor with `AS OF NOW WITH SNAPSHOT`,
+//!   server-side row predicates, durable cursor resume after gateway restart.
+//! - [`historical`] — `AS OF EPOCH`, `AS OF TIMESTAMP`, and
+//!   `AS OF MONOTONE PARTIAL` query execution; retention window enforcement
+//!   with RS-2006.
 
 pub mod error;
+pub mod freshness;
+pub mod historical;
 pub mod inline_view;
 pub mod limits;
 pub mod partial_agg;
@@ -40,8 +52,17 @@ pub mod pgwire;
 pub mod pool;
 pub mod rockstream_catalog;
 pub mod segment_cache;
+pub mod subscribe;
 
 pub use error::GatewayError;
+pub use freshness::{
+    FreshnessToken, IsolationMode, ReadYourWritesSession, WaitForConfig, WaitForOutcome,
+};
+pub use historical::{
+    check_retention, execute_historical_query, execute_monotone_partial, find_epoch_for_timestamp,
+    oldest_retained_epoch, EpochTimestampEntry, HistoricalAsOf, HistoricalQueryResult,
+    HistoricalRow, MonotonePartialResult, RetentionConfig,
+};
 pub use inline_view::InlineViewCatalog;
 pub use limits::{check_timeout, QueryTimeoutConfig, RateLimitConfig, RateLimiter};
 pub use partial_agg::{
@@ -62,6 +83,10 @@ pub use rockstream_catalog::{
     CatalogPipeline, CatalogShard, PipelineStatus, ShardHealth,
 };
 pub use segment_cache::{SegmentCache, SegmentCacheConfig, SegmentCacheStats, ShardSegmentKey};
+pub use subscribe::{
+    simulate_subscribe_batch, ChangeRetentionConfig, SubscribeAsOf, SubscribeBatch,
+    SubscribeCursor, SubscribeOptions, SubscribePredicate, SubscribeRow,
+};
 
 #[cfg(test)]
 mod tests {
