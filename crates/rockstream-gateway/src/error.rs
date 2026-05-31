@@ -1,8 +1,10 @@
-//! Gateway error types (v0.40).
+//! Gateway error types (v0.42).
 
 use thiserror::Error;
 
-use rockstream_types::error_code::{ErrorCode, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005};
+use rockstream_types::error_code::{
+    ErrorCode, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006,
+};
 
 /// Errors produced by the RockStream Postgres gateway.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -37,6 +39,19 @@ pub enum GatewayError {
     /// Partial aggregation combining failed (merge law returned an error).
     #[error("partial aggregation merge error: {0}")]
     PartialAggMergeError(String),
+
+    /// Historical query references an epoch before the checkpoint retention
+    /// window (RS-2006, v0.42).
+    #[error(
+        "historical query references epoch {requested} which is before the \
+         retention window (oldest retained: {oldest_retained})"
+    )]
+    HistoricalQueryBeyondRetention {
+        /// The epoch requested by the query.
+        requested: u64,
+        /// Oldest retained epoch.
+        oldest_retained: u64,
+    },
 }
 
 impl GatewayError {
@@ -50,6 +65,7 @@ impl GatewayError {
             Self::RateLimitExceeded(_) => RS_2005,
             Self::PoolExhausted(_) => RS_2001,
             Self::PartialAggMergeError(_) => RS_2001,
+            Self::HistoricalQueryBeyondRetention { .. } => RS_2006,
         }
     }
 }
