@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 use rockstream_types::error_code::{
-    ErrorCode, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2008,
+    ErrorCode, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007, RS_2008,
 };
 
 /// Errors produced by the RockStream Postgres gateway.
@@ -65,6 +65,10 @@ pub enum GatewayError {
         /// The epoch at which the conflicting transaction committed.
         conflicting_epoch: u64,
     },
+
+    /// A non-idempotent write is missing required idempotency details (RS-2007, v0.44).
+    #[error("idempotency key required for non-idempotent write (RS-2007)")]
+    IdempotencyKeyRequired,
 }
 
 impl GatewayError {
@@ -80,6 +84,7 @@ impl GatewayError {
             Self::PartialAggMergeError(_) => RS_2001,
             Self::HistoricalQueryBeyondRetention { .. } => RS_2006,
             Self::OptimisticConflict { .. } => RS_2008,
+            Self::IdempotencyKeyRequired => RS_2007,
         }
     }
 }

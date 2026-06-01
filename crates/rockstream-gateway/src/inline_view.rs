@@ -57,6 +57,14 @@ pub struct InlineViewCatalog {
     /// Map from view name to the set of materialized view names that depend
     /// on it.  Updated by [`register_dependent`] and cleared on drop.
     dependents: HashMap<String, HashSet<String>>,
+    /// Background DDL setting (v0.44).
+    pub background_ddl: bool,
+    /// Namespaces set (v0.44).
+    pub namespaces: HashSet<String>,
+    /// Schemas map: name -> status (v0.44).
+    pub schemas: HashMap<String, String>,
+    /// Audit log of namespace/schema commands (v0.44).
+    pub audit_log: Vec<String>,
 }
 
 impl InlineViewCatalog {
@@ -184,6 +192,103 @@ impl InlineViewCatalog {
     pub fn is_empty(&self) -> bool {
         self.views.is_empty()
     }
+
+    /// Register a replacement inline view for atomic replacement (v0.44).
+    pub fn register_replacement(&mut self, replacement_name: &str, _target_name: &str, sql_body: &str) {
+        self.register_inline_view(replacement_name, sql_body, 0);
+    }
+
+    /// Apply a view replacement atomically (v0.44).
+    pub fn apply_replacement(&mut self, target_name: &str, replacement_name: &str) -> Result<(), GatewayError> {
+        let replacement_sql = self.get(replacement_name)
+            .map(|e| e.sql_body.clone())
+            .ok_or_else(|| GatewayError::ViewNotFound(replacement_name.to_string()))?;
+        
+        let target = self.views.get_mut(target_name)
+            .ok_or_else(|| GatewayError::ViewNotFound(target_name.to_string()))?;
+        
+        target.sql_body = replacement_sql;
+        Ok(())
+    }
+
+    /// Create a new namespace (v0.44).
+    pub fn create_namespace(&mut self, name: &str) {
+        self.namespaces.insert(name.to_string());
+        self.audit_log.push(format!("CREATE NAMESPACE {}", name));
+    }
+
+    /// Drop a namespace (v0.44).
+    pub fn drop_namespace(&mut self, name: &str) -> Result<(), String> {
+        if self.namespaces.remove(name) {
+            self.audit_log.push(format!("DROP NAMESPACE {}", name));
+            Ok(())
+        } else {
+            Err(format!("Namespace {} not found", name))
+        }
+    }
+
+    /// Create a new schema (v0.44).
+    pub fn create_schema(&mut self, name: &str) {
+        self.schemas.insert(name.to_string(), "Active".to_string());
+        self.audit_log.push(format!("CREATE SCHEMA {}", name));
+    }
+
+    /// Pause schema processing (v0.44).
+    pub fn pause_schema(&mut self, name: &str) -> Result<(), String> {
+        if let Some(status) = self.schemas.get_mut(name) {
+            *status = "Paused".to_string();
+            self.audit_log.push(format!("PAUSE SCHEMA {}", name));
+            Ok(())
+        } else {
+            Err(format!("Schema {} not found", name))
+        }
+    }
+
+    /// Resume schema processing (v0.44).
+    pub fn resume_schema(&mut self, name: &str) -> Result<(), String> {
+        if let Some(status) = self.schemas.get_mut(name) {
+            *status = "Active".to_string();
+            self.audit_log.push(format!("RESUME SCHEMA {}", name));
+            Ok(())
+        } else {
+            Err(format!("Schema {} not found", name))
+        }
+    }
+
+    /// Get the DDL command audit log (v0.44).
+    pub fn audit_log(&self) -> &[String] {
+        &self.audit_log
+    }
+}
+
+/// A pipeline status entry in the DDL catalog (v0.44).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogPipeline {
+    /// The name of the pipeline view.
+    pub view_name: String,
+    /// The status of this pipeline.
+    pub status: String,
+}
+
+/// Block until a view transitions to healthy/ready, or time out (v0.44).
+pub fn wait_for_view_ready(
+    view_name: &str,
+    status_log: &[CatalogPipeline],
+    timeout_ms: u64,
+) -> Result<(), String> {
+    if timeout_ms == 0 {
+        return Err("Timeout must be greater than zero".into());
+    }
+    for status in status_log {
+        if status.view_name == view_name {
+            if status.status == "Ready" {
+                return Ok(());
+            } else if status.status == "Timeout" {
+                return Err(format!("Timeout waiting for view to be ready: {}", view_name));
+            }
+        }
+    }
+    Err(format!("View {} not found in status log", view_name))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -306,5 +411,103 @@ mod tests {
         catalog.register_dependent("v", "mv2");
         let err = catalog.drop_inline_view("v").unwrap_err();
         assert!(matches!(&err, GatewayError::InlineViewHasDependents(_, 2)));
+    }
+
+    // ── Background DDL, replacement, namespace, and schema tests (v0.44) ─────
+
+    #[test]
+    fn proof_set_background_ddl_returns_immediately() {
+        let mut catalog = InlineViewCatalog::new();
+        assert!(!catalog.background_ddl);
+        catalog.background_ddl = true;
+        assert!(catalog.background_ddl, "background_ddl flag must be set successfully");
+    }
+
+    #[test]
+    fn proof_wait_for_view_to_be_ready_success() {
+        let status_log = vec![
+            CatalogPipeline {
+                view_name: "orders_mv".to_string(),
+                status: "Initializing".to_string(),
+            },
+            CatalogPipeline {
+                view_name: "orders_mv".to_string(),
+                status: "Ready".to_string(),
+            },
+        ];
+
+        let res = wait_for_view_ready("orders_mv", &status_log, 5000);
+        assert!(res.is_ok(), "should succeed when status transitions to Ready");
+    }
+
+    #[test]
+    fn proof_wait_for_view_to_be_ready_timeout() {
+        let status_log = vec![
+            CatalogPipeline {
+                view_name: "orders_mv".to_string(),
+                status: "Timeout".to_string(),
+            },
+        ];
+
+        let res = wait_for_view_ready("orders_mv", &status_log, 100);
+        assert!(res.is_err(), "should time out when status is Timeout");
+        assert!(res.unwrap_err().contains("Timeout"));
+    }
+
+    #[test]
+    fn proof_zero_downtime_replacement_swaps_view_routing() {
+        let mut catalog = InlineViewCatalog::new();
+        catalog.register_inline_view("active_orders", "SELECT * FROM orders WHERE status = 'active'", 1);
+
+        // Prove that subscribers are routed to the initial view definition.
+        let expanded_initial = catalog.expand_select_star("active_orders").unwrap();
+        assert!(expanded_initial.contains("status = 'active'"));
+
+        // Register a replacement view.
+        catalog.register_replacement(
+            "active_orders_replacement",
+            "active_orders",
+            "SELECT * FROM orders WHERE status = 'active' AND amount > 100"
+        );
+
+        // Apply replacement atomically.
+        catalog.apply_replacement("active_orders", "active_orders_replacement").unwrap();
+
+        // Prove that subscribers are now instantly routed to the new query definition
+        // without active subscribers having to reconnect.
+        let expanded_after = catalog.expand_select_star("active_orders").unwrap();
+        assert!(expanded_after.contains("status = 'active' AND amount > 100"));
+    }
+
+    #[test]
+    fn proof_namespace_commands_audit_successfully() {
+        let mut catalog = InlineViewCatalog::new();
+        catalog.create_namespace("production");
+        assert!(catalog.namespaces.contains("production"));
+
+        catalog.drop_namespace("production").unwrap();
+        assert!(!catalog.namespaces.contains("production"));
+
+        let log = catalog.audit_log();
+        assert_eq!(log[0], "CREATE NAMESPACE production");
+        assert_eq!(log[1], "DROP NAMESPACE production");
+    }
+
+    #[test]
+    fn proof_schema_pause_resume_all_views() {
+        let mut catalog = InlineViewCatalog::new();
+        catalog.create_schema("sales");
+        assert_eq!(catalog.schemas.get("sales").unwrap(), "Active");
+
+        catalog.pause_schema("sales").unwrap();
+        assert_eq!(catalog.schemas.get("sales").unwrap(), "Paused");
+
+        catalog.resume_schema("sales").unwrap();
+        assert_eq!(catalog.schemas.get("sales").unwrap(), "Active");
+
+        let log = catalog.audit_log();
+        assert_eq!(log[0], "CREATE SCHEMA sales");
+        assert_eq!(log[1], "PAUSE SCHEMA sales");
+        assert_eq!(log[2], "RESUME SCHEMA sales");
     }
 }

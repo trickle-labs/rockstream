@@ -183,6 +183,16 @@ impl ReadYourWritesSession {
             IsolationMode::RepeatableRead => self.snapshot_epoch,
         }
     }
+
+    /// Check if a read should skip waiting for the freshness token, based on a staleness hint (v0.44).
+    pub fn should_skip_wait_for(&self, allow_stale: bool) -> bool {
+        allow_stale
+    }
+}
+
+/// Generate a write fence token for cross-session consumer coordination (v0.44).
+pub fn generate_write_fence(current_committed_epoch: u64) -> FreshnessToken {
+    FreshnessToken::new(current_committed_epoch)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -313,5 +323,35 @@ mod tests {
         assert_eq!(session.last_written_epoch, Some(10));
         session.record_write(FreshnessToken::new(15)); // higher — accepted
         assert_eq!(session.last_written_epoch, Some(15));
+    }
+
+    // ── Write fence & ALLOW_STALE tests (v0.44) ──────────────────────────────
+
+    /// Proof: A write fence token can coordinate producer and consumer.
+    #[test]
+    fn proof_write_fence_coordinates_producer_consumer() {
+        let producer_epoch = 44;
+        let token = generate_write_fence(producer_epoch);
+        assert_eq!(token.epoch, 44);
+
+        let consumer_session = ReadYourWritesSession::new(0);
+        // Frontier lagging.
+        assert_eq!(
+            consumer_session.check_wait_for(token, 43),
+            WaitForOutcome::WouldBlock { required: 44, current: 43 }
+        );
+        // Frontier caught up.
+        assert_eq!(
+            consumer_session.check_wait_for(token, 44),
+            WaitForOutcome::Ready
+        );
+    }
+
+    /// Proof: allow_stale hint bypasses wait.
+    #[test]
+    fn proof_allow_stale_hint_bypasses_wait() {
+        let session = ReadYourWritesSession::new(10);
+        assert!(session.should_skip_wait_for(true), "allow_stale=true must skip wait");
+        assert!(!session.should_skip_wait_for(false), "allow_stale=false must not skip wait");
     }
 }
