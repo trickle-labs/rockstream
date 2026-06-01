@@ -338,7 +338,10 @@ mod tests {
         // Frontier lagging.
         assert_eq!(
             consumer_session.check_wait_for(token, 43),
-            WaitForOutcome::WouldBlock { required: 44, current: 43 }
+            WaitForOutcome::WouldBlock {
+                required: 44,
+                current: 43
+            }
         );
         // Frontier caught up.
         assert_eq!(
@@ -351,7 +354,13 @@ mod tests {
     #[test]
     fn proof_allow_stale_hint_bypasses_wait() {
         let session = ReadYourWritesSession::new(10);
-        assert!(session.should_skip_wait_for(true), "allow_stale=true must skip wait");
-        assert!(!session.should_skip_wait_for(false), "allow_stale=false must not skip wait");
+        assert!(
+            session.should_skip_wait_for(true),
+            "allow_stale=true must skip wait"
+        );
+        assert!(
+            !session.should_skip_wait_for(false),
+            "allow_stale=false must not skip wait"
+        );
     }
 }

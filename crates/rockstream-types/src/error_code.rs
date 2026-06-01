@@ -300,9 +300,9 @@ mod tests {
     fn all_codes_have_descriptions() {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
-            RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007, RS_2008,
-            RS_3003, RS_4001, RS_4002, RS_5001, RS_5002, RS_5003, RS_1512, RS_1513, RS_3601,
-            RS_3602, RS_3603, RS_1701, RS_1702, RS_1703,
+            RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007,
+            RS_2008, RS_3003, RS_4001, RS_4002, RS_5001, RS_5002, RS_5003, RS_1512, RS_1513,
+            RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703,
         ];
         for code in codes {
             assert_ne!(

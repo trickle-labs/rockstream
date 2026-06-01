@@ -299,7 +299,10 @@ impl OptimisticTransaction {
         committed_log: &[CommittedWrite],
     ) -> Result<Vec<CommittedWrite>, GatewayError> {
         // Enforce idempotency keys on non-idempotent writes (v0.44).
-        if self.is_non_idempotent && self.idempotency_key.is_none() && self.exactly_once_envelope.is_none() {
+        if self.is_non_idempotent
+            && self.idempotency_key.is_none()
+            && self.exactly_once_envelope.is_none()
+        {
             return Err(GatewayError::IdempotencyKeyRequired);
         }
 
@@ -307,7 +310,10 @@ impl OptimisticTransaction {
         // If a transaction with the same idempotency key is already committed,
         // we return successfully with zero new side-effects.
         if let Some(ref key) = self.idempotency_key {
-            if committed_log.iter().any(|w| w.idempotency_key.as_ref() == Some(key)) {
+            if committed_log
+                .iter()
+                .any(|w| w.idempotency_key.as_ref() == Some(key))
+            {
                 return Ok(vec![]);
             }
         }
@@ -667,8 +673,7 @@ mod tests {
     /// Proof: Idempotency key handles duplicate replays.
     #[test]
     fn proof_idempotency_key_handles_replays() {
-        let mut tx1 = OptimisticTransaction::new(5)
-            .with_idempotency("key-abc-123");
+        let mut tx1 = OptimisticTransaction::new(5).with_idempotency("key-abc-123");
         tx1.execute(&DmlStatement::Update {
             table: "counters".into(),
             set_columns: vec!["value".into()],
@@ -684,8 +689,7 @@ mod tests {
         assert_eq!(log[0].idempotency_key.as_deref(), Some("key-abc-123"));
 
         // Duplicate replay: transaction with the same idempotency key.
-        let mut tx2 = OptimisticTransaction::new(5)
-            .with_idempotency("key-abc-123");
+        let mut tx2 = OptimisticTransaction::new(5).with_idempotency("key-abc-123");
         tx2.execute(&DmlStatement::Update {
             table: "counters".into(),
             set_columns: vec!["value".into()],
@@ -697,11 +701,14 @@ mod tests {
 
         // Commit of duplicate must succeed immediately with zero new side-effects.
         let log_replay = tx2.commit(7, &log).unwrap();
-        assert_eq!(log_replay.len(), 0, "idempotent replay must return success with no new writes");
+        assert_eq!(
+            log_replay.len(),
+            0,
+            "idempotent replay must return success with no new writes"
+        );
 
         // Exactly-once envelope also succeeds (no conflict on different key, and satisfies idempotency check).
-        let mut tx3 = OptimisticTransaction::new(5)
-            .with_exactly_once(100);
+        let mut tx3 = OptimisticTransaction::new(5).with_exactly_once(100);
         tx3.execute(&DmlStatement::Update {
             table: "counters".into(),
             set_columns: vec!["value".into()],
@@ -727,11 +734,10 @@ mod tests {
         let mut total_attempts = 0;
         for i in 0..total_unique_increments {
             let key = format!("idemp-key-{}", i);
-            
+
             // First attempt: not in the log, so it will commit.
             total_attempts += 1;
-            let mut tx_first = OptimisticTransaction::new(10)
-                .with_idempotency(&key);
+            let mut tx_first = OptimisticTransaction::new(10).with_idempotency(&key);
             tx_first.execute(&DmlStatement::Update {
                 table: "counters".into(),
                 set_columns: vec!["value".into()],
@@ -753,8 +759,7 @@ mod tests {
             let committed_slice = &[committed_entry];
             for _ in 1..duplicate_multiplier {
                 total_attempts += 1;
-                let mut tx_dup = OptimisticTransaction::new(10)
-                    .with_idempotency(&key);
+                let mut tx_dup = OptimisticTransaction::new(10).with_idempotency(&key);
                 tx_dup.execute(&DmlStatement::Update {
                     table: "counters".into(),
                     set_columns: vec!["value".into()],
@@ -765,11 +770,18 @@ mod tests {
                 tx_dup.set_non_idempotent(true);
 
                 let dup_entries = tx_dup.commit(12, committed_slice).unwrap();
-                assert_eq!(dup_entries.len(), 0, "duplicate attempt must yield 0 committed entries");
+                assert_eq!(
+                    dup_entries.len(),
+                    0,
+                    "duplicate attempt must yield 0 committed entries"
+                );
             }
         }
 
-        assert_eq!(total_attempts, 1_000_000, "must simulate exactly 1M attempts");
+        assert_eq!(
+            total_attempts, 1_000_000,
+            "must simulate exactly 1M attempts"
+        );
         assert_eq!(
             committed_log.len(),
             total_unique_increments,

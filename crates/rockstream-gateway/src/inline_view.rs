@@ -194,19 +194,31 @@ impl InlineViewCatalog {
     }
 
     /// Register a replacement inline view for atomic replacement (v0.44).
-    pub fn register_replacement(&mut self, replacement_name: &str, _target_name: &str, sql_body: &str) {
+    pub fn register_replacement(
+        &mut self,
+        replacement_name: &str,
+        _target_name: &str,
+        sql_body: &str,
+    ) {
         self.register_inline_view(replacement_name, sql_body, 0);
     }
 
     /// Apply a view replacement atomically (v0.44).
-    pub fn apply_replacement(&mut self, target_name: &str, replacement_name: &str) -> Result<(), GatewayError> {
-        let replacement_sql = self.get(replacement_name)
+    pub fn apply_replacement(
+        &mut self,
+        target_name: &str,
+        replacement_name: &str,
+    ) -> Result<(), GatewayError> {
+        let replacement_sql = self
+            .get(replacement_name)
             .map(|e| e.sql_body.clone())
             .ok_or_else(|| GatewayError::ViewNotFound(replacement_name.to_string()))?;
-        
-        let target = self.views.get_mut(target_name)
+
+        let target = self
+            .views
+            .get_mut(target_name)
             .ok_or_else(|| GatewayError::ViewNotFound(target_name.to_string()))?;
-        
+
         target.sql_body = replacement_sql;
         Ok(())
     }
@@ -284,7 +296,10 @@ pub fn wait_for_view_ready(
             if status.status == "Ready" {
                 return Ok(());
             } else if status.status == "Timeout" {
-                return Err(format!("Timeout waiting for view to be ready: {}", view_name));
+                return Err(format!(
+                    "Timeout waiting for view to be ready: {}",
+                    view_name
+                ));
             }
         }
     }
@@ -420,7 +435,10 @@ mod tests {
         let mut catalog = InlineViewCatalog::new();
         assert!(!catalog.background_ddl);
         catalog.background_ddl = true;
-        assert!(catalog.background_ddl, "background_ddl flag must be set successfully");
+        assert!(
+            catalog.background_ddl,
+            "background_ddl flag must be set successfully"
+        );
     }
 
     #[test]
@@ -437,17 +455,18 @@ mod tests {
         ];
 
         let res = wait_for_view_ready("orders_mv", &status_log, 5000);
-        assert!(res.is_ok(), "should succeed when status transitions to Ready");
+        assert!(
+            res.is_ok(),
+            "should succeed when status transitions to Ready"
+        );
     }
 
     #[test]
     fn proof_wait_for_view_to_be_ready_timeout() {
-        let status_log = vec![
-            CatalogPipeline {
-                view_name: "orders_mv".to_string(),
-                status: "Timeout".to_string(),
-            },
-        ];
+        let status_log = vec![CatalogPipeline {
+            view_name: "orders_mv".to_string(),
+            status: "Timeout".to_string(),
+        }];
 
         let res = wait_for_view_ready("orders_mv", &status_log, 100);
         assert!(res.is_err(), "should time out when status is Timeout");
@@ -457,7 +476,11 @@ mod tests {
     #[test]
     fn proof_zero_downtime_replacement_swaps_view_routing() {
         let mut catalog = InlineViewCatalog::new();
-        catalog.register_inline_view("active_orders", "SELECT * FROM orders WHERE status = 'active'", 1);
+        catalog.register_inline_view(
+            "active_orders",
+            "SELECT * FROM orders WHERE status = 'active'",
+            1,
+        );
 
         // Prove that subscribers are routed to the initial view definition.
         let expanded_initial = catalog.expand_select_star("active_orders").unwrap();
@@ -467,11 +490,13 @@ mod tests {
         catalog.register_replacement(
             "active_orders_replacement",
             "active_orders",
-            "SELECT * FROM orders WHERE status = 'active' AND amount > 100"
+            "SELECT * FROM orders WHERE status = 'active' AND amount > 100",
         );
 
         // Apply replacement atomically.
-        catalog.apply_replacement("active_orders", "active_orders_replacement").unwrap();
+        catalog
+            .apply_replacement("active_orders", "active_orders_replacement")
+            .unwrap();
 
         // Prove that subscribers are now instantly routed to the new query definition
         // without active subscribers having to reconnect.
