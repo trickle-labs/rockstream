@@ -212,10 +212,11 @@ pub enum ControlMessage {
 ///
 /// Once `Decommissioned`, the control plane stops assigning new shards and
 /// the worker is removed from the topology after a short grace period.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum WorkerLifecycleState {
     /// Normal operation — accepts new shard assignments.
+    #[default]
     Active,
     /// Drain requested — the worker is handing off all owned shards.
     /// New shard assignments are rejected.  Transitions to `Decommissioned`
@@ -243,12 +244,6 @@ impl WorkerLifecycleState {
     /// (i.e., should not receive new shard assignments).
     pub fn is_draining_or_decommissioned(&self) -> bool {
         !self.is_active()
-    }
-}
-
-impl Default for WorkerLifecycleState {
-    fn default() -> Self {
-        Self::Active
     }
 }
 

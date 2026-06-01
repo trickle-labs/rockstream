@@ -297,7 +297,7 @@ impl SkewDetector {
         // Sort by state_bytes to find median and worst.
         samples.sort_by_key(|s| s.state_bytes);
         let n = samples.len();
-        let median_state_bytes = if n % 2 == 0 {
+        let median_state_bytes = if n.is_multiple_of(2) {
             (samples[n / 2 - 1].state_bytes + samples[n / 2].state_bytes) / 2
         } else {
             samples[n / 2].state_bytes
