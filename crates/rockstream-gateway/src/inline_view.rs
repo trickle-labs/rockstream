@@ -296,9 +296,7 @@ pub fn wait_for_view_ready(
             if status.status == "Ready" {
                 return Ok(());
             } else if status.status == "Timeout" {
-                return Err(format!(
-                    "Timeout waiting for view to be ready: {view_name}"
-                ));
+                return Err(format!("Timeout waiting for view to be ready: {view_name}"));
             }
         }
     }

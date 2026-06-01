@@ -247,8 +247,6 @@ impl WorkerLifecycleState {
     }
 }
 
-
-
 /// Request from the control plane to a worker to begin draining.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrainRequest {
