@@ -605,8 +605,7 @@ mod tests {
         // Each uncontended key (different transactions writing unique keys)
         // would all commit.  Verify this with a separate set.
         let mut log2: Vec<CommittedWrite> = Vec::new();
-        let mut epoch2: u64 = 11;
-        for i in 0..4u64 {
+        for (epoch2, i) in (11_u64..).zip(0..4u64) {
             let mut tx = OptimisticTransaction::new(read_epoch);
             tx.execute(&DmlStatement::Insert {
                 table: "orders".into(),
@@ -617,7 +616,6 @@ mod tests {
                 .commit(epoch2, &log2)
                 .expect("unique keys must not conflict");
             log2.extend(entries);
-            epoch2 += 1;
         }
         assert_eq!(log2.len(), 4, "all uncontended inserts commit");
     }
@@ -733,7 +731,7 @@ mod tests {
 
         let mut total_attempts = 0;
         for i in 0..total_unique_increments {
-            let key = format!("idemp-key-{}", i);
+            let key = format!("idemp-key-{i}");
 
             // First attempt: not in the log, so it will commit.
             total_attempts += 1;
