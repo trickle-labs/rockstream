@@ -294,6 +294,10 @@ pub fn ansi_type_name(type_tag: u8) -> &'static str {
         10 => "uuid",
         11 => "jsonb",
         12 => "numeric",
+        13 => "counter",
+        14 => "max_register",
+        15 => "min_register",
+        16 => "lww",
         _ => "unknown",
     }
 }

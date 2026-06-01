@@ -69,6 +69,10 @@ pub enum GatewayError {
     /// A non-idempotent write is missing required idempotency details (RS-2007, v0.44).
     #[error("idempotency key required for non-idempotent write (RS-2007)")]
     IdempotencyKeyRequired,
+
+    /// Invalid DDL or DML statement syntax or configuration (RS-2001).
+    #[error("invalid DML or DDL statement: {0}")]
+    InvalidDml(String),
 }
 
 impl GatewayError {
@@ -85,6 +89,7 @@ impl GatewayError {
             Self::HistoricalQueryBeyondRetention { .. } => RS_2006,
             Self::OptimisticConflict { .. } => RS_2008,
             Self::IdempotencyKeyRequired => RS_2007,
+            Self::InvalidDml(_) => RS_2001,
         }
     }
 }

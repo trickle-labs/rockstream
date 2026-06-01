@@ -18,11 +18,15 @@ pub enum MergeTag {
     MaxRegister = 0x03,
     /// Semilattice MIN: values are i64 (big-endian), merged by `min(a, b)`.
     MinRegister = 0x04,
+    /// Semilattice LWWRegister: timestamp (u64 BE) + value (i64 BE).
+    LWWRegister = 0x22,
+    /// PNCounter: positive-negative counter, values are i64 (big-endian).
+    PNCounter = 0x30,
 }
 
 /// A merge operator that performs associative sum and count operations.
 ///
-/// Value format: `[tag:1][payload:8]`
+/// Value format: `[tag:1][payload:8]` (or 16 for LWWRegister)
 /// - Sum tag: payload is i64 big-endian, merged by addition
 /// - Count tag: payload is u64 big-endian, merged by addition
 ///
@@ -43,12 +47,9 @@ impl MergeOperator for SumCountMergeOperator {
             return Ok(value);
         };
 
-        // Both existing and new must be at least 9 bytes (1 tag + 8 payload).
-        if existing.len() < 9 || value.len() < 9 {
-            // Fail-closed: malformed operand (RS-3009).
+        if existing.is_empty() || value.is_empty() {
             return Err(MergeOperatorError::Callback {
-                message: "RS-3009: merge operand malformed (expected 9 bytes: 1 tag + 8 payload)"
-                    .into(),
+                message: "RS-3009: merge operand is empty".into(),
             });
         }
 
@@ -62,6 +63,11 @@ impl MergeOperator for SumCountMergeOperator {
 
         match tag {
             t if t == MergeTag::Sum as u8 => {
+                if existing.len() < 9 || value.len() < 9 {
+                    return Err(MergeOperatorError::Callback {
+                        message: "RS-3009: merge operand malformed".into(),
+                    });
+                }
                 let a = i64::from_be_bytes(existing[1..9].try_into().unwrap());
                 let b = i64::from_be_bytes(value[1..9].try_into().unwrap());
                 let result = a.wrapping_add(b);
@@ -71,6 +77,11 @@ impl MergeOperator for SumCountMergeOperator {
                 Ok(Bytes::from(out))
             }
             t if t == MergeTag::Count as u8 => {
+                if existing.len() < 9 || value.len() < 9 {
+                    return Err(MergeOperatorError::Callback {
+                        message: "RS-3009: merge operand malformed".into(),
+                    });
+                }
                 let a = u64::from_be_bytes(existing[1..9].try_into().unwrap());
                 let b = u64::from_be_bytes(value[1..9].try_into().unwrap());
                 let result = a.wrapping_add(b);
@@ -80,6 +91,11 @@ impl MergeOperator for SumCountMergeOperator {
                 Ok(Bytes::from(out))
             }
             t if t == MergeTag::MaxRegister as u8 => {
+                if existing.len() < 9 || value.len() < 9 {
+                    return Err(MergeOperatorError::Callback {
+                        message: "RS-3009: merge operand malformed".into(),
+                    });
+                }
                 let a = i64::from_be_bytes(existing[1..9].try_into().unwrap());
                 let b = i64::from_be_bytes(value[1..9].try_into().unwrap());
                 let result = a.max(b);
@@ -89,12 +105,56 @@ impl MergeOperator for SumCountMergeOperator {
                 Ok(Bytes::from(out))
             }
             t if t == MergeTag::MinRegister as u8 => {
+                if existing.len() < 9 || value.len() < 9 {
+                    return Err(MergeOperatorError::Callback {
+                        message: "RS-3009: merge operand malformed".into(),
+                    });
+                }
                 let a = i64::from_be_bytes(existing[1..9].try_into().unwrap());
                 let b = i64::from_be_bytes(value[1..9].try_into().unwrap());
                 let result = a.min(b);
                 let mut out = Vec::with_capacity(9);
                 out.push(MergeTag::MinRegister as u8);
                 out.extend_from_slice(&result.to_be_bytes());
+                Ok(Bytes::from(out))
+            }
+            t if t == MergeTag::PNCounter as u8 => {
+                if existing.len() < 9 || value.len() < 9 {
+                    return Err(MergeOperatorError::Callback {
+                        message: "RS-3009: merge operand malformed".into(),
+                    });
+                }
+                let a = i64::from_be_bytes(existing[1..9].try_into().unwrap());
+                let b = i64::from_be_bytes(value[1..9].try_into().unwrap());
+                let result = a.wrapping_add(b);
+                let mut out = Vec::with_capacity(9);
+                out.push(MergeTag::PNCounter as u8);
+                out.extend_from_slice(&result.to_be_bytes());
+                Ok(Bytes::from(out))
+            }
+            t if t == MergeTag::LWWRegister as u8 => {
+                if existing.len() < 17 || value.len() < 17 {
+                    return Err(MergeOperatorError::Callback {
+                        message: "RS-3009: merge operand malformed".into(),
+                    });
+                }
+                let ts_a = u64::from_be_bytes(existing[1..9].try_into().unwrap());
+                let val_a = i64::from_be_bytes(existing[9..17].try_into().unwrap());
+                let ts_b = u64::from_be_bytes(value[1..9].try_into().unwrap());
+                let val_b = i64::from_be_bytes(value[9..17].try_into().unwrap());
+
+                let (ts_res, val_res) = if ts_b > ts_a {
+                    (ts_b, val_b)
+                } else if ts_a > ts_b {
+                    (ts_a, val_a)
+                } else {
+                    (ts_a, val_a.max(val_b))
+                };
+
+                let mut out = Vec::with_capacity(17);
+                out.push(MergeTag::LWWRegister as u8);
+                out.extend_from_slice(&ts_res.to_be_bytes());
+                out.extend_from_slice(&val_res.to_be_bytes());
                 Ok(Bytes::from(out))
             }
             _ => {
@@ -176,6 +236,41 @@ impl MergeOperatorRegistry {
             return None;
         }
         Some(i64::from_be_bytes(data[1..9].try_into().ok()?))
+    }
+
+    /// Encode a PNCounter value for merge operations.
+    pub fn encode_pn_counter(value: i64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9);
+        out.push(MergeTag::PNCounter as u8);
+        out.extend_from_slice(&value.to_be_bytes());
+        out
+    }
+
+    /// Decode a PNCounter value from merged bytes.
+    pub fn decode_pn_counter(data: &[u8]) -> Option<i64> {
+        if data.len() < 9 || data[0] != MergeTag::PNCounter as u8 {
+            return None;
+        }
+        Some(i64::from_be_bytes(data[1..9].try_into().ok()?))
+    }
+
+    /// Encode a LWWRegister value for merge operations.
+    pub fn encode_lww_register(ts: u64, value: i64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(17);
+        out.push(MergeTag::LWWRegister as u8);
+        out.extend_from_slice(&ts.to_be_bytes());
+        out.extend_from_slice(&value.to_be_bytes());
+        out
+    }
+
+    /// Decode a LWWRegister value from merged bytes.
+    pub fn decode_lww_register(data: &[u8]) -> Option<(u64, i64)> {
+        if data.len() < 17 || data[0] != MergeTag::LWWRegister as u8 {
+            return None;
+        }
+        let ts = u64::from_be_bytes(data[1..9].try_into().ok()?);
+        let val = i64::from_be_bytes(data[9..17].try_into().ok()?);
+        Some((ts, val))
     }
 }
 

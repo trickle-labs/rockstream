@@ -27,6 +27,14 @@ pub enum DataType {
     Binary,
     /// Milliseconds since Unix epoch (UTC).
     TimestampMs,
+    /// PNCounter (COUNTER)
+    Counter,
+    /// MaxRegister (MAX_REGISTER)
+    MaxRegister,
+    /// MinRegister (MIN_REGISTER)
+    MinRegister,
+    /// LWW (LWW)
+    Lww,
 }
 
 impl DataType {
@@ -41,6 +49,10 @@ impl DataType {
             Self::Utf8 => "Utf8",
             Self::Binary => "Binary",
             Self::TimestampMs => "TimestampMs",
+            Self::Counter => "Counter",
+            Self::MaxRegister => "MaxRegister",
+            Self::MinRegister => "MinRegister",
+            Self::Lww => "Lww",
         }
     }
 }

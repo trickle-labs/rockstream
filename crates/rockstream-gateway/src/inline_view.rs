@@ -50,6 +50,19 @@ pub struct InlineViewEntry {
 ///
 /// Thread safety: single-threaded; wrap in `Mutex` or `RwLock` for
 /// multi-threaded use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableColumn {
+    pub name: String,
+    pub type_tag: u8,
+    pub is_primary_key: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableEntry {
+    pub name: String,
+    pub columns: Vec<TableColumn>,
+}
+
 #[derive(Debug, Default)]
 pub struct InlineViewCatalog {
     /// Map from view name to the stored view entry.
@@ -65,6 +78,8 @@ pub struct InlineViewCatalog {
     pub schemas: HashMap<String, String>,
     /// Audit log of namespace/schema commands (v0.44).
     pub audit_log: Vec<String>,
+    /// Map from table name to the stored table entry (v0.45).
+    pub tables: HashMap<String, TableEntry>,
 }
 
 impl InlineViewCatalog {
@@ -270,6 +285,109 @@ impl InlineViewCatalog {
     /// Get the DDL command audit log (v0.44).
     pub fn audit_log(&self) -> &[String] {
         &self.audit_log
+    }
+
+    /// Create a new table entry in the catalog (v0.45).
+    pub fn create_table(&mut self, name: &str, columns: Vec<TableColumn>) {
+        let entry = TableEntry {
+            name: name.to_string(),
+            columns,
+        };
+        self.tables.insert(name.to_string(), entry);
+    }
+
+    /// Execute a CREATE TABLE DDL command (v0.45).
+    pub fn execute_ddl(&mut self, sql: &str) -> Result<(), GatewayError> {
+        let sql_trimmed = sql.trim();
+        let sql_upper = sql_trimmed.to_uppercase();
+
+        if sql_upper.starts_with("CREATE TABLE") {
+            let open_paren = sql_trimmed.find('(').ok_or_else(|| {
+                GatewayError::InvalidDml("Missing opening parenthesis in CREATE TABLE".into())
+            })?;
+            let close_paren = sql_trimmed.rfind(')').ok_or_else(|| {
+                GatewayError::InvalidDml("Missing closing parenthesis in CREATE TABLE".into())
+            })?;
+
+            let header = &sql_trimmed[..open_paren];
+            let parts: Vec<&str> = header.split_whitespace().collect();
+            if parts.len() < 3 {
+                return Err(GatewayError::InvalidDml(
+                    "Invalid CREATE TABLE header".into(),
+                ));
+            }
+            let table_name = parts[2].trim_matches(|c| c == '"' || c == '`').to_string();
+
+            let col_defs_str = &sql_trimmed[open_paren + 1..close_paren];
+            let mut columns = Vec::new();
+
+            for col_def in col_defs_str.split(',') {
+                let col_def = col_def.trim();
+                if col_def.is_empty() {
+                    continue;
+                }
+                let mut col_parts = col_def.split_whitespace();
+                let col_name = col_parts
+                    .next()
+                    .ok_or_else(|| {
+                        GatewayError::InvalidDml("Missing column name in column definition".into())
+                    })?
+                    .trim_matches(|c| c == '"' || c == '`')
+                    .to_string();
+
+                let mut type_parts = Vec::new();
+                let mut is_primary_key = false;
+
+                while let Some(part) = col_parts.next() {
+                    let part_upper = part.to_uppercase();
+                    if part_upper == "PRIMARY" {
+                        if let Some(next_part) = col_parts.next() {
+                            if next_part.to_uppercase() == "KEY" {
+                                is_primary_key = true;
+                                continue;
+                            }
+                        }
+                    }
+                    type_parts.push(part);
+                }
+
+                let type_str = type_parts.join(" ").to_uppercase();
+                let type_tag = match type_str.as_str() {
+                    "BOOL" | "BOOLEAN" => 1,
+                    "INT" | "INTEGER" | "INT4" => 2,
+                    "INT8" | "BIGINT" => 3,
+                    "FLOAT" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => 4,
+                    "TEXT" => 5,
+                    "VARCHAR" | "CHARACTER VARYING" => 6,
+                    "BYTEA" => 7,
+                    "DATE" => 8,
+                    "TIMESTAMP" => 9,
+                    "UUID" => 10,
+                    "JSONB" => 11,
+                    "NUMERIC" => 12,
+                    "COUNTER" => 13,
+                    "MAX_REGISTER" => 14,
+                    "MIN_REGISTER" => 15,
+                    "LWW" => 16,
+                    _ => {
+                        return Err(GatewayError::InvalidDml(format!(
+                            "Unsupported column type: {type_str}"
+                        )));
+                    }
+                };
+
+                columns.push(TableColumn {
+                    name: col_name,
+                    type_tag,
+                    is_primary_key,
+                });
+            }
+
+            self.create_table(&table_name, columns);
+            Ok(())
+        } else {
+            Err(GatewayError::InvalidDml("Unsupported DDL command".into()))
+        }
     }
 }
 

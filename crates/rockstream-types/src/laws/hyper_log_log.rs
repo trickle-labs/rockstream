@@ -43,7 +43,7 @@ use crate::merge_law::{
 };
 
 /// Well-known ID for `HyperLogLog/v1`.
-pub const HLL_ID: MergeLawId = MergeLawId(0x0005);
+pub const HLL_ID: MergeLawId = MergeLawId(0x0009);
 
 /// Well-known version.
 pub const HLL_VERSION: MergeLawVersion = MergeLawVersion(1);

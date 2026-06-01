@@ -36,7 +36,7 @@ use crate::merge_law::{
 };
 
 /// Well-known ID for `BloomUnion/v1`.
-pub const BLOOM_UNION_ID: MergeLawId = MergeLawId(0x0006);
+pub const BLOOM_UNION_ID: MergeLawId = MergeLawId(0x000a);
 
 /// Well-known version.
 pub const BLOOM_UNION_VERSION: MergeLawVersion = MergeLawVersion(1);
