@@ -226,33 +226,33 @@ impl InlineViewCatalog {
     /// Create a new namespace (v0.44).
     pub fn create_namespace(&mut self, name: &str) {
         self.namespaces.insert(name.to_string());
-        self.audit_log.push(format!("CREATE NAMESPACE {}", name));
+        self.audit_log.push(format!("CREATE NAMESPACE {name}"));
     }
 
     /// Drop a namespace (v0.44).
     pub fn drop_namespace(&mut self, name: &str) -> Result<(), String> {
         if self.namespaces.remove(name) {
-            self.audit_log.push(format!("DROP NAMESPACE {}", name));
+            self.audit_log.push(format!("DROP NAMESPACE {name}"));
             Ok(())
         } else {
-            Err(format!("Namespace {} not found", name))
+            Err(format!("Namespace {name} not found"))
         }
     }
 
     /// Create a new schema (v0.44).
     pub fn create_schema(&mut self, name: &str) {
         self.schemas.insert(name.to_string(), "Active".to_string());
-        self.audit_log.push(format!("CREATE SCHEMA {}", name));
+        self.audit_log.push(format!("CREATE SCHEMA {name}"));
     }
 
     /// Pause schema processing (v0.44).
     pub fn pause_schema(&mut self, name: &str) -> Result<(), String> {
         if let Some(status) = self.schemas.get_mut(name) {
             *status = "Paused".to_string();
-            self.audit_log.push(format!("PAUSE SCHEMA {}", name));
+            self.audit_log.push(format!("PAUSE SCHEMA {name}"));
             Ok(())
         } else {
-            Err(format!("Schema {} not found", name))
+            Err(format!("Schema {name} not found"))
         }
     }
 
@@ -260,10 +260,10 @@ impl InlineViewCatalog {
     pub fn resume_schema(&mut self, name: &str) -> Result<(), String> {
         if let Some(status) = self.schemas.get_mut(name) {
             *status = "Active".to_string();
-            self.audit_log.push(format!("RESUME SCHEMA {}", name));
+            self.audit_log.push(format!("RESUME SCHEMA {name}"));
             Ok(())
         } else {
-            Err(format!("Schema {} not found", name))
+            Err(format!("Schema {name} not found"))
         }
     }
 
@@ -297,13 +297,12 @@ pub fn wait_for_view_ready(
                 return Ok(());
             } else if status.status == "Timeout" {
                 return Err(format!(
-                    "Timeout waiting for view to be ready: {}",
-                    view_name
+                    "Timeout waiting for view to be ready: {view_name}"
                 ));
             }
         }
     }
-    Err(format!("View {} not found in status log", view_name))
+    Err(format!("View {view_name} not found in status log"))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
