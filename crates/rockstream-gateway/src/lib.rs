@@ -40,12 +40,23 @@
 //! - [`historical`] — `AS OF EPOCH`, `AS OF TIMESTAMP`, and
 //!   `AS OF MONOTONE PARTIAL` query execution; retention window enforcement
 //!   with RS-2006.
+//!
+//! # v0.43 deliverables
+//!
+//! - [`dml`] — INSERT, UPDATE, DELETE, `INSERT ... RETURNING` DML statement
+//!   types; [`dml::OptimisticTransaction`] with epoch-based conflict detection
+//!   returning RS-2008 on write-write conflicts.
+//! - [`max_staleness`] — session max-staleness check and Postgres NOTICE
+//!   formatting; emits a NOTICE when a session's snapshot epoch lags the
+//!   committed frontier by more than the configured threshold.
 
+pub mod dml;
 pub mod error;
 pub mod freshness;
 pub mod historical;
 pub mod inline_view;
 pub mod limits;
+pub mod max_staleness;
 pub mod partial_agg;
 pub mod pg_catalog;
 pub mod pgwire;
@@ -54,6 +65,9 @@ pub mod rockstream_catalog;
 pub mod segment_cache;
 pub mod subscribe;
 
+pub use dml::{
+    CommittedWrite, DmlResult, DmlStatement, OptimisticTransaction, WriteKind, WriteSetEntry,
+};
 pub use error::GatewayError;
 pub use freshness::{
     FreshnessToken, IsolationMode, ReadYourWritesSession, WaitForConfig, WaitForOutcome,
@@ -65,6 +79,7 @@ pub use historical::{
 };
 pub use inline_view::InlineViewCatalog;
 pub use limits::{check_timeout, QueryTimeoutConfig, RateLimitConfig, RateLimiter};
+pub use max_staleness::{check_staleness, format_notice, MaxStalenessConfig, StalenessStatus};
 pub use partial_agg::{
     build_partial_agg_plan, combine_partial_results, explain_partial_agg, CombinedAggRow,
     PartialAggExplainRow, PartialAggPlan, PartialAggRow,
