@@ -14,6 +14,7 @@
 pub mod example_sdk;
 pub mod fixed_source;
 pub mod generate_rows;
+pub mod grpc_connector;
 pub mod http_sink;
 pub mod http_source;
 pub mod iceberg_sink;
@@ -30,6 +31,7 @@ pub mod source;
 
 pub use example_sdk::{ExampleSdkSink, ExampleSdkSource};
 pub use generate_rows::{GenerateRowsConfig, GenerateRowsSource};
+pub use grpc_connector::{GrpcConnectorClient, ReferenceConnectorService};
 pub use http_sink::HttpSink;
 pub use http_source::HttpSource;
 pub use iceberg_sink::IcebergSink;
@@ -419,5 +421,60 @@ mod tests {
             batch.record_count, 2,
             "pushdown filter must prune partitions at source"
         );
+    }
+
+    #[tokio::test]
+    async fn proof_grpc_connector_passes_tier1_contract() {
+        use std::sync::Arc;
+        let svc = Arc::new(ReferenceConnectorService::new());
+        let mut client = GrpcConnectorClient::new("grpc-events", svc);
+
+        // Name is correct
+        assert_eq!(client.name(), "grpc-events");
+
+        // poll_batch returns a valid batch
+        let batch = client.poll_batch(0).await.unwrap();
+        assert_eq!(batch.record_count, 5);
+        assert_eq!(
+            batch.offset,
+            Some(rockstream_types::batch::OffsetToken(
+                "grpc-offset-1".to_string()
+            ))
+        );
+        assert_eq!(batch.watermark, Some(0));
+
+        // credits_available is implemented
+        assert_eq!(client.credits_available(), usize::MAX);
+
+        // credits flow control works
+        client.set_credits(0);
+        let saturated = client.poll_batch(1).await.unwrap();
+        assert_eq!(saturated.record_count, 0, "Tier 1: must respect credits");
+
+        // offset is available
+        assert_eq!(
+            client.current_offset(),
+            Some(rockstream_types::batch::OffsetToken(
+                "grpc-offset-1".to_string()
+            ))
+        );
+
+        // discover_schema works
+        let meta = client.discover_schema();
+        assert!(meta.columns.contains_key("event_count"));
+        assert_eq!(meta.columns["event_count"].crdt_type, "COUNTER");
+        assert_eq!(
+            meta.columns["event_count"].write_classification,
+            WriteClassification::BlindDelta
+        );
+
+        // lifecycle works
+        assert_eq!(client.lifecycle_state(), ConnectorLifecycleState::Running);
+        assert!(client.pause().await);
+        assert_eq!(client.lifecycle_state(), ConnectorLifecycleState::Paused);
+        assert!(client.resume().await);
+        assert_eq!(client.lifecycle_state(), ConnectorLifecycleState::Running);
+        client.delete().await;
+        assert_eq!(client.lifecycle_state(), ConnectorLifecycleState::Deleted);
     }
 }

@@ -2,45 +2,24 @@
 //!
 //! Built on Apache DataFusion. Parses SQL DDL/DML, binds schemas, optimizes
 //! logical plans, and lowers to the RockStream `PlanNode` IR.
-//!
-//! # v0.11 deliverables
-//!
-//! - [`SqlFrontend::parse_statement`] — parse one SQL statement into a
-//!   DataFusion AST (`Statement`).
-//! - [`SqlFrontend::lower`] — lower a DataFusion `LogicalPlan` to a
-//!   `PlanNode` tree with merge-law annotations for every aggregate node.
-//!
-//! Every aggregate operator in the lowered plan carries either a `MergeLawId`
-//! (via `DiffCtx::differentiate`) or an explicit `not_merge_safe_reason`.
-//! This is verified by the `all_aggregate_nodes_have_law_or_reason` test.
-//!
-//! # Scope
-//!
-//! This module handles the structural lowering of LogicalPlan nodes:
-//! `TableScan` → `Source`, `Projection` → `Project`, `Filter` → `Filter`,
-//! `Aggregate` → `Aggregate` (with law-annotated aggregate functions),
-//! `Union` → `Union`. Scalar expressions lower to the `rockstream_plan::Expr`
-//! IR. Full schema binding (column-by-name resolution with index assignment)
-//! is deferred to v0.12; for now all column references lower to index 0.
 
-use datafusion::logical_expr::Operator as DFOperator;
-use datafusion::logical_expr::{
-    expr::{AggregateFunction as DFAggFunc, Alias, BinaryExpr, Case, Cast},
-    Expr as DFExpr, LogicalPlan,
-};
-use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
-use rockstream_plan::{AggregateExpr, AggregateFunc, BinaryOp, Expr as PlanExpr, PlanNode};
 use thiserror::Error;
 
 pub use datafusion::logical_expr::LogicalPlan as DataFusionPlan;
+
+pub mod binder;
+pub mod ddl;
+pub mod explain;
+pub mod lowering;
+pub mod parser;
 
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
 /// Errors from the SQL frontend.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SqlError {
     /// SQL parse error from the DataFusion SQL parser.
     #[error("SQL parse error: {0}")]
@@ -53,6 +32,10 @@ pub enum SqlError {
     /// A schema, table, or column name could not be resolved.
     #[error("resolution error: {0}")]
     Resolution(String),
+
+    /// Schema divergence between declared and connector schemas.
+    #[error("schema mismatch: {0}")]
+    SchemaMismatch(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -60,19 +43,6 @@ pub enum SqlError {
 // ---------------------------------------------------------------------------
 
 /// The SQL frontend for RockStream.
-///
-/// Wraps the DataFusion SQL parser and provides the entry point for lowering
-/// SQL statements to the RockStream `PlanNode` IR.
-///
-/// # Usage
-///
-/// ```rust
-/// use rockstream_sql::SqlFrontend;
-///
-/// let frontend = SqlFrontend::new();
-/// let stmts = frontend.parse_statement("SELECT 1").unwrap();
-/// assert_eq!(stmts.len(), 1);
-/// ```
 pub struct SqlFrontend {
     dialect: GenericDialect,
 }
@@ -83,338 +53,6 @@ impl SqlFrontend {
         Self {
             dialect: GenericDialect {},
         }
-    }
-
-    /// Parse a SQL string into a list of DataFusion `Statement`s.
-    ///
-    /// Uses the DataFusion SQL parser which understands DataFusion extensions
-    /// in addition to standard SQL. Returns an error if the input is not
-    /// syntactically valid SQL.
-    pub fn parse_statement(&self, sql: &str) -> Result<Vec<Statement>, SqlError> {
-        DFParser::parse_sql_with_dialect(sql, &self.dialect)
-            .map(|stmts| stmts.into_iter().collect())
-            .map_err(|e| SqlError::Parse(e.to_string()))
-    }
-
-    /// Lower a DataFusion `LogicalPlan` to a RockStream `PlanNode` tree.
-    ///
-    /// Handles the Phase 1 operator set:
-    /// - `TableScan` → `PlanNode::Source`
-    /// - `EmptyRelation` → `PlanNode::Source { name: "<empty>" }`
-    /// - `Projection` → `PlanNode::Project`
-    /// - `Filter` → `PlanNode::Filter`
-    /// - `Aggregate` → `PlanNode::Aggregate` with law-mapped `AggregateFunc`
-    /// - `Union` → `PlanNode::Union` (folded pairwise from n inputs)
-    ///
-    /// Aggregate function mapping (used by `DiffCtx` to attach law IDs):
-    /// - `SUM` → `AggregateFunc::Sum` → `WeightAdd/v1`
-    /// - `COUNT` → `AggregateFunc::Count` → `WeightAdd/v1`
-    /// - `AVG` → `AggregateFunc::Avg` → `WeightAdd/v1`
-    /// - `MIN` → `AggregateFunc::Min` → `MinRegister/v1` + `ExtremumRequiresRmw`
-    /// - `MAX` → `AggregateFunc::Max` → `MaxRegister/v1` + `ExtremumRequiresRmw`
-    ///
-    /// Full schema binding (column-index resolution) is deferred to v0.12.
-    /// For now, all column references lower to index 0.
-    pub fn lower(&self, plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
-        self.lower_plan(plan)
-    }
-
-    fn lower_plan(&self, plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
-        match plan {
-            LogicalPlan::TableScan(ts) => Ok(PlanNode::Source {
-                name: ts.table_name.table().to_string(),
-            }),
-
-            LogicalPlan::EmptyRelation(_) => Ok(PlanNode::Source {
-                name: "<empty>".into(),
-            }),
-
-            LogicalPlan::Projection(proj) => {
-                let input = self.lower_plan(proj.input.as_ref())?;
-                let columns = proj
-                    .expr
-                    .iter()
-                    .map(|e| self.lower_expr(e))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(PlanNode::Project {
-                    input: Box::new(input),
-                    columns,
-                })
-            }
-
-            LogicalPlan::Filter(filter) => {
-                let input = self.lower_plan(filter.input.as_ref())?;
-                let predicate = self.lower_expr(&filter.predicate)?;
-                Ok(PlanNode::Filter {
-                    input: Box::new(input),
-                    predicate,
-                })
-            }
-
-            LogicalPlan::Aggregate(agg) => {
-                let input = self.lower_plan(agg.input.as_ref())?;
-                let group_by = agg
-                    .group_expr
-                    .iter()
-                    .map(|e| self.lower_expr(e))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let aggregates = agg
-                    .aggr_expr
-                    .iter()
-                    .map(|e| self.lower_aggregate_expr(e))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(PlanNode::Aggregate {
-                    input: Box::new(input),
-                    group_by,
-                    aggregates,
-                })
-            }
-
-            LogicalPlan::Union(union_plan) => {
-                let mut it = union_plan.inputs.iter();
-                let first = match it.next() {
-                    Some(p) => self.lower_plan(p)?,
-                    None => {
-                        return Err(SqlError::Resolution("Union has no inputs".into()));
-                    }
-                };
-                it.try_fold(first, |acc, next| {
-                    let right = self.lower_plan(next)?;
-                    Ok(PlanNode::Union {
-                        left: Box::new(acc),
-                        right: Box::new(right),
-                    })
-                })
-            }
-
-            // Inner/outer/cross joins.
-            LogicalPlan::Join(join) => {
-                let left = self.lower_plan(join.left.as_ref())?;
-                let right = self.lower_plan(join.right.as_ref())?;
-                let condition = self.lower_join_condition(&join.on, join.filter.as_ref())?;
-                Ok(PlanNode::Join {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    condition,
-                })
-            }
-
-            // SubqueryAlias is transparent — lower the inner plan.
-            LogicalPlan::SubqueryAlias(alias) => self.lower_plan(alias.input.as_ref()),
-
-            // Limit/Sort/Distinct are not yet supported; return a clear error.
-            other => Err(SqlError::NotYetImplemented(format!(
-                "LogicalPlan node '{}' — will be lowered in v0.12+",
-                other.display()
-            ))),
-        }
-    }
-
-    /// Build a join condition expression from equijoin key pairs and an
-    /// optional non-equijoin filter.
-    ///
-    /// Key pairs are AND-folded as `Eq(left_key, right_key)` expressions.
-    /// If no key pairs exist but a filter is present, the filter is lowered.
-    /// If both are absent (cross join), returns a constant-true literal.
-    fn lower_join_condition(
-        &self,
-        on: &[(DFExpr, DFExpr)],
-        filter: Option<&DFExpr>,
-    ) -> Result<PlanExpr, SqlError> {
-        if !on.is_empty() {
-            let mut result: Option<PlanExpr> = None;
-            for (l, r) in on {
-                let le = self.lower_expr(l)?;
-                let re = self.lower_expr(r)?;
-                let pair = PlanExpr::BinaryOp {
-                    op: BinaryOp::Eq,
-                    left: Box::new(le),
-                    right: Box::new(re),
-                };
-                result = Some(match result {
-                    None => pair,
-                    Some(acc) => PlanExpr::BinaryOp {
-                        op: BinaryOp::And,
-                        left: Box::new(acc),
-                        right: Box::new(pair),
-                    },
-                });
-            }
-            Ok(result.unwrap())
-        } else if let Some(f) = filter {
-            self.lower_expr(f)
-        } else {
-            // Cross join — condition is always-true literal `[1]`.
-            Ok(PlanExpr::Literal(vec![1u8]))
-        }
-    }
-
-    fn lower_expr(&self, expr: &DFExpr) -> Result<PlanExpr, SqlError> {
-        match expr {
-            // Column reference: full index resolution is deferred to v0.12.
-            DFExpr::Column(_col) => Ok(PlanExpr::Column(0)),
-
-            DFExpr::Literal(scalar, _) => {
-                let bytes = scalar.to_string().into_bytes();
-                Ok(PlanExpr::Literal(bytes))
-            }
-
-            DFExpr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                let l = self.lower_expr(left.as_ref())?;
-                let r = self.lower_expr(right.as_ref())?;
-                let bin_op = self.lower_operator(op)?;
-                Ok(PlanExpr::BinaryOp {
-                    op: bin_op,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                })
-            }
-
-            // Cast: preserve inner expression; type info is schema-bound in v0.12.
-            DFExpr::Cast(Cast { expr, .. }) => self.lower_expr(expr.as_ref()),
-            DFExpr::TryCast(tc) => self.lower_expr(tc.expr.as_ref()),
-
-            // CASE: lower to the else branch or first result branch.
-            DFExpr::Case(Case {
-                when_then_expr,
-                else_expr,
-                ..
-            }) => {
-                if let Some(e) = else_expr {
-                    self.lower_expr(e.as_ref())
-                } else if let Some((_, result)) = when_then_expr.first() {
-                    self.lower_expr(result.as_ref())
-                } else {
-                    Err(SqlError::NotYetImplemented("CASE with no arms".into()))
-                }
-            }
-
-            // Alias: transparent wrapper — lower the inner expression.
-            DFExpr::Alias(Alias { expr, .. }) => self.lower_expr(expr.as_ref()),
-
-            other => Err(SqlError::NotYetImplemented(format!("Expr: {other}"))),
-        }
-    }
-
-    fn lower_operator(&self, op: &DFOperator) -> Result<BinaryOp, SqlError> {
-        match op {
-            DFOperator::Eq => Ok(BinaryOp::Eq),
-            DFOperator::NotEq => Ok(BinaryOp::Ne),
-            DFOperator::Lt => Ok(BinaryOp::Lt),
-            DFOperator::LtEq => Ok(BinaryOp::Le),
-            DFOperator::Gt => Ok(BinaryOp::Gt),
-            DFOperator::GtEq => Ok(BinaryOp::Ge),
-            DFOperator::Plus => Ok(BinaryOp::Add),
-            DFOperator::Minus => Ok(BinaryOp::Sub),
-            DFOperator::Multiply => Ok(BinaryOp::Mul),
-            DFOperator::Divide => Ok(BinaryOp::Div),
-            DFOperator::And => Ok(BinaryOp::And),
-            DFOperator::Or => Ok(BinaryOp::Or),
-            other => Err(SqlError::NotYetImplemented(format!("Operator: {other:?}"))),
-        }
-    }
-
-    fn lower_aggregate_expr(&self, expr: &DFExpr) -> Result<AggregateExpr, SqlError> {
-        match expr {
-            DFExpr::AggregateFunction(DFAggFunc { func, params }) => {
-                let name = func.name().to_lowercase();
-                let agg_func = match name.as_str() {
-                    "count" => AggregateFunc::Count,
-                    "sum" => AggregateFunc::Sum,
-                    "avg" | "mean" => AggregateFunc::Avg,
-                    "min" => AggregateFunc::Min,
-                    "max" => AggregateFunc::Max,
-                    other => {
-                        return Err(SqlError::NotYetImplemented(format!(
-                            "aggregate function '{other}'"
-                        )));
-                    }
-                };
-                let input_expr = params
-                    .args
-                    .first()
-                    .map(|e| self.lower_expr(e))
-                    .unwrap_or(Ok(PlanExpr::Column(0)))?;
-                Ok(AggregateExpr {
-                    func: agg_func,
-                    input: input_expr,
-                    distinct: params.distinct,
-                })
-            }
-
-            // Alias wrapping an aggregate (common after projection pushdown).
-            DFExpr::Alias(Alias { expr, .. }) => self.lower_aggregate_expr(expr.as_ref()),
-
-            other => Err(SqlError::NotYetImplemented(format!(
-                "aggregate expression: {other}"
-            ))),
-        }
-    }
-
-    /// Parse and plan an `EXPLAIN TRANSACTION` query.
-    ///
-    /// If the SQL starts with `EXPLAIN TRANSACTION`, it parses the query, collects its `LawSchemaMetadata`,
-    /// and formats the `ExplainTransaction` output showing write-classification fields.
-    pub fn explain_transaction(&self, sql: &str) -> Result<String, SqlError> {
-        let trimmed = sql.trim();
-        if !trimmed
-            .to_ascii_lowercase()
-            .starts_with("explain transaction")
-        {
-            return Err(SqlError::Parse(
-                "Not an EXPLAIN TRANSACTION statement".into(),
-            ));
-        }
-        let inner_sql = trimmed["explain transaction".len()..].trim();
-
-        // Let's parse the statement
-        let stmts = self.parse_statement(inner_sql)?;
-        if stmts.is_empty() {
-            return Err(SqlError::Parse(
-                "Empty statement in EXPLAIN TRANSACTION".into(),
-            ));
-        }
-
-        // Collect LawSchemaMetadata from the schema/connectors involved
-        let mut meta = rockstream_types::connector::LawSchemaMetadata::empty();
-        let connector_name = if inner_sql.to_ascii_lowercase().contains("orders") {
-            "kafka_orders"
-        } else if inner_sql.to_ascii_lowercase().contains("events") {
-            "s3_events"
-        } else {
-            "connector_generic"
-        };
-
-        if connector_name == "kafka_orders" {
-            meta = meta.with_column(
-                "amount",
-                rockstream_types::merge_law::MergeLawId(1), // WeightAdd/v1
-                "COUNTER",
-                rockstream_types::connector::WriteClassification::BlindDelta,
-            );
-        } else if connector_name == "s3_events" {
-            meta = meta.with_column(
-                "event_count",
-                rockstream_types::merge_law::MergeLawId(1),
-                "COUNTER",
-                rockstream_types::connector::WriteClassification::BlindDelta,
-            );
-        } else {
-            meta = meta.with_column(
-                "value",
-                rockstream_types::merge_law::MergeLawId(1),
-                "COUNTER",
-                rockstream_types::connector::WriteClassification::ReadDependentDelta,
-            );
-        }
-
-        let explain = rockstream_types::connector::ExplainTransaction::from_schema_metadata(
-            connector_name,
-            true, // partition filter support
-            &meta,
-        );
-
-        Ok(explain.format_lines().join("\n"))
     }
 }
 
@@ -487,11 +125,14 @@ mod lowering_tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
-    use datafusion::logical_expr::{col, table_scan, LogicalPlanBuilder};
+    use datafusion::logical_expr::{
+        col, table_scan, Expr as DFExpr, LogicalPlan, LogicalPlanBuilder,
+    };
     use datafusion::prelude::lit;
     use rockstream_diff::DiffCtx;
     use rockstream_plan::{
-        AggregateExpr, AggregateFunc, Expr as PlanExpr, NotMergeSafeReason, OpKind, OpNode,
+        AggregateExpr, AggregateFunc, BinaryOp, Expr as PlanExpr, NotMergeSafeReason, OpKind,
+        OpNode, PlanNode,
     };
     use rockstream_types::laws::max_register::MAX_REGISTER_ID;
     use rockstream_types::laws::min_register::MIN_REGISTER_ID;
@@ -758,12 +399,6 @@ mod lowering_tests {
 
     // --- "identical physical plans" proof (the v0.11 proof criterion) ---
 
-    /// Proof: SQL-lowered and hand-built PlanIR produce identical physical
-    /// plans (operator kinds + law annotations) for the Phase 1 operators.
-    ///
-    /// This is the core v0.11 proof criterion from ROADMAP.md:
-    /// "SQL and hard-coded PlanIR produce identical physical plans for the
-    ///  Phase 1 operators".
     #[test]
     fn sql_plan_matches_hand_built_aggregate_sum_phase1_proof() {
         // Build via DataFusion LogicalPlanBuilder
@@ -903,7 +538,6 @@ mod lowering_tests {
 
         let f = SqlFrontend::new();
 
-        // Type alias avoids clippy::type_complexity lint.
         type AggCase = (
             &'static str,
             fn() -> DFExpr,
@@ -962,33 +596,22 @@ mod lowering_tests {
 // SQL Alpha soak tests (v0.18 proof)
 // ---------------------------------------------------------------------------
 
-/// SQL Alpha soak: correctness pass and divergence fuzzer.
-///
-/// This module is the proof artifact for v0.18 ("SQL Alpha soak"). It covers:
-/// - Inner join lowering (new in v0.18)
-/// - Cross join lowering
-/// - Union / set-op correctness (UNION ALL, UNION)
-/// - DDL parse (CREATE VIEW, CREATE MATERIALIZED VIEW)
-/// - Correctness soak across all Phase 1 operators combined
-/// - **Deterministic fuzzer**: generates N random PlanNode trees with seeded
-///   RNG and verifies that every aggregate has a law annotation and that the
-///   explain output is fully consistent (no divergence). Designed to run for
-///   extended periods; in CI the seed count is bounded but the harness is the
-///   same one used for one-hour soak runs.
 #[cfg(test)]
 mod soak_tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
-    use datafusion::logical_expr::{col, table_scan, JoinType, LogicalPlanBuilder};
+    use datafusion::logical_expr::{
+        col, table_scan, Expr as DFExpr, JoinType, LogicalPlan, LogicalPlanBuilder,
+    };
     use datafusion::prelude::lit;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
     use rockstream_diff::DiffCtx;
-    use rockstream_plan::{AggregateExpr, AggregateFunc, Expr as PlanExpr, OpKind, PlanNode};
+    use rockstream_plan::{
+        AggregateExpr, AggregateFunc, BinaryOp, Expr as PlanExpr, OpKind, PlanNode,
+    };
     use rockstream_runtime::explain::explain_plan;
-
-    // ── Helpers ─────────────────────────────────────────────────────────────
 
     fn orders_scan() -> LogicalPlan {
         let schema = Schema::new(vec![
@@ -1014,8 +637,6 @@ mod soak_tests {
             .expect("build")
     }
 
-    /// Assert that the lowered plan contains exactly the expected operator
-    /// kinds in topological order (sources first).
     fn assert_op_kinds(plan: &PlanNode, expected: &[&str]) {
         let mut ctx = DiffCtx::new();
         let ops = ctx.differentiate(plan);
@@ -1042,9 +663,6 @@ mod soak_tests {
         assert_eq!(got, expected, "operator kind sequence mismatch");
     }
 
-    // ── Join lowering tests (v0.18 new) ──────────────────────────────────────
-
-    /// Proof: `JOIN orders ON product_id = id` lowers to `PlanNode::Join`.
     #[test]
     fn lower_inner_join_produces_join_node() {
         let orders = orders_scan();
@@ -1069,8 +687,6 @@ mod soak_tests {
         assert_op_kinds(&lowered, &["Source", "Source", "Join"]);
     }
 
-    /// Proof: cross join (no condition) lowers to `PlanNode::Join` with a
-    /// constant-true literal condition.
     #[test]
     fn lower_cross_join_produces_join_with_true_condition() {
         let orders = orders_scan();
@@ -1087,7 +703,6 @@ mod soak_tests {
             matches!(lowered, PlanNode::Join { .. }),
             "cross join must lower to PlanNode::Join; got {lowered:?}"
         );
-        // Condition must be the always-true literal [1].
         if let PlanNode::Join { condition, .. } = &lowered {
             assert_eq!(
                 *condition,
@@ -1097,7 +712,6 @@ mod soak_tests {
         }
     }
 
-    /// Proof: aggregate over an inner join produces Source→Source→Join→Aggregate.
     #[test]
     fn lower_aggregate_over_join_produces_correct_structure() {
         let orders = orders_scan();
@@ -1123,9 +737,6 @@ mod soak_tests {
         assert_op_kinds(&lowered, &["Source", "Source", "Join", "Aggregate"]);
     }
 
-    // ── Union / set-op correctness ────────────────────────────────────────────
-
-    /// Proof: UNION ALL of two table scans lowers to PlanNode::Union.
     #[test]
     fn lower_union_produces_union_node() {
         let a = orders_scan();
@@ -1144,7 +755,6 @@ mod soak_tests {
         );
     }
 
-    /// Proof: three-way UNION folds pairwise into Union(Union(A,B),C).
     #[test]
     fn lower_three_way_union_folds_pairwise() {
         let a = orders_scan();
@@ -1163,9 +773,6 @@ mod soak_tests {
         assert_op_kinds(&lowered, &["Source", "Source", "Union", "Source", "Union"]);
     }
 
-    // ── DDL parse correctness ─────────────────────────────────────────────────
-
-    /// Proof: CREATE VIEW parses without error.
     #[test]
     fn ddl_create_view_parses() {
         let f = SqlFrontend::new();
@@ -1179,7 +786,6 @@ mod soak_tests {
         assert_eq!(stmts.len(), 1, "CREATE VIEW must produce one statement");
     }
 
-    /// Proof: CREATE MATERIALIZED VIEW parses without error.
     #[test]
     fn ddl_create_materialized_view_parses() {
         let f = SqlFrontend::new();
@@ -1197,7 +803,6 @@ mod soak_tests {
         );
     }
 
-    /// Proof: multiple DDL statements in one batch parse correctly.
     #[test]
     fn ddl_multiple_statements_parse() {
         let f = SqlFrontend::new();
@@ -1210,10 +815,6 @@ mod soak_tests {
         assert_eq!(stmts.len(), 2, "two statements must parse as two items");
     }
 
-    // ── Explain integration ───────────────────────────────────────────────────
-
-    /// Proof: explain output for a join plan includes Join, Source×2, and is
-    /// non-empty.
     #[test]
     fn explain_join_plan_contains_join_row() {
         let orders = orders_scan();
@@ -1243,8 +844,6 @@ mod soak_tests {
         );
     }
 
-    /// Proof: filter → join → aggregate produces an explain with all four
-    /// operator kinds and the aggregate has a law annotation.
     #[test]
     fn explain_filter_join_aggregate_has_all_rows_and_law() {
         let orders = orders_scan();
@@ -1281,12 +880,6 @@ mod soak_tests {
         );
     }
 
-    // ── All-operator correctness soak ──────────────────────────────────────────
-
-    /// Soak: runs the full Phase 1 operator set (Source, Filter, Project,
-    /// Aggregate×5, Join, Union) through lowering and explain. Every operator
-    /// kind must appear in the output and all aggregates must have law
-    /// annotations.
     #[test]
     fn sql_alpha_soak_all_phase1_operators() {
         type Case = (&'static str, fn() -> LogicalPlan);
@@ -1445,14 +1038,12 @@ mod soak_tests {
                 .lower(&df_plan)
                 .unwrap_or_else(|e| panic!("{label}: lowering failed: {e}"));
 
-            // All operators must appear in explain output.
             let rows = explain_plan(&lowered);
             assert!(
                 !rows.is_empty(),
                 "{label}: explain must produce at least one row"
             );
 
-            // Every aggregate must have a law annotation.
             let mut ctx = DiffCtx::new();
             let ops = ctx.differentiate(&lowered);
             for op in &ops {
@@ -1469,16 +1060,7 @@ mod soak_tests {
         }
     }
 
-    // ── SQL Alpha fuzzer: no-divergence proof ─────────────────────────────────
-
-    /// Build a random `PlanNode` tree from a seeded RNG.
-    ///
-    /// This is the plan generator used by the SQL Alpha fuzzer.  It builds
-    /// a depth-bounded tree of the Phase 1 operators so that the fuzzer is
-    /// fast enough to run many iterations in CI while still covering every
-    /// operator combination.
     fn random_plan(rng: &mut SmallRng) -> PlanNode {
-        // Random source name drawn from a small alphabet.
         let source_names = ["t0", "t1", "t2", "orders", "products", "events"];
         let source_idx = rng.gen_range(0..source_names.len());
         let root = PlanNode::Source {
@@ -1491,7 +1073,6 @@ mod soak_tests {
         if depth >= 4 {
             return node;
         }
-        // Each step randomly picks one of the Phase 1 operators.
         match rng.gen_range(0u32..7) {
             0 => PlanNode::Filter {
                 input: Box::new(node),
@@ -1529,7 +1110,6 @@ mod soak_tests {
                 }
             }
             4 => {
-                // Union with a fresh source on the right.
                 let source_names = ["t0", "t1", "t2", "orders", "products"];
                 let idx = rng.gen_range(0..source_names.len());
                 let right = PlanNode::Source {
@@ -1541,7 +1121,6 @@ mod soak_tests {
                 }
             }
             5 => {
-                // Join with a fresh source on the right.
                 let source_names = ["t0", "t1", "orders", "products"];
                 let idx = rng.gen_range(0..source_names.len());
                 let right = PlanNode::Source {
@@ -1557,29 +1136,12 @@ mod soak_tests {
                     },
                 }
             }
-            // 6: recurse deeper (apply extend_plan to the same node type again).
             _ => extend_plan(rng, node, depth + 1),
         }
     }
 
-    /// **SQL Alpha fuzzer** — one-hour soak harness running N random PlanNode
-    /// trees through `DiffCtx::differentiate` and `explain_plan`.
-    ///
-    /// Proof criterion (v0.18): "One-hour fuzzer finds no divergence."
-    ///
-    /// In CI this runs `SOAK_ITERATIONS` iterations with a deterministic seed
-    /// so it is fast and reproducible. The same harness can be run for a full
-    /// hour by increasing `SOAK_ITERATIONS` (or removing the cap entirely).
-    ///
-    /// "No divergence" means:
-    /// - Lowering never panics.
-    /// - Every aggregate op has a merge_law or not_merge_safe_reason.
-    /// - Explain output is non-empty and consistent with DiffCtx output.
-    /// - Re-running the same seed produces byte-for-byte identical results.
     #[test]
     fn sql_alpha_fuzzer_no_divergence() {
-        // Deterministic seed — changing this seed changes the plan sequence but
-        // must never cause a failure if the implementation is correct.
         const SEED: u64 = 0x5EED_1850_ADEF_0018_u64;
         const SOAK_ITERATIONS: usize = 256;
 
@@ -1588,7 +1150,6 @@ mod soak_tests {
         for iter in 0..SOAK_ITERATIONS {
             let plan = random_plan(&mut rng);
 
-            // DiffCtx must not panic and must annotate every aggregate.
             let mut ctx = DiffCtx::new();
             let ops = ctx.differentiate(&plan);
             assert!(
@@ -1607,7 +1168,6 @@ mod soak_tests {
                 }
             }
 
-            // Explain must produce a non-empty, consistent output.
             let rows = explain_plan(&plan);
             assert!(
                 !rows.is_empty(),
@@ -1619,7 +1179,6 @@ mod soak_tests {
                 "iter {iter}: explain row count must match differentiate op count"
             );
 
-            // Re-run with same plan — must produce identical output (no divergence).
             let mut ctx2 = DiffCtx::new();
             let ops2 = ctx2.differentiate(&plan);
             assert_eq!(
@@ -1644,8 +1203,6 @@ mod soak_tests {
         }
     }
 
-    /// **Seed stability**: running the fuzzer with `SEED` twice produces the
-    /// same sequence of plans (byte-for-byte RNG reproducibility).
     #[test]
     fn sql_alpha_fuzzer_seed_stability() {
         const SEED: u64 = 0x5EED_1850_ADEF_0018_u64;

@@ -342,7 +342,31 @@ pub fn catalog_dead_letter_queue(source_name: &str) -> Vec<CatalogDeadLetterEntr
     }
 }
 
-// ── Alias resolution ──────────────────────────────────────────────────────────
+static DEPRECATION_NOTICES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+pub fn get_deprecation_notices() -> Vec<String> {
+    DEPRECATION_NOTICES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+pub fn clear_deprecation_notices() {
+    DEPRECATION_NOTICES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .clear();
+}
+
+pub fn emit_deprecation_notice(msg: &str) {
+    DEPRECATION_NOTICES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(msg.to_string());
+}
 
 /// Resolve the historical `rockstream.*` schema prefix to
 /// `rockstream_catalog.*`.
@@ -356,6 +380,9 @@ pub fn catalog_dead_letter_queue(source_name: &str) -> Vec<CatalogDeadLetterEntr
 /// prefix is the legacy `"rockstream"`, otherwise returns the input unchanged.
 pub fn resolve_catalog_alias(schema_prefix: &str) -> &'static str {
     if schema_prefix == "rockstream" {
+        emit_deprecation_notice(
+            "NOTICE: rockstream.* prefix is deprecated; use rockstream_catalog.* instead",
+        );
         "rockstream_catalog"
     } else {
         // SAFETY: caller-provided string; we return a well-known static string
@@ -371,6 +398,9 @@ pub fn resolve_catalog_alias(schema_prefix: &str) -> &'static str {
 /// `rockstream.table` alias.
 pub fn resolve_catalog_table(schema: &str, table: &str) -> String {
     let canonical_schema = if schema == "rockstream" {
+        emit_deprecation_notice(
+            "NOTICE: rockstream.* prefix is deprecated; use rockstream_catalog.* instead",
+        );
         "rockstream_catalog"
     } else {
         schema
@@ -570,5 +600,23 @@ mod tests {
         assert_eq!(rows[0].source_name, "kafka_orders");
         assert_eq!(rows[0].error_code, "RS-1003");
         assert_eq!(rows[0].replay_attempt, 0);
+    }
+
+    #[test]
+    fn proof_deprecation_notice_emitted_for_legacy_alias() {
+        clear_deprecation_notices();
+        let _ = resolve_catalog_alias("rockstream");
+        let notices = get_deprecation_notices();
+        assert!(!notices.is_empty(), "must emit notice on alias");
+        assert!(
+            notices[0].contains("deprecated"),
+            "must contain warning about deprecation"
+        );
+
+        clear_deprecation_notices();
+        let _ = resolve_catalog_table("rockstream", "pipelines");
+        let notices2 = get_deprecation_notices();
+        assert!(!notices2.is_empty());
+        assert!(notices2[0].contains("deprecated"));
     }
 }

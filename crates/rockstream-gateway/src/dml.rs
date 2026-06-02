@@ -35,6 +35,7 @@
 //!   oracle divergence — `proof_fuzzer_concurrent_abort_no_oracle_divergence`.
 
 use crate::error::GatewayError;
+use rockstream_types::connector::{LawSchemaMetadata, WriteClassification};
 
 // ── DML statement types ───────────────────────────────────────────────────────
 
@@ -260,6 +261,46 @@ impl OptimisticTransaction {
     /// Configure whether this write targets a non-idempotent law (v0.44).
     pub fn set_non_idempotent(&mut self, val: bool) {
         self.is_non_idempotent = val;
+    }
+
+    /// Validate the transaction against the write classifications in the schema metadata.
+    /// Returns true if a read-validation round-trip was triggered (read check),
+    /// or false if it was skipped (blind delta).
+    pub fn validate(
+        &mut self,
+        schema_metadata: &LawSchemaMetadata,
+        read_round_trips: &mut usize,
+    ) -> bool {
+        let mut has_read_dependent = false;
+        let mut has_blind = false;
+
+        for col_meta in schema_metadata.columns.values() {
+            match col_meta.write_classification {
+                WriteClassification::ReadDependentDelta => {
+                    has_read_dependent = true;
+                }
+                WriteClassification::BlindDelta => {
+                    has_blind = true;
+                }
+                _ => {}
+            }
+        }
+
+        if has_read_dependent {
+            self.read_dependent = true;
+            *read_round_trips += 1;
+            true
+        } else if has_blind {
+            self.read_dependent = false;
+            false
+        } else {
+            if self.read_dependent {
+                *read_round_trips += 1;
+                true
+            } else {
+                false
+            }
+        }
     }
 
     /// Simulate executing a DML statement and buffering the write.
@@ -1202,5 +1243,36 @@ mod tests {
             total_unique_increments,
             "exactly 100,000 unique increments must land out of 1M attempts across shards and restarts"
         );
+    }
+
+    #[test]
+    fn proof_write_classification_validate() {
+        use rockstream_types::merge_law::MergeLawId;
+
+        let blind_meta = LawSchemaMetadata::empty().with_column(
+            "amount",
+            MergeLawId(1),
+            "COUNTER",
+            WriteClassification::BlindDelta,
+        );
+
+        let read_meta = LawSchemaMetadata::empty().with_column(
+            "amount",
+            MergeLawId(1),
+            "COUNTER",
+            WriteClassification::ReadDependentDelta,
+        );
+
+        let mut tx1 = OptimisticTransaction::new(10);
+        let mut read_trips_1 = 0;
+        let is_read_1 = tx1.validate(&blind_meta, &mut read_trips_1);
+        assert!(!is_read_1);
+        assert_eq!(read_trips_1, 0);
+
+        let mut tx2 = OptimisticTransaction::new(10);
+        let mut read_trips_2 = 0;
+        let is_read_2 = tx2.validate(&read_meta, &mut read_trips_2);
+        assert!(is_read_2);
+        assert_eq!(read_trips_2, 1);
     }
 }

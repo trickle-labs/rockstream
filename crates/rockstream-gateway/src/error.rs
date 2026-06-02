@@ -73,6 +73,14 @@ pub enum GatewayError {
     /// Invalid DDL or DML statement syntax or configuration (RS-2001).
     #[error("invalid DML or DDL statement: {0}")]
     InvalidDml(String),
+
+    /// Client authentication failed.
+    #[error("client authentication failed: {0}")]
+    Unauthenticated(String),
+
+    /// Client lacks permissions for the requested action.
+    #[error("access forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl GatewayError {
@@ -90,6 +98,8 @@ impl GatewayError {
             Self::OptimisticConflict { .. } => RS_2008,
             Self::IdempotencyKeyRequired => RS_2007,
             Self::InvalidDml(_) => RS_2001,
+            Self::Unauthenticated(_) => RS_2001,
+            Self::Forbidden(_) => RS_2001,
         }
     }
 }

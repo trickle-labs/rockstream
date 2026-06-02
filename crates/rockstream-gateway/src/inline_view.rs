@@ -461,9 +461,57 @@ impl InlineViewCatalog {
                     "Unsupported ALTER SOURCE command".into(),
                 ))
             }
+        } else if sql_upper.starts_with("CREATE SECRET") {
+            let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
+            if parts.len() < 5 {
+                return Err(GatewayError::InvalidDml(
+                    "Invalid CREATE SECRET statement".into(),
+                ));
+            }
+            let name = parts[2].trim_matches(|c| c == '"' || c == '`').to_string();
+
+            let mut sec_type = "GENERIC".to_string();
+            let mut kek_ref = "kek-v1".to_string();
+            let mut val_idx = 0;
+
+            let mut i = 3;
+            while i < parts.len() {
+                let part_upper = parts[i].to_uppercase();
+                if part_upper == "TYPE" {
+                    sec_type = parts[i + 1].trim_matches('\'').to_string();
+                    i += 2;
+                } else if part_upper == "KEK" {
+                    kek_ref = parts[i + 1].trim_matches('\'').to_string();
+                    i += 2;
+                } else if part_upper == "AS" {
+                    val_idx = i + 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+
+            if val_idx == 0 || val_idx >= parts.len() {
+                return Err(GatewayError::InvalidDml(
+                    "Missing AS 'value' in CREATE SECRET".into(),
+                ));
+            }
+
+            let value = parts[val_idx..].join(" ").trim_matches('\'').to_string();
+            rockstream_types::secret::get_global_secrets()
+                .register(&name, &sec_type, &value, &kek_ref)
+                .map_err(GatewayError::InvalidDml)?;
+
+            self.audit_log.push(sql_trimmed.to_string());
+            Ok(())
         } else {
             Err(GatewayError::InvalidDml("Unsupported DDL command".into()))
         }
+    }
+
+    /// Execute a SHOW SECRETS query, returning a list of (name, type, value).
+    pub fn show_secrets(&self) -> Vec<(String, String, String)> {
+        rockstream_types::secret::get_global_secrets().list()
     }
 
     pub fn configure_dlq_warning_threshold(&mut self, source_name: &str, threshold: u32) {
@@ -897,5 +945,29 @@ mod tests {
             catalog.dead_letter_queue.is_empty(),
             "Dismiss should remove all matched records"
         );
+    }
+
+    #[test]
+    fn proof_secrets_ddl_and_masking() {
+        let mut catalog = InlineViewCatalog::new();
+        let res = catalog.execute_ddl(
+            "CREATE SECRET my_secret TYPE 'API_KEY' KEK 'kek-v1' AS 'my-secret-value'",
+        );
+        assert!(res.is_ok());
+
+        // SHOW SECRETS (show_secrets) never exposes values
+        let secrets = catalog.show_secrets();
+        let entry = secrets
+            .iter()
+            .find(|(name, _, _)| name == "my_secret")
+            .unwrap();
+        assert_eq!(entry.1, "API_KEY");
+        assert_eq!(entry.2, "[MASKED]");
+
+        // Secrets are encrypted at rest but can be decrypted
+        let decrypted = rockstream_types::secret::get_global_secrets()
+            .get_decrypted("my_secret")
+            .unwrap();
+        assert_eq!(decrypted, "my-secret-value");
     }
 }
