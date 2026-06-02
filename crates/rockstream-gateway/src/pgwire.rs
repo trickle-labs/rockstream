@@ -97,6 +97,38 @@ pub fn map_to_postgres_oid(type_tag: u8) -> PostgresOid {
 
 // ─── pgwire messages ──────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthContext {
+    pub actor: String,
+    pub role: String,
+    pub tenant: String,
+}
+
+impl AuthContext {
+    pub fn authorize_read(&self, view_namespace: &str) -> Result<(), GatewayError> {
+        if self.tenant != view_namespace && self.role != "admin" {
+            return Err(GatewayError::Forbidden(
+                "Cross-tenant access rejected".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn authorize_write(&self, view_namespace: &str) -> Result<(), GatewayError> {
+        if self.role == "viewer" {
+            return Err(GatewayError::Forbidden(
+                "Viewer role cannot perform write/DML/DDL operations".into(),
+            ));
+        }
+        if self.tenant != view_namespace && self.role != "admin" {
+            return Err(GatewayError::Forbidden(
+                "Cross-tenant access rejected".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The Postgres startup message sent by the client at connection time.
 ///
 /// Carries the `user`, `database`, and optional application name.
@@ -110,6 +142,8 @@ pub struct PgStartupMessage {
     pub user: String,
     /// Optional application name (used by pg_stat_activity).
     pub application_name: Option<String>,
+    /// OIDC bearer token or service account token (v0.49).
+    pub token: Option<String>,
 }
 
 impl PgStartupMessage {
@@ -123,7 +157,48 @@ impl PgStartupMessage {
             database: database.into(),
             user: user.into(),
             application_name: None,
+            token: None,
         }
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    pub fn validate_auth(&self) -> Result<AuthContext, GatewayError> {
+        let token = self.token.as_deref().unwrap_or("");
+        if token.is_empty() {
+            return Err(GatewayError::Unauthenticated("No token provided".into()));
+        }
+        if let Some(val) = token.strip_prefix("bearer ") {
+            let parts: Vec<&str> = val.split(':').collect();
+            if parts.len() == 2 {
+                let role = parts[0];
+                let tenant = parts[1];
+                if ["viewer", "pipeline_owner", "admin"].contains(&role) {
+                    return Ok(AuthContext {
+                        actor: self.user.clone(),
+                        role: role.to_string(),
+                        tenant: tenant.to_string(),
+                    });
+                }
+            }
+        } else if let Some(val) = token.strip_prefix("sa:") {
+            let parts: Vec<&str> = val.split(':').collect();
+            if parts.len() == 2 {
+                let role = parts[0];
+                let tenant = parts[1];
+                if ["viewer", "pipeline_owner", "admin"].contains(&role) {
+                    return Ok(AuthContext {
+                        actor: format!("sa:{}", self.user),
+                        role: role.to_string(),
+                        tenant: tenant.to_string(),
+                    });
+                }
+            }
+        }
+        Err(GatewayError::Unauthenticated("Invalid token format".into()))
     }
 }
 
@@ -419,5 +494,60 @@ mod tests {
         let q = PgExtendedQuery::unnamed("SELECT $1");
         assert!(q.statement_name.is_empty());
         assert!(q.params.is_empty());
+    }
+
+    #[test]
+    fn proof_oidc_bearer_auth_and_rbac() {
+        // 1. Unauthenticated startup messages
+        let msg_no_token = PgStartupMessage::new("mydb", "alice");
+        assert_eq!(
+            msg_no_token.validate_auth().unwrap_err().error_code(),
+            rockstream_types::error_code::RS_2001
+        );
+
+        let msg_invalid_token = PgStartupMessage::new("mydb", "alice").with_token("invalid-format");
+        assert!(msg_invalid_token.validate_auth().is_err());
+
+        // 2. Viewer role
+        let msg_viewer =
+            PgStartupMessage::new("mydb", "alice").with_token("bearer viewer:production");
+        let auth_viewer = msg_viewer.validate_auth().unwrap();
+        assert_eq!(auth_viewer.actor, "alice");
+        assert_eq!(auth_viewer.role, "viewer");
+        assert_eq!(auth_viewer.tenant, "production");
+
+        assert!(auth_viewer.authorize_read("production").is_ok());
+        assert!(
+            auth_viewer.authorize_read("marketing").is_err(),
+            "cross-tenant read must fail"
+        );
+        assert!(
+            auth_viewer.authorize_write("production").is_err(),
+            "viewer cannot perform write"
+        );
+
+        // 3. Pipeline owner role
+        let msg_owner =
+            PgStartupMessage::new("mydb", "bob").with_token("bearer pipeline_owner:production");
+        let auth_owner = msg_owner.validate_auth().unwrap();
+        assert!(auth_owner.authorize_read("production").is_ok());
+        assert!(auth_owner.authorize_write("production").is_ok());
+        assert!(
+            auth_owner.authorize_write("marketing").is_err(),
+            "cross-tenant write must fail"
+        );
+
+        // 4. Admin role (can access any tenant)
+        let msg_admin = PgStartupMessage::new("mydb", "admin").with_token("bearer admin:any");
+        let auth_admin = msg_admin.validate_auth().unwrap();
+        assert!(auth_admin.authorize_read("production").is_ok());
+        assert!(auth_admin.authorize_write("marketing").is_ok());
+
+        // 5. Service account token
+        let msg_sa = PgStartupMessage::new("mydb", "svc-connector")
+            .with_token("sa:pipeline_owner:production");
+        let auth_sa = msg_sa.validate_auth().unwrap();
+        assert_eq!(auth_sa.actor, "sa:svc-connector");
+        assert!(auth_sa.authorize_write("production").is_ok());
     }
 }

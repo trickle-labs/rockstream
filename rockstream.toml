@@ -1,0 +1,14 @@
+# RockStream Configuration (v0.49)
+
+[cluster]
+min_epoch_ms = 10
+checkpoint_retention_count = 128
+state_budget_gb = 10
+
+[worker]
+segment_cache_bytes = 536870912 # 512 MB
+max_rows_per_quantum = 1000
+
+[connector]
+dlq_warn_threshold = 100
+dlq_retention_days = 7

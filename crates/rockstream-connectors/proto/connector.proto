@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package rockstream.connector;
+
+service ConnectorService {
+  rpc PollBatch(PollBatchRequest) returns (PollBatchResponse);
+  rpc DiscoverSchema(DiscoverSchemaRequest) returns (DiscoverSchemaResponse);
+  rpc Lifecycle(LifecycleRequest) returns (LifecycleResponse);
+}
+
+message PollBatchRequest {
+  uint64 epoch = 1;
+}
+
+message PollBatchResponse {
+  uint64 record_count = 1;
+  uint64 epoch = 2;
+  string offset = 3;
+  uint64 watermark = 4;
+}
+
+message DiscoverSchemaRequest {}
+
+message DiscoverSchemaResponse {
+  map<string, ColumnMetadata> columns = 1;
+}
+
+message ColumnMetadata {
+  uint32 law_id = 1;
+  string crdt_type = 2;
+  string write_classification = 3;
+}
+
+message LifecycleRequest {
+  string action = 1; // pause, resume, delete, get_state
+}
+
+message LifecycleResponse {
+  bool success = 1;
+  string state = 2; // running, paused, deleted
+}

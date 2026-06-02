@@ -7,6 +7,7 @@
 pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
+pub mod config;
 pub mod connector;
 pub mod dlq;
 pub mod error_code;
@@ -19,6 +20,7 @@ pub mod lease;
 pub mod merge_law;
 pub mod metrics;
 pub mod schema_evolution;
+pub mod secret;
 pub mod state_budget;
 pub mod topology;
 pub mod view_lifecycle;

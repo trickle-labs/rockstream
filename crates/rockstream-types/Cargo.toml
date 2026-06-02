@@ -9,6 +9,7 @@ description = "Shared types for RockStream (timestamps, frontiers, Z-set rows, s
 [dependencies]
 arrow = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
