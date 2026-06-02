@@ -15,8 +15,10 @@ ERRORS=0
 
 # Extract versions marked Done from roadmap version table rows.
 # Rows look like: | v0.1 | ✅ Done | ...
+# We only extract the version from the first column to avoid false matches
+# on version numbers mentioned inside the row description text.
 done_versions=$(grep -E '^\| v[0-9]+\.[0-9]+ \|.*Done' "$ROADMAP" \
-  | grep -oE 'v[0-9]+\.[0-9]+' || true)
+  | sed 's/^| \(v[0-9]*\.[0-9]*\) |.*/\1/' || true)
 
 if [ -z "$done_versions" ]; then
   echo "No versions marked Done in ROADMAP.md."
