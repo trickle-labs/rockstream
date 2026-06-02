@@ -21,7 +21,6 @@ impl LawRegistry {
         Self::default()
     }
 
-    /// Create a registry pre-populated with all built-in laws.
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(super::WeightAddV1));
@@ -32,6 +31,8 @@ impl LawRegistry {
         reg.register(Arc::new(super::BloomUnionV1));
         reg.register(Arc::new(super::PNCounterV1));
         reg.register(Arc::new(super::LWWRegisterV1));
+        reg.register(Arc::new(super::OrSetV1));
+        reg.register(Arc::new(super::MVRegisterV1));
         reg
     }
 
@@ -88,7 +89,7 @@ mod tests {
     #[test]
     fn registry_with_builtins() {
         let reg = LawRegistry::with_builtins();
-        assert_eq!(reg.len(), 8);
+        assert_eq!(reg.len(), 10);
         assert!(reg.contains(WEIGHT_ADD_ID));
         assert!(reg.contains(crate::laws::sum_count::SUM_COUNT_ID));
         assert!(reg.contains(crate::laws::max_register::MAX_REGISTER_ID));
@@ -97,6 +98,8 @@ mod tests {
         assert!(reg.contains(crate::laws::bloom_union::BLOOM_UNION_ID));
         assert!(reg.contains(crate::laws::pn_counter::PN_COUNTER_ID));
         assert!(reg.contains(crate::laws::lww_register::LWW_REGISTER_ID));
+        assert!(reg.contains(crate::laws::or_set::OR_SET_ID));
+        assert!(reg.contains(crate::laws::mv_register::MV_REGISTER_ID));
     }
 
     #[test]
@@ -114,13 +117,17 @@ mod tests {
         assert_eq!(hll_law.name(), "HyperLogLog");
         let bloom_law = reg.get(crate::laws::bloom_union::BLOOM_UNION_ID).unwrap();
         assert_eq!(bloom_law.name(), "BloomUnion");
+        let or_law = reg.get(crate::laws::or_set::OR_SET_ID).unwrap();
+        assert_eq!(or_law.name(), "OrSet");
+        let mv_law = reg.get(crate::laws::mv_register::MV_REGISTER_ID).unwrap();
+        assert_eq!(mv_law.name(), "MVRegister");
     }
 
     #[test]
     fn descriptors_lists_all() {
         let reg = LawRegistry::with_builtins();
         let descs = reg.descriptors();
-        assert_eq!(descs.len(), 8);
+        assert_eq!(descs.len(), 10);
         let names: std::collections::HashSet<_> = descs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains("WeightAdd"));
         assert!(names.contains("SumCount"));
@@ -130,6 +137,8 @@ mod tests {
         assert!(names.contains("BloomUnion"));
         assert!(names.contains("PNCounter"));
         assert!(names.contains("LWWRegister"));
+        assert!(names.contains("OrSet"));
+        assert!(names.contains("MVRegister"));
     }
 
     #[test]
