@@ -895,7 +895,6 @@ mod tests {
             tag: t,
         };
         let initial_pairs = vec![pair(1, 100), pair(2, 200), pair(3, 300), pair(4, 400)];
-        let initial_payload = encode_or_set(&initial_pairs);
 
         // 2. Simulate shard split: divide elements into two new shards (even and odd element_ids).
         let shard1_pairs: Vec<OrSetPair> = initial_pairs
