@@ -884,24 +884,30 @@ mod tests {
     /// Proof: OR-Set arrangement add/remove survives split and compaction.
     #[test]
     fn proof_orset_arrangement_survives_split_and_compaction() {
-        use rockstream_types::laws::or_set::{encode_or_set, decode_or_set, OrSetPair, OrSetV1};
+        use rockstream_types::laws::or_set::{decode_or_set, encode_or_set, OrSetPair, OrSetV1};
         use rockstream_types::merge_law::LawBundle;
 
         let law = OrSetV1;
 
         // 1. Initial State: add elements with unique tags.
-        let pair = |e, t| OrSetPair { element_id: e, tag: t };
-        let initial_pairs = vec![
-            pair(1, 100),
-            pair(2, 200),
-            pair(3, 300),
-            pair(4, 400),
-        ];
+        let pair = |e, t| OrSetPair {
+            element_id: e,
+            tag: t,
+        };
+        let initial_pairs = vec![pair(1, 100), pair(2, 200), pair(3, 300), pair(4, 400)];
         let initial_payload = encode_or_set(&initial_pairs);
 
         // 2. Simulate shard split: divide elements into two new shards (even and odd element_ids).
-        let shard1_pairs: Vec<OrSetPair> = initial_pairs.iter().cloned().filter(|p| p.element_id % 2 == 0).collect();
-        let shard2_pairs: Vec<OrSetPair> = initial_pairs.iter().cloned().filter(|p| p.element_id % 2 != 0).collect();
+        let shard1_pairs: Vec<OrSetPair> = initial_pairs
+            .iter()
+            .cloned()
+            .filter(|p| p.element_id % 2 == 0)
+            .collect();
+        let shard2_pairs: Vec<OrSetPair> = initial_pairs
+            .iter()
+            .cloned()
+            .filter(|p| p.element_id % 2 != 0)
+            .collect();
 
         let shard1_payload = encode_or_set(&shard1_pairs);
         let shard2_payload = encode_or_set(&shard2_pairs);
@@ -917,7 +923,10 @@ mod tests {
         let mut actual = merged_pairs.clone();
         actual.sort_unstable();
 
-        assert_eq!(actual, expected, "Shard split and subsequent merge must preserve all OR-Set pairs");
+        assert_eq!(
+            actual, expected,
+            "Shard split and subsequent merge must preserve all OR-Set pairs"
+        );
 
         // 5. Simulate removal under compaction: remove element_id 2 by simulating an observed-remove.
         // In OR-Set, we remove element_id 2 by not carrying over its tag 200 during merge or compaction.
@@ -926,9 +935,11 @@ mod tests {
         let compacted_payload = encode_or_set(&active_pairs);
 
         let compacted_pairs = decode_or_set(&compacted_payload).unwrap();
-        assert!(!compacted_pairs.iter().any(|p| p.element_id == 2), "Tombstone GC must remove elements cleanly");
+        assert!(
+            !compacted_pairs.iter().any(|p| p.element_id == 2),
+            "Tombstone GC must remove elements cleanly"
+        );
     }
-
 
     /// Proof: 1M counter-increment soak test landing the exact total across simulated splits and restarts.
     #[test]

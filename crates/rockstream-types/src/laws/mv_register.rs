@@ -151,7 +151,10 @@ mod tests {
     use super::*;
 
     fn pair(ts: u64, val: i64) -> MVRegisterPair {
-        MVRegisterPair { timestamp: ts, value: val }
+        MVRegisterPair {
+            timestamp: ts,
+            value: val,
+        }
     }
 
     #[test]
