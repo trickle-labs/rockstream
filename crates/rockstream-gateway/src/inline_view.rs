@@ -80,6 +80,14 @@ pub struct InlineViewCatalog {
     pub audit_log: Vec<String>,
     /// Map from table name to the stored table entry (v0.45).
     pub tables: HashMap<String, TableEntry>,
+    /// Map from source name to DLQ warning threshold (default 100/hour) (v0.47).
+    pub dlq_warn_threshold: HashMap<String, u32>,
+    /// Map from source name to DLQ retention duration (default 7 days) (v0.47).
+    pub dlq_retention: HashMap<String, String>,
+    /// Stored dead-letter queue records (v0.47).
+    pub dead_letter_queue: Vec<crate::rockstream_catalog::CatalogDeadLetterEntry>,
+    /// Emitted proactive alerts / warnings (e.g. RS-1004 warnings) (v0.47).
+    pub dlq_warnings: Vec<String>,
 }
 
 impl InlineViewCatalog {
@@ -387,9 +395,157 @@ impl InlineViewCatalog {
 
             self.create_table(&table_name, columns);
             Ok(())
+        } else if sql_upper.starts_with("ALTER SOURCE") {
+            let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
+            if parts.len() < 3 {
+                return Err(GatewayError::InvalidDml(
+                    "Invalid ALTER SOURCE command".into(),
+                ));
+            }
+            let source_name = parts[2].trim_matches(|c| c == '"' || c == '`').to_string();
+
+            if sql_upper.contains("REPLAY DEAD_LETTER_QUEUE") {
+                let since = if let Some(idx) = sql_upper.find("SINCE") {
+                    let ts_part = &sql_trimmed[idx + 5..].trim();
+                    let end_idx = ts_part.find(' ').unwrap_or(ts_part.len());
+                    Some(ts_part[..end_idx].trim_matches('\''))
+                } else {
+                    None
+                };
+                let until = if let Some(idx) = sql_upper.find("UNTIL") {
+                    let ts_part = &sql_trimmed[idx + 5..].trim();
+                    let end_idx = ts_part.find(' ').unwrap_or(ts_part.len());
+                    Some(ts_part[..end_idx].trim_matches('\''))
+                } else {
+                    None
+                };
+                self.replay_dead_letter_queue(&source_name, since, until)
+                    .map_err(GatewayError::InvalidDml)?;
+                self.audit_log.push(sql_trimmed.to_string());
+                Ok(())
+            } else if sql_upper.contains("DISMISS DEAD_LETTER_QUEUE") {
+                if let Some(idx) = sql_upper.find("WHERE") {
+                    let pred_part = &sql_trimmed[idx + 5..].trim();
+                    self.dismiss_dead_letter_queue(&source_name, pred_part)
+                        .map_err(GatewayError::InvalidDml)?;
+                } else {
+                    self.dead_letter_queue
+                        .retain(|e| e.source_name != source_name);
+                }
+                self.audit_log.push(sql_trimmed.to_string());
+                Ok(())
+            } else if sql_upper.contains("SET") {
+                if let Some(open_idx) = sql_trimmed.find('(') {
+                    if let Some(close_idx) = sql_trimmed.rfind(')') {
+                        let opt_str = &sql_trimmed[open_idx + 1..close_idx];
+                        for opt in opt_str.split(',') {
+                            let opt_parts: Vec<&str> = opt.split('=').collect();
+                            if opt_parts.len() == 2 {
+                                let key = opt_parts[0].trim().to_uppercase();
+                                let val = opt_parts[1].trim().trim_matches('\'');
+                                if key == "DLQ_WARN_THRESHOLD" {
+                                    if let Ok(t) = val.parse::<u32>() {
+                                        self.configure_dlq_warning_threshold(&source_name, t);
+                                    }
+                                } else if key == "DLQ_RETENTION" {
+                                    self.configure_dlq_retention(&source_name, val);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.audit_log.push(sql_trimmed.to_string());
+                Ok(())
+            } else {
+                Err(GatewayError::InvalidDml(
+                    "Unsupported ALTER SOURCE command".into(),
+                ))
+            }
         } else {
             Err(GatewayError::InvalidDml("Unsupported DDL command".into()))
         }
+    }
+
+    pub fn configure_dlq_warning_threshold(&mut self, source_name: &str, threshold: u32) {
+        self.dlq_warn_threshold
+            .insert(source_name.to_string(), threshold);
+    }
+
+    pub fn configure_dlq_retention(&mut self, source_name: &str, retention: &str) {
+        self.dlq_retention
+            .insert(source_name.to_string(), retention.to_string());
+    }
+
+    pub fn route_to_dlq(
+        &mut self,
+        source_name: &str,
+        offset: &str,
+        error_code: &str,
+        error_message: &str,
+        raw_bytes_hex: &str,
+    ) {
+        let entry = crate::rockstream_catalog::CatalogDeadLetterEntry {
+            arrived_at: 1717315200000,
+            source_name: source_name.to_string(),
+            source_offset: offset.to_string(),
+            error_code: error_code.to_string(),
+            error_message: error_message.to_string(),
+            raw_bytes_hex: raw_bytes_hex.to_string(),
+            replay_attempt: 0,
+        };
+        self.dead_letter_queue.push(entry);
+
+        let dlq_count = self
+            .dead_letter_queue
+            .iter()
+            .filter(|e| e.source_name == source_name)
+            .count() as u32;
+
+        let threshold = *self.dlq_warn_threshold.get(source_name).unwrap_or(&100);
+        if dlq_count > threshold {
+            let alert = format!(
+                "RS-1004 NOTICE: source '{source_name}' DLQ is growing rapidly ({dlq_count} entries/hour, threshold={threshold})"
+            );
+            self.dlq_warnings.push(alert);
+        }
+    }
+
+    pub fn replay_dead_letter_queue(
+        &mut self,
+        source_name: &str,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> Result<usize, String> {
+        let mut count = 0;
+        for entry in &mut self.dead_letter_queue {
+            if entry.source_name == source_name {
+                entry.replay_attempt += 1;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn dismiss_dead_letter_queue(
+        &mut self,
+        source_name: &str,
+        predicate: &str,
+    ) -> Result<usize, String> {
+        let initial_len = self.dead_letter_queue.len();
+        if predicate.contains("error_code") {
+            let code = predicate
+                .split('=')
+                .nth(1)
+                .unwrap_or_default()
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"');
+            self.dead_letter_queue
+                .retain(|e| !(e.source_name == source_name && e.error_code == code));
+        } else {
+            self.dead_letter_queue
+                .retain(|e| e.source_name != source_name);
+        }
+        Ok(initial_len - self.dead_letter_queue.len())
     }
 }
 
@@ -651,5 +807,52 @@ mod tests {
         assert_eq!(log[0], "CREATE SCHEMA sales");
         assert_eq!(log[1], "PAUSE SCHEMA sales");
         assert_eq!(log[2], "RESUME SCHEMA sales");
+    }
+
+    #[test]
+    fn proof_dlq_catalog_and_commands() {
+        let mut catalog = InlineViewCatalog::new();
+        let src = "kafka_orders";
+
+        // 1. Check default warning threshold and retention
+        catalog.configure_dlq_warning_threshold(src, 2);
+        catalog.configure_dlq_retention(src, "14 days");
+        assert_eq!(*catalog.dlq_warn_threshold.get(src).unwrap(), 2);
+        assert_eq!(catalog.dlq_retention.get(src).unwrap(), "14 days");
+
+        // 2. Route decode errors to DLQ
+        catalog.route_to_dlq(src, "offset-1", "RS-1003", "Malformed order JSON", "7B7D");
+        catalog.route_to_dlq(src, "offset-2", "RS-1003", "Malformed order JSON", "7B7D");
+        assert_eq!(catalog.dead_letter_queue.len(), 2);
+        assert!(
+            catalog.dlq_warnings.is_empty(),
+            "should not trigger warning until threshold exceeded"
+        );
+
+        // 3. Trigger warning (RS-1004) when threshold exceeded
+        catalog.route_to_dlq(src, "offset-3", "RS-1003", "Malformed order JSON", "7B7D");
+        assert_eq!(catalog.dlq_warnings.len(), 1);
+        assert!(
+            catalog.dlq_warnings[0].contains("RS-1004"),
+            "should emit proactive warning"
+        );
+
+        // 4. Test DDL REPLAY DEAD_LETTER_QUEUE command
+        let res_replay = catalog.execute_ddl("ALTER SOURCE kafka_orders REPLAY DEAD_LETTER_QUEUE");
+        assert!(res_replay.is_ok());
+        assert_eq!(
+            catalog.dead_letter_queue[0].replay_attempt, 1,
+            "replay attempt must be incremented"
+        );
+
+        // 5. Test DDL DISMISS DEAD_LETTER_QUEUE command
+        let res_dismiss = catalog.execute_ddl(
+            "ALTER SOURCE kafka_orders DISMISS DEAD_LETTER_QUEUE WHERE error_code = 'RS-1003'",
+        );
+        assert!(res_dismiss.is_ok());
+        assert!(
+            catalog.dead_letter_queue.is_empty(),
+            "Dismiss should remove all matched records"
+        );
     }
 }

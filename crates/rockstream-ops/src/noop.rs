@@ -66,6 +66,8 @@ mod tests {
         let input = SourceBatch {
             record_count: 5,
             epoch: 0,
+            offset: None,
+            watermark: None,
         };
         let output = op.process(&input).await;
         assert_eq!(output.record_count, 5);

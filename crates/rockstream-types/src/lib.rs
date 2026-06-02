@@ -32,6 +32,9 @@ pub mod timestamp {
 
     /// Event-time timestamp (application-defined millis since Unix epoch).
     pub type EventTime = u64;
+
+    /// Event-time watermark (application-defined millis since Unix epoch).
+    pub type EventTimeWatermark = u64;
 }
 
 #[cfg(test)]

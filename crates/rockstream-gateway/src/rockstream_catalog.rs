@@ -255,6 +255,40 @@ pub fn catalog_audit_log(entries: &[(&str, &str, &str, u64)]) -> Vec<CatalogAudi
         .collect()
 }
 
+// ── dead_letter_queue ─────────────────────────────────────────────────────────
+
+/// A row in `rockstream_catalog.dead_letter_queue`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogDeadLetterEntry {
+    /// Milliseconds since Unix epoch when record arrived at the queue.
+    pub arrived_at: u64,
+    /// The name of the source connector.
+    pub source_name: String,
+    /// Opaque source offset as a string.
+    pub source_offset: String,
+    /// The error code registered for the decode failure.
+    pub error_code: String,
+    /// The decode error message.
+    pub error_message: String,
+    /// Raw payload bytes represented as hexadecimal.
+    pub raw_bytes_hex: String,
+    /// The count of replay attempts (starts at 0).
+    pub replay_attempt: u32,
+}
+
+/// Return stub dead letter queue rows.
+pub fn catalog_dead_letter_queue(source_name: &str) -> Vec<CatalogDeadLetterEntry> {
+    vec![CatalogDeadLetterEntry {
+        arrived_at: 1717315200000,
+        source_name: source_name.to_owned(),
+        source_offset: "part:0-offset:42".to_owned(),
+        error_code: "RS-1003".to_owned(),
+        error_message: "Record decode error".to_owned(),
+        raw_bytes_hex: "DEADC0DE".to_owned(),
+        replay_attempt: 0,
+    }]
+}
+
 // ── Alias resolution ──────────────────────────────────────────────────────────
 
 /// Resolve the historical `rockstream.*` schema prefix to
@@ -440,6 +474,20 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].seq, 1);
         assert_eq!(rows[1].seq, 2);
-        assert_eq!(rows[0].action, "create_view");
+        assert_eq!(event_action(&rows[0]), "create_view");
+    }
+
+    /// Stub dead letter queue rows are returned correctly.
+    #[test]
+    fn dead_letter_queue_returns_stub_entry() {
+        let rows = catalog_dead_letter_queue("kafka_orders");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_name, "kafka_orders");
+        assert_eq!(rows[0].error_code, "RS-1003");
+        assert_eq!(rows[0].replay_attempt, 0);
+    }
+
+    fn event_action(entry: &CatalogAuditEntry) -> &str {
+        &entry.action
     }
 }

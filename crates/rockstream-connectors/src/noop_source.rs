@@ -35,6 +35,8 @@ impl Source for NoopSource {
         Some(SourceBatch {
             record_count: 0,
             epoch,
+            offset: None,
+            watermark: None,
         })
     }
 
