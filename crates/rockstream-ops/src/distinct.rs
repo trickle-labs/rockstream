@@ -23,6 +23,7 @@
 //! reports `WEIGHT_ADD_ID` via `merge_law()` for `EXPLAIN INCREMENTAL`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rockstream_types::batch::{SinkBatch, SourceBatch, ZSet, ZSetBatch};
@@ -40,6 +41,8 @@ pub struct DistinctOp {
     name: String,
     /// Per-`(key, value)` cumulative weight stored as `WeightAdd/v1` bytes.
     weight_state: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
+    budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
+    warned_over_budget: bool,
 }
 
 impl DistinctOp {
@@ -48,7 +51,18 @@ impl DistinctOp {
         Self {
             name: name.into(),
             weight_state: HashMap::new(),
+            budget: None,
+            warned_over_budget: false,
         }
+    }
+
+    /// Attach a state budget for memory bounding.
+    pub fn with_budget(
+        mut self,
+        budget: Arc<rockstream_types::state_budget::StateBudgetMeter>,
+    ) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Process a `ZSet` delta and return the DISTINCT output delta.
@@ -59,6 +73,23 @@ impl DistinctOp {
 
         for row in input.iter() {
             let entry_key = (row.key.clone(), row.value.clone());
+
+            let is_new = !self.weight_state.contains_key(&entry_key);
+            if is_new {
+                if let Some(ref budget) = self.budget {
+                    let charge = (row.key.len() + row.value.len() + 8) as u64; // key + val + weight bytes
+                    if let Err(e) = budget.try_acquire(charge) {
+                        if !self.warned_over_budget {
+                            tracing::warn!(
+                                "RS-3604: state budget exceeded, OVER_BUDGET_RELAXED: {}",
+                                e
+                            );
+                            self.warned_over_budget = true;
+                        }
+                        continue;
+                    }
+                }
+            }
 
             // Load existing weight (default 0 if not present).
             let old_weight: i64 = self
@@ -71,7 +102,12 @@ impl DistinctOp {
 
             // Update or remove state.
             if new_weight == 0 {
-                self.weight_state.remove(&entry_key);
+                if self.weight_state.remove(&entry_key).is_some() {
+                    if let Some(ref budget) = self.budget {
+                        let released = (row.key.len() + row.value.len() + 8) as u64;
+                        budget.release(released);
+                    }
+                }
             } else {
                 self.weight_state
                     .insert(entry_key.clone(), encode_weight(new_weight));

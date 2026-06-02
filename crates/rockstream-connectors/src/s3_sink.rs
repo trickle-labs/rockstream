@@ -80,9 +80,13 @@ impl Sink for S3Sink {
         // In production: atomic rename `_pending/{epoch}/` → final path.
         self.state = S3TxState::Committed { epoch };
         self.committed_epochs.push(epoch);
+        if self.committed_epochs.len() > 1024 {
+            self.committed_epochs.remove(0);
+        }
         tracing::debug!(
             bucket = %self.bucket,
             epoch,
+            committed_fill_level = ?(self.committed_epochs.len() as f64 / 1024.0),
             "s3 sink: atomic rename to final path"
         );
     }
@@ -91,9 +95,13 @@ impl Sink for S3Sink {
         // In production: delete `_pending/{epoch}/` objects.
         self.state = S3TxState::Idle;
         self.aborted_epochs.push(epoch);
+        if self.aborted_epochs.len() > 1024 {
+            self.aborted_epochs.remove(0);
+        }
         tracing::debug!(
             bucket = %self.bucket,
             epoch,
+            aborted_fill_level = ?(self.aborted_epochs.len() as f64 / 1024.0),
             "s3 sink: pending objects deleted"
         );
     }

@@ -64,20 +64,40 @@ pub async fn run_pipeline(
     }
 
     let mut epoch: Epoch = 0;
+    let mut bytes_buffered: u64 = 0;
+    let mut epochs_buffered: u32 = 0;
 
     while let Some(batch) = source.poll_batch(epoch).await {
         // Process through operator
         let output = operator.process(&batch).await;
 
-        // Write to sink
-        sink.write_batch(&output).await;
-        sink.commit(epoch).await;
+        // Estimate bytes (assuming 256 bytes per record on average)
+        bytes_buffered += (output.record_count * 256) as u64;
+        epochs_buffered += 1;
+
+        // Write/prepare to sink
+        sink.prepare(&output).await;
+
+        // Respect should_flush override or hard ceiling (500 epochs or 256 MB)
+        if sink.should_flush(bytes_buffered, epochs_buffered)
+            || epochs_buffered >= 500
+            || bytes_buffered >= 256 * 1024 * 1024
+        {
+            sink.commit(epoch).await;
+            bytes_buffered = 0;
+            epochs_buffered = 0;
+        }
 
         // Signal epoch complete
         operator.epoch_complete(epoch).await;
 
         tracing::debug!(epoch, "epoch completed");
         epoch += 1;
+    }
+
+    // Flush any remaining buffered data at the end of the pipeline run
+    if epochs_buffered > 0 && epoch > 0 {
+        sink.commit(epoch - 1).await;
     }
 
     // Audit: pipeline stopped

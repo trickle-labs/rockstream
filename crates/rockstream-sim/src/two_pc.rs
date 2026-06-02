@@ -76,6 +76,9 @@ impl TwoPcSinkState {
                 let epoch = *epoch;
                 self.phase = TwoPcPhase::Committed { epoch };
                 self.committed_epochs.push(epoch);
+                if self.committed_epochs.len() > 1024 {
+                    self.committed_epochs.remove(0);
+                }
                 Ok(epoch)
             }
             TwoPcPhase::Committed { epoch } => Ok(*epoch),

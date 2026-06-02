@@ -362,4 +362,62 @@ mod tests {
         assert_eq!(src.lifecycle_state(), ConnectorLifecycleState::Deleted);
         assert_eq!(sink.lifecycle_state(), ConnectorLifecycleState::Deleted);
     }
+
+    struct MockPartitionPushdownSource {
+        filter_called: Option<PartitionFilter>,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for MockPartitionPushdownSource {
+        async fn poll_batch(
+            &mut self,
+            _epoch: rockstream_types::timestamp::Epoch,
+        ) -> Option<rockstream_types::batch::SourceBatch> {
+            Some(rockstream_types::batch::SourceBatch {
+                record_count: 5,
+                epoch: 0,
+                offset: None,
+                watermark: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "mock-pushdown"
+        }
+
+        fn partition_filter_support(&self) -> bool {
+            true
+        }
+
+        async fn start_snapshot(
+            &mut self,
+            _epoch: rockstream_types::timestamp::Epoch,
+            filter: Option<&PartitionFilter>,
+        ) -> Option<rockstream_types::batch::SourceBatch> {
+            self.filter_called = filter.cloned();
+            Some(rockstream_types::batch::SourceBatch {
+                record_count: if filter.is_some() { 2 } else { 5 },
+                epoch: 0,
+                offset: None,
+                watermark: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn proof_partition_filter_pushdown_active() {
+        let filter = PartitionFilter::eq("date_partition", "2026-01-01");
+        let mut src = MockPartitionPushdownSource {
+            filter_called: None,
+        };
+
+        let batch = src.start_snapshot(0, Some(&filter)).await.unwrap();
+
+        assert!(src.filter_called.is_some());
+        assert_eq!(src.filter_called.unwrap(), filter);
+        assert_eq!(
+            batch.record_count, 2,
+            "pushdown filter must prune partitions at source"
+        );
+    }
 }

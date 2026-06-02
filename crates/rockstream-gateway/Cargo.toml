@@ -8,5 +8,8 @@ description = "Query gateway service for RockStream (pgwire, HTTP)"
 
 [dependencies]
 rockstream-types = { workspace = true }
+rockstream-storage = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

@@ -77,14 +77,30 @@ impl Sink for PostgresSink {
         // In production: COMMIT.
         self.state = PostgresTxState::Committed { epoch };
         self.committed_epochs.push(epoch);
-        tracing::debug!(table = %self.table, epoch, "postgres sink: transaction committed");
+        if self.committed_epochs.len() > 1024 {
+            self.committed_epochs.remove(0);
+        }
+        tracing::debug!(
+            table = %self.table,
+            epoch,
+            committed_fill_level = ?(self.committed_epochs.len() as f64 / 1024.0),
+            "postgres sink: transaction committed"
+        );
     }
 
     async fn abort(&mut self, epoch: Epoch) {
         // In production: ROLLBACK.
         self.state = PostgresTxState::Idle;
         self.aborted_epochs.push(epoch);
-        tracing::debug!(table = %self.table, epoch, "postgres sink: transaction rolled back");
+        if self.aborted_epochs.len() > 1024 {
+            self.aborted_epochs.remove(0);
+        }
+        tracing::debug!(
+            table = %self.table,
+            epoch,
+            aborted_fill_level = ?(self.aborted_epochs.len() as f64 / 1024.0),
+            "postgres sink: transaction rolled back"
+        );
     }
 
     fn name(&self) -> &str {

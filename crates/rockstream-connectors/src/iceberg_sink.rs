@@ -138,12 +138,16 @@ impl Sink for IcebergSink {
         // Materialise a Parquet file and commit to Iceberg metadata.
         self.state = IcebergTxState::Committed { epoch };
         self.committed_epochs.push(epoch);
+        if self.committed_epochs.len() > 1024 {
+            self.committed_epochs.remove(0);
+        }
         // Reset accumulation counters
         self.bytes_buffered = 0;
         self.epochs_buffered = 0;
         tracing::debug!(
             table = %self.table_location,
             epoch,
+            committed_fill_level = ?(self.committed_epochs.len() as f64 / 1024.0),
             "iceberg sink: snapshot committed"
         );
     }
@@ -151,11 +155,15 @@ impl Sink for IcebergSink {
     async fn abort(&mut self, epoch: Epoch) {
         self.state = IcebergTxState::Idle;
         self.aborted_epochs.push(epoch);
+        if self.aborted_epochs.len() > 1024 {
+            self.aborted_epochs.remove(0);
+        }
         self.bytes_buffered = 0;
         self.epochs_buffered = 0;
         tracing::debug!(
             table = %self.table_location,
             epoch,
+            aborted_fill_level = ?(self.aborted_epochs.len() as f64 / 1024.0),
             "iceberg sink: snapshot aborted, staging cleared"
         );
     }

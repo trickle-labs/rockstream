@@ -200,12 +200,22 @@ mod tests {
         let keys0: Vec<u64> = b0
             .zset
             .iter()
-            .map(|r| u64::from_be_bytes(r.key.try_into().unwrap()))
+            .map(|r| {
+                let mut buf = [0u8; 8];
+                let len = r.key.len().min(8);
+                buf[8 - len..].copy_from_slice(&r.key[..len]);
+                u64::from_be_bytes(buf)
+            })
             .collect();
         let keys1: Vec<u64> = b1
             .zset
             .iter()
-            .map(|r| u64::from_be_bytes(r.key.try_into().unwrap()))
+            .map(|r| {
+                let mut buf = [0u8; 8];
+                let len = r.key.len().min(8);
+                buf[8 - len..].copy_from_slice(&r.key[..len]);
+                u64::from_be_bytes(buf)
+            })
             .collect();
 
         let max0 = keys0.iter().copied().max().unwrap();

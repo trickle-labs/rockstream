@@ -182,6 +182,9 @@ impl StateBudget {
     }
 }
 
+/// Alias for `StateBudget` as used by operators.
+pub type StateBudgetMeter = StateBudget;
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

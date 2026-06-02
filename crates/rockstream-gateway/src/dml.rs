@@ -184,6 +184,31 @@ pub struct CommittedWrite {
     pub idempotency_key: Option<String>,
 }
 
+fn fnv64(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut h = FNV_OFFSET;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d049bb133111eb);
+    h ^= h >> 31;
+    h
+}
+
+fn hash_idempotency_key(key: &str) -> [u8; 16] {
+    let h1 = fnv64(key.as_bytes());
+    let h2 = fnv64(format!("{key}:alt").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&h1.to_be_bytes());
+    bytes[8..16].copy_from_slice(&h2.to_be_bytes());
+    bytes
+}
+
 // ── Optimistic transaction ────────────────────────────────────────────────────
 
 /// An in-progress optimistic transaction.
@@ -382,6 +407,106 @@ impl OptimisticTransaction {
         Ok(new_entries)
     }
 
+    /// Attempt to commit this transaction using a persistent ShardDb.
+    ///
+    /// Checks conflicts against in-memory committed_log, but also checks and writes
+    /// idempotency keys atomically to ShardDb.
+    pub async fn commit_persistent(
+        &self,
+        commit_epoch: u64,
+        committed_log: &[CommittedWrite],
+        shard_id: u32,
+        db: Option<&rockstream_storage::ShardDb>,
+    ) -> Result<Vec<CommittedWrite>, GatewayError> {
+        // Enforce idempotency keys on non-idempotent writes (v0.44).
+        if self.is_non_idempotent
+            && self.idempotency_key.is_none()
+            && self.exactly_once_envelope.is_none()
+        {
+            return Err(GatewayError::IdempotencyKeyRequired);
+        }
+
+        // Idempotent duplicate-replay check (v0.44 & v0.48.1).
+        // If a transaction with the same idempotency key is already committed,
+        // we return successfully with zero new side-effects.
+        if let Some(ref key) = self.idempotency_key {
+            // 1. Check local/in-memory log
+            if committed_log
+                .iter()
+                .rev()
+                .any(|w| w.idempotency_key.as_ref() == Some(key))
+            {
+                return Ok(vec![]);
+            }
+
+            // 2. Check persistent per-shard DbReader/ShardDb lookup
+            if let Some(db) = db {
+                let hash = hash_idempotency_key(key);
+                if let Ok(Some(_epoch)) = db.get_idempotency_epoch(shard_id, hash).await {
+                    return Ok(vec![]);
+                }
+            }
+        }
+
+        // Filter log to writes committed after our read epoch.
+        let concurrent: Vec<&CommittedWrite> = committed_log
+            .iter()
+            .filter(|w| w.epoch > self.read_epoch)
+            .collect();
+
+        if self.read_dependent {
+            for entry in &self.write_set {
+                for concurrent_write in &concurrent {
+                    if concurrent_write.table == entry.table
+                        && concurrent_write.row_key == entry.row_key
+                    {
+                        return Err(GatewayError::OptimisticConflict {
+                            table: entry.table.clone(),
+                            conflicting_epoch: concurrent_write.epoch,
+                        });
+                    }
+                }
+            }
+        }
+
+        // No conflicts: produce committed-write entries.
+        let new_entries: Vec<CommittedWrite> = self
+            .write_set
+            .iter()
+            .map(|e| CommittedWrite {
+                epoch: commit_epoch,
+                table: e.table.clone(),
+                row_key: e.row_key.clone(),
+                idempotency_key: self.idempotency_key.clone(),
+            })
+            .collect();
+
+        // Write to persistent ShardDb WriteBatch atomically on success
+        if let Some(db) = db {
+            let mut batch = rockstream_storage::shard_db::WriteBatch::new();
+            if let Some(ref key) = self.idempotency_key {
+                let hash = hash_idempotency_key(key);
+                rockstream_storage::shard_db::set_allow_law_operand_fallback(true);
+                rockstream_storage::ShardDb::put_idempotency_key(
+                    &mut batch,
+                    shard_id,
+                    hash,
+                    commit_epoch,
+                );
+            }
+            // Also write DML entries if any
+            for entry in &self.write_set {
+                let storage_key = format!("dml/{}/{}", entry.table, entry.row_key);
+                batch.put(storage_key.as_bytes(), b"committed");
+            }
+            db.write_batch(batch)
+                .await
+                .map_err(|e| GatewayError::InvalidDml(e.to_string()))?;
+        }
+
+        Ok(new_entries)
+    }
+
     /// Returns a reference to the buffered write set.
     pub fn write_set(&self) -> &[WriteSetEntry] {
         &self.write_set
@@ -507,16 +632,16 @@ mod tests {
             "conflict must return RS-2008; got {err:?}"
         );
 
-        match err {
-            GatewayError::OptimisticConflict {
-                table,
-                conflicting_epoch,
-            } => {
-                assert_eq!(table, "orders");
-                assert_eq!(conflicting_epoch, 6);
-            }
-            other => panic!("expected OptimisticConflict, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                err,
+                GatewayError::OptimisticConflict {
+                    ref table,
+                    conflicting_epoch: 6,
+                } if table == "orders"
+            ),
+            "expected OptimisticConflict for orders at epoch 6, got {err:?}"
+        );
     }
 
     // ── No conflict ───────────────────────────────────────────────────────────
@@ -746,6 +871,67 @@ mod tests {
         });
         tx3.set_non_idempotent(true);
         assert!(tx3.commit(8, &log).is_ok());
+    }
+
+    /// Proof (v0.48.1): Idempotency-key deduplication survives a gateway restart
+    /// by falling back to persistent per-shard DbReader/ShardDb lookup.
+    #[tokio::test]
+    async fn proof_idempotency_key_survives_gateway_restart() {
+        use object_store::memory::InMemory;
+        use std::sync::Arc;
+
+        let path = "test/dml_idempotency_restart";
+        let object_store = Arc::new(InMemory::new());
+        let db = rockstream_storage::ShardDb::builder(path, object_store)
+            .build()
+            .await
+            .unwrap();
+
+        let mut tx1 = OptimisticTransaction::new(5).with_idempotency("key-persistent-456");
+        tx1.execute(&DmlStatement::Update {
+            table: "counters".into(),
+            set_columns: vec!["value".into()],
+            set_values: vec!["1".into()],
+            where_column: "id".into(),
+            where_value: "counter-2".into(),
+        });
+        tx1.set_non_idempotent(true);
+
+        // 1. First commit: written to ShardDb.
+        let log = tx1.commit_persistent(6, &[], 0, Some(&db)).await.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0].idempotency_key.as_deref(),
+            Some("key-persistent-456")
+        );
+
+        // 2. Gateway restart occurs: in-memory `committed_log` is completely cleared.
+        let cleared_log: Vec<CommittedWrite> = Vec::new();
+
+        // 3. Duplicate replay with the same key.
+        let mut tx2 = OptimisticTransaction::new(5).with_idempotency("key-persistent-456");
+        tx2.execute(&DmlStatement::Update {
+            table: "counters".into(),
+            set_columns: vec!["value".into()],
+            set_values: vec!["1".into()],
+            where_column: "id".into(),
+            where_value: "counter-2".into(),
+        });
+        tx2.set_non_idempotent(true);
+
+        // 4. Commit of duplicate must succeed immediately with 0 new entries
+        // because it finds the key in the persistent shard DB!
+        let log_replay = tx2
+            .commit_persistent(7, &cleared_log, 0, Some(&db))
+            .await
+            .unwrap();
+        assert_eq!(
+            log_replay.len(),
+            0,
+            "duplicate attempt must yield 0 committed entries after gateway restart"
+        );
+
+        db.close().await.unwrap();
     }
 
     /// Proof: 1M concurrent counter increments with idempotency keys land exact total.

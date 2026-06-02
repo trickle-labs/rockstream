@@ -55,6 +55,8 @@ pub struct AggregateMergeOp {
     agg_state: HashMap<Vec<u8>, Vec<u8>>,
     /// Last-emitted value per group key (for computing output deltas).
     last_emitted: HashMap<Vec<u8>, Vec<u8>>,
+    budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
+    warned_over_budget: bool,
 }
 
 impl AggregateMergeOp {
@@ -72,7 +74,18 @@ impl AggregateMergeOp {
             law: SumCountV1,
             agg_state: HashMap::new(),
             last_emitted: HashMap::new(),
+            budget: None,
+            warned_over_budget: false,
         }
+    }
+
+    /// Attach a state budget for memory bounding.
+    pub fn with_budget(
+        mut self,
+        budget: Arc<rockstream_types::state_budget::StateBudgetMeter>,
+    ) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Process a `ZSet` delta and return the output Z-set delta.
@@ -91,6 +104,23 @@ impl AggregateMergeOp {
             let weighted_sum = sum_contrib.saturating_mul(row.weight);
             let weighted_count = count_contrib.saturating_mul(row.weight);
             let delta_bytes = encode_sum_count(weighted_sum, weighted_count);
+
+            let is_new = !self.agg_state.contains_key(&group_key);
+            if is_new {
+                if let Some(ref budget) = self.budget {
+                    let charge = (group_key.len() + delta_bytes.len()) as u64;
+                    if let Err(e) = budget.try_acquire(charge) {
+                        if !self.warned_over_budget {
+                            tracing::warn!(
+                                "RS-3604: state budget exceeded, OVER_BUDGET_RELAXED: {}",
+                                e
+                            );
+                            self.warned_over_budget = true;
+                        }
+                        continue; // Skip this insertion!
+                    }
+                }
+            }
 
             let current = self
                 .agg_state
@@ -133,8 +163,11 @@ impl AggregateMergeOp {
             }
 
             // Compact identity-valued groups from agg_state.
-            if self.law.is_identity(&new_state) {
-                self.agg_state.remove(&group_key);
+            if self.law.is_identity(&new_state) && self.agg_state.remove(&group_key).is_some() {
+                if let Some(ref budget) = self.budget {
+                    let released = (group_key.len() + new_state.len()) as u64;
+                    budget.release(released);
+                }
             }
         }
 
@@ -312,5 +345,29 @@ mod tests {
         let (s, c) = decode_sum_count(&bytes).unwrap();
         assert_eq!(s, 42);
         assert_eq!(c, 7);
+    }
+
+    #[test]
+    fn state_budget_property_test_over_budget() {
+        use rockstream_types::state_budget::StateBudgetMeter;
+
+        let budget_limit = 50;
+        let budget = Arc::new(StateBudgetMeter::new("test_agg_budget", budget_limit));
+        let mut op = AggregateMergeOp::new("test_agg", key_as_group(), val_measure())
+            .with_budget(Arc::clone(&budget));
+
+        // Let's insert many unique keys to exceed budget by 10x
+        let mut input = ZSet::new();
+        for i in 0..100 {
+            let (k, v) = make_row(i, 10);
+            input.insert(k, v, 1);
+        }
+
+        let _output = op.process_zset(&input);
+
+        // Usage must not exceed limit + one delta
+        let delta_bytes_limit = 8 + 16; // key (8 bytes) + val (16 bytes)
+        assert!(budget.current_bytes() <= budget_limit + delta_bytes_limit);
+        assert!(op.warned_over_budget);
     }
 }

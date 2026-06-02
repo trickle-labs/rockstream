@@ -69,13 +69,29 @@ impl Sink for HttpSink {
     async fn commit(&mut self, epoch: Epoch) {
         self.state = HttpTxState::Committed { epoch };
         self.committed_epochs.push(epoch);
-        tracing::debug!(url = %self.url, epoch, "http sink: webhook transaction committed");
+        if self.committed_epochs.len() > 1024 {
+            self.committed_epochs.remove(0);
+        }
+        tracing::debug!(
+            url = %self.url,
+            epoch,
+            committed_fill_level = ?(self.committed_epochs.len() as f64 / 1024.0),
+            "http sink: webhook transaction committed"
+        );
     }
 
     async fn abort(&mut self, epoch: Epoch) {
         self.state = HttpTxState::Idle;
         self.aborted_epochs.push(epoch);
-        tracing::debug!(url = %self.url, epoch, "http sink: webhook transaction aborted");
+        if self.aborted_epochs.len() > 1024 {
+            self.aborted_epochs.remove(0);
+        }
+        tracing::debug!(
+            url = %self.url,
+            epoch,
+            aborted_fill_level = ?(self.aborted_epochs.len() as f64 / 1024.0),
+            "http sink: webhook transaction aborted"
+        );
     }
 
     fn name(&self) -> &str {

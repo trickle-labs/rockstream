@@ -112,6 +112,8 @@ pub struct TopKOp {
     partition_fn: PartitionFn,
     partition_state: HashMap<PartitionKey, PartitionState>,
     name: String,
+    budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
+    warned_over_budget: bool,
 }
 
 impl TopKOp {
@@ -132,7 +134,18 @@ impl TopKOp {
             partition_fn,
             partition_state: HashMap::new(),
             name: "TopKOp".to_owned(),
+            budget: None,
+            warned_over_budget: false,
         }
+    }
+
+    /// Attach a state budget for memory bounding.
+    pub fn with_budget(
+        mut self,
+        budget: Arc<rockstream_types::state_budget::StateBudgetMeter>,
+    ) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Process an incremental ZSet delta and return the output delta.
@@ -155,6 +168,25 @@ impl TopKOp {
                 .or_insert_with(PartitionState::new);
 
             // Update net weight.
+            let is_new = !ps.rows.contains_key(&row_id);
+            if is_new {
+                if let Some(ref budget) = self.budget {
+                    let charge =
+                        (partition_key.len() + row_id.len() + row.key.len() + row.value.len() + 16)
+                            as u64;
+                    if let Err(e) = budget.try_acquire(charge) {
+                        if !self.warned_over_budget {
+                            tracing::warn!(
+                                "RS-3604: state budget exceeded, OVER_BUDGET_RELAXED: {}",
+                                e
+                            );
+                            self.warned_over_budget = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+
             let entry = ps
                 .rows
                 .entry(row_id.clone())
@@ -162,11 +194,13 @@ impl TopKOp {
             entry.2 += row.weight;
 
             // Remove the entry only when weight reaches exactly 0 (balanced).
-            // Negative-weight entries (ghosts) are retained so that a future
-            // INSERT is correctly netted against the prior DELETE.  When the
-            // entry reaches 0, the row is absent and no longer needed in state.
-            if entry.2 == 0 {
-                ps.rows.remove(&row_id);
+            if entry.2 == 0 && ps.rows.remove(&row_id).is_some() {
+                if let Some(ref budget) = self.budget {
+                    let released =
+                        (partition_key.len() + row_id.len() + row.key.len() + row.value.len() + 16)
+                            as u64;
+                    budget.release(released);
+                }
             }
 
             if !touched.contains(&partition_key) {

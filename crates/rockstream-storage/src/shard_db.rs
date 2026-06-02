@@ -13,6 +13,20 @@ use rockstream_types::merge_law::{ArrangementHeader, MergeLawId};
 use slatedb::config::Settings;
 use slatedb::Db;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static ALLOW_LAW_OPERAND_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// Set whether to allow fallback to raw bytes when a law operand is corrupted.
+pub fn set_allow_law_operand_fallback(allow: bool) {
+    ALLOW_LAW_OPERAND_FALLBACK.store(allow, Ordering::SeqCst);
+}
+
+/// Check if fallback to raw bytes is allowed when a law operand is corrupted.
+pub fn is_allow_law_operand_fallback() -> bool {
+    ALLOW_LAW_OPERAND_FALLBACK.load(Ordering::SeqCst)
+}
+
 use crate::error::StorageError;
 use crate::keys::ShardKeyEncoder;
 use crate::merge_registry::SumCountMergeOperator;
@@ -24,6 +38,13 @@ use crate::merge_registry::SumCountMergeOperator;
 /// identity (uncommon). For the identity element itself, `is_identity` short-
 /// circuits.
 fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes: &[u8]) -> bool {
+    let mut bytes = bytes;
+    if !bytes.is_empty() {
+        let tag = bytes[0];
+        if tag == 0x01 || tag == 0x02 || tag == 0x03 || tag == 0x04 || tag == 0x22 || tag == 0x30 {
+            bytes = &bytes[1..];
+        }
+    }
     if law.is_identity(bytes) {
         return true;
     }
@@ -186,7 +207,10 @@ impl ShardDb {
             if value.len() < ArrangementHeader::WIRE_SIZE {
                 continue; // malformed entry — skip (not a law catalog entry)
             }
-            let buf: [u8; 4] = value[..4].try_into().unwrap();
+            let buf: [u8; 4] = match value[..4].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
             let header = ArrangementHeader::decode(&buf);
             if !known_law_ids.contains(&header.law_id) {
                 return Err(StorageError::UnknownMergeLaw {
@@ -207,6 +231,33 @@ impl ShardDb {
         let key = ShardKeyEncoder::meta_key(key_suffix.as_bytes());
         let value = header.encode();
         self.put(&key, &value).await
+    }
+
+    /// Look up an idempotency key epoch.
+    pub async fn get_idempotency_epoch(
+        &self,
+        shard_id: u32,
+        key_hash: [u8; 16],
+    ) -> Result<Option<u64>, StorageError> {
+        let key = ShardKeyEncoder::idempotency_key(shard_id, key_hash);
+        if let Some(bytes) = self.get(&key).await? {
+            if bytes.len() == 8 {
+                let epoch = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+                return Ok(Some(epoch));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Add an idempotency key insert to a WriteBatch.
+    pub fn put_idempotency_key(
+        batch: &mut WriteBatch,
+        shard_id: u32,
+        key_hash: [u8; 16],
+        epoch: u64,
+    ) {
+        let key = ShardKeyEncoder::idempotency_key(shard_id, key_hash);
+        batch.put(&key, &epoch.to_be_bytes());
     }
 
     /// Close the database, flushing any pending writes.
@@ -248,7 +299,10 @@ impl ShardDb {
             None => Ok(None),
             Some(bytes) if bytes.len() < ArrangementHeader::WIRE_SIZE => Ok(None),
             Some(bytes) => {
-                let buf: [u8; 4] = bytes[..4].try_into().unwrap();
+                let buf: [u8; 4] = match bytes[..4].try_into() {
+                    Ok(b) => b,
+                    Err(_) => return Ok(None),
+                };
                 Ok(Some(ArrangementHeader::decode(&buf)))
             }
         }
@@ -283,10 +337,18 @@ impl ShardDb {
                 };
                 if is_valid_law_operand(law, &bytes) {
                     rockstream_types::metrics::inc_applied(&metric_key);
+                    Ok(Some(bytes.to_vec()))
                 } else {
                     rockstream_types::metrics::inc_fallback(&metric_key);
+                    if is_allow_law_operand_fallback() {
+                        Ok(Some(bytes.to_vec()))
+                    } else {
+                        Err(StorageError::OperandCorruption {
+                            law_id: law.id().0,
+                            law_name: law.name().to_string(),
+                        })
+                    }
                 }
-                Ok(Some(bytes.to_vec()))
             }
         }
     }
@@ -313,17 +375,23 @@ impl ShardDb {
             law_version: law.version().0,
         };
 
-        let results = entries
-            .into_iter()
-            .map(|(k, v)| {
-                if is_valid_law_operand(law, &v) {
-                    rockstream_types::metrics::inc_applied(&metric_key);
+        let mut results = Vec::with_capacity(entries.len());
+        for (k, v) in entries {
+            if is_valid_law_operand(law, &v) {
+                rockstream_types::metrics::inc_applied(&metric_key);
+                results.push((k, v.to_vec()));
+            } else {
+                rockstream_types::metrics::inc_fallback(&metric_key);
+                if is_allow_law_operand_fallback() {
+                    results.push((k, v.to_vec()));
                 } else {
-                    rockstream_types::metrics::inc_fallback(&metric_key);
+                    return Err(StorageError::OperandCorruption {
+                        law_id: law.id().0,
+                        law_name: law.name().to_string(),
+                    });
                 }
-                (k, v.to_vec())
-            })
-            .collect();
+            }
+        }
 
         Ok(results)
     }

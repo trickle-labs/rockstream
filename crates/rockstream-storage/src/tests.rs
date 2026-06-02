@@ -654,6 +654,7 @@ async fn scan_merged_returns_entries_and_increments_applied() {
 #[serial_test::serial]
 #[tokio::test]
 async fn scan_merged_fallback_increments_fallback_metric() {
+    crate::set_allow_law_operand_fallback(true);
     use rockstream_types::laws::weight_add::WeightAddV1;
     use rockstream_types::merge_law::MergeLawId;
     use rockstream_types::metrics::{read_fallback, LawMetricKey};
@@ -683,6 +684,7 @@ async fn scan_merged_fallback_increments_fallback_metric() {
     );
 
     db.close().await.unwrap();
+    crate::set_allow_law_operand_fallback(false);
 }
 
 // === Arrangement Header Tests ===

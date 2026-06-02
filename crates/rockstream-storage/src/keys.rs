@@ -102,6 +102,31 @@ impl ShardKeyEncoder {
         key.extend_from_slice(&epoch.to_be_bytes());
         key
     }
+
+    /// Encode an idempotency key.
+    /// Format: `0x02` (OpIndex) + `b"IK"` + `shard_id: u32` + `key_hash: [u8; 16]`
+    pub fn idempotency_key(shard_id: u32, key_hash: [u8; 16]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 4 + 16);
+        key.push(ShardPrefix::OpIndex.as_byte());
+        key.extend_from_slice(b"IK");
+        key.extend_from_slice(&shard_id.to_be_bytes());
+        key.extend_from_slice(&key_hash);
+        key
+    }
+
+    /// Decode an idempotency key.
+    /// Returns (shard_id, key_hash) if it is a valid idempotency key.
+    pub fn decode_idempotency_key(key: &[u8]) -> Option<(u32, [u8; 16])> {
+        if key.len() != 23 {
+            return None;
+        }
+        if key[0] != ShardPrefix::OpIndex.as_byte() || &key[1..3] != b"IK" {
+            return None;
+        }
+        let shard_id = u32::from_be_bytes(key[3..7].try_into().ok()?);
+        let key_hash = key[7..23].try_into().ok()?;
+        Some((shard_id, key_hash))
+    }
 }
 
 /// Encoder for catalog (control-plane) keys.
@@ -272,5 +297,16 @@ mod tests {
         let k100 = ShardKeyEncoder::epoch_key(100);
         assert!(k1 < k2);
         assert!(k2 < k100);
+    }
+
+    #[test]
+    fn idempotency_key_encode_decode_roundtrip() {
+        let hash = [7u8; 16];
+        let key = ShardKeyEncoder::idempotency_key(123, hash);
+        assert_eq!(key[0], ShardPrefix::OpIndex.as_byte());
+        assert_eq!(&key[1..3], b"IK");
+        let (shard, decoded_hash) = ShardKeyEncoder::decode_idempotency_key(&key).unwrap();
+        assert_eq!(shard, 123);
+        assert_eq!(decoded_hash, hash);
     }
 }

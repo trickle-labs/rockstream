@@ -85,6 +85,8 @@ pub enum DurableError {
     Merge(String),
     /// Law not registered.
     UnknownLaw(MergeLawId),
+    /// Malformed object structure.
+    MalformedObject,
 }
 
 impl std::fmt::Display for DurableError {
@@ -97,6 +99,7 @@ impl std::fmt::Display for DurableError {
             DurableError::Store(e) => write!(f, "object store error: {e}"),
             DurableError::Merge(e) => write!(f, "merge error: {e}"),
             DurableError::UnknownLaw(id) => write!(f, "unknown law: {id}"),
+            DurableError::MalformedObject => write!(f, "malformed object structure"),
         }
     }
 }
@@ -143,13 +146,25 @@ pub fn decode_object(data: &[u8]) -> Result<Vec<ShuffleFrame>, DurableError> {
     }
 
     // Read footer offset (last 8 bytes)
-    let footer_off = u64::from_be_bytes(data[data.len() - 8..].try_into().unwrap()) as usize;
+    let last_8_bytes = data
+        .get(data.len() - 8..)
+        .ok_or(DurableError::TruncatedObject)?;
+    let footer_off_bytes: [u8; 8] = last_8_bytes
+        .try_into()
+        .map_err(|_| DurableError::MalformedObject)?;
+    let footer_off = u64::from_be_bytes(footer_off_bytes) as usize;
+
     if footer_off + 4 > data.len() - 8 {
         return Err(DurableError::TruncatedObject);
     }
 
-    let frame_count =
-        u32::from_be_bytes(data[footer_off..footer_off + 4].try_into().unwrap()) as usize;
+    let count_slice = data
+        .get(footer_off..footer_off + 4)
+        .ok_or(DurableError::TruncatedObject)?;
+    let count_bytes: [u8; 4] = count_slice
+        .try_into()
+        .map_err(|_| DurableError::MalformedObject)?;
+    let frame_count = u32::from_be_bytes(count_bytes) as usize;
 
     let offsets_start = footer_off + 4;
     let offsets_end = offsets_start + frame_count * 8;
@@ -159,9 +174,12 @@ pub fn decode_object(data: &[u8]) -> Result<Vec<ShuffleFrame>, DurableError> {
 
     let mut frames = Vec::with_capacity(frame_count);
     for i in 0..frame_count {
-        let off_bytes: [u8; 8] = data[offsets_start + i * 8..offsets_start + i * 8 + 8]
+        let offset_slice = data
+            .get(offsets_start + i * 8..offsets_start + i * 8 + 8)
+            .ok_or(DurableError::TruncatedObject)?;
+        let off_bytes: [u8; 8] = offset_slice
             .try_into()
-            .unwrap();
+            .map_err(|_| DurableError::MalformedObject)?;
         let offset = u64::from_be_bytes(off_bytes) as usize;
 
         // Each frame: target_shard(8) + key_len(4) + val_len(4) + key + val
@@ -169,11 +187,30 @@ pub fn decode_object(data: &[u8]) -> Result<Vec<ShuffleFrame>, DurableError> {
         if header_end > data.len() {
             return Err(DurableError::MalformedFrame(i));
         }
-        let target_shard = u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap());
-        let key_len =
-            u32::from_be_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
-        let val_len =
-            u32::from_be_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
+
+        let shard_slice = data
+            .get(offset..offset + 8)
+            .ok_or(DurableError::MalformedFrame(i))?;
+        let shard_bytes: [u8; 8] = shard_slice
+            .try_into()
+            .map_err(|_| DurableError::MalformedObject)?;
+        let target_shard = u64::from_be_bytes(shard_bytes);
+
+        let key_len_slice = data
+            .get(offset + 8..offset + 12)
+            .ok_or(DurableError::MalformedFrame(i))?;
+        let key_len_bytes: [u8; 4] = key_len_slice
+            .try_into()
+            .map_err(|_| DurableError::MalformedObject)?;
+        let key_len = u32::from_be_bytes(key_len_bytes) as usize;
+
+        let val_len_slice = data
+            .get(offset + 12..offset + 16)
+            .ok_or(DurableError::MalformedFrame(i))?;
+        let val_len_bytes: [u8; 4] = val_len_slice
+            .try_into()
+            .map_err(|_| DurableError::MalformedObject)?;
+        let val_len = u32::from_be_bytes(val_len_bytes) as usize;
 
         let key_end = header_end + key_len;
         let val_end = key_end + val_len;
@@ -381,5 +418,38 @@ mod tests {
             decode_object(truncated),
             Err(DurableError::TruncatedObject)
         ));
+    }
+
+    #[test]
+    fn fuzz_decode_object_robustness() {
+        // Generate a valid object with multiple frames
+        let frames = vec![
+            frame(1, b"key1", b"val1"),
+            frame(2, b"longerkey", b"shorter"),
+            frame(42, b"", b""),
+        ];
+        let data = encode_object(&frames);
+
+        // Test every truncation length
+        for len in 0..data.len() {
+            let truncated = &data[..len];
+            let _ = decode_object(truncated); // Must not panic
+        }
+
+        // Fuzz single-byte corruptions across 10,000 seeds/variations
+        // We use a deterministic LCG pseudo-random generator for 10k iterations.
+        let mut rng_state: u64 = 0x5EED;
+        let next_rng = |state: &mut u64| {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *state
+        };
+
+        for _ in 0..10_000 {
+            let mut corrupted = data.clone();
+            let index = (next_rng(&mut rng_state) as usize) % corrupted.len();
+            let bit_flip = next_rng(&mut rng_state) as u8;
+            corrupted[index] ^= bit_flip;
+            let _ = decode_object(&corrupted); // Must not panic
+        }
     }
 }
