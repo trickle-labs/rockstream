@@ -369,6 +369,8 @@ impl InlineViewCatalog {
                     "MAX_REGISTER" => 14,
                     "MIN_REGISTER" => 15,
                     "LWW" => 16,
+                    "OR_SET" => 17,
+                    "MV_REGISTER" => 18,
                     _ => {
                         return Err(GatewayError::InvalidDml(format!(
                             "Unsupported column type: {type_str}"

@@ -89,6 +89,8 @@ pub fn map_to_postgres_oid(type_tag: u8) -> PostgresOid {
         14 => oid::INT8, // MAX_REGISTER maps to INT8
         15 => oid::INT8, // MIN_REGISTER maps to INT8
         16 => oid::INT8, // LWW maps to INT8
+        17 => oid::TEXT, // OR_SET maps to TEXT
+        18 => oid::INT8, // MV_REGISTER maps to INT8
         _ => oid::UNKNOWN,
     }
 }

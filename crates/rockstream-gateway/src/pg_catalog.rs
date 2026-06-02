@@ -298,6 +298,8 @@ pub fn ansi_type_name(type_tag: u8) -> &'static str {
         14 => "max_register",
         15 => "min_register",
         16 => "lww",
+        17 => "or_set",
+        18 => "mv_register",
         _ => "unknown",
     }
 }
