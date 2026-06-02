@@ -42,7 +42,7 @@ mod tests {
                 assert!(msg.contains("amount"));
                 assert!(msg.contains("COUNTER"));
             }
-            other => panic!("expected SchemaMismatch, got {:?}", other),
+            other => panic!("expected SchemaMismatch, got {other:?}"),
         }
     }
 }

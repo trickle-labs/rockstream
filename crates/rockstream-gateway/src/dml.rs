@@ -293,13 +293,11 @@ impl OptimisticTransaction {
         } else if has_blind {
             self.read_dependent = false;
             false
+        } else if self.read_dependent {
+            *read_round_trips += 1;
+            true
         } else {
-            if self.read_dependent {
-                *read_round_trips += 1;
-                true
-            } else {
-                false
-            }
+            false
         }
     }
 
