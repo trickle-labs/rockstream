@@ -308,6 +308,9 @@ fn proof_seed_corpus_covers_all_registered_laws() {
         "WeightAdd/v1",
         "SumCount/v1",
         "MaxRegister/v1",
+        "MinRegister/v1",
+        "PNCounter/v1",
+        "LWWRegister/v1",
         "HyperLogLog/v1",
         "BloomUnion/v1",
     ];

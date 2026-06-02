@@ -186,6 +186,37 @@ pub fn build_initial_corpus() -> SeedCorpus {
         scenario: "law.max_register.duplicate: same update delivered twice",
     });
 
+    // MinRegister/v1 — last-write-wins minimum.
+    corpus.add_law_seed(LawSeed {
+        law_id: "MinRegister/v1",
+        seed: 0x5555_AAAA_5555_AAAA,
+        scenario: "law.min_register.reorder: updates arrive out of order",
+    });
+
+    // PNCounter/v1 — positive-negative counter.
+    corpus.add_law_seed(LawSeed {
+        law_id: "PNCounter/v1",
+        seed: 0x1111_3333_5555_7777,
+        scenario: "law.pn_counter.reorder: updates arrive out of order",
+    });
+    corpus.add_law_seed(LawSeed {
+        law_id: "PNCounter/v1",
+        seed: 0x2222_4444_6666_8888,
+        scenario: "law.pn_counter.duplicate: same update delivered twice",
+    });
+
+    // LWWRegister/v1 — last-writer-wins register.
+    corpus.add_law_seed(LawSeed {
+        law_id: "LWWRegister/v1",
+        seed: 0x1234_1234_1234_1234,
+        scenario: "law.lww_register.reorder: updates arrive out of order with different timestamps",
+    });
+    corpus.add_law_seed(LawSeed {
+        law_id: "LWWRegister/v1",
+        seed: 0x5678_5678_5678_5678,
+        scenario: "law.lww_register.duplicate: same update delivered twice",
+    });
+
     // HyperLogLog/v1 — approximate distinct count sketch.
     corpus.add_law_seed(LawSeed {
         law_id: "HyperLogLog/v1",
@@ -233,6 +264,9 @@ mod tests {
             "WeightAdd/v1",
             "SumCount/v1",
             "MaxRegister/v1",
+            "MinRegister/v1",
+            "PNCounter/v1",
+            "LWWRegister/v1",
             "HyperLogLog/v1",
             "BloomUnion/v1",
         ]));
