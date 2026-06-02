@@ -121,6 +121,8 @@ impl Source for GenerateRowsSource {
         Some(SourceBatch {
             record_count: rows,
             epoch,
+            offset: None,
+            watermark: None,
         })
     }
 

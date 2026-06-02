@@ -339,6 +339,7 @@ impl OptimisticTransaction {
         if let Some(ref key) = self.idempotency_key {
             if committed_log
                 .iter()
+                .rev()
                 .any(|w| w.idempotency_key.as_ref() == Some(key))
             {
                 return Ok(vec![]);

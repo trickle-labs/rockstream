@@ -38,4 +38,9 @@ pub trait Sink: Send {
 
     /// Name of this sink for diagnostics.
     fn name(&self) -> &str;
+
+    /// Override default flush trigger based on bytes and epochs buffered.
+    fn should_flush(&self, _bytes_buffered: u64, _epochs_buffered: u32) -> bool {
+        true
+    }
 }

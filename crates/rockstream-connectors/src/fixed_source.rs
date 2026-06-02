@@ -49,6 +49,8 @@ impl Source for FixedSource {
         Some(SourceBatch {
             record_count: count,
             epoch,
+            offset: None,
+            watermark: None,
         })
     }
 

@@ -10,6 +10,10 @@ use crate::timestamp::Epoch;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Opaque token representing source offset position.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct OffsetToken(pub String);
+
 /// A batch of records produced by a source in one epoch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceBatch {
@@ -17,6 +21,10 @@ pub struct SourceBatch {
     pub record_count: usize,
     /// Epoch this batch belongs to.
     pub epoch: Epoch,
+    /// Opaque source offset.
+    pub offset: Option<OffsetToken>,
+    /// Event-time watermark.
+    pub watermark: Option<crate::timestamp::EventTimeWatermark>,
 }
 
 /// A batch of records to be written by a sink.
