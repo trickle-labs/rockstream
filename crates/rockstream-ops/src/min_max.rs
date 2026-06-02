@@ -81,6 +81,8 @@ pub struct MinMaxOp {
     multiset_state: HashMap<Vec<u8>, GroupMultiset>,
     /// Last-emitted extremum per group (for computing output deltas).
     last_emitted: HashMap<Vec<u8>, i64>,
+    budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
+    warned_over_budget: bool,
 }
 
 impl MinMaxOp {
@@ -103,7 +105,18 @@ impl MinMaxOp {
             scalar_fn,
             multiset_state: HashMap::new(),
             last_emitted: HashMap::new(),
+            budget: None,
+            warned_over_budget: false,
         }
+    }
+
+    /// Attach a state budget for memory bounding.
+    pub fn with_budget(
+        mut self,
+        budget: Arc<rockstream_types::state_budget::StateBudgetMeter>,
+    ) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Derive the current extremum for a group from its indexed multiset.
@@ -128,6 +141,23 @@ impl MinMaxOp {
         for row in input.iter() {
             let group_key = (self.group_fn)(&row.key, &row.value);
             let val = (self.scalar_fn)(&row.key, &row.value);
+
+            let is_new = !self.multiset_state.contains_key(&group_key);
+            if is_new {
+                if let Some(ref budget) = self.budget {
+                    let charge = (group_key.len() + 16) as u64; // key + val bytes approx
+                    if let Err(e) = budget.try_acquire(charge) {
+                        if !self.warned_over_budget {
+                            tracing::warn!(
+                                "RS-3604: state budget exceeded, OVER_BUDGET_RELAXED: {}",
+                                e
+                            );
+                            self.warned_over_budget = true;
+                        }
+                        continue;
+                    }
+                }
+            }
 
             let multiset = self.multiset_state.entry(group_key.clone()).or_default();
             *multiset.entry(val).or_insert(0) += row.weight;
@@ -166,9 +196,15 @@ impl MinMaxOp {
             }
 
             // Prune empty multisets.
-            if let Some(m) = self.multiset_state.get(&group_key) {
-                if m.is_empty() {
-                    self.multiset_state.remove(&group_key);
+            if self
+                .multiset_state
+                .get(&group_key)
+                .is_some_and(|m| m.is_empty())
+            {
+                self.multiset_state.remove(&group_key);
+                if let Some(ref budget) = self.budget {
+                    let released = (group_key.len() + 16) as u64;
+                    budget.release(released);
                 }
             }
         }

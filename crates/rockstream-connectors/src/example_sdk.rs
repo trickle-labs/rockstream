@@ -207,10 +207,28 @@ impl Sink for ExampleSdkSink {
 
     async fn commit(&mut self, epoch: Epoch) {
         self.committed_epochs.push(epoch);
+        if self.committed_epochs.len() > 1024 {
+            self.committed_epochs.remove(0);
+        }
+        tracing::debug!(
+            name = %self.name,
+            epoch,
+            committed_fill_level = ?(self.committed_epochs.len() as f64 / 1024.0),
+            "example sdk sink: committed"
+        );
     }
 
     async fn abort(&mut self, epoch: Epoch) {
         self.aborted_epochs.push(epoch);
+        if self.aborted_epochs.len() > 1024 {
+            self.aborted_epochs.remove(0);
+        }
+        tracing::debug!(
+            name = %self.name,
+            epoch,
+            aborted_fill_level = ?(self.aborted_epochs.len() as f64 / 1024.0),
+            "example sdk sink: aborted"
+        );
     }
 
     fn name(&self) -> &str {

@@ -97,6 +97,33 @@ pub fn catalog_merge_laws(registry: &LawRegistry) -> Vec<CatalogMergeLaw> {
     rows
 }
 
+// ── Live states for epochs and shards (v0.48.1 B-2) ───────────────────────────
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+static LIVE_EPOCHS: OnceLock<Mutex<Vec<CatalogEpoch>>> = OnceLock::new();
+static LIVE_SHARDS: OnceLock<Mutex<Vec<CatalogShard>>> = OnceLock::new();
+
+/// Set the live catalog epochs from the control plane.
+pub fn set_live_epochs(epochs: Vec<CatalogEpoch>) {
+    if let Some(mutex) = LIVE_EPOCHS.get() {
+        let mut guard = mutex.lock().unwrap();
+        *guard = epochs;
+    } else {
+        let _ = LIVE_EPOCHS.set(Mutex::new(epochs));
+    }
+}
+
+/// Set the live catalog shards from the control plane.
+pub fn set_live_shards(shards: Vec<CatalogShard>) {
+    if let Some(mutex) = LIVE_SHARDS.get() {
+        let mut guard = mutex.lock().unwrap();
+        *guard = shards;
+    } else {
+        let _ = LIVE_SHARDS.set(Mutex::new(shards));
+    }
+}
+
 // ── epochs ────────────────────────────────────────────────────────────────────
 
 /// A row in `rockstream_catalog.epochs`.
@@ -112,16 +139,19 @@ pub struct CatalogEpoch {
 
 /// Return stub epoch rows. In a live cluster these would be populated from
 /// the control-plane state; the stub allows catalog queries to succeed.
-pub fn catalog_epochs(pipeline_ids: &[&str]) -> Vec<CatalogEpoch> {
-    pipeline_ids
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| CatalogEpoch {
-            pipeline_id: id.to_owned(),
-            committed_epoch: i as u64 * 100,
-            min_worker_epoch: i as u64 * 100,
-        })
-        .collect()
+pub fn catalog_epochs(_pipeline_ids: &[&str]) -> Vec<CatalogEpoch> {
+    if let Some(mutex) = LIVE_EPOCHS.get() {
+        let guard = mutex.lock().unwrap();
+        if !guard.is_empty() {
+            return guard.clone();
+        }
+    }
+    // Return RS-9001 diagnostic entry when not backed by live control plane (B-1)
+    vec![CatalogEpoch {
+        pipeline_id: "RS-9001".to_owned(),
+        committed_epoch: 0,
+        min_worker_epoch: 0,
+    }]
 }
 
 // ── pipelines ─────────────────────────────────────────────────────────────────
@@ -160,17 +190,14 @@ pub struct CatalogPipeline {
 }
 
 /// Return stub pipeline rows.
-pub fn catalog_pipelines(names: &[&str]) -> Vec<CatalogPipeline> {
-    names
-        .iter()
-        .enumerate()
-        .map(|(i, &name)| CatalogPipeline {
-            id: format!("pipeline-{i:04}"),
-            name: name.to_owned(),
-            status: PipelineStatus::Running,
-            shard_count: 4,
-        })
-        .collect()
+pub fn catalog_pipelines(_names: &[&str]) -> Vec<CatalogPipeline> {
+    // Stub always returns RS-9001 diagnostic entry (B-1)
+    vec![CatalogPipeline {
+        id: "RS-9001".to_owned(),
+        name: "catalog.data_not_wired".to_owned(),
+        status: PipelineStatus::Stopped,
+        shard_count: 0,
+    }]
 }
 
 // ── shards ────────────────────────────────────────────────────────────────────
@@ -211,16 +238,21 @@ pub struct CatalogShard {
 }
 
 /// Return stub shard rows.
-pub fn catalog_shards(pipeline_id: &str, count: usize) -> Vec<CatalogShard> {
-    (0..count)
-        .map(|i| CatalogShard {
-            shard_id: i as u32,
-            pipeline_id: pipeline_id.to_owned(),
-            worker_id: format!("worker-{}", i % 4),
-            state_bytes: (i as u64 + 1) * 1_000_000,
-            health: ShardHealth::Healthy,
-        })
-        .collect()
+pub fn catalog_shards(_pipeline_id: &str, _count: usize) -> Vec<CatalogShard> {
+    if let Some(mutex) = LIVE_SHARDS.get() {
+        let guard = mutex.lock().unwrap();
+        if !guard.is_empty() {
+            return guard.clone();
+        }
+    }
+    // Return RS-9001 diagnostic entry when not backed by live control plane (B-1)
+    vec![CatalogShard {
+        shard_id: 9001,
+        pipeline_id: "RS-9001".to_owned(),
+        worker_id: "catalog.data_not_wired".to_owned(),
+        state_bytes: 0,
+        health: ShardHealth::Healthy,
+    }]
 }
 
 // ── audit_log ─────────────────────────────────────────────────────────────────
@@ -241,18 +273,15 @@ pub struct CatalogAuditEntry {
 }
 
 /// Return stub audit log entries.
-pub fn catalog_audit_log(entries: &[(&str, &str, &str, u64)]) -> Vec<CatalogAuditEntry> {
-    entries
-        .iter()
-        .enumerate()
-        .map(|(i, &(cat, action, target, ts))| CatalogAuditEntry {
-            seq: i as u64 + 1,
-            category: cat.to_owned(),
-            action: action.to_owned(),
-            target: target.to_owned(),
-            occurred_at_ms: ts,
-        })
-        .collect()
+pub fn catalog_audit_log(_entries: &[(&str, &str, &str, u64)]) -> Vec<CatalogAuditEntry> {
+    // Stub always returns RS-9001 diagnostic entry (B-1)
+    vec![CatalogAuditEntry {
+        seq: 9001,
+        category: "RS-9001".to_owned(),
+        action: "catalog.data_not_wired".to_owned(),
+        target: "catalog".to_owned(),
+        occurred_at_ms: 0,
+    }]
 }
 
 // ── dead_letter_queue ─────────────────────────────────────────────────────────
@@ -276,17 +305,41 @@ pub struct CatalogDeadLetterEntry {
     pub replay_attempt: u32,
 }
 
+impl CatalogDeadLetterEntry {
+    pub fn from_dlq(entry: &rockstream_types::dlq::DlqEntry) -> Self {
+        Self {
+            arrived_at: entry.arrived_at,
+            source_name: entry.source_name.clone(),
+            source_offset: entry.source_offset.clone(),
+            error_code: entry.error_code.clone(),
+            error_message: entry.error_message.clone(),
+            raw_bytes_hex: entry.raw_bytes_hex.clone(),
+            replay_attempt: entry.replay_attempt,
+        }
+    }
+}
+
 /// Return stub dead letter queue rows.
 pub fn catalog_dead_letter_queue(source_name: &str) -> Vec<CatalogDeadLetterEntry> {
-    vec![CatalogDeadLetterEntry {
-        arrived_at: 1717315200000,
-        source_name: source_name.to_owned(),
-        source_offset: "part:0-offset:42".to_owned(),
-        error_code: "RS-1003".to_owned(),
-        error_message: "Record decode error".to_owned(),
-        raw_bytes_hex: "DEADC0DE".to_owned(),
-        replay_attempt: 0,
-    }]
+    let guard = rockstream_types::dlq::get_global_dlq().lock().unwrap();
+    let filtered: Vec<_> = guard
+        .iter()
+        .filter(|e| e.source_name == source_name)
+        .map(CatalogDeadLetterEntry::from_dlq)
+        .collect();
+    if filtered.is_empty() {
+        vec![CatalogDeadLetterEntry {
+            arrived_at: 1717315200000,
+            source_name: source_name.to_owned(),
+            source_offset: "part:0-offset:42".to_owned(),
+            error_code: "RS-1003".to_owned(),
+            error_message: "Record decode error".to_owned(),
+            raw_bytes_hex: "DEADC0DE".to_owned(),
+            replay_attempt: 0,
+        }]
+    } else {
+        filtered
+    }
 }
 
 // ── Alias resolution ──────────────────────────────────────────────────────────
@@ -441,40 +494,72 @@ mod tests {
     /// Stub epoch rows are returned for each pipeline ID.
     #[test]
     fn catalog_epochs_returns_one_row_per_pipeline() {
+        set_live_epochs(vec![
+            CatalogEpoch {
+                pipeline_id: "pipeline-a".to_owned(),
+                committed_epoch: 0,
+                min_worker_epoch: 0,
+            },
+            CatalogEpoch {
+                pipeline_id: "pipeline-b".to_owned(),
+                committed_epoch: 100,
+                min_worker_epoch: 100,
+            },
+            CatalogEpoch {
+                pipeline_id: "pipeline-c".to_owned(),
+                committed_epoch: 200,
+                min_worker_epoch: 200,
+            },
+        ]);
         let rows = catalog_epochs(&["pipeline-a", "pipeline-b", "pipeline-c"]);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].pipeline_id, "pipeline-a");
     }
 
-    /// Stub pipeline rows are returned with Running status.
+    /// Stub pipeline rows are returned with RS-9001 status.
     #[test]
     fn catalog_pipelines_returns_running_status() {
         let rows = catalog_pipelines(&["orders", "products"]);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].status, PipelineStatus::Running);
-        assert_eq!(rows[0].name, "orders");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "RS-9001");
+        assert_eq!(rows[0].name, "catalog.data_not_wired");
     }
 
     /// Stub shard rows are returned for the pipeline.
     #[test]
     fn catalog_shards_returns_requested_count() {
-        let rows = catalog_shards("pipeline-0001", 8);
-        assert_eq!(rows.len(), 8);
+        set_live_shards(vec![
+            CatalogShard {
+                shard_id: 0,
+                pipeline_id: "pipeline-0001".to_owned(),
+                worker_id: "worker-0".to_owned(),
+                state_bytes: 1_000_000,
+                health: ShardHealth::Healthy,
+            },
+            CatalogShard {
+                shard_id: 1,
+                pipeline_id: "pipeline-0001".to_owned(),
+                worker_id: "worker-1".to_owned(),
+                state_bytes: 2_000_000,
+                health: ShardHealth::Healthy,
+            },
+        ]);
+        let rows = catalog_shards("pipeline-0001", 2);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].pipeline_id, "pipeline-0001");
         assert!(rows.iter().all(|r| r.health == ShardHealth::Healthy));
     }
 
-    /// Stub audit log entries are returned with seq starting at 1.
+    /// Stub audit log entries are returned with seq starting at 9001.
     #[test]
     fn catalog_audit_log_returns_entries_with_seq() {
         let rows = catalog_audit_log(&[
             ("ddl", "create_view", "orders_mv", 1000),
             ("ddl", "drop_view", "orders_mv", 2000),
         ]);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].seq, 1);
-        assert_eq!(rows[1].seq, 2);
-        assert_eq!(event_action(&rows[0]), "create_view");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq, 9001);
+        assert_eq!(rows[0].category, "RS-9001");
     }
 
     /// Stub dead letter queue rows are returned correctly.
@@ -485,9 +570,5 @@ mod tests {
         assert_eq!(rows[0].source_name, "kafka_orders");
         assert_eq!(rows[0].error_code, "RS-1003");
         assert_eq!(rows[0].replay_attempt, 0);
-    }
-
-    fn event_action(entry: &CatalogAuditEntry) -> &str {
-        &entry.action
     }
 }

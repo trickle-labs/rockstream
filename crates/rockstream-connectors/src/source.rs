@@ -128,3 +128,43 @@ pub trait Source: Send {
     /// Delete (permanently deactivate) the connector.
     async fn delete(&mut self) {}
 }
+
+/// Opt-in trait for sources that support partition-level push-down.
+pub trait PartitionPushdownSource: Source {
+    /// Check if partition-level push-down is supported.
+    fn partition_filter_support(&self) -> bool {
+        Source::partition_filter_support(self)
+    }
+}
+
+/// Opt-in trait for sources that support schema discovery.
+pub trait SchemaAwareSource: Source {
+    /// Discover the schema of this source and return CRDT column metadata.
+    fn discover_schema(&self) -> LawSchemaMetadata {
+        Source::discover_schema(self)
+    }
+}
+
+/// Opt-in trait for sources that support lifecycle management.
+#[async_trait]
+pub trait LifecycleSource: Source {
+    /// Return the current lifecycle state of this connector.
+    fn lifecycle_state(&self) -> ConnectorLifecycleState {
+        Source::lifecycle_state(self)
+    }
+
+    /// Pause the connector. Returns `true` if the transition succeeded.
+    async fn pause(&mut self) -> bool {
+        Source::pause(self).await
+    }
+
+    /// Resume a paused connector. Returns `true` if the transition succeeded.
+    async fn resume(&mut self) -> bool {
+        Source::resume(self).await
+    }
+
+    /// Delete (permanently deactivate) the connector.
+    async fn delete(&mut self) {
+        Source::delete(self).await;
+    }
+}

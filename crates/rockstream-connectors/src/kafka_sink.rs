@@ -77,9 +77,13 @@ impl Sink for KafkaSink {
         // In production: commit_transaction().
         self.state = KafkaTxState::Committed { epoch };
         self.committed_epochs.push(epoch);
+        if self.committed_epochs.len() > 1024 {
+            self.committed_epochs.remove(0);
+        }
         tracing::debug!(
             topic = %self.topic,
             epoch,
+            committed_fill_level = ?(self.committed_epochs.len() as f64 / 1024.0),
             "kafka sink: producer transaction committed"
         );
     }
@@ -88,9 +92,13 @@ impl Sink for KafkaSink {
         // In production: abort_transaction().
         self.state = KafkaTxState::Idle;
         self.aborted_epochs.push(epoch);
+        if self.aborted_epochs.len() > 1024 {
+            self.aborted_epochs.remove(0);
+        }
         tracing::debug!(
             topic = %self.topic,
             epoch,
+            aborted_fill_level = ?(self.aborted_epochs.len() as f64 / 1024.0),
             "kafka sink: producer transaction aborted"
         );
     }

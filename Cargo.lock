@@ -3597,6 +3597,7 @@ dependencies = [
  "rockstream-plan",
  "rockstream-runtime",
  "rockstream-sql",
+ "rockstream-storage",
  "rockstream-types",
  "serde_json",
  "tokio",
@@ -3660,9 +3661,12 @@ dependencies = [
 name = "rockstream-gateway"
 version = "0.48.0"
 dependencies = [
+ "object_store 0.12.5",
+ "rockstream-storage",
  "rockstream-types",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

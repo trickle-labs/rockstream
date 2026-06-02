@@ -47,6 +47,22 @@ impl ShardReader {
         Ok(self.reader.get(key).await?)
     }
 
+    /// Look up an idempotency key epoch.
+    pub async fn get_idempotency_epoch(
+        &self,
+        shard_id: u32,
+        key_hash: [u8; 16],
+    ) -> Result<Option<u64>, StorageError> {
+        let key = crate::keys::ShardKeyEncoder::idempotency_key(shard_id, key_hash);
+        if let Some(bytes) = self.get(&key).await? {
+            if bytes.len() == 8 {
+                let epoch = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+                return Ok(Some(epoch));
+            }
+        }
+        Ok(None)
+    }
+
     /// Scan all key-value pairs with the given prefix from the snapshot.
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
         let mut results = Vec::new();

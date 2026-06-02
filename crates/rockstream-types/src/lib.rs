@@ -8,6 +8,7 @@ pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
 pub mod connector;
+pub mod dlq;
 pub mod error_code;
 pub mod exchange;
 pub mod explain;

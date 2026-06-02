@@ -107,3 +107,37 @@ pub trait Sink: Send {
     /// Delete (permanently deactivate) the sink.
     async fn delete(&mut self) {}
 }
+
+/// Opt-in trait for sinks that support Tier 2 features (should_flush, discover_schema, lifecycle).
+#[async_trait]
+pub trait Tier2Sink: Sink {
+    /// Override default flush trigger for file-format sinks.
+    fn should_flush(&self, bytes_buffered: u64, epochs_buffered: u32) -> bool {
+        Sink::should_flush(self, bytes_buffered, epochs_buffered)
+    }
+
+    /// Discover the schema of this sink and return CRDT column metadata.
+    fn discover_schema(&self) -> LawSchemaMetadata {
+        Sink::discover_schema(self)
+    }
+
+    /// Return the current lifecycle state of this connector.
+    fn lifecycle_state(&self) -> ConnectorLifecycleState {
+        Sink::lifecycle_state(self)
+    }
+
+    /// Pause the sink. Returns `true` if the transition succeeded.
+    async fn pause(&mut self) -> bool {
+        Sink::pause(self).await
+    }
+
+    /// Resume a paused sink. Returns `true` if the transition succeeded.
+    async fn resume(&mut self) -> bool {
+        Sink::resume(self).await
+    }
+
+    /// Delete (permanently deactivate) the sink.
+    async fn delete(&mut self) {
+        Sink::delete(self).await;
+    }
+}

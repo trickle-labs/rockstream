@@ -21,6 +21,21 @@ connector is classified by its **tier**:
 
 ---
 
+## Connector Capability Status Matrix
+
+Below is the formal capability matrix mapping out operational status versus known stubs for all built-in and SDK-based connectors:
+
+| Connector | Tier | Partition Filter Push-down | Custom Flush (`should_flush`) | CRDT Schema (`discover_schema`) | Lifecycle (Pause/Resume/Delete) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Kafka** | Tier 1 | ❌ Unsupported | ❌ Default (Flush on Epoch) | ❌ Unsupported |  Supported |
+| **Postgres CDC** | Tier 1 | ❌ Unsupported | ❌ Default (Flush on Epoch) | ❌ Unsupported |  Supported |
+| **S3** | Tier 1 | ❌ Unsupported | ❌ Default (Flush on Epoch) | ❌ Unsupported |  Supported |
+| **HTTP** | Tier 1 | ❌ Unsupported | ❌ Default (Flush on Epoch) | ❌ Unsupported |  Supported |
+| **Iceberg** | Tier 2 | ❌ Unsupported |  Supported (Size/Epoch) | ❌ Unsupported |  Supported |
+| **Example SDK** | Tier 2 |  Supported (Mock) |  Supported |  Supported (COUNTER, MAX_REGISTER) |  Supported |
+
+---
+
 ## Tier 1 Contract
 
 All connectors **must** implement these methods from the `Source` or `Sink`
@@ -287,6 +302,43 @@ as a reference baseline. Your connector should pass equivalent tests covering:
 
 ```bash
 cargo test --package rockstream-connectors
+```
+
+### Containerized MinIO Integration Testing (For S3-Active Sinks/Sources)
+
+Any functional pathway interacting with S3-compatible object storage (such as checkpoint snapshots, WALs, or the S3 connector) should execute integration tests against a real local MinIO instance.
+
+#### 1. Spin up MinIO Container
+Run a local MinIO container using Docker:
+```bash
+docker run -d -p 9000:9000 -p 9001:9001 \
+  -e "MINIO_ROOT_USER=rockstream" \
+  -e "MINIO_ROOT_PASSWORD=rockstream-secret" \
+  minio/minio server /data --console-address ":9001"
+```
+
+#### 2. Configure Environment Variables
+Before running tests, configure the AWS/S3 environment variables to target the local MinIO endpoint:
+```bash
+export AWS_ACCESS_KEY_ID=rockstream
+export AWS_SECRET_ACCESS_KEY=rockstream-secret
+export AWS_ENDPOINT_URL=http://localhost:9000
+export AWS_REGION=us-east-1
+```
+
+#### 3. Run S3 Integration Test Suite
+Execute the dedicated S3 connector and storage tests with feature flag `s3-integration`:
+```bash
+cargo test --package rockstream-connectors --features s3-integration
+```
+
+#### 4. Simulated Fault Injection
+To verify client resilience (timeouts, 503 retries, checksum validations), tests use a proxy or configure the internal S3 client request wrapper with an artificial fault-injection rate:
+```rust
+// When running S3/MinIO integration tests:
+let config = S3ClientConfig::default()
+    .with_endpoint("http://localhost:9000")
+    .with_fault_injection_rate(0.10); // 10% simulated HTTP 503/timeout faults
 ```
 
 ---

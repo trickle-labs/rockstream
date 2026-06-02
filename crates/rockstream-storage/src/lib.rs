@@ -24,7 +24,9 @@ pub use error::StorageError;
 pub use keys::{CatalogKeyEncoder, ShardKeyEncoder, ShardPrefix};
 pub use merge_registry::{MergeOperatorRegistry, SumCountMergeOperator};
 pub use reader::ShardReader;
-pub use shard_db::{ShardDb, WriteBatch};
+pub use shard_db::{
+    is_allow_law_operand_fallback, set_allow_law_operand_fallback, ShardDb, WriteBatch,
+};
 pub use wal_cache::WalListingCache;
 
 #[cfg(test)]

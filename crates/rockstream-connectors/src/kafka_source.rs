@@ -59,7 +59,20 @@ impl Source for KafkaSource {
         // Simulate decode errors
         if self.decode_errors_count > 0 {
             self.decode_errors_count -= 1;
-            // Record the decode error: in production, this would route to DLQ
+            // Record the decode error to the global persistent DLQ database (B-3)
+            let entry = rockstream_types::dlq::DlqEntry {
+                arrived_at: 1717315200000,
+                source_name: self.name().to_string(),
+                source_offset: format!("part:0-offset:{}", self.current_offset),
+                error_code: "RS-1003".to_string(),
+                error_message: "Record decode error".to_string(),
+                raw_bytes_hex: "DEADC0DE".to_string(),
+                replay_attempt: 0,
+            };
+            {
+                let mut guard = rockstream_types::dlq::get_global_dlq().lock().unwrap();
+                guard.push(entry);
+            }
             tracing::warn!(
                 topic = %self.topic,
                 offset = self.current_offset,

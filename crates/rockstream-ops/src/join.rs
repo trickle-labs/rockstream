@@ -88,6 +88,8 @@ pub struct HashJoinOp {
     left_arr: Arrangement,
     /// Right arrangement: join_key → (row_key, row_value) → weight.
     right_arr: Arrangement,
+    budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
+    warned_over_budget: bool,
 }
 
 impl HashJoinOp {
@@ -110,7 +112,18 @@ impl HashJoinOp {
             combine_fn,
             left_arr: HashMap::new(),
             right_arr: HashMap::new(),
+            budget: None,
+            warned_over_budget: false,
         }
+    }
+
+    /// Attach a state budget for memory bounding.
+    pub fn with_budget(
+        mut self,
+        budget: Arc<rockstream_types::state_budget::StateBudgetMeter>,
+    ) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Process a left-side delta.
@@ -142,7 +155,23 @@ impl HashJoinOp {
         // Phase 2: update left arrangement (after output is produced).
         for row in left_delta.iter() {
             let join_key = (self.left_key_fn)(&row.key, &row.value);
-            let bucket = self.left_arr.entry(join_key).or_default();
+            let bucket = self.left_arr.entry(join_key.clone()).or_default();
+            let is_new = !bucket.contains_key(&(row.key.clone(), row.value.clone()));
+            if is_new {
+                if let Some(ref budget) = self.budget {
+                    let charge = (join_key.len() + row.key.len() + row.value.len() + 8) as u64;
+                    if let Err(e) = budget.try_acquire(charge) {
+                        if !self.warned_over_budget {
+                            tracing::warn!(
+                                "RS-3604: state budget exceeded, OVER_BUDGET_RELAXED: {}",
+                                e
+                            );
+                            self.warned_over_budget = true;
+                        }
+                        continue;
+                    }
+                }
+            }
             *bucket
                 .entry((row.key.clone(), row.value.clone()))
                 .or_insert(0) += row.weight;
@@ -180,7 +209,23 @@ impl HashJoinOp {
         // Phase 2: update right arrangement (after output is produced).
         for row in right_delta.iter() {
             let join_key = (self.right_key_fn)(&row.key, &row.value);
-            let bucket = self.right_arr.entry(join_key).or_default();
+            let bucket = self.right_arr.entry(join_key.clone()).or_default();
+            let is_new = !bucket.contains_key(&(row.key.clone(), row.value.clone()));
+            if is_new {
+                if let Some(ref budget) = self.budget {
+                    let charge = (join_key.len() + row.key.len() + row.value.len() + 8) as u64;
+                    if let Err(e) = budget.try_acquire(charge) {
+                        if !self.warned_over_budget {
+                            tracing::warn!(
+                                "RS-3604: state budget exceeded, OVER_BUDGET_RELAXED: {}",
+                                e
+                            );
+                            self.warned_over_budget = true;
+                        }
+                        continue;
+                    }
+                }
+            }
             *bucket
                 .entry((row.key.clone(), row.value.clone()))
                 .or_insert(0) += row.weight;
@@ -211,8 +256,8 @@ impl HashJoinOp {
     ///
     /// Called at epoch boundaries to reclaim memory.
     pub fn compact(&mut self) {
-        compact_arr(&mut self.left_arr);
-        compact_arr(&mut self.right_arr);
+        compact_arr(&mut self.left_arr, &self.budget);
+        compact_arr(&mut self.right_arr, &self.budget);
     }
 
     /// Returns runtime metadata for `EXPLAIN INCREMENTAL`.
@@ -274,9 +319,22 @@ impl Operator for HashJoinOp {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn compact_arr(arr: &mut Arrangement) {
-    arr.retain(|_, bucket| {
-        bucket.retain(|_, w| *w != 0);
+fn compact_arr(
+    arr: &mut Arrangement,
+    budget: &Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
+) {
+    arr.retain(|join_key, bucket| {
+        bucket.retain(|(rk, rv), w| {
+            if *w == 0 {
+                if let Some(ref b) = budget {
+                    let released = (join_key.len() + rk.len() + rv.len() + 8) as u64;
+                    b.release(released);
+                }
+                false
+            } else {
+                true
+            }
+        });
         !bucket.is_empty()
     });
 }

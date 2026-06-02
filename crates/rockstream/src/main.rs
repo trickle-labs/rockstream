@@ -106,6 +106,10 @@ enum Command {
         /// Path to the CA certificate used for peer verification (PEM).
         #[arg(long)]
         tls_ca_cert: Option<String>,
+
+        /// Allow merge-read fallback to raw bytes on law operand corruption (emergency recovery only).
+        #[arg(long)]
+        allow_law_operand_fallback: bool,
     },
     /// Bootstrap a new cluster at a running control service.
     ///
@@ -164,7 +168,9 @@ async fn main() {
             tls_cert,
             tls_key,
             tls_ca_cert,
+            allow_law_operand_fallback,
         }) => {
+            rockstream_storage::set_allow_law_operand_fallback(allow_law_operand_fallback);
             run_start(
                 &storage,
                 role,

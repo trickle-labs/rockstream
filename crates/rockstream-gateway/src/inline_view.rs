@@ -493,6 +493,21 @@ impl InlineViewCatalog {
             raw_bytes_hex: raw_bytes_hex.to_string(),
             replay_attempt: 0,
         };
+
+        // Also push to the global static DLQ!
+        {
+            let mut guard = rockstream_types::dlq::get_global_dlq().lock().unwrap();
+            guard.push(rockstream_types::dlq::DlqEntry {
+                arrived_at: entry.arrived_at,
+                source_name: entry.source_name.clone(),
+                source_offset: entry.source_offset.clone(),
+                error_code: entry.error_code.clone(),
+                error_message: entry.error_message.clone(),
+                raw_bytes_hex: entry.raw_bytes_hex.clone(),
+                replay_attempt: entry.replay_attempt,
+            });
+        }
+
         self.dead_letter_queue.push(entry);
 
         let dlq_count = self
@@ -517,6 +532,17 @@ impl InlineViewCatalog {
         _until: Option<&str>,
     ) -> Result<usize, String> {
         let mut count = 0;
+
+        // Update the global static DLQ!
+        {
+            let mut guard = rockstream_types::dlq::get_global_dlq().lock().unwrap();
+            for entry in guard.iter_mut() {
+                if entry.source_name == source_name {
+                    entry.replay_attempt += 1;
+                }
+            }
+        }
+
         for entry in &mut self.dead_letter_queue {
             if entry.source_name == source_name {
                 entry.replay_attempt += 1;
@@ -532,6 +558,23 @@ impl InlineViewCatalog {
         predicate: &str,
     ) -> Result<usize, String> {
         let initial_len = self.dead_letter_queue.len();
+
+        // Update the global static DLQ!
+        {
+            let mut guard = rockstream_types::dlq::get_global_dlq().lock().unwrap();
+            if predicate.contains("error_code") {
+                let code = predicate
+                    .split('=')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"');
+                guard.retain(|e| !(e.source_name == source_name && e.error_code == code));
+            } else {
+                guard.retain(|e| e.source_name != source_name);
+            }
+        }
+
         if predicate.contains("error_code") {
             let code = predicate
                 .split('=')
