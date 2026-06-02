@@ -100,8 +100,10 @@ These names are for orientation. They are not calendar commitments.
 | Integration Beta | v0.48 | Postgres access, direct writes, and major external connectors work end to end. |
 | Integration Beta — Wired | v0.48.1 | All v0.47–v0.48 connector and catalog features wired end-to-end; correctness debts paid; connector lifecycle DDL, persistent DLQ, and per-shard idempotency operational. Prerequisite for all subsequent versions. |
 | Production Beta | v0.55 | Observability, auth, upgrades, security review, and long soaks are ready for a pilot. |
-| Data Lake GA | v0.58 | Cold-tier Iceberg/Delta sinks, Iceberg REST catalog, external tool consumption proven. |
-| 1.0 | after v0.58 | Tagged only after a real production handoff succeeds without design exceptions. |
+| Data Lake GA | v0.58 | Cold-tier Iceberg/Delta sinks, Iceberg REST catalog, external tool consumption proven. Re-sequenced to post-1.0 where it expands stable surface (see *Moved to Post-1.0*). |
+| Surface Freeze | v0.59 | Stable CLI/config/SQL/API surface is frozen; remaining work is proof and hardening, not new capability. |
+| Release Candidate | v0.60 | Unstable public surface removed or hidden; release-blocking correctness/recovery/upgrade bugs closed; soak clean. |
+| 1.0 | v1.0 (after v0.60) | Stable core release: small surface, proven correctness/recovery/upgrade, documented limits. Tagged only after a real production-like handoff succeeds without design exceptions. |
 
 ---
 
@@ -238,6 +240,197 @@ the documentation is reviewed and merged.
 
 ---
 
+## After v0.48: Freeze, Prove, Harden
+
+After v0.48, RockStream stops expanding the stable feature surface and shifts
+to proving, freezing, simplifying, and hardening the system for 1.0. The
+Integration Beta surface is the last broad capability expansion that 1.0
+inherits by default.
+
+From this point forward, new work must do at least one of the following:
+
+- improve correctness,
+- reduce operational risk,
+- reduce public surface,
+- improve debuggability,
+- validate recovery or upgrade behavior, or
+- produce production evidence.
+
+Work that does none of these belongs after 1.0. This is not a judgement that
+deferred work is unimportant; it is a deliberate choice to protect 1.0 quality
+by keeping the stable core small, supportable, and predictable.
+
+---
+
+## 1.0 Scope
+
+1.0 is a stable core release, not a feature-complete distributed SQL system.
+It should be boring, supportable, and predictable. The 1.0 surface is:
+
+- a documented SQL subset for live views (not long-tail PostgreSQL parity);
+- core incremental operators that are fully tested against the oracle;
+- production-grade single-region deployment;
+- stable source / view / pipeline lifecycle management;
+- predictable recovery from worker and coordinator failure;
+- checkpoint / replay correctness;
+- a safe rolling-upgrade path;
+- essential freshness / SLO controls;
+- essential quotas;
+- essential metrics, logs, traces, error codes, and audit events;
+- a support bundle;
+- a small number of production-grade connectors;
+- a minimal, stable CLI / config / API surface;
+- documented operational limits.
+
+If a capability is not on this list, it is not required for 1.0.
+
+---
+
+## Moved to Post-1.0
+
+The following are deliberately deferred until after 1.0. They are not rejected;
+they are sequenced behind the 1.0 quality bar. Several already appear in the
+version table above (v0.49–v0.58); where they do, their advanced form is
+deferred and only the minimal 1.0-safe slice — if any — is kept pre-1.0. The
+1.0 tag is gated by the 1.0 Gate below, not by completing every v0.x version.
+
+- full SQL ambition and long-tail PostgreSQL compatibility;
+- recursion and advanced recursive query support;
+- lateral joins and other advanced relational operators;
+- a broad connector catalog;
+- non-core sinks;
+- custom sink / plugin APIs;
+- advanced auto-tuning sophistication;
+- manual low-level distributed controls;
+- multi-region support;
+- highly dynamic elasticity scenarios;
+- a large public observability surface;
+- user-facing PlanIR or internal execution APIs;
+- multiple equivalent stable control-plane surfaces;
+- advanced windowing beyond essential cases;
+- complex view-on-view behavior beyond simple safe cases;
+- user-defined merge laws (`CREATE MERGE LAW`);
+- cold-tier Iceberg/Delta sinks and the Iceberg REST catalog server;
+- performance optimizations that complicate deterministic replay, recovery, or
+  correctness.
+
+A capability already implemented and proven before 1.0 may remain only if it
+does not increase the stable public surface. Otherwise it is marked
+experimental or internal (see Public Surface Policy) and its stabilization is
+post-1.0.
+
+---
+
+## Post-v0.48 Release Gates
+
+In addition to the Common Definition of Done, every post-v0.48 version must
+produce evidence appropriate to its scope. The path to 1.0 must accumulate, in
+aggregate, all of the following:
+
+- a full differential correctness oracle suite;
+- randomized insert / update / delete / retract tests;
+- metamorphic SQL tests;
+- a deterministic simulation matrix;
+- worker and coordinator crash tests;
+- checkpoint-interruption tests;
+- object-store timeout / throttling tests;
+- rolling-upgrade tests;
+- mixed-version compatibility tests where applicable;
+- storage-format compatibility tests;
+- connector conformance tests;
+- a 7–14 day pre-RC production-like soak;
+- a longer final soak before 1.0;
+- documented benchmark methodology;
+- a documented public API stability policy;
+- every stable public error documented;
+- every stable metric documented;
+- all supported SQL documented;
+- no undocumented stable public behavior.
+
+These are gates, not aspirations. A missing gate blocks the version that claims
+it, exactly as a failing soak blocks sign-off.
+
+---
+
+## Public Surface Policy
+
+After v0.48, every user-reachable surface is classified into one of four
+categories:
+
+- **stable** — covered by the public API stability policy and supported at 1.0;
+- **experimental** — visibly marked; may change or be removed without a
+  stability guarantee;
+- **internal** — not documented as stable and not a supported dependency;
+- **deprecated** — scheduled for removal, with a documented replacement.
+
+Rules from v0.48 onward:
+
+- No new stable public API is added without explicit review.
+- Internal APIs must not be documented as stable.
+- Experimental features must be visibly marked as experimental.
+- CLI commands, config keys, SQL extensions, system tables, metrics, and error
+  codes are each classified.
+- Debug and internal endpoints must not become accidental production
+  dependencies.
+
+RockStream exposes intent, not mechanism. The stable 1.0 surface exposes
+freshness targets, quotas, priority, retention, and connector configuration. It
+does not expose shard placement, frontier internals, exchange fanout,
+compaction internals, physical execution details, or low-level scheduler
+controls as stable 1.0 surface.
+
+---
+
+## Path to 1.0 — Surface Freeze, Release Candidate, Stable Core
+
+These milestones realize the post-v0.48 principle. The existing v0.49–v0.58
+versions are narrowed to their 1.0-essential scope (operability, security,
+upgrades, recovery, soak) with non-core work deferred per *Moved to Post-1.0*;
+the three milestones below are the explicit freeze-and-harden tail. Numbering
+follows the existing roadmap — the proposed "v0.49 / v0.50 / v1.0" shape is
+adapted to v0.59 / v0.60 / v1.0 because v0.49–v0.58 are already allocated. As
+always, these are evidence milestones, not dates.
+
+### v0.59 — Surface Freeze and Production Evidence
+
+- Freeze the stable CLI / config / SQL / API surface.
+- Classify every unstable surface as experimental or internal.
+- Complete the correctness-model documentation.
+- Complete the operator handbook.
+- Complete the SQL compatibility / subset documentation.
+- Run the full correctness oracle suite.
+- Run the deterministic distributed simulation matrix.
+- Run upgrade and recovery tests.
+- Validate object-store failure and throttling behavior.
+- Run a 7–14 day production-like soak.
+- Publish the benchmark methodology.
+
+### v0.60 — Release Candidate Hardening
+
+- Remove or hide unstable public surface.
+- Fix release-blocking correctness / recovery / upgrade bugs.
+- Validate rolling upgrades.
+- Validate support-bundle usefulness.
+- Validate connector contract behavior.
+- Validate bounded resource usage.
+- Validate freshness behavior under load.
+- Validate that documented workloads cause no unbounded object-store cost
+  growth.
+- Prepare 1.0 release notes and documented limitations.
+
+### v1.0 — Stable Core Release
+
+- A small stable surface.
+- Documented limits.
+- Proven correctness.
+- Proven recovery.
+- Proven upgrade path.
+- Production-grade operations.
+- A supportable cloud-native deployment.
+- No accidental PostgreSQL-clone positioning.
+
+---
+
 ## 1.0 Gate
 
 RockStream should not tag 1.0 simply because v0.55 is complete. The 1.0 gate is
@@ -337,9 +530,10 @@ These may be good ideas later, but they dilute the first implementation:
   blind writes are pre-1.0 (§13.5.1), but a *global* cross-shard coordinator
   covering every shard is an explicit non-goal.
 - Full OLTP compatibility with Postgres.
-- Arbitrary user-defined CRDT merge functions before v0.51. `CREATE MERGE LAW`
-  is gated on the built-in catalog (v0.43–v0.46) and the shared property-test
-  suite proven in production soaks.
+- Arbitrary user-defined CRDT merge functions (`CREATE MERGE LAW`). Deferred to
+  post-1.0 (see *Moved to Post-1.0*); gated on the built-in catalog
+  (v0.43–v0.46) and the shared property-test suite proven in production soaks.
+  Pre-1.0 it remains feature-flagged and experimental, never stable surface.
 - A large web console before the CLI and metrics are excellent.
 - Per-query billing or chargeback.
 - Arbitrary user-defined distributed transactions.

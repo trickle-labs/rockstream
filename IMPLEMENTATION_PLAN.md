@@ -49,6 +49,7 @@ The phase numbers here map to ROADMAP.md roadmap versions as follows:
 | 10 | v0.49–v0.53 | Not started | Auth, observability, auto-tuner, secondary indexes, upgrades, security | — |
 | 11 | v0.54–v0.55 | Not started | Long soak and production beta handoff | — |
 | 12 | v0.56–v0.58 | Not started | Cold-tier sink, Iceberg REST catalog, snapshot GC | — |
+| 13 | v0.59–v1.0 | Not started | Pre-1.0 hardening, surface freeze, release candidate (mandatory) | — |
 
 > Note: Phase 4 and Phase 5 sign-offs were formally completed on 2026-05-31 under simulation-compensated
 > waivers approved by the Principal Architect, recorded in `plans/phase4-signoff.md` and `plans/phase5-signoff.md`.
@@ -56,6 +57,52 @@ The phase numbers here map to ROADMAP.md roadmap versions as follows:
 Durations are indicative effort, not calendar time, and assume a small
 dedicated team. The ROADMAP.md version table is the single source of truth
 for sequencing; this table exists only to orient readers between documents.
+
+---
+
+## Pre-1.0 Scope Control
+
+This plan intentionally narrows pre-1.0 scope. Before 1.0, the engineering
+priority is not feature completeness; it is correctness, recovery, operability,
+and a stable public surface. The Integration Beta surface (through v0.48) is the
+last broad capability expansion 1.0 inherits by default. Everything after v0.48
+must improve correctness, reduce operational risk, reduce public surface,
+improve debuggability, validate recovery/upgrade behavior, or produce production
+evidence — otherwise it is deferred to post-1.0 (Phase 14).
+
+This narrowing does not change RockStream's identity. The core design intent is
+preserved: correctness before scale; evidence over dates; simulation from the
+beginning; operability is not deferred; object-storage-backed cloud-native
+design; no accidental PostgreSQL clone (Postgres compatibility is an access
+layer, not the product goal); one binary / one CLI / one config; users interact
+with pipelines and views, not shards and antichains.
+
+### Narrowed or deferred to post-1.0
+
+Where the phases below list the following as pre-1.0 deliverables, they are
+narrowed to a minimal 1.0-safe form or deferred to post-1.0 (Phase 14):
+
+- full SQL coverage beyond the documented 1.0 subset;
+- recursion;
+- lateral joins;
+- advanced windowing beyond essential cases;
+- complex view-on-view optimization;
+- a large connector matrix;
+- custom connector / plugin / sink APIs;
+- multi-region operation;
+- advanced auto-tuning;
+- extensive user-facing debug APIs;
+- user-facing PlanIR;
+- low-level distributed control knobs;
+- multiple stable control-plane APIs;
+- advanced dynamic rebalancing / topology churn;
+- user-defined merge laws (`CREATE MERGE LAW`);
+- cold-tier Iceberg/Delta sinks and the Iceberg REST catalog server;
+- performance optimizations that compromise replay / recovery simplicity.
+
+A foundational feature that cannot be removed entirely is kept only in its
+minimal 1.0-safe form; its advanced form is explicitly deferred. These
+deferrals protect 1.0 quality; they are not rejections.
 
 ---
 
@@ -1633,6 +1680,15 @@ prune scatter sets for OLAP queries with selective predicates. See DESIGN.md
 
 **Goal**: GA release.
 
+> **Pre-1.0 scope control (see *Pre-1.0 Scope Control* and Phase 13).** The
+> "GA / v1.0.0 tagged" milestone here is the **stable core** release, gated by
+> the Phase 13 freeze-and-harden work and the ROADMAP 1.0 Gate. User-defined
+> merge laws (`CREATE MERGE LAW`) and the advanced optimistic-transaction subset
+> below are **deferred to post-1.0** unless already implemented and proven
+> without increasing the stable public surface; pre-1.0 they remain
+> feature-flagged and experimental. They are deferred to protect 1.0 quality,
+> not rejected.
+
 **Deliverables**
 
 - Versioning policy (SemVer), release engineering pipeline.
@@ -1862,6 +1918,137 @@ the audit log with the evidence considered.
   contention; no partial-visibility leaks over 7-day soak;
   `crdt_txn_pending_visible_total` stays at zero when atomic visibility
   is enabled.
+
+---
+
+---
+
+## Phase 13 — Pre-1.0 Hardening, Surface Freeze & Release Candidate
+
+**Maps to ROADMAP versions**: v0.59 (Surface Freeze and Production Evidence),
+v0.60 (Release Candidate Hardening), v1.0 (Stable Core Release).
+
+**Goal**: Prove, freeze, and harden the stable core for 1.0. This phase is
+mandatory, not optional. It introduces no new user-visible capability; its
+output is evidence, documentation, a frozen surface, and a release candidate.
+
+### Hardening workstreams
+
+- **Correctness hardening**: close every known oracle divergence; expand the
+  differential oracle corpus to cover the full documented SQL subset.
+- **Distributed simulation hardening**: scale the deterministic `SimRuntime`
+  matrix; every historical failing seed replays in CI.
+- **Recovery hardening**: worker and coordinator crash, checkpoint
+  interruption, and reassignment paths validated against the recovery SLOs.
+- **Rolling-upgrade hardening**: N→N+1 and mixed-version paths validated with
+  no epoch loss; storage-format compatibility gated.
+- **Connector contract validation**: every production-grade connector passes
+  the connector contract gates below.
+- **Public surface freeze**: stable surface frozen and classified (see audit
+  tasks below).
+- **Documentation completion**: all deliverables below merged and reviewed.
+- **Production-like soak**: a 7–14 day pre-RC soak, then a longer final soak
+  before 1.0.
+- **Benchmark validation**: documented benchmark methodology; published
+  baselines.
+- **Supportability review**: a person who did not build the system can operate
+  it using the docs, dashboard, CLI, audit log, and support bundle.
+
+### Documentation deliverables (release gates)
+
+- operator handbook;
+- correctness model;
+- SQL subset and compatibility guide;
+- public API stability policy;
+- error-code catalog;
+- metrics catalog;
+- troubleshooting guide;
+- failure-mode playbooks;
+- upgrade guide;
+- backup / restore / recovery guide;
+- connector contract documentation;
+- known limitations for 1.0.
+
+A version is not accepted until its documentation deliverables are merged.
+
+### Test deliverables (release gates)
+
+- differential correctness oracle tests;
+- randomized insert / update / delete / retract tests;
+- metamorphic SQL tests;
+- long-running state-drift tests;
+- deterministic simulation tests;
+- crash / restart tests;
+- checkpoint / replay tests;
+- object-store fault-injection tests;
+- connector conformance tests;
+- rolling-upgrade tests;
+- mixed-version tests where applicable;
+- storage-format compatibility tests;
+- performance-regression tests;
+- soak tests;
+- resource-leak tests;
+- bounded object-store cost-growth tests.
+
+These are release gates where applicable: a missing or failing gate blocks the
+version that claims it.
+
+### Connector contract gates
+
+Before any connector is considered production-grade, it must demonstrate:
+
+- duplicate-input handling;
+- replay handling;
+- offset / checkpoint behavior;
+- schema-evolution behavior;
+- auth-failure behavior;
+- permission-failure behavior;
+- source-restart behavior;
+- sink-idempotency behavior;
+- backpressure behavior;
+- observability and error-code coverage;
+- a passing conformance test suite.
+
+1.0 ships a small number of connectors that pass these gates. Broad connector
+expansion is post-1.0.
+
+### Public-surface audit and classification
+
+Audit and classify every user-reachable surface as **stable**,
+**experimental**, **internal**, or **deprecated**:
+
+- CLI commands;
+- config keys;
+- SQL extensions;
+- system tables;
+- metrics;
+- error codes;
+- audit events;
+- REST / gRPC / admin APIs (where present);
+- debug endpoints;
+- internal PlanIR / execution APIs.
+
+The stable 1.0 surface must be minimal. Internal and debug surfaces must not be
+documented as stable and must not become accidental production dependencies.
+
+### Deferred to post-1.0 (Phase 14)
+
+The capabilities listed under *Pre-1.0 Scope Control → Narrowed or deferred to
+post-1.0* are sequenced into a post-1.0 phase. They are deferred to protect 1.0
+quality, not rejected. Notably, this includes user-defined merge laws
+(`CREATE MERGE LAW`), the cold-tier Iceberg/Delta sinks and Iceberg REST catalog
+server (current v0.53–v0.58 scope), secondary-index sophistication beyond the
+1.0-safe slice, advanced auto-tuning, multi-region, and any performance
+optimization that complicates deterministic replay or recovery.
+
+**Exit criteria (Phase 13 / 1.0)**
+
+- The 1.0 Gate in ROADMAP.md is satisfied.
+- The stable public surface is frozen, classified, and minimal.
+- All documentation deliverables above are merged.
+- All applicable test and soak gates pass.
+- 1.0 is tagged as a stable core release with documented limits — not as a
+  feature-complete distributed SQL system.
 
 ---
 
