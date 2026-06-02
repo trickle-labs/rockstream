@@ -265,7 +265,7 @@ impl ConnectorService for ReferenceConnectorService {
             return Ok(PollBatchResponse {
                 record_count: 0,
                 epoch: request.epoch,
-                offset: format!("grpc-offset-{}", offset_val),
+                offset: format!("grpc-offset-{offset_val}"),
                 watermark: request.epoch * 100,
             });
         }
