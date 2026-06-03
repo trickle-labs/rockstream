@@ -211,6 +211,13 @@ without that proof, the version is not done.
 | v0.57 |  | Catalog registration and Iceberg REST catalog server | Catalog registration backends (§13.6.5): `filesystem` (self-contained, already functional), `glue`, `rest`, `hive`, `ducklake`; native Iceberg REST catalog server (§13.7) on gateway HTTP port 8181: `/iceberg/v1/` serves namespaces, tables, snapshots backed by control-plane metadata; auth token/mTLS passed through. **DX, Docs & MinIO integration**: (1) DX: include `/metrics` endpoint metrics showing active HTTP traffic, authorization successes/failures, table listing response times, and catalog latency metrics. (2) Docs: publish **"Iceberg REST Catalog Server Reference Guide"** in `docs/iceberg-rest-catalog.md` detailing standard routing endpoints, credentials resolution, schema mappings, and multi-tenant authorization hooks. (3) MinIO integration: run integration testing connecting Spark, Trino, and DuckDB to a local Rocksdb/gRPC cluster with containerized MinIO acting as the physical Iceberg catalog backend storage, verifying queries over Iceberg tables with active write workloads. | Spark/Trino/DuckDB discover views by name via `catalog.uri=http://rockstream:8181/iceberg/v1`; Glue catalog shows table within 30s of snapshot commit; `CATALOG_WARN` state surfaces cleanly when external catalog is unreachable; catalog API failures never block IVM; Spark-to-MinIO and Trino-to-MinIO queries over RockStream REST catalog server achieve bit-identical results compared to local Postgres read queries under live 10k ops/sec writes. |
 | v0.58 |  | Cold-tier soak, Delta Lake, law-version upgrade replay, and mixed optimistic transaction soak | Delta Lake cold-tier sink variant (`CREATE SINK ... TO DELTA`), cold-tier + hot tail merge correctness soak (randomized inserts/updates/deletes, compare cold+hot read vs. hot-only accumulated state); cold-tier law-version upgrade replay test (cold snapshot at law v1 + hot tail at law v2 must read consistently); snapshot interval tuning, cost-accounting (cold-tier storage bytes in `EXPLAIN INCREMENTAL ESTIMATE` and quota system); **mixed optimistic transaction soak**: mixed exact-key + CRDT validation under randomized concurrent writes, transaction envelope recovery from cold + hot tail, row-version metadata preserved in cold snapshots, compaction safety for pending/committed transaction operands; decision gate — if simulation finds no partial visibility and abort rates are explainable, promote optimistic subset to pre-1.0 documented behavior, otherwise keep experimental. **DX, Docs & MinIO integration**: (1) Docs: publish the final launch guide **"High-Scale Cold Tier Soak & Mixed Workload Integration Standard"** in `docs/cold-tier-standard.md` proving complete operational readiness and explaining Delta Lake integrations. (2) MinIO integration: execute a 7-day high-throughput continuous soak test writing Delta Lake tables to MinIO, validating mixed optimistic serialization correctness, crash recovery safety, and partition prunings. | 7-day cold-tier soak with continuous writes shows no merge divergence; Delta `_delta_log/` is readable by DuckDB `delta_scan`; `EXPLAIN INCREMENTAL ESTIMATE` reports cold-tier storage cost within 20% of actual; cold-snapshot bytes count against pipeline `state_budget_gb`; law-version upgrade replay test passes for every registered law that declares cross-version compatibility; mixed optimistic transaction abort rate is < 5% under representative contention; no partial-visibility leaks observed over 7-day soak; `crdt_txn_pending_visible_total` stays at zero when atomic visibility is enabled; 7-day soak on MinIO verifies perfect zero-leak Delta log parity. |
 
+### Path to 1.0
+
+| Version | Status | Focus | Scope | Proof |
+|---|---|---|---|---|
+| v0.59 |  | Surface Freeze and Production Evidence | Freeze stable CLI / config / SQL / API surface; label experimental/internal; complete correctness model doc, operator handbook, compatibility and SQL subset doc, public API stability policy; run full correctness oracle suite, distributed simulation matrix, upgrade/recovery tests, object-store failure/throttling behavior; run 7-14 day soak; publish benchmark methodology. | No new stable public API without review; all public errors, metrics, and supported SQL documented; all distributed coordination paths have seeded simulation tests. |
+| v0.60 |  | Release Candidate Hardening | Remove or hide unstable public surface; fix release-blocking correctness / recovery / upgrade bugs; validate rolling upgrades, support-bundle usefulness, connector contract behavior, bounded resource usage, freshness behavior under load, and object-store cost growth under long workloads. Complete failure-mode playbooks. | Clean long soak, clean upgrade test, clean recovery test, no unexplained freshness stalls, no undocumented public behavior, no unbounded resource growth under documented workloads. |
+
 ---
 
 ## Documentation Budget
@@ -233,6 +240,8 @@ Post-0.48, every version includes dedicated user-facing documentation milestones
 | v0.56 | Storage Tiering Architecture: "Two-Tier Cold Tier Architecture & Integration Guide" (describing Parquet schemas, Iceberg serialization details, epoch compaction, and CRDT column folding layouts). |
 | v0.57 | Catalog Interface Reference: "Iceberg REST Catalog Server Reference Guide" (detailing standard routing endpoints, credentials resolution, schema mappings, and multi-tenant authorization hooks). |
 | v0.58 | Data Lake Integration: "High-Scale Cold Tier Soak & Mixed Workload Integration Standard" proving complete operational readiness and explaining Delta Lake integrations. |
+| v0.59 | Correctness & Operations: "Correctness Model Document" (exactly-once, view freshness, frontier semantics, delete/retract rules, outer joins, late data, schema evolution), "Operator Handbook" (deploy, size, freshness SLOs, lag investigation, worker recovery, checkpoint restore, error remediation), and "SQL Subset Compatibility Document" (supported/unsupported SQL, Postgres differences, transaction/isolation semantics, connector/sink guarantees). "Public API Stability Policy" classifying all CLI, config, SQL, system table, metrics, and error codes (stable, experimental, internal, deprecated). |
+| v0.60 | Troubleshooting: "Failure-Mode Playbooks" covering stale views, memory growth, object-store cost, paused pipelines, rebalance stalls, connector backpressure, node restarts, and rolling upgrades. |
 
 Each documentation deliverable is listed as an explicit exit criterion in the
 corresponding version's sign-off checklist. A version is not accepted until
@@ -259,6 +268,17 @@ From this point forward, new work must do at least one of the following:
 Work that does none of these belongs after 1.0. This is not a judgement that
 deferred work is unimportant; it is a deliberate choice to protect 1.0 quality
 by keeping the stable core small, supportable, and predictable.
+
+### Release Gates
+
+Post-0.48 (specifically post-0.50) releases are explicitly constrained by key **Release Gates** that must be satisfied:
+- **Upgrade Gate**: Verify rolling upgrades from version N-1 to N, mixed-version cluster compatibility, storage format compatibility, and failed upgrade rollback.
+- **Recovery Gate**: Verify exactly-once recovery under simulated network partitions, node/coordinator restarts, cluster checkpoints, and storage unavailability.
+- **Correctness Gate**: Verify queries against differential correctness oracles and metamorphic SQL test suites.
+- **Operator Usability Gate**: Verify error remediation text, diagnostics clarity, dashboard templates, and support-bundle usefulness.
+- **Performance Regression Gate**: Ensure there is no unbounded CPU/memory/storage growth and freshness SLOs are met under load.
+- **Connector Contract Gate**: Verify connector conformance (at-least-once, backpressure, offset rewinds, DLQ behavior).
+- **Public API Freeze Gate**: Ensure that no undocumented or unauthorized stable surface is introduced.
 
 ---
 
@@ -327,25 +347,33 @@ In addition to the Common Definition of Done, every post-v0.48 version must
 produce evidence appropriate to its scope. The path to 1.0 must accumulate, in
 aggregate, all of the following:
 
-- a full differential correctness oracle suite;
-- randomized insert / update / delete / retract tests;
-- metamorphic SQL tests;
-- a deterministic simulation matrix;
-- worker and coordinator crash tests;
-- checkpoint-interruption tests;
-- object-store timeout / throttling tests;
-- rolling-upgrade tests;
-- mixed-version compatibility tests where applicable;
-- storage-format compatibility tests;
-- connector conformance tests;
-- a 7–14 day pre-RC production-like soak;
-- a longer final soak before 1.0;
-- documented benchmark methodology;
-- a documented public API stability policy;
-- every stable public error documented;
-- every stable metric documented;
-- all supported SQL documented;
-- no undocumented stable public behavior.
+- **Differential correctness oracle tests**:
+  - Every supported SQL construct must have randomized insert/update/delete/retract tests comparing incremental output against batch recomputation using DataFusion batch, Postgres matching semantics, pg_trickle-derived oracles, or hand-written multiset expected results for edge cases.
+- **Metamorphic SQL tests**:
+  - Verify that equivalent queries produce equivalent results (e.g. predicate pushdown vs. no pushdown, join order variants, CTE vs. inline subquery, aggregate rewrite equivalence, view-on-view vs. expanded query, filter-before-join vs. join-before-filter where valid).
+- **Long-running state drift tests**:
+  - Run long random workloads with millions of changes, deletes/re-inserts, skewed keys, hot partitions, NULL-heavy data, late data, schema changes, worker restarts, and checkpoint/restore cycles to verify zero state drift.
+- **Deterministic simulation as a release blocker**:
+  - Require seeded simulations for: worker crash during checkpoint, coordinator crash during rebalance, object-store timeout during compaction, connector restart during backfill, duplicate source events, partial sink failure, frontier stuck conditions, network partitions, slow shard, and rolling upgrade.
+- **Upgrade and downgrade tests**:
+  - Test rolling upgrade from N-1 to N, mixed-version cluster behavior, storage format compatibility, failed upgrade rollback, config migration, metric/error-code continuity, and existing views surviving upgrade.
+- **Connector contract tests**:
+  - Conformance suite per connector verifying: at-least-once input, duplicate input, out-of-order input, source restart, offset rewind, schema evolution, sink idempotency, backpressure, and authentication/permission failure.
+- **Cloud-Native Storage Proofs**:
+  - **Object-store throttling & latency**: resilience to simulated S3/MinIO throttling and slow/stale reads.
+  - **Compaction backlog**: stability and bounds on compaction backlog under sustained write pressure.
+  - **Checkpoint corruption**: simulation of corrupted checkpoint manifests and recovery behaviors.
+  - **Interrupted uploads**: recovery from uploads interrupted mid-way.
+  - **Object-store unavailability**: multi-worker recovery and failover behavior during partial object-store outages.
+  - **Cost growth bounds**: verifying that storage cost and file counts do not grow unbounded under continuous workloads.
+- A 7–14 day pre-RC production-like soak;
+- A longer final soak before 1.0;
+- Documented benchmark methodology;
+- A documented public API stability policy;
+- Every stable public error documented;
+- Every stable metric documented;
+- All supported SQL documented;
+- No undocumented stable public behavior.
 
 These are gates, not aspirations. A missing gate blocks the version that claims
 it, exactly as a failing soak blocks sign-off.
@@ -368,6 +396,8 @@ Rules from v0.48 onward:
 - No new stable public API is added without explicit review.
 - Internal APIs must not be documented as stable.
 - Experimental features must be visibly marked as experimental.
+- Mark unstable/internal surfaces visibly to prevent accidental production dependency. Use prefixes like `experimental`, `debug`, or `internal` in CLI subcommands (e.g. `rockstream experimental ...`) or configuration keys.
+- For SQL/system APIs, place experimental or internal catalogs under distinct namespaces: `rockstream_experimental.*` and `rockstream_internal.*`.
 - CLI commands, config keys, SQL extensions, system tables, metrics, and error
   codes are each classified.
 - Debug and internal endpoints must not become accidental production
@@ -393,30 +423,42 @@ always, these are evidence milestones, not dates.
 
 ### v0.59 — Surface Freeze and Production Evidence
 
-- Freeze the stable CLI / config / SQL / API surface.
-- Classify every unstable surface as experimental or internal.
-- Complete the correctness-model documentation.
+**Goals:**
+- Freeze stable CLI, configuration, and SQL subset.
+- Label all experimental/internal surfaces clearly.
 - Complete the operator handbook.
-- Complete the SQL compatibility / subset documentation.
+- Complete the correctness model document.
+- Complete the SQL compatibility and subset document.
 - Run the full correctness oracle suite.
-- Run the deterministic distributed simulation matrix.
+- Run the distributed simulation matrix.
 - Run upgrade and recovery tests.
-- Validate object-store failure and throttling behavior.
-- Run a 7–14 day production-like soak.
+- Run a 7–14 day pre-RC production-like soak.
 - Publish the benchmark methodology.
+
+**Exit Criteria:**
+- No new stable public API is allowed without review.
+- All public error codes are fully documented.
+- All public metrics are fully documented.
+- All supported SQL constructs have differential correctness oracle coverage.
+- All distributed coordination paths have seeded simulation tests.
 
 ### v0.60 — Release Candidate Hardening
 
-- Remove or hide unstable public surface.
-- Fix release-blocking correctness / recovery / upgrade bugs.
-- Validate rolling upgrades.
-- Validate support-bundle usefulness.
-- Validate connector contract behavior.
-- Validate bounded resource usage.
-- Validate freshness behavior under load.
-- Validate that documented workloads cause no unbounded object-store cost
-  growth.
-- Prepare 1.0 release notes and documented limitations.
+**Goals:**
+- Remove or hide unstable/experimental public surfaces.
+- Fix all release-blocking correctness, recovery, and upgrade bugs.
+- Validate recovery and rolling upgrades.
+- Validate connector contracts.
+- Validate object-store cost, throttling, and failure behaviors under long-running workloads.
+- Run production-like load and stress tests.
+
+**Exit Criteria:**
+- Clean long soak without regressions.
+- Clean rolling-upgrade tests.
+- Clean recovery tests.
+- No unexplained freshness stalls or lag.
+- No undocumented public behavior.
+- No unbounded resource (CPU/memory/storage) growth under documented workloads.
 
 ### v1.0 — Stable Core Release
 
