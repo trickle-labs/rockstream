@@ -35,10 +35,13 @@ impl SqlFrontend {
                         "Schema name missing in SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA".into(),
                     ));
                 }
-            } else if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW") {
-                if parts.len() < 7 || parts[6].is_empty() {
-                    return Err(SqlError::Parse("Materialized view name missing in SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW".into()));
-                }
+            } else if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW")
+                && (parts.len() < 7 || parts[6].is_empty())
+            {
+                return Err(SqlError::Parse(
+                    "Materialized view name missing in SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW"
+                        .into(),
+                ));
             }
             return Ok(());
         }

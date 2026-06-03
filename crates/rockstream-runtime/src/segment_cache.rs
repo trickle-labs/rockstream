@@ -168,6 +168,10 @@ impl SegmentCache {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// A wrapper around `ShardReader` that integrates the `SegmentCache` directly
