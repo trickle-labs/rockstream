@@ -56,16 +56,12 @@ async fn assert_help(args: Vec<&str>, expected_substring: &str) {
 
     assert_eq!(
         exit_code, 0,
-        "CLI command {:?} failed. Stderr: {}",
-        args, stderr
+        "CLI command {args:?} failed. Stderr: {stderr}"
     );
-    let combined = format!("{}\n{}", stdout, stderr);
+    let combined = format!("{stdout}\n{stderr}");
     assert!(
         combined.contains(expected_substring),
-        "Output of {:?} did not contain '{}'. Output:\n{}",
-        args,
-        expected_substring,
-        combined
+        "Output of {args:?} did not contain '{expected_substring}'. Output:\n{combined}"
     );
 }
 
@@ -107,8 +103,7 @@ async fn test_start_role_matrix_all() {
 
     assert_eq!(
         exit_code, 0,
-        "role=all exited with non-zero. Stderr: {}",
-        stderr
+        "role=all exited with non-zero. Stderr: {stderr}"
     );
 
     // Verify audit.jsonl was written and contains expected events
@@ -165,13 +160,12 @@ async fn test_start_role_matrix_worker_missing_control() {
         exit_code, 0,
         "role=worker should have failed without control"
     );
-    let combined = format!("{}\n{}", stdout, stderr);
+    let combined = format!("{stdout}\n{stderr}");
     assert!(
         combined.contains("RS-0011")
             || combined.contains("control")
             || combined.contains("required"),
-        "error message did not mention control requirement: {}",
-        combined
+        "error message did not mention control requirement: {combined}"
     );
 }
 
@@ -197,7 +191,7 @@ async fn test_start_role_matrix_gateway_and_frontier() {
         let exit_code = wait_container_exit(&id).await;
         let (_stdout, stderr) = get_container_logs(&id);
 
-        assert_eq!(exit_code, 0, "role={} failed. Stderr: {}", role, stderr);
+        assert_eq!(exit_code, 0, "role={role} failed. Stderr: {stderr}");
 
         // Verify audit log
         let audit_path = temp_dir.path().join("audit.jsonl");
@@ -221,11 +215,10 @@ async fn test_bootstrap_flow() {
     let exit_code_fail = wait_container_exit(&id_fail).await;
     let (stdout_fail, stderr_fail) = get_container_logs(&id_fail);
     assert_ne!(exit_code_fail, 0);
-    let combined_fail = format!("{}\n{}", stdout_fail, stderr_fail);
+    let combined_fail = format!("{stdout_fail}\n{stderr_fail}");
     assert!(
         combined_fail.contains("RS-0013") || combined_fail.contains("connect"),
-        "error message did not mention connection failure: {}",
-        combined_fail
+        "error message did not mention connection failure: {combined_fail}"
     );
 
     // 2. Bootstrap succeeds when control is present
@@ -246,8 +239,7 @@ async fn test_bootstrap_flow() {
     let control_ip = get_container_ip(&control_id);
     assert!(
         !control_ip.is_empty() && control_ip != "invalid IP",
-        "failed to get control container IP: {}",
-        control_ip
+        "failed to get control container IP: {control_ip}"
     );
 
     // Wait a brief moment to let control start listening
@@ -266,15 +258,13 @@ async fn test_bootstrap_flow() {
 
     assert_eq!(
         exit_code_bootstrap, 0,
-        "bootstrap command failed. Stderr: {}",
-        stderr_boot
+        "bootstrap command failed. Stderr: {stderr_boot}"
     );
-    let combined_boot = format!("{}\n{}", stdout_boot, stderr_boot);
+    let combined_boot = format!("{stdout_boot}\n{stderr_boot}");
     assert!(
         combined_boot.contains("Bootstrap probe registered")
             || combined_boot.contains("Control service is reachable"),
-        "bootstrap output was unexpected: {}",
-        combined_boot
+        "bootstrap output was unexpected: {combined_boot}"
     );
 }
 
@@ -295,11 +285,10 @@ async fn test_error_path_contract_tls() {
     let (stdout, stderr) = get_container_logs(&id);
 
     assert_ne!(exit_code, 0, "invalid TLS flags should have caused failure");
-    let combined = format!("{}\n{}", stdout, stderr);
+    let combined = format!("{stdout}\n{stderr}");
     assert!(
         combined.contains("RS-0010") || combined.contains("must all be provided together"),
-        "error did not contain expected TLS error code RS-0010: {}",
-        combined
+        "error did not contain expected TLS error code RS-0010: {combined}"
     );
 }
 
