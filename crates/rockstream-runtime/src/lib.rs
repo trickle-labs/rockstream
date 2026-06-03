@@ -17,6 +17,7 @@
 //! v0.39 adds the clone module: pipeline clone, blue/green plan replacement,
 //! compatible/incompatible schema workflows, and law-version upgrade path.
 
+pub mod auto_tuner;
 pub mod bench;
 pub mod checkpoint;
 pub mod clone;

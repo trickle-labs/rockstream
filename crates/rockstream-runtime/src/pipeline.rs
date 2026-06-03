@@ -28,6 +28,8 @@ pub struct PipelineConfig {
     pub storage_dir: String,
     /// Target maximum staleness in milliseconds.
     pub freshness_slo_ms: Option<u64>,
+    /// Whether the auto-tuner is enabled.
+    pub autotuner_enabled: bool,
 }
 
 /// Run a pipeline: source → operator → sink, epoch by epoch.
@@ -65,6 +67,27 @@ pub async fn run_pipeline(
         tracing::warn!(error = %e, "failed to write audit event");
     }
 
+    let override_path = Some(Path::new(&config.storage_dir).join("tune_overrides.json"));
+    let autotuner_config = rockstream_types::config::AutotunerConfig {
+        enabled: config.autotuner_enabled,
+        ..Default::default()
+    };
+
+    let mut autotuner = crate::auto_tuner::Autotuner::new(
+        autotuner_config,
+        override_path,
+        config.freshness_slo_ms.unwrap_or(100),
+    );
+
+    let mut tuning_action = crate::auto_tuner::TuningAction {
+        parallelism: autotuner.load_overrides().parallelism.unwrap_or(4),
+        epoch_size_ms: autotuner
+            .load_overrides()
+            .epoch_size_ms
+            .unwrap_or(config.freshness_slo_ms.unwrap_or(100)),
+        source_throttle_rate: None,
+    };
+
     let mut epoch: Epoch = 0;
     let mut bytes_buffered: u64 = 0;
     let mut epochs_buffered: u32 = 0;
@@ -82,7 +105,7 @@ pub async fn run_pipeline(
         sink.prepare(&output).await;
 
         let elapsed = last_commit_time.elapsed().as_millis() as u64;
-        let should_slo_flush = config.freshness_slo_ms.is_some_and(|slo| elapsed >= slo);
+        let should_slo_flush = elapsed >= tuning_action.epoch_size_ms;
 
         // Respect should_flush override or hard ceiling (500 epochs or 256 MB) or SLO
         if sink.should_flush(bytes_buffered, epochs_buffered)
@@ -98,6 +121,30 @@ pub async fn run_pipeline(
 
         // Signal epoch complete
         operator.epoch_complete(epoch).await;
+
+        // Run auto-tuner step at the end of each epoch
+        let metrics = operator.snapshot_metrics();
+        let is_stalled = crate::auto_tuner::is_slatedb_stalled();
+        tuning_action = autotuner.tune_step(&metrics, elapsed, is_stalled, audit_log);
+
+        // Apply parallelism suggestion
+        let hints = rockstream_ops::operator::OperatorHints {
+            parallelism: Some(tuning_action.parallelism),
+        };
+        let _ = operator.reconfigure(hints);
+
+        // Apply dynamic ingestion throttling
+        if let Some(throttle_rate) = tuning_action.source_throttle_rate {
+            let record_count = batch.record_count;
+            if record_count > 0 && throttle_rate > 0 {
+                let expected_micros =
+                    (record_count as f64 / throttle_rate as f64 * 1_000_000.0) as u64;
+                tokio::time::sleep(tokio::time::Duration::from_micros(expected_micros)).await;
+            }
+            source.set_credits(throttle_rate as usize);
+        } else {
+            source.set_credits(usize::MAX);
+        }
 
         tracing::debug!(epoch, "epoch completed");
         epoch += 1;
@@ -136,6 +183,7 @@ pub async fn run_noop_pipeline(storage_dir: &Path) -> PipelineResult {
         name: "noop-pipeline".to_string(),
         storage_dir: storage_dir.display().to_string(),
         freshness_slo_ms: None,
+        autotuner_enabled: false,
     };
 
     let mut source = NoopSource::new(5);
@@ -207,6 +255,7 @@ mod tests {
             name: "custom-pipeline".to_string(),
             storage_dir: dir.path().display().to_string(),
             freshness_slo_ms: None,
+            autotuner_enabled: false,
         };
 
         let mut source = NoopSource::new(10);
