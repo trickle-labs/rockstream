@@ -563,6 +563,7 @@ async fn get_merged_returns_value_and_increments_applied() {
         law_id: MergeLawId(0x0001),
         law_name: "WeightAdd",
         law_version: 1,
+        operator_id: None,
     };
     let applied_before = read_applied(&metric_key);
 
@@ -597,6 +598,7 @@ async fn get_merged_missing_key_returns_none() {
         law_id: MergeLawId(0x0001),
         law_name: "WeightAdd",
         law_version: 1,
+        operator_id: None,
     };
     let applied_before = read_applied(&metric_key);
     let fallback_before = read_fallback(&metric_key);
@@ -627,6 +629,7 @@ async fn scan_merged_returns_entries_and_increments_applied() {
         law_id: MergeLawId(0x0001),
         law_name: "WeightAdd",
         law_version: 1,
+        operator_id: None,
     };
     let applied_before = read_applied(&metric_key);
 
@@ -666,6 +669,7 @@ async fn scan_merged_fallback_increments_fallback_metric() {
         law_id: MergeLawId(0x0001),
         law_name: "WeightAdd",
         law_version: 1,
+        operator_id: None,
     };
     let fallback_before = read_fallback(&metric_key);
 

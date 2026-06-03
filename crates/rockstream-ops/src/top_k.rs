@@ -114,6 +114,8 @@ pub struct TopKOp {
     name: String,
     budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
     warned_over_budget: bool,
+    rows_processed: u64,
+    state_read_count: u64,
 }
 
 impl TopKOp {
@@ -136,6 +138,8 @@ impl TopKOp {
             name: "TopKOp".to_owned(),
             budget: None,
             warned_over_budget: false,
+            rows_processed: 0,
+            state_read_count: 0,
         }
     }
 
@@ -158,10 +162,12 @@ impl TopKOp {
         let mut touched: Vec<PartitionKey> = Vec::new();
 
         for row in delta.iter() {
+            self.rows_processed += 1;
             let partition_key = (self.partition_fn)(&row.key, &row.value);
             let score = (self.score_fn)(&row.key, &row.value);
             let row_id = make_row_id(&row.key, &row.value);
 
+            self.state_read_count += 1;
             let ps = self
                 .partition_state
                 .entry(partition_key.clone())
@@ -289,6 +295,12 @@ impl TopKOp {
 
 #[async_trait]
 impl Operator for TopKOp {
+    fn set_context(&mut self, ctx: crate::operator::OperatorContext) {
+        if let Some(budget) = ctx.state_budget {
+            self.budget = Some(budget);
+        }
+    }
+
     async fn process(&mut self, _input: &SourceBatch) -> SinkBatch {
         SinkBatch::default()
     }
@@ -305,6 +317,35 @@ impl Operator for TopKOp {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn snapshot_metrics(&self) -> crate::operator::OperatorMetrics {
+        crate::operator::OperatorMetrics {
+            rows_processed: self.rows_processed,
+            state_read_count: self.state_read_count,
+            rmw_avoided: false,
+            p99_latency_ms: 0.0,
+        }
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.partition_state
+            .iter()
+            .map(|(pk, ps)| {
+                let rows_size: u64 = ps
+                    .rows
+                    .iter()
+                    .map(|(rid, (k, v, _, _))| (rid.len() + k.len() + v.len() + 16) as u64)
+                    .sum();
+                let emitted_size: u64 = ps.emitted.iter().map(|(_, rid)| rid.len() as u64).sum();
+                let cache_size: u64 = ps
+                    .emitted_cache
+                    .iter()
+                    .map(|(rid, (k, v))| (rid.len() + k.len() + v.len()) as u64)
+                    .sum();
+                pk.len() as u64 + rows_size + emitted_size + cache_size
+            })
+            .sum()
     }
 }
 

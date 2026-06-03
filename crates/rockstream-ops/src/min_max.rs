@@ -71,7 +71,6 @@ pub type ScalarFn = Arc<dyn Fn(&[u8], &[u8]) -> i64 + Send + Sync + 'static>;
 /// for cleanup.
 type GroupMultiset = BTreeMap<i64, i64>;
 
-/// Retraction-aware MIN/MAX incremental operator.
 pub struct MinMaxOp {
     name: String,
     kind: MinMaxKind,
@@ -83,6 +82,8 @@ pub struct MinMaxOp {
     last_emitted: HashMap<Vec<u8>, i64>,
     budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
     warned_over_budget: bool,
+    rows_processed: u64,
+    state_read_count: u64,
 }
 
 impl MinMaxOp {
@@ -107,6 +108,8 @@ impl MinMaxOp {
             last_emitted: HashMap::new(),
             budget: None,
             warned_over_budget: false,
+            rows_processed: 0,
+            state_read_count: 0,
         }
     }
 
@@ -139,9 +142,11 @@ impl MinMaxOp {
 
         // Phase 1: update multiset state for all incoming deltas.
         for row in input.iter() {
+            self.rows_processed += 1;
             let group_key = (self.group_fn)(&row.key, &row.value);
             let val = (self.scalar_fn)(&row.key, &row.value);
 
+            self.state_read_count += 1;
             let is_new = !self.multiset_state.contains_key(&group_key);
             if is_new {
                 if let Some(ref budget) = self.budget {
@@ -233,6 +238,12 @@ impl MinMaxOp {
 
 #[async_trait]
 impl Operator for MinMaxOp {
+    fn set_context(&mut self, ctx: crate::operator::OperatorContext) {
+        if let Some(budget) = ctx.state_budget {
+            self.budget = Some(budget);
+        }
+    }
+
     async fn process(&mut self, _input: &SourceBatch) -> SinkBatch {
         SinkBatch::default()
     }
@@ -253,6 +264,22 @@ impl Operator for MinMaxOp {
 
     fn merge_law(&self) -> Option<MergeLawId> {
         Some(self.law_id())
+    }
+
+    fn snapshot_metrics(&self) -> crate::operator::OperatorMetrics {
+        crate::operator::OperatorMetrics {
+            rows_processed: self.rows_processed,
+            state_read_count: self.state_read_count,
+            rmw_avoided: false,
+            p99_latency_ms: 0.0,
+        }
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.multiset_state
+            .iter()
+            .map(|(k, v)| (k.len() + v.len() * 16) as u64)
+            .sum()
     }
 }
 

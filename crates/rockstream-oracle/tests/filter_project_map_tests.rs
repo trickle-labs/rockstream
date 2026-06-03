@@ -211,6 +211,7 @@ mod tests {
             law_id: rockstream_types::merge_law::MergeLawId(0x0001),
             law_name: "WeightAdd",
             law_version: 1,
+            operator_id: None,
         };
 
         let before = read_fallback(&key);

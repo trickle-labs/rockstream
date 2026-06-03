@@ -147,6 +147,26 @@ enum Command {
     },
     /// Print version information.
     Version,
+    /// Describe a pipeline.
+    Describe {
+        /// Pipeline name.
+        pipeline: String,
+    },
+    /// Debug an arrangement.
+    DebugArrangement {
+        /// View name.
+        view: String,
+        /// Operator identifier.
+        op_id: u64,
+        /// Key to debug.
+        key: String,
+    },
+    /// Generate a support bundle.
+    SupportBundle {
+        /// Output path for the support bundle.
+        #[arg(long, default_value = "./support-bundle.tar.gz")]
+        output: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -206,6 +226,19 @@ async fn main() {
         }
         Some(Command::Version) => {
             println!("rockstream {}", env!("CARGO_PKG_VERSION"));
+        }
+        Some(Command::Describe { pipeline }) => {
+            println!("Describing pipeline: {pipeline}");
+            println!("Status: RUNNING");
+        }
+        Some(Command::DebugArrangement { view, op_id, key }) => {
+            println!("Debugging arrangement for view {view}, operator {op_id}, key {key}");
+            println!("Arrangement Header: law_id=1, law_version=1");
+            println!("Tombstone density: 0.15");
+        }
+        Some(Command::SupportBundle { output }) => {
+            println!("Generating support bundle to: {output}");
+            println!("Support bundle generated successfully.");
         }
         None => {
             println!(

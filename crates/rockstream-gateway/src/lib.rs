@@ -27,9 +27,6 @@
 //!   tables: `merge_laws`, `epochs`, `pipelines`, `shards`, `audit_log`
 //!   (DESIGN.md §12.6.1); legacy `rockstream.*` prefix alias accepted through
 //!   the 0.45 release.
-//! - [`segment_cache`] — per-worker arrangement segment cache keyed by
-//!   `(shard_id, segment_id)` with LRU eviction and hit-ratio tracking
-//!   (DESIGN.md §5.4).
 //!
 //! # v0.42 deliverables
 //!
@@ -62,7 +59,6 @@ pub mod pg_catalog;
 pub mod pgwire;
 pub mod pool;
 pub mod rockstream_catalog;
-pub mod segment_cache;
 pub mod subscribe;
 
 pub use dml::{
@@ -97,7 +93,6 @@ pub use rockstream_catalog::{
     resolve_catalog_alias, resolve_catalog_table, CatalogAuditEntry, CatalogEpoch, CatalogMergeLaw,
     CatalogPipeline, CatalogShard, PipelineStatus, ShardHealth,
 };
-pub use segment_cache::{SegmentCache, SegmentCacheConfig, SegmentCacheStats, ShardSegmentKey};
 pub use subscribe::{
     simulate_subscribe_batch, ChangeRetentionConfig, SubscribeAsOf, SubscribeBatch,
     SubscribeCursor, SubscribeOptions, SubscribePredicate, SubscribeRow,

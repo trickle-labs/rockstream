@@ -90,6 +90,8 @@ pub struct HashJoinOp {
     right_arr: Arrangement,
     budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
     warned_over_budget: bool,
+    rows_processed: u64,
+    state_read_count: u64,
 }
 
 impl HashJoinOp {
@@ -114,6 +116,8 @@ impl HashJoinOp {
             right_arr: HashMap::new(),
             budget: None,
             warned_over_budget: false,
+            rows_processed: 0,
+            state_read_count: 0,
         }
     }
 
@@ -137,7 +141,9 @@ impl HashJoinOp {
 
         // Phase 1: join each left delta row against the right-arrangement snapshot.
         for row in left_delta.iter() {
+            self.rows_processed += 1;
             let join_key = (self.left_key_fn)(&row.key, &row.value);
+            self.state_read_count += 1;
             if let Some(right_bucket) = self.right_arr.get(&join_key) {
                 for ((rk, rv), rw) in right_bucket {
                     if *rw == 0 {
@@ -191,7 +197,9 @@ impl HashJoinOp {
 
         // Phase 1: join each right delta row against the left-arrangement snapshot.
         for row in right_delta.iter() {
+            self.rows_processed += 1;
             let join_key = (self.right_key_fn)(&row.key, &row.value);
+            self.state_read_count += 1;
             if let Some(left_bucket) = self.left_arr.get(&join_key) {
                 for ((lk, lv), lw) in left_bucket {
                     if *lw == 0 {
@@ -283,6 +291,12 @@ impl HashJoinOp {
 
 #[async_trait::async_trait]
 impl Operator for HashJoinOp {
+    fn set_context(&mut self, ctx: crate::operator::OperatorContext) {
+        if let Some(budget) = ctx.state_budget {
+            self.budget = Some(budget);
+        }
+    }
+
     async fn process(
         &mut self,
         input: &rockstream_types::batch::SourceBatch,
@@ -314,6 +328,41 @@ impl Operator for HashJoinOp {
         // Inner join produces a Z-set delta — no per-arrangement merge law at
         // the join level. Each side's arrangement uses WeightAdd semantics.
         None
+    }
+
+    fn snapshot_metrics(&self) -> crate::operator::OperatorMetrics {
+        crate::operator::OperatorMetrics {
+            rows_processed: self.rows_processed,
+            state_read_count: self.state_read_count,
+            rmw_avoided: false,
+            p99_latency_ms: 0.0,
+        }
+    }
+
+    fn state_bytes(&self) -> u64 {
+        let left_bytes: u64 = self
+            .left_arr
+            .iter()
+            .map(|(jk, inner)| {
+                jk.len() as u64
+                    + inner
+                        .iter()
+                        .map(|((rk, rv), _)| (rk.len() + rv.len() + 8) as u64)
+                        .sum::<u64>()
+            })
+            .sum();
+        let right_bytes: u64 = self
+            .right_arr
+            .iter()
+            .map(|(jk, inner)| {
+                jk.len() as u64
+                    + inner
+                        .iter()
+                        .map(|((rk, rv), _)| (rk.len() + rv.len() + 8) as u64)
+                        .sum::<u64>()
+            })
+            .sum();
+        left_bytes + right_bytes
     }
 }
 

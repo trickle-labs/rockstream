@@ -367,6 +367,7 @@ fn per_law_rmw_avoidance_ratio_proof() {
             law_id: law.id(),
             law_name: law.name(),
             law_version: law.version().0,
+            operator_id: None,
         };
         for _ in 0..ops_per_law {
             if *avoids_rmw {
@@ -382,6 +383,7 @@ fn per_law_rmw_avoidance_ratio_proof() {
         law_id: WEIGHT_ADD_ID,
         law_name: "WeightAdd",
         law_version: 1,
+        operator_id: None,
     };
     let wa_ratio = rmw_avoidance_ratio(&wa_key);
     assert!(
@@ -394,6 +396,7 @@ fn per_law_rmw_avoidance_ratio_proof() {
         law_id: SUM_COUNT_ID,
         law_name: "SumCount",
         law_version: 1,
+        operator_id: None,
     };
     let sc_ratio = rmw_avoidance_ratio(&sc_key);
     assert!(

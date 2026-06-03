@@ -54,6 +54,120 @@ impl fmt::Display for StateBudgetError {
 
 impl std::error::Error for StateBudgetError {}
 
+use crate::ids::WorkloadId;
+use std::sync::atomic::AtomicBool;
+
+// ─── WorkloadBudget ──────────────────────────────────────────────────────────
+
+/// Memory budget for a workload (shared across multiple operators/views).
+#[derive(Debug)]
+pub struct WorkloadBudget {
+    workload_id: WorkloadId,
+    max_bytes: u64,
+    current_bytes: AtomicU64,
+    notice_emitted_80: AtomicBool,
+    warning_emitted_95: AtomicBool,
+}
+
+impl WorkloadBudget {
+    /// Create a new workload-level budget.
+    pub fn new(workload_id: WorkloadId, max_bytes: u64) -> Self {
+        Self {
+            workload_id,
+            max_bytes,
+            current_bytes: AtomicU64::new(0),
+            notice_emitted_80: AtomicBool::new(false),
+            warning_emitted_95: AtomicBool::new(false),
+        }
+    }
+
+    /// Retrieve the workload ID.
+    pub fn workload_id(&self) -> WorkloadId {
+        self.workload_id
+    }
+
+    /// Retrieve the maximum bytes.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// Retrieve current bytes.
+    pub fn current_bytes(&self) -> u64 {
+        self.current_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Charge/acquire bytes against the workload budget.
+    pub fn try_acquire(&self, bytes: u64) -> Result<(), StateBudgetError> {
+        loop {
+            let current = self.current_bytes.load(Ordering::Relaxed);
+            let proposed = current.saturating_add(bytes);
+            if self.max_bytes > 0 && proposed > self.max_bytes {
+                return Err(StateBudgetError {
+                    operator_name: format!("workload-{}", self.workload_id.0),
+                    max_bytes: self.max_bytes,
+                    current_bytes: current,
+                    requested_bytes: bytes,
+                });
+            }
+            match self.current_bytes.compare_exchange_weak(
+                current,
+                proposed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    if self.max_bytes > 0 {
+                        let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
+                        if pct >= 95.0 && !self.warning_emitted_95.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                "RS-5019: Workload {} is at {:.1}% memory utilization (current={}, limit={})",
+                                self.workload_id, pct, proposed, self.max_bytes
+                            );
+                        } else if pct >= 80.0
+                            && !self.notice_emitted_80.swap(true, Ordering::Relaxed)
+                        {
+                            tracing::info!(
+                                "RS-5018: Workload {} is at {:.1}% memory utilization (current={}, limit={})",
+                                self.workload_id, pct, proposed, self.max_bytes
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Release bytes from the workload budget.
+    pub fn release(&self, bytes: u64) {
+        loop {
+            let current = self.current_bytes.load(Ordering::Relaxed);
+            let proposed = current.saturating_sub(bytes);
+            match self.current_bytes.compare_exchange_weak(
+                current,
+                proposed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    if self.max_bytes > 0 {
+                        let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
+                        if pct < 95.0 {
+                            self.warning_emitted_95.store(false, Ordering::Relaxed);
+                        }
+                        if pct < 80.0 {
+                            self.notice_emitted_80.store(false, Ordering::Relaxed);
+                        }
+                    }
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
 // ─── StateBudget ─────────────────────────────────────────────────────────────
 
 /// An operator-scoped state budget: tracks how many bytes of arrangement state
@@ -65,6 +179,9 @@ pub struct StateBudget {
     operator_name: String,
     max_bytes: u64,
     current_bytes: AtomicU64,
+    workload_budget: Option<Arc<WorkloadBudget>>,
+    notice_emitted_80: AtomicBool,
+    warning_emitted_95: AtomicBool,
 }
 
 impl StateBudget {
@@ -79,6 +196,25 @@ impl StateBudget {
             operator_name: operator_name.into(),
             max_bytes,
             current_bytes: AtomicU64::new(0),
+            workload_budget: None,
+            notice_emitted_80: AtomicBool::new(false),
+            warning_emitted_95: AtomicBool::new(false),
+        }
+    }
+
+    /// Create a new budget associated with a workload budget.
+    pub fn new_with_workload(
+        operator_name: impl Into<String>,
+        max_bytes: u64,
+        workload_budget: Option<Arc<WorkloadBudget>>,
+    ) -> Self {
+        Self {
+            operator_name: operator_name.into(),
+            max_bytes,
+            current_bytes: AtomicU64::new(0),
+            workload_budget,
+            notice_emitted_80: AtomicBool::new(false),
+            warning_emitted_95: AtomicBool::new(false),
         }
     }
 
@@ -102,6 +238,11 @@ impl StateBudget {
         self.current_bytes.load(Ordering::Relaxed)
     }
 
+    /// Retrieve the workload budget.
+    pub fn workload_budget(&self) -> Option<&Arc<WorkloadBudget>> {
+        self.workload_budget.as_ref()
+    }
+
     /// Fill fraction in the range `[0.0, ∞)`.
     ///
     /// Values > 1.0 indicate the budget has been exceeded (possible if the
@@ -120,12 +261,19 @@ impl StateBudget {
     /// Returns `Err(StateBudgetError)` if it would exceed the limit — in
     /// which case the usage counter is **not** incremented.
     pub fn try_acquire(&self, bytes: u64) -> Result<(), StateBudgetError> {
+        if let Some(ref wl) = self.workload_budget {
+            wl.try_acquire(bytes)?;
+        }
+
         // Use a compare-exchange loop so that two concurrent acquisitions do
         // not both "succeed" and overshoot the budget together.
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
             let proposed = current.saturating_add(bytes);
             if proposed > self.max_bytes {
+                if let Some(ref wl) = self.workload_budget {
+                    wl.release(bytes);
+                }
                 return Err(StateBudgetError {
                     operator_name: self.operator_name.clone(),
                     max_bytes: self.max_bytes,
@@ -140,7 +288,25 @@ impl StateBudget {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    if self.max_bytes > 0 {
+                        let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
+                        if pct >= 95.0 && !self.warning_emitted_95.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                "RS-5019: State budget for '{}' is at {:.1}% utilization (current={}, limit={})",
+                                self.operator_name, pct, proposed, self.max_bytes
+                            );
+                        } else if pct >= 80.0
+                            && !self.notice_emitted_80.swap(true, Ordering::Relaxed)
+                        {
+                            tracing::info!(
+                                "RS-5018: State budget for '{}' is at {:.1}% utilization (current={}, limit={})",
+                                self.operator_name, pct, proposed, self.max_bytes
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
                 Err(_) => continue, // lost race, retry
             }
         }
@@ -152,6 +318,9 @@ impl StateBudget {
     /// has already been applied previously). Also used in tests to set up
     /// a pre-filled budget.
     pub fn force_acquire(&self, bytes: u64) {
+        if let Some(ref wl) = self.workload_budget {
+            wl.current_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
         self.current_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
@@ -159,6 +328,9 @@ impl StateBudget {
     ///
     /// Saturates at zero rather than wrapping.
     pub fn release(&self, bytes: u64) {
+        if let Some(ref wl) = self.workload_budget {
+            wl.release(bytes);
+        }
         // Saturating subtract via compare-exchange loop.
         loop {
             let current = self.current_bytes.load(Ordering::Relaxed);
@@ -169,7 +341,18 @@ impl StateBudget {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    if self.max_bytes > 0 {
+                        let pct = (proposed as f64 / self.max_bytes as f64) * 100.0;
+                        if pct < 95.0 {
+                            self.warning_emitted_95.store(false, Ordering::Relaxed);
+                        }
+                        if pct < 80.0 {
+                            self.notice_emitted_80.store(false, Ordering::Relaxed);
+                        }
+                    }
+                    return;
+                }
                 Err(_) => continue,
             }
         }
@@ -178,7 +361,14 @@ impl StateBudget {
     /// Reset the usage counter to zero. For use in tests only.
     #[doc(hidden)]
     pub fn reset(&self) {
+        if let Some(ref wl) = self.workload_budget {
+            wl.current_bytes.store(0, Ordering::Relaxed);
+            wl.notice_emitted_80.store(false, Ordering::Relaxed);
+            wl.warning_emitted_95.store(false, Ordering::Relaxed);
+        }
         self.current_bytes.store(0, Ordering::Relaxed);
+        self.notice_emitted_80.store(false, Ordering::Relaxed);
+        self.warning_emitted_95.store(false, Ordering::Relaxed);
     }
 }
 
@@ -278,5 +468,28 @@ mod tests {
         b.force_acquire(90);
         let err = b.try_acquire(20).unwrap_err();
         assert_eq!(err.operator_name, "aggregate_sum");
+    }
+
+    #[test]
+    fn workload_budget_enforcement() {
+        let wl = Arc::new(WorkloadBudget::new(WorkloadId(42), 1000));
+        let b1 = StateBudget::new_with_workload("op1", 800, Some(wl.clone()));
+        let b2 = StateBudget::new_with_workload("op2", 800, Some(wl.clone()));
+
+        // Acquire within workload and operator limits
+        assert!(b1.try_acquire(400).is_ok());
+        assert_eq!(wl.current_bytes(), 400);
+
+        assert!(b2.try_acquire(400).is_ok());
+        assert_eq!(wl.current_bytes(), 800);
+
+        // This would exceed workload limit (800 + 300 = 1100 > 1000), even though within operator limit (400 + 300 = 700 < 800)
+        let err = b1.try_acquire(300).unwrap_err();
+        assert_eq!(err.operator_name, "workload-42");
+        assert_eq!(wl.current_bytes(), 800); // counter should not change
+
+        // Release works correctly
+        b1.release(400);
+        assert_eq!(wl.current_bytes(), 400);
     }
 }
