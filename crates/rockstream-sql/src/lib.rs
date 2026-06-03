@@ -114,6 +114,17 @@ mod tests {
         );
         assert!(result.contains("COUNTER"), "must surface CRDT type");
     }
+
+    #[test]
+    fn explain_index_parses_and_plans() {
+        let f = SqlFrontend::new();
+        let result = f.explain_index("EXPLAIN INDEX idx_orders_region").unwrap();
+        assert!(result.contains("Index: idx_orders_region"));
+        assert!(result.contains("Selectivity: 0.0050"));
+        assert!(result.contains("Fragmentation Ratio: 0.12"));
+        assert!(result.contains("Cache Hit Metric: 0.88"));
+        assert!(result.contains("Statistics: scan_count=150"));
+    }
 }
 
 // ---------------------------------------------------------------------------

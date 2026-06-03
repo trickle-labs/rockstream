@@ -62,6 +62,19 @@ pub struct CatalogEntry {
     pub backfill_started_epoch: Option<u64>,
 }
 
+/// A secondary index entry in the catalog.
+#[derive(Debug, Clone)]
+pub struct IndexEntry {
+    pub name: String,
+    pub namespace_id: NamespaceId,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub predicate: Option<String>,
+    pub state: ViewState, // BUILDING or READY
+    pub state_bytes: u64,
+    pub lag_ms: u64,
+}
+
 /// Key type for catalog lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CatalogKey {
@@ -80,6 +93,8 @@ pub struct CatalogStore {
     entries: HashMap<CatalogKey, CatalogEntry>,
     /// Workload registry and namespace defaults (v0.16).
     workloads: WorkloadStore,
+    /// Secondary indexes (v0.52).
+    pub indexes: HashMap<CatalogKey, IndexEntry>,
 }
 
 impl CatalogStore {
@@ -489,6 +504,102 @@ impl CatalogStore {
             state: entry.state.clone(),
             backfill_started_epoch: entry.backfill_started_epoch,
         })
+    }
+
+    // ─── v0.52: Secondary Indexes ─────────────────────────────────────────────
+
+    /// Register a secondary index — `CREATE INDEX`.
+    pub fn register_index(
+        &mut self,
+        namespace_id: NamespaceId,
+        name: impl Into<String>,
+        table: impl Into<String>,
+        columns: Vec<String>,
+        predicate: Option<String>,
+    ) -> Result<(), CatalogError> {
+        let name = name.into();
+        let table = table.into();
+        let key = CatalogKey {
+            namespace_id,
+            name: name.clone(),
+        };
+        // Check conflict with existing entries or indexes
+        if self.entries.contains_key(&key) || self.indexes.contains_key(&key) {
+            return Err(CatalogError::IndexNameConflict { name });
+        }
+        self.indexes.insert(
+            key,
+            IndexEntry {
+                name,
+                namespace_id,
+                table,
+                columns,
+                predicate,
+                state: ViewState::BackfillingFromEpoch(0), // BUILDING
+                state_bytes: 0,
+                lag_ms: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Set an index to READY state (`ViewState::Running`).
+    pub fn set_index_ready(
+        &mut self,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<(), CatalogError> {
+        let key = CatalogKey {
+            namespace_id,
+            name: name.to_owned(),
+        };
+        let index = self
+            .indexes
+            .get_mut(&key)
+            .ok_or_else(|| CatalogError::NotFound {
+                name: name.to_owned(),
+            })?;
+        index.state = ViewState::Running;
+        Ok(())
+    }
+
+    /// Retrieve an index entry.
+    pub fn get_index(&self, namespace_id: NamespaceId, name: &str) -> Option<&IndexEntry> {
+        self.indexes.get(&CatalogKey {
+            namespace_id,
+            name: name.to_owned(),
+        })
+    }
+
+    /// Drop a secondary index — `DROP INDEX`.
+    pub fn drop_index(&mut self, namespace_id: NamespaceId, name: &str) -> Result<(), CatalogError> {
+        let key = CatalogKey {
+            namespace_id,
+            name: name.to_owned(),
+        };
+        if self.indexes.remove(&key).is_none() {
+            return Err(CatalogError::NotFound {
+                name: name.to_owned(),
+            });
+        }
+        // Frontier-aware arrangement GC will handle physical deletion
+        Ok(())
+    }
+
+    /// Rebuild an index — resets state to BUILDING.
+    pub fn rebuild_index(&mut self, namespace_id: NamespaceId, name: &str) -> Result<(), CatalogError> {
+        let key = CatalogKey {
+            namespace_id,
+            name: name.to_owned(),
+        };
+        let index = self
+            .indexes
+            .get_mut(&key)
+            .ok_or_else(|| CatalogError::NotFound {
+                name: name.to_owned(),
+            })?;
+        index.state = ViewState::BackfillingFromEpoch(0);
+        Ok(())
     }
 }
 

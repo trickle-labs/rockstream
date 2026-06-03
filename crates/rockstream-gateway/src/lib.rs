@@ -51,6 +51,7 @@ pub mod dml;
 pub mod error;
 pub mod freshness;
 pub mod historical;
+pub mod index_scan;
 pub mod inline_view;
 pub mod limits;
 pub mod max_staleness;
@@ -61,6 +62,7 @@ pub mod pool;
 pub mod rockstream_catalog;
 pub mod subscribe;
 
+pub use index_scan::{select_scan_path, check_index_status, ScanPath, charge_index_budget};
 pub use dml::{
     CommittedWrite, DmlResult, DmlStatement, OptimisticTransaction, WriteKind, WriteSetEntry,
 };
@@ -90,6 +92,7 @@ pub use pgwire::{
 pub use pool::{ConnectionPool, ConnectionPoolConfig, PooledConnection};
 pub use rockstream_catalog::{
     catalog_audit_log, catalog_epochs, catalog_merge_laws, catalog_pipelines, catalog_shards,
+    catalog_indexes, set_live_indexes, CatalogIndex,
     resolve_catalog_alias, resolve_catalog_table, CatalogAuditEntry, CatalogEpoch, CatalogMergeLaw,
     CatalogPipeline, CatalogShard, PipelineStatus, ShardHealth,
 };

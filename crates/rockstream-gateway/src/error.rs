@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use rockstream_types::error_code::{
     ErrorCode, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007, RS_2008,
+    RS_2014, RS_2015, RS_2016,
 };
 
 /// Errors produced by the RockStream Postgres gateway.
@@ -81,6 +82,18 @@ pub enum GatewayError {
     /// Client lacks permissions for the requested action.
     #[error("access forbidden: {0}")]
     Forbidden(String),
+
+    /// Index is building — `RS-2014`.
+    #[error("RS-2014: index '{name}' is building")]
+    IndexBuilding { name: String },
+
+    /// Index has exceeded max lag — `RS-2015`.
+    #[error("RS-2015: index '{name}' frontier lag of {lag_ms} ms exceeds limit")]
+    IndexFrontierLag { name: String, lag_ms: u64 },
+
+    /// Index name conflict — `RS-2016`.
+    #[error("RS-2016: index name conflict: '{name}' already exists")]
+    IndexNameConflict { name: String },
 }
 
 impl GatewayError {
@@ -100,6 +113,9 @@ impl GatewayError {
             Self::InvalidDml(_) => RS_2001,
             Self::Unauthenticated(_) => RS_2001,
             Self::Forbidden(_) => RS_2001,
+            Self::IndexBuilding { .. } => RS_2014,
+            Self::IndexFrontierLag { .. } => RS_2015,
+            Self::IndexNameConflict { .. } => RS_2016,
         }
     }
 }

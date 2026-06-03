@@ -388,6 +388,51 @@ pub fn catalog_workload_resource_usage() -> Vec<CatalogWorkloadResourceUsage> {
     }]
 }
 
+// ── indexes ───────────────────────────────────────────────────────────────────
+
+/// A row in `rockstream_catalog.indexes`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogIndex {
+    pub name: String,
+    pub table_name: String,
+    pub columns: String,
+    pub predicate: Option<String>,
+    pub state: String,
+    pub state_bytes: u64,
+    pub lag_ms: u64,
+}
+
+static LIVE_INDEXES: OnceLock<Mutex<Vec<CatalogIndex>>> = OnceLock::new();
+
+/// Set the live catalog indexes from the control plane/catalog.
+pub fn set_live_indexes(indexes: Vec<CatalogIndex>) {
+    if let Some(mutex) = LIVE_INDEXES.get() {
+        let mut guard = mutex.lock().unwrap();
+        *guard = indexes;
+    } else {
+        let _ = LIVE_INDEXES.set(Mutex::new(indexes));
+    }
+}
+
+/// Return stub catalog index rows.
+pub fn catalog_indexes() -> Vec<CatalogIndex> {
+    if let Some(mutex) = LIVE_INDEXES.get() {
+        let guard = mutex.lock().unwrap();
+        if !guard.is_empty() {
+            return guard.clone();
+        }
+    }
+    vec![CatalogIndex {
+        name: "idx_orders_region".to_string(),
+        table_name: "orders".to_string(),
+        columns: "region".to_string(),
+        predicate: None,
+        state: "READY".to_string(),
+        state_bytes: 1024,
+        lag_ms: 0,
+    }]
+}
+
 /// Resolve the historical `rockstream.*` schema prefix to
 /// `rockstream_catalog.*`.
 ///
@@ -617,5 +662,22 @@ mod tests {
         let rows = catalog_workload_resource_usage();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].workload_id, "realtime");
+    }
+
+    #[test]
+    fn test_catalog_indexes() {
+        set_live_indexes(vec![CatalogIndex {
+            name: "idx_custom".to_string(),
+            table_name: "custom_table".to_string(),
+            columns: "col1".to_string(),
+            predicate: None,
+            state: "BUILDING".to_string(),
+            state_bytes: 512,
+            lag_ms: 50,
+        }]);
+        let rows = catalog_indexes();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "idx_custom");
+        assert_eq!(rows[0].state, "BUILDING");
     }
 }

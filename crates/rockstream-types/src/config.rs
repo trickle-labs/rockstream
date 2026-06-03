@@ -32,13 +32,25 @@ pub struct TunerOverrides {
     pub memory_limit_mb: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+fn default_selectivity_threshold() -> f64 {
+    0.01
+}
+
+fn default_max_lag_ms() -> u64 {
+    1000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClusterConfig {
     pub min_epoch_ms: u64,
     pub checkpoint_retention_count: u32,
     pub state_budget_gb: u64,
     #[serde(default)]
     pub autotuner: AutotunerConfig,
+    #[serde(default = "default_selectivity_threshold")]
+    pub index_prefer_selectivity_threshold: f64,
+    #[serde(default = "default_max_lag_ms")]
+    pub index_max_lag_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,7 +65,7 @@ pub struct ConnectorConfig {
     pub dlq_retention_days: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RockstreamConfig {
     pub cluster: ClusterConfig,
     pub worker: WorkerConfig,
@@ -78,6 +90,8 @@ impl Default for RockstreamConfig {
                 checkpoint_retention_count: 128,
                 state_budget_gb: 10,
                 autotuner: AutotunerConfig::default(),
+                index_prefer_selectivity_threshold: 0.01,
+                index_max_lag_ms: 1000,
             },
             worker: WorkerConfig {
                 segment_cache_bytes: 536870912, // 512 MB

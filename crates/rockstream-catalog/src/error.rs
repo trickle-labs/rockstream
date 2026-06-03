@@ -1,7 +1,7 @@
 //! Catalog error types with RS-XXXX error codes.
 
 use rockstream_types::error_code::{
-    ErrorCode, RS_1002, RS_1005, RS_1006, RS_1007, RS_1008, RS_5002,
+    ErrorCode, RS_1002, RS_1005, RS_1006, RS_1007, RS_1008, RS_5002, RS_2014, RS_2015, RS_2016,
 };
 use thiserror::Error;
 
@@ -56,6 +56,18 @@ pub enum CatalogError {
     /// View is not paused — `RS-1008`.
     #[error("RS-1008: view '{name}' is not paused")]
     ViewNotPaused { name: String },
+
+    /// Index is building — `RS-2014`.
+    #[error("RS-2014: index '{name}' is building")]
+    IndexBuilding { name: String },
+
+    /// Index has exceeded max lag — `RS-2015`.
+    #[error("RS-2015: index '{name}' frontier lag of {lag_ms} ms exceeds limit")]
+    IndexFrontierLag { name: String, lag_ms: u64 },
+
+    /// Index name conflict — `RS-2016`.
+    #[error("RS-2016: index name conflict: '{name}' already exists")]
+    IndexNameConflict { name: String },
 }
 
 impl CatalogError {
@@ -68,6 +80,9 @@ impl CatalogError {
             Self::WorkloadAlreadyExists { .. } => RS_1006,
             Self::ViewAlreadyPaused { .. } => RS_1007,
             Self::ViewNotPaused { .. } => RS_1008,
+            Self::IndexBuilding { .. } => RS_2014,
+            Self::IndexFrontierLag { .. } => RS_2015,
+            Self::IndexNameConflict { .. } => RS_2016,
             Self::Codec(_) | Self::AlreadyExists { .. } | Self::NotFound { .. } => {
                 // Use RS-0001 (internal error) for codec/store errors.
                 rockstream_types::error_code::RS_0001
