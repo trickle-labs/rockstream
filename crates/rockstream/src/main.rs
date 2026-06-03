@@ -232,9 +232,7 @@ async fn main() {
             println!("Status: RUNNING");
         }
         Some(Command::DebugArrangement { view, op_id, key }) => {
-            println!(
-                "Debugging arrangement for view {view}, operator {op_id}, key {key}"
-            );
+            println!("Debugging arrangement for view {view}, operator {op_id}, key {key}");
             println!("Arrangement Header: law_id=1, law_version=1");
             println!("Tombstone density: 0.15");
         }
