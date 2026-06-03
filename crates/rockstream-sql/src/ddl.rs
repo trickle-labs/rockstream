@@ -7,7 +7,7 @@ impl SqlFrontend {
     pub fn process_ddl(&self, sql: &str) -> Result<(), SqlError> {
         let sql_trimmed = sql.trim();
         let sql_upper = sql_trimmed.to_uppercase();
-        
+
         // Resource usage commands
         if sql_upper == "SHOW RESOURCE USAGE"
             || sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD")
@@ -16,7 +16,9 @@ impl SqlFrontend {
             if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
                 let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
                 if parts.len() < 6 || parts[5].is_empty() {
-                    return Err(SqlError::Parse("Workload name missing in SHOW RESOURCE USAGE FOR WORKLOAD".into()));
+                    return Err(SqlError::Parse(
+                        "Workload name missing in SHOW RESOURCE USAGE FOR WORKLOAD".into(),
+                    ));
                 }
             }
             return Ok(());
@@ -29,7 +31,9 @@ impl SqlFrontend {
             let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
             if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
                 if parts.len() < 6 || parts[5].is_empty() {
-                    return Err(SqlError::Parse("Schema name missing in SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA".into()));
+                    return Err(SqlError::Parse(
+                        "Schema name missing in SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA".into(),
+                    ));
                 }
             } else if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW") {
                 if parts.len() < 7 || parts[6].is_empty() {
@@ -83,9 +87,11 @@ mod tests {
     fn show_resource_usage_parses_successfully() {
         let f = SqlFrontend::new();
         assert!(f.process_ddl("SHOW RESOURCE USAGE").is_ok());
-        assert!(f.process_ddl("SHOW RESOURCE USAGE FOR WORKLOAD realtime").is_ok());
+        assert!(f
+            .process_ddl("SHOW RESOURCE USAGE FOR WORKLOAD realtime")
+            .is_ok());
         assert!(f.process_ddl("SHOW CLUSTER RESOURCE USAGE").is_ok());
-        
+
         let res_err = f.process_ddl("SHOW RESOURCE USAGE FOR WORKLOAD");
         assert!(res_err.is_err());
     }
@@ -93,10 +99,18 @@ mod tests {
     #[test]
     fn show_schema_evolution_parses_successfully() {
         let f = SqlFrontend::new();
-        assert!(f.process_ddl("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA my_schema").is_ok());
-        assert!(f.process_ddl("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW my_view").is_ok());
-        
-        assert!(f.process_ddl("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA").is_err());
-        assert!(f.process_ddl("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW").is_err());
+        assert!(f
+            .process_ddl("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA my_schema")
+            .is_ok());
+        assert!(f
+            .process_ddl("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW my_view")
+            .is_ok());
+
+        assert!(f
+            .process_ddl("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA")
+            .is_err());
+        assert!(f
+            .process_ddl("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW")
+            .is_err());
     }
 }

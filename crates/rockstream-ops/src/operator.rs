@@ -3,13 +3,13 @@
 //! All IVM operators implement this trait. The trait works with `ZSetBatch`
 //! (the delta unit) and carries a merge-law annotation for `EXPLAIN`.
 
-use std::sync::Arc;
 use async_trait::async_trait;
 use rockstream_types::batch::{SinkBatch, SourceBatch, ZSetBatch};
-use rockstream_types::merge_law::MergeLawId;
-use rockstream_types::timestamp::Epoch;
 use rockstream_types::ids::WorkloadId;
+use rockstream_types::merge_law::MergeLawId;
 use rockstream_types::state_budget::StateBudgetMeter;
+use rockstream_types::timestamp::Epoch;
+use std::sync::Arc;
 
 /// Context provided to each operator instance containing workload and budgeting info.
 #[derive(Clone)]

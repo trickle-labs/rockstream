@@ -340,12 +340,28 @@ impl Operator for HashJoinOp {
     }
 
     fn state_bytes(&self) -> u64 {
-        let left_bytes: u64 = self.left_arr.iter().map(|(jk, inner)| {
-            jk.len() as u64 + inner.iter().map(|((rk, rv), _)| (rk.len() + rv.len() + 8) as u64).sum::<u64>()
-        }).sum();
-        let right_bytes: u64 = self.right_arr.iter().map(|(jk, inner)| {
-            jk.len() as u64 + inner.iter().map(|((rk, rv), _)| (rk.len() + rv.len() + 8) as u64).sum::<u64>()
-        }).sum();
+        let left_bytes: u64 = self
+            .left_arr
+            .iter()
+            .map(|(jk, inner)| {
+                jk.len() as u64
+                    + inner
+                        .iter()
+                        .map(|((rk, rv), _)| (rk.len() + rv.len() + 8) as u64)
+                        .sum::<u64>()
+            })
+            .sum();
+        let right_bytes: u64 = self
+            .right_arr
+            .iter()
+            .map(|(jk, inner)| {
+                jk.len() as u64
+                    + inner
+                        .iter()
+                        .map(|((rk, rv), _)| (rk.len() + rv.len() + 8) as u64)
+                        .sum::<u64>()
+            })
+            .sum();
         left_bytes + right_bytes
     }
 }

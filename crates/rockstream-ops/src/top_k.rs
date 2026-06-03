@@ -335,21 +335,13 @@ impl Operator for TopKOp {
                 let rows_size: u64 = ps
                     .rows
                     .iter()
-                    .map(|(rid, (k, v, _, _))| {
-                        (rid.len() + k.len() + v.len() + 16) as u64
-                    })
+                    .map(|(rid, (k, v, _, _))| (rid.len() + k.len() + v.len() + 16) as u64)
                     .sum();
-                let emitted_size: u64 = ps
-                    .emitted
-                    .iter()
-                    .map(|(_, rid)| rid.len() as u64)
-                    .sum();
+                let emitted_size: u64 = ps.emitted.iter().map(|(_, rid)| rid.len() as u64).sum();
                 let cache_size: u64 = ps
                     .emitted_cache
                     .iter()
-                    .map(|(rid, (k, v))| {
-                        (rid.len() + k.len() + v.len()) as u64
-                    })
+                    .map(|(rid, (k, v))| (rid.len() + k.len() + v.len()) as u64)
                     .sum();
                 pk.len() as u64 + rows_size + emitted_size + cache_size
             })

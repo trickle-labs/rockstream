@@ -133,16 +133,17 @@ impl ControlService {
     }
 
     /// Collect live operator statistics for a pipeline.
-    pub fn collect_operator_stats(&self, _pipeline_id: u64) -> Vec<rockstream_types::explain::OperatorStats> {
-        vec![
-            rockstream_types::explain::OperatorStats {
-                rows_per_s: 12500.0,
-                state_reads: 120,
-                rmw_ratio: 0.15,
-                p99_latency_ms: 12.0,
-                dlq_entries: 0,
-            }
-        ]
+    pub fn collect_operator_stats(
+        &self,
+        _pipeline_id: u64,
+    ) -> Vec<rockstream_types::explain::OperatorStats> {
+        vec![rockstream_types::explain::OperatorStats {
+            rows_per_s: 12500.0,
+            state_reads: 120,
+            rmw_ratio: 0.15,
+            p99_latency_ms: 12.0,
+            dlq_entries: 0,
+        }]
     }
 }
 

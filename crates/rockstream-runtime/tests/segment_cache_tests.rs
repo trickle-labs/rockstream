@@ -2,11 +2,9 @@
 
 #[cfg(test)]
 mod tests {
+    use rockstream_runtime::segment_cache::{SegmentCache, SegmentCacheConfig, ShardSegmentKey};
     use std::sync::Arc;
     use tokio::sync::Mutex;
-    use rockstream_runtime::segment_cache::{
-        SegmentCache, SegmentCacheConfig, ShardSegmentKey,
-    };
 
     #[test]
     fn insert_and_get_returns_correct_data() {
@@ -18,7 +16,10 @@ mod tests {
 
     #[test]
     fn evicts_lru_when_at_capacity() {
-        let config = SegmentCacheConfig { max_segments: 4, epoch_ttl: 10 };
+        let config = SegmentCacheConfig {
+            max_segments: 4,
+            epoch_ttl: 10,
+        };
         let mut cache = SegmentCache::new(config);
 
         // Fill to capacity.
@@ -42,7 +43,10 @@ mod tests {
 
     #[test]
     fn evicts_expired_entries_by_ttl() {
-        let config = SegmentCacheConfig { max_segments: 10, epoch_ttl: 2 };
+        let config = SegmentCacheConfig {
+            max_segments: 10,
+            epoch_ttl: 2,
+        };
         let mut cache = SegmentCache::new(config);
 
         cache.set_epoch(1);
@@ -67,7 +71,10 @@ mod tests {
         const HOT_SEGMENTS: u64 = 20;
         const HOT_REPLAYS: u64 = 5000;
 
-        let config = SegmentCacheConfig { max_segments: 32, epoch_ttl: 100 };
+        let config = SegmentCacheConfig {
+            max_segments: 32,
+            epoch_ttl: 100,
+        };
         let mut cache = SegmentCache::new(config);
 
         // Warm up hot set

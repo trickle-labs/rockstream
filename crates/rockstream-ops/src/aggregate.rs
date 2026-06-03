@@ -233,7 +233,10 @@ impl Operator for AggregateMergeOp {
     }
 
     fn state_bytes(&self) -> u64 {
-        self.agg_state.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum()
+        self.agg_state
+            .iter()
+            .map(|(k, v)| (k.len() + v.len()) as u64)
+            .sum()
     }
 }
 

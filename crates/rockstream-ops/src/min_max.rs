@@ -278,9 +278,7 @@ impl Operator for MinMaxOp {
     fn state_bytes(&self) -> u64 {
         self.multiset_state
             .iter()
-            .map(|(k, v)| {
-                (k.len() + v.len() * 16) as u64
-            })
+            .map(|(k, v)| (k.len() + v.len() * 16) as u64)
             .sum()
     }
 }

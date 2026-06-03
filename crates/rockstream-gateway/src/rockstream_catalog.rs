@@ -388,7 +388,6 @@ pub fn catalog_workload_resource_usage() -> Vec<CatalogWorkloadResourceUsage> {
     }]
 }
 
-
 /// Resolve the historical `rockstream.*` schema prefix to
 /// `rockstream_catalog.*`.
 ///

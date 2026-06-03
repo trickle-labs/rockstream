@@ -3,13 +3,13 @@
 //! Implements the worker-side LRU arrangement segment cache in `rockstream-runtime`,
 //! keyed by `(shard_id, segment_id)` with TTL tied to checkpoint epoch.
 
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use bytes::Bytes;
 
-use rockstream_storage::ShardReader;
 use rockstream_storage::error::StorageError;
+use rockstream_storage::ShardReader;
 
 /// Opaque key identifying a specific arrangement segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,7 +99,7 @@ impl SegmentCache {
     pub fn get(&mut self, key: &ShardSegmentKey) -> Option<&[u8]> {
         self.seq += 1;
         let seq = self.seq;
-        
+
         if let Some(entry) = self.entries.get_mut(key) {
             entry.last_accessed = seq;
             self.stats.hits += 1;
@@ -148,7 +148,8 @@ impl SegmentCache {
     fn evict_expired(&mut self) {
         let current = self.current_epoch;
         let ttl = self.config.epoch_ttl;
-        self.entries.retain(|_, entry| current.saturating_sub(entry.created_epoch) <= ttl);
+        self.entries
+            .retain(|_, entry| current.saturating_sub(entry.created_epoch) <= ttl);
     }
 
     fn evict_lru(&mut self) {
@@ -187,9 +188,13 @@ impl CachedShardReader {
     }
 
     /// Read value for key/segment from the cache, falling back to the reader.
-    pub async fn get_cached(&self, key: &[u8], segment_id: u64) -> Result<Option<Bytes>, StorageError> {
+    pub async fn get_cached(
+        &self,
+        key: &[u8],
+        segment_id: u64,
+    ) -> Result<Option<Bytes>, StorageError> {
         let cache_key = ShardSegmentKey::new(self.shard_id, segment_id);
-        
+
         // 1. Try cache lookup
         {
             let mut cache = self.cache.lock().await;

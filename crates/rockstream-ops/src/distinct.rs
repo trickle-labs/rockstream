@@ -186,9 +186,7 @@ impl Operator for DistinctOp {
     fn state_bytes(&self) -> u64 {
         self.weight_state
             .iter()
-            .map(|((k, v), val)| {
-                (k.len() + v.len() + val.len()) as u64
-            })
+            .map(|((k, v), val)| (k.len() + v.len() + val.len()) as u64)
             .sum()
     }
 }
