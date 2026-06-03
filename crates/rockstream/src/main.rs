@@ -228,19 +228,18 @@ async fn main() {
             println!("rockstream {}", env!("CARGO_PKG_VERSION"));
         }
         Some(Command::Describe { pipeline }) => {
-            println!("Describing pipeline: {}", pipeline);
+            println!("Describing pipeline: {pipeline}");
             println!("Status: RUNNING");
         }
         Some(Command::DebugArrangement { view, op_id, key }) => {
             println!(
-                "Debugging arrangement for view {}, operator {}, key {}",
-                view, op_id, key
+                "Debugging arrangement for view {view}, operator {op_id}, key {key}"
             );
             println!("Arrangement Header: law_id=1, law_version=1");
             println!("Tombstone density: 0.15");
         }
         Some(Command::SupportBundle { output }) => {
-            println!("Generating support bundle to: {}", output);
+            println!("Generating support bundle to: {output}");
             println!("Support bundle generated successfully.");
         }
         None => {
