@@ -21,6 +21,7 @@ pub mod merge_law;
 pub mod metrics;
 pub mod schema_evolution;
 pub mod secret;
+pub mod shard_stats;
 pub mod state_budget;
 pub mod topology;
 pub mod view_lifecycle;
