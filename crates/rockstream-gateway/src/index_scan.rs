@@ -1,7 +1,6 @@
 use crate::error::GatewayError;
 use rockstream_types::state_budget::StateBudgetMeter;
 use rockstream_types::view_lifecycle::ViewState;
-use std::sync::Arc;
 
 /// Query scan execution path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,11 +17,8 @@ pub fn select_scan_path(
     lag_ms: u64,
     max_lag_ms: u64,
 ) -> ScanPath {
-    match state {
-        ViewState::BackfillingFromEpoch(_) => {
-            return ScanPath::ShardScan;
-        }
-        _ => {}
+    if let ViewState::BackfillingFromEpoch(_) = state {
+        return ScanPath::ShardScan;
     }
     if lag_ms > max_lag_ms {
         return ScanPath::ShardScan;
@@ -41,13 +37,10 @@ pub fn check_index_status(
     max_lag_ms: u64,
     name: &str,
 ) -> Result<(), GatewayError> {
-    match state {
-        ViewState::BackfillingFromEpoch(_) => {
-            return Err(GatewayError::IndexBuilding {
-                name: name.to_string(),
-            });
-        }
-        _ => {}
+    if let ViewState::BackfillingFromEpoch(_) = state {
+        return Err(GatewayError::IndexBuilding {
+            name: name.to_string(),
+        });
     }
     if lag_ms > max_lag_ms {
         return Err(GatewayError::IndexFrontierLag {

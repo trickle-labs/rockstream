@@ -77,7 +77,7 @@ pub struct IndexEntry {
 
 /// Key type for catalog lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CatalogKey {
+pub struct CatalogKey {
     namespace_id: NamespaceId,
     name: String,
 }

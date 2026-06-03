@@ -1,11 +1,6 @@
-use rockstream_gateway::{
-    charge_index_budget, check_index_status, select_scan_path, set_live_indexes, CatalogIndex,
-    ScanPath,
-};
-use rockstream_types::error_code::{RS_2014, RS_2015};
+use rockstream_gateway::{charge_index_budget, select_scan_path, ScanPath};
 use rockstream_types::state_budget::StateBudgetMeter;
 use rockstream_types::view_lifecycle::ViewState;
-use std::sync::Arc;
 
 #[test]
 fn test_selectivity_scans() {
