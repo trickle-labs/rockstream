@@ -151,6 +151,14 @@ pub const RS_5001: ErrorCode = ErrorCode::new(5001);
 pub const RS_5002: ErrorCode = ErrorCode::new(5002);
 /// Wire protocol version not supported; rolling upgrade version skew (v0.36, DESIGN.md §5.5).
 pub const RS_5003: ErrorCode = ErrorCode::new(5003);
+/// Resource usage budget warning (80% threshold reached).
+pub const RS_5018: ErrorCode = ErrorCode::new(5018);
+/// Resource usage budget critical (95% threshold reached).
+pub const RS_5019: ErrorCode = ErrorCode::new(5019);
+
+// 6xxx: Connector schema evolution
+/// Incompatible upstream schema evolution detected.
+pub const RS_6001: ErrorCode = ErrorCode::new(6001);
 
 /// Metadata for a registered error code.
 pub struct ErrorCodeMeta {
@@ -212,6 +220,9 @@ pub fn description(code: ErrorCode) -> &'static str {
         5001 => "Incompatible storage format",
         5002 => "Unknown merge law in arrangement header",
         5003 => "Wire protocol version not supported; rolling upgrade version skew",
+        5018 => "Resource usage budget warning (80% threshold reached)",
+        5019 => "Resource usage budget critical (95% threshold reached)",
+        6001 => "Incompatible upstream schema evolution detected",
         _ => "Unknown error",
     }
 }
@@ -225,6 +236,9 @@ pub fn severity(code: ErrorCode) -> Severity {
         3009 => Severity::Error,
         5001 => Severity::Fatal,
         5002 => Severity::Fatal,
+        5018 => Severity::Warning,
+        5019 => Severity::Warning,
+        6001 => Severity::Warning,
         _ => Severity::Error,
     }
 }
@@ -243,26 +257,41 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1006 => "Use a different workload name or drop the existing workload first.",
         1007 => "The view is already paused; use RESUME MATERIALIZED VIEW to restart it.",
         1008 => "The view is not paused; only paused views can be resumed.",
-        2001 => "Check view name and ensure the pipeline is running.",
-        2002 => "Reduce query scope or increase timeout.",
-        2003 => "Use a supported isolation level (snapshot or eventual).",
-        3009 => "Inspect the stored arrangement value; possible data corruption or law version mismatch.",
-        4001 => "Verify source connection settings and network connectivity.",
-        4002 => "Check sink availability and credentials.",
-        5001 => "Run the storage migration tool before upgrading.",
-        3003 => "Reduce input rate or increase local_buffer_max_epochs; check object store availability.",
-        5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
-        5003 => "Ensure N+1 binary is backward compatible with N; check rolling upgrade procedure in DESIGN.md §5.5.",
+        1009 => "Ensure the recursive query is monotone or restructure it; check EXPLAIN for recursion rules.",
+        1010 => "Verify connector positions, reset offsets, or perform a full bootstrap rebuild.",
+        1011 => "Resolve cycle in view dependencies; view-on-view relations must form a DAG.",
         1512 => "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs.",
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
-        3601 => "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation.",
-        3602 => "Wait for recovery to complete; monitor shard reassignment and frontier progress via SHOW VIEW STATUS.",
-        3603 => "Recovery is exceeding SLO; check worker health, storage latency, and frontier progress. Escalate if recovery does not complete within expected bounds.",
         1701 => "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead.",
         1702 => "Worker has been fenced out; acquire a new lease before retrying.",
         1703 => "No lease exists for this shard; acquire a lease before operating on it.",
+        2001 => "Check view name and ensure the pipeline is running.",
+        2002 => "Reduce query scope or increase timeout.",
+        2003 => "Use a supported isolation level (snapshot or eventual).",
+        2004 => "Drop all dependent materialized views first, or use CASCADE.",
+        2005 => "Reduce query rate, bundle queries, or increase tenant concurrency limits.",
+        2006 => "Query a more recent epoch or timestamp, or increase the catalog's checkpoint_retention_duration.",
         2007 => "Provide a client-supplied idempotency key or an exactly-once source-epoch envelope.",
         2008 => "Retry the transaction; if conflicts persist, reduce write concurrency or switch to a serializable protocol.",
+        3003 => "Reduce input rate or increase local_buffer_max_epochs; check object store availability.",
+        3009 => "Inspect the stored arrangement value; possible data corruption or law version mismatch.",
+        3601 => "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation.",
+        3602 => "Wait for recovery to complete; monitor shard reassignment and frontier progress via SHOW VIEW STATUS.",
+        3603 => "Recovery is exceeding SLO; check worker health, storage latency, and frontier progress. Escalate if recovery does not complete within expected bounds.",
+        3604 => "Wait for worker drain to complete, or target active workers for shard assignment.",
+        3605 => "Allow adaptive re-sharding to complete or manually trigger partition splitting.",
+        3606 => "Investigate slow network/compaction preventing worker from draining; review worker logs.",
+        3607 => "Perform a zero-downtime view replacement using a blue/green deployment strategy.",
+        3608 => "Wait for the existing clone backfill to finish before starting a new one.",
+        3609 => "Reduce write load or check worker resource usage to allow backfill to catch up before flip.",
+        4001 => "Verify source connection settings and network connectivity.",
+        4002 => "Check sink availability and credentials.",
+        5001 => "Run the storage migration tool before upgrading.",
+        5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
+        5003 => "Ensure N+1 binary is backward compatible with N; check rolling upgrade procedure in DESIGN.md §5.5.",
+        5018 => "Examine view resource usage and plan to scale out cluster capacity or adjust memory limits.",
+        5019 => "Immediately free unused view resources or scale cluster capacity to prevent pipeline stalls.",
+        6001 => "Apply view replacement or run manual migration to match the new upstream schema.",
         _ => "See documentation for this error code.",
     }
 }
@@ -297,12 +326,13 @@ mod tests {
     }
 
     #[test]
-    fn all_codes_have_descriptions() {
+    fn all_codes_have_descriptions_and_actionable_next_steps() {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
             RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007,
             RS_2008, RS_3003, RS_4001, RS_4002, RS_5001, RS_5002, RS_5003, RS_1512, RS_1513,
             RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703,
+            RS_5018, RS_5019, RS_6001,
         ];
         for code in codes {
             assert_ne!(
@@ -310,6 +340,12 @@ mod tests {
                 "Unknown error",
                 "Code {code} has no description"
             );
+            assert_ne!(
+                next_steps(code),
+                "See documentation for this error code.",
+                "Code {code} has no actionable next steps"
+            );
+            assert!(!next_steps(code).is_empty(), "Code {code} has empty next steps");
         }
     }
 }

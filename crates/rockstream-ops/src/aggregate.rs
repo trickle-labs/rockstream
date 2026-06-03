@@ -57,6 +57,8 @@ pub struct AggregateMergeOp {
     last_emitted: HashMap<Vec<u8>, Vec<u8>>,
     budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
     warned_over_budget: bool,
+    rows_processed: u64,
+    state_read_count: u64,
 }
 
 impl AggregateMergeOp {
@@ -76,6 +78,8 @@ impl AggregateMergeOp {
             last_emitted: HashMap::new(),
             budget: None,
             warned_over_budget: false,
+            rows_processed: 0,
+            state_read_count: 0,
         }
     }
 
@@ -97,6 +101,7 @@ impl AggregateMergeOp {
 
         // Phase 1: accumulate deltas into per-group state.
         for row in input.iter() {
+            self.rows_processed += 1;
             let group_key = (self.group_fn)(&row.key, &row.value);
             let (sum_contrib, count_contrib) = (self.measure_fn)(&row.key, &row.value);
 
@@ -105,6 +110,7 @@ impl AggregateMergeOp {
             let weighted_count = count_contrib.saturating_mul(row.weight);
             let delta_bytes = encode_sum_count(weighted_sum, weighted_count);
 
+            self.state_read_count += 1;
             let is_new = !self.agg_state.contains_key(&group_key);
             if is_new {
                 if let Some(ref budget) = self.budget {
@@ -189,6 +195,12 @@ impl AggregateMergeOp {
 
 #[async_trait]
 impl Operator for AggregateMergeOp {
+    fn set_context(&mut self, ctx: crate::operator::OperatorContext) {
+        if let Some(budget) = ctx.state_budget {
+            self.budget = Some(budget);
+        }
+    }
+
     async fn process(&mut self, _input: &SourceBatch) -> SinkBatch {
         SinkBatch::default()
     }
@@ -209,6 +221,19 @@ impl Operator for AggregateMergeOp {
 
     fn merge_law(&self) -> Option<MergeLawId> {
         Some(SUM_COUNT_ID)
+    }
+
+    fn snapshot_metrics(&self) -> crate::operator::OperatorMetrics {
+        crate::operator::OperatorMetrics {
+            rows_processed: self.rows_processed,
+            state_read_count: self.state_read_count,
+            rmw_avoided: true,
+            p99_latency_ms: 0.0,
+        }
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.agg_state.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum()
     }
 }
 

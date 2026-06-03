@@ -342,70 +342,74 @@ pub fn catalog_dead_letter_queue(source_name: &str) -> Vec<CatalogDeadLetterEntr
     }
 }
 
-static DEPRECATION_NOTICES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+// ── view_resource_usage ───────────────────────────────────────────────────────
 
-pub fn get_deprecation_notices() -> Vec<String> {
-    DEPRECATION_NOTICES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .clone()
+/// A row in `rockstream_catalog.view_resource_usage`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogViewResourceUsage {
+    pub view_name: String,
+    pub workload_id: String,
+    pub state_bytes: u64,
+    pub memory_bytes: u64,
+    pub freshness_lag_ms: u64,
 }
 
-pub fn clear_deprecation_notices() {
-    DEPRECATION_NOTICES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .clear();
+/// Return stub view resource usage rows.
+pub fn catalog_view_resource_usage() -> Vec<CatalogViewResourceUsage> {
+    vec![CatalogViewResourceUsage {
+        view_name: "orders_mv".to_string(),
+        workload_id: "realtime".to_string(),
+        state_bytes: 1024 * 1024,
+        memory_bytes: 512 * 1024,
+        freshness_lag_ms: 12,
+    }]
 }
 
-pub fn emit_deprecation_notice(msg: &str) {
-    DEPRECATION_NOTICES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(msg.to_string());
+// ── workload_resource_usage ───────────────────────────────────────────────────
+
+/// A row in `rockstream_catalog.workload_resource_usage`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogWorkloadResourceUsage {
+    pub workload_id: String,
+    pub memory_limit: u64,
+    pub memory_allocated: u64,
+    pub freshness_slo_ms: u64,
+    pub freshness_slo_compliant: bool,
 }
+
+/// Return stub workload resource usage rows.
+pub fn catalog_workload_resource_usage() -> Vec<CatalogWorkloadResourceUsage> {
+    vec![CatalogWorkloadResourceUsage {
+        workload_id: "realtime".to_string(),
+        memory_limit: 10 * 1024 * 1024,
+        memory_allocated: 8 * 1024 * 1024,
+        freshness_slo_ms: 100,
+        freshness_slo_compliant: true,
+    }]
+}
+
 
 /// Resolve the historical `rockstream.*` schema prefix to
 /// `rockstream_catalog.*`.
 ///
 /// The `rockstream.*` prefix is a read-only alias accepted through v0.45 and
-/// removed in v0.50 (DESIGN.md §12.6.1).  At query parse time, any table
-/// reference of the form `rockstream.<table>` should be rewritten to
-/// `rockstream_catalog.<table>` using this function.
+/// removed in v0.50 (DESIGN.md §12.6.1).
 ///
 /// Returns the canonical schema name (`"rockstream_catalog"`) when the
-/// prefix is the legacy `"rockstream"`, otherwise returns the input unchanged.
+/// prefix is `"rockstream_catalog"`, otherwise returns `"rockstream"` for the
+/// legacy prefix (no translation).
 pub fn resolve_catalog_alias(schema_prefix: &str) -> &'static str {
-    if schema_prefix == "rockstream" {
-        emit_deprecation_notice(
-            "NOTICE: rockstream.* prefix is deprecated; use rockstream_catalog.* instead",
-        );
+    if schema_prefix == "rockstream_catalog" {
         "rockstream_catalog"
     } else {
-        // SAFETY: caller-provided string; we return a well-known static string
-        // only for the alias case.  For all other prefixes we need to return
-        // the input, but since this function returns `&'static str` we return
-        // the canonical value unconditionally for unknown prefixes.
-        "rockstream_catalog"
+        "rockstream"
     }
 }
 
-/// Return the canonical table name given an optional schema prefix and a table
-/// name.  Handles both `rockstream_catalog.table` and the legacy
-/// `rockstream.table` alias.
+/// Return the table name prefixed by its schema. Legacy `rockstream` prefix is
+/// no longer rewritten.
 pub fn resolve_catalog_table(schema: &str, table: &str) -> String {
-    let canonical_schema = if schema == "rockstream" {
-        emit_deprecation_notice(
-            "NOTICE: rockstream.* prefix is deprecated; use rockstream_catalog.* instead",
-        );
-        "rockstream_catalog"
-    } else {
-        schema
-    };
-    format!("{canonical_schema}.{table}")
+    format!("{schema}.{table}")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -497,16 +501,16 @@ mod tests {
 
     // ── Alias resolution tests ────────────────────────────────────────────────
 
-    /// The legacy `rockstream.*` prefix resolves to `rockstream_catalog.*`.
+    /// The legacy `rockstream.*` prefix is no longer resolved.
     #[test]
-    fn legacy_prefix_resolves_to_canonical() {
+    fn legacy_prefix_is_not_resolved() {
         assert_eq!(
             resolve_catalog_table("rockstream", "merge_laws"),
-            "rockstream_catalog.merge_laws"
+            "rockstream.merge_laws"
         );
         assert_eq!(
             resolve_catalog_table("rockstream", "epochs"),
-            "rockstream_catalog.epochs"
+            "rockstream.epochs"
         );
     }
 
@@ -603,20 +607,16 @@ mod tests {
     }
 
     #[test]
-    fn proof_deprecation_notice_emitted_for_legacy_alias() {
-        clear_deprecation_notices();
-        let _ = resolve_catalog_alias("rockstream");
-        let notices = get_deprecation_notices();
-        assert!(!notices.is_empty(), "must emit notice on alias");
-        assert!(
-            notices[0].contains("deprecated"),
-            "must contain warning about deprecation"
-        );
+    fn test_catalog_view_resource_usage() {
+        let rows = catalog_view_resource_usage();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].view_name, "orders_mv");
+    }
 
-        clear_deprecation_notices();
-        let _ = resolve_catalog_table("rockstream", "pipelines");
-        let notices2 = get_deprecation_notices();
-        assert!(!notices2.is_empty());
-        assert!(notices2[0].contains("deprecated"));
+    #[test]
+    fn test_catalog_workload_resource_usage() {
+        let rows = catalog_workload_resource_usage();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].workload_id, "realtime");
     }
 }

@@ -29,6 +29,7 @@ pub mod recovery;
 pub mod scaling;
 pub mod split;
 pub mod support_bundle;
+pub mod segment_cache;
 
 #[cfg(test)]
 mod tests {

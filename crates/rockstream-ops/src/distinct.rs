@@ -43,6 +43,8 @@ pub struct DistinctOp {
     weight_state: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
     budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
     warned_over_budget: bool,
+    rows_processed: u64,
+    state_read_count: u64,
 }
 
 impl DistinctOp {
@@ -53,6 +55,8 @@ impl DistinctOp {
             weight_state: HashMap::new(),
             budget: None,
             warned_over_budget: false,
+            rows_processed: 0,
+            state_read_count: 0,
         }
     }
 
@@ -72,8 +76,10 @@ impl DistinctOp {
         let mut output = ZSet::new();
 
         for row in input.iter() {
+            self.rows_processed += 1;
             let entry_key = (row.key.clone(), row.value.clone());
 
+            self.state_read_count += 1;
             let is_new = !self.weight_state.contains_key(&entry_key);
             if is_new {
                 if let Some(ref budget) = self.budget {
@@ -140,6 +146,12 @@ impl DistinctOp {
 
 #[async_trait]
 impl Operator for DistinctOp {
+    fn set_context(&mut self, ctx: crate::operator::OperatorContext) {
+        if let Some(budget) = ctx.state_budget {
+            self.budget = Some(budget);
+        }
+    }
+
     async fn process(&mut self, _input: &SourceBatch) -> SinkBatch {
         SinkBatch::default()
     }
@@ -160,6 +172,24 @@ impl Operator for DistinctOp {
 
     fn merge_law(&self) -> Option<MergeLawId> {
         Some(WEIGHT_ADD_ID)
+    }
+
+    fn snapshot_metrics(&self) -> crate::operator::OperatorMetrics {
+        crate::operator::OperatorMetrics {
+            rows_processed: self.rows_processed,
+            state_read_count: self.state_read_count,
+            rmw_avoided: true,
+            p99_latency_ms: 0.0,
+        }
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.weight_state
+            .iter()
+            .map(|((k, v), val)| {
+                (k.len() + v.len() + val.len()) as u64
+            })
+            .sum()
     }
 }
 

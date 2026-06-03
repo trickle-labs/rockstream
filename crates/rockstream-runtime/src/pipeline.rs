@@ -26,6 +26,8 @@ pub struct PipelineConfig {
     pub name: String,
     /// Storage directory.
     pub storage_dir: String,
+    /// Target maximum staleness in milliseconds.
+    pub freshness_slo_ms: Option<u64>,
 }
 
 /// Run a pipeline: source → operator → sink, epoch by epoch.
@@ -66,6 +68,7 @@ pub async fn run_pipeline(
     let mut epoch: Epoch = 0;
     let mut bytes_buffered: u64 = 0;
     let mut epochs_buffered: u32 = 0;
+    let mut last_commit_time = tokio::time::Instant::now();
 
     while let Some(batch) = source.poll_batch(epoch).await {
         // Process through operator
@@ -78,14 +81,19 @@ pub async fn run_pipeline(
         // Write/prepare to sink
         sink.prepare(&output).await;
 
-        // Respect should_flush override or hard ceiling (500 epochs or 256 MB)
+        let elapsed = last_commit_time.elapsed().as_millis() as u64;
+        let should_slo_flush = config.freshness_slo_ms.is_some_and(|slo| elapsed >= slo);
+
+        // Respect should_flush override or hard ceiling (500 epochs or 256 MB) or SLO
         if sink.should_flush(bytes_buffered, epochs_buffered)
             || epochs_buffered >= 500
             || bytes_buffered >= 256 * 1024 * 1024
+            || should_slo_flush
         {
             sink.commit(epoch).await;
             bytes_buffered = 0;
             epochs_buffered = 0;
+            last_commit_time = tokio::time::Instant::now();
         }
 
         // Signal epoch complete
@@ -127,6 +135,7 @@ pub async fn run_noop_pipeline(storage_dir: &Path) -> PipelineResult {
     let config = PipelineConfig {
         name: "noop-pipeline".to_string(),
         storage_dir: storage_dir.display().to_string(),
+        freshness_slo_ms: None,
     };
 
     let mut source = NoopSource::new(5);
@@ -197,6 +206,7 @@ mod tests {
         let config = PipelineConfig {
             name: "custom-pipeline".to_string(),
             storage_dir: dir.path().display().to_string(),
+            freshness_slo_ms: None,
         };
 
         let mut source = NoopSource::new(10);

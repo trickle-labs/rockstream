@@ -334,6 +334,7 @@ impl ShardDb {
                     law_id: law.id(),
                     law_name: law.name(),
                     law_version: law.version().0,
+                    operator_id: None,
                 };
                 if is_valid_law_operand(law, &bytes) {
                     rockstream_types::metrics::inc_applied(&metric_key);
@@ -373,6 +374,7 @@ impl ShardDb {
             law_id: law.id(),
             law_name: law.name(),
             law_version: law.version().0,
+            operator_id: None,
         };
 
         let mut results = Vec::with_capacity(entries.len());

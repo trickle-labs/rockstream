@@ -25,6 +25,7 @@ pub struct LawMetricKey {
     pub law_id: MergeLawId,
     pub law_name: &'static str,
     pub law_version: u16,
+    pub operator_id: Option<crate::ids::OperatorId>,
 }
 
 /// A single atomic counter for one metric key.
@@ -273,6 +274,7 @@ mod tests {
             law_id: MergeLawId(0x0001),
             law_name: "WeightAdd",
             law_version: 1,
+            operator_id: None,
         }
     }
 
@@ -305,11 +307,13 @@ mod tests {
             law_id: MergeLawId(0x0001),
             law_name: "WeightAdd",
             law_version: 1,
+            operator_id: None,
         };
         let k2 = LawMetricKey {
             law_id: MergeLawId(0x0002),
             law_name: "SumCount",
             law_version: 1,
+            operator_id: None,
         };
         inc_applied(&k1);
         inc_applied(&k1);
@@ -328,6 +332,7 @@ mod tests {
             law_id: MergeLawId(0x0001),
             law_name: "WeightAdd",
             law_version: 1,
+            operator_id: None,
         };
         assert_eq!(read_rmw_avoided(&k), 0);
         inc_rmw_avoided(&k);
@@ -344,6 +349,7 @@ mod tests {
             law_id: MergeLawId(0x0003),
             law_name: "MaxRegister",
             law_version: 1,
+            operator_id: None,
         };
         inc_rmw_required(&k);
         inc_rmw_required(&k);
@@ -361,6 +367,7 @@ mod tests {
             law_id: MergeLawId(0x0001),
             law_name: "WeightAdd",
             law_version: 1,
+            operator_id: None,
         };
         for _ in 0..100 {
             inc_rmw_avoided(&k);
@@ -381,6 +388,7 @@ mod tests {
             law_id: MergeLawId(0x0003),
             law_name: "MaxRegister",
             law_version: 1,
+            operator_id: None,
         };
         for _ in 0..50 {
             inc_rmw_required(&k);
@@ -400,6 +408,7 @@ mod tests {
             law_id: MergeLawId(0x0002),
             law_name: "SumCount",
             law_version: 1,
+            operator_id: None,
         };
         // No operations yet — should default to 1.0.
         assert!((rmw_avoidance_ratio(&k) - 1.0).abs() < 1e-9);
@@ -413,11 +422,13 @@ mod tests {
             law_id: MergeLawId(0x0001),
             law_name: "WeightAdd",
             law_version: 1,
+            operator_id: None,
         };
         let k2 = LawMetricKey {
             law_id: MergeLawId(0x0002),
             law_name: "SumCount",
             law_version: 1,
+            operator_id: None,
         };
         inc_rmw_avoided(&k1);
         inc_rmw_avoided(&k2);
@@ -454,6 +465,7 @@ mod tests {
             law_id: MergeLawId(0x0002),
             law_name: "SumCount",
             law_version: 1,
+            operator_id: None,
         };
         // Simulate 1000 merge operations — all avoided (abelian group).
         for _ in 0..1000 {
@@ -476,6 +488,7 @@ mod tests {
             law_id: MergeLawId(0x0001),
             law_name: "WeightAdd",
             law_version: 1,
+            operator_id: None,
         };
         for _ in 0..1000 {
             inc_rmw_avoided(&weight_add_key);

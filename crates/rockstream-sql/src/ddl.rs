@@ -5,7 +5,40 @@ use crate::{SqlError, SqlFrontend};
 impl SqlFrontend {
     /// Process a DDL statement, validating the declared schema against connector schema metadata.
     pub fn process_ddl(&self, sql: &str) -> Result<(), SqlError> {
-        let sql_upper = sql.to_uppercase();
+        let sql_trimmed = sql.trim();
+        let sql_upper = sql_trimmed.to_uppercase();
+        
+        // Resource usage commands
+        if sql_upper == "SHOW RESOURCE USAGE"
+            || sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD")
+            || sql_upper == "SHOW CLUSTER RESOURCE USAGE"
+        {
+            if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
+                let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
+                if parts.len() < 6 || parts[5].is_empty() {
+                    return Err(SqlError::Parse("Workload name missing in SHOW RESOURCE USAGE FOR WORKLOAD".into()));
+                }
+            }
+            return Ok(());
+        }
+
+        // Schema evolution commands
+        if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA")
+            || sql_upper.starts_with("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW")
+        {
+            let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
+            if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
+                if parts.len() < 6 || parts[5].is_empty() {
+                    return Err(SqlError::Parse("Schema name missing in SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA".into()));
+                }
+            } else if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW") {
+                if parts.len() < 7 || parts[6].is_empty() {
+                    return Err(SqlError::Parse("Materialized view name missing in SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW".into()));
+                }
+            }
+            return Ok(());
+        }
+
         if sql_upper.starts_with("CREATE SOURCE") || sql_upper.starts_with("CREATE SINK") {
             // Verify schema against connector's discovered metadata
             if sql_upper.contains("KAFKA") {
@@ -44,5 +77,26 @@ mod tests {
             }
             other => panic!("expected SchemaMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn show_resource_usage_parses_successfully() {
+        let f = SqlFrontend::new();
+        assert!(f.process_ddl("SHOW RESOURCE USAGE").is_ok());
+        assert!(f.process_ddl("SHOW RESOURCE USAGE FOR WORKLOAD realtime").is_ok());
+        assert!(f.process_ddl("SHOW CLUSTER RESOURCE USAGE").is_ok());
+        
+        let res_err = f.process_ddl("SHOW RESOURCE USAGE FOR WORKLOAD");
+        assert!(res_err.is_err());
+    }
+
+    #[test]
+    fn show_schema_evolution_parses_successfully() {
+        let f = SqlFrontend::new();
+        assert!(f.process_ddl("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA my_schema").is_ok());
+        assert!(f.process_ddl("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW my_view").is_ok());
+        
+        assert!(f.process_ddl("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA").is_err());
+        assert!(f.process_ddl("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW").is_err());
     }
 }

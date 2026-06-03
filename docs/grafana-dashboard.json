@@ -1,0 +1,110 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "title": "Ingestion Rate (rows/sec)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(merge_law_applied_total[1m])",
+          "legendFormat": "{{operator_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "title": "SlateDB Compaction Lag",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "merge_law_tombstone_bytes",
+          "legendFormat": "{{shard_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "title": "Memory / State Budget Utilization",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "workload_memory_bytes / memory_limit",
+          "legendFormat": "{{workload_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "title": "gRPC Exchange Queue Depths",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "exchange_queue_depth",
+          "legendFormat": "{{channel_id}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 36,
+  "style": "dark",
+  "tags": ["rockstream", "observability"],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "RockStream System Dashboard",
+  "version": 1
+}
