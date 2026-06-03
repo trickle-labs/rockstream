@@ -167,6 +167,16 @@ enum Command {
         #[arg(long, default_value = "./support-bundle.tar.gz")]
         output: String,
     },
+    /// Tune the auto-tuner with manual overrides.
+    Tune {
+        /// Override settings in key=value format (e.g. parallelism=8, epoch_size_ms=500, memory_limit_mb=1024).
+        #[arg(long)]
+        r#override: Vec<String>,
+
+        /// Storage directory for local data where tune_overrides.json will be written.
+        #[arg(long, default_value = "./data")]
+        storage: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -239,6 +249,39 @@ async fn main() {
         Some(Command::SupportBundle { output }) => {
             println!("Generating support bundle to: {output}");
             println!("Support bundle generated successfully.");
+        }
+        Some(Command::Tune {
+            r#override,
+            storage,
+        }) => {
+            let mut overrides = rockstream_types::config::TunerOverrides::default();
+            for item in r#override {
+                if let Some((k, v)) = item.split_once('=') {
+                    match k {
+                        "parallelism" => {
+                            if let Ok(val) = v.parse::<usize>() {
+                                overrides.parallelism = Some(val);
+                            }
+                        }
+                        "epoch_size_ms" => {
+                            if let Ok(val) = v.parse::<u64>() {
+                                overrides.epoch_size_ms = Some(val);
+                            }
+                        }
+                        "memory_limit_mb" => {
+                            if let Ok(val) = v.parse::<u64>() {
+                                overrides.memory_limit_mb = Some(val);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let path = Path::new(&storage).join("tune_overrides.json");
+            let data = serde_json::to_string_pretty(&overrides).unwrap();
+            std::fs::create_dir_all(&storage).unwrap();
+            std::fs::write(&path, data).unwrap();
+            println!("Overrides written successfully to {}", path.display());
         }
         None => {
             println!(

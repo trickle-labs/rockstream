@@ -39,7 +39,8 @@ pub struct OperatorMetrics {
 /// Tuning hints sent to an operator to reconfigure its behavior.
 #[derive(Debug, Clone, Default)]
 pub struct OperatorHints {
-    // Placeholders for future auto-tuner integration
+    /// Pinned or suggested parallelism width for the operator.
+    pub parallelism: Option<usize>,
 }
 
 /// Outcome of a reconfiguration attempt.

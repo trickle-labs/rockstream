@@ -3,10 +3,42 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutotunerConfig {
+    pub enabled: bool,
+    pub hysteresis_scale_up_windows: usize,
+    pub hysteresis_scale_down_windows: usize,
+    pub default_parallelism: usize,
+    pub min_parallelism: usize,
+    pub max_parallelism: usize,
+}
+
+impl Default for AutotunerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hysteresis_scale_up_windows: 3,
+            hysteresis_scale_down_windows: 12, // 4x K
+            default_parallelism: 4,
+            min_parallelism: 1,
+            max_parallelism: 32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TunerOverrides {
+    pub parallelism: Option<usize>,
+    pub epoch_size_ms: Option<u64>,
+    pub memory_limit_mb: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterConfig {
     pub min_epoch_ms: u64,
     pub checkpoint_retention_count: u32,
     pub state_budget_gb: u64,
+    #[serde(default)]
+    pub autotuner: AutotunerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,6 +77,7 @@ impl Default for RockstreamConfig {
                 min_epoch_ms: 10,
                 checkpoint_retention_count: 128,
                 state_budget_gb: 10,
+                autotuner: AutotunerConfig::default(),
             },
             worker: WorkerConfig {
                 segment_cache_bytes: 536870912, // 512 MB
