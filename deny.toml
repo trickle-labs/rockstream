@@ -4,6 +4,8 @@ version = 2
 ignore = [
     "RUSTSEC-2025-0141", # bincode - unmaintained (SlateDB transitive dep)
     "RUSTSEC-2024-0436", # paste - unmaintained (SlateDB transitive dep)
+    "RUSTSEC-2025-0111", # tokio-tar - PAX extended headers vulnerability (testcontainers transitive dep)
+    "RUSTSEC-2025-0134", # rustls-pemfile - unmaintained (testcontainers transitive dep via bollard)
 ]
 
 [licenses]
