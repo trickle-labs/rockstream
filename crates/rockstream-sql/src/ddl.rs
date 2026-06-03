@@ -58,6 +58,52 @@ impl SqlFrontend {
                 }
             }
         }
+
+        if sql_upper.starts_with("CREATE INDEX") {
+            let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
+            if parts.len() < 5 {
+                return Err(SqlError::Parse("Malformed CREATE INDEX statement".into()));
+            }
+            if parts[3].to_uppercase() != "ON" {
+                return Err(SqlError::Parse("Expected ON keyword".into()));
+            }
+            let remainder = parts[4..].join(" ");
+            if !remainder.contains('(') || !remainder.contains(')') {
+                return Err(SqlError::Parse(
+                    "Expected column list in parentheses".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        if sql_upper.starts_with("DROP INDEX") {
+            let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
+            if parts.len() < 3 || parts[2].is_empty() {
+                return Err(SqlError::Parse("Index name missing in DROP INDEX".into()));
+            }
+            return Ok(());
+        }
+
+        if sql_upper.starts_with("REBUILD INDEX") {
+            let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
+            if parts.len() < 3 || parts[2].is_empty() {
+                return Err(SqlError::Parse(
+                    "Index name missing in REBUILD INDEX".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        if sql_upper.starts_with("EXPLAIN INDEX") {
+            let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
+            if parts.len() < 3 || parts[2].is_empty() {
+                return Err(SqlError::Parse(
+                    "Index name missing in EXPLAIN INDEX".into(),
+                ));
+            }
+            return Ok(());
+        }
+
         Ok(())
     }
 }
@@ -65,6 +111,21 @@ impl SqlFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_ddl_parsing_tests() {
+        let f = SqlFrontend::new();
+        assert!(f.process_ddl("CREATE INDEX idx ON orders (region)").is_ok());
+        assert!(f
+            .process_ddl("CREATE INDEX idx ON orders (region) WHERE amount > 100")
+            .is_ok());
+        assert!(f.process_ddl("DROP INDEX idx").is_ok());
+        assert!(f.process_ddl("REBUILD INDEX idx").is_ok());
+        assert!(f.process_ddl("EXPLAIN INDEX idx").is_ok());
+
+        assert!(f.process_ddl("CREATE INDEX idx ON").is_err());
+        assert!(f.process_ddl("DROP INDEX").is_err());
+    }
 
     #[test]
     fn proof_create_source_crdt_mismatch_raises_schema_mismatch() {

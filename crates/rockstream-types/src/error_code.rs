@@ -120,6 +120,12 @@ pub const RS_2006: ErrorCode = ErrorCode::new(2006);
 pub const RS_2007: ErrorCode = ErrorCode::new(2007);
 /// Optimistic transaction conflict detected; a concurrent write committed to the same key (v0.43).
 pub const RS_2008: ErrorCode = ErrorCode::new(2008);
+/// Index is building.
+pub const RS_2014: ErrorCode = ErrorCode::new(2014);
+/// Index has exceeded max lag.
+pub const RS_2015: ErrorCode = ErrorCode::new(2015);
+/// Index name conflict.
+pub const RS_2016: ErrorCode = ErrorCode::new(2016);
 
 // 3xxx: Merge / arrangement
 /// Merge operand malformed (fail-closed: never silently overwrites).
@@ -207,6 +213,9 @@ pub fn description(code: ErrorCode) -> &'static str {
         2006 => "Historical query beyond checkpoint retention window",
         2007 => "Idempotency key required for non-idempotent write",
         2008 => "Optimistic transaction conflict: a concurrent write committed to the same key",
+        2014 => "Index is building",
+        2015 => "Index frontier lag exceeded limit",
+        2016 => "Index name conflict",
         3003 => "Pipeline blocked: object store brownout, local buffer exhausted",
         3009 => "Merge operand malformed",
         3604 => "Worker drain in progress; new shard assignments rejected",
@@ -273,6 +282,9 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2006 => "Query a more recent epoch or timestamp, or increase the catalog's checkpoint_retention_duration.",
         2007 => "Provide a client-supplied idempotency key or an exactly-once source-epoch envelope.",
         2008 => "Retry the transaction; if conflicts persist, reduce write concurrency or switch to a serializable protocol.",
+        2014 => "Wait for index backfill to complete.",
+        2015 => "Index is too far behind view. Wait for synchronization or increase index_max_lag_ms.",
+        2016 => "An index with the same name already exists.",
         3003 => "Reduce input rate or increase local_buffer_max_epochs; check object store availability.",
         3009 => "Inspect the stored arrangement value; possible data corruption or law version mismatch.",
         3601 => "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation.",
@@ -330,8 +342,9 @@ mod tests {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
             RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007,
-            RS_2008, RS_3003, RS_4001, RS_4002, RS_5001, RS_5002, RS_5003, RS_1512, RS_1513,
-            RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001,
+            RS_2008, RS_2014, RS_2015, RS_2016, RS_3003, RS_4001, RS_4002, RS_5001, RS_5002,
+            RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703,
+            RS_5018, RS_5019, RS_6001,
         ];
         for code in codes {
             assert_ne!(

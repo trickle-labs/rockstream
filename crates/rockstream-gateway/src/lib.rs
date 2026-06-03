@@ -51,6 +51,7 @@ pub mod dml;
 pub mod error;
 pub mod freshness;
 pub mod historical;
+pub mod index_scan;
 pub mod inline_view;
 pub mod limits;
 pub mod max_staleness;
@@ -73,6 +74,7 @@ pub use historical::{
     oldest_retained_epoch, EpochTimestampEntry, HistoricalAsOf, HistoricalQueryResult,
     HistoricalRow, MonotonePartialResult, RetentionConfig,
 };
+pub use index_scan::{charge_index_budget, check_index_status, select_scan_path, ScanPath};
 pub use inline_view::InlineViewCatalog;
 pub use limits::{check_timeout, QueryTimeoutConfig, RateLimitConfig, RateLimiter};
 pub use max_staleness::{check_staleness, format_notice, MaxStalenessConfig, StalenessStatus};
@@ -89,9 +91,10 @@ pub use pgwire::{
 };
 pub use pool::{ConnectionPool, ConnectionPoolConfig, PooledConnection};
 pub use rockstream_catalog::{
-    catalog_audit_log, catalog_epochs, catalog_merge_laws, catalog_pipelines, catalog_shards,
-    resolve_catalog_alias, resolve_catalog_table, CatalogAuditEntry, CatalogEpoch, CatalogMergeLaw,
-    CatalogPipeline, CatalogShard, PipelineStatus, ShardHealth,
+    catalog_audit_log, catalog_epochs, catalog_indexes, catalog_merge_laws, catalog_pipelines,
+    catalog_shards, resolve_catalog_alias, resolve_catalog_table, set_live_indexes,
+    CatalogAuditEntry, CatalogEpoch, CatalogIndex, CatalogMergeLaw, CatalogPipeline, CatalogShard,
+    PipelineStatus, ShardHealth,
 };
 pub use subscribe::{
     simulate_subscribe_batch, ChangeRetentionConfig, SubscribeAsOf, SubscribeBatch,
