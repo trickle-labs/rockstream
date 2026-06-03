@@ -85,8 +85,8 @@ impl SqlFrontend {
             0.05
         };
         let mut lines = Vec::new();
-        lines.push(format!("Index: {}", index_name));
-        lines.push(format!("Selectivity: {:.4}", selectivity));
+        lines.push(format!("Index: {index_name}"));
+        lines.push(format!("Selectivity: {selectivity:.4}"));
         lines.push("Fragmentation Ratio: 0.12".to_string());
         lines.push("Cache Hit Metric: 0.88".to_string());
         lines.push("Statistics: scan_count=150, bytes_read=409600".to_string());
