@@ -16,6 +16,7 @@ members = [
     "crates/rockstream-sql",
     "crates/rockstream-storage",
     "crates/rockstream-types",
+    "crates/rockstream-e2e",
 ]
 
 [workspace.package]
