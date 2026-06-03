@@ -1,6 +1,6 @@
 use crate::error::GatewayError;
-use rockstream_types::view_lifecycle::ViewState;
 use rockstream_types::state_budget::StateBudgetMeter;
+use rockstream_types::view_lifecycle::ViewState;
 use std::sync::Arc;
 
 /// Query scan execution path.
@@ -43,12 +43,17 @@ pub fn check_index_status(
 ) -> Result<(), GatewayError> {
     match state {
         ViewState::BackfillingFromEpoch(_) => {
-            return Err(GatewayError::IndexBuilding { name: name.to_string() });
+            return Err(GatewayError::IndexBuilding {
+                name: name.to_string(),
+            });
         }
         _ => {}
     }
     if lag_ms > max_lag_ms {
-        return Err(GatewayError::IndexFrontierLag { name: name.to_string(), lag_ms });
+        return Err(GatewayError::IndexFrontierLag {
+            name: name.to_string(),
+            lag_ms,
+        });
     }
     Ok(())
 }
@@ -94,7 +99,8 @@ mod tests {
     fn test_check_index_status() {
         assert!(check_index_status(&ViewState::Running, 100, 1000, "idx").is_ok());
 
-        let err_building = check_index_status(&ViewState::BackfillingFromEpoch(0), 100, 1000, "idx").unwrap_err();
+        let err_building =
+            check_index_status(&ViewState::BackfillingFromEpoch(0), 100, 1000, "idx").unwrap_err();
         assert_eq!(err_building.error_code(), RS_2014);
 
         let err_lag = check_index_status(&ViewState::Running, 1500, 1000, "idx").unwrap_err();

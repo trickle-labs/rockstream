@@ -572,7 +572,11 @@ impl CatalogStore {
     }
 
     /// Drop a secondary index — `DROP INDEX`.
-    pub fn drop_index(&mut self, namespace_id: NamespaceId, name: &str) -> Result<(), CatalogError> {
+    pub fn drop_index(
+        &mut self,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<(), CatalogError> {
         let key = CatalogKey {
             namespace_id,
             name: name.to_owned(),
@@ -587,7 +591,11 @@ impl CatalogStore {
     }
 
     /// Rebuild an index — resets state to BUILDING.
-    pub fn rebuild_index(&mut self, namespace_id: NamespaceId, name: &str) -> Result<(), CatalogError> {
+    pub fn rebuild_index(
+        &mut self,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<(), CatalogError> {
         let key = CatalogKey {
             namespace_id,
             name: name.to_owned(),

@@ -1,7 +1,7 @@
 //! Catalog error types with RS-XXXX error codes.
 
 use rockstream_types::error_code::{
-    ErrorCode, RS_1002, RS_1005, RS_1006, RS_1007, RS_1008, RS_5002, RS_2014, RS_2015, RS_2016,
+    ErrorCode, RS_1002, RS_1005, RS_1006, RS_1007, RS_1008, RS_2014, RS_2015, RS_2016, RS_5002,
 };
 use thiserror::Error;
 

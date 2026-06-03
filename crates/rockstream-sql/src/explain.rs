@@ -67,13 +67,8 @@ impl SqlFrontend {
     /// Parse and plan an `EXPLAIN INDEX` query.
     pub fn explain_index(&self, sql: &str) -> Result<String, SqlError> {
         let trimmed = sql.trim();
-        if !trimmed
-            .to_ascii_lowercase()
-            .starts_with("explain index")
-        {
-            return Err(SqlError::Parse(
-                "Not an EXPLAIN INDEX statement".into(),
-            ));
+        if !trimmed.to_ascii_lowercase().starts_with("explain index") {
+            return Err(SqlError::Parse("Not an EXPLAIN INDEX statement".into()));
         }
         let index_name = trimmed["explain index".len()..].trim();
         if index_name.is_empty() {

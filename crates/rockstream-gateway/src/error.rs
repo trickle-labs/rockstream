@@ -3,8 +3,8 @@
 use thiserror::Error;
 
 use rockstream_types::error_code::{
-    ErrorCode, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007, RS_2008,
-    RS_2014, RS_2015, RS_2016,
+    ErrorCode, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007, RS_2008, RS_2014,
+    RS_2015, RS_2016,
 };
 
 /// Errors produced by the RockStream Postgres gateway.

@@ -1,7 +1,10 @@
-use rockstream_gateway::{select_scan_path, check_index_status, ScanPath, charge_index_budget, set_live_indexes, CatalogIndex};
-use rockstream_types::view_lifecycle::ViewState;
-use rockstream_types::state_budget::StateBudgetMeter;
+use rockstream_gateway::{
+    charge_index_budget, check_index_status, select_scan_path, set_live_indexes, CatalogIndex,
+    ScanPath,
+};
 use rockstream_types::error_code::{RS_2014, RS_2015};
+use rockstream_types::state_budget::StateBudgetMeter;
+use rockstream_types::view_lifecycle::ViewState;
 use std::sync::Arc;
 
 #[test]
@@ -33,7 +36,7 @@ fn test_backfill_and_lag_fallback() {
 fn test_index_state_budget_charging() {
     // StateBudget cap of 1000 bytes.
     let budget = StateBudgetMeter::new("test_index_budget", 1000);
-    
+
     // Charge 400 bytes for index -> success.
     assert!(charge_index_budget(&budget, 400).is_ok());
     assert_eq!(budget.current_bytes(), 400);

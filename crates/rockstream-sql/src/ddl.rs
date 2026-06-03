@@ -69,7 +69,9 @@ impl SqlFrontend {
             }
             let remainder = parts[4..].join(" ");
             if !remainder.contains('(') || !remainder.contains(')') {
-                return Err(SqlError::Parse("Expected column list in parentheses".into()));
+                return Err(SqlError::Parse(
+                    "Expected column list in parentheses".into(),
+                ));
             }
             return Ok(());
         }
@@ -85,7 +87,9 @@ impl SqlFrontend {
         if sql_upper.starts_with("REBUILD INDEX") {
             let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
             if parts.len() < 3 || parts[2].is_empty() {
-                return Err(SqlError::Parse("Index name missing in REBUILD INDEX".into()));
+                return Err(SqlError::Parse(
+                    "Index name missing in REBUILD INDEX".into(),
+                ));
             }
             return Ok(());
         }
@@ -93,7 +97,9 @@ impl SqlFrontend {
         if sql_upper.starts_with("EXPLAIN INDEX") {
             let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
             if parts.len() < 3 || parts[2].is_empty() {
-                return Err(SqlError::Parse("Index name missing in EXPLAIN INDEX".into()));
+                return Err(SqlError::Parse(
+                    "Index name missing in EXPLAIN INDEX".into(),
+                ));
             }
             return Ok(());
         }
@@ -110,7 +116,9 @@ mod tests {
     fn index_ddl_parsing_tests() {
         let f = SqlFrontend::new();
         assert!(f.process_ddl("CREATE INDEX idx ON orders (region)").is_ok());
-        assert!(f.process_ddl("CREATE INDEX idx ON orders (region) WHERE amount > 100").is_ok());
+        assert!(f
+            .process_ddl("CREATE INDEX idx ON orders (region) WHERE amount > 100")
+            .is_ok());
         assert!(f.process_ddl("DROP INDEX idx").is_ok());
         assert!(f.process_ddl("REBUILD INDEX idx").is_ok());
         assert!(f.process_ddl("EXPLAIN INDEX idx").is_ok());
