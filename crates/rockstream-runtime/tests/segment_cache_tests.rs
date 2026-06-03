@@ -3,8 +3,6 @@
 #[cfg(test)]
 mod tests {
     use rockstream_runtime::segment_cache::{SegmentCache, SegmentCacheConfig, ShardSegmentKey};
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     #[test]
     fn insert_and_get_returns_correct_data() {
@@ -67,7 +65,6 @@ mod tests {
     /// Benchmark test asserting > 80% hit rate on join workloads.
     #[test]
     fn proof_segment_cache_hit_ratio_exceeds_80_percent() {
-        const TOTAL_SEGMENTS: u64 = 200;
         const HOT_SEGMENTS: u64 = 20;
         const HOT_REPLAYS: u64 = 5000;
 
