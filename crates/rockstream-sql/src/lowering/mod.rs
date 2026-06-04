@@ -120,13 +120,13 @@ impl SqlFrontend {
                             .params
                             .partition_by
                             .iter()
-                            .map(|e| self.resolve_col_index(window.input.schema(), e))
+                            .map(|e| Self::resolve_col_index(window.input.schema(), e))
                             .collect::<Vec<_>>();
                         let order_by_indices = window_fun
                             .params
                             .order_by
                             .iter()
-                            .map(|se| self.resolve_col_index(window.input.schema(), &se.expr))
+                            .map(|se| Self::resolve_col_index(window.input.schema(), &se.expr))
                             .collect::<Vec<_>>();
                         window_exprs.push(rockstream_plan::WindowExpr {
                             func: window_func,
@@ -279,10 +279,10 @@ impl SqlFrontend {
         }
     }
 
-    fn resolve_col_index(&self, schema: &datafusion::common::DFSchemaRef, expr: &DFExpr) -> usize {
+    fn resolve_col_index(schema: &datafusion::common::DFSchemaRef, expr: &DFExpr) -> usize {
         match expr {
             DFExpr::Column(col) => schema.index_of_column(col).unwrap_or(0),
-            DFExpr::Alias(Alias { expr, .. }) => self.resolve_col_index(schema, expr),
+            DFExpr::Alias(Alias { expr, .. }) => Self::resolve_col_index(schema, expr),
             _ => 0,
         }
     }
