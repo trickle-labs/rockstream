@@ -1205,7 +1205,7 @@ fn http_get_with_retry(
     path: &str,
     attempts: u32,
 ) -> std::io::Result<(String, String)> {
-    let mut last_err = std::io::Error::new(std::io::ErrorKind::Other, "no attempts");
+    let mut last_err = std::io::Error::other("no attempts");
     for i in 0..attempts {
         match http_get(host, port, path) {
             Ok(result) => return Ok(result),
