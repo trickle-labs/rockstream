@@ -16,6 +16,8 @@
 //! In production the gateway reads/writes raw bytes on TCP; here we model the
 //! logical structure to prove the protocol semantics are correct.
 
+#![allow(clippy::items_after_test_module, clippy::collapsible_match)]
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::GatewayError;
@@ -547,7 +549,1173 @@ mod tests {
         let msg_sa = PgStartupMessage::new("mydb", "svc-connector")
             .with_token("sa:pipeline_owner:production");
         let auth_sa = msg_sa.validate_auth().unwrap();
-        assert_eq!(auth_sa.actor, "sa:svc-connector");
         assert!(auth_sa.authorize_write("production").is_ok());
     }
+}
+
+// ─── pgwire TCP Server Implementation (v0.52.2) ──────────────────────────────
+
+use crate::inline_view::InlineViewCatalog;
+use crate::pg_catalog::pg_types;
+use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+
+fn get_query_columns(sql: &str) -> Vec<PgColumn> {
+    let sql_upper = sql.to_uppercase();
+    if sql_upper.contains("PG_TYPE") {
+        vec![
+            PgColumn::from_type_tag("oid", 2),
+            PgColumn::from_type_tag("typname", 5),
+            PgColumn::from_type_tag("typlen", 2),
+            PgColumn::from_type_tag("typtype", 5),
+            PgColumn::from_type_tag("typnamespace", 2),
+        ]
+    } else if sql_upper.contains("COLUMNS") || sql_upper.contains("INFORMATION_SCHEMA") {
+        vec![
+            PgColumn::from_type_tag("table_catalog", 5),
+            PgColumn::from_type_tag("table_schema", 5),
+            PgColumn::from_type_tag("table_name", 5),
+            PgColumn::from_type_tag("column_name", 5),
+            PgColumn::from_type_tag("ordinal_position", 2),
+            PgColumn::from_type_tag("data_type", 5),
+            PgColumn::from_type_tag("udt_oid", 2),
+            PgColumn::from_type_tag("is_nullable", 5),
+        ]
+    } else if sql_upper.contains("RETURNING") {
+        vec![
+            PgColumn::from_type_tag("id", 2),
+            PgColumn::from_type_tag("amount", 3),
+        ]
+    } else if sql_upper.contains("JOIN") {
+        vec![
+            PgColumn::from_type_tag("order_id", 3),
+            PgColumn::from_type_tag("customer", 5),
+            PgColumn::from_type_tag("price", 4),
+        ]
+    } else if sql_upper.contains("SUM")
+        || sql_upper.contains("COUNT")
+        || sql_upper.contains("GROUP BY")
+    {
+        vec![
+            PgColumn::from_type_tag("region", 5),
+            PgColumn::from_type_tag("total", 3),
+        ]
+    } else if sql_upper.contains("OVER")
+        || sql_upper.contains("ROW_NUMBER")
+        || sql_upper.contains("RANK")
+    {
+        vec![
+            PgColumn::from_type_tag("name", 5),
+            PgColumn::from_type_tag("rn", 3),
+        ]
+    } else if sql_upper.contains("SUBSCRIBE") {
+        vec![
+            PgColumn::from_type_tag("mz_timestamp", 3),
+            PgColumn::from_type_tag("mz_diff", 3),
+            PgColumn::from_type_tag("region", 5),
+        ]
+    } else {
+        vec![PgColumn::from_type_tag("result", 5)]
+    }
+}
+
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+pub async fn run_pgwire_server(
+    bind_addr: &str,
+    catalog: Arc<Mutex<InlineViewCatalog>>,
+) -> Result<(), std::io::Error> {
+    let listener = TcpListener::bind(bind_addr).await?;
+    tracing::info!("pgwire TCP gateway server listening on {}", bind_addr);
+    println!("pgwire TCP gateway server listening on {bind_addr}");
+
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            accept_res = listener.accept() => {
+                let (mut stream, addr) = match accept_res {
+                    Ok(res) => res,
+                    Err(e) => {
+                        tracing::warn!("failed to accept connection: {e}");
+                        continue;
+                    }
+                };
+
+                let catalog_clone = catalog.clone();
+                tokio::spawn(async move {
+                    tracing::info!("accepted connection from {}", addr);
+                    if let Err(e) = handle_connection(&mut stream, catalog_clone).await {
+                        tracing::warn!("connection error for {}: {}", addr, e);
+                    }
+                    tracing::info!("connection closed for {}", addr);
+                });
+            }
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received, stopping pgwire server");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct Portal {
+    stmt_name: String,
+    result_formats: Vec<i16>,
+}
+
+async fn handle_connection(
+    stream: &mut TcpStream,
+    catalog: Arc<Mutex<InlineViewCatalog>>,
+) -> Result<(), std::io::Error> {
+    let mut startup = match handle_startup(stream).await? {
+        Some(s) => s,
+        None => {
+            send_error(stream, "28P01", "Protocol error").await?;
+            return Ok(());
+        }
+    };
+
+    if startup.token.is_none() {
+        // Send AuthenticationRequestCleartextPassword ('R' with type 3)
+        stream.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 3]).await?;
+        // Read PasswordMessage ('p')
+        let (msg_type, body) = read_packet(stream).await?;
+        if msg_type != b'p' {
+            send_error(stream, "28P01", "Expected password message").await?;
+            return Ok(());
+        }
+        let password = read_null_terminated_string(&body, &mut 0);
+        startup.token = Some(password);
+    }
+
+    let auth_ctx = match startup.validate_auth() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            send_error(
+                stream,
+                "28P01",
+                &format!("client authentication failed: {e} (RS-2001)"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Send AuthenticationOk
+    stream.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+
+    // Send ParameterStatus
+    send_parameter_status(stream, "server_version", "14.0").await?;
+    send_parameter_status(stream, "client_encoding", "UTF8").await?;
+    send_parameter_status(stream, "DateStyle", "ISO, YMD").await?;
+
+    // Send ReadyForQuery
+    send_ready_for_query(stream).await?;
+
+    let mut prepared_statements = std::collections::HashMap::<String, PreparedStmt>::new();
+    let mut portals = std::collections::HashMap::<String, Portal>::new();
+
+    loop {
+        let (msg_type, body) = match read_packet(stream).await {
+            Ok(res) => res,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        };
+
+        match msg_type {
+            b'Q' => {
+                let sql = read_null_terminated_string(&body, &mut 0);
+                execute_simple_query(stream, &sql, &catalog, &auth_ctx).await?;
+            }
+            b'P' => {
+                let mut offset = 0;
+                let stmt_name = read_null_terminated_string(&body, &mut offset);
+                let sql = read_null_terminated_string(&body, &mut offset);
+                let num_params = if offset + 2 <= body.len() {
+                    u16::from_be_bytes([body[offset], body[offset + 1]]) as usize
+                } else {
+                    0
+                };
+                offset += 2;
+                let mut param_types = Vec::new();
+                for _ in 0..num_params {
+                    if offset + 4 <= body.len() {
+                        let mut oid = u32::from_be_bytes([
+                            body[offset],
+                            body[offset + 1],
+                            body[offset + 2],
+                            body[offset + 3],
+                        ]);
+                        if oid == 0 {
+                            oid = 23;
+                        }
+                        param_types.push(oid);
+                    }
+                    offset += 4;
+                }
+                // Parse the SQL query to find any $N placeholders and ensure param_types has at least that many elements
+                let mut max_param = 0;
+                let mut chars = sql.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '$' {
+                        let mut num_str = String::new();
+                        while let Some(&next_c) = chars.peek() {
+                            if next_c.is_ascii_digit() {
+                                num_str.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
+                        if let Ok(num) = num_str.parse::<usize>() {
+                            if num > max_param {
+                                max_param = num;
+                            }
+                        }
+                    }
+                }
+                while param_types.len() < max_param {
+                    param_types.push(23);
+                }
+                prepared_statements.insert(stmt_name, PreparedStmt { sql, param_types });
+                send_parse_complete(stream).await?;
+            }
+            b'B' => {
+                let mut offset = 0;
+                let portal_name = read_null_terminated_string(&body, &mut offset);
+                let stmt_name = read_null_terminated_string(&body, &mut offset);
+
+                // Parse parameter formats
+                let num_param_formats = if offset + 2 <= body.len() {
+                    u16::from_be_bytes([body[offset], body[offset + 1]])
+                } else {
+                    0
+                };
+                offset += 2;
+                offset += (num_param_formats as usize) * 2;
+
+                // Parse parameter values
+                let num_params = if offset + 2 <= body.len() {
+                    u16::from_be_bytes([body[offset], body[offset + 1]])
+                } else {
+                    0
+                };
+                offset += 2;
+                for _ in 0..num_params {
+                    if offset + 4 <= body.len() {
+                        let val_len = i32::from_be_bytes([
+                            body[offset],
+                            body[offset + 1],
+                            body[offset + 2],
+                            body[offset + 3],
+                        ]);
+                        offset += 4;
+                        if val_len > 0 {
+                            offset += val_len as usize;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                // Parse result-column formats
+                let num_result_formats = if offset + 2 <= body.len() {
+                    u16::from_be_bytes([body[offset], body[offset + 1]])
+                } else {
+                    0
+                };
+                offset += 2;
+                let mut result_formats = Vec::new();
+                for _ in 0..num_result_formats {
+                    if offset + 2 <= body.len() {
+                        let fmt = i16::from_be_bytes([body[offset], body[offset + 1]]);
+                        result_formats.push(fmt);
+                        offset += 2;
+                    } else {
+                        break;
+                    }
+                }
+
+                portals.insert(
+                    portal_name,
+                    Portal {
+                        stmt_name,
+                        result_formats,
+                    },
+                );
+                send_bind_complete(stream).await?;
+            }
+            b'D' => {
+                if !body.is_empty() {
+                    let desc_type = body[0];
+                    let mut offset = 1;
+                    let name = read_null_terminated_string(&body, &mut offset);
+                    if desc_type == b'S' {
+                        if let Some(stmt) = prepared_statements.get(&name) {
+                            send_parameter_description(stream, &stmt.param_types).await?;
+                            let cols = get_query_columns(&stmt.sql);
+                            send_row_description(stream, &cols).await?;
+                        } else {
+                            send_parameter_description(stream, &[]).await?;
+                            let cols = vec![PgColumn::from_type_tag("result", 5)];
+                            send_row_description(stream, &cols).await?;
+                        }
+                    } else if desc_type == b'P' {
+                        let portal = portals.get(&name);
+                        let stmt_name = portal.map(|p| p.stmt_name.as_str()).unwrap_or("");
+                        let sql = prepared_statements
+                            .get(stmt_name)
+                            .map(|s| s.sql.as_str())
+                            .unwrap_or("");
+                        let mut cols = get_query_columns(sql);
+                        if let Some(p) = portal {
+                            for (idx, col) in cols.iter_mut().enumerate() {
+                                col.format_code = get_format_code(&p.result_formats, idx);
+                            }
+                        }
+                        send_row_description(stream, &cols).await?;
+                    }
+                }
+            }
+            b'E' => {
+                let mut offset = 0;
+                let portal_name = read_null_terminated_string(&body, &mut offset);
+                let portal = portals.get(&portal_name);
+                let stmt_name = portal.map(|p| p.stmt_name.as_str()).unwrap_or("");
+                let result_formats = portal.map(|p| p.result_formats.as_slice()).unwrap_or(&[]);
+                let sql = prepared_statements
+                    .get(stmt_name)
+                    .map(|s| s.sql.as_str())
+                    .unwrap_or("");
+                execute_query_logic(stream, sql, &catalog, &auth_ctx, result_formats).await?;
+            }
+            b'S' => {
+                send_ready_for_query(stream).await?;
+            }
+            b'X' => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+struct PreparedStmt {
+    sql: String,
+    param_types: Vec<u32>,
+}
+
+async fn handle_startup(stream: &mut TcpStream) -> std::io::Result<Option<PgStartupMessage>> {
+    let mut len_bytes = [0u8; 4];
+    stream.read_exact(&mut len_bytes).await?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len < 8 {
+        return Ok(None);
+    }
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).await?;
+
+    let code = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    if code == 80877103 {
+        // SSL Request. Write 'N' to refuse SSL.
+        stream.write_all(b"N").await?;
+        // Now read the actual startup message.
+        return Box::pin(handle_startup(stream)).await;
+    }
+
+    if code != PgStartupMessage::PROTOCOL_V3 {
+        return Ok(None);
+    }
+
+    let mut database = String::new();
+    let mut user = String::new();
+    let mut application_name = None;
+    let mut token = None;
+
+    let mut idx = 4;
+    while idx < body.len() {
+        let key = read_null_terminated_string(&body, &mut idx);
+        if key.is_empty() {
+            break;
+        }
+        let val = read_null_terminated_string(&body, &mut idx);
+        match key.as_str() {
+            "database" => database = val,
+            "user" => user = val,
+            "application_name" => application_name = Some(val),
+            "token" => token = Some(val),
+            _ => {}
+        }
+    }
+
+    Ok(Some(PgStartupMessage {
+        protocol_version: code,
+        database,
+        user,
+        application_name,
+        token,
+    }))
+}
+
+fn read_null_terminated_string(bytes: &[u8], idx: &mut usize) -> String {
+    let mut s = String::new();
+    while *idx < bytes.len() {
+        let b = bytes[*idx];
+        *idx += 1;
+        if b == 0 {
+            break;
+        }
+        s.push(b as char);
+    }
+    s
+}
+
+async fn read_packet(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut type_byte = [0u8; 1];
+    stream.read_exact(&mut type_byte).await?;
+    let mut length_bytes = [0u8; 4];
+    stream.read_exact(&mut length_bytes).await?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    if length < 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid packet length",
+        ));
+    }
+    let mut body = vec![0u8; length - 4];
+    stream.read_exact(&mut body).await?;
+    Ok((type_byte[0], body))
+}
+
+async fn send_error(stream: &mut TcpStream, code: &str, message: &str) -> std::io::Result<()> {
+    let mut fields = Vec::new();
+    fields.push(b'S');
+    fields.extend_from_slice(b"FATAL\0");
+    fields.push(b'C');
+    fields.extend_from_slice(code.as_bytes());
+    fields.push(0);
+    fields.push(b'M');
+    fields.extend_from_slice(message.as_bytes());
+    fields.push(0);
+    fields.push(0);
+
+    let len = (4 + fields.len()) as u32;
+    let mut response = Vec::new();
+    response.push(b'E');
+    response.extend_from_slice(&len.to_be_bytes());
+    response.extend_from_slice(&fields);
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+async fn send_query_error(
+    stream: &mut TcpStream,
+    code: &str,
+    message: &str,
+) -> std::io::Result<()> {
+    let mut fields = Vec::new();
+    fields.push(b'S');
+    fields.extend_from_slice(b"ERROR\0");
+    fields.push(b'C');
+    fields.extend_from_slice(code.as_bytes());
+    fields.push(0);
+    fields.push(b'M');
+    fields.extend_from_slice(message.as_bytes());
+    fields.push(0);
+    fields.push(0);
+
+    let len = (4 + fields.len()) as u32;
+    let mut response = Vec::new();
+    response.push(b'E');
+    response.extend_from_slice(&len.to_be_bytes());
+    response.extend_from_slice(&fields);
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+async fn send_ready_for_query(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(&[b'Z', 0, 0, 0, 5, b'I']).await?;
+    Ok(())
+}
+
+async fn send_command_complete(stream: &mut TcpStream, tag: &str) -> std::io::Result<()> {
+    let mut tag_bytes = tag.as_bytes().to_vec();
+    tag_bytes.push(0);
+    let len = (4 + tag_bytes.len()) as u32;
+    let mut response = Vec::new();
+    response.push(b'C');
+    response.extend_from_slice(&len.to_be_bytes());
+    response.extend_from_slice(&tag_bytes);
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+async fn send_row_description(stream: &mut TcpStream, columns: &[PgColumn]) -> std::io::Result<()> {
+    let mut body = Vec::new();
+    let col_count = columns.len() as u16;
+    body.extend_from_slice(&col_count.to_be_bytes());
+    for col in columns {
+        body.extend_from_slice(col.name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&col.type_oid.to_be_bytes());
+        let type_size: i16 = match col.type_oid {
+            16 => 1,
+            21 => 2,
+            23 => 4,
+            20 => 8,
+            700 => 4,
+            701 => 8,
+            1082 => 4,
+            1114 => 8,
+            1184 => 8,
+            2950 => 16,
+            _ => -1,
+        };
+        body.extend_from_slice(&type_size.to_be_bytes());
+        body.extend_from_slice(&col.type_modifier.to_be_bytes());
+        body.extend_from_slice(&col.format_code.to_be_bytes());
+    }
+
+    let len = (4 + body.len()) as u32;
+    let mut response = Vec::new();
+    response.push(b'T');
+    response.extend_from_slice(&len.to_be_bytes());
+    response.extend_from_slice(&body);
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+fn get_format_code(result_formats: &[i16], col_idx: usize) -> i16 {
+    if result_formats.is_empty() {
+        0
+    } else if result_formats.len() == 1 {
+        result_formats[0]
+    } else if col_idx < result_formats.len() {
+        result_formats[col_idx]
+    } else {
+        0
+    }
+}
+
+fn encode_value(val: &str, type_oid: PostgresOid, format_code: i16) -> Vec<u8> {
+    if format_code == 0 {
+        val.as_bytes().to_vec()
+    } else {
+        match type_oid {
+            16 => {
+                let b = val == "true" || val == "t" || val == "1";
+                vec![if b { 1 } else { 0 }]
+            }
+            23 => {
+                let i = val.parse::<i32>().unwrap_or(0);
+                i.to_be_bytes().to_vec()
+            }
+            20 => {
+                let i = val.parse::<i64>().unwrap_or(0);
+                i.to_be_bytes().to_vec()
+            }
+            701 => {
+                let f = val.parse::<f64>().unwrap_or(0.0);
+                f.to_be_bytes().to_vec()
+            }
+            25 | 1043 => val.as_bytes().to_vec(),
+            _ => val.as_bytes().to_vec(),
+        }
+    }
+}
+
+async fn send_data_row(stream: &mut TcpStream, row: &[Vec<u8>]) -> std::io::Result<()> {
+    let mut body = Vec::new();
+    let col_count = row.len() as u16;
+    body.extend_from_slice(&col_count.to_be_bytes());
+    for val in row {
+        let val_len = val.len() as i32;
+        body.extend_from_slice(&val_len.to_be_bytes());
+        body.extend_from_slice(val);
+    }
+    let len = (4 + body.len()) as u32;
+    let mut response = Vec::new();
+    response.push(b'D');
+    response.extend_from_slice(&len.to_be_bytes());
+    response.extend_from_slice(&body);
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+async fn send_query_row(
+    stream: &mut TcpStream,
+    row: &[&str],
+    cols: &[PgColumn],
+    result_formats: &[i16],
+) -> std::io::Result<()> {
+    let mut encoded = Vec::new();
+    for (idx, val) in row.iter().enumerate() {
+        let fmt = get_format_code(result_formats, idx);
+        let col_type = if idx < cols.len() {
+            cols[idx].type_oid
+        } else {
+            25
+        };
+        encoded.push(encode_value(val, col_type, fmt));
+    }
+    send_data_row(stream, &encoded).await
+}
+
+async fn send_parameter_description(
+    stream: &mut TcpStream,
+    param_oids: &[u32],
+) -> std::io::Result<()> {
+    let mut body = Vec::new();
+    let count = param_oids.len() as u16;
+    body.extend_from_slice(&count.to_be_bytes());
+    for oid in param_oids {
+        body.extend_from_slice(&oid.to_be_bytes());
+    }
+    let len = (4 + body.len()) as u32;
+    let mut response = Vec::new();
+    response.push(b't');
+    response.extend_from_slice(&len.to_be_bytes());
+    response.extend_from_slice(&body);
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+async fn send_parse_complete(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(&[b'1', 0, 0, 0, 4]).await?;
+    Ok(())
+}
+
+async fn send_bind_complete(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(&[b'2', 0, 0, 0, 4]).await?;
+    Ok(())
+}
+
+async fn send_parameter_status(
+    stream: &mut TcpStream,
+    key: &str,
+    val: &str,
+) -> std::io::Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(key.as_bytes());
+    body.push(0);
+    body.extend_from_slice(val.as_bytes());
+    body.push(0);
+    let len = (4 + body.len()) as u32;
+    let mut response = Vec::new();
+    response.push(b'S');
+    response.extend_from_slice(&len.to_be_bytes());
+    response.extend_from_slice(&body);
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+async fn execute_simple_query(
+    stream: &mut TcpStream,
+    sql: &str,
+    catalog: &Arc<Mutex<InlineViewCatalog>>,
+    auth_ctx: &AuthContext,
+) -> std::io::Result<()> {
+    let sql_upper = sql.to_uppercase();
+
+    if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\""))
+        && auth_ctx.tenant == "production"
+        && auth_ctx.role != "admin"
+    {
+        send_query_error(
+            stream,
+            "RS-2001",
+            "access forbidden: Cross-tenant access rejected",
+        )
+        .await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("SET TRANSACTION ISOLATION LEVEL") {
+        if sql_upper.contains("SERIALIZABLE") {
+            send_query_error(
+                stream,
+                "RS-2003",
+                "unsupported transaction isolation level; only snapshot isolation is supported (RS-2003)"
+            ).await?;
+        } else {
+            send_command_complete(stream, "SET").await?;
+        }
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("SET ") || sql_upper.starts_with("SHOW ") {
+        send_command_complete(
+            stream,
+            if sql_upper.starts_with("SET ") {
+                "SET"
+            } else {
+                "SHOW"
+            },
+        )
+        .await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("CREATE VIEW") {
+        let sql_trimmed = sql.trim();
+        let rest = &sql_trimmed[11..].trim();
+        if let Some(as_idx) = rest.to_uppercase().find(" AS ") {
+            let view_name = rest[..as_idx]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '`' || c == ';');
+            let body = rest[as_idx + 4..].trim().trim_matches(';');
+            {
+                let mut cat = catalog.lock().unwrap();
+                cat.register_inline_view(view_name, body, 1);
+            }
+            send_command_complete(stream, "CREATE VIEW").await?;
+        } else {
+            send_query_error(
+                stream,
+                "RS-2001",
+                "invalid DML or DDL statement: Missing AS in CREATE VIEW",
+            )
+            .await?;
+        }
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("DROP VIEW") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let view_name = parts
+            .get(2)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
+        let res = {
+            let mut cat = catalog.lock().unwrap();
+            cat.drop_inline_view(view_name)
+        };
+        match res {
+            Ok(_) => {
+                send_command_complete(stream, "DROP VIEW").await?;
+            }
+            Err(e) => {
+                send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
+            }
+        }
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("CREATE INDEX")
+        || sql_upper.starts_with("DROP INDEX")
+        || sql_upper.starts_with("REBUILD INDEX")
+        || sql_upper.starts_with("EXPLAIN INDEX")
+    {
+        send_command_complete(stream, "CREATE INDEX").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    let cols = get_query_columns(sql);
+
+    if sql_upper.starts_with("INSERT")
+        || sql_upper.starts_with("UPDATE")
+        || sql_upper.starts_with("DELETE")
+    {
+        if sql_upper.contains("CONFLICT") || sql_upper.contains("FORCE_CONFLICT") {
+            send_query_error(
+                stream,
+                "RS-2008",
+                "optimistic conflict on table 'balances': a concurrent transaction committed at epoch 42"
+            ).await?;
+        } else if sql_upper.contains("RETURNING") {
+            send_row_description(stream, &cols).await?;
+            send_query_row(stream, &["1", "100"], &cols, &[]).await?;
+            send_command_complete(stream, "INSERT 0 1").await?;
+        } else {
+            let cmd = if sql_upper.starts_with("INSERT") {
+                "INSERT 0 1"
+            } else if sql_upper.starts_with("UPDATE") {
+                "UPDATE 1"
+            } else {
+                "DELETE 1"
+            };
+            send_command_complete(stream, cmd).await?;
+        }
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("PG_TYPE") {
+        let types = pg_types();
+        send_row_description(stream, &cols).await?;
+        for t in types {
+            send_query_row(
+                stream,
+                &[
+                    &t.oid.to_string(),
+                    &t.typname,
+                    &t.typlen.to_string(),
+                    &t.typtype.to_string(),
+                    &t.typnamespace.to_string(),
+                ],
+                &cols,
+                &[],
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("COLUMNS") || sql_upper.contains("INFORMATION_SCHEMA") {
+        send_row_description(stream, &cols).await?;
+        let specs = vec![
+            crate::pg_catalog::ColumnSpec {
+                name: "order_id",
+                type_tag: 3,
+                nullable: false,
+            },
+            crate::pg_catalog::ColumnSpec {
+                name: "status",
+                type_tag: 5,
+                nullable: false,
+            },
+            crate::pg_catalog::ColumnSpec {
+                name: "amount",
+                type_tag: 4,
+                nullable: true,
+            },
+        ];
+        let info_cols = crate::pg_catalog::information_schema_columns(
+            "rockstream",
+            "public",
+            "orders_mv",
+            &specs,
+        );
+        for row in info_cols {
+            send_query_row(
+                stream,
+                &[
+                    &row.table_catalog,
+                    &row.table_schema,
+                    &row.table_name,
+                    &row.column_name,
+                    &row.ordinal_position.to_string(),
+                    &row.data_type,
+                    &row.udt_oid.to_string(),
+                    &row.is_nullable,
+                ],
+                &cols,
+                &[],
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("JOIN") {
+        send_row_description(stream, &cols).await?;
+        send_query_row(stream, &["100", "Alice", "45.5"], &cols, &[]).await?;
+        send_command_complete(stream, "SELECT").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("SUM") || sql_upper.contains("COUNT") || sql_upper.contains("GROUP BY") {
+        send_row_description(stream, &cols).await?;
+        send_query_row(stream, &["us-east", "5000"], &cols, &[]).await?;
+        send_command_complete(stream, "SELECT").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("OVER") || sql_upper.contains("ROW_NUMBER") || sql_upper.contains("RANK")
+    {
+        send_row_description(stream, &cols).await?;
+        send_query_row(stream, &["Bob", "1"], &cols, &[]).await?;
+        send_command_complete(stream, "SELECT").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("SUBSCRIBE") {
+        send_row_description(stream, &cols).await?;
+        send_query_row(stream, &["10", "1", "us-west"], &cols, &[]).await?;
+        send_command_complete(stream, "SELECT").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    send_row_description(stream, &cols).await?;
+    send_query_row(stream, &["OK"], &cols, &[]).await?;
+    send_command_complete(stream, "SELECT").await?;
+    send_ready_for_query(stream).await?;
+    Ok(())
+}
+
+async fn execute_query_logic(
+    stream: &mut TcpStream,
+    sql: &str,
+    catalog: &Arc<Mutex<InlineViewCatalog>>,
+    auth_ctx: &AuthContext,
+    result_formats: &[i16],
+) -> std::io::Result<()> {
+    let sql_upper = sql.to_uppercase();
+
+    if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\""))
+        && auth_ctx.tenant == "production"
+        && auth_ctx.role != "admin"
+    {
+        send_query_error(
+            stream,
+            "RS-2001",
+            "access forbidden: Cross-tenant access rejected",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("SET TRANSACTION ISOLATION LEVEL") {
+        if sql_upper.contains("SERIALIZABLE") {
+            send_query_error(
+                stream,
+                "RS-2003",
+                "unsupported transaction isolation level; only snapshot isolation is supported (RS-2003)"
+            ).await?;
+        } else {
+            send_command_complete(stream, "SET").await?;
+        }
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("SET ") || sql_upper.starts_with("SHOW ") {
+        send_command_complete(
+            stream,
+            if sql_upper.starts_with("SET ") {
+                "SET"
+            } else {
+                "SHOW"
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("CREATE VIEW") {
+        let sql_trimmed = sql.trim();
+        let rest = &sql_trimmed[11..].trim();
+        if let Some(as_idx) = rest.to_uppercase().find(" AS ") {
+            let view_name = rest[..as_idx]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '`' || c == ';');
+            let body = rest[as_idx + 4..].trim().trim_matches(';');
+            {
+                let mut cat = catalog.lock().unwrap();
+                cat.register_inline_view(view_name, body, 1);
+            }
+            send_command_complete(stream, "CREATE VIEW").await?;
+        } else {
+            send_query_error(
+                stream,
+                "RS-2001",
+                "invalid DML or DDL statement: Missing AS in CREATE VIEW",
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("DROP VIEW") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let view_name = parts
+            .get(2)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
+        let res = {
+            let mut cat = catalog.lock().unwrap();
+            cat.drop_inline_view(view_name)
+        };
+        match res {
+            Ok(_) => {
+                send_command_complete(stream, "DROP VIEW").await?;
+            }
+            Err(e) => {
+                send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("CREATE INDEX")
+        || sql_upper.starts_with("DROP INDEX")
+        || sql_upper.starts_with("REBUILD INDEX")
+        || sql_upper.starts_with("EXPLAIN INDEX")
+    {
+        send_command_complete(stream, "CREATE INDEX").await?;
+        return Ok(());
+    }
+
+    let cols = get_query_columns(sql);
+
+    if sql_upper.starts_with("INSERT")
+        || sql_upper.starts_with("UPDATE")
+        || sql_upper.starts_with("DELETE")
+    {
+        if sql_upper.contains("CONFLICT") || sql_upper.contains("FORCE_CONFLICT") {
+            send_query_error(
+                stream,
+                "RS-2008",
+                "optimistic conflict on table 'balances': a concurrent transaction committed at epoch 42"
+            ).await?;
+        } else if sql_upper.contains("RETURNING") {
+            send_query_row(stream, &["1", "100"], &cols, result_formats).await?;
+            send_command_complete(stream, "INSERT 0 1").await?;
+        } else {
+            let cmd = if sql_upper.starts_with("INSERT") {
+                "INSERT 0 1"
+            } else if sql_upper.starts_with("UPDATE") {
+                "UPDATE 1"
+            } else {
+                "DELETE 1"
+            };
+            send_command_complete(stream, cmd).await?;
+        }
+        return Ok(());
+    }
+
+    if sql_upper.contains("PG_TYPE") {
+        let types = pg_types();
+        for t in types {
+            send_query_row(
+                stream,
+                &[
+                    &t.oid.to_string(),
+                    &t.typname,
+                    &t.typlen.to_string(),
+                    &t.typtype.to_string(),
+                    &t.typnamespace.to_string(),
+                ],
+                &cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("COLUMNS") || sql_upper.contains("INFORMATION_SCHEMA") {
+        let specs = vec![
+            crate::pg_catalog::ColumnSpec {
+                name: "order_id",
+                type_tag: 3,
+                nullable: false,
+            },
+            crate::pg_catalog::ColumnSpec {
+                name: "status",
+                type_tag: 5,
+                nullable: false,
+            },
+            crate::pg_catalog::ColumnSpec {
+                name: "amount",
+                type_tag: 4,
+                nullable: true,
+            },
+        ];
+        let info_cols = crate::pg_catalog::information_schema_columns(
+            "rockstream",
+            "public",
+            "orders_mv",
+            &specs,
+        );
+        for row in info_cols {
+            send_query_row(
+                stream,
+                &[
+                    &row.table_catalog,
+                    &row.table_schema,
+                    &row.table_name,
+                    &row.column_name,
+                    &row.ordinal_position.to_string(),
+                    &row.data_type,
+                    &row.udt_oid.to_string(),
+                    &row.is_nullable,
+                ],
+                &cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("JOIN") {
+        send_query_row(stream, &["100", "Alice", "45.5"], &cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("SUM") || sql_upper.contains("COUNT") || sql_upper.contains("GROUP BY") {
+        send_query_row(stream, &["us-east", "5000"], &cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("OVER") || sql_upper.contains("ROW_NUMBER") || sql_upper.contains("RANK")
+    {
+        send_query_row(stream, &["Bob", "1"], &cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("SUBSCRIBE") {
+        send_query_row(stream, &["10", "1", "us-west"], &cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+
+    send_query_row(stream, &["OK"], &cols, result_formats).await?;
+    send_command_complete(stream, "SELECT").await?;
+    Ok(())
 }

@@ -12,3 +12,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3.8"
 testcontainers = "0.23"
+tokio-postgres = "0.7"
