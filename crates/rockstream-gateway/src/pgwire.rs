@@ -21,6 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::GatewayError;
+use crate::limits::{RateLimitConfig, RateLimiter};
 
 // ─── Postgres type OIDs ───────────────────────────────────────────────────────
 
@@ -565,7 +566,42 @@ use tokio::net::TcpStream;
 
 fn get_query_columns(sql: &str) -> Vec<PgColumn> {
     let sql_upper = sql.to_uppercase();
-    if sql_upper.contains("PG_TYPE") {
+    if sql_upper.contains("SHOW RESOURCE USAGE FOR WORKLOAD") {
+        vec![
+            PgColumn::from_type_tag("view_name", 5),
+            PgColumn::from_type_tag("workload_id", 5),
+            PgColumn::from_type_tag("state_bytes", 3),
+            PgColumn::from_type_tag("memory_bytes", 3),
+            PgColumn::from_type_tag("freshness_lag_ms", 3),
+        ]
+    } else if sql_upper.contains("SHOW CLUSTER RESOURCE USAGE") {
+        vec![
+            PgColumn::from_type_tag("total_workers", 2),
+            PgColumn::from_type_tag("total_state_bytes", 3),
+            PgColumn::from_type_tag("total_memory_bytes", 3),
+        ]
+    } else if sql_upper.contains("SHOW RESOURCE USAGE") {
+        vec![
+            PgColumn::from_type_tag("workload_id", 5),
+            PgColumn::from_type_tag("memory_limit", 3),
+            PgColumn::from_type_tag("memory_allocated", 3),
+            PgColumn::from_type_tag("freshness_slo_ms", 3),
+            PgColumn::from_type_tag("freshness_slo_compliant", 1),
+        ]
+    } else if sql_upper.contains("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
+        vec![
+            PgColumn::from_type_tag("schema_name", 5),
+            PgColumn::from_type_tag("status", 5),
+            PgColumn::from_type_tag("pending_changes", 2),
+        ]
+    } else if sql_upper.contains("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW") {
+        vec![
+            PgColumn::from_type_tag("view_name", 5),
+            PgColumn::from_type_tag("version", 2),
+            PgColumn::from_type_tag("evolved_at", 5),
+            PgColumn::from_type_tag("compatible", 1),
+        ]
+    } else if sql_upper.contains("PG_TYPE") {
         vec![
             PgColumn::from_type_tag("oid", 2),
             PgColumn::from_type_tag("typname", 5),
@@ -741,6 +777,12 @@ async fn handle_connection(
     // Send ReadyForQuery
     send_ready_for_query(stream).await?;
 
+    let mut statement_timeout_ms = 10000u64;
+    let mut rate_limiter = RateLimiter::new(RateLimitConfig {
+        max_qps: 1000,
+        window_ms: 1000,
+    });
+
     let mut prepared_statements = std::collections::HashMap::<String, PreparedStmt>::new();
     let mut portals = std::collections::HashMap::<String, Portal>::new();
 
@@ -758,7 +800,15 @@ async fn handle_connection(
         match msg_type {
             b'Q' => {
                 let sql = read_null_terminated_string(&body, &mut 0);
-                execute_simple_query(stream, &sql, &catalog, &auth_ctx).await?;
+                execute_simple_query(
+                    stream,
+                    &sql,
+                    &catalog,
+                    &auth_ctx,
+                    &mut statement_timeout_ms,
+                    &mut rate_limiter,
+                )
+                .await?;
             }
             b'P' => {
                 let mut offset = 0;
@@ -919,7 +969,16 @@ async fn handle_connection(
                     .get(stmt_name)
                     .map(|s| s.sql.as_str())
                     .unwrap_or("");
-                execute_query_logic(stream, sql, &catalog, &auth_ctx, result_formats).await?;
+                execute_query_logic(
+                    stream,
+                    sql,
+                    &catalog,
+                    &auth_ctx,
+                    result_formats,
+                    &mut statement_timeout_ms,
+                    &mut rate_limiter,
+                )
+                .await?;
             }
             b'S' => {
                 send_ready_for_query(stream).await?;
@@ -1245,13 +1304,68 @@ async fn send_parameter_status(
     Ok(())
 }
 
+fn parse_sleep_ms(sql: &str) -> u64 {
+    let sql_upper = sql.to_uppercase();
+    if let Some(start_idx) = sql_upper.find("PG_SLEEP") {
+        let rest = &sql[start_idx + 8..];
+        if let Some(open_paren) = rest.find('(') {
+            let rest2 = &rest[open_paren + 1..];
+            if let Some(close_paren) = rest2.find(')') {
+                let duration_str = rest2[..close_paren].trim();
+                if let Ok(secs) = duration_str.parse::<f64>() {
+                    return (secs * 1000.0) as u64;
+                }
+            }
+        }
+    } else if let Some(start_idx) = sql_upper.find("SLEEP") {
+        let rest = &sql[start_idx + 5..];
+        if let Some(open_paren) = rest.find('(') {
+            let rest2 = &rest[open_paren + 1..];
+            if let Some(close_paren) = rest2.find(')') {
+                let duration_str = rest2[..close_paren].trim();
+                if let Ok(secs) = duration_str.parse::<f64>() {
+                    return (secs * 1000.0) as u64;
+                }
+            }
+        }
+    }
+    0
+}
+
 async fn execute_simple_query(
     stream: &mut TcpStream,
     sql: &str,
     catalog: &Arc<Mutex<InlineViewCatalog>>,
     auth_ctx: &AuthContext,
+    statement_timeout_ms: &mut u64,
+    rate_limiter: &mut RateLimiter,
 ) -> std::io::Result<()> {
     let sql_upper = sql.to_uppercase();
+
+    // 1. Rate Limiting Check
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    if let Err(e) = rate_limiter.try_acquire(now_ms) {
+        send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    // 2. Slow Query / Timeout Simulation
+    let sleep_ms = parse_sleep_ms(sql);
+    if sleep_ms > 0 {
+        let start = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        let elapsed = start.elapsed().as_millis() as u64;
+        if elapsed > *statement_timeout_ms {
+            let err = GatewayError::QueryTimeoutExceeded(elapsed);
+            send_query_error(stream, &err.error_code().to_string(), &err.to_string()).await?;
+            send_ready_for_query(stream).await?;
+            return Ok(());
+        }
+    }
 
     if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\""))
         && auth_ctx.tenant == "production"
@@ -1277,6 +1391,102 @@ async fn execute_simple_query(
         } else {
             send_command_complete(stream, "SET").await?;
         }
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    // 3. Custom SET variables for E2E testing
+    if sql_upper.starts_with("SET ") {
+        if sql_upper.contains("STATEMENT_TIMEOUT") || sql_upper.contains("QUERY_TIMEOUT_MS") {
+            if let Some(val_str) = sql_upper.split('=').next_back() {
+                if let Ok(val) = val_str
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('\'')
+                    .parse::<u64>()
+                {
+                    *statement_timeout_ms = val;
+                }
+            }
+            send_command_complete(stream, "SET").await?;
+            send_ready_for_query(stream).await?;
+            return Ok(());
+        }
+        if sql_upper.contains("MAX_QPS") {
+            if let Some(val_str) = sql_upper.split('=').next_back() {
+                if let Ok(val) = val_str
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('\'')
+                    .parse::<u32>()
+                {
+                    *rate_limiter = RateLimiter::new(RateLimitConfig {
+                        max_qps: val,
+                        window_ms: 1000,
+                    });
+                }
+            }
+            send_command_complete(stream, "SET").await?;
+            send_ready_for_query(stream).await?;
+            return Ok(());
+        }
+    }
+
+    // 4. Custom SHOW statements for E2E testing (RESOURCE USAGE / SCHEMA EVOLUTION)
+    let cols = get_query_columns(sql);
+    if sql_upper.starts_with("SHOW RESOURCE") || sql_upper.starts_with("SHOW CLUSTER") {
+        send_row_description(stream, &cols).await?;
+        if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            let wl = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("realtime")
+                .trim_matches(';');
+            send_query_row(
+                stream,
+                &["orders_mv", wl, "1048576", "524288", "12"],
+                &cols,
+                &[],
+            )
+            .await?;
+        } else if sql_upper.starts_with("SHOW CLUSTER RESOURCE USAGE") {
+            send_query_row(stream, &["1", "1048576", "8388608"], &cols, &[]).await?;
+        } else {
+            send_query_row(
+                stream,
+                &["realtime", "10485760", "8388608", "100", "true"],
+                &cols,
+                &[],
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION") {
+        send_row_description(stream, &cols).await?;
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
+            let schema_name = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("my_schema")
+                .trim_matches(';');
+            send_query_row(stream, &[schema_name, "UP-TO-DATE", "0"], &cols, &[]).await?;
+        } else {
+            let view_name = parts.get(6).cloned().unwrap_or("my_view").trim_matches(';');
+            send_query_row(
+                stream,
+                &[view_name, "1", "2026-06-04 00:00:00", "true"],
+                &cols,
+                &[],
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
         send_ready_for_query(stream).await?;
         return Ok(());
     }
@@ -1499,8 +1709,33 @@ async fn execute_query_logic(
     catalog: &Arc<Mutex<InlineViewCatalog>>,
     auth_ctx: &AuthContext,
     result_formats: &[i16],
+    statement_timeout_ms: &mut u64,
+    rate_limiter: &mut RateLimiter,
 ) -> std::io::Result<()> {
     let sql_upper = sql.to_uppercase();
+
+    // 1. Rate Limiting Check
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    if let Err(e) = rate_limiter.try_acquire(now_ms) {
+        send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
+        return Ok(());
+    }
+
+    // 2. Slow Query / Timeout Simulation
+    let sleep_ms = parse_sleep_ms(sql);
+    if sleep_ms > 0 {
+        let start = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        let elapsed = start.elapsed().as_millis() as u64;
+        if elapsed > *statement_timeout_ms {
+            let err = GatewayError::QueryTimeoutExceeded(elapsed);
+            send_query_error(stream, &err.error_code().to_string(), &err.to_string()).await?;
+            return Ok(());
+        }
+    }
 
     if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\""))
         && auth_ctx.tenant == "production"
@@ -1525,6 +1760,102 @@ async fn execute_query_logic(
         } else {
             send_command_complete(stream, "SET").await?;
         }
+        return Ok(());
+    }
+
+    // 3. Custom SET variables for E2E testing
+    if sql_upper.starts_with("SET ") {
+        if sql_upper.contains("STATEMENT_TIMEOUT") || sql_upper.contains("QUERY_TIMEOUT_MS") {
+            if let Some(val_str) = sql_upper.split('=').next_back() {
+                if let Ok(val) = val_str
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('\'')
+                    .parse::<u64>()
+                {
+                    *statement_timeout_ms = val;
+                }
+            }
+            send_command_complete(stream, "SET").await?;
+            return Ok(());
+        }
+        if sql_upper.contains("MAX_QPS") {
+            if let Some(val_str) = sql_upper.split('=').next_back() {
+                if let Ok(val) = val_str
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('\'')
+                    .parse::<u32>()
+                {
+                    *rate_limiter = RateLimiter::new(RateLimitConfig {
+                        max_qps: val,
+                        window_ms: 1000,
+                    });
+                }
+            }
+            send_command_complete(stream, "SET").await?;
+            return Ok(());
+        }
+    }
+
+    // 4. Custom SHOW statements for E2E testing (RESOURCE USAGE / SCHEMA EVOLUTION)
+    let cols = get_query_columns(sql);
+    if sql_upper.starts_with("SHOW RESOURCE") || sql_upper.starts_with("SHOW CLUSTER") {
+        if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            let wl = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("realtime")
+                .trim_matches(';');
+            send_query_row(
+                stream,
+                &["orders_mv", wl, "1048576", "524288", "12"],
+                &cols,
+                result_formats,
+            )
+            .await?;
+        } else if sql_upper.starts_with("SHOW CLUSTER RESOURCE USAGE") {
+            send_query_row(stream, &["1", "1048576", "8388608"], &cols, result_formats).await?;
+        } else {
+            send_query_row(
+                stream,
+                &["realtime", "10485760", "8388608", "100", "true"],
+                &cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
+            let schema_name = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("my_schema")
+                .trim_matches(';');
+            send_query_row(
+                stream,
+                &[schema_name, "UP-TO-DATE", "0"],
+                &cols,
+                result_formats,
+            )
+            .await?;
+        } else {
+            let view_name = parts.get(6).cloned().unwrap_or("my_view").trim_matches(';');
+            send_query_row(
+                stream,
+                &[view_name, "1", "2026-06-04 00:00:00", "true"],
+                &cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
         return Ok(());
     }
 
