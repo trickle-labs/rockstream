@@ -581,8 +581,7 @@ async fn test_gateway_pgwire_e2e() {
         let err_msg = get_db_error_message(&res.unwrap_err());
         assert!(
             err_msg.contains("RS-2004"),
-            "expected RS-2004, got: {}",
-            err_msg
+            "expected RS-2004, got: {err_msg}"
         );
     }
     // 3. Optimistic conflict DML error RS-2008
@@ -597,8 +596,7 @@ async fn test_gateway_pgwire_e2e() {
         let err_msg = get_db_error_message(&res.unwrap_err());
         assert!(
             err_msg.contains("RS-2008"),
-            "expected RS-2008, got: {}",
-            err_msg
+            "expected RS-2008, got: {err_msg}"
         );
     }
     // 4. INSERT ... RETURNING row description and execution
@@ -621,8 +619,7 @@ async fn test_gateway_pgwire_e2e() {
         let err_msg = get_db_error_message(&res.unwrap_err());
         assert!(
             err_msg.contains("Cross-tenant") || err_msg.contains("RS-2001"),
-            "unexpected error: {}",
-            err_msg
+            "unexpected error: {err_msg}"
         );
     }
     // Admin user should bypass tenant isolation
@@ -664,7 +661,7 @@ async fn test_gateway_pgwire_e2e() {
     assert!(!rows.is_empty());
 
     // Scenario H: psql client compatibility witness
-    let network_arg = format!("--network=container:{}", gateway_id);
+    let network_arg = format!("--network=container:{gateway_id}");
     let psql_output = Command::new("docker")
         .args([
             "run",
