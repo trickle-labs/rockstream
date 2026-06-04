@@ -330,6 +330,7 @@ fn build_tls_config(
 }
 
 /// Implement the `start` subcommand.
+#[allow(clippy::too_many_arguments)]
 async fn run_start(
     storage: &str,
     role: Role,
@@ -385,7 +386,9 @@ async fn run_start(
             });
             run_tier1_worker(ctrl_addr, storage_path, audit_log.clone()).await;
         }
-        Role::All => run_tier2_all(control_bind, gateway_bind, storage_path, audit_log.clone()).await,
+        Role::All => {
+            run_tier2_all(control_bind, gateway_bind, storage_path, audit_log.clone()).await
+        }
         Role::Gateway => {
             run_gateway(gateway_bind, audit_log.clone()).await;
         }
@@ -605,18 +608,18 @@ async fn run_tier2_all(
     println!("Workers registered: {}", catalog.len());
 }
 
-async fn run_gateway(
-    gateway_bind: &str,
-    audit: Arc<rockstream_control::audit::FileAuditLog>,
-) {
-    let catalog = Arc::new(std::sync::Mutex::new(rockstream_gateway::InlineViewCatalog::new()));
+async fn run_gateway(gateway_bind: &str, audit: Arc<rockstream_control::audit::FileAuditLog>) {
+    let catalog = Arc::new(std::sync::Mutex::new(
+        rockstream_gateway::InlineViewCatalog::new(),
+    ));
     {
         let mut cat = catalog.lock().unwrap();
         cat.register_inline_view("view_with_dep", "SELECT 1", 1);
         cat.register_dependent("view_with_dep", "mv_dep");
     }
-    let event = rockstream_types::audit::AuditEvent::now("system", "gateway_service.started", "gateway")
-        .with_detail(format!("bind={gateway_bind}"));
+    let event =
+        rockstream_types::audit::AuditEvent::now("system", "gateway_service.started", "gateway")
+            .with_detail(format!("bind={gateway_bind}"));
     let _ = audit.append(&event);
     if let Err(e) = rockstream_gateway::pgwire::run_pgwire_server(gateway_bind, catalog).await {
         tracing::error!("gateway pgwire server failed: {e}");

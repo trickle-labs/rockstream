@@ -16,6 +16,8 @@
 //! In production the gateway reads/writes raw bytes on TCP; here we model the
 //! logical structure to prove the protocol semantics are correct.
 
+#![allow(clippy::items_after_test_module, clippy::collapsible_match)]
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::GatewayError;
@@ -553,13 +555,13 @@ mod tests {
 
 // ─── pgwire TCP Server Implementation (v0.52.2) ──────────────────────────────
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::inline_view::InlineViewCatalog;
 use crate::pg_catalog::pg_types;
+use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
 fn get_query_columns(sql: &str) -> Vec<PgColumn> {
     let sql_upper = sql.to_uppercase();
@@ -585,7 +587,7 @@ fn get_query_columns(sql: &str) -> Vec<PgColumn> {
     } else if sql_upper.contains("RETURNING") {
         vec![
             PgColumn::from_type_tag("id", 2),
-            PgColumn::from_type_tag("amount", 3)
+            PgColumn::from_type_tag("amount", 3),
         ]
     } else if sql_upper.contains("JOIN") {
         vec![
@@ -593,12 +595,18 @@ fn get_query_columns(sql: &str) -> Vec<PgColumn> {
             PgColumn::from_type_tag("customer", 5),
             PgColumn::from_type_tag("price", 4),
         ]
-    } else if sql_upper.contains("SUM") || sql_upper.contains("COUNT") || sql_upper.contains("GROUP BY") {
+    } else if sql_upper.contains("SUM")
+        || sql_upper.contains("COUNT")
+        || sql_upper.contains("GROUP BY")
+    {
         vec![
             PgColumn::from_type_tag("region", 5),
             PgColumn::from_type_tag("total", 3),
         ]
-    } else if sql_upper.contains("OVER") || sql_upper.contains("ROW_NUMBER") || sql_upper.contains("RANK") {
+    } else if sql_upper.contains("OVER")
+        || sql_upper.contains("ROW_NUMBER")
+        || sql_upper.contains("RANK")
+    {
         vec![
             PgColumn::from_type_tag("name", 5),
             PgColumn::from_type_tag("rn", 3),
@@ -712,7 +720,12 @@ async fn handle_connection(
     let auth_ctx = match startup.validate_auth() {
         Ok(ctx) => ctx,
         Err(e) => {
-            send_error(stream, "28P01", &format!("client authentication failed: {} (RS-2001)", e)).await?;
+            send_error(
+                stream,
+                "28P01",
+                &format!("client authentication failed: {} (RS-2001)", e),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -752,7 +765,7 @@ async fn handle_connection(
                 let stmt_name = read_null_terminated_string(&body, &mut offset);
                 let sql = read_null_terminated_string(&body, &mut offset);
                 let num_params = if offset + 2 <= body.len() {
-                    u16::from_be_bytes([body[offset], body[offset+1]]) as usize
+                    u16::from_be_bytes([body[offset], body[offset + 1]]) as usize
                 } else {
                     0
                 };
@@ -760,7 +773,12 @@ async fn handle_connection(
                 let mut param_types = Vec::new();
                 for _ in 0..num_params {
                     if offset + 4 <= body.len() {
-                        let mut oid = u32::from_be_bytes([body[offset], body[offset+1], body[offset+2], body[offset+3]]);
+                        let mut oid = u32::from_be_bytes([
+                            body[offset],
+                            body[offset + 1],
+                            body[offset + 2],
+                            body[offset + 3],
+                        ]);
                         if oid == 0 {
                             oid = 23;
                         }
@@ -801,7 +819,7 @@ async fn handle_connection(
 
                 // Parse parameter formats
                 let num_param_formats = if offset + 2 <= body.len() {
-                    u16::from_be_bytes([body[offset], body[offset+1]])
+                    u16::from_be_bytes([body[offset], body[offset + 1]])
                 } else {
                     0
                 };
@@ -810,14 +828,19 @@ async fn handle_connection(
 
                 // Parse parameter values
                 let num_params = if offset + 2 <= body.len() {
-                    u16::from_be_bytes([body[offset], body[offset+1]])
+                    u16::from_be_bytes([body[offset], body[offset + 1]])
                 } else {
                     0
                 };
                 offset += 2;
                 for _ in 0..num_params {
                     if offset + 4 <= body.len() {
-                        let val_len = i32::from_be_bytes([body[offset], body[offset+1], body[offset+2], body[offset+3]]);
+                        let val_len = i32::from_be_bytes([
+                            body[offset],
+                            body[offset + 1],
+                            body[offset + 2],
+                            body[offset + 3],
+                        ]);
                         offset += 4;
                         if val_len > 0 {
                             offset += val_len as usize;
@@ -829,7 +852,7 @@ async fn handle_connection(
 
                 // Parse result-column formats
                 let num_result_formats = if offset + 2 <= body.len() {
-                    u16::from_be_bytes([body[offset], body[offset+1]])
+                    u16::from_be_bytes([body[offset], body[offset + 1]])
                 } else {
                     0
                 };
@@ -837,7 +860,7 @@ async fn handle_connection(
                 let mut result_formats = Vec::new();
                 for _ in 0..num_result_formats {
                     if offset + 2 <= body.len() {
-                        let fmt = i16::from_be_bytes([body[offset], body[offset+1]]);
+                        let fmt = i16::from_be_bytes([body[offset], body[offset + 1]]);
                         result_formats.push(fmt);
                         offset += 2;
                     } else {
@@ -845,7 +868,13 @@ async fn handle_connection(
                     }
                 }
 
-                portals.insert(portal_name, Portal { stmt_name, result_formats });
+                portals.insert(
+                    portal_name,
+                    Portal {
+                        stmt_name,
+                        result_formats,
+                    },
+                );
                 send_bind_complete(stream).await?;
             }
             b'D' => {
@@ -866,7 +895,10 @@ async fn handle_connection(
                     } else if desc_type == b'P' {
                         let portal = portals.get(&name);
                         let stmt_name = portal.map(|p| p.stmt_name.as_str()).unwrap_or("");
-                        let sql = prepared_statements.get(stmt_name).map(|s| s.sql.as_str()).unwrap_or("");
+                        let sql = prepared_statements
+                            .get(stmt_name)
+                            .map(|s| s.sql.as_str())
+                            .unwrap_or("");
                         let mut cols = get_query_columns(sql);
                         if let Some(p) = portal {
                             for (idx, col) in cols.iter_mut().enumerate() {
@@ -883,7 +915,10 @@ async fn handle_connection(
                 let portal = portals.get(&portal_name);
                 let stmt_name = portal.map(|p| p.stmt_name.as_str()).unwrap_or("");
                 let result_formats = portal.map(|p| p.result_formats.as_slice()).unwrap_or(&[]);
-                let sql = prepared_statements.get(stmt_name).map(|s| s.sql.as_str()).unwrap_or("");
+                let sql = prepared_statements
+                    .get(stmt_name)
+                    .map(|s| s.sql.as_str())
+                    .unwrap_or("");
                 execute_query_logic(stream, sql, &catalog, &auth_ctx, result_formats).await?;
             }
             b'S' => {
@@ -976,7 +1011,10 @@ async fn read_packet(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     stream.read_exact(&mut length_bytes).await?;
     let length = u32::from_be_bytes(length_bytes) as usize;
     if length < 4 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid packet length"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid packet length",
+        ));
     }
     let mut body = vec![0u8; length - 4];
     stream.read_exact(&mut body).await?;
@@ -1004,7 +1042,11 @@ async fn send_error(stream: &mut TcpStream, code: &str, message: &str) -> std::i
     Ok(())
 }
 
-async fn send_query_error(stream: &mut TcpStream, code: &str, message: &str) -> std::io::Result<()> {
+async fn send_query_error(
+    stream: &mut TcpStream,
+    code: &str,
+    message: &str,
+) -> std::io::Result<()> {
     let mut fields = Vec::new();
     fields.push(b'S');
     fields.extend_from_slice(b"ERROR\0");
@@ -1112,12 +1154,8 @@ fn encode_value(val: &str, type_oid: PostgresOid, format_code: i16) -> Vec<u8> {
                 let f = val.parse::<f64>().unwrap_or(0.0);
                 f.to_be_bytes().to_vec()
             }
-            25 | 1043 => {
-                val.as_bytes().to_vec()
-            }
-            _ => {
-                val.as_bytes().to_vec()
-            }
+            25 | 1043 => val.as_bytes().to_vec(),
+            _ => val.as_bytes().to_vec(),
         }
     }
 }
@@ -1149,14 +1187,20 @@ async fn send_query_row(
     let mut encoded = Vec::new();
     for (idx, val) in row.iter().enumerate() {
         let fmt = get_format_code(result_formats, idx);
-        let col_type = if idx < cols.len() { cols[idx].type_oid } else { 25 };
+        let col_type = if idx < cols.len() {
+            cols[idx].type_oid
+        } else {
+            25
+        };
         encoded.push(encode_value(val, col_type, fmt));
     }
     send_data_row(stream, &encoded).await
 }
 
-
-async fn send_parameter_description(stream: &mut TcpStream, param_oids: &[u32]) -> std::io::Result<()> {
+async fn send_parameter_description(
+    stream: &mut TcpStream,
+    param_oids: &[u32],
+) -> std::io::Result<()> {
     let mut body = Vec::new();
     let count = param_oids.len() as u16;
     body.extend_from_slice(&count.to_be_bytes());
@@ -1182,7 +1226,11 @@ async fn send_bind_complete(stream: &mut TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn send_parameter_status(stream: &mut TcpStream, key: &str, val: &str) -> std::io::Result<()> {
+async fn send_parameter_status(
+    stream: &mut TcpStream,
+    key: &str,
+    val: &str,
+) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(key.as_bytes());
     body.push(0);
@@ -1205,8 +1253,16 @@ async fn execute_simple_query(
 ) -> std::io::Result<()> {
     let sql_upper = sql.to_uppercase();
 
-    if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\"")) && auth_ctx.tenant == "production" && auth_ctx.role != "admin" {
-        send_query_error(stream, "RS-2001", "access forbidden: Cross-tenant access rejected").await?;
+    if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\""))
+        && auth_ctx.tenant == "production"
+        && auth_ctx.role != "admin"
+    {
+        send_query_error(
+            stream,
+            "RS-2001",
+            "access forbidden: Cross-tenant access rejected",
+        )
+        .await?;
         send_ready_for_query(stream).await?;
         return Ok(());
     }
@@ -1226,7 +1282,15 @@ async fn execute_simple_query(
     }
 
     if sql_upper.starts_with("SET ") || sql_upper.starts_with("SHOW ") {
-        send_command_complete(stream, if sql_upper.starts_with("SET ") { "SET" } else { "SHOW" }).await?;
+        send_command_complete(
+            stream,
+            if sql_upper.starts_with("SET ") {
+                "SET"
+            } else {
+                "SHOW"
+            },
+        )
+        .await?;
         send_ready_for_query(stream).await?;
         return Ok(());
     }
@@ -1235,7 +1299,9 @@ async fn execute_simple_query(
         let sql_trimmed = sql.trim();
         let rest = &sql_trimmed[11..].trim();
         if let Some(as_idx) = rest.to_uppercase().find(" AS ") {
-            let view_name = rest[..as_idx].trim().trim_matches(|c| c == '"' || c == '`' || c == ';');
+            let view_name = rest[..as_idx]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '`' || c == ';');
             let body = rest[as_idx + 4..].trim().trim_matches(';');
             {
                 let mut cat = catalog.lock().unwrap();
@@ -1243,7 +1309,12 @@ async fn execute_simple_query(
             }
             send_command_complete(stream, "CREATE VIEW").await?;
         } else {
-            send_query_error(stream, "RS-2001", "invalid DML or DDL statement: Missing AS in CREATE VIEW").await?;
+            send_query_error(
+                stream,
+                "RS-2001",
+                "invalid DML or DDL statement: Missing AS in CREATE VIEW",
+            )
+            .await?;
         }
         send_ready_for_query(stream).await?;
         return Ok(());
@@ -1251,7 +1322,10 @@ async fn execute_simple_query(
 
     if sql_upper.starts_with("DROP VIEW") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let view_name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        let view_name = parts
+            .get(2)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
         let res = {
             let mut cat = catalog.lock().unwrap();
             cat.drop_inline_view(view_name)
@@ -1268,7 +1342,11 @@ async fn execute_simple_query(
         return Ok(());
     }
 
-    if sql_upper.starts_with("CREATE INDEX") || sql_upper.starts_with("DROP INDEX") || sql_upper.starts_with("REBUILD INDEX") || sql_upper.starts_with("EXPLAIN INDEX") {
+    if sql_upper.starts_with("CREATE INDEX")
+        || sql_upper.starts_with("DROP INDEX")
+        || sql_upper.starts_with("REBUILD INDEX")
+        || sql_upper.starts_with("EXPLAIN INDEX")
+    {
         send_command_complete(stream, "CREATE INDEX").await?;
         send_ready_for_query(stream).await?;
         return Ok(());
@@ -1276,7 +1354,10 @@ async fn execute_simple_query(
 
     let cols = get_query_columns(sql);
 
-    if sql_upper.starts_with("INSERT") || sql_upper.starts_with("UPDATE") || sql_upper.starts_with("DELETE") {
+    if sql_upper.starts_with("INSERT")
+        || sql_upper.starts_with("UPDATE")
+        || sql_upper.starts_with("DELETE")
+    {
         if sql_upper.contains("CONFLICT") || sql_upper.contains("FORCE_CONFLICT") {
             send_query_error(
                 stream,
@@ -1288,7 +1369,13 @@ async fn execute_simple_query(
             send_query_row(stream, &["1", "100"], &cols, &[]).await?;
             send_command_complete(stream, "INSERT 0 1").await?;
         } else {
-            let cmd = if sql_upper.starts_with("INSERT") { "INSERT 0 1" } else if sql_upper.starts_with("UPDATE") { "UPDATE 1" } else { "DELETE 1" };
+            let cmd = if sql_upper.starts_with("INSERT") {
+                "INSERT 0 1"
+            } else if sql_upper.starts_with("UPDATE") {
+                "UPDATE 1"
+            } else {
+                "DELETE 1"
+            };
             send_command_complete(stream, cmd).await?;
         }
         send_ready_for_query(stream).await?;
@@ -1299,13 +1386,19 @@ async fn execute_simple_query(
         let types = pg_types();
         send_row_description(stream, &cols).await?;
         for t in types {
-            send_query_row(stream, &[
-                &t.oid.to_string(),
-                &t.typname,
-                &t.typlen.to_string(),
-                &t.typtype.to_string(),
-                &t.typnamespace.to_string(),
-            ], &cols, &[]).await?;
+            send_query_row(
+                stream,
+                &[
+                    &t.oid.to_string(),
+                    &t.typname,
+                    &t.typlen.to_string(),
+                    &t.typtype.to_string(),
+                    &t.typnamespace.to_string(),
+                ],
+                &cols,
+                &[],
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         send_ready_for_query(stream).await?;
@@ -1315,22 +1408,45 @@ async fn execute_simple_query(
     if sql_upper.contains("COLUMNS") || sql_upper.contains("INFORMATION_SCHEMA") {
         send_row_description(stream, &cols).await?;
         let specs = vec![
-            crate::pg_catalog::ColumnSpec { name: "order_id", type_tag: 3, nullable: false },
-            crate::pg_catalog::ColumnSpec { name: "status", type_tag: 5, nullable: false },
-            crate::pg_catalog::ColumnSpec { name: "amount", type_tag: 4, nullable: true },
+            crate::pg_catalog::ColumnSpec {
+                name: "order_id",
+                type_tag: 3,
+                nullable: false,
+            },
+            crate::pg_catalog::ColumnSpec {
+                name: "status",
+                type_tag: 5,
+                nullable: false,
+            },
+            crate::pg_catalog::ColumnSpec {
+                name: "amount",
+                type_tag: 4,
+                nullable: true,
+            },
         ];
-        let info_cols = crate::pg_catalog::information_schema_columns("rockstream", "public", "orders_mv", &specs);
+        let info_cols = crate::pg_catalog::information_schema_columns(
+            "rockstream",
+            "public",
+            "orders_mv",
+            &specs,
+        );
         for row in info_cols {
-            send_query_row(stream, &[
-                &row.table_catalog,
-                &row.table_schema,
-                &row.table_name,
-                &row.column_name,
-                &row.ordinal_position.to_string(),
-                &row.data_type,
-                &row.udt_oid.to_string(),
-                &row.is_nullable,
-            ], &cols, &[]).await?;
+            send_query_row(
+                stream,
+                &[
+                    &row.table_catalog,
+                    &row.table_schema,
+                    &row.table_name,
+                    &row.column_name,
+                    &row.ordinal_position.to_string(),
+                    &row.data_type,
+                    &row.udt_oid.to_string(),
+                    &row.is_nullable,
+                ],
+                &cols,
+                &[],
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         send_ready_for_query(stream).await?;
@@ -1353,7 +1469,8 @@ async fn execute_simple_query(
         return Ok(());
     }
 
-    if sql_upper.contains("OVER") || sql_upper.contains("ROW_NUMBER") || sql_upper.contains("RANK") {
+    if sql_upper.contains("OVER") || sql_upper.contains("ROW_NUMBER") || sql_upper.contains("RANK")
+    {
         send_row_description(stream, &cols).await?;
         send_query_row(stream, &["Bob", "1"], &cols, &[]).await?;
         send_command_complete(stream, "SELECT").await?;
@@ -1385,8 +1502,16 @@ async fn execute_query_logic(
 ) -> std::io::Result<()> {
     let sql_upper = sql.to_uppercase();
 
-    if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\"")) && auth_ctx.tenant == "production" && auth_ctx.role != "admin" {
-        send_query_error(stream, "RS-2001", "access forbidden: Cross-tenant access rejected").await?;
+    if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\""))
+        && auth_ctx.tenant == "production"
+        && auth_ctx.role != "admin"
+    {
+        send_query_error(
+            stream,
+            "RS-2001",
+            "access forbidden: Cross-tenant access rejected",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1404,7 +1529,15 @@ async fn execute_query_logic(
     }
 
     if sql_upper.starts_with("SET ") || sql_upper.starts_with("SHOW ") {
-        send_command_complete(stream, if sql_upper.starts_with("SET ") { "SET" } else { "SHOW" }).await?;
+        send_command_complete(
+            stream,
+            if sql_upper.starts_with("SET ") {
+                "SET"
+            } else {
+                "SHOW"
+            },
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1412,7 +1545,9 @@ async fn execute_query_logic(
         let sql_trimmed = sql.trim();
         let rest = &sql_trimmed[11..].trim();
         if let Some(as_idx) = rest.to_uppercase().find(" AS ") {
-            let view_name = rest[..as_idx].trim().trim_matches(|c| c == '"' || c == '`' || c == ';');
+            let view_name = rest[..as_idx]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '`' || c == ';');
             let body = rest[as_idx + 4..].trim().trim_matches(';');
             {
                 let mut cat = catalog.lock().unwrap();
@@ -1420,14 +1555,22 @@ async fn execute_query_logic(
             }
             send_command_complete(stream, "CREATE VIEW").await?;
         } else {
-            send_query_error(stream, "RS-2001", "invalid DML or DDL statement: Missing AS in CREATE VIEW").await?;
+            send_query_error(
+                stream,
+                "RS-2001",
+                "invalid DML or DDL statement: Missing AS in CREATE VIEW",
+            )
+            .await?;
         }
         return Ok(());
     }
 
     if sql_upper.starts_with("DROP VIEW") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let view_name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        let view_name = parts
+            .get(2)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
         let res = {
             let mut cat = catalog.lock().unwrap();
             cat.drop_inline_view(view_name)
@@ -1443,14 +1586,21 @@ async fn execute_query_logic(
         return Ok(());
     }
 
-    if sql_upper.starts_with("CREATE INDEX") || sql_upper.starts_with("DROP INDEX") || sql_upper.starts_with("REBUILD INDEX") || sql_upper.starts_with("EXPLAIN INDEX") {
+    if sql_upper.starts_with("CREATE INDEX")
+        || sql_upper.starts_with("DROP INDEX")
+        || sql_upper.starts_with("REBUILD INDEX")
+        || sql_upper.starts_with("EXPLAIN INDEX")
+    {
         send_command_complete(stream, "CREATE INDEX").await?;
         return Ok(());
     }
 
     let cols = get_query_columns(sql);
 
-    if sql_upper.starts_with("INSERT") || sql_upper.starts_with("UPDATE") || sql_upper.starts_with("DELETE") {
+    if sql_upper.starts_with("INSERT")
+        || sql_upper.starts_with("UPDATE")
+        || sql_upper.starts_with("DELETE")
+    {
         if sql_upper.contains("CONFLICT") || sql_upper.contains("FORCE_CONFLICT") {
             send_query_error(
                 stream,
@@ -1461,7 +1611,13 @@ async fn execute_query_logic(
             send_query_row(stream, &["1", "100"], &cols, result_formats).await?;
             send_command_complete(stream, "INSERT 0 1").await?;
         } else {
-            let cmd = if sql_upper.starts_with("INSERT") { "INSERT 0 1" } else if sql_upper.starts_with("UPDATE") { "UPDATE 1" } else { "DELETE 1" };
+            let cmd = if sql_upper.starts_with("INSERT") {
+                "INSERT 0 1"
+            } else if sql_upper.starts_with("UPDATE") {
+                "UPDATE 1"
+            } else {
+                "DELETE 1"
+            };
             send_command_complete(stream, cmd).await?;
         }
         return Ok(());
@@ -1470,13 +1626,19 @@ async fn execute_query_logic(
     if sql_upper.contains("PG_TYPE") {
         let types = pg_types();
         for t in types {
-            send_query_row(stream, &[
-                &t.oid.to_string(),
-                &t.typname,
-                &t.typlen.to_string(),
-                &t.typtype.to_string(),
-                &t.typnamespace.to_string(),
-            ], &cols, result_formats).await?;
+            send_query_row(
+                stream,
+                &[
+                    &t.oid.to_string(),
+                    &t.typname,
+                    &t.typlen.to_string(),
+                    &t.typtype.to_string(),
+                    &t.typnamespace.to_string(),
+                ],
+                &cols,
+                result_formats,
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         return Ok(());
@@ -1484,22 +1646,45 @@ async fn execute_query_logic(
 
     if sql_upper.contains("COLUMNS") || sql_upper.contains("INFORMATION_SCHEMA") {
         let specs = vec![
-            crate::pg_catalog::ColumnSpec { name: "order_id", type_tag: 3, nullable: false },
-            crate::pg_catalog::ColumnSpec { name: "status", type_tag: 5, nullable: false },
-            crate::pg_catalog::ColumnSpec { name: "amount", type_tag: 4, nullable: true },
+            crate::pg_catalog::ColumnSpec {
+                name: "order_id",
+                type_tag: 3,
+                nullable: false,
+            },
+            crate::pg_catalog::ColumnSpec {
+                name: "status",
+                type_tag: 5,
+                nullable: false,
+            },
+            crate::pg_catalog::ColumnSpec {
+                name: "amount",
+                type_tag: 4,
+                nullable: true,
+            },
         ];
-        let info_cols = crate::pg_catalog::information_schema_columns("rockstream", "public", "orders_mv", &specs);
+        let info_cols = crate::pg_catalog::information_schema_columns(
+            "rockstream",
+            "public",
+            "orders_mv",
+            &specs,
+        );
         for row in info_cols {
-            send_query_row(stream, &[
-                &row.table_catalog,
-                &row.table_schema,
-                &row.table_name,
-                &row.column_name,
-                &row.ordinal_position.to_string(),
-                &row.data_type,
-                &row.udt_oid.to_string(),
-                &row.is_nullable,
-            ], &cols, result_formats).await?;
+            send_query_row(
+                stream,
+                &[
+                    &row.table_catalog,
+                    &row.table_schema,
+                    &row.table_name,
+                    &row.column_name,
+                    &row.ordinal_position.to_string(),
+                    &row.data_type,
+                    &row.udt_oid.to_string(),
+                    &row.is_nullable,
+                ],
+                &cols,
+                result_formats,
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         return Ok(());
@@ -1517,7 +1702,8 @@ async fn execute_query_logic(
         return Ok(());
     }
 
-    if sql_upper.contains("OVER") || sql_upper.contains("ROW_NUMBER") || sql_upper.contains("RANK") {
+    if sql_upper.contains("OVER") || sql_upper.contains("ROW_NUMBER") || sql_upper.contains("RANK")
+    {
         send_query_row(stream, &["Bob", "1"], &cols, result_formats).await?;
         send_command_complete(stream, "SELECT").await?;
         return Ok(());

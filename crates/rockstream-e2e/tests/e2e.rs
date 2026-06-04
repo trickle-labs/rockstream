@@ -2,8 +2,8 @@ use std::fs;
 use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
-use testcontainers::runners::AsyncRunner;
 use testcontainers::core::{IntoContainerPort, Mount};
+use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use rockstream_e2e::ensure_image_built;
@@ -420,7 +420,10 @@ async fn test_gateway_pgwire_e2e() {
         ]);
     let container_gateway = image_gateway.start().await.unwrap();
     let gateway_id = container_gateway.id().to_string();
-    let gateway_port = container_gateway.get_host_port_ipv4(5432.tcp()).await.unwrap();
+    let gateway_port = container_gateway
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .unwrap();
     eprintln!("DEBUG: Gateway started (port: {})", gateway_port);
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -451,97 +454,213 @@ async fn test_gateway_pgwire_e2e() {
     // 1. Unauthenticated startup path should fail
     eprintln!("DEBUG: Running Scenario A.1 (unauthenticated)");
     {
-        let res = connect(host_ip.clone(), gateway_port, "alice".to_owned(), "mydb".to_owned(), Some("".to_owned())).await;
+        let res = connect(
+            host_ip.clone(),
+            gateway_port,
+            "alice".to_owned(),
+            "mydb".to_owned(),
+            Some("".to_owned()),
+        )
+        .await;
         assert!(res.is_err(), "unauthenticated connection should fail");
         let err_msg = get_db_error_message(&res.unwrap_err());
-        assert!(err_msg.contains("client authentication failed") || err_msg.contains("RS-2001"), "unexpected error: {}", err_msg);
+        assert!(
+            err_msg.contains("client authentication failed") || err_msg.contains("RS-2001"),
+            "unexpected error: {}",
+            err_msg
+        );
     }
     // 2. Invalid auth token should fail
     eprintln!("DEBUG: Running Scenario A.2 (invalid token)");
     {
-        let res = connect(host_ip.clone(), gateway_port, "alice".to_owned(), "mydb".to_owned(), Some("invalid-token".to_owned())).await;
+        let res = connect(
+            host_ip.clone(),
+            gateway_port,
+            "alice".to_owned(),
+            "mydb".to_owned(),
+            Some("invalid-token".to_owned()),
+        )
+        .await;
         assert!(res.is_err());
     }
     // 3. Authenticated startup path (viewer role)
     eprintln!("DEBUG: Running Scenario A.3 (viewer)");
-    let client_viewer = connect(host_ip.clone(), gateway_port, "alice".to_owned(), "mydb".to_owned(), Some("bearer viewer:production".to_owned())).await.unwrap();
+    let client_viewer = connect(
+        host_ip.clone(),
+        gateway_port,
+        "alice".to_owned(),
+        "mydb".to_owned(),
+        Some("bearer viewer:production".to_owned()),
+    )
+    .await
+    .unwrap();
 
     // 4. Authenticated startup path (admin role)
     eprintln!("DEBUG: Running Scenario A.4 (admin)");
-    let client_admin = connect(host_ip.clone(), gateway_port, "admin".to_owned(), "mydb".to_owned(), Some("bearer admin:any".to_owned())).await.unwrap();
+    let client_admin = connect(
+        host_ip.clone(),
+        gateway_port,
+        "admin".to_owned(),
+        "mydb".to_owned(),
+        Some("bearer admin:any".to_owned()),
+    )
+    .await
+    .unwrap();
 
     // Scenario B: Simple query isolation level coverage
     eprintln!("DEBUG: Running Scenario B");
     // 1. SET TRANSACTION ISOLATION LEVEL REPEATABLE READ succeeds
-    client_viewer.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &[]).await.unwrap();
+    client_viewer
+        .execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &[])
+        .await
+        .unwrap();
     // 2. SET TRANSACTION ISOLATION LEVEL SERIALIZABLE fails with RS-2003
     {
-        let res = client_viewer.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", &[]).await;
+        let res = client_viewer
+            .execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", &[])
+            .await;
         assert!(res.is_err());
         let err_msg = get_db_error_message(&res.unwrap_err());
-        assert!(err_msg.contains("RS-2003"), "expected RS-2003, got: {}", err_msg);
+        assert!(
+            err_msg.contains("RS-2003"),
+            "expected RS-2003, got: {}",
+            err_msg
+        );
     }
     // 3. SHOW / SET other variables
-    client_viewer.execute("SET client_encoding TO 'UTF8'", &[]).await.unwrap();
-    client_viewer.execute("SHOW client_encoding", &[]).await.unwrap();
+    client_viewer
+        .execute("SET client_encoding TO 'UTF8'", &[])
+        .await
+        .unwrap();
+    client_viewer
+        .execute("SHOW client_encoding", &[])
+        .await
+        .unwrap();
 
     // Scenario C: Extended query coverage (Parse/Bind/Execute)
-    let stmt = client_viewer.prepare("SELECT * FROM pg_catalog.pg_type WHERE oid = $1").await.unwrap();
+    let stmt = client_viewer
+        .prepare("SELECT * FROM pg_catalog.pg_type WHERE oid = $1")
+        .await
+        .unwrap();
     let rows = client_viewer.query(&stmt, &[&16i32]).await.unwrap();
     assert!(!rows.is_empty(), "pg_type query returned no rows");
 
     // Scenario D: Catalog reflection
     // 1. pg_catalog.pg_type OIDs and metadata
-    let rows = client_viewer.query("SELECT oid, typname FROM pg_catalog.pg_type", &[]).await.unwrap();
-    assert!(rows.iter().any(|r| r.get::<_, i32>("oid") == 16 && r.get::<_, &str>("typname") == "bool"));
+    let rows = client_viewer
+        .query("SELECT oid, typname FROM pg_catalog.pg_type", &[])
+        .await
+        .unwrap();
+    assert!(rows
+        .iter()
+        .any(|r| r.get::<_, i32>("oid") == 16 && r.get::<_, &str>("typname") == "bool"));
     // 2. information_schema.columns OIDs and types
-    let rows = client_viewer.query("SELECT table_name, column_name, data_type, udt_oid FROM information_schema.columns", &[]).await.unwrap();
-    assert!(rows.iter().any(|r| r.get::<_, &str>("table_name") == "orders_mv" && r.get::<_, &str>("column_name") == "order_id" && r.get::<_, i32>("udt_oid") == 20));
+    let rows = client_viewer
+        .query(
+            "SELECT table_name, column_name, data_type, udt_oid FROM information_schema.columns",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(rows
+        .iter()
+        .any(|r| r.get::<_, &str>("table_name") == "orders_mv"
+            && r.get::<_, &str>("column_name") == "order_id"
+            && r.get::<_, i32>("udt_oid") == 20));
 
     // Scenario E: Inline DDL/DML, Optimistic conflicts, and View dependencies
     // 1. CREATE VIEW view_a
-    client_viewer.execute("CREATE VIEW view_a AS SELECT order_id FROM orders_mv", &[]).await.unwrap();
+    client_viewer
+        .execute("CREATE VIEW view_a AS SELECT order_id FROM orders_mv", &[])
+        .await
+        .unwrap();
     // 2. DROP VIEW view_with_dep (dependent view error RS-2004)
     {
         let res = client_viewer.execute("DROP VIEW view_with_dep", &[]).await;
         assert!(res.is_err());
         let err_msg = get_db_error_message(&res.unwrap_err());
-        assert!(err_msg.contains("RS-2004"), "expected RS-2004, got: {}", err_msg);
+        assert!(
+            err_msg.contains("RS-2004"),
+            "expected RS-2004, got: {}",
+            err_msg
+        );
     }
     // 3. Optimistic conflict DML error RS-2008
     {
-        let res = client_viewer.execute("INSERT INTO balances (account, amount) VALUES ('alice', CONFLICT)", &[]).await;
+        let res = client_viewer
+            .execute(
+                "INSERT INTO balances (account, amount) VALUES ('alice', CONFLICT)",
+                &[],
+            )
+            .await;
         assert!(res.is_err());
         let err_msg = get_db_error_message(&res.unwrap_err());
-        assert!(err_msg.contains("RS-2008"), "expected RS-2008, got: {}", err_msg);
+        assert!(
+            err_msg.contains("RS-2008"),
+            "expected RS-2008, got: {}",
+            err_msg
+        );
     }
     // 4. INSERT ... RETURNING row description and execution
-    let rows = client_viewer.query("INSERT INTO balances (account, amount) VALUES ('alice', 100) RETURNING id, amount", &[]).await.unwrap();
+    let rows = client_viewer
+        .query(
+            "INSERT INTO balances (account, amount) VALUES ('alice', 100) RETURNING id, amount",
+            &[],
+        )
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("id"), 1);
 
     // Scenario F: Tenant isolation
     {
-        let res = client_viewer.query("SELECT * FROM marketing.orders", &[]).await;
+        let res = client_viewer
+            .query("SELECT * FROM marketing.orders", &[])
+            .await;
         assert!(res.is_err());
         let err_msg = get_db_error_message(&res.unwrap_err());
-        assert!(err_msg.contains("Cross-tenant") || err_msg.contains("RS-2001"), "unexpected error: {}", err_msg);
+        assert!(
+            err_msg.contains("Cross-tenant") || err_msg.contains("RS-2001"),
+            "unexpected error: {}",
+            err_msg
+        );
     }
     // Admin user should bypass tenant isolation
-    let _ = client_admin.query("SELECT * FROM marketing.orders", &[]).await.unwrap();
+    let _ = client_admin
+        .query("SELECT * FROM marketing.orders", &[])
+        .await
+        .unwrap();
 
     // Scenario G: Query semantics
     // 1. Join query
-    let rows = client_viewer.query("SELECT * FROM a JOIN b ON a.id = b.id", &[]).await.unwrap();
+    let rows = client_viewer
+        .query("SELECT * FROM a JOIN b ON a.id = b.id", &[])
+        .await
+        .unwrap();
     assert!(!rows.is_empty());
     // 2. Aggregate query
-    let rows = client_viewer.query("SELECT region, SUM(amount) FROM orders GROUP BY region", &[]).await.unwrap();
+    let rows = client_viewer
+        .query(
+            "SELECT region, SUM(amount) FROM orders GROUP BY region",
+            &[],
+        )
+        .await
+        .unwrap();
     assert!(!rows.is_empty());
     // 3. Window query
-    let rows = client_viewer.query("SELECT name, ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY id) FROM users", &[]).await.unwrap();
+    let rows = client_viewer
+        .query(
+            "SELECT name, ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY id) FROM users",
+            &[],
+        )
+        .await
+        .unwrap();
     assert!(!rows.is_empty());
     // 4. Subscribe query
-    let rows = client_viewer.query("SUBSCRIBE orders_mv", &[]).await.unwrap();
+    let rows = client_viewer
+        .query("SUBSCRIBE orders_mv", &[])
+        .await
+        .unwrap();
     assert!(!rows.is_empty());
 
     // Scenario H: psql client compatibility witness
@@ -569,6 +688,12 @@ async fn test_gateway_pgwire_e2e() {
 
     let stdout = String::from_utf8_lossy(&psql_output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&psql_output.stderr).to_string();
-    assert!(psql_output.status.success(), "psql container failed. Stderr: {stderr}");
-    assert!(stdout.contains("bool"), "psql output did not contain 'bool'. Output: {stdout}");
+    assert!(
+        psql_output.status.success(),
+        "psql container failed. Stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("bool"),
+        "psql output did not contain 'bool'. Output: {stdout}"
+    );
 }
