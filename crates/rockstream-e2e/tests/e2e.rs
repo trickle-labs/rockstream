@@ -424,12 +424,12 @@ async fn test_gateway_pgwire_e2e() {
         .get_host_port_ipv4(5432.tcp())
         .await
         .unwrap();
-    eprintln!("DEBUG: Gateway started (port: {})", gateway_port);
+    eprintln!("DEBUG: Gateway started (port: {gateway_port})");
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Helper to connect to gateway
     let connect = |ip: String, port: u16, user: String, db: String, token: Option<String>| async move {
-        eprintln!("DEBUG: connecting to {}:{} as {}...", ip, port, user);
+        eprintln!("DEBUG: connecting to {ip}:{port} as {user}...");
         let mut config = tokio_postgres::Config::new();
         config.host(&ip);
         config.port(port);
@@ -466,8 +466,7 @@ async fn test_gateway_pgwire_e2e() {
         let err_msg = get_db_error_message(&res.unwrap_err());
         assert!(
             err_msg.contains("client authentication failed") || err_msg.contains("RS-2001"),
-            "unexpected error: {}",
-            err_msg
+            "unexpected error: {err_msg}"
         );
     }
     // 2. Invalid auth token should fail
@@ -523,8 +522,7 @@ async fn test_gateway_pgwire_e2e() {
         let err_msg = get_db_error_message(&res.unwrap_err());
         assert!(
             err_msg.contains("RS-2003"),
-            "expected RS-2003, got: {}",
-            err_msg
+            "expected RS-2003, got: {err_msg}"
         );
     }
     // 3. SHOW / SET other variables
