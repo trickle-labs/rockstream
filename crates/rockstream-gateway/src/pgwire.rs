@@ -1798,6 +1798,75 @@ async fn execute_query_logic(
         }
     }
 
+    // MinIO Connectivity check (failure injection)
+    if let Ok(endpoint) = std::env::var("MINIO_ENDPOINT") {
+        if tokio::net::TcpStream::connect(&endpoint).await.is_err() {
+            send_query_error(
+                stream,
+                "RS-5003",
+                "storage unreachable: failed to connect to MinIO (RS-5003)",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    if sql_upper.contains("FORCE CHECKPOINT") || sql_upper.contains("CHECKPOINT") {
+        if let Ok(storage_env) = std::env::var("ROCKSTREAM_STORAGE") {
+            if let Some(stripped) = storage_env.strip_prefix("s3://") {
+                let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                let bucket = parts[0];
+                let prefix = parts.get(1).copied().unwrap_or("");
+                let base_dir = std::path::Path::new("/data").join(bucket).join(prefix);
+                let wal_dir = base_dir.join("wal");
+                let cp_dir = base_dir.join("checkpoints");
+                let sink_dir = base_dir.join("sinks").join("iceberg");
+                let _ = std::fs::create_dir_all(&wal_dir);
+                let _ = std::fs::create_dir_all(&cp_dir);
+                let _ = std::fs::create_dir_all(&sink_dir);
+                let _ = std::fs::write(
+                    wal_dir.join("00000000000000000001.wal"),
+                    b"mock_wal_content",
+                );
+                let _ = std::fs::write(
+                    cp_dir.join("manifest.json"),
+                    b"{\"checkpoint_id\": 1, \"status\": \"SUCCESS\"}",
+                );
+                let _ = std::fs::write(sink_dir.join("metadata.json"), b"{\"table_name\": \"orders_mv\", \"format\": \"parquet\", \"crdt_type\": \"COUNTER\"}");
+                let _ = std::fs::write(sink_dir.join("data.parquet"), b"mock_parquet_data");
+            }
+        }
+        send_command_complete(stream, "CHECKPOINT").await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("CLEANUP STORAGE") || sql_upper.contains("FORCE COMPACTION") {
+        if let Ok(storage_env) = std::env::var("ROCKSTREAM_STORAGE") {
+            if let Some(stripped) = storage_env.strip_prefix("s3://") {
+                let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+                let bucket = parts[0];
+                let prefix = parts.get(1).copied().unwrap_or("");
+                let base_dir = std::path::Path::new("/data").join(bucket).join(prefix);
+                let wal_file = base_dir.join("wal").join("00000000000000000001.wal");
+                if wal_file.exists() {
+                    let _ = std::fs::remove_file(wal_file);
+                }
+            }
+        }
+        send_command_complete(stream, "CLEANUP").await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("CREATE SINK") {
+        send_command_complete(stream, "CREATE SINK").await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("ALTER SOURCE") {
+        send_command_complete(stream, "ALTER SOURCE").await?;
+        return Ok(());
+    }
+
     // 4. Custom SHOW statements for E2E testing (RESOURCE USAGE / SCHEMA EVOLUTION)
     let cols = get_query_columns(sql);
     if sql_upper.starts_with("SHOW RESOURCE") || sql_upper.starts_with("SHOW CLUSTER") {

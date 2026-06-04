@@ -356,7 +356,9 @@ async fn run_start(
 ) {
     tracing::info!(storage = %storage, role = %role, "starting rockstream");
 
-    let storage_path = Path::new(storage);
+    let is_s3 = storage.starts_with("s3://");
+    let storage_dir = if is_s3 { "./data" } else { storage };
+    let storage_path = Path::new(storage_dir);
     if let Err(e) = std::fs::create_dir_all(storage_path) {
         tracing::error!(
             error = %e,

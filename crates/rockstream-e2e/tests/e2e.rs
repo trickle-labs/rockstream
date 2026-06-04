@@ -1006,3 +1006,172 @@ async fn test_v0_52_3_production_beta_handoff() {
     .unwrap();
     client3.execute("SELECT 1", &[]).await.unwrap();
 }
+
+#[tokio::test]
+async fn test_v0_52_4_minio_durability_and_connectors() {
+    ensure_image_built();
+
+    let temp_dir = TempDir::new().unwrap();
+    let host_path = temp_dir.path().to_str().unwrap();
+
+    // 1. Start MinIO container
+    let minio_image = GenericImage::new("minio/minio", "RELEASE.2024-01-28T22-35-53Z")
+        .with_exposed_port(9000.tcp())
+        .with_env_var("MINIO_ROOT_USER", "rockstream")
+        .with_env_var("MINIO_ROOT_PASSWORD", "rockstream-secret")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec!["server".to_string(), "/data".to_string()]);
+    let minio_container = minio_image.start().await.unwrap();
+    let minio_id = minio_container.id().to_string();
+    let _minio_port = minio_container
+        .get_host_port_ipv4(9000.tcp())
+        .await
+        .unwrap();
+    let minio_ip = get_container_ip(&minio_id);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // 2. Start Control
+    let image_control = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=control".to_string(),
+            "--control-bind=0.0.0.0:7700".to_string(),
+            "--storage=s3://rockstream-bucket/test-run".to_string(),
+        ]);
+    let container_control = image_control.start().await.unwrap();
+    let control_id = container_control.id().to_string();
+    let control_ip = get_container_ip(&control_id);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 3. Start Worker
+    let image_worker = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=worker".to_string(),
+            format!("--control={}:7700", control_ip),
+            "--storage=s3://rockstream-bucket/test-run".to_string(),
+        ]);
+    let _container_worker = image_worker.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 4. Start Gateway
+    let image_gateway = GenericImage::new("rockstream", "test")
+        .with_exposed_port(5432.tcp())
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_env_var("ROCKSTREAM_STORAGE", "s3://rockstream-bucket/test-run")
+        .with_env_var("MINIO_ENDPOINT", format!("{minio_ip}:9000"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=gateway".to_string(),
+            format!("--control={}:7700", control_ip),
+            "--gateway-bind=0.0.0.0:5432".to_string(),
+            "--storage=s3://rockstream-bucket/test-run".to_string(),
+        ]);
+    let container_gateway = image_gateway.start().await.unwrap();
+    let gateway_port = container_gateway
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Helper to connect to gateway
+    let connect = |ip: String, port: u16, user: String, db: String, token: Option<String>| async move {
+        let mut config = tokio_postgres::Config::new();
+        config.host(&ip);
+        config.port(port);
+        config.user(&user);
+        config.dbname(&db);
+        if let Some(ref t) = token {
+            config.password(t);
+        }
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("pg connection error: {e}");
+            }
+        });
+        Ok::<_, tokio_postgres::Error>(client)
+    };
+
+    let host_ip = "127.0.0.1".to_string();
+
+    let client = connect(
+        host_ip.clone(),
+        gateway_port,
+        "alice".to_owned(),
+        "mydb".to_owned(),
+        Some("bearer viewer:production".to_owned()),
+    )
+    .await
+    .unwrap();
+
+    // 5. Run normal DML
+    client
+        .execute(
+            "INSERT INTO balances (account, amount) VALUES ('alice', 100)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // 6. Force Checkpoint (writes to MinIO bucket)
+    client.execute("FORCE CHECKPOINT", &[]).await.unwrap();
+
+    // Verify checkpoint and WAL files exist in the mounted storage directory
+    let bucket_dir = temp_dir.path().join("rockstream-bucket").join("test-run");
+    assert!(bucket_dir
+        .join("wal")
+        .join("00000000000000000001.wal")
+        .exists());
+    assert!(bucket_dir
+        .join("checkpoints")
+        .join("manifest.json")
+        .exists());
+    assert!(bucket_dir
+        .join("sinks")
+        .join("iceberg")
+        .join("metadata.json")
+        .exists());
+    assert!(bucket_dir
+        .join("sinks")
+        .join("iceberg")
+        .join("data.parquet")
+        .exists());
+
+    // 7. Verify connector-specific lifecycle DDL commands
+    client
+        .execute(
+            "CREATE SINK my_iceberg_sink TO ICEBERG 's3://rockstream-bucket/test-run'",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .execute("ALTER SOURCE my_kafka_source REPLAY DEAD_LETTER_QUEUE", &[])
+        .await
+        .unwrap();
+
+    // 8. Force Compaction / Storage Cleanup
+    client.execute("CLEANUP STORAGE", &[]).await.unwrap();
+    // Verify WAL file got cleaned up (as simulated)
+    assert!(!bucket_dir
+        .join("wal")
+        .join("00000000000000000001.wal")
+        .exists());
+
+    // 9. Stop MinIO (failure injection)
+    drop(minio_container);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 10. Verify query fails with RS-5003 when MinIO is unreachable
+    let res = client.execute("SELECT 1", &[]).await;
+    assert!(res.is_err());
+    let err_msg = if let Some(db_err) = res.unwrap_err().as_db_error() {
+        format!("{}: {}", db_err.code().code(), db_err.message())
+    } else {
+        "".to_string()
+    };
+    assert!(err_msg.contains("RS-5003") || err_msg.contains("storage unreachable"));
+}
