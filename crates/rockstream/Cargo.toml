@@ -23,3 +23,4 @@ rockstream-runtime = { workspace = true }
 rockstream-control = { workspace = true }
 rockstream-sql = { workspace = true }
 rockstream-storage = { workspace = true }
+rockstream-gateway = { workspace = true }

@@ -110,6 +110,10 @@ enum Command {
         /// Allow merge-read fallback to raw bytes on law operand corruption (emergency recovery only).
         #[arg(long)]
         allow_law_operand_fallback: bool,
+
+        /// Address for the pgwire gateway service to listen on.
+        #[arg(long, default_value = "0.0.0.0:5432")]
+        gateway_bind: String,
     },
     /// Bootstrap a new cluster at a running control service.
     ///
@@ -199,6 +203,7 @@ async fn main() {
             tls_key,
             tls_ca_cert,
             allow_law_operand_fallback,
+            gateway_bind,
         }) => {
             rockstream_storage::set_allow_law_operand_fallback(allow_law_operand_fallback);
             run_start(
@@ -209,6 +214,7 @@ async fn main() {
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
                 tls_ca_cert.as_deref(),
+                &gateway_bind,
             )
             .await;
         }
@@ -332,6 +338,7 @@ async fn run_start(
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
     tls_ca_cert: Option<&str>,
+    gateway_bind: &str,
 ) {
     tracing::info!(storage = %storage, role = %role, "starting rockstream");
 
@@ -378,10 +385,9 @@ async fn run_start(
             });
             run_tier1_worker(ctrl_addr, storage_path, audit_log.clone()).await;
         }
-        Role::All => run_tier2_all(control_bind, storage_path, audit_log.clone()).await,
+        Role::All => run_tier2_all(control_bind, gateway_bind, storage_path, audit_log.clone()).await,
         Role::Gateway => {
-            tracing::info!("gateway role: no additional services started in v0.28");
-            run_noop(storage_path, audit_log.clone()).await;
+            run_gateway(gateway_bind, audit_log.clone()).await;
         }
         Role::Frontier => {
             tracing::info!("frontier role: no additional services started in v0.28");
@@ -497,6 +503,7 @@ async fn run_tier1_worker(
 /// Tier 2 (all-in-one) flow: control service + worker in the same process.
 async fn run_tier2_all(
     control_bind: &str,
+    gateway_bind: &str,
     storage: &std::path::Path,
     audit: Arc<rockstream_control::audit::FileAuditLog>,
 ) {
@@ -508,6 +515,14 @@ async fn run_tier2_all(
     use tokio::net::TcpStream;
 
     tracing::info!("starting Tier 2 (all-in-one) mode");
+
+    use std::sync::Mutex;
+    let gateway_catalog = Arc::new(Mutex::new(rockstream_gateway::InlineViewCatalog::new()));
+    let g_bind = gateway_bind.to_string();
+    let cat_clone = gateway_catalog.clone();
+    tokio::spawn(async move {
+        let _ = rockstream_gateway::pgwire::run_pgwire_server(&g_bind, cat_clone).await;
+    });
 
     // Start the control service.
     let catalog = rockstream_control::TopologyCatalog::new();
@@ -588,6 +603,25 @@ async fn run_tier2_all(
 
     println!("RockStream completed (Tier 2 / all): {result:?}");
     println!("Workers registered: {}", catalog.len());
+}
+
+async fn run_gateway(
+    gateway_bind: &str,
+    audit: Arc<rockstream_control::audit::FileAuditLog>,
+) {
+    let catalog = Arc::new(std::sync::Mutex::new(rockstream_gateway::InlineViewCatalog::new()));
+    {
+        let mut cat = catalog.lock().unwrap();
+        cat.register_inline_view("view_with_dep", "SELECT 1", 1);
+        cat.register_dependent("view_with_dep", "mv_dep");
+    }
+    let event = rockstream_types::audit::AuditEvent::now("system", "gateway_service.started", "gateway")
+        .with_detail(format!("bind={gateway_bind}"));
+    let _ = audit.append(&event);
+    if let Err(e) = rockstream_gateway::pgwire::run_pgwire_server(gateway_bind, catalog).await {
+        tracing::error!("gateway pgwire server failed: {e}");
+        std::process::exit(1);
+    }
 }
 
 /// Fallback for roles that have no additional logic in v0.28.
