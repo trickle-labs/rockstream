@@ -62,7 +62,6 @@ pub mod pool;
 pub mod rockstream_catalog;
 pub mod subscribe;
 
-pub use index_scan::{select_scan_path, check_index_status, ScanPath, charge_index_budget};
 pub use dml::{
     CommittedWrite, DmlResult, DmlStatement, OptimisticTransaction, WriteKind, WriteSetEntry,
 };
@@ -75,6 +74,7 @@ pub use historical::{
     oldest_retained_epoch, EpochTimestampEntry, HistoricalAsOf, HistoricalQueryResult,
     HistoricalRow, MonotonePartialResult, RetentionConfig,
 };
+pub use index_scan::{charge_index_budget, check_index_status, select_scan_path, ScanPath};
 pub use inline_view::InlineViewCatalog;
 pub use limits::{check_timeout, QueryTimeoutConfig, RateLimitConfig, RateLimiter};
 pub use max_staleness::{check_staleness, format_notice, MaxStalenessConfig, StalenessStatus};

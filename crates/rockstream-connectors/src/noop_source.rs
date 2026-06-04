@@ -25,6 +25,7 @@ impl NoopSource {
 #[async_trait]
 impl Source for NoopSource {
     async fn poll_batch(&mut self, epoch: Epoch) -> Option<SourceBatch> {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if let Some(max) = self.max_epochs {
             if epoch >= max {
                 tracing::info!(epoch, "noop source exhausted");

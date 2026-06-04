@@ -16,10 +16,11 @@ members = [
     "crates/rockstream-sql",
     "crates/rockstream-storage",
     "crates/rockstream-types",
+    "crates/rockstream-e2e",
 ]
 
 [workspace.package]
-version = "0.52.0"
+version = "0.52.1"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
