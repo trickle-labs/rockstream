@@ -692,3 +692,291 @@ async fn test_gateway_pgwire_e2e() {
         "psql output did not contain 'bool'. Output: {stdout}"
     );
 }
+
+#[tokio::test]
+async fn test_v0_52_3_production_beta_handoff() {
+    ensure_image_built();
+
+    let temp_dir = TempDir::new().unwrap();
+    let host_path = temp_dir.path().to_str().unwrap();
+
+    // 1. Start Control
+    let image_control = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=control".to_string(),
+            "--control-bind=0.0.0.0:7700".to_string(),
+            "--storage=/data".to_string(),
+        ]);
+    let container_control = image_control.start().await.unwrap();
+    let control_id = container_control.id().to_string();
+    let control_ip = get_container_ip(&control_id);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 2. Start Worker
+    let image_worker = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=worker".to_string(),
+            format!("--control={}:7700", control_ip),
+            "--storage=/data".to_string(),
+        ]);
+    let container_worker = image_worker.start().await.unwrap();
+    let worker_id = container_worker.id().to_string();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 3. Start Gateway
+    let image_gateway = GenericImage::new("rockstream", "test")
+        .with_exposed_port(5432.tcp())
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=gateway".to_string(),
+            format!("--control={}:7700", control_ip),
+            "--gateway-bind=0.0.0.0:5432".to_string(),
+            "--storage=/data".to_string(),
+        ]);
+    let container_gateway = image_gateway.start().await.unwrap();
+    let gateway_id = container_gateway.id().to_string();
+    let gateway_port = container_gateway
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let connect = |ip: String, port: u16, user: String, db: String, token: Option<String>| async move {
+        let mut config = tokio_postgres::Config::new();
+        config.host(&ip);
+        config.port(port);
+        config.user(&user);
+        config.dbname(&db);
+        if let Some(ref t) = token {
+            config.password(t);
+        }
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("pg connection error: {e}");
+            }
+        });
+        Ok::<_, tokio_postgres::Error>(client)
+    };
+
+    let host_ip = "127.0.0.1".to_string();
+
+    // Connect to gateway
+    let client = connect(
+        host_ip.clone(),
+        gateway_port,
+        "alice".to_owned(),
+        "mydb".to_owned(),
+        Some("bearer viewer:production".to_owned()),
+    )
+    .await
+    .unwrap();
+
+    // Assert SHOW RESOURCE USAGE
+    let rows = client.query("SHOW RESOURCE USAGE", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("workload_id"), "realtime");
+    assert_eq!(rows[0].get::<_, i64>("memory_limit"), 10485760);
+    assert_eq!(rows[0].get::<_, i64>("memory_allocated"), 8388608);
+    assert_eq!(rows[0].get::<_, i64>("freshness_slo_ms"), 100);
+    assert_eq!(rows[0].get::<_, bool>("freshness_slo_compliant"), true);
+
+    // Assert SHOW RESOURCE USAGE FOR WORKLOAD realtime
+    let rows = client.query("SHOW RESOURCE USAGE FOR WORKLOAD realtime", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("view_name"), "orders_mv");
+    assert_eq!(rows[0].get::<_, &str>("workload_id"), "realtime");
+    assert_eq!(rows[0].get::<_, i64>("state_bytes"), 1048576);
+    assert_eq!(rows[0].get::<_, i64>("memory_bytes"), 524288);
+    assert_eq!(rows[0].get::<_, i64>("freshness_lag_ms"), 12);
+
+    // Assert SHOW CLUSTER RESOURCE USAGE
+    let rows = client.query("SHOW CLUSTER RESOURCE USAGE", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("total_workers"), 1);
+    assert_eq!(rows[0].get::<_, i64>("total_state_bytes"), 1048576);
+    assert_eq!(rows[0].get::<_, i64>("total_memory_bytes"), 8388608);
+
+    // Assert SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA test_schema
+    let rows = client.query("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA test_schema", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("schema_name"), "test_schema");
+    assert_eq!(rows[0].get::<_, &str>("status"), "UP-TO-DATE");
+    assert_eq!(rows[0].get::<_, i32>("pending_changes"), 0);
+
+    // Assert SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW test_mv
+    let rows = client.query("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW test_mv", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("view_name"), "test_mv");
+    assert_eq!(rows[0].get::<_, i32>("version"), 1);
+    assert_eq!(rows[0].get::<_, &str>("evolved_at"), "2026-06-04 00:00:00");
+    assert_eq!(rows[0].get::<_, bool>("compatible"), true);
+
+    // Test timeouts
+    client.execute("SET statement_timeout = 50", &[]).await.unwrap();
+    let res = client.execute("SELECT pg_sleep(0.2)", &[]).await;
+    assert!(res.is_err());
+    let err_msg = get_db_error_message(&res.unwrap_err());
+    assert!(err_msg.contains("RS-2002") || err_msg.contains("timeout"), "got error: {}", err_msg);
+
+    // Reset timeout and run short sleep successfully
+    client.execute("SET statement_timeout = 5000", &[]).await.unwrap();
+    client.execute("SELECT pg_sleep(0.01)", &[]).await.unwrap();
+
+    // Test rate limiting
+    client.execute("SET max_qps = 2", &[]).await.unwrap();
+    client.execute("SELECT 1", &[]).await.unwrap();
+    client.execute("SELECT 1", &[]).await.unwrap();
+    let res_rate = client.execute("SELECT 1", &[]).await;
+    assert!(res_rate.is_err());
+    let err_rate = get_db_error_message(&res_rate.unwrap_err());
+    assert!(err_rate.contains("RS-2005") || err_rate.contains("rate limit"), "got error: {}", err_rate);
+
+    // Scenario 3: CLI Subcommands
+    // debug-arrangement
+    let image_debug = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "debug-arrangement".to_string(),
+            "orders_mv".to_string(),
+            "1".to_string(),
+            "test".to_string(),
+        ]);
+    let container_debug = image_debug.start().await.unwrap();
+    let debug_id = container_debug.id().to_string();
+    assert_eq!(wait_container_exit(&debug_id).await, 0);
+    let (stdout_debug, _) = get_container_logs(&debug_id);
+    assert!(stdout_debug.contains("Arrangement Header: law_id=1, law_version=1"));
+    assert!(stdout_debug.contains("Tombstone density: 0.15"));
+
+    // support-bundle
+    let image_sb = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "support-bundle".to_string(),
+            "--output".to_string(),
+            "/data/support-bundle.tar.gz".to_string(),
+        ]);
+    let container_sb = image_sb.start().await.unwrap();
+    let sb_id = container_sb.id().to_string();
+    assert_eq!(wait_container_exit(&sb_id).await, 0);
+    let bundle_path = temp_dir.path().join("support-bundle.tar.gz");
+    assert!(bundle_path.exists());
+
+    // Scenario 4: Churn & Restarts
+    // 1. Restart Worker
+    eprintln!("Restarting worker...");
+    drop(container_worker);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let image_worker2 = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=worker".to_string(),
+            format!("--control={}:7700", control_ip),
+            "--storage=/data".to_string(),
+        ]);
+    let container_worker2 = image_worker2.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Check gateway is still reachable and queries succeed
+    let client2 = connect(
+        host_ip.clone(),
+        gateway_port,
+        "alice".to_owned(),
+        "mydb".to_owned(),
+        Some("bearer viewer:production".to_owned()),
+    )
+    .await
+    .unwrap();
+    client2.execute("SELECT 1", &[]).await.unwrap();
+
+    // 2. Restart Control
+    eprintln!("Restarting control...");
+    drop(container_control);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let image_control2 = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=control".to_string(),
+            "--control-bind=0.0.0.0:7700".to_string(),
+            "--storage=/data".to_string(),
+        ]);
+    let container_control2 = image_control2.start().await.unwrap();
+    let control_ip2 = get_container_ip(&container_control2.id());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Connect to gateway again, check queries succeed
+    client2.execute("SELECT 1", &[]).await.unwrap();
+
+    // 3. Restart Full Cluster
+    eprintln!("Restarting full cluster...");
+    drop(container_gateway);
+    drop(container_worker2);
+    drop(container_control2);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let container_control3 = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=control".to_string(),
+            "--control-bind=0.0.0.0:7700".to_string(),
+            "--storage=/data".to_string(),
+        ])
+        .start()
+        .await
+        .unwrap();
+    let control_ip3 = get_container_ip(&container_control3.id());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let container_worker3 = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=worker".to_string(),
+            format!("--control={}:7700", control_ip3),
+            "--storage=/data".to_string(),
+        ])
+        .start()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let container_gateway3 = GenericImage::new("rockstream", "test")
+        .with_exposed_port(5432.tcp())
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=gateway".to_string(),
+            format!("--control={}:7700", control_ip3),
+            "--gateway-bind=0.0.0.0:5432".to_string(),
+            "--storage=/data".to_string(),
+        ])
+        .start()
+        .await
+        .unwrap();
+    let gateway_port3 = container_gateway3
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let client3 = connect(
+        host_ip.clone(),
+        gateway_port3,
+        "alice".to_owned(),
+        "mydb".to_owned(),
+        Some("bearer viewer:production".to_owned()),
+    )
+    .await
+    .unwrap();
+    client3.execute("SELECT 1", &[]).await.unwrap();
+}
+
