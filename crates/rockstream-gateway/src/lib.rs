@@ -47,6 +47,7 @@
 //!   formatting; emits a NOTICE when a session's snapshot epoch lags the
 //!   committed frontier by more than the configured threshold.
 
+pub mod catalog_rest;
 pub mod dml;
 pub mod error;
 pub mod freshness;
@@ -100,6 +101,8 @@ pub use subscribe::{
     simulate_subscribe_batch, ChangeRetentionConfig, SubscribeAsOf, SubscribeBatch,
     SubscribeCursor, SubscribeOptions, SubscribePredicate, SubscribeRow,
 };
+
+pub use catalog_rest::{run_catalog_rest_server, CatalogRegistry};
 
 #[cfg(test)]
 mod tests {

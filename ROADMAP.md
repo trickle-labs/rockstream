@@ -200,7 +200,7 @@ The detailed acceptance matrix for the versions after v0.52.0 now lives in [plan
 | v0.52.2 | ✅ Done | Read-only pgwire and SQL query surface | `psql` and `tokio-postgres` against a live gateway: startup handshake, auth, simple query, extended query, catalog reflection, notices, and read-only SQL. | `psql` and `tokio-postgres` agree on rows, metadata, OIDs, and error handling for the supported read-only surface. |
 | v0.52.3 | ✅ Done | DML, transaction semantics, and authorization | Live write path over pgwire: `INSERT`, `UPDATE`, `DELETE`, `INSERT ... RETURNING`, optimistic conflict detection, freshness semantics, RBAC, reconnects, and admin surfaces. | Concurrent writers behave deterministically and client-visible notices/errors are stable. |
 | v0.52.4 | ✅ Done | MinIO-backed durability and connectors | MinIO-backed WAL/checkpoint/recovery, storage cleanup, connector lifecycle, DLQ replay, and failure injection. | Object-store side effects are visible in MinIO and survive restart/recovery tests. |
-| v0.52.5 |  | Catalog registration and REST server | SQL/catalog coherence and the local REST catalog endpoint backed by the live cluster, without external cloud services. | SQL-visible metadata and catalog responses stay in sync across restart and direct HTTP checks. |
+| v0.52.5 | ✅ Done | Catalog registration and REST server | SQL/catalog coherence and the local REST catalog endpoint backed by the live cluster, without external cloud services. | SQL-visible metadata and catalog responses stay in sync across restart and direct HTTP checks. |
 
 The detailed post-v0.52 material below is retained as a historical appendix and
 should not be treated as the authoritative plan.

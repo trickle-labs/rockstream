@@ -114,6 +114,10 @@ enum Command {
         /// Address for the pgwire gateway service to listen on.
         #[arg(long, default_value = "0.0.0.0:5432")]
         gateway_bind: String,
+
+        /// Address for the HTTP catalog REST server to listen on (v0.52.5).
+        #[arg(long, default_value = "0.0.0.0:8181")]
+        catalog_bind: String,
     },
     /// Bootstrap a new cluster at a running control service.
     ///
@@ -204,6 +208,7 @@ async fn main() {
             tls_ca_cert,
             allow_law_operand_fallback,
             gateway_bind,
+            catalog_bind,
         }) => {
             rockstream_storage::set_allow_law_operand_fallback(allow_law_operand_fallback);
             run_start(
@@ -215,6 +220,7 @@ async fn main() {
                 tls_key.as_deref(),
                 tls_ca_cert.as_deref(),
                 &gateway_bind,
+                &catalog_bind,
             )
             .await;
         }
@@ -353,6 +359,7 @@ async fn run_start(
     tls_key: Option<&str>,
     tls_ca_cert: Option<&str>,
     gateway_bind: &str,
+    catalog_bind: &str,
 ) {
     tracing::info!(storage = %storage, role = %role, "starting rockstream");
 
@@ -402,10 +409,17 @@ async fn run_start(
             run_tier1_worker(ctrl_addr, storage_path, audit_log.clone()).await;
         }
         Role::All => {
-            run_tier2_all(control_bind, gateway_bind, storage_path, audit_log.clone()).await
+            run_tier2_all(
+                control_bind,
+                gateway_bind,
+                catalog_bind,
+                storage_path,
+                audit_log.clone(),
+            )
+            .await
         }
         Role::Gateway => {
-            run_gateway(gateway_bind, audit_log.clone()).await;
+            run_gateway(gateway_bind, catalog_bind, audit_log.clone()).await;
         }
         Role::Frontier => {
             tracing::info!("frontier role: no additional services started in v0.28");
@@ -522,6 +536,7 @@ async fn run_tier1_worker(
 async fn run_tier2_all(
     control_bind: &str,
     gateway_bind: &str,
+    catalog_bind: &str,
     storage: &std::path::Path,
     audit: Arc<rockstream_control::audit::FileAuditLog>,
 ) {
@@ -541,6 +556,21 @@ async fn run_tier2_all(
     tokio::spawn(async move {
         let _ = rockstream_gateway::pgwire::run_pgwire_server(&g_bind, cat_clone).await;
     });
+
+    // Start the catalog REST server.
+    let cat_registry = rockstream_gateway::CatalogRegistry::new();
+    {
+        let inline_cat = gateway_catalog.lock().unwrap();
+        cat_registry.sync_from_inline_catalog(&inline_cat);
+    }
+    let cat_reg_clone = cat_registry.clone();
+    let c_bind = catalog_bind.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = rockstream_gateway::run_catalog_rest_server(&c_bind, cat_reg_clone).await {
+            tracing::warn!("catalog REST server error (tier2): {e}");
+        }
+    });
+    tracing::info!(addr = %catalog_bind, "catalog REST server spawned (Tier 2)");
 
     // Start the control service.
     let catalog = rockstream_control::TopologyCatalog::new();
@@ -623,7 +653,11 @@ async fn run_tier2_all(
     println!("Workers registered: {}", catalog.len());
 }
 
-async fn run_gateway(gateway_bind: &str, audit: Arc<rockstream_control::audit::FileAuditLog>) {
+async fn run_gateway(
+    gateway_bind: &str,
+    catalog_bind: &str,
+    audit: Arc<rockstream_control::audit::FileAuditLog>,
+) {
     let catalog = Arc::new(std::sync::Mutex::new(
         rockstream_gateway::InlineViewCatalog::new(),
     ));
@@ -636,6 +670,22 @@ async fn run_gateway(gateway_bind: &str, audit: Arc<rockstream_control::audit::F
         rockstream_types::audit::AuditEvent::now("system", "gateway_service.started", "gateway")
             .with_detail(format!("bind={gateway_bind}"));
     let _ = audit.append(&event);
+
+    // Start the HTTP catalog REST server alongside pgwire.
+    let cat_registry = rockstream_gateway::CatalogRegistry::new();
+    {
+        let inline_cat = catalog.lock().unwrap();
+        cat_registry.sync_from_inline_catalog(&inline_cat);
+    }
+    let cat_reg_clone = cat_registry.clone();
+    let c_bind = catalog_bind.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = rockstream_gateway::run_catalog_rest_server(&c_bind, cat_reg_clone).await {
+            tracing::warn!("catalog REST server error: {e}");
+        }
+    });
+    tracing::info!(addr = %catalog_bind, "catalog REST server spawned");
+
     if let Err(e) = rockstream_gateway::pgwire::run_pgwire_server(gateway_bind, catalog).await {
         tracing::error!("gateway pgwire server failed: {e}");
         std::process::exit(1);

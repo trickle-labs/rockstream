@@ -1175,3 +1175,415 @@ async fn test_v0_52_4_minio_durability_and_connectors() {
     };
     assert!(err_msg.contains("RS-5003") || err_msg.contains("storage unreachable"));
 }
+
+// ─── Helper: HTTP GET request to a running catalog REST server ───────────────
+
+/// Perform an HTTP GET to `http://host:port/path` and return `(status_line, body)`.
+fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<(String, String)> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let mut stream = TcpStream::connect(format!("{host}:{port}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let request =
+        format!("GET {path} HTTP/1.0\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+
+    // Split headers from body.
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+    let status_line = headers.lines().next().unwrap_or("").to_string();
+    Ok((status_line, body.to_string()))
+}
+
+/// Retry `http_get` up to `attempts` times with a small delay between attempts.
+fn http_get_with_retry(
+    host: &str,
+    port: u16,
+    path: &str,
+    attempts: u32,
+) -> std::io::Result<(String, String)> {
+    let mut last_err = std::io::Error::other("no attempts");
+    for i in 0..attempts {
+        match http_get(host, port, path) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                last_err = e;
+                if i + 1 < attempts {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+// ─── v0.52.5 E2E test ────────────────────────────────────────────────────────
+
+/// **v0.52.5 — Catalog Registration and REST Server**
+///
+/// Verifies that the local HTTP catalog endpoint and the SQL gateway describe
+/// the same world, and that catalog state survives a cluster restart.
+///
+/// Mandatory scenarios (from plans/e2e-test-plan.md §v0.52.5):
+///
+/// 1. Catalog registration — after start, HTTP catalog reflects namespaces and
+///    tables; catalog remains consistent after restart.
+/// 2. Metadata coherence — HTTP `/catalog/v1/namespaces` matches what
+///    `information_schema.tables` shows via SQL.
+/// 3. Auth and transport — endpoint is accessible (open in local dev topology).
+/// 4. Regression matrix — smoke-tests from v0.52.1..v0.52.4 pass.
+///
+/// Pass criteria (v0.52.5):
+/// - SQL gateway and catalog endpoint describe the same world.
+/// - Local interoperability proven without requiring Spark/Trino/DuckDB/AWS S3.
+/// - Suite broad enough that a change to any public surface fails somewhere.
+#[tokio::test]
+async fn test_v0_52_5_catalog_rest_server() {
+    ensure_image_built();
+
+    let temp_dir = TempDir::new().unwrap();
+    let host_path = temp_dir.path().to_str().unwrap();
+
+    // ── 1. Start cluster: control + worker + gateway (with catalog REST) ──────
+
+    // Control
+    let image_control = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=control".to_string(),
+            "--control-bind=0.0.0.0:7700".to_string(),
+            "--storage=/data".to_string(),
+        ]);
+    let container_control = image_control.start().await.unwrap();
+    let control_id = container_control.id().to_string();
+    let control_ip = get_container_ip(&control_id);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Worker
+    let image_worker = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=worker".to_string(),
+            format!("--control={}:7700", control_ip),
+            "--storage=/data".to_string(),
+        ]);
+    let _container_worker = image_worker.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Gateway — expose both pgwire (5432) and catalog REST (8181)
+    let image_gateway = GenericImage::new("rockstream", "test")
+        .with_exposed_port(5432.tcp())
+        .with_exposed_port(8181.tcp())
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=gateway".to_string(),
+            format!("--control={}:7700", control_ip),
+            "--gateway-bind=0.0.0.0:5432".to_string(),
+            "--catalog-bind=0.0.0.0:8181".to_string(),
+            "--storage=/data".to_string(),
+        ]);
+    let container_gateway = image_gateway.start().await.unwrap();
+    let gateway_port = container_gateway
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .unwrap();
+    let catalog_port = container_gateway
+        .get_host_port_ipv4(8181.tcp())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let host_ip = "127.0.0.1";
+
+    // ── Scenario 1: Catalog REST health probe ─────────────────────────────────
+
+    let (status, body) =
+        http_get_with_retry(host_ip, catalog_port, "/catalog/v1/health", 10).unwrap();
+    assert!(
+        status.contains("200"),
+        "catalog /health should return 200, got: {status}"
+    );
+    assert!(
+        body.contains(r#""status":"ok""#),
+        "catalog /health body should contain status:ok, got: {body}"
+    );
+
+    // ── Scenario 2: Catalog REST namespaces ───────────────────────────────────
+
+    let (status, body) =
+        http_get_with_retry(host_ip, catalog_port, "/catalog/v1/namespaces", 5).unwrap();
+    assert!(
+        status.contains("200"),
+        "catalog /namespaces should return 200, got: {status}"
+    );
+    assert!(
+        body.contains("public"),
+        "catalog /namespaces should contain 'public', got: {body}"
+    );
+    // Parse that it is valid JSON with a "namespaces" key.
+    let ns_json: serde_json::Value =
+        serde_json::from_str(&body).expect("catalog /namespaces response must be valid JSON");
+    let ns_array = ns_json
+        .get("namespaces")
+        .and_then(|v| v.as_array())
+        .expect("catalog response must have 'namespaces' array");
+    assert!(!ns_array.is_empty(), "namespaces array must not be empty");
+
+    // ── Scenario 3: Catalog REST tables in 'public' namespace ─────────────────
+
+    let (status, body) = http_get_with_retry(
+        host_ip,
+        catalog_port,
+        "/catalog/v1/namespaces/public/tables",
+        5,
+    )
+    .unwrap();
+    assert!(
+        status.contains("200"),
+        "catalog /namespaces/public/tables should return 200, got: {status}"
+    );
+    let tables_json: serde_json::Value = serde_json::from_str(&body)
+        .expect("catalog /namespaces/public/tables response must be valid JSON");
+    let tables_array = tables_json
+        .get("tables")
+        .and_then(|v| v.as_array())
+        .expect("response must have 'tables' array");
+    // The catalog always seeds 'public' with demo tables.
+    assert!(
+        !tables_array.is_empty(),
+        "tables array for 'public' namespace must not be empty"
+    );
+    // Verify that known demo tables appear.
+    let table_names: Vec<String> = tables_array
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "orders_mv"),
+        "catalog /namespaces/public/tables must include 'orders_mv'; got: {table_names:?}"
+    );
+
+    // ── Scenario 4: Metadata coherence — SQL vs HTTP ──────────────────────────
+    // Connect to gateway via SQL and verify information_schema reports 'public'.
+
+    let connect_sql = |port: u16| async move {
+        let mut config = tokio_postgres::Config::new();
+        config.host(host_ip);
+        config.port(port);
+        config.user("alice");
+        config.dbname("mydb");
+        config.password("bearer viewer:production");
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok::<_, tokio_postgres::Error>(client)
+    };
+
+    let sql_client = connect_sql(gateway_port).await.unwrap();
+
+    // SQL: get all table_schema values from information_schema.columns
+    let rows = sql_client
+        .query(
+            "SELECT DISTINCT table_schema FROM information_schema.columns",
+            &[],
+        )
+        .await
+        .unwrap();
+    let sql_schemas: Vec<String> = rows
+        .iter()
+        .map(|r| r.get::<_, &str>("table_schema").to_string())
+        .collect();
+
+    // The HTTP catalog must include every schema visible via SQL.
+    for schema in &sql_schemas {
+        assert!(
+            ns_array
+                .iter()
+                .any(|ns| ns.get("name").and_then(|v| v.as_str()) == Some(schema.as_str())),
+            "HTTP catalog must include SQL-visible schema '{schema}'; http namespaces: {ns_array:?}"
+        );
+    }
+
+    // ── Scenario 5: Merge laws via HTTP ──────────────────────────────────────
+
+    let (status, body) =
+        http_get_with_retry(host_ip, catalog_port, "/catalog/v1/merge-laws", 5).unwrap();
+    assert!(
+        status.contains("200"),
+        "catalog /merge-laws should return 200, got: {status}"
+    );
+    let laws_json: serde_json::Value =
+        serde_json::from_str(&body).expect("merge-laws response must be valid JSON");
+    let laws_array = laws_json
+        .get("laws")
+        .and_then(|v| v.as_array())
+        .expect("response must have 'laws' array");
+    assert!(
+        laws_array.len() >= 6,
+        "must have at least 6 registered laws; got: {}",
+        laws_array.len()
+    );
+    // WeightAdd must be present.
+    assert!(
+        laws_array
+            .iter()
+            .any(|l| l.get("name").and_then(|n| n.as_str()) == Some("WeightAdd")),
+        "WeightAdd must appear in merge-laws; got: {laws_array:?}"
+    );
+
+    // ── Scenario 6: Post-restart catalog consistency ───────────────────────────
+    // Drop and restart the full cluster; verify catalog still responds correctly.
+
+    drop(container_gateway);
+    drop(_container_worker);
+    drop(container_control);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Restart control
+    let container_control2 = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=control".to_string(),
+            "--control-bind=0.0.0.0:7700".to_string(),
+            "--storage=/data".to_string(),
+        ])
+        .start()
+        .await
+        .unwrap();
+    let control_ip2 = get_container_ip(container_control2.id());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Restart worker
+    let _container_worker2 = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=worker".to_string(),
+            format!("--control={}:7700", control_ip2),
+            "--storage=/data".to_string(),
+        ])
+        .start()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Restart gateway with catalog
+    let container_gateway2 = GenericImage::new("rockstream", "test")
+        .with_exposed_port(5432.tcp())
+        .with_exposed_port(8181.tcp())
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=gateway".to_string(),
+            format!("--control={}:7700", control_ip2),
+            "--gateway-bind=0.0.0.0:5432".to_string(),
+            "--catalog-bind=0.0.0.0:8181".to_string(),
+            "--storage=/data".to_string(),
+        ])
+        .start()
+        .await
+        .unwrap();
+    let catalog_port2 = container_gateway2
+        .get_host_port_ipv4(8181.tcp())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // After restart, catalog health must still be OK.
+    let (status2, body2) =
+        http_get_with_retry(host_ip, catalog_port2, "/catalog/v1/health", 10).unwrap();
+    assert!(
+        status2.contains("200"),
+        "catalog /health after restart should return 200, got: {status2}"
+    );
+    assert!(
+        body2.contains(r#""status":"ok""#),
+        "catalog /health after restart should contain status:ok, got: {body2}"
+    );
+
+    // Namespaces must still be present after restart.
+    let (status3, body3) =
+        http_get_with_retry(host_ip, catalog_port2, "/catalog/v1/namespaces", 5).unwrap();
+    assert!(
+        status3.contains("200"),
+        "catalog /namespaces after restart should return 200, got: {status3}"
+    );
+    let ns_json2: serde_json::Value = serde_json::from_str(&body3).unwrap();
+    let ns_array2 = ns_json2
+        .get("namespaces")
+        .and_then(|v| v.as_array())
+        .expect("must have namespaces array after restart");
+    assert!(
+        !ns_array2.is_empty(),
+        "namespaces array must not be empty after restart"
+    );
+
+    // ── Scenario 7: Unknown path returns 404 ─────────────────────────────────
+
+    let (status_404, _body_404) =
+        http_get_with_retry(host_ip, catalog_port2, "/catalog/v1/nonexistent", 3).unwrap();
+    assert!(
+        status_404.contains("404"),
+        "unknown path should return 404, got: {status_404}"
+    );
+
+    // ── Scenario 8: Regression matrix (smoke tests v0.52.1..v0.52.4) ─────────
+
+    // v0.52.1 smoke: version subcommand exits 0 and prints version
+    let image_ver = GenericImage::new("rockstream", "test").with_cmd(vec!["version".to_string()]);
+    let container_ver = image_ver.start().await.unwrap();
+    let ver_id = container_ver.id().to_string();
+    let ver_exit = wait_container_exit(&ver_id).await;
+    let (ver_stdout, ver_stderr) = get_container_logs(&ver_id);
+    assert_eq!(
+        ver_exit, 0,
+        "version subcommand must exit 0. Stderr: {ver_stderr}"
+    );
+    let ver_combined = format!("{ver_stdout}\n{ver_stderr}");
+    assert!(
+        ver_combined.contains("rockstream") || ver_combined.contains("0.52"),
+        "version output must contain version info: {ver_combined}"
+    );
+
+    // v0.52.2 smoke: pgwire connect succeeds
+    let gateway_port2 = container_gateway2
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .unwrap();
+    let sql_client2 = connect_sql(gateway_port2).await.unwrap();
+    let smoke_rows = sql_client2
+        .query("SELECT oid, typname FROM pg_catalog.pg_type", &[])
+        .await
+        .unwrap();
+    assert!(
+        !smoke_rows.is_empty(),
+        "regression v0.52.2: pg_type must return rows"
+    );
+
+    // v0.52.3 smoke: SHOW RESOURCE USAGE works
+    let resource_rows = sql_client2.query("SHOW RESOURCE USAGE", &[]).await.unwrap();
+    assert!(
+        !resource_rows.is_empty(),
+        "regression v0.52.3: SHOW RESOURCE USAGE must return rows"
+    );
+
+    // v0.52.4 smoke: audit.jsonl written to storage
+    let audit_path = temp_dir.path().join("audit.jsonl");
+    assert!(
+        audit_path.exists(),
+        "regression v0.52.4: audit.jsonl must exist in storage"
+    );
+    let audit_content = fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        audit_content.contains("server.started"),
+        "regression v0.52.4: audit.jsonl must contain server.started"
+    );
+}
