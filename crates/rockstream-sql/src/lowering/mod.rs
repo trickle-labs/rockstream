@@ -101,8 +101,12 @@ impl SqlFrontend {
                 for expr in &window.window_expr {
                     if let DFExpr::WindowFunction(window_fun) = expr {
                         let name = match &window_fun.fun {
-                            datafusion::logical_expr::WindowFunctionDefinition::WindowUDF(udf) => udf.name().to_lowercase(),
-                            datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(udf) => udf.name().to_lowercase(),
+                            datafusion::logical_expr::WindowFunctionDefinition::WindowUDF(udf) => {
+                                udf.name().to_lowercase()
+                            }
+                            datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(
+                                udf,
+                            ) => udf.name().to_lowercase(),
                         };
                         let window_func = match name.as_str() {
                             "row_number" => rockstream_plan::WindowFunc::RowNumber,
@@ -112,11 +116,15 @@ impl SqlFrontend {
                             "lead" => rockstream_plan::WindowFunc::Lead { offset: 1 },
                             _ => rockstream_plan::WindowFunc::RowNumber,
                         };
-                        let partition_by_indices = window_fun.params.partition_by
+                        let partition_by_indices = window_fun
+                            .params
+                            .partition_by
                             .iter()
                             .map(|e| self.resolve_col_index(window.input.schema(), e))
                             .collect::<Vec<_>>();
-                        let order_by_indices = window_fun.params.order_by
+                        let order_by_indices = window_fun
+                            .params
+                            .order_by
                             .iter()
                             .map(|se| self.resolve_col_index(window.input.schema(), &se.expr))
                             .collect::<Vec<_>>();
@@ -273,9 +281,7 @@ impl SqlFrontend {
 
     fn resolve_col_index(&self, schema: &datafusion::common::DFSchemaRef, expr: &DFExpr) -> usize {
         match expr {
-            DFExpr::Column(col) => {
-                schema.index_of_column(col).unwrap_or(0)
-            }
+            DFExpr::Column(col) => schema.index_of_column(col).unwrap_or(0),
             DFExpr::Alias(Alias { expr, .. }) => self.resolve_col_index(schema, expr),
             _ => 0,
         }
