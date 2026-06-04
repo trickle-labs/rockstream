@@ -388,7 +388,7 @@ async fn test_gateway_pgwire_e2e() {
     let container_control = image_control.start().await.unwrap();
     let control_id = container_control.id().to_string();
     let control_ip = get_container_ip(&control_id);
-    eprintln!("DEBUG: Control started (ip: {})", control_ip);
+    eprintln!("DEBUG: Control started (ip: {control_ip})");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // 2. Start Worker
