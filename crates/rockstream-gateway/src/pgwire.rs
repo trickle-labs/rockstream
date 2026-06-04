@@ -652,7 +652,7 @@ pub async fn run_pgwire_server(
 ) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(bind_addr).await?;
     tracing::info!("pgwire TCP gateway server listening on {}", bind_addr);
-    println!("pgwire TCP gateway server listening on {}", bind_addr);
+    println!("pgwire TCP gateway server listening on {bind_addr}");
 
     let shutdown = wait_for_shutdown_signal();
     tokio::pin!(shutdown);
@@ -723,7 +723,7 @@ async fn handle_connection(
             send_error(
                 stream,
                 "28P01",
-                &format!("client authentication failed: {} (RS-2001)", e),
+                &format!("client authentication failed: {e} (RS-2001)"),
             )
             .await?;
             return Ok(());
