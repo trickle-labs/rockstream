@@ -787,7 +787,10 @@ async fn test_v0_52_3_production_beta_handoff() {
     assert_eq!(rows[0].get::<_, bool>("freshness_slo_compliant"), true);
 
     // Assert SHOW RESOURCE USAGE FOR WORKLOAD realtime
-    let rows = client.query("SHOW RESOURCE USAGE FOR WORKLOAD realtime", &[]).await.unwrap();
+    let rows = client
+        .query("SHOW RESOURCE USAGE FOR WORKLOAD realtime", &[])
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, &str>("view_name"), "orders_mv");
     assert_eq!(rows[0].get::<_, &str>("workload_id"), "realtime");
@@ -796,21 +799,33 @@ async fn test_v0_52_3_production_beta_handoff() {
     assert_eq!(rows[0].get::<_, i64>("freshness_lag_ms"), 12);
 
     // Assert SHOW CLUSTER RESOURCE USAGE
-    let rows = client.query("SHOW CLUSTER RESOURCE USAGE", &[]).await.unwrap();
+    let rows = client
+        .query("SHOW CLUSTER RESOURCE USAGE", &[])
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("total_workers"), 1);
     assert_eq!(rows[0].get::<_, i64>("total_state_bytes"), 1048576);
     assert_eq!(rows[0].get::<_, i64>("total_memory_bytes"), 8388608);
 
     // Assert SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA test_schema
-    let rows = client.query("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA test_schema", &[]).await.unwrap();
+    let rows = client
+        .query("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA test_schema", &[])
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, &str>("schema_name"), "test_schema");
     assert_eq!(rows[0].get::<_, &str>("status"), "UP-TO-DATE");
     assert_eq!(rows[0].get::<_, i32>("pending_changes"), 0);
 
     // Assert SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW test_mv
-    let rows = client.query("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW test_mv", &[]).await.unwrap();
+    let rows = client
+        .query(
+            "SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW test_mv",
+            &[],
+        )
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, &str>("view_name"), "test_mv");
     assert_eq!(rows[0].get::<_, i32>("version"), 1);
@@ -818,14 +833,24 @@ async fn test_v0_52_3_production_beta_handoff() {
     assert_eq!(rows[0].get::<_, bool>("compatible"), true);
 
     // Test timeouts
-    client.execute("SET statement_timeout = 50", &[]).await.unwrap();
+    client
+        .execute("SET statement_timeout = 50", &[])
+        .await
+        .unwrap();
     let res = client.execute("SELECT pg_sleep(0.2)", &[]).await;
     assert!(res.is_err());
     let err_msg = get_db_error_message(&res.unwrap_err());
-    assert!(err_msg.contains("RS-2002") || err_msg.contains("timeout"), "got error: {}", err_msg);
+    assert!(
+        err_msg.contains("RS-2002") || err_msg.contains("timeout"),
+        "got error: {}",
+        err_msg
+    );
 
     // Reset timeout and run short sleep successfully
-    client.execute("SET statement_timeout = 5000", &[]).await.unwrap();
+    client
+        .execute("SET statement_timeout = 5000", &[])
+        .await
+        .unwrap();
     client.execute("SELECT pg_sleep(0.01)", &[]).await.unwrap();
 
     // Test rate limiting
@@ -835,7 +860,11 @@ async fn test_v0_52_3_production_beta_handoff() {
     let res_rate = client.execute("SELECT 1", &[]).await;
     assert!(res_rate.is_err());
     let err_rate = get_db_error_message(&res_rate.unwrap_err());
-    assert!(err_rate.contains("RS-2005") || err_rate.contains("rate limit"), "got error: {}", err_rate);
+    assert!(
+        err_rate.contains("RS-2005") || err_rate.contains("rate limit"),
+        "got error: {}",
+        err_rate
+    );
 
     // Scenario 3: CLI Subcommands
     // debug-arrangement
@@ -979,4 +1008,3 @@ async fn test_v0_52_3_production_beta_handoff() {
     .unwrap();
     client3.execute("SELECT 1", &[]).await.unwrap();
 }
-

@@ -21,8 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::GatewayError;
-use crate::limits::{RateLimiter, RateLimitConfig};
-
+use crate::limits::{RateLimitConfig, RateLimiter};
 
 // ─── Postgres type OIDs ───────────────────────────────────────────────────────
 
@@ -1400,7 +1399,12 @@ async fn execute_simple_query(
     if sql_upper.starts_with("SET ") {
         if sql_upper.contains("STATEMENT_TIMEOUT") || sql_upper.contains("QUERY_TIMEOUT_MS") {
             if let Some(val_str) = sql_upper.split('=').last() {
-                if let Ok(val) = val_str.trim().trim_matches(';').trim_matches('\'').parse::<u64>() {
+                if let Ok(val) = val_str
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('\'')
+                    .parse::<u64>()
+                {
                     *statement_timeout_ms = val;
                 }
             }
@@ -1410,7 +1414,12 @@ async fn execute_simple_query(
         }
         if sql_upper.contains("MAX_QPS") {
             if let Some(val_str) = sql_upper.split('=').last() {
-                if let Ok(val) = val_str.trim().trim_matches(';').trim_matches('\'').parse::<u32>() {
+                if let Ok(val) = val_str
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('\'')
+                    .parse::<u32>()
+                {
                     *rate_limiter = RateLimiter::new(RateLimitConfig {
                         max_qps: val,
                         window_ms: 1000,
@@ -1429,12 +1438,28 @@ async fn execute_simple_query(
         send_row_description(stream, &cols).await?;
         if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            let wl = parts.get(5).cloned().unwrap_or("realtime").trim_matches(';');
-            send_query_row(stream, &["orders_mv", wl, "1048576", "524288", "12"], &cols, &[]).await?;
+            let wl = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("realtime")
+                .trim_matches(';');
+            send_query_row(
+                stream,
+                &["orders_mv", wl, "1048576", "524288", "12"],
+                &cols,
+                &[],
+            )
+            .await?;
         } else if sql_upper.starts_with("SHOW CLUSTER RESOURCE USAGE") {
             send_query_row(stream, &["1", "1048576", "8388608"], &cols, &[]).await?;
         } else {
-            send_query_row(stream, &["realtime", "10485760", "8388608", "100", "true"], &cols, &[]).await?;
+            send_query_row(
+                stream,
+                &["realtime", "10485760", "8388608", "100", "true"],
+                &cols,
+                &[],
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         send_ready_for_query(stream).await?;
@@ -1445,11 +1470,21 @@ async fn execute_simple_query(
         send_row_description(stream, &cols).await?;
         let parts: Vec<&str> = sql.split_whitespace().collect();
         if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
-            let schema_name = parts.get(5).cloned().unwrap_or("my_schema").trim_matches(';');
+            let schema_name = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("my_schema")
+                .trim_matches(';');
             send_query_row(stream, &[schema_name, "UP-TO-DATE", "0"], &cols, &[]).await?;
         } else {
             let view_name = parts.get(6).cloned().unwrap_or("my_view").trim_matches(';');
-            send_query_row(stream, &[view_name, "1", "2026-06-04 00:00:00", "true"], &cols, &[]).await?;
+            send_query_row(
+                stream,
+                &[view_name, "1", "2026-06-04 00:00:00", "true"],
+                &cols,
+                &[],
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         send_ready_for_query(stream).await?;
@@ -1732,7 +1767,12 @@ async fn execute_query_logic(
     if sql_upper.starts_with("SET ") {
         if sql_upper.contains("STATEMENT_TIMEOUT") || sql_upper.contains("QUERY_TIMEOUT_MS") {
             if let Some(val_str) = sql_upper.split('=').last() {
-                if let Ok(val) = val_str.trim().trim_matches(';').trim_matches('\'').parse::<u64>() {
+                if let Ok(val) = val_str
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('\'')
+                    .parse::<u64>()
+                {
                     *statement_timeout_ms = val;
                 }
             }
@@ -1741,7 +1781,12 @@ async fn execute_query_logic(
         }
         if sql_upper.contains("MAX_QPS") {
             if let Some(val_str) = sql_upper.split('=').last() {
-                if let Ok(val) = val_str.trim().trim_matches(';').trim_matches('\'').parse::<u32>() {
+                if let Ok(val) = val_str
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('\'')
+                    .parse::<u32>()
+                {
                     *rate_limiter = RateLimiter::new(RateLimitConfig {
                         max_qps: val,
                         window_ms: 1000,
@@ -1758,12 +1803,28 @@ async fn execute_query_logic(
     if sql_upper.starts_with("SHOW RESOURCE") || sql_upper.starts_with("SHOW CLUSTER") {
         if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            let wl = parts.get(5).cloned().unwrap_or("realtime").trim_matches(';');
-            send_query_row(stream, &["orders_mv", wl, "1048576", "524288", "12"], &cols, result_formats).await?;
+            let wl = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("realtime")
+                .trim_matches(';');
+            send_query_row(
+                stream,
+                &["orders_mv", wl, "1048576", "524288", "12"],
+                &cols,
+                result_formats,
+            )
+            .await?;
         } else if sql_upper.starts_with("SHOW CLUSTER RESOURCE USAGE") {
             send_query_row(stream, &["1", "1048576", "8388608"], &cols, result_formats).await?;
         } else {
-            send_query_row(stream, &["realtime", "10485760", "8388608", "100", "true"], &cols, result_formats).await?;
+            send_query_row(
+                stream,
+                &["realtime", "10485760", "8388608", "100", "true"],
+                &cols,
+                result_formats,
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         return Ok(());
@@ -1772,11 +1833,27 @@ async fn execute_query_logic(
     if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
-            let schema_name = parts.get(5).cloned().unwrap_or("my_schema").trim_matches(';');
-            send_query_row(stream, &[schema_name, "UP-TO-DATE", "0"], &cols, result_formats).await?;
+            let schema_name = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("my_schema")
+                .trim_matches(';');
+            send_query_row(
+                stream,
+                &[schema_name, "UP-TO-DATE", "0"],
+                &cols,
+                result_formats,
+            )
+            .await?;
         } else {
             let view_name = parts.get(6).cloned().unwrap_or("my_view").trim_matches(';');
-            send_query_row(stream, &[view_name, "1", "2026-06-04 00:00:00", "true"], &cols, result_formats).await?;
+            send_query_row(
+                stream,
+                &[view_name, "1", "2026-06-04 00:00:00", "true"],
+                &cols,
+                result_formats,
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         return Ok(());
