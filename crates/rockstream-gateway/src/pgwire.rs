@@ -1398,7 +1398,7 @@ async fn execute_simple_query(
     // 3. Custom SET variables for E2E testing
     if sql_upper.starts_with("SET ") {
         if sql_upper.contains("STATEMENT_TIMEOUT") || sql_upper.contains("QUERY_TIMEOUT_MS") {
-            if let Some(val_str) = sql_upper.split('=').last() {
+            if let Some(val_str) = sql_upper.split('=').next_back() {
                 if let Ok(val) = val_str
                     .trim()
                     .trim_matches(';')
@@ -1413,7 +1413,7 @@ async fn execute_simple_query(
             return Ok(());
         }
         if sql_upper.contains("MAX_QPS") {
-            if let Some(val_str) = sql_upper.split('=').last() {
+            if let Some(val_str) = sql_upper.split('=').next_back() {
                 if let Ok(val) = val_str
                     .trim()
                     .trim_matches(';')
@@ -1766,7 +1766,7 @@ async fn execute_query_logic(
     // 3. Custom SET variables for E2E testing
     if sql_upper.starts_with("SET ") {
         if sql_upper.contains("STATEMENT_TIMEOUT") || sql_upper.contains("QUERY_TIMEOUT_MS") {
-            if let Some(val_str) = sql_upper.split('=').last() {
+            if let Some(val_str) = sql_upper.split('=').next_back() {
                 if let Ok(val) = val_str
                     .trim()
                     .trim_matches(';')
@@ -1780,7 +1780,7 @@ async fn execute_query_logic(
             return Ok(());
         }
         if sql_upper.contains("MAX_QPS") {
-            if let Some(val_str) = sql_upper.split('=').last() {
+            if let Some(val_str) = sql_upper.split('=').next_back() {
                 if let Ok(val) = val_str
                     .trim()
                     .trim_matches(';')

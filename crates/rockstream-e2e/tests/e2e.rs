@@ -724,7 +724,7 @@ async fn test_v0_52_3_production_beta_handoff() {
             "--storage=/data".to_string(),
         ]);
     let container_worker = image_worker.start().await.unwrap();
-    let worker_id = container_worker.id().to_string();
+    let _worker_id = container_worker.id().to_string();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // 3. Start Gateway
@@ -739,7 +739,7 @@ async fn test_v0_52_3_production_beta_handoff() {
             "--storage=/data".to_string(),
         ]);
     let container_gateway = image_gateway.start().await.unwrap();
-    let gateway_id = container_gateway.id().to_string();
+    let _gateway_id = container_gateway.id().to_string();
     let gateway_port = container_gateway
         .get_host_port_ipv4(5432.tcp())
         .await
@@ -784,7 +784,7 @@ async fn test_v0_52_3_production_beta_handoff() {
     assert_eq!(rows[0].get::<_, i64>("memory_limit"), 10485760);
     assert_eq!(rows[0].get::<_, i64>("memory_allocated"), 8388608);
     assert_eq!(rows[0].get::<_, i64>("freshness_slo_ms"), 100);
-    assert_eq!(rows[0].get::<_, bool>("freshness_slo_compliant"), true);
+    assert!(rows[0].get::<_, bool>("freshness_slo_compliant"));
 
     // Assert SHOW RESOURCE USAGE FOR WORKLOAD realtime
     let rows = client
@@ -830,7 +830,7 @@ async fn test_v0_52_3_production_beta_handoff() {
     assert_eq!(rows[0].get::<_, &str>("view_name"), "test_mv");
     assert_eq!(rows[0].get::<_, i32>("version"), 1);
     assert_eq!(rows[0].get::<_, &str>("evolved_at"), "2026-06-04 00:00:00");
-    assert_eq!(rows[0].get::<_, bool>("compatible"), true);
+    assert!(rows[0].get::<_, bool>("compatible"));
 
     // Test timeouts
     client
@@ -842,8 +842,7 @@ async fn test_v0_52_3_production_beta_handoff() {
     let err_msg = get_db_error_message(&res.unwrap_err());
     assert!(
         err_msg.contains("RS-2002") || err_msg.contains("timeout"),
-        "got error: {}",
-        err_msg
+        "got error: {err_msg}"
     );
 
     // Reset timeout and run short sleep successfully
@@ -862,8 +861,7 @@ async fn test_v0_52_3_production_beta_handoff() {
     let err_rate = get_db_error_message(&res_rate.unwrap_err());
     assert!(
         err_rate.contains("RS-2005") || err_rate.contains("rate limit"),
-        "got error: {}",
-        err_rate
+        "got error: {err_rate}"
     );
 
     // Scenario 3: CLI Subcommands
@@ -938,7 +936,7 @@ async fn test_v0_52_3_production_beta_handoff() {
             "--storage=/data".to_string(),
         ]);
     let container_control2 = image_control2.start().await.unwrap();
-    let control_ip2 = get_container_ip(&container_control2.id());
+    let _control_ip2 = get_container_ip(container_control2.id());
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Connect to gateway again, check queries succeed
@@ -962,10 +960,10 @@ async fn test_v0_52_3_production_beta_handoff() {
         .start()
         .await
         .unwrap();
-    let control_ip3 = get_container_ip(&container_control3.id());
+    let control_ip3 = get_container_ip(container_control3.id());
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let container_worker3 = GenericImage::new("rockstream", "test")
+    let _container_worker3 = GenericImage::new("rockstream", "test")
         .with_mount(Mount::bind_mount(host_path, "/data"))
         .with_cmd(vec![
             "start".to_string(),
