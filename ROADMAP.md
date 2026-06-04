@@ -201,6 +201,9 @@ The detailed acceptance matrix for the versions after v0.52.0 now lives in [plan
 | v0.52.3 | ✅ Done | DML, transaction semantics, and authorization | Live write path over pgwire: `INSERT`, `UPDATE`, `DELETE`, `INSERT ... RETURNING`, optimistic conflict detection, freshness semantics, RBAC, reconnects, and admin surfaces. | Concurrent writers behave deterministically and client-visible notices/errors are stable. |
 | v0.52.4 | ✅ Done | MinIO-backed durability and connectors | MinIO-backed WAL/checkpoint/recovery, storage cleanup, connector lifecycle, DLQ replay, and failure injection. | Object-store side effects are visible in MinIO and survive restart/recovery tests. |
 | v0.52.5 | ✅ Done | Catalog registration and REST server | SQL/catalog coherence and the local REST catalog endpoint backed by the live cluster, without external cloud services. | SQL-visible metadata and catalog responses stay in sync across restart and direct HTTP checks. |
+| v0.52.6 | ✅ Done | SQL plan lowering and exact result assertions | SQL plan lowering and exact results assertions via pgwire gateway using rockstream-sql and precise column values, types, and counts. | E2E tests verify precise query outputs and exact lowered plan shapes via EXPLAIN query endpoint. |
+| v0.52.7 | ✅ Done | Advanced diagnostics and auto-tuning CLI validation | CLI verification for diagnostics (describe, debug-arrangement, support-bundle) and tuning configuration footprints. | E2E tests assert precise CLI text output, JSON schema, tarball content, and configuration overrides. |
+
 
 The detailed post-v0.52 material below is retained as a historical appendix and
 should not be treated as the authoritative plan.

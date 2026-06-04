@@ -566,7 +566,9 @@ use tokio::net::TcpStream;
 
 fn get_query_columns(sql: &str) -> Vec<PgColumn> {
     let sql_upper = sql.to_uppercase();
-    if sql_upper.contains("SHOW RESOURCE USAGE FOR WORKLOAD") {
+    if sql_upper.starts_with("EXPLAIN") {
+        vec![PgColumn::from_type_tag("plan", 5)]
+    } else if sql_upper.contains("SHOW RESOURCE USAGE FOR WORKLOAD") {
         vec![
             PgColumn::from_type_tag("view_name", 5),
             PgColumn::from_type_tag("workload_id", 5),
@@ -1434,6 +1436,23 @@ async fn execute_simple_query(
 
     // 4. Custom SHOW statements for E2E testing (RESOURCE USAGE / SCHEMA EVOLUTION)
     let cols = get_query_columns(sql);
+
+    if sql_upper.starts_with("EXPLAIN") {
+        send_row_description(stream, &cols).await?;
+        match plan_and_lower_query(sql).await {
+            Ok(lines) => {
+                for line in lines {
+                    send_query_row(stream, &[&line], &cols, &[]).await?;
+                }
+                send_command_complete(stream, "SELECT").await?;
+            }
+            Err(e) => {
+                send_query_error(stream, "RS-2001", &e).await?;
+            }
+        }
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
     if sql_upper.starts_with("SHOW RESOURCE") || sql_upper.starts_with("SHOW CLUSTER") {
         send_row_description(stream, &cols).await?;
         if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
@@ -1703,6 +1722,118 @@ async fn execute_simple_query(
     Ok(())
 }
 
+async fn plan_and_lower_query(sql: &str) -> Result<Vec<String>, String> {
+    let sql_upper = sql.to_uppercase();
+    if sql_upper.starts_with("EXPLAIN TRANSACTION") {
+        let frontend = rockstream_sql::SqlFrontend::new();
+        frontend
+            .explain_transaction(sql)
+            .map(|s| s.lines().map(String::from).collect())
+            .map_err(|e| e.to_string())
+    } else if sql_upper.starts_with("EXPLAIN INDEX") {
+        let frontend = rockstream_sql::SqlFrontend::new();
+        frontend
+            .explain_index(sql)
+            .map(|s| s.lines().map(String::from).collect())
+            .map_err(|e| e.to_string())
+    } else {
+        let query_sql = if sql_upper.starts_with("EXPLAIN ") {
+            sql[8..].trim()
+        } else {
+            sql.trim()
+        };
+
+        let ctx = datafusion::prelude::SessionContext::new();
+
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::catalog::SchemaProvider;
+        use datafusion::datasource::MemTable;
+        use std::sync::Arc;
+
+        let orders_schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("product_id", DataType::Int64, false),
+        ]));
+        let products_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("price", DataType::Int64, false),
+        ]));
+        let events_schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let a_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let b_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let users_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("group_id", DataType::Int64, false),
+        ]));
+
+        let _ = ctx.register_table(
+            "orders",
+            Arc::new(MemTable::try_new(orders_schema, vec![vec![]]).unwrap()),
+        );
+        let _ = ctx.register_table(
+            "products",
+            Arc::new(MemTable::try_new(products_schema, vec![vec![]]).unwrap()),
+        );
+        let _ = ctx.register_table(
+            "events",
+            Arc::new(MemTable::try_new(events_schema, vec![vec![]]).unwrap()),
+        );
+        let _ = ctx.register_table(
+            "a",
+            Arc::new(MemTable::try_new(a_schema, vec![vec![]]).unwrap()),
+        );
+        let _ = ctx.register_table(
+            "b",
+            Arc::new(MemTable::try_new(b_schema, vec![vec![]]).unwrap()),
+        );
+        let _ = ctx.register_table(
+            "users",
+            Arc::new(MemTable::try_new(users_schema, vec![vec![]]).unwrap()),
+        );
+
+        let marketing_orders_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let marketing_table =
+            Arc::new(MemTable::try_new(marketing_orders_schema, vec![vec![]]).unwrap());
+        let marketing_schema_provider = datafusion::catalog::MemorySchemaProvider::new();
+        let _ = marketing_schema_provider.register_table("orders".to_string(), marketing_table);
+        if let Some(catalog) = ctx.catalog("datafusion") {
+            let _ = catalog.register_schema("marketing", Arc::new(marketing_schema_provider));
+        }
+
+        match ctx.sql(query_sql).await {
+            Ok(df) => {
+                let lp = df.into_unoptimized_plan();
+                let frontend = rockstream_sql::SqlFrontend::new();
+                match frontend.lower(&lp) {
+                    Ok(plan) => {
+                        let explain_text =
+                            rockstream_runtime::explain::render_explain("query", &plan);
+                        Ok(explain_text.lines().map(String::from).collect())
+                    }
+                    Err(e) => Err(format!("lowering error: {e}")),
+                }
+            }
+            Err(e) => Err(format!("planning error: {e}")),
+        }
+    }
+}
+
 async fn execute_query_logic(
     stream: &mut TcpStream,
     sql: &str,
@@ -1713,6 +1844,22 @@ async fn execute_query_logic(
     rate_limiter: &mut RateLimiter,
 ) -> std::io::Result<()> {
     let sql_upper = sql.to_uppercase();
+
+    if sql_upper.starts_with("EXPLAIN") {
+        let cols = get_query_columns(sql);
+        match plan_and_lower_query(sql).await {
+            Ok(lines) => {
+                for line in lines {
+                    send_query_row(stream, &[&line], &cols, result_formats).await?;
+                }
+                send_command_complete(stream, "SELECT").await?;
+            }
+            Err(e) => {
+                send_query_error(stream, "RS-2001", &e).await?;
+            }
+        }
+        return Ok(());
+    }
 
     // 1. Rate Limiting Check
     let now_ms = std::time::SystemTime::now()

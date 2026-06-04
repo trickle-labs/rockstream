@@ -632,7 +632,11 @@ async fn test_gateway_pgwire_e2e() {
         .query("SELECT * FROM a JOIN b ON a.id = b.id", &[])
         .await
         .unwrap();
-    assert!(!rows.is_empty());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>("order_id"), 100);
+    assert_eq!(rows[0].get::<_, &str>("customer"), "Alice");
+    assert_eq!(rows[0].get::<_, f64>("price"), 45.5);
+
     // 2. Aggregate query
     let rows = client_viewer
         .query(
@@ -641,7 +645,10 @@ async fn test_gateway_pgwire_e2e() {
         )
         .await
         .unwrap();
-    assert!(!rows.is_empty());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("region"), "us-east");
+    assert_eq!(rows[0].get::<_, i64>("total"), 5000);
+
     // 3. Window query
     let rows = client_viewer
         .query(
@@ -650,13 +657,19 @@ async fn test_gateway_pgwire_e2e() {
         )
         .await
         .unwrap();
-    assert!(!rows.is_empty());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("name"), "Bob");
+    assert_eq!(rows[0].get::<_, i64>("rn"), 1);
+
     // 4. Subscribe query
     let rows = client_viewer
         .query("SUBSCRIBE orders_mv", &[])
         .await
         .unwrap();
-    assert!(!rows.is_empty());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>("mz_timestamp"), 10);
+    assert_eq!(rows[0].get::<_, i64>("mz_diff"), 1);
+    assert_eq!(rows[0].get::<_, &str>("region"), "us-west");
 
     // Scenario H: psql client compatibility witness
     let network_arg = format!("--network=container:{gateway_id}");
@@ -1586,4 +1599,235 @@ async fn test_v0_52_5_catalog_rest_server() {
         audit_content.contains("server.started"),
         "regression v0.52.4: audit.jsonl must contain server.started"
     );
+}
+
+#[tokio::test]
+async fn test_v0_52_6_sql_lowering_precision() {
+    ensure_image_built();
+
+    let temp_dir = TempDir::new().unwrap();
+    let host_path = temp_dir.path().to_str().unwrap();
+
+    // Start combined role=all node
+    let image = GenericImage::new("rockstream", "test")
+        .with_exposed_port(5432.tcp())
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=all".to_string(),
+            "--storage=/data".to_string(),
+        ]);
+    let container = image.start().await.unwrap();
+    let gateway_port = container.get_host_port_ipv4(5432.tcp()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut config = tokio_postgres::Config::new();
+    config.host("127.0.0.1");
+    config.port(gateway_port);
+    config.user("alice");
+    config.dbname("mydb");
+    config.password("bearer viewer:production");
+    let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // 1. Verify EXPLAIN on JOIN query
+    let rows_join = client
+        .query("EXPLAIN SELECT * FROM a JOIN b ON a.id = b.id", &[])
+        .await
+        .unwrap();
+    assert!(!rows_join.is_empty(), "EXPLAIN JOIN must return plan lines");
+    let plan_join = rows_join
+        .iter()
+        .map(|r| r.get::<_, &str>(0))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    assert!(
+        plan_join.contains("Join"),
+        "plan must contain Join operator, got:\n{plan_join}"
+    );
+
+    // 2. Verify EXPLAIN on SUM aggregate query (WeightAdd/v1 merge law)
+    let rows_sum = client
+        .query(
+            "EXPLAIN SELECT region, SUM(amount) FROM orders GROUP BY region",
+            &[],
+        )
+        .await
+        .unwrap();
+    let plan_sum = rows_sum
+        .iter()
+        .map(|r| r.get::<_, &str>(0))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    assert!(
+        plan_sum.contains("Aggregate"),
+        "plan must contain Aggregate operator"
+    );
+    assert!(
+        plan_sum.contains("WeightAdd/v1") || plan_sum.contains("WeightAdd"),
+        "plan must contain WeightAdd/v1 merge law annotation, got:\n{plan_sum}"
+    );
+
+    // 3. Verify EXPLAIN on MAX aggregate query (MaxRegister/v1 and extremum_requires_rmw reason)
+    let rows_max = client
+        .query(
+            "EXPLAIN SELECT region, MAX(amount) FROM orders GROUP BY region",
+            &[],
+        )
+        .await
+        .unwrap();
+    let plan_max = rows_max
+        .iter()
+        .map(|r| r.get::<_, &str>(0))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    assert!(
+        plan_max.contains("MaxRegister/v1") || plan_max.contains("MaxRegister"),
+        "plan must contain MaxRegister/v1 merge law annotation"
+    );
+    assert!(
+        plan_max.contains("extremum_requires_rmw") || plan_max.contains("ExtremumRequiresRmw"),
+        "plan must contain extremum_requires_rmw reason annotation, got:\n{plan_max}"
+    );
+
+    // 4. Verify EXPLAIN on WINDOW query
+    let rows_win = client
+        .query(
+            "EXPLAIN SELECT name, ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY id) FROM users",
+            &[],
+        )
+        .await
+        .unwrap();
+    let plan_win = rows_win
+        .iter()
+        .map(|r| r.get::<_, &str>(0))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    assert!(
+        plan_win.contains("Window"),
+        "plan must contain Window operator, got:\n{plan_win}"
+    );
+}
+
+#[tokio::test]
+async fn test_v0_52_7_cli_diagnostics_and_tuning() {
+    ensure_image_built();
+
+    let temp_dir = TempDir::new().unwrap();
+    let host_path = temp_dir.path().to_str().unwrap();
+
+    // Start control+worker+gateway cluster to generate real audit events
+    let image_control = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=control".to_string(),
+            "--control-bind=0.0.0.0:7700".to_string(),
+            "--storage=/data".to_string(),
+        ]);
+    let container_control = image_control.start().await.unwrap();
+    let control_id = container_control.id().to_string();
+    let _control_ip = get_container_ip(&control_id);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Describe command execution
+    let image_desc = GenericImage::new("rockstream", "test")
+        .with_cmd(vec!["describe".to_string(), "my-pipeline".to_string()]);
+    let container_desc = image_desc.start().await.unwrap();
+    let desc_id = container_desc.id().to_string();
+    assert_eq!(wait_container_exit(&desc_id).await, 0);
+    let (desc_stdout, _) = get_container_logs(&desc_id);
+    assert!(desc_stdout.contains("Pipeline: my-pipeline"));
+    assert!(desc_stdout.contains("Status: RUNNING"));
+    assert!(desc_stdout.contains("[Source: kafka_orders]"));
+    assert!(desc_stdout.contains("[Sink: iceberg_orders]"));
+
+    // Debug-arrangement command execution
+    let image_arr = GenericImage::new("rockstream", "test").with_cmd(vec![
+        "debug-arrangement".to_string(),
+        "orders_mv".to_string(),
+        "1".to_string(),
+        "key1".to_string(),
+    ]);
+    let container_arr = image_arr.start().await.unwrap();
+    let arr_id = container_arr.id().to_string();
+    assert_eq!(wait_container_exit(&arr_id).await, 0);
+    let (arr_stdout, _) = get_container_logs(&arr_id);
+    assert!(arr_stdout.contains("Debugging arrangement for view: orders_mv"));
+    assert!(arr_stdout.contains("WeightAdd/v1"));
+    assert!(arr_stdout.contains("Tombstone density: 0.15"));
+
+    // Tune command execution (manual overrides)
+    let image_tune = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "tune".to_string(),
+            "--override".to_string(),
+            "parallelism=8".to_string(),
+            "--override".to_string(),
+            "epoch_size_ms=500".to_string(),
+            "--storage".to_string(),
+            "/data".to_string(),
+        ]);
+    let container_tune = image_tune.start().await.unwrap();
+    let tune_id = container_tune.id().to_string();
+    assert_eq!(wait_container_exit(&tune_id).await, 0);
+
+    // Verify tune_overrides.json exists in storage and parses correctly
+    let overrides_path = temp_dir.path().join("tune_overrides.json");
+    assert!(overrides_path.exists(), "tune_overrides.json must exist");
+    let overrides_content = fs::read_to_string(&overrides_path).unwrap();
+    let overrides_json: serde_json::Value = serde_json::from_str(&overrides_content).unwrap();
+    assert_eq!(
+        overrides_json.get("parallelism").unwrap().as_u64().unwrap(),
+        8
+    );
+    assert_eq!(
+        overrides_json
+            .get("epoch_size_ms")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        500
+    );
+
+    // Stop control node to trigger audit logging shutdown events
+    drop(container_control);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Support bundle generation
+    let image_sb = GenericImage::new("rockstream", "test")
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "support-bundle".to_string(),
+            "--output".to_string(),
+            "/data/support-bundle-test.json".to_string(),
+        ]);
+    let container_sb = image_sb.start().await.unwrap();
+    let sb_id = container_sb.id().to_string();
+    assert_eq!(wait_container_exit(&sb_id).await, 0);
+
+    // Verify support bundle contains actual audit log events
+    let bundle_path = temp_dir.path().join("support-bundle-test.json");
+    assert!(bundle_path.exists());
+    let bundle_content = fs::read_to_string(&bundle_path).unwrap();
+    let bundle_json: serde_json::Value = serde_json::from_str(&bundle_content).unwrap();
+    assert_eq!(
+        bundle_json
+            .get("system_info")
+            .unwrap()
+            .get("version")
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        env!("CARGO_PKG_VERSION")
+    );
+    let audit_events = bundle_json.get("audit_events").unwrap().as_array().unwrap();
+    assert!(!audit_events.is_empty(), "audit_events must not be empty");
+    let has_start = audit_events
+        .iter()
+        .any(|e| e.get("action").and_then(|v| v.as_str()) == Some("server.started"));
+    assert!(has_start, "audit_events must record server.started event");
 }
