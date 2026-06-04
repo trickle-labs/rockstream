@@ -216,6 +216,13 @@ impl InlineViewCatalog {
         self.views.is_empty()
     }
 
+    /// Return all registered inline view names (sorted for determinism).
+    pub fn view_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.views.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Register a replacement inline view for atomic replacement (v0.44).
     pub fn register_replacement(
         &mut self,
