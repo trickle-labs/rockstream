@@ -15,8 +15,6 @@ fn get_db_error_message(err: &tokio_postgres::Error) -> String {
         err.to_string()
     }
 }
-
-
 // Helper to wait for container exit and return exit code
 async fn wait_container_exit(container_id: &str) -> i32 {
     let output = Command::new("docker")
@@ -208,7 +206,6 @@ async fn test_start_role_matrix_gateway_and_frontier() {
         } else {
             wait_container_exit(&id).await
         };
-
         let (_stdout, stderr) = get_container_logs(&id);
 
         assert_eq!(exit_code, 0, "role={role} failed. Stderr: {stderr}");
