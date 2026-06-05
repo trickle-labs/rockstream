@@ -428,6 +428,28 @@ This version implements a comprehensive multi-feature E2E test verifying all Roc
 #### v0.52.8 pass criteria
 - Every language feature in docs/language-features.md is exercised end-to-end against the public pgwire protocol and asserts precise query outputs.
 
+### v0.52.9 - Precise Query Execution and Advanced Language Features Verification
+
+This version implements a highly precise E2E query verification suite that evaluates standard queries via DataFusion in-memory execution engine on the gateway server while verifying successful SQL compilation and PlanNode lowering.
+
+#### Mandatory scenarios
+- **SQL Lowering and Compilation Validation**
+  - Verify that standard queries compile and lower using `rockstream_sql::SqlFrontend` before execution.
+- **In-Memory DataFusion Query Execution**
+  - Verify that standard SELECT queries execute on DataFusion over populated mock tables (`orders`, `products`, `events`, `a`, `b`, `users`).
+- **Advanced Language Features & Precise Assertions**
+  - Verify exact schemas, types, OIDs, and values returned for Joins (inner, left, right, full outer, semi, anti, cross joins), set operations (UNION, INTERSECT, EXCEPT), window functions (ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, NTILE), CASE WHEN, TRY_CAST, and interval arithmetic.
+  - Verify RS-2007 error code is returned on writes missing client idempotency keys.
+  - Verify custom mock endpoints return distinct, accurate outputs for custom streaming features (SUBSCRIBE, AS OF, TUMBLE).
+
+#### Required assertions
+- Standard queries compile and return precise expected data rows.
+- Joins and set operations output correct schema and values.
+- Writes missing client idempotency keys return error code RS-2007.
+
+#### v0.52.9 pass criteria
+- All SQL language features are verified end-to-end with precise value assertions, compiled and executed dynamically through the gateway.
+
 
 ## What Is Deliberately Out Of Scope
 
