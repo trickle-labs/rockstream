@@ -1948,8 +1948,14 @@ async fn test_v0_52_8_comprehensive_language_features() {
     assert_eq!(rows_sub[0].get::<_, &str>("region"), "us-west");
 
     // 7. Session and freshness controls
-    client.execute("SET rockstream.session_wait_for = off", &[]).await.unwrap();
-    client.execute("SET rockstream.max_staleness = 5000", &[]).await.unwrap();
+    client
+        .execute("SET rockstream.session_wait_for = off", &[])
+        .await
+        .unwrap();
+    client
+        .execute("SET rockstream.max_staleness = 5000", &[])
+        .await
+        .unwrap();
 
     // 8. Transaction semantics & Optimistic conflict (RS-2008)
     let res_conflict = client
@@ -1971,7 +1977,10 @@ async fn test_v0_52_8_comprehensive_language_features() {
         .await
         .unwrap();
     client
-        .execute("CREATE REPLACEMENT VIEW mv_test AS SELECT * FROM orders", &[])
+        .execute(
+            "CREATE REPLACEMENT VIEW mv_test AS SELECT * FROM orders",
+            &[],
+        )
         .await
         .unwrap();
     client
@@ -1991,8 +2000,14 @@ async fn test_v0_52_8_comprehensive_language_features() {
     assert_eq!(rows_repl[0].get::<_, &str>("view_name"), "orders_mv");
     assert_eq!(rows_repl[0].get::<_, &str>("status"), "APPLIED");
 
-    client.execute("PAUSE MATERIALIZED VIEW mv_test", &[]).await.unwrap();
-    client.execute("RESUME MATERIALIZED VIEW mv_test", &[]).await.unwrap();
+    client
+        .execute("PAUSE MATERIALIZED VIEW mv_test", &[])
+        .await
+        .unwrap();
+    client
+        .execute("RESUME MATERIALIZED VIEW mv_test", &[])
+        .await
+        .unwrap();
 
     let rows_view_status = client
         .query("SHOW VIEW STATUS FOR NAMESPACE public", &[])
@@ -2051,7 +2066,10 @@ async fn test_v0_52_8_comprehensive_language_features() {
         .unwrap();
     assert!(!rows_idx_explain.is_empty());
 
-    client.execute("SET BACKGROUND_DDL = ON", &[]).await.unwrap();
+    client
+        .execute("SET BACKGROUND_DDL = ON", &[])
+        .await
+        .unwrap();
     client
         .execute(
             "WAIT FOR MATERIALIZED VIEW mv_test TO BE READY TIMEOUT 5000",

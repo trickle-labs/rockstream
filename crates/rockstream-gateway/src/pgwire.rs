@@ -675,7 +675,11 @@ fn get_query_columns(sql: &str) -> Vec<PgColumn> {
             PgColumn::from_type_tag("status", 5),
             PgColumn::from_type_tag("amount", 4),
         ]
-    } else if sql_upper.contains("UNION") || sql_upper.contains("INTERSECT") || sql_upper.contains("EXCEPT") || sql_upper.contains("RECURSIVE") {
+    } else if sql_upper.contains("UNION")
+        || sql_upper.contains("INTERSECT")
+        || sql_upper.contains("EXCEPT")
+        || sql_upper.contains("RECURSIVE")
+    {
         vec![PgColumn::from_type_tag("id", 3)]
     } else if sql_upper.contains("SHOW RESOURCE USAGE FOR WORKLOAD") {
         vec![
@@ -795,7 +799,11 @@ async fn execute_mock_queries(
                     if r.commutative { "t" } else { "f" },
                     if r.has_inverse { "t" } else { "f" },
                     if r.has_identity { "t" } else { "f" },
-                    if r.supports_gateway_pushdown { "t" } else { "f" },
+                    if r.supports_gateway_pushdown {
+                        "t"
+                    } else {
+                        "f"
+                    },
                 ],
                 cols,
                 result_formats,
@@ -994,7 +1002,13 @@ async fn execute_mock_queries(
         if send_desc {
             send_row_description(stream, cols).await?;
         }
-        send_query_row(stream, &["orders_mv", "orders_mv_replacement", "APPLIED"], cols, result_formats).await?;
+        send_query_row(
+            stream,
+            &["orders_mv", "orders_mv_replacement", "APPLIED"],
+            cols,
+            result_formats,
+        )
+        .await?;
         send_command_complete(stream, "SELECT").await?;
         return Ok(true);
     }
@@ -1002,7 +1016,13 @@ async fn execute_mock_queries(
         if send_desc {
             send_row_description(stream, cols).await?;
         }
-        send_query_row(stream, &["orders_mv", "RUNNING", "100"], cols, result_formats).await?;
+        send_query_row(
+            stream,
+            &["orders_mv", "RUNNING", "100"],
+            cols,
+            result_formats,
+        )
+        .await?;
         send_command_complete(stream, "SELECT").await?;
         return Ok(true);
     }
@@ -1010,7 +1030,13 @@ async fn execute_mock_queries(
         if send_desc {
             send_row_description(stream, cols).await?;
         }
-        send_query_row(stream, &["orders_mv", "1.0", "COMPLETED"], cols, result_formats).await?;
+        send_query_row(
+            stream,
+            &["orders_mv", "1.0", "COMPLETED"],
+            cols,
+            result_formats,
+        )
+        .await?;
         send_command_complete(stream, "SELECT").await?;
         return Ok(true);
     }
@@ -1018,7 +1044,13 @@ async fn execute_mock_queries(
         if send_desc {
             send_row_description(stream, cols).await?;
         }
-        send_query_row(stream, &["us-east", "2026-06-05 08:00:00"], cols, result_formats).await?;
+        send_query_row(
+            stream,
+            &["us-east", "2026-06-05 08:00:00"],
+            cols,
+            result_formats,
+        )
+        .await?;
         send_command_complete(stream, "SELECT").await?;
         return Ok(true);
     }
@@ -1030,7 +1062,11 @@ async fn execute_mock_queries(
         send_command_complete(stream, "SELECT").await?;
         return Ok(true);
     }
-    if sql_upper.contains("UNION") || sql_upper.contains("INTERSECT") || sql_upper.contains("EXCEPT") || sql_upper.contains("RECURSIVE") {
+    if sql_upper.contains("UNION")
+        || sql_upper.contains("INTERSECT")
+        || sql_upper.contains("EXCEPT")
+        || sql_upper.contains("RECURSIVE")
+    {
         if send_desc {
             send_row_description(stream, cols).await?;
         }
