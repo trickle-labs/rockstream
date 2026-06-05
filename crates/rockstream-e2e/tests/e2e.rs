@@ -1849,6 +1849,21 @@ async fn test_v0_52_8_comprehensive_language_features() {
             "--storage=/data".to_string(),
         ]);
     let container = image.start().await.unwrap();
+    struct LogOnError {
+        container_id: String,
+    }
+    impl Drop for LogOnError {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let (stdout, stderr) = get_container_logs(&self.container_id);
+                println!("--- CONTAINER STDOUT ---\n{}", stdout);
+                println!("--- CONTAINER STDERR ---\n{}", stderr);
+            }
+        }
+    }
+    let _guard = LogOnError {
+        container_id: container.id().to_string(),
+    };
     let gateway_port = container.get_host_port_ipv4(5432.tcp()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
