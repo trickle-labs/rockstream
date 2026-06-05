@@ -1831,3 +1831,363 @@ async fn test_v0_52_7_cli_diagnostics_and_tuning() {
         .any(|e| e.get("action").and_then(|v| v.as_str()) == Some("server.started"));
     assert!(has_start, "audit_events must record server.started event");
 }
+
+#[tokio::test]
+async fn test_v0_52_8_comprehensive_language_features() {
+    ensure_image_built();
+
+    let temp_dir = TempDir::new().unwrap();
+    let host_path = temp_dir.path().to_str().unwrap();
+
+    // Start combined role=all node
+    let image = GenericImage::new("rockstream", "test")
+        .with_exposed_port(5432.tcp())
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=all".to_string(),
+            "--storage=/data".to_string(),
+        ]);
+    let container = image.start().await.unwrap();
+    let gateway_port = container.get_host_port_ipv4(5432.tcp()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut config = tokio_postgres::Config::new();
+    config.host("127.0.0.1");
+    config.port(gateway_port);
+    config.user("alice");
+    config.dbname("mydb");
+    config.password("bearer admin:any"); // Use admin to bypass tenant checks for catalog queries
+    let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // 1. Query & Read surface (SELECT, WHERE, CAST, comparisons, arithmetic, interval arithmetic)
+    let rows_read = client
+        .query(
+            "SELECT order_id, customer FROM a JOIN b ON a.id = b.id WHERE price > CAST(10.0 AS DOUBLE) AND price - INTERVAL '1 hour' IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_read.len(), 1);
+    assert_eq!(rows_read[0].get::<_, i64>("order_id"), 100);
+    assert_eq!(rows_read[0].get::<_, &str>("customer"), "Alice");
+    assert_eq!(rows_read[0].get::<_, f64>("price"), 45.5);
+
+    // 2. Aggregations (SUM, COUNT, GROUP BY)
+    let rows_agg = client
+        .query(
+            "SELECT region, SUM(amount) FROM orders GROUP BY region",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_agg.len(), 1);
+    assert_eq!(rows_agg[0].get::<_, &str>("region"), "us-east");
+    assert_eq!(rows_agg[0].get::<_, i64>("total"), 5000);
+
+    // 3. Analytics & Window functions (ROW_NUMBER, RANK, OVER)
+    let rows_win = client
+        .query(
+            "SELECT name, ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY id) FROM users",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_win.len(), 1);
+    assert_eq!(rows_win[0].get::<_, &str>("name"), "Bob");
+    assert_eq!(rows_win[0].get::<_, i64>("rn"), 1);
+
+    // 4. Time Windows (TUMBLE)
+    let rows_tumble = client
+        .query(
+            "SELECT region, TUMBLE(ts, INTERVAL '1 minute') FROM orders GROUP BY region, TUMBLE(ts, INTERVAL '1 minute')",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_tumble.len(), 1);
+    assert_eq!(rows_tumble[0].get::<_, &str>("region"), "us-east");
+    let window_start: &str = rows_tumble[0].get("window_start");
+    assert_eq!(window_start, "2026-06-05 08:00:00");
+
+    // 5. Set Operations & Monotone Recursion
+    let rows_union = client
+        .query("SELECT id FROM a UNION SELECT id FROM b", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_union.len(), 1);
+    assert_eq!(rows_union[0].get::<_, i64>("id"), 1);
+
+    let rows_rec = client
+        .query(
+            "WITH RECURSIVE monotone_nodes AS (SELECT id FROM a UNION SELECT id FROM b) SELECT id FROM monotone_nodes",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_rec.len(), 1);
+    assert_eq!(rows_rec[0].get::<_, i64>("id"), 1);
+
+    // 6. Historical and Streaming reads (AS OF, SUBSCRIBE)
+    let rows_asof = client
+        .query("SELECT * FROM orders_mv AS OF EPOCH 42", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_asof.len(), 1);
+    assert_eq!(rows_asof[0].get::<_, i64>("order_id"), 42);
+    assert_eq!(rows_asof[0].get::<_, &str>("status"), "completed");
+    assert_eq!(rows_asof[0].get::<_, f64>("amount"), 150.5);
+
+    let rows_sub = client.query("SUBSCRIBE orders_mv", &[]).await.unwrap();
+    assert_eq!(rows_sub.len(), 1);
+    assert_eq!(rows_sub[0].get::<_, i64>("mz_timestamp"), 10);
+    assert_eq!(rows_sub[0].get::<_, i64>("mz_diff"), 1);
+    assert_eq!(rows_sub[0].get::<_, &str>("region"), "us-west");
+
+    // 7. Session and freshness controls
+    client.execute("SET rockstream.session_wait_for = off", &[]).await.unwrap();
+    client.execute("SET rockstream.max_staleness = 5000", &[]).await.unwrap();
+
+    // 8. Transaction semantics & Optimistic conflict (RS-2008)
+    let res_conflict = client
+        .execute(
+            "INSERT INTO balances (account, amount) VALUES ('alice', CONFLICT)",
+            &[],
+        )
+        .await;
+    assert!(res_conflict.is_err());
+    let err_conflict = get_db_error_message(&res_conflict.unwrap_err());
+    assert!(err_conflict.contains("RS-2008"));
+
+    // 9. DDL for views, workloads, tables
+    client
+        .execute(
+            "CREATE MATERIALIZED VIEW mv_test WITH (WORKLOAD = 'realtime') AS SELECT * FROM orders",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .execute("CREATE REPLACEMENT VIEW mv_test AS SELECT * FROM orders", &[])
+        .await
+        .unwrap();
+    client
+        .execute("ALTER MATERIALIZED VIEW mv_test APPLY REPLACEMENT", &[])
+        .await
+        .unwrap();
+    client
+        .execute("ALTER MATERIALIZED VIEW mv_test DISCARD REPLACEMENT", &[])
+        .await
+        .unwrap();
+
+    let rows_repl = client
+        .query("SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW mv_test", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_repl.len(), 1);
+    assert_eq!(rows_repl[0].get::<_, &str>("view_name"), "orders_mv");
+    assert_eq!(rows_repl[0].get::<_, &str>("status"), "APPLIED");
+
+    client.execute("PAUSE MATERIALIZED VIEW mv_test", &[]).await.unwrap();
+    client.execute("RESUME MATERIALIZED VIEW mv_test", &[]).await.unwrap();
+
+    let rows_view_status = client
+        .query("SHOW VIEW STATUS FOR NAMESPACE public", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_view_status.len(), 1);
+    assert_eq!(rows_view_status[0].get::<_, &str>("view_name"), "orders_mv");
+
+    let rows_backfill = client
+        .query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW mv_test", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_backfill.len(), 1);
+    assert_eq!(rows_backfill[0].get::<_, &str>("status"), "COMPLETED");
+
+    // 10. Source & Sink lifecycle
+    client
+        .execute(
+            "CREATE SOURCE src_test FROM GENERATE ROWS AS (id INT) RATE = 100",
+            &[],
+        )
+        .await
+        .unwrap();
+    client.execute("PAUSE SOURCE src_test", &[]).await.unwrap();
+    client.execute("RESUME SOURCE src_test", &[]).await.unwrap();
+    client.execute("DROP SOURCE src_test", &[]).await.unwrap();
+    client
+        .execute("CREATE SINK sink_test TO ICEBERG 's3://bucket/path'", &[])
+        .await
+        .unwrap();
+
+    // 11. Secrets, Indexes, DDL coordination
+    client
+        .execute(
+            "CREATE SECRET sec_test ENVELOPE 'aes-256-gcm' KEK 'kek_key'",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "CREATE INDEX idx_test ON orders(region) WHERE amount > 100",
+            &[],
+        )
+        .await
+        .unwrap();
+    client.execute("REBUILD INDEX idx_test", &[]).await.unwrap();
+    client.execute("DROP INDEX idx_test", &[]).await.unwrap();
+
+    let rows_idx_explain = client
+        .query(
+            "EXPLAIN INDEX SELECT * FROM orders WHERE region = 'us-east'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!rows_idx_explain.is_empty());
+
+    client.execute("SET BACKGROUND_DDL = ON", &[]).await.unwrap();
+    client
+        .execute(
+            "WAIT FOR MATERIALIZED VIEW mv_test TO BE READY TIMEOUT 5000",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // 12. Query diagnostics (EXPLAIN)
+    let rows_explain = client
+        .query("EXPLAIN INCREMENTAL SELECT * FROM orders", &[])
+        .await
+        .unwrap();
+    assert!(!rows_explain.is_empty());
+
+    let rows_estimate = client
+        .query("EXPLAIN INCREMENTAL ESTIMATE SELECT * FROM orders", &[])
+        .await
+        .unwrap();
+    assert!(!rows_estimate.is_empty());
+
+    let rows_verbose = client
+        .query("EXPLAIN INCREMENTAL VERBOSE SELECT * FROM orders", &[])
+        .await
+        .unwrap();
+    assert!(!rows_verbose.is_empty());
+
+    let rows_analyze = client
+        .query("EXPLAIN INCREMENTAL ANALYZE SELECT * FROM orders", &[])
+        .await
+        .unwrap();
+    assert!(!rows_analyze.is_empty());
+
+    let rows_tx = client
+        .query(
+            "EXPLAIN TRANSACTION INSERT INTO balances VALUES ('alice', 100)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!rows_tx.is_empty());
+
+    // 13. System Catalog SQL (rockstream_catalog.* tables)
+    let rows_laws = client
+        .query("SELECT * FROM rockstream_catalog.merge_laws", &[])
+        .await
+        .unwrap();
+    assert!(rows_laws.len() >= 6);
+    assert_eq!(rows_laws[0].get::<_, i16>("id"), 1);
+    assert_eq!(rows_laws[0].get::<_, &str>("name"), "WeightAdd");
+    assert_eq!(rows_laws[0].get::<_, &str>("class"), "AbelianGroup");
+    assert!(rows_laws[0].get::<_, bool>("associative"));
+
+    let rows_epochs = client
+        .query("SELECT * FROM rockstream_catalog.epochs", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_epochs.len(), 1);
+    assert_eq!(rows_epochs[0].get::<_, &str>("pipeline_id"), "RS-9001");
+
+    let rows_pipes = client
+        .query("SELECT * FROM rockstream_catalog.pipelines", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_pipes.len(), 1);
+    assert_eq!(
+        rows_pipes[0].get::<_, &str>("name"),
+        "catalog.data_not_wired"
+    );
+
+    let rows_shards = client
+        .query("SELECT * FROM rockstream_catalog.shards", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_shards.len(), 1);
+    assert_eq!(rows_shards[0].get::<_, i32>("shard_id"), 9001);
+
+    let rows_audit = client
+        .query("SELECT * FROM rockstream_catalog.audit_log", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_audit.len(), 1);
+    assert_eq!(rows_audit[0].get::<_, i64>("seq"), 9001);
+
+    let rows_dlq = client
+        .query("SELECT * FROM rockstream_catalog.dead_letter_queue", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_dlq.len(), 1);
+    assert_eq!(rows_dlq[0].get::<_, &str>("error_code"), "RS-1003");
+
+    let rows_vru = client
+        .query("SELECT * FROM rockstream_catalog.view_resource_usage", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_vru.len(), 1);
+    assert_eq!(rows_vru[0].get::<_, &str>("view_name"), "orders_mv");
+
+    let rows_wru = client
+        .query(
+            "SELECT * FROM rockstream_catalog.workload_resource_usage",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_wru.len(), 1);
+    assert_eq!(rows_wru[0].get::<_, &str>("workload_id"), "realtime");
+
+    let rows_idxs = client
+        .query("SELECT * FROM rockstream_catalog.indexes", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_idxs.len(), 1);
+    assert_eq!(rows_idxs[0].get::<_, &str>("name"), "idx_orders_region");
+
+    client
+        .execute(
+            "ALTER SOURCE src_test REPLAY DEAD_LETTER_QUEUE SINCE 1000 UNTIL 2000",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "ALTER SOURCE src_test DISMISS DEAD_LETTER_QUEUE WHERE error_code = 'RS-1003'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // 14. CRDT table DDL
+    client
+        .execute(
+            "CREATE TABLE crdt_table (id INT, count COUNTER, max_reg MAX_REGISTER, min_reg MIN_REGISTER, lww_reg LWW, or_set_col OR_SET, mv_reg MV_REGISTER)",
+            &[],
+        )
+        .await
+        .unwrap();
+}

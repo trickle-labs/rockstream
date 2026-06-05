@@ -398,6 +398,36 @@ This version validates CLI diagnostic subcommands (`tune`, `describe`, `debug-ar
 #### v0.52.7 pass criteria
 - Diagnostic and tuning CLI tools are verified end-to-end against real/simulated storage states.
 
+### v0.52.8 - Comprehensive Language Features Validation
+
+This version implements a comprehensive multi-feature E2E test verifying all RockStream language features end-to-end against a live gateway cluster.
+
+#### Mandatory scenarios
+- **Query & Read Surface**
+  - Execute complex SELECT queries containing WHERE filters, CAST, TRY_CAST, boolean operators, comparisons, and interval arithmetic over JOINs, and assert precise returned values.
+- **Aggregations**
+  - Run aggregations (SUM, COUNT, AVG, MIN, MAX) over GROUP BY and verify the exact group keys and aggregate values are returned.
+- **Analytics & Time Windows**
+  - Run window functions (ROW_NUMBER, RANK, OVER) and TUMBLE time window queries, and assert precise returned values.
+- **Set Operations & Recursion**
+  - Execute set operations (UNION, INTERSECT, EXCEPT) and monotone insert-only recursion (WITH RECURSIVE), asserting correct row counts and values.
+- **Historical & Streaming Reads**
+  - Run historical query options (AS OF EPOCH, AS OF TIMESTAMP, AS OF NOW WITH SNAPSHOT, AS OF MONOTONE PARTIAL) and open change subscription streams (SUBSCRIBE), and assert precise returned values.
+- **Freshness & Session Controls**
+  - Verify session configuration parameters like `rockstream.session_wait_for` and `rockstream.max_staleness`.
+- **DML & Transactions**
+  - Verify DDL/DML statements, table/view lifecycles (CREATE, DROP, REPLACEMENT, APPLY, DISCARD, PAUSE, RESUME), workloads, and optimistic transaction conflict (RS-2008).
+- **Diagnostics & Introspection**
+  - Verify query diagnostics (EXPLAIN INCREMENTAL/VERBOSE/ESTIMATE/ANALYZE/TRANSACTION/INDEX) and query the complete virtual stubs under `rockstream_catalog.*` system tables (merge_laws, epochs, pipelines, shards, audit_log, dead_letter_queue, view_resource_usage, workload_resource_usage, indexes).
+
+#### Required assertions
+- Every query listed above returns exact columns, OIDs, and precise expected values.
+- The `rockstream_catalog.*` system tables return populated mock/live rows.
+- Unsupported isolation levels or conflicts return the correct RS-xxxx error codes.
+
+#### v0.52.8 pass criteria
+- Every language feature in docs/language-features.md is exercised end-to-end against the public pgwire protocol and asserts precise query outputs.
+
 
 ## What Is Deliberately Out Of Scope
 

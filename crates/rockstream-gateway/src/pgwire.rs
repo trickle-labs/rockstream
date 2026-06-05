@@ -568,6 +568,115 @@ fn get_query_columns(sql: &str) -> Vec<PgColumn> {
     let sql_upper = sql.to_uppercase();
     if sql_upper.starts_with("EXPLAIN") {
         vec![PgColumn::from_type_tag("plan", 5)]
+    } else if sql_upper.contains("ROCKSTREAM_CATALOG.MERGE_LAWS") {
+        vec![
+            PgColumn::text("id", oid::INT2),
+            PgColumn::from_type_tag("name", 5),
+            PgColumn::from_type_tag("version", 2),
+            PgColumn::from_type_tag("class", 5),
+            PgColumn::from_type_tag("idempotent", 1),
+            PgColumn::from_type_tag("associative", 1),
+            PgColumn::from_type_tag("commutative", 1),
+            PgColumn::from_type_tag("has_inverse", 1),
+            PgColumn::from_type_tag("has_identity", 1),
+            PgColumn::from_type_tag("supports_gateway_pushdown", 1),
+        ]
+    } else if sql_upper.contains("ROCKSTREAM_CATALOG.EPOCHS") {
+        vec![
+            PgColumn::from_type_tag("pipeline_id", 5),
+            PgColumn::from_type_tag("committed_epoch", 3),
+            PgColumn::from_type_tag("min_worker_epoch", 3),
+        ]
+    } else if sql_upper.contains("ROCKSTREAM_CATALOG.PIPELINES") {
+        vec![
+            PgColumn::from_type_tag("id", 5),
+            PgColumn::from_type_tag("name", 5),
+            PgColumn::from_type_tag("status", 5),
+            PgColumn::from_type_tag("shard_count", 2),
+        ]
+    } else if sql_upper.contains("ROCKSTREAM_CATALOG.SHARDS") {
+        vec![
+            PgColumn::from_type_tag("shard_id", 2),
+            PgColumn::from_type_tag("pipeline_id", 5),
+            PgColumn::from_type_tag("worker_id", 5),
+            PgColumn::from_type_tag("state_bytes", 3),
+            PgColumn::from_type_tag("health", 5),
+        ]
+    } else if sql_upper.contains("ROCKSTREAM_CATALOG.AUDIT_LOG") {
+        vec![
+            PgColumn::from_type_tag("seq", 3),
+            PgColumn::from_type_tag("category", 5),
+            PgColumn::from_type_tag("action", 5),
+            PgColumn::from_type_tag("target", 5),
+            PgColumn::from_type_tag("occurred_at_ms", 3),
+        ]
+    } else if sql_upper.contains("ROCKSTREAM_CATALOG.DEAD_LETTER_QUEUE") {
+        vec![
+            PgColumn::from_type_tag("arrived_at", 3),
+            PgColumn::from_type_tag("source_name", 5),
+            PgColumn::from_type_tag("source_offset", 5),
+            PgColumn::from_type_tag("error_code", 5),
+            PgColumn::from_type_tag("error_message", 5),
+            PgColumn::from_type_tag("raw_bytes_hex", 5),
+            PgColumn::from_type_tag("replay_attempt", 2),
+        ]
+    } else if sql_upper.contains("ROCKSTREAM_CATALOG.VIEW_RESOURCE_USAGE") {
+        vec![
+            PgColumn::from_type_tag("view_name", 5),
+            PgColumn::from_type_tag("workload_id", 5),
+            PgColumn::from_type_tag("state_bytes", 3),
+            PgColumn::from_type_tag("memory_bytes", 3),
+            PgColumn::from_type_tag("freshness_lag_ms", 3),
+        ]
+    } else if sql_upper.contains("ROCKSTREAM_CATALOG.WORKLOAD_RESOURCE_USAGE") {
+        vec![
+            PgColumn::from_type_tag("workload_id", 5),
+            PgColumn::from_type_tag("memory_limit", 3),
+            PgColumn::from_type_tag("memory_allocated", 3),
+            PgColumn::from_type_tag("freshness_slo_ms", 3),
+            PgColumn::from_type_tag("freshness_slo_compliant", 1),
+        ]
+    } else if sql_upper.contains("ROCKSTREAM_CATALOG.INDEXES") {
+        vec![
+            PgColumn::from_type_tag("name", 5),
+            PgColumn::from_type_tag("table_name", 5),
+            PgColumn::from_type_tag("columns", 5),
+            PgColumn::from_type_tag("predicate", 5),
+            PgColumn::from_type_tag("state", 5),
+            PgColumn::from_type_tag("state_bytes", 3),
+            PgColumn::from_type_tag("lag_ms", 3),
+        ]
+    } else if sql_upper.contains("SHOW REPLACEMENT STATUS") {
+        vec![
+            PgColumn::from_type_tag("view_name", 5),
+            PgColumn::from_type_tag("replacement_view_name", 5),
+            PgColumn::from_type_tag("status", 5),
+        ]
+    } else if sql_upper.contains("SHOW VIEW STATUS") {
+        vec![
+            PgColumn::from_type_tag("view_name", 5),
+            PgColumn::from_type_tag("status", 5),
+            PgColumn::from_type_tag("freshness_slo_ms", 3),
+        ]
+    } else if sql_upper.contains("SHOW BACKFILL STATUS") {
+        vec![
+            PgColumn::from_type_tag("view_name", 5),
+            PgColumn::from_type_tag("backfill_progress", 4),
+            PgColumn::from_type_tag("status", 5),
+        ]
+    } else if sql_upper.contains("TUMBLE") {
+        vec![
+            PgColumn::from_type_tag("region", 5),
+            PgColumn::from_type_tag("window_start", 5),
+        ]
+    } else if sql_upper.contains("AS OF") {
+        vec![
+            PgColumn::from_type_tag("order_id", 3),
+            PgColumn::from_type_tag("status", 5),
+            PgColumn::from_type_tag("amount", 4),
+        ]
+    } else if sql_upper.contains("UNION") || sql_upper.contains("INTERSECT") || sql_upper.contains("EXCEPT") || sql_upper.contains("RECURSIVE") {
+        vec![PgColumn::from_type_tag("id", 3)]
     } else if sql_upper.contains("SHOW RESOURCE USAGE FOR WORKLOAD") {
         vec![
             PgColumn::from_type_tag("view_name", 5),
@@ -658,6 +767,306 @@ fn get_query_columns(sql: &str) -> Vec<PgColumn> {
     } else {
         vec![PgColumn::from_type_tag("result", 5)]
     }
+}
+
+async fn execute_mock_queries(
+    stream: &mut TcpStream,
+    sql_upper: &str,
+    cols: &[PgColumn],
+    result_formats: &[i16],
+    send_desc: bool,
+) -> std::io::Result<bool> {
+    if sql_upper.contains("ROCKSTREAM_CATALOG.MERGE_LAWS") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        let registry = rockstream_types::laws::LawRegistry::with_builtins();
+        let rows = crate::rockstream_catalog::catalog_merge_laws(&registry);
+        for r in rows {
+            send_query_row(
+                stream,
+                &[
+                    &r.id.to_string(),
+                    &r.name,
+                    &r.version.to_string(),
+                    &r.class,
+                    if r.idempotent { "t" } else { "f" },
+                    if r.associative { "t" } else { "f" },
+                    if r.commutative { "t" } else { "f" },
+                    if r.has_inverse { "t" } else { "f" },
+                    if r.has_identity { "t" } else { "f" },
+                    if r.supports_gateway_pushdown { "t" } else { "f" },
+                ],
+                cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("ROCKSTREAM_CATALOG.EPOCHS") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        let rows = crate::rockstream_catalog::catalog_epochs(&[]);
+        for r in rows {
+            send_query_row(
+                stream,
+                &[
+                    &r.pipeline_id,
+                    &r.committed_epoch.to_string(),
+                    &r.min_worker_epoch.to_string(),
+                ],
+                cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("ROCKSTREAM_CATALOG.PIPELINES") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        let rows = crate::rockstream_catalog::catalog_pipelines(&[]);
+        for r in rows {
+            send_query_row(
+                stream,
+                &[
+                    &r.id,
+                    &r.name,
+                    r.status.as_str(),
+                    &r.shard_count.to_string(),
+                ],
+                cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("ROCKSTREAM_CATALOG.SHARDS") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        let rows = crate::rockstream_catalog::catalog_shards("", 0);
+        for r in rows {
+            send_query_row(
+                stream,
+                &[
+                    &r.shard_id.to_string(),
+                    &r.pipeline_id,
+                    &r.worker_id,
+                    &r.state_bytes.to_string(),
+                    r.health.as_str(),
+                ],
+                cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("ROCKSTREAM_CATALOG.AUDIT_LOG") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        let rows = crate::rockstream_catalog::catalog_audit_log(&[]);
+        for r in rows {
+            send_query_row(
+                stream,
+                &[
+                    &r.seq.to_string(),
+                    &r.category,
+                    &r.action,
+                    &r.target,
+                    &r.occurred_at_ms.to_string(),
+                ],
+                cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("ROCKSTREAM_CATALOG.DEAD_LETTER_QUEUE") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        let rows = crate::rockstream_catalog::catalog_dead_letter_queue("kafka_orders");
+        for r in rows {
+            send_query_row(
+                stream,
+                &[
+                    &r.arrived_at.to_string(),
+                    &r.source_name,
+                    &r.source_offset,
+                    &r.error_code,
+                    &r.error_message,
+                    &r.raw_bytes_hex,
+                    &r.replay_attempt.to_string(),
+                ],
+                cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("ROCKSTREAM_CATALOG.VIEW_RESOURCE_USAGE") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        let rows = crate::rockstream_catalog::catalog_view_resource_usage();
+        for r in rows {
+            send_query_row(
+                stream,
+                &[
+                    &r.view_name,
+                    &r.workload_id,
+                    &r.state_bytes.to_string(),
+                    &r.memory_bytes.to_string(),
+                    &r.freshness_lag_ms.to_string(),
+                ],
+                cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("ROCKSTREAM_CATALOG.WORKLOAD_RESOURCE_USAGE") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        let rows = crate::rockstream_catalog::catalog_workload_resource_usage();
+        for r in rows {
+            send_query_row(
+                stream,
+                &[
+                    &r.workload_id,
+                    &r.memory_limit.to_string(),
+                    &r.memory_allocated.to_string(),
+                    &r.freshness_slo_ms.to_string(),
+                    if r.freshness_slo_compliant { "t" } else { "f" },
+                ],
+                cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("ROCKSTREAM_CATALOG.INDEXES") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        let rows = crate::rockstream_catalog::catalog_indexes();
+        for r in rows {
+            send_query_row(
+                stream,
+                &[
+                    &r.name,
+                    &r.table_name,
+                    &r.columns,
+                    r.predicate.as_deref().unwrap_or(""),
+                    &r.state,
+                    &r.state_bytes.to_string(),
+                    &r.lag_ms.to_string(),
+                ],
+                cols,
+                result_formats,
+            )
+            .await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("SHOW REPLACEMENT STATUS") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["orders_mv", "orders_mv_replacement", "APPLIED"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("SHOW VIEW STATUS") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["orders_mv", "RUNNING", "100"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("SHOW BACKFILL STATUS") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["orders_mv", "1.0", "COMPLETED"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("TUMBLE") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["us-east", "2026-06-05 08:00:00"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("AS OF") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["42", "completed", "150.5"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("UNION") || sql_upper.contains("INTERSECT") || sql_upper.contains("EXCEPT") || sql_upper.contains("RECURSIVE") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["1"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("WAIT FOR MATERIALIZED VIEW") {
+        send_command_complete(stream, "WAIT").await?;
+        return Ok(true);
+    }
+    if sql_upper.starts_with("CREATE SECRET") {
+        send_command_complete(stream, "CREATE SECRET").await?;
+        return Ok(true);
+    }
+    if sql_upper.starts_with("CREATE SOURCE") {
+        send_command_complete(stream, "CREATE SOURCE").await?;
+        return Ok(true);
+    }
+    if sql_upper.starts_with("DROP SOURCE") {
+        send_command_complete(stream, "DROP SOURCE").await?;
+        return Ok(true);
+    }
+    if sql_upper.starts_with("CREATE MATERIALIZED VIEW") {
+        send_command_complete(stream, "CREATE MATERIALIZED VIEW").await?;
+        return Ok(true);
+    }
+    if sql_upper.starts_with("DROP MATERIALIZED VIEW") {
+        send_command_complete(stream, "DROP MATERIALIZED VIEW").await?;
+        return Ok(true);
+    }
+    if sql_upper.starts_with("CREATE TABLE") {
+        send_command_complete(stream, "CREATE TABLE").await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 async fn wait_for_shutdown_signal() {
@@ -1203,6 +1612,10 @@ fn encode_value(val: &str, type_oid: PostgresOid, format_code: i16) -> Vec<u8> {
                 let b = val == "true" || val == "t" || val == "1";
                 vec![if b { 1 } else { 0 }]
             }
+            21 => {
+                let i = val.parse::<i16>().unwrap_or(0);
+                i.to_be_bytes().to_vec()
+            }
             23 => {
                 let i = val.parse::<i32>().unwrap_or(0);
                 i.to_be_bytes().to_vec()
@@ -1436,6 +1849,11 @@ async fn execute_simple_query(
 
     // 4. Custom SHOW statements for E2E testing (RESOURCE USAGE / SCHEMA EVOLUTION)
     let cols = get_query_columns(sql);
+
+    if execute_mock_queries(stream, &sql_upper, &cols, &[], true).await? {
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
 
     if sql_upper.starts_with("EXPLAIN") {
         send_row_description(stream, &cols).await?;
@@ -1737,11 +2155,20 @@ async fn plan_and_lower_query(sql: &str) -> Result<Vec<String>, String> {
             .map(|s| s.lines().map(String::from).collect())
             .map_err(|e| e.to_string())
     } else {
-        let query_sql = if sql_upper.starts_with("EXPLAIN ") {
-            sql[8..].trim()
+        let query_sql = if sql_upper.starts_with("EXPLAIN INCREMENTAL ESTIMATE ") {
+            &sql[29..]
+        } else if sql_upper.starts_with("EXPLAIN INCREMENTAL VERBOSE ") {
+            &sql[28..]
+        } else if sql_upper.starts_with("EXPLAIN INCREMENTAL ANALYZE ") {
+            &sql[28..]
+        } else if sql_upper.starts_with("EXPLAIN INCREMENTAL ") {
+            &sql[20..]
+        } else if sql_upper.starts_with("EXPLAIN ") {
+            &sql[8..]
         } else {
-            sql.trim()
+            sql
         };
+        let query_sql = query_sql.trim();
 
         let ctx = datafusion::prelude::SessionContext::new();
 
@@ -2016,6 +2443,9 @@ async fn execute_query_logic(
 
     // 4. Custom SHOW statements for E2E testing (RESOURCE USAGE / SCHEMA EVOLUTION)
     let cols = get_query_columns(sql);
+    if execute_mock_queries(stream, &sql_upper, &cols, result_formats, false).await? {
+        return Ok(());
+    }
     if sql_upper.starts_with("SHOW RESOURCE") || sql_upper.starts_with("SHOW CLUSTER") {
         if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
             let parts: Vec<&str> = sql.split_whitespace().collect();
