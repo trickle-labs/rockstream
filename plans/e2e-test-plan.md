@@ -352,6 +352,53 @@ engines or cloud catalog services.
 - The suite is now broad enough that a change to any public surface is likely to
   fail somewhere visible.
 
+### v0.52.6 - SQL Plan Lowering and Exact Result Assertions
+
+This version verifies SQL compilation, planning, and lowering to `PlanNode` IR end-to-end via the pgwire gateway.
+
+#### Mandatory scenarios
+- **SQL Explain API**
+  - Execute `EXPLAIN <query>` for SELECT, JOIN, AGGREGATE, and WINDOW queries.
+  - Verify that the gateway returns the correct lowered plan structures (e.g. `Join`, `Aggregate`, `Window`).
+  - Verify that the plan contains correct merge law annotations (e.g. `WeightAdd/v1`, `MaxRegister/v1`) and `not_merge_safe_reason` strings.
+- **Precise Query Value Assertions**
+  - Verify that SELECT queries return exact column schemas (names, OIDs, and types).
+  - Verify that query results are validated for exact values, row counts, and column types.
+
+#### Required assertions
+- `EXPLAIN SELECT * FROM a JOIN b ON a.id = b.id` returns a plan containing a `Join` operator.
+- `EXPLAIN SELECT region, SUM(amount) FROM orders GROUP BY region` returns a plan containing `Aggregate` and merge law `WeightAdd/v1`.
+- `EXPLAIN SELECT region, MAX(amount) FROM orders GROUP BY region` returns a plan containing `Aggregate`, `MaxRegister/v1`, and reason `extremum_requires_rmw`.
+- SELECT results are matched exactly on row values rather than just asserting non-emptiness.
+
+#### v0.52.6 pass criteria
+- The SQL compiler/lowerer is exercised directly through public PG gateway connections.
+- Query result assertions are strict, verifying value correctness, column metadata, and types.
+
+### v0.52.7 - Advanced Diagnostics and Auto-Tuning CLI Validation
+
+This version validates CLI diagnostic subcommands (`tune`, `describe`, `debug-arrangement`, and `support-bundle`) against active/simulated cluster states.
+
+#### Mandatory scenarios
+- **Pipeline Description**
+  - Run `rockstream describe <pipeline>` and verify it prints a structured ASCII/Unicode DAG of the pipeline.
+- **Arrangement Debugging**
+  - Run `rockstream debug-arrangement <view> <op-id> <key>` and verify it decodes the arrangement key/metadata against registered merge laws and prints compaction metrics.
+- **Auto-Tuning Configuration**
+  - Run `rockstream tune --override` and verify it writes the overridden hysteresis configuration correctly into the storage directory.
+- **Diagnostic Archive Compilation**
+  - Run `rockstream support-bundle` and verify it compiles a valid `.tar.gz` bundle containing the real `audit.jsonl` log file.
+
+#### Required assertions
+- `rockstream describe` outputs expected DAG nodes (e.g. `Source`, `Filter`, `Project`, `Sink`).
+- `rockstream debug-arrangement` resolves the target view in the catalog and prints the correct merge law.
+- `rockstream tune` overrides write to `tuned_config.json` inside the storage root.
+- The `support-bundle` tarball is generated and contains the correct files.
+
+#### v0.52.7 pass criteria
+- Diagnostic and tuning CLI tools are verified end-to-end against real/simulated storage states.
+
+
 ## What Is Deliberately Out Of Scope
 
 The following are not part of this plan yet:

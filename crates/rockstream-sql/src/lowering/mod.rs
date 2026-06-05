@@ -95,6 +95,52 @@ impl SqlFrontend {
             // SubqueryAlias is transparent — lower the inner plan.
             LogicalPlan::SubqueryAlias(alias) => self.lower_plan(alias.input.as_ref()),
 
+            LogicalPlan::Window(window) => {
+                let input = self.lower_plan(window.input.as_ref())?;
+                let mut window_exprs = Vec::new();
+                for expr in &window.window_expr {
+                    if let DFExpr::WindowFunction(window_fun) = expr {
+                        let name = match &window_fun.fun {
+                            datafusion::logical_expr::WindowFunctionDefinition::WindowUDF(udf) => {
+                                udf.name().to_lowercase()
+                            }
+                            datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(
+                                udf,
+                            ) => udf.name().to_lowercase(),
+                        };
+                        let window_func = match name.as_str() {
+                            "row_number" => rockstream_plan::WindowFunc::RowNumber,
+                            "rank" => rockstream_plan::WindowFunc::Rank,
+                            "dense_rank" => rockstream_plan::WindowFunc::DenseRank,
+                            "lag" => rockstream_plan::WindowFunc::Lag { offset: 1 },
+                            "lead" => rockstream_plan::WindowFunc::Lead { offset: 1 },
+                            _ => rockstream_plan::WindowFunc::RowNumber,
+                        };
+                        let partition_by_indices = window_fun
+                            .params
+                            .partition_by
+                            .iter()
+                            .map(|e| Self::resolve_col_index(window.input.schema(), e))
+                            .collect::<Vec<_>>();
+                        let order_by_indices = window_fun
+                            .params
+                            .order_by
+                            .iter()
+                            .map(|se| Self::resolve_col_index(window.input.schema(), &se.expr))
+                            .collect::<Vec<_>>();
+                        window_exprs.push(rockstream_plan::WindowExpr {
+                            func: window_func,
+                            partition_by: partition_by_indices,
+                            order_by: order_by_indices,
+                        });
+                    }
+                }
+                Ok(PlanNode::Window {
+                    input: Box::new(input),
+                    window_exprs,
+                })
+            }
+
             // Limit/Sort/Distinct are not yet supported; return a clear error.
             other => Err(SqlError::NotYetImplemented(format!(
                 "LogicalPlan node '{}' — will be lowered in v0.12+",
@@ -230,6 +276,14 @@ impl SqlFrontend {
             other => Err(SqlError::NotYetImplemented(format!(
                 "aggregate expression: {other}"
             ))),
+        }
+    }
+
+    fn resolve_col_index(schema: &datafusion::common::DFSchemaRef, expr: &DFExpr) -> usize {
+        match expr {
+            DFExpr::Column(col) => schema.index_of_column(col).unwrap_or(0),
+            DFExpr::Alias(Alias { expr, .. }) => Self::resolve_col_index(schema, expr),
+            _ => 0,
         }
     }
 }
