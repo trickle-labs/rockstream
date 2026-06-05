@@ -2193,9 +2193,9 @@ async fn plan_and_lower_query(sql: &str) -> Result<Vec<String>, String> {
     } else {
         let query_sql = if sql_upper.starts_with("EXPLAIN INCREMENTAL ESTIMATE ") {
             &sql[29..]
-        } else if sql_upper.starts_with("EXPLAIN INCREMENTAL VERBOSE ") {
-            &sql[28..]
-        } else if sql_upper.starts_with("EXPLAIN INCREMENTAL ANALYZE ") {
+        } else if sql_upper.starts_with("EXPLAIN INCREMENTAL VERBOSE ")
+            || sql_upper.starts_with("EXPLAIN INCREMENTAL ANALYZE ")
+        {
             &sql[28..]
         } else if sql_upper.starts_with("EXPLAIN INCREMENTAL ") {
             &sql[20..]
