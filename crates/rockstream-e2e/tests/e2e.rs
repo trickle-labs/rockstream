@@ -1839,13 +1839,13 @@ async fn test_v0_52_8_comprehensive_language_features() {
     let temp_dir = TempDir::new().unwrap();
     let host_path = temp_dir.path().to_str().unwrap();
 
-    // Start combined role=all node
+    // Start gateway node
     let image = GenericImage::new("rockstream", "test")
         .with_exposed_port(5432.tcp())
         .with_mount(Mount::bind_mount(host_path, "/data"))
         .with_cmd(vec![
             "start".to_string(),
-            "--role=all".to_string(),
+            "--role=gateway".to_string(),
             "--storage=/data".to_string(),
         ]);
     let container = image.start().await.unwrap();
