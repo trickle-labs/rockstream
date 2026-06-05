@@ -1856,8 +1856,8 @@ async fn test_v0_52_8_comprehensive_language_features() {
         fn drop(&mut self) {
             if std::thread::panicking() {
                 let (stdout, stderr) = get_container_logs(&self.container_id);
-                println!("--- CONTAINER STDOUT ---\n{}", stdout);
-                println!("--- CONTAINER STDERR ---\n{}", stderr);
+                println!("--- CONTAINER STDOUT ---\n{stdout}");
+                println!("--- CONTAINER STDERR ---\n{stderr}");
             }
         }
     }
