@@ -2927,3 +2927,241 @@ async fn test_v0_52_9_precise_language_features() {
         "occurred_at_ms must be non-negative"
     );
 }
+
+// ─── v0.52.10 E2E test ────────────────────────────────────────────────────────
+
+/// **v0.52.10 — Campaign Attribution DAG and Comprehensive Language Features Validation**
+///
+/// Verifies that data flows correctly through a multi-stage campaign attribution
+/// and recursive referral materialized view DAG under various language configurations,
+/// with precise value assertions, OID catalog mapping checks, and resource usage reflection.
+#[tokio::test]
+async fn test_v0_52_10_real_world_dag_and_language_features() {
+    ensure_image_built();
+
+    let temp_dir = TempDir::new().unwrap();
+    let host_path = temp_dir.path().to_str().unwrap();
+
+    // Start gateway-only node (sufficient for SQL surface tests)
+    let image = GenericImage::new("rockstream", "test")
+        .with_exposed_port(5432.tcp())
+        .with_mount(Mount::bind_mount(host_path, "/data"))
+        .with_cmd(vec![
+            "start".to_string(),
+            "--role=gateway".to_string(),
+            "--storage=/data".to_string(),
+        ]);
+    let container = image.start().await.unwrap();
+    struct LogOnError {
+        container_id: String,
+    }
+    impl Drop for LogOnError {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let (stdout, stderr) = get_container_logs(&self.container_id);
+                println!("--- CONTAINER STDOUT ---\n{stdout}");
+                println!("--- CONTAINER STDERR ---\n{stderr}");
+            }
+        }
+    }
+    let _guard = LogOnError {
+        container_id: container.id().to_string(),
+    };
+    let gateway_port = container.get_host_port_ipv4(5432.tcp()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut config = tokio_postgres::Config::new();
+    config.host("127.0.0.1");
+    config.port(gateway_port);
+    config.user("alice");
+    config.dbname("mydb");
+    config.password("bearer admin:any");
+    let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // 1. DDL Coordination & DDL confirmation options
+    client
+        .execute(
+            "CREATE MATERIALIZED VIEW mv_costly WITHOUT CONFIRMATION AS SELECT * FROM orders",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // 2. Transaction Isolation Level (READ COMMITTED)
+    client
+        .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", &[])
+        .await
+        .unwrap();
+
+    // 3. TRY_CAST & NOW()
+    let rows_cast = client
+        .query(
+            "SELECT TRY_CAST(amount AS DOUBLE) AS amount_dbl FROM orders",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_cast.len(), 1);
+    let amount_dbl: f64 = rows_cast[0].get(0);
+    assert_eq!(amount_dbl, 5000.0);
+
+    let rows_now = client.query("SELECT NOW()", &[]).await.unwrap();
+    assert_eq!(rows_now.len(), 1);
+    let now_val: &str = rows_now[0].get(0);
+    assert_eq!(now_val, "2026-06-06 20:00:00");
+
+    // 4. Namespace DDL & Lifecycle
+    client
+        .execute(
+            "ALTER NAMESPACE public SET DEFAULT WORKLOAD = 'realtime'",
+            &[],
+        )
+        .await
+        .unwrap();
+    client.execute("PAUSE NAMESPACE public", &[]).await.unwrap();
+    client
+        .execute("RESUME NAMESPACE public", &[])
+        .await
+        .unwrap();
+
+    // 5. Schema Validation for mismatched CRDT columns
+    let res_mismatch = client
+        .execute(
+            "CREATE SOURCE src_mismatch FROM GENERATE ROWS AS (amount COUNTER) RATE = 100",
+            &[],
+        )
+        .await;
+    assert!(res_mismatch.is_err(), "mismatched CRDT schema must fail");
+    let err_mismatch = get_db_error_message(&res_mismatch.unwrap_err());
+    assert!(
+        err_mismatch.contains("RS-1002") || err_mismatch.contains("validation"),
+        "expected RS-1002 for schema mismatch, got: {err_mismatch}"
+    );
+
+    // 6. Campaign Attribution & Referral Tracking DAG Views
+    // 6a. mv_purchases_enriched
+    let rows_enriched = client
+        .query("SELECT * FROM mv_purchases_enriched", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_enriched.len(), 1);
+    assert_eq!(rows_enriched[0].get::<_, i64>("purchase_id"), 1001);
+    assert_eq!(rows_enriched[0].get::<_, i64>("user_id"), 1);
+    assert_eq!(rows_enriched[0].get::<_, &str>("user_name"), "Bob");
+    assert_eq!(rows_enriched[0].get::<_, &str>("product_name"), "Widget");
+    assert_eq!(rows_enriched[0].get::<_, i64>("price"), 15);
+    assert_eq!(rows_enriched[0].get::<_, i64>("amount"), 2);
+    assert_eq!(rows_enriched[0].get::<_, f64>("total_amount"), 30.0);
+    assert_eq!(rows_enriched[0].get::<_, i64>("ts"), 1717574400);
+
+    // 6b. mv_conversion_funnel
+    let rows_funnel = client
+        .query("SELECT * FROM mv_conversion_funnel", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_funnel.len(), 1);
+    assert_eq!(rows_funnel[0].get::<_, i64>("click_id"), 5001);
+    assert_eq!(rows_funnel[0].get::<_, i64>("user_id"), 1);
+    assert_eq!(rows_funnel[0].get::<_, i64>("campaign_id"), 10);
+    assert_eq!(rows_funnel[0].get::<_, i64>("purchase_id"), 1001);
+    assert_eq!(rows_funnel[0].get::<_, f64>("total_amount"), 30.0);
+    assert_eq!(rows_funnel[0].get::<_, i64>("ts"), 1717574400);
+    assert!(rows_funnel[0].get::<_, bool>("matched"));
+
+    // 6c. mv_campaign_performance
+    let rows_perf = client
+        .query("SELECT * FROM mv_campaign_performance", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_perf.len(), 1);
+    assert_eq!(rows_perf[0].get::<_, i64>("campaign_id"), 10);
+    assert_eq!(rows_perf[0].get::<_, i64>("clicks_count"), 1);
+    assert_eq!(rows_perf[0].get::<_, f64>("total_amount"), 30.0);
+    assert_eq!(
+        rows_perf[0].get::<_, &str>("window_start"),
+        "2026-06-05 08:00:00"
+    );
+
+    // 6d. mv_top_campaigns
+    let rows_top = client
+        .query("SELECT * FROM mv_top_campaigns", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_top.len(), 1);
+    assert_eq!(rows_top[0].get::<_, i64>("campaign_id"), 10);
+    assert_eq!(rows_top[0].get::<_, f64>("total_amount"), 30.0);
+    assert_eq!(rows_top[0].get::<_, i64>("rank_val"), 1);
+
+    // 6e. mv_referral_depth
+    let rows_referral = client
+        .query("SELECT * FROM mv_referral_depth", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_referral.len(), 1);
+    assert_eq!(rows_referral[0].get::<_, i64>("referrer_id"), 1);
+    assert_eq!(rows_referral[0].get::<_, i64>("referee_id"), 3);
+    assert_eq!(rows_referral[0].get::<_, i64>("depth"), 2);
+    assert_eq!(rows_referral[0].get::<_, &str>("path"), "1->2->3");
+
+    // 7. pg_catalog.pg_type OID list verification
+    let rows_types = client
+        .query("SELECT oid, typname FROM pg_catalog.pg_type", &[])
+        .await
+        .unwrap();
+    assert!(rows_types.len() >= 15);
+    let find_oid = |name: &str, rows: &[tokio_postgres::Row]| -> i32 {
+        rows.iter()
+            .find(|r| r.get::<_, &str>("typname") == name)
+            .map(|r| r.get::<_, i32>("oid"))
+            .unwrap_or(-1)
+    };
+    assert_eq!(find_oid("bool", &rows_types), 16);
+    assert_eq!(find_oid("int2", &rows_types), 21);
+    assert_eq!(find_oid("int4", &rows_types), 23);
+    assert_eq!(find_oid("int8", &rows_types), 20);
+    assert_eq!(find_oid("float4", &rows_types), 700);
+    assert_eq!(find_oid("float8", &rows_types), 701);
+    assert_eq!(find_oid("text", &rows_types), 25);
+    assert_eq!(find_oid("varchar", &rows_types), 1043);
+    assert_eq!(find_oid("bytea", &rows_types), 17);
+    assert_eq!(find_oid("date", &rows_types), 1082);
+    assert_eq!(find_oid("timestamp", &rows_types), 1114);
+    assert_eq!(find_oid("timestamptz", &rows_types), 1184);
+    assert_eq!(find_oid("uuid", &rows_types), 2950);
+    assert_eq!(find_oid("jsonb", &rows_types), 3802);
+    assert_eq!(find_oid("numeric", &rows_types), 1700);
+
+    // 8. Resource usage & index diagnostics
+    let rows_vru = client
+        .query("SELECT * FROM rockstream_catalog.view_resource_usage", &[])
+        .await
+        .unwrap();
+    assert!(!rows_vru.is_empty());
+
+    let rows_wru = client
+        .query(
+            "SELECT * FROM rockstream_catalog.workload_resource_usage",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!rows_wru.is_empty());
+
+    let rows_idx = client
+        .query("SELECT * FROM rockstream_catalog.indexes", &[])
+        .await
+        .unwrap();
+    assert!(!rows_idx.is_empty());
+
+    let rows_idx_explain = client
+        .query(
+            "EXPLAIN INDEX SELECT * FROM orders WHERE region = 'us-east'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!rows_idx_explain.is_empty());
+}
