@@ -450,6 +450,37 @@ This version implements a highly precise E2E query verification suite that evalu
 #### v0.52.9 pass criteria
 - All SQL language features are verified end-to-end with precise value assertions, compiled and executed dynamically through the gateway.
 
+### v0.52.10 - Campaign Attribution DAG and Comprehensive Language Features Validation
+
+This version expands the E2E test coverage to cover a real-world campaign attribution and recursive referral materialized view DAG under worker failover, and completes validation of all remaining language features.
+
+#### Mandatory scenarios
+- **Real-World Materialized View DAG Flow**
+  - Execute a multi-stage campaign attribution pipeline:
+    - Base tables: `clicks`, `purchases`, `referrals`, `users`, `products` populated with mock data.
+    - View 1: `mv_purchases_enriched` (joins `purchases`, `users`, `products` with INNER JOIN).
+    - View 2: `mv_conversion_funnel` (joins `clicks` and `mv_purchases_enriched` with LEFT JOIN).
+    - View 3: `mv_campaign_performance` (window time-grouping / tumbling aggregate on conversions).
+    - View 4: `mv_top_campaigns` (ranks campaigns using DENSE_RANK window function).
+    - View 5: `mv_referral_depth` (recursive referral CTE view).
+  - Verify exact row counts, values, and schemas for each view.
+- **Advanced Language Features & Precise Assertions**
+  - Verify `TRY_CAST` and `NOW()` expressions.
+  - Verify setting transaction isolation level `READ COMMITTED`.
+  - Verify schema/namespace-level default workloads (`ALTER NAMESPACE SET DEFAULT WORKLOAD`) and lifecycle controls (`PAUSE NAMESPACE`, `RESUME NAMESPACE`).
+  - Verify validation check that rejects mismatched CRDT column schemas.
+  - Verify full index lifecycle and resource usage catalog queries.
+  - Verify all 15 Postgres type OIDs in `pg_catalog.pg_type`.
+  - Verify expensive view creation using `WITHOUT CONFIRMATION`.
+
+#### Required assertions
+- Queries on the campaign attribution DAG views return exact schemas, types, and values.
+- Mismatched CRDT column schemas are rejected with a catalog validation error.
+- All 15 Postgres OIDs are returned correctly by `pg_catalog.pg_type`.
+- DDL coordination features and transaction isolation level settings execute successfully.
+
+#### v0.52.10 pass criteria
+- A complex, multi-stage materialized view DAG is executed and verified with exact value assertions. All remaining language features are validated, and the system catalog accurately reports OIDs and resources.
 
 ## What Is Deliberately Out Of Scope
 

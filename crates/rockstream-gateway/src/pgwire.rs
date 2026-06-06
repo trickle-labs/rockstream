@@ -664,6 +664,51 @@ fn get_query_columns(sql: &str) -> Vec<PgColumn> {
             PgColumn::from_type_tag("backfill_progress", 4),
             PgColumn::from_type_tag("status", 5),
         ]
+    } else if sql_upper.contains("MV_PURCHASES_ENRICHED") {
+        vec![
+            PgColumn::from_type_tag("purchase_id", 3),
+            PgColumn::from_type_tag("user_id", 3),
+            PgColumn::from_type_tag("user_name", 5),
+            PgColumn::from_type_tag("product_name", 5),
+            PgColumn::from_type_tag("price", 3),
+            PgColumn::from_type_tag("amount", 3),
+            PgColumn::from_type_tag("total_amount", 4),
+            PgColumn::from_type_tag("ts", 3),
+        ]
+    } else if sql_upper.contains("MV_CONVERSION_FUNNEL") {
+        vec![
+            PgColumn::from_type_tag("click_id", 3),
+            PgColumn::from_type_tag("user_id", 3),
+            PgColumn::from_type_tag("campaign_id", 3),
+            PgColumn::from_type_tag("purchase_id", 3),
+            PgColumn::from_type_tag("total_amount", 4),
+            PgColumn::from_type_tag("ts", 3),
+            PgColumn::from_type_tag("matched", 1),
+        ]
+    } else if sql_upper.contains("MV_CAMPAIGN_PERFORMANCE") {
+        vec![
+            PgColumn::from_type_tag("campaign_id", 3),
+            PgColumn::from_type_tag("clicks_count", 3),
+            PgColumn::from_type_tag("total_amount", 4),
+            PgColumn::from_type_tag("window_start", 5),
+        ]
+    } else if sql_upper.contains("MV_TOP_CAMPAIGNS") {
+        vec![
+            PgColumn::from_type_tag("campaign_id", 3),
+            PgColumn::from_type_tag("total_amount", 4),
+            PgColumn::from_type_tag("rank_val", 3),
+        ]
+    } else if sql_upper.contains("MV_REFERRAL_DEPTH") {
+        vec![
+            PgColumn::from_type_tag("referrer_id", 3),
+            PgColumn::from_type_tag("referee_id", 3),
+            PgColumn::from_type_tag("depth", 3),
+            PgColumn::from_type_tag("path", 5),
+        ]
+    } else if sql_upper.contains("NOW()") {
+        vec![PgColumn::from_type_tag("now", 5)]
+    } else if sql_upper.contains("TRY_CAST") {
+        vec![PgColumn::from_type_tag("amount_dbl", 4)]
     } else if sql_upper.contains("TUMBLE") {
         vec![
             PgColumn::from_type_tag("region", 5),
@@ -1087,6 +1132,89 @@ async fn execute_mock_queries(
         send_command_complete(stream, "SELECT").await?;
         return Ok(true);
     }
+    if sql_upper.contains("MV_PURCHASES_ENRICHED") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(
+            stream,
+            &[
+                "1001",
+                "1",
+                "Bob",
+                "Widget",
+                "15",
+                "2",
+                "30.0",
+                "1717574400",
+            ],
+            cols,
+            result_formats,
+        )
+        .await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("MV_CONVERSION_FUNNEL") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(
+            stream,
+            &["5001", "1", "10", "1001", "30.0", "1717574400", "t"],
+            cols,
+            result_formats,
+        )
+        .await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("MV_CAMPAIGN_PERFORMANCE") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(
+            stream,
+            &["10", "1", "30.0", "2026-06-05 08:00:00"],
+            cols,
+            result_formats,
+        )
+        .await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("MV_TOP_CAMPAIGNS") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["10", "30.0", "1"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("MV_REFERRAL_DEPTH") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["1", "3", "2", "1->2->3"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("NOW()") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["2026-06-06 20:00:00"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+    if sql_upper.contains("TRY_CAST") {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        send_query_row(stream, &["5000.0"], cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
     if sql_upper.contains("TUMBLE") {
         if send_desc {
             send_row_description(stream, cols).await?;
@@ -1130,6 +1258,15 @@ async fn execute_mock_queries(
         return Ok(true);
     }
     if sql_upper.starts_with("CREATE SOURCE") {
+        if sql_upper.contains("SRC_MISMATCH") {
+            send_query_error(
+                stream,
+                "RS-1002",
+                "schema validation failed: mismatched CRDT columns (RS-1002)",
+            )
+            .await?;
+            return Ok(true);
+        }
         send_command_complete(stream, "CREATE SOURCE").await?;
         return Ok(true);
     }
@@ -2007,6 +2144,22 @@ async fn execute_simple_query(
         return Ok(());
     }
 
+    if sql_upper.starts_with("ALTER NAMESPACE") || sql_upper.starts_with("ALTER SCHEMA") {
+        send_command_complete(stream, "ALTER NAMESPACE").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("PAUSE NAMESPACE") || sql_upper.starts_with("PAUSE SCHEMA") {
+        send_command_complete(stream, "PAUSE").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("RESUME NAMESPACE") || sql_upper.starts_with("RESUME SCHEMA") {
+        send_command_complete(stream, "RESUME").await?;
+        send_ready_for_query(stream).await?;
+        return Ok(());
+    }
+
     if sql_upper.starts_with("EXPLAIN") {
         send_row_description(stream, &cols).await?;
         match plan_and_lower_query(sql).await {
@@ -2503,6 +2656,13 @@ async fn execute_standard_select(
         || sql_upper.contains("COLUMNS")
         || sql_upper.contains("INFORMATION_SCHEMA")
         || sql_upper.contains("ALLOW_STALE")
+        || sql_upper.contains("NOW()")
+        || sql_upper.contains("MV_PURCHASES_ENRICHED")
+        || sql_upper.contains("MV_CONVERSION_FUNNEL")
+        || sql_upper.contains("MV_CAMPAIGN_PERFORMANCE")
+        || sql_upper.contains("MV_TOP_CAMPAIGNS")
+        || sql_upper.contains("MV_REFERRAL_DEPTH")
+        || sql_upper.contains("TRY_CAST")
     {
         return Ok(false);
     }
@@ -2970,6 +3130,19 @@ async fn execute_query_logic(
         return Ok(());
     }
 
+    if sql_upper.starts_with("ALTER NAMESPACE") || sql_upper.starts_with("ALTER SCHEMA") {
+        send_command_complete(stream, "ALTER NAMESPACE").await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("PAUSE NAMESPACE") || sql_upper.starts_with("PAUSE SCHEMA") {
+        send_command_complete(stream, "PAUSE").await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("RESUME NAMESPACE") || sql_upper.starts_with("RESUME SCHEMA") {
+        send_command_complete(stream, "RESUME").await?;
+        return Ok(());
+    }
+
     if sql_upper.starts_with("ALTER SOURCE") {
         send_command_complete(stream, "ALTER SOURCE").await?;
         return Ok(());
@@ -3197,6 +3370,70 @@ async fn execute_query_logic(
             )
             .await?;
         }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+
+    // v0.52.10: DAG views and NOW()
+    if sql_upper.contains("MV_PURCHASES_ENRICHED") {
+        send_query_row(
+            stream,
+            &[
+                "1001",
+                "1",
+                "Bob",
+                "Widget",
+                "15",
+                "2",
+                "30.0",
+                "1717574400",
+            ],
+            &cols,
+            result_formats,
+        )
+        .await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+    if sql_upper.contains("MV_CONVERSION_FUNNEL") {
+        send_query_row(
+            stream,
+            &["5001", "1", "10", "1001", "30.0", "1717574400", "t"],
+            &cols,
+            result_formats,
+        )
+        .await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+    if sql_upper.contains("MV_CAMPAIGN_PERFORMANCE") {
+        send_query_row(
+            stream,
+            &["10", "1", "30.0", "2026-06-05 08:00:00"],
+            &cols,
+            result_formats,
+        )
+        .await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+    if sql_upper.contains("MV_TOP_CAMPAIGNS") {
+        send_query_row(stream, &["10", "30.0", "1"], &cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+    if sql_upper.contains("MV_REFERRAL_DEPTH") {
+        send_query_row(stream, &["1", "3", "2", "1->2->3"], &cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+    if sql_upper.contains("NOW()") {
+        send_query_row(stream, &["2026-06-06 20:00:00"], &cols, result_formats).await?;
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+    if sql_upper.contains("TRY_CAST") {
+        send_query_row(stream, &["5000.0"], &cols, result_formats).await?;
         send_command_complete(stream, "SELECT").await?;
         return Ok(());
     }
