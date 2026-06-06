@@ -4030,7 +4030,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "clap",
  "datafusion",
@@ -4049,7 +4049,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-catalog"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "rockstream-diff",
  "rockstream-plan",
@@ -4061,14 +4061,14 @@ dependencies = [
 
 [[package]]
 name = "rockstream-cli"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "rockstream-types",
 ]
 
 [[package]]
 name = "rockstream-connectors"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "async-trait",
  "rand 0.8.6",
@@ -4079,7 +4079,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-control"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "parking_lot",
  "rockstream-types",
@@ -4093,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-diff"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "rockstream-plan",
  "rockstream-types",
@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-e2e"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -4113,7 +4113,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-gateway"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "datafusion",
  "object_store 0.12.5",
@@ -4129,7 +4129,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-ops"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4147,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-oracle"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "arrow",
  "datafusion",
@@ -4166,14 +4166,14 @@ dependencies = [
 
 [[package]]
 name = "rockstream-plan"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "rockstream-types",
 ]
 
 [[package]]
 name = "rockstream-runtime"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4196,7 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sim"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4208,7 +4208,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sql"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "datafusion",
  "rand 0.8.6",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-storage"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "bytes",
  "object_store 0.12.5",
@@ -4236,7 +4236,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-types"
-version = "0.52.7"
+version = "0.52.9"
 dependencies = [
  "arrow",
  "serde",

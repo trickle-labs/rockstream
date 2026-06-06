@@ -2305,7 +2305,10 @@ async fn test_v0_52_9_precise_language_features() {
 
     // 1a. LEFT JOIN — must return "matched" column indicating outer join result
     let rows_lj = client
-        .query("SELECT order_id, customer, price, matched FROM a LEFT JOIN b ON a.id = b.id", &[])
+        .query(
+            "SELECT order_id, customer, price, matched FROM a LEFT JOIN b ON a.id = b.id",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(rows_lj.len(), 1, "LEFT JOIN must return 1 row");
@@ -2316,7 +2319,10 @@ async fn test_v0_52_9_precise_language_features() {
 
     // 1b. RIGHT JOIN
     let rows_rj = client
-        .query("SELECT order_id, customer, price, matched FROM a RIGHT JOIN b ON a.id = b.id", &[])
+        .query(
+            "SELECT order_id, customer, price, matched FROM a RIGHT JOIN b ON a.id = b.id",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(rows_rj.len(), 1, "RIGHT JOIN must return 1 row");
@@ -2324,14 +2330,20 @@ async fn test_v0_52_9_precise_language_features() {
 
     // 1c. FULL OUTER JOIN
     let rows_fj = client
-        .query("SELECT order_id, customer, price, matched FROM a FULL OUTER JOIN b ON a.id = b.id", &[])
+        .query(
+            "SELECT order_id, customer, price, matched FROM a FULL OUTER JOIN b ON a.id = b.id",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(rows_fj.len(), 1, "FULL OUTER JOIN must return 1 row");
 
     // 1d. CROSS JOIN
     let rows_cj = client
-        .query("SELECT order_id, customer, price, matched FROM a CROSS JOIN b", &[])
+        .query(
+            "SELECT order_id, customer, price, matched FROM a CROSS JOIN b",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(rows_cj.len(), 1, "CROSS JOIN must return 1 row");
@@ -2340,7 +2352,10 @@ async fn test_v0_52_9_precise_language_features() {
 
     // 2a. UNION ALL — combined set (mock returns 1 row)
     let rows_union_all = client
-        .query("SELECT id, name FROM a UNION ALL SELECT id, name FROM a", &[])
+        .query(
+            "SELECT id, name FROM a UNION ALL SELECT id, name FROM a",
+            &[],
+        )
         .await
         .unwrap();
     assert!(!rows_union_all.is_empty(), "UNION ALL must return rows");
@@ -2348,7 +2363,10 @@ async fn test_v0_52_9_precise_language_features() {
 
     // 2b. INTERSECT — common elements
     let rows_inter = client
-        .query("SELECT id, name FROM a INTERSECT SELECT id, name FROM b", &[])
+        .query(
+            "SELECT id, name FROM a INTERSECT SELECT id, name FROM b",
+            &[],
+        )
         .await
         .unwrap();
     assert!(!rows_inter.is_empty(), "INTERSECT must return rows");
@@ -2401,7 +2419,10 @@ async fn test_v0_52_9_precise_language_features() {
     // ── 4. AVG / MEAN aggregation (SumCount/v1) ───────────────────────────────
 
     let rows_avg = client
-        .query("SELECT region, AVG(amount) AS avg_amount FROM orders GROUP BY region", &[])
+        .query(
+            "SELECT region, AVG(amount) AS avg_amount FROM orders GROUP BY region",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(rows_avg.len(), 1, "AVG must return 1 row");
@@ -2410,7 +2431,10 @@ async fn test_v0_52_9_precise_language_features() {
     assert!(avg_val > 0.0, "avg_amount must be positive, got: {avg_val}");
 
     let rows_mean = client
-        .query("SELECT region, MEAN(amount) AS avg_amount FROM orders GROUP BY region", &[])
+        .query(
+            "SELECT region, MEAN(amount) AS avg_amount FROM orders GROUP BY region",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(rows_mean.len(), 1, "MEAN must return 1 row");
@@ -2444,10 +2468,17 @@ async fn test_v0_52_9_precise_language_features() {
 
     // Also test via SELECT with ALLOW_STALE = true pattern
     let rows_stale2 = client
-        .query("SELECT order_id, status FROM orders_mv WHERE ALLOW_STALE = true", &[])
+        .query(
+            "SELECT order_id, status FROM orders_mv WHERE ALLOW_STALE = true",
+            &[],
+        )
         .await
         .unwrap();
-    assert_eq!(rows_stale2.len(), 1, "ALLOW_STALE with boolean must return 1 row");
+    assert_eq!(
+        rows_stale2.len(),
+        1,
+        "ALLOW_STALE with boolean must return 1 row"
+    );
 
     // ── 7. Write fence tokens ─────────────────────────────────────────────────
 
@@ -2471,9 +2502,15 @@ async fn test_v0_52_9_precise_language_features() {
 
     // Without idempotency key, INSERT into COUNTERS table must fail
     let res_no_key = client
-        .execute("INSERT INTO counters (account, amount) VALUES ('alice', 50)", &[])
+        .execute(
+            "INSERT INTO counters (account, amount) VALUES ('alice', 50)",
+            &[],
+        )
         .await;
-    assert!(res_no_key.is_err(), "INSERT to COUNTERS without idempotency key must fail");
+    assert!(
+        res_no_key.is_err(),
+        "INSERT to COUNTERS without idempotency key must fail"
+    );
     let err_no_key = get_db_error_message(&res_no_key.unwrap_err());
     assert!(
         err_no_key.contains("RS-2007"),
@@ -2486,7 +2523,10 @@ async fn test_v0_52_9_precise_language_features() {
         .await
         .unwrap();
     client
-        .execute("INSERT INTO counters (account, amount) VALUES ('alice', 50)", &[])
+        .execute(
+            "INSERT INTO counters (account, amount) VALUES ('alice', 50)",
+            &[],
+        )
         .await
         .unwrap();
 
@@ -2496,9 +2536,15 @@ async fn test_v0_52_9_precise_language_features() {
         .await
         .unwrap();
     let res_no_key2 = client
-        .execute("UPDATE counters SET amount = 100 WHERE account = 'alice'", &[])
+        .execute(
+            "UPDATE counters SET amount = 100 WHERE account = 'alice'",
+            &[],
+        )
         .await;
-    assert!(res_no_key2.is_err(), "UPDATE to COUNTERS without idempotency key must fail");
+    assert!(
+        res_no_key2.is_err(),
+        "UPDATE to COUNTERS without idempotency key must fail"
+    );
     let err2 = get_db_error_message(&res_no_key2.unwrap_err());
     assert!(
         err2.contains("RS-2007"),
@@ -2531,10 +2577,16 @@ async fn test_v0_52_9_precise_language_features() {
     assert_eq!(rows_epoch.len(), 1, "AS OF EPOCH must return 1 row");
     assert_eq!(rows_epoch[0].get::<_, i64>("order_id"), 42);
     assert_eq!(rows_epoch[0].get::<_, &str>("status"), "completed");
-    assert!(rows_epoch[0].get::<_, f64>("amount") > 0.0, "amount must be positive");
+    assert!(
+        rows_epoch[0].get::<_, f64>("amount") > 0.0,
+        "amount must be positive"
+    );
 
     let rows_ts = client
-        .query("SELECT * FROM orders_mv AS OF TIMESTAMP '2026-06-01 00:00:00'", &[])
+        .query(
+            "SELECT * FROM orders_mv AS OF TIMESTAMP '2026-06-01 00:00:00'",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(rows_ts.len(), 1, "AS OF TIMESTAMP must return 1 row");
@@ -2544,7 +2596,11 @@ async fn test_v0_52_9_precise_language_features() {
         .query("SELECT * FROM orders_mv AS OF NOW WITH SNAPSHOT", &[])
         .await
         .unwrap();
-    assert_eq!(rows_snap.len(), 1, "AS OF NOW WITH SNAPSHOT must return 1 row");
+    assert_eq!(
+        rows_snap.len(),
+        1,
+        "AS OF NOW WITH SNAPSHOT must return 1 row"
+    );
 
     // ── 11. pg_catalog.pg_type precise OID verification ──────────────────────
 
@@ -2566,10 +2622,22 @@ async fn test_v0_52_9_precise_language_features() {
     assert_eq!(find_type("bool", &rows_types), 16, "bool OID must be 16");
     assert_eq!(find_type("int4", &rows_types), 23, "int4 OID must be 23");
     assert_eq!(find_type("int8", &rows_types), 20, "int8 OID must be 20");
-    assert_eq!(find_type("float8", &rows_types), 701, "float8 OID must be 701");
+    assert_eq!(
+        find_type("float8", &rows_types),
+        701,
+        "float8 OID must be 701"
+    );
     assert_eq!(find_type("text", &rows_types), 25, "text OID must be 25");
-    assert_eq!(find_type("uuid", &rows_types), 2950, "uuid OID must be 2950");
-    assert_eq!(find_type("jsonb", &rows_types), 3802, "jsonb OID must be 3802");
+    assert_eq!(
+        find_type("uuid", &rows_types),
+        2950,
+        "uuid OID must be 2950"
+    );
+    assert_eq!(
+        find_type("jsonb", &rows_types),
+        3802,
+        "jsonb OID must be 3802"
+    );
 
     // ── 12. CRDT catalog: merge law properties ────────────────────────────────
 
@@ -2579,19 +2647,35 @@ async fn test_v0_52_9_precise_language_features() {
         .unwrap();
     assert!(rows_laws.len() >= 6, "merge_laws must have at least 6 rows");
 
-    let weight_add = rows_laws.iter().find(|r| r.get::<_, &str>("name") == "WeightAdd");
+    let weight_add = rows_laws
+        .iter()
+        .find(|r| r.get::<_, &str>("name") == "WeightAdd");
     assert!(weight_add.is_some(), "WeightAdd law must be present");
     let wa = weight_add.unwrap();
     assert_eq!(wa.get::<_, &str>("class"), "AbelianGroup");
-    assert!(wa.get::<_, bool>("associative"), "WeightAdd must be associative");
-    assert!(wa.get::<_, bool>("commutative"), "WeightAdd must be commutative");
-    assert!(wa.get::<_, bool>("has_inverse"), "WeightAdd must have inverse");
+    assert!(
+        wa.get::<_, bool>("associative"),
+        "WeightAdd must be associative"
+    );
+    assert!(
+        wa.get::<_, bool>("commutative"),
+        "WeightAdd must be commutative"
+    );
+    assert!(
+        wa.get::<_, bool>("has_inverse"),
+        "WeightAdd must have inverse"
+    );
 
-    let max_reg = rows_laws.iter().find(|r| r.get::<_, &str>("name") == "MaxRegister");
+    let max_reg = rows_laws
+        .iter()
+        .find(|r| r.get::<_, &str>("name") == "MaxRegister");
     assert!(max_reg.is_some(), "MaxRegister law must be present");
     let mr = max_reg.unwrap();
     assert_eq!(mr.get::<_, &str>("class"), "Semilattice");
-    assert!(!mr.get::<_, bool>("has_inverse"), "MaxRegister must not have inverse");
+    assert!(
+        !mr.get::<_, bool>("has_inverse"),
+        "MaxRegister must not have inverse"
+    );
 
     // ── 13. information_schema.columns OID check ─────────────────────────────
 
@@ -2602,12 +2686,18 @@ async fn test_v0_52_9_precise_language_features() {
         )
         .await
         .unwrap();
-    assert!(!rows_cols.is_empty(), "information_schema.columns must return rows");
+    assert!(
+        !rows_cols.is_empty(),
+        "information_schema.columns must return rows"
+    );
     let order_id_col = rows_cols.iter().find(|r| {
         r.get::<_, &str>("table_name") == "orders_mv"
             && r.get::<_, &str>("column_name") == "order_id"
     });
-    assert!(order_id_col.is_some(), "orders_mv.order_id must appear in information_schema");
+    assert!(
+        order_id_col.is_some(),
+        "orders_mv.order_id must appear in information_schema"
+    );
     assert_eq!(
         order_id_col.unwrap().get::<_, i32>("udt_oid"),
         20,
@@ -2623,19 +2713,36 @@ async fn test_v0_52_9_precise_language_features() {
         )
         .await
         .unwrap();
-    assert!(!rows_explain_dr.is_empty(), "EXPLAIN DENSE_RANK must return plan lines");
-    let plan_dr = rows_explain_dr.iter().map(|r| r.get::<_, &str>(0)).collect::<Vec<_>>().join("\n");
+    assert!(
+        !rows_explain_dr.is_empty(),
+        "EXPLAIN DENSE_RANK must return plan lines"
+    );
+    let plan_dr = rows_explain_dr
+        .iter()
+        .map(|r| r.get::<_, &str>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         plan_dr.contains("Window") || plan_dr.contains("Aggregate"),
         "DENSE_RANK plan must contain Window or Aggregate, got:\n{plan_dr}"
     );
 
     let rows_explain_avg = client
-        .query("EXPLAIN SELECT region, AVG(amount) FROM orders GROUP BY region", &[])
+        .query(
+            "EXPLAIN SELECT region, AVG(amount) FROM orders GROUP BY region",
+            &[],
+        )
         .await
         .unwrap();
-    assert!(!rows_explain_avg.is_empty(), "EXPLAIN AVG must return plan lines");
-    let plan_avg = rows_explain_avg.iter().map(|r| r.get::<_, &str>(0)).collect::<Vec<_>>().join("\n");
+    assert!(
+        !rows_explain_avg.is_empty(),
+        "EXPLAIN AVG must return plan lines"
+    );
+    let plan_avg = rows_explain_avg
+        .iter()
+        .map(|r| r.get::<_, &str>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         plan_avg.contains("Aggregate"),
         "AVG plan must contain Aggregate operator, got:\n{plan_avg}"
@@ -2649,8 +2756,15 @@ async fn test_v0_52_9_precise_language_features() {
         .query("EXPLAIN SELECT * FROM a LEFT JOIN b ON a.id = b.id", &[])
         .await
         .unwrap();
-    assert!(!rows_explain_lj.is_empty(), "EXPLAIN LEFT JOIN must return plan lines");
-    let plan_lj = rows_explain_lj.iter().map(|r| r.get::<_, &str>(0)).collect::<Vec<_>>().join("\n");
+    assert!(
+        !rows_explain_lj.is_empty(),
+        "EXPLAIN LEFT JOIN must return plan lines"
+    );
+    let plan_lj = rows_explain_lj
+        .iter()
+        .map(|r| r.get::<_, &str>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         plan_lj.contains("Join"),
         "LEFT JOIN plan must contain Join operator, got:\n{plan_lj}"
@@ -2665,14 +2779,23 @@ async fn test_v0_52_9_precise_language_features() {
     assert_eq!(rows_dlq.len(), 1, "DLQ must return 1 row");
     assert_eq!(rows_dlq[0].get::<_, &str>("error_code"), "RS-1003");
     let replay: i32 = rows_dlq[0].get("replay_attempt");
-    assert!(replay >= 0, "replay_attempt must be non-negative, got: {replay}");
+    assert!(
+        replay >= 0,
+        "replay_attempt must be non-negative, got: {replay}"
+    );
 
     client
-        .execute("ALTER SOURCE kafka_orders REPLAY DEAD_LETTER_QUEUE SINCE 1000 UNTIL 9999", &[])
+        .execute(
+            "ALTER SOURCE kafka_orders REPLAY DEAD_LETTER_QUEUE SINCE 1000 UNTIL 9999",
+            &[],
+        )
         .await
         .unwrap();
     client
-        .execute("ALTER SOURCE kafka_orders DISMISS DEAD_LETTER_QUEUE WHERE error_code = 'RS-1003'", &[])
+        .execute(
+            "ALTER SOURCE kafka_orders DISMISS DEAD_LETTER_QUEUE WHERE error_code = 'RS-1003'",
+            &[],
+        )
         .await
         .unwrap();
 
@@ -2699,10 +2822,17 @@ async fn test_v0_52_9_precise_language_features() {
     );
 
     let rows_rs = client
-        .query("SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW orders_mv", &[])
+        .query(
+            "SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW orders_mv",
+            &[],
+        )
         .await
         .unwrap();
-    assert_eq!(rows_rs.len(), 1, "SHOW REPLACEMENT STATUS must return 1 row");
+    assert_eq!(
+        rows_rs.len(),
+        1,
+        "SHOW REPLACEMENT STATUS must return 1 row"
+    );
     assert_eq!(rows_rs[0].get::<_, &str>("status"), "APPLIED");
 
     // ── 17. Schema evolution ──────────────────────────────────────────────────
@@ -2711,19 +2841,33 @@ async fn test_v0_52_9_precise_language_features() {
         .query("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA public", &[])
         .await
         .unwrap();
-    assert_eq!(rows_se.len(), 1, "SHOW SCHEMA_EVOLUTION STATUS must return 1 row");
+    assert_eq!(
+        rows_se.len(),
+        1,
+        "SHOW SCHEMA_EVOLUTION STATUS must return 1 row"
+    );
     assert_eq!(rows_se[0].get::<_, &str>("schema_name"), "public");
     assert_eq!(rows_se[0].get::<_, &str>("status"), "UP-TO-DATE");
     assert_eq!(rows_se[0].get::<_, i32>("pending_changes"), 0);
 
     let rows_seh = client
-        .query("SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW orders_mv", &[])
+        .query(
+            "SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW orders_mv",
+            &[],
+        )
         .await
         .unwrap();
-    assert_eq!(rows_seh.len(), 1, "SHOW SCHEMA_EVOLUTION HISTORY must return 1 row");
+    assert_eq!(
+        rows_seh.len(),
+        1,
+        "SHOW SCHEMA_EVOLUTION HISTORY must return 1 row"
+    );
     assert_eq!(rows_seh[0].get::<_, &str>("view_name"), "orders_mv");
     assert_eq!(rows_seh[0].get::<_, i32>("version"), 1);
-    assert!(rows_seh[0].get::<_, bool>("compatible"), "schema evolution must be compatible");
+    assert!(
+        rows_seh[0].get::<_, bool>("compatible"),
+        "schema evolution must be compatible"
+    );
 
     // ── 18. Indexes catalog ───────────────────────────────────────────────────
 
@@ -2774,7 +2918,10 @@ async fn test_v0_52_9_precise_language_features() {
         .unwrap();
     assert_eq!(rows_audit.len(), 1, "audit_log must return 1 row");
     assert_eq!(rows_audit[0].get::<_, i64>("seq"), 9001);
-    assert!(!rows_audit[0].get::<_, &str>("action").is_empty(), "action must not be empty");
+    assert!(
+        !rows_audit[0].get::<_, &str>("action").is_empty(),
+        "action must not be empty"
+    );
     assert!(
         rows_audit[0].get::<_, i64>("occurred_at_ms") >= 0,
         "occurred_at_ms must be non-negative"

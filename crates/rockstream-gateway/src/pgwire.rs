@@ -1918,15 +1918,18 @@ async fn execute_simple_query(
     }
 
     // RS-2007 check for non-idempotent DML
-    if (sql_upper.starts_with("INSERT") || sql_upper.starts_with("UPDATE") || sql_upper.starts_with("DELETE"))
+    if (sql_upper.starts_with("INSERT")
+        || sql_upper.starts_with("UPDATE")
+        || sql_upper.starts_with("DELETE"))
         && sql_upper.contains("COUNTERS")
         && idempotency_key.is_none()
     {
         send_query_error(
             stream,
             "RS-2007",
-            "idempotency key required for non-idempotent write (RS-2007)"
-        ).await?;
+            "idempotency key required for non-idempotent write (RS-2007)",
+        )
+        .await?;
         send_ready_for_query(stream).await?;
         return Ok(());
     }
@@ -1936,8 +1939,8 @@ async fn execute_simple_query(
         Ok(true) => {
             send_ready_for_query(stream).await?;
             return Ok(());
-        },
-        Ok(false) => {}, // fallback
+        }
+        Ok(false) => {} // fallback
         Err(e) => {
             send_query_error(stream, "RS-2001", &e).await?;
             send_ready_for_query(stream).await?;
@@ -2506,9 +2509,9 @@ async fn execute_standard_select(
 
     let ctx = datafusion::prelude::SessionContext::new();
 
+    use datafusion::arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray};
     use datafusion::datasource::MemTable;
     use std::sync::Arc;
 
@@ -2527,11 +2530,13 @@ async fn execute_standard_select(
             Arc::new(Int64Array::from(vec![200])),
             Arc::new(Int64Array::from(vec![1717574400])),
         ],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     ctx.register_table(
         "orders",
         Arc::new(MemTable::try_new(orders_schema, vec![vec![orders_batch]]).unwrap()),
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     let products_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -2545,11 +2550,13 @@ async fn execute_standard_select(
             Arc::new(StringArray::from(vec!["Widget"])),
             Arc::new(Int64Array::from(vec![15])),
         ],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     ctx.register_table(
         "products",
         Arc::new(MemTable::try_new(products_schema, vec![vec![products_batch]]).unwrap()),
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     let events_schema = Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
@@ -2563,11 +2570,13 @@ async fn execute_standard_select(
             Arc::new(StringArray::from(vec!["click"])),
             Arc::new(Int64Array::from(vec![1])),
         ],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     ctx.register_table(
         "events",
         Arc::new(MemTable::try_new(events_schema, vec![vec![events_batch]]).unwrap()),
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     let a_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -2585,11 +2594,13 @@ async fn execute_standard_select(
             Arc::new(StringArray::from(vec!["Alice"])),
             Arc::new(Float64Array::from(vec![45.5])),
         ],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     ctx.register_table(
         "a",
         Arc::new(MemTable::try_new(a_schema, vec![vec![a_batch]]).unwrap()),
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     let b_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -2603,11 +2614,13 @@ async fn execute_standard_select(
             Arc::new(Int64Array::from(vec![10])),
             Arc::new(Float64Array::from(vec![45.5])),
         ],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     ctx.register_table(
         "b",
         Arc::new(MemTable::try_new(b_schema, vec![vec![b_batch]]).unwrap()),
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     let users_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -2621,11 +2634,13 @@ async fn execute_standard_select(
             Arc::new(StringArray::from(vec!["Bob"])),
             Arc::new(Int64Array::from(vec![1])),
         ],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     ctx.register_table(
         "users",
         Arc::new(MemTable::try_new(users_schema, vec![vec![users_batch]]).unwrap()),
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     // 1. Compile & Lower using rockstream_sql::SqlFrontend
     match ctx.sql(sql).await {
@@ -2660,7 +2675,9 @@ async fn execute_standard_select(
                 .collect();
 
             // 4. Send RowDescription
-            send_row_description(stream, &cols).await.map_err(|e| e.to_string())?;
+            send_row_description(stream, &cols)
+                .await
+                .map_err(|e| e.to_string())?;
 
             // 5. Send RowData
             for batch in batches {
@@ -2674,53 +2691,76 @@ async fn execute_standard_select(
                             "".to_string()
                         } else {
                             match array.data_type() {
-                                DataType::Int8 => {
-                                    array.as_any().downcast_ref::<datafusion::arrow::array::Int8Array>().map(|a| a.value(r).to_string())
-                                        .unwrap_or_default()
-                                }
-                                DataType::Int16 => {
-                                    array.as_any().downcast_ref::<datafusion::arrow::array::Int16Array>().map(|a| a.value(r).to_string())
-                                        .unwrap_or_default()
-                                }
-                                DataType::Int32 => {
-                                    array.as_any().downcast_ref::<datafusion::arrow::array::Int32Array>().map(|a| a.value(r).to_string())
-                                        .unwrap_or_default()
-                                }
-                                DataType::Int64 => {
-                                    array.as_any().downcast_ref::<Int64Array>().map(|a| a.value(r).to_string()).unwrap_or_default()
-                                }
-                                DataType::Float32 => {
-                                    array.as_any().downcast_ref::<datafusion::arrow::array::Float32Array>().map(|a| a.value(r).to_string())
-                                        .unwrap_or_default()
-                                }
-                                DataType::Float64 => {
-                                    array.as_any().downcast_ref::<Float64Array>().map(|a| a.value(r).to_string()).unwrap_or_default()
-                                }
-                                DataType::Utf8 => {
-                                    array.as_any().downcast_ref::<StringArray>().map(|a| a.value(r).to_string()).unwrap_or_default()
-                                }
+                                DataType::Int8 => array
+                                    .as_any()
+                                    .downcast_ref::<datafusion::arrow::array::Int8Array>()
+                                    .map(|a| a.value(r).to_string())
+                                    .unwrap_or_default(),
+                                DataType::Int16 => array
+                                    .as_any()
+                                    .downcast_ref::<datafusion::arrow::array::Int16Array>()
+                                    .map(|a| a.value(r).to_string())
+                                    .unwrap_or_default(),
+                                DataType::Int32 => array
+                                    .as_any()
+                                    .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                                    .map(|a| a.value(r).to_string())
+                                    .unwrap_or_default(),
+                                DataType::Int64 => array
+                                    .as_any()
+                                    .downcast_ref::<Int64Array>()
+                                    .map(|a| a.value(r).to_string())
+                                    .unwrap_or_default(),
+                                DataType::Float32 => array
+                                    .as_any()
+                                    .downcast_ref::<datafusion::arrow::array::Float32Array>()
+                                    .map(|a| a.value(r).to_string())
+                                    .unwrap_or_default(),
+                                DataType::Float64 => array
+                                    .as_any()
+                                    .downcast_ref::<Float64Array>()
+                                    .map(|a| a.value(r).to_string())
+                                    .unwrap_or_default(),
+                                DataType::Utf8 => array
+                                    .as_any()
+                                    .downcast_ref::<StringArray>()
+                                    .map(|a| a.value(r).to_string())
+                                    .unwrap_or_default(),
                                 DataType::Boolean => {
-                                    let val = array.as_any().downcast_ref::<BooleanArray>().map(|a| a.value(r)).unwrap_or(false);
-                                    if val { "t".to_string() } else { "f".to_string() }
+                                    let val = array
+                                        .as_any()
+                                        .downcast_ref::<BooleanArray>()
+                                        .map(|a| a.value(r))
+                                        .unwrap_or(false);
+                                    if val {
+                                        "t".to_string()
+                                    } else {
+                                        "f".to_string()
+                                    }
                                 }
-                                _ => format!("{:?}", array),
+                                _ => format!("{array:?}"),
                             }
                         };
                         row_strings.push(val_str);
                     }
                     let row_refs: Vec<&str> = row_strings.iter().map(|s| s.as_str()).collect();
-                    send_query_row(stream, &row_refs, &cols, result_formats).await.map_err(|e| e.to_string())?;
+                    send_query_row(stream, &row_refs, &cols, result_formats)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
             }
 
             // 6. Send CommandComplete
-            send_command_complete(stream, "SELECT").await.map_err(|e| e.to_string())?;
+            send_command_complete(stream, "SELECT")
+                .await
+                .map_err(|e| e.to_string())?;
             Ok(true)
         }
         Err(e) => Err(format!("planning error: {e}")),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_query_logic(
     stream: &mut TcpStream,
     sql: &str,
@@ -2734,15 +2774,18 @@ async fn execute_query_logic(
     let sql_upper = sql.to_uppercase();
 
     // RS-2007 check for non-idempotent DML
-    if (sql_upper.starts_with("INSERT") || sql_upper.starts_with("UPDATE") || sql_upper.starts_with("DELETE"))
+    if (sql_upper.starts_with("INSERT")
+        || sql_upper.starts_with("UPDATE")
+        || sql_upper.starts_with("DELETE"))
         && sql_upper.contains("COUNTERS")
         && idempotency_key.is_none()
     {
         send_query_error(
             stream,
             "RS-2007",
-            "idempotency key required for non-idempotent write (RS-2007)"
-        ).await?;
+            "idempotency key required for non-idempotent write (RS-2007)",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -3164,7 +3207,13 @@ async fn execute_query_logic(
         || sql_upper.contains("FULL OUTER JOIN")
         || sql_upper.contains("CROSS JOIN")
     {
-        send_query_row(stream, &["100", "Alice", "45.5", "t"], &cols, result_formats).await?;
+        send_query_row(
+            stream,
+            &["100", "Alice", "45.5", "t"],
+            &cols,
+            result_formats,
+        )
+        .await?;
         send_command_complete(stream, "SELECT").await?;
         return Ok(());
     }
@@ -3222,7 +3271,13 @@ async fn execute_query_logic(
 
     // v0.52.9: write fence
     if sql_upper.contains("WRITE_FENCE") || sql_upper.contains("AFTER_FENCE") {
-        send_query_row(stream, &["fence:epoch=42:ts=1717574400"], &cols, result_formats).await?;
+        send_query_row(
+            stream,
+            &["fence:epoch=42:ts=1717574400"],
+            &cols,
+            result_formats,
+        )
+        .await?;
         send_command_complete(stream, "SELECT").await?;
         return Ok(());
     }
