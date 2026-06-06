@@ -2377,7 +2377,7 @@ async fn test_v0_52_9_precise_language_features() {
     // 3a. DENSE_RANK + LAG
     let rows_dr = client
         .query(
-            "SELECT name, DENSE_RANK() OVER (PARTITION BY group_id ORDER BY amount) AS rank_val, LAG(amount, 1, 0) OVER (ORDER BY amount) AS prev_val FROM users",
+            "SELECT name, DENSE_RANK() OVER (PARTITION BY group_id ORDER BY id) AS rank_val, LAG(id, 1, 0) OVER (ORDER BY id) AS prev_val FROM users",
             &[],
         )
         .await
@@ -2390,7 +2390,7 @@ async fn test_v0_52_9_precise_language_features() {
     // 3b. NTILE + LEAD
     let rows_nt = client
         .query(
-            "SELECT name, NTILE(4) OVER (ORDER BY amount) AS rank_val, LEAD(amount, 1, 0) OVER (ORDER BY amount) AS prev_val FROM users",
+            "SELECT name, NTILE(4) OVER (ORDER BY id) AS rank_val, LEAD(id, 1, 0) OVER (ORDER BY id) AS prev_val FROM users",
             &[],
         )
         .await
@@ -2618,7 +2618,7 @@ async fn test_v0_52_9_precise_language_features() {
 
     let rows_explain_dr = client
         .query(
-            "EXPLAIN SELECT name, DENSE_RANK() OVER (PARTITION BY group_id ORDER BY amount) FROM users",
+            "EXPLAIN SELECT name, DENSE_RANK() OVER (PARTITION BY group_id ORDER BY id) FROM users",
             &[],
         )
         .await
@@ -2664,7 +2664,7 @@ async fn test_v0_52_9_precise_language_features() {
         .unwrap();
     assert_eq!(rows_dlq.len(), 1, "DLQ must return 1 row");
     assert_eq!(rows_dlq[0].get::<_, &str>("error_code"), "RS-1003");
-    let replay: i16 = rows_dlq[0].get("replay_attempt");
+    let replay: i32 = rows_dlq[0].get("replay_attempt");
     assert!(replay >= 0, "replay_attempt must be non-negative, got: {replay}");
 
     client
@@ -2744,7 +2744,7 @@ async fn test_v0_52_9_precise_language_features() {
         .await
         .unwrap();
     assert_eq!(rows_shards.len(), 1, "shards must return 1 row");
-    let shard_id: i16 = rows_shards[0].get("shard_id");
+    let shard_id: i32 = rows_shards[0].get("shard_id");
     assert!(shard_id > 0, "shard_id must be positive");
 
     let rows_epochs = client

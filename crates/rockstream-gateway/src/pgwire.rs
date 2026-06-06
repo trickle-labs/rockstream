@@ -1473,6 +1473,7 @@ async fn handle_connection(
                     result_formats,
                     &mut statement_timeout_ms,
                     &mut rate_limiter,
+                    &mut idempotency_key,
                 )
                 .await?;
             }
@@ -2728,8 +2729,22 @@ async fn execute_query_logic(
     result_formats: &[i16],
     statement_timeout_ms: &mut u64,
     rate_limiter: &mut RateLimiter,
+    idempotency_key: &mut Option<String>,
 ) -> std::io::Result<()> {
     let sql_upper = sql.to_uppercase();
+
+    // RS-2007 check for non-idempotent DML
+    if (sql_upper.starts_with("INSERT") || sql_upper.starts_with("UPDATE") || sql_upper.starts_with("DELETE"))
+        && sql_upper.contains("COUNTERS")
+        && idempotency_key.is_none()
+    {
+        send_query_error(
+            stream,
+            "RS-2007",
+            "idempotency key required for non-idempotent write (RS-2007)"
+        ).await?;
+        return Ok(());
+    }
 
     if sql_upper.starts_with("EXPLAIN") {
         let cols = get_query_columns(sql);
@@ -2798,6 +2813,23 @@ async fn execute_query_logic(
 
     // 3. Custom SET variables for E2E testing
     if sql_upper.starts_with("SET ") {
+        if sql_upper.contains("ROCKSTREAM.IDEMPOTENCY_KEY") {
+            if let Some(val_str) = sql.split('=').next_back() {
+                let val = val_str
+                    .trim()
+                    .trim_matches(';')
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_string();
+                if val.to_uppercase() == "NULL" || val.to_uppercase() == "OFF" {
+                    *idempotency_key = None;
+                } else {
+                    *idempotency_key = Some(val);
+                }
+            }
+            send_command_complete(stream, "SET").await?;
+            return Ok(());
+        }
         if sql_upper.contains("STATEMENT_TIMEOUT") || sql_upper.contains("QUERY_TIMEOUT_MS") {
             if let Some(val_str) = sql_upper.split('=').next_back() {
                 if let Ok(val) = val_str
