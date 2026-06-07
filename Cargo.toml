@@ -1,8 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rockstream",
-    "crates/rockstream-catalog",
     "crates/rockstream-cli",
     "crates/rockstream-connectors",
     "crates/rockstream-control",
@@ -16,7 +14,6 @@ members = [
     "crates/rockstream-sql",
     "crates/rockstream-storage",
     "crates/rockstream-types",
-    "crates/rockstream-e2e",
 ]
 
 [workspace.package]
@@ -48,7 +45,6 @@ serde_json = "1"
 toml = "0.8"
 
 # Workspace crate references
-rockstream-catalog = { path = "crates/rockstream-catalog" }
 rockstream-cli = { path = "crates/rockstream-cli" }
 rockstream-connectors = { path = "crates/rockstream-connectors" }
 rockstream-control = { path = "crates/rockstream-control" }

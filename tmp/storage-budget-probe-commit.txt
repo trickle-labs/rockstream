@@ -1,9 +1,0 @@
-Add 10s connectivity probe to azure_store to prevent hang
-
-builder.build() only validates credential config; the first real TCP
-connection happens at open_shard time. If the container doesn't exist or
-the account is unreachable, the benchmark would hang indefinitely.
-
-Add a tokio::time::timeout(10s) probe using store.head() before returning
-the store. A 404 response still confirms connectivity; only a timeout (or
-no response) causes azure_store to return None with a clear error message.

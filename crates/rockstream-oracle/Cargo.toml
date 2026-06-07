@@ -21,5 +21,4 @@ rockstream-ops = { workspace = true }
 rockstream-plan = { workspace = true }
 rockstream-runtime = { workspace = true }
 rockstream-storage = { workspace = true }
-rockstream-catalog = { workspace = true }
 object_store = { workspace = true }
