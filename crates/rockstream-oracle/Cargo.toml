@@ -8,6 +8,8 @@ description = "Batch reference engine and property-test harness for RockStream c
 
 [dependencies]
 rockstream-types = { workspace = true }
+rockstream-ops = { workspace = true }
+rockstream-plan = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 tokio = { workspace = true }

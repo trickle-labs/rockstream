@@ -59,6 +59,9 @@ fn collect_refs(plan: &PlanNode, out: &mut Vec<String>) {
             collect_refs(step, out);
         }
         PlanNode::Lateral { input, .. } => collect_refs(input, out),
+        // v0.4 additions
+        PlanNode::ViewSink { child, .. } => collect_refs(child, out),
+        PlanNode::Exchange { child, .. } => collect_refs(child, out),
     }
 }
 

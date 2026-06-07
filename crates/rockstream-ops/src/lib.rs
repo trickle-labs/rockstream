@@ -1,17 +1,32 @@
 //! Operator trait and per-operator implementations for RockStream.
 //!
-//! This crate will hold the `Operator` trait, the `EpochOutput` type, the
-//! `OperatorTask` event loop, and the per-operator IVM implementations.
-//!
-//! Per the focused roadmap, operators are implemented test-first one slice at a
-//! time starting in **v0.4** (filter / project / map), followed by algebraic
-//! aggregates (v0.5), MIN/MAX (v0.6), joins (v0.8–v0.9), and the remaining
-//! operators in later versions. Each operator ships with an oracle property
-//! test (`incremental == batch`) before it is considered complete. The crate is
-//! intentionally an empty scaffold at v0.1 ("workspace and CI").
+//! v0.4: Z-set types (Arrow RecordBatch with `_weight`), stateless linear
+//! operators (Filter, Project, Map), the `Operator` trait + `EpochOutput`,
+//! `OperatorTask` event loop, credit-based scheduler, built-in sources
+//! (GENERATE ROWS, Vec-delta), ViewSink, and the embedded single-process
+//! runtime profile.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn ops_crate_compiles() {}
-}
+pub mod embedded;
+pub mod error;
+pub mod expr;
+pub mod filter;
+pub mod map;
+pub mod op;
+pub mod pipeline;
+pub mod project;
+pub mod scheduler;
+pub mod sink;
+pub mod source;
+pub mod task;
+pub mod zset;
+
+pub use error::OpError;
+pub use filter::FilterOp;
+pub use map::MapOp;
+pub use op::{EpochOutput, Operator};
+pub use project::ProjectOp;
+pub use scheduler::CreditScheduler;
+pub use sink::ViewSinkOp;
+pub use source::{GenerateRowsSource, VecDeltaSource};
+pub use task::OperatorTask;
+pub use zset::ArrowZSet;

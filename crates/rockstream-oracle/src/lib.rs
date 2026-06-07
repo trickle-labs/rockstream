@@ -17,9 +17,13 @@
 //! - [`harness`]: `assert_oracle_noop` and the proptest harness that proves
 //!   `incremental == batch` on the trivial no-op pipeline.
 //!
-//! Later versions will add per-operator oracle tests (filter, project, map,
-//! aggregate, join, etc.) as those operators are implemented.
+//! ## v0.4 additions
+//!
+//! - [`filter_oracle`]: Oracle property tests for `Filter`, `Project`, `Map`
+//!   — the `SELECT a, b*2 AS c FROM t WHERE b*2 > 10` query over ≥100k
+//!   random insert/delete sequences.
 
 pub mod batch;
+pub mod filter_oracle;
 pub mod harness;
 pub mod zset;

@@ -177,6 +177,51 @@ pub enum PlanNode {
         /// The set-returning function to apply to each input row.
         func: LateralFunc,
     },
+
+    // ── v0.4 additions ─────────────────────────────────────────────────────
+
+    /// Materialize the input stream into a named view in shard storage (v0.4).
+    ///
+    /// Writes each output Z-set batch into the `view_output` namespace of the
+    /// shard's `ShardDb`.  The `pk` field lists the column indices that form
+    /// the view's primary key for upsert/retract keying.
+    ViewSink {
+        /// Name of the view being materialized.
+        view_name: String,
+        /// Primary-key column indices (used as the row identity key in storage).
+        pk: Vec<usize>,
+        /// Input plan producing the Z-set deltas to materialize.
+        child: Box<PlanNode>,
+    },
+
+    /// Exchange operator stub (v0.4).
+    ///
+    /// In the embedded single-process runtime (v0.4), Exchange is always
+    /// `Loopback`: data passes through without any network call or shuffle
+    /// object.  Full hash/broadcast/range exchange over gRPC + durable
+    /// shuffle objects is implemented in v0.16.
+    Exchange {
+        /// How this exchange partitions data.
+        kind: ExchangeKind,
+        /// The input plan to re-partition.
+        child: Box<PlanNode>,
+    },
+}
+
+/// How an Exchange operator partitions data across shards (v0.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangeKind {
+    /// Single-process loopback — no network, no shuffle objects.
+    /// This is the only mode active in v0.4's embedded runtime.
+    Loopback,
+    /// Hash-partition by the plan's declared `partition_key`.
+    Hash,
+    /// Broadcast to every downstream shard.
+    Broadcast,
+    /// Route all data to a single shard (gather).
+    Single,
+    /// Range-partition by the declared `partition_key`.
+    Range,
 }
 
 /// Policy for late-arriving rows in time-window operators.
@@ -503,6 +548,25 @@ pub enum OpKind {
     Lateral {
         /// The set-returning function applied to each input row.
         func: LateralFunc,
+    },
+
+    // ── v0.4 additions ─────────────────────────────────────────────────────
+
+    /// View-sink operator: writes Z-set deltas to shard view_output (v0.4).
+    ViewSink {
+        /// Name of the materialized view.
+        view_name: String,
+        /// Primary-key column indices for row identity in storage.
+        pk: Vec<usize>,
+    },
+
+    /// Exchange operator stub (v0.4).
+    ///
+    /// In v0.4's embedded runtime, always `Loopback` — passes data through
+    /// with zero network calls and zero shuffle objects.
+    Exchange {
+        /// Partitioning strategy for this exchange.
+        kind: ExchangeKind,
     },
 }
 

@@ -1,17 +1,24 @@
-//! Worker process, scheduler, epoch-commit coordinator, and exchange for
-//! RockStream.
+//! RockStream worker runtime.
 //!
-//! This crate will hold the per-worker runtime: the async ownership-free
-//! scheduler with credit backpressure, the epoch-commit coordinator, and the
-//! exchange (shuffle) paths.
+//! v0.4 re-exports the key runtime primitives from `rockstream-ops`:
+//! the `CreditScheduler`, `EmbeddedRuntime`, and related types.
 //!
-//! Per the focused roadmap, the worker scheduler and embedded runtime profile
-//! arrive in **v0.4**, group commit and persisted frontier in **v0.5**, and the
-//! distributed exchange paths in the v0.16–v0.17 range. The crate is
-//! intentionally an empty scaffold at v0.1 ("workspace and CI").
+//! Later versions add the epoch-commit coordinator (v0.5), exchange (v0.16),
+//! and the control-plane service (v0.15).
+
+pub use rockstream_ops::embedded::{EmbeddedCounters, EmbeddedRuntime};
+pub use rockstream_ops::scheduler::CreditScheduler;
+pub use rockstream_ops::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn runtime_crate_compiles() {}
+    fn runtime_crate_compiles() {
+        let rt = EmbeddedRuntime::new();
+        assert_eq!(rt.counters.grpc_call_count(), 0);
+        assert_eq!(rt.counters.shuffle_write_count(), 0);
+    }
 }
+

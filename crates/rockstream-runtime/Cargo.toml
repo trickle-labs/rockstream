@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 description = "Worker process, scheduler, epoch-commit coordinator, and exchange for RockStream"
 
-# Intentionally dependency-free scaffold at v0.1. The scheduler, epoch-commit
-# coordinator, and exchange paths are implemented test-first from v0.4 onward.
 [dependencies]
+rockstream-ops = { workspace = true }
+rockstream-types = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

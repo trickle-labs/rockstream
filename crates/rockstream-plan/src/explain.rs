@@ -80,6 +80,9 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
         } => format!("Snapshot[{source_name},batch={batch_size}]"),
         OpKind::ViewRef { view_name } => format!("ViewRef[{view_name}]"),
         OpKind::Lateral { func } => format!("Lateral[{func:?}]"),
+        // v0.4 additions
+        OpKind::ViewSink { view_name, pk } => format!("ViewSink[{view_name},pk={pk:?}]"),
+        OpKind::Exchange { kind } => format!("Exchange[{kind:?}]"),
     };
 
     let shard_info = match level {

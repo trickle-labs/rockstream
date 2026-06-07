@@ -3731,6 +3731,12 @@ dependencies = [
 [[package]]
 name = "rockstream-diff"
 version = "0.52.10"
+dependencies = [
+ "rockstream-plan",
+ "rockstream-types",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "rockstream-gateway"
@@ -3739,6 +3745,20 @@ version = "0.52.10"
 [[package]]
 name = "rockstream-ops"
 version = "0.52.10"
+dependencies = [
+ "arrow",
+ "bytes",
+ "object_store 0.12.5",
+ "proptest",
+ "rockstream-plan",
+ "rockstream-storage",
+ "rockstream-types",
+ "tempfile",
+ "testcontainers",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "rockstream-oracle"
@@ -3747,6 +3767,8 @@ dependencies = [
  "arrow",
  "datafusion",
  "proptest",
+ "rockstream-ops",
+ "rockstream-plan",
  "rockstream-types",
  "tokio",
 ]
@@ -3761,6 +3783,12 @@ dependencies = [
 [[package]]
 name = "rockstream-runtime"
 version = "0.52.10"
+dependencies = [
+ "rockstream-ops",
+ "rockstream-types",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "rockstream-sim"

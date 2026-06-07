@@ -6,6 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 description = "Operator trait and per-operator implementations for RockStream"
 
-# Intentionally dependency-free scaffold at v0.1. Dependencies (and benches) are
-# added as operators are implemented test-first from v0.4 onward.
 [dependencies]
+rockstream-types = { workspace = true }
+rockstream-plan = { workspace = true }
+rockstream-storage = { workspace = true }
+arrow = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+object_store = { workspace = true }
+rockstream-plan = { workspace = true }
+
+[dev-dependencies.testcontainers]
+workspace = true
