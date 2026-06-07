@@ -48,11 +48,14 @@ fn make_filter_project_pipeline() -> LinearPipeline {
     };
     let project = ProjectOp::new(vec![
         NamedExpr::new("a", Expr::Column(0)),
-        NamedExpr::new("c", Expr::BinaryOp {
-            op: BinaryOp::Mul,
-            left: Box::new(Expr::Column(1)),
-            right: Box::new(lit(2)),
-        }),
+        NamedExpr::new(
+            "c",
+            Expr::BinaryOp {
+                op: BinaryOp::Mul,
+                left: Box::new(Expr::Column(1)),
+                right: Box::new(lit(2)),
+            },
+        ),
     ]);
     LinearPipeline::new()
         .push(Arc::new(FilterOp::new(predicate)))
@@ -168,9 +171,7 @@ pub async fn run_datafusion_filter_project(
         ],
     )?;
     let ctx = SessionContext::new();
-    let mem_table = datafusion::datasource::memory::MemTable::try_new(
-        schema, vec![vec![batch]],
-    )?;
+    let mem_table = datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
     ctx.register_table("t", Arc::new(mem_table))?;
     let df = ctx
         .sql("SELECT a, b*2 AS c FROM t WHERE b*2 > 10 ORDER BY a, b*2")
@@ -224,18 +225,15 @@ mod tests {
     #[test]
     fn oracle_insert_filtered_row_then_update() {
         // Insert (1,3) (filtered), then update to (1,6) (insert (1,6), delete (1,3))
-        assert_oracle_filter_project(&[
-            vec![(1, 3, 1)],
-            vec![(1, 3, -1), (1, 6, 1)],
-        ]);
+        assert_oracle_filter_project(&[vec![(1, 3, 1)], vec![(1, 3, -1), (1, 6, 1)]]);
     }
 
     #[test]
     fn oracle_multiple_epochs_mixed() {
         assert_oracle_filter_project(&[
-            vec![(1, 6, 1), (2, 3, 1)],  // (1,6) passes, (2,3) filtered
-            vec![(3, 8, 1)],              // (3,8) passes, c=16
-            vec![(1, 6, -1)],            // delete (1,6)
+            vec![(1, 6, 1), (2, 3, 1)], // (1,6) passes, (2,3) filtered
+            vec![(3, 8, 1)],            // (3,8) passes, c=16
+            vec![(1, 6, -1)],           // delete (1,6)
         ]);
     }
 
@@ -272,19 +270,19 @@ mod tests {
             let df_result = run_datafusion_filter_project(input_rows).await.unwrap();
             assert_eq!(
                 df_result, expected,
-                "DataFusion mismatch for input {:?}", input_rows
+                "DataFusion mismatch for input {:?}",
+                input_rows
             );
 
             // Batch reference side
-            let input_map: BTreeMap<(i64, i64), i64> = input_rows
-                .iter()
-                .map(|&(a, b)| ((a, b), 1i64))
-                .collect();
+            let input_map: BTreeMap<(i64, i64), i64> =
+                input_rows.iter().map(|&(a, b)| ((a, b), 1i64)).collect();
             let mut batch_ref = batch_reference(&input_map);
             batch_ref.sort();
             assert_eq!(
                 batch_ref, expected,
-                "Batch reference mismatch for input {:?}", input_rows
+                "Batch reference mismatch for input {:?}",
+                input_rows
             );
         }
     }
@@ -308,8 +306,8 @@ mod tests {
         fn epoch_strategy() -> impl Strategy<Value = Vec<(i64, i64, i64)>> {
             prop::collection::vec(
                 (
-                    -100i64..=100i64,   // a
-                    -20i64..=20i64,     // b  (b*2 range: -40..40, interesting around 10)
+                    -100i64..=100i64, // a
+                    -20i64..=20i64,   // b  (b*2 range: -40..40, interesting around 10)
                     prop_oneof![Just(1i64), Just(-1i64), Just(2i64)],
                 ),
                 0..=10,

@@ -22,7 +22,15 @@
 //! - [`filter_oracle`]: Oracle property tests for `Filter`, `Project`, `Map`
 //!   — the `SELECT a, b*2 AS c FROM t WHERE b*2 > 10` query over ≥100k
 //!   random insert/delete sequences.
+//!
+//! ## v0.5 additions
+//!
+//! - [`aggregate_oracle`]: Oracle property tests for `Aggregate`
+//!   (SUM/COUNT/AVG) — the `SELECT k, SUM(v), COUNT(*), AVG(v) FROM t
+//!   GROUP BY k` query over ≥100k random insert/update/delete sequences
+//!   with group churn.
 
+pub mod aggregate_oracle;
 pub mod batch;
 pub mod filter_oracle;
 pub mod harness;

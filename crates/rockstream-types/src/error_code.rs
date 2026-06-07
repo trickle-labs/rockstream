@@ -95,6 +95,14 @@ pub const RS_3602: ErrorCode = ErrorCode::new(3602);
 /// Pipeline freshness recovery is slower than the 60s SLO; RECOVERING_SLOW state (v0.35).
 pub const RS_3603: ErrorCode = ErrorCode::new(3603);
 
+// 1015-1016: Aggregate operators (v0.5)
+/// Group-commit capacity exceeded; operator queue is full and back-pressure is applied.
+/// next_steps: reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards.
+pub const RS_1015: ErrorCode = ErrorCode::new(1015);
+/// Aggregate running sum overflowed i64; epoch rejected.
+/// next_steps: reduce value magnitudes or switch to a wider numeric type.
+pub const RS_1016: ErrorCode = ErrorCode::new(1016);
+
 // 17xx: Lease management
 /// Shard is already leased by a different worker; acquire rejected (v0.29).
 pub const RS_1701: ErrorCode = ErrorCode::new(1701);
@@ -197,6 +205,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         1009 => "Non-monotone delta rejected in monotone recursion",
         1010 => "Bootstrap interrupted; connector position lost",
         1011 => "View-on-view DAG contains a cycle",
+        1015 => "Group-commit queue full; back-pressure applied",
+        1016 => "Aggregate running sum overflowed i64",
         1512 => "Inner-frontier stall in distributed recursion; per-shard recompute triggered",
         1513 => "Distributed recursion max-iteration cap exceeded without convergence",
         3601 => "Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded",
@@ -269,6 +279,8 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1009 => "Ensure the recursive query is monotone or restructure it; check EXPLAIN for recursion rules.",
         1010 => "Verify connector positions, reset offsets, or perform a full bootstrap rebuild.",
         1011 => "Resolve cycle in view dependencies; view-on-view relations must form a DAG.",
+        1015 => "Reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards.",
+        1016 => "Reduce value magnitudes or switch to a wider numeric type.",
         1512 => "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs.",
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
         1701 => "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead.",
@@ -344,7 +356,7 @@ mod tests {
             RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007,
             RS_2008, RS_2014, RS_2015, RS_2016, RS_3003, RS_4001, RS_4002, RS_5001, RS_5002,
             RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703,
-            RS_5018, RS_5019, RS_6001,
+            RS_5018, RS_5019, RS_6001, RS_1015, RS_1016,
         ];
         for code in codes {
             assert_ne!(

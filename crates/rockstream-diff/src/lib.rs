@@ -8,12 +8,22 @@
 //! - Linear-operator rules for `Filter`, `Project`, `Map`, `Source`,
 //!   `ViewSink`, and `Exchange` (stub).
 //!
+//! ## v0.5 scope
+//!
+//! - Stateful aggregate rule for `Aggregate` (SUM/COUNT/AVG).
+//!
 //! ## DBSP linear-operator rule
 //!
 //! For any linear function `F`, `ΔF(Δx) = F(Δx)`.
 //! Filter, Project, and Map are all linear: they are applied unchanged to
 //! every incoming delta batch. The differentiation pass therefore emits a
 //! physical plan identical in structure to the logical plan for these nodes.
+//!
+//! ## DBSP aggregate-operator rule
+//!
+//! `Aggregate` is not linear. Its differentiation requires an arrangement
+//! (the `AggState`): for each input delta `(k, v, w)`, the rule is:
+//! `Δagg(k) = (new_agg(k), +1) ⊎ (old_agg(k), -1)` when the state changes.
 
 use rockstream_plan::{OpKind, OpNode, PlanNode};
 use rockstream_types::ids::OperatorId;
@@ -22,7 +32,9 @@ use rockstream_types::ids::OperatorId;
 #[derive(Debug, thiserror::Error)]
 pub enum DiffError {
     /// A plan node that is not yet implemented in this version.
-    #[error("RS-1014: unsupported plan node '{0}' in v0.4 — this operator arrives in a later version")]
+    #[error(
+        "RS-1014: unsupported plan node '{0}' in v0.5 — this operator arrives in a later version"
+    )]
     UnsupportedNode(String),
 }
 
@@ -133,7 +145,11 @@ impl DiffCtx {
             }
 
             // ── ViewSink ──────────────────────────────────────────────────
-            PlanNode::ViewSink { view_name, pk, child } => {
+            PlanNode::ViewSink {
+                view_name,
+                pk,
+                child,
+            } => {
                 let input_id = self.diff_node(child, ops)?;
                 let id = self.next_op_id();
                 ops.push(OpNode {
@@ -164,7 +180,24 @@ impl DiffCtx {
                 Ok(id)
             }
 
-            // ── Not yet implemented in v0.4 ───────────────────────────────
+            // ── Aggregate (v0.5) ──────────────────────────────────────────
+            // DBSP stateful rule: for each (k, v, w) delta, compute
+            // Δagg(k) = (new_state(k), +1) ⊎ (old_state(k), -1) via
+            // the AggState arrangement in `AggregateOp`.
+            PlanNode::Aggregate { input, .. } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Aggregate,
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
+            // ── Not yet implemented in v0.5 ───────────────────────────────
             other => Err(DiffError::UnsupportedNode(format!("{other:?}"))),
         }
     }
@@ -202,11 +235,14 @@ mod tests {
         };
         let projected = PlanNode::Project {
             input: Box::new(filtered),
-            columns: vec![Expr::Column(0), Expr::BinaryOp {
-                op: BinaryOp::Mul,
-                left: Box::new(Expr::Column(1)),
-                right: Box::new(lit(2)),
-            }],
+            columns: vec![
+                Expr::Column(0),
+                Expr::BinaryOp {
+                    op: BinaryOp::Mul,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(lit(2)),
+                },
+            ],
         };
         PlanNode::ViewSink {
             view_name: "v".into(),
@@ -242,18 +278,47 @@ mod tests {
         let mut ctx = DiffCtx::new();
         let physical = ctx.differentiate(&exchange).unwrap();
         assert_eq!(physical.ops.len(), 2);
-        assert!(matches!(physical.ops[1].kind, OpKind::Exchange { kind: ExchangeKind::Loopback }));
+        assert!(matches!(
+            physical.ops[1].kind,
+            OpKind::Exchange {
+                kind: ExchangeKind::Loopback
+            }
+        ));
+    }
+
+    #[test]
+    fn diff_aggregate_emits_aggregate_op() {
+        // v0.5: Aggregate is now supported — DiffCtx must emit OpKind::Aggregate.
+        use rockstream_plan::AggregateExpr;
+        use rockstream_plan::AggregateFunc;
+        let aggregate = PlanNode::Aggregate {
+            input: Box::new(PlanNode::Source { name: "t".into() }),
+            group_by: vec![Expr::Column(0)],
+            aggregates: vec![AggregateExpr {
+                func: AggregateFunc::Sum,
+                input: Expr::Column(1),
+                distinct: false,
+            }],
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&aggregate).unwrap();
+        // Source(op0) → Aggregate(op1)
+        assert_eq!(physical.ops.len(), 2);
+        assert!(matches!(physical.ops[0].kind, OpKind::Source { .. }));
+        assert!(matches!(physical.ops[1].kind, OpKind::Aggregate));
+        assert_eq!(physical.ops[1].inputs, vec![OperatorId(0)]);
     }
 
     #[test]
     fn diff_unsupported_node_returns_error() {
-        let aggregate = PlanNode::Aggregate {
-            input: Box::new(PlanNode::Source { name: "t".into() }),
-            group_by: vec![],
-            aggregates: vec![],
+        // v0.5: Use a node that is not yet supported (Join).
+        let join = PlanNode::Join {
+            left: Box::new(PlanNode::Source { name: "a".into() }),
+            right: Box::new(PlanNode::Source { name: "b".into() }),
+            condition: Expr::Column(0),
         };
         let mut ctx = DiffCtx::new();
-        let result = ctx.differentiate(&aggregate);
+        let result = ctx.differentiate(&join);
         assert!(result.is_err());
     }
 
@@ -280,4 +345,3 @@ mod tests {
         assert_eq!(filter_ops.len(), 1);
     }
 }
-

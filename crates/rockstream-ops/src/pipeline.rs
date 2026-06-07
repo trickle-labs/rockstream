@@ -70,9 +70,9 @@ impl Default for LinearPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::lit;
     use crate::filter::FilterOp;
     use crate::project::{NamedExpr, ProjectOp};
-    use crate::expr::lit;
     use rockstream_plan::{BinaryOp, Expr};
 
     fn make_filter_project() -> LinearPipeline {
@@ -87,11 +87,14 @@ mod tests {
         };
         let project = ProjectOp::new(vec![
             NamedExpr::new("a", Expr::Column(0)),
-            NamedExpr::new("c", Expr::BinaryOp {
-                op: BinaryOp::Mul,
-                left: Box::new(Expr::Column(1)),
-                right: Box::new(lit(2)),
-            }),
+            NamedExpr::new(
+                "c",
+                Expr::BinaryOp {
+                    op: BinaryOp::Mul,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(lit(2)),
+                },
+            ),
         ]);
         LinearPipeline::new()
             .push(Arc::new(FilterOp::new(predicate)))

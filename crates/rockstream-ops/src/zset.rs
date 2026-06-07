@@ -74,7 +74,10 @@ impl ArrowZSet {
             })
             .collect();
         let data = RecordBatch::try_new(schema, columns).expect("empty batch");
-        ArrowZSet { data, weights: Vec::new() }
+        ArrowZSet {
+            data,
+            weights: Vec::new(),
+        }
     }
 
     /// Build an `ArrowZSet` from a list of `(a: i64, b: i64)` rows with a
@@ -128,15 +131,18 @@ impl ArrowZSet {
             .iter()
             .map(|col| arrow::compute::filter(col.as_ref(), &bool_array).expect("compact filter"))
             .collect();
-        let new_data = RecordBatch::try_new(self.data.schema(), filtered_cols)
-            .expect("compact batch");
+        let new_data =
+            RecordBatch::try_new(self.data.schema(), filtered_cols).expect("compact batch");
         let new_weights: Vec<i64> = mask
             .iter()
             .zip(&self.weights)
             .filter(|(b, _)| **b)
             .map(|(_, w)| *w)
             .collect();
-        ArrowZSet { data: new_data, weights: new_weights }
+        ArrowZSet {
+            data: new_data,
+            weights: new_weights,
+        }
     }
 
     /// Return the positive-weight rows as `(a: i64, b: i64)` pairs.
@@ -204,15 +210,18 @@ impl ArrowZSet {
             .iter()
             .map(|col| arrow::compute::filter(col.as_ref(), &bool_array).map_err(OpError::arrow))
             .collect::<Result<_, _>>()?;
-        let new_data = RecordBatch::try_new(self.data.schema(), filtered_cols)
-            .map_err(OpError::arrow)?;
+        let new_data =
+            RecordBatch::try_new(self.data.schema(), filtered_cols).map_err(OpError::arrow)?;
         let new_weights: Vec<i64> = mask
             .iter()
             .zip(&self.weights)
             .filter(|(b, _)| **b)
             .map(|(_, w)| *w)
             .collect();
-        Ok(ArrowZSet { data: new_data, weights: new_weights })
+        Ok(ArrowZSet {
+            data: new_data,
+            weights: new_weights,
+        })
     }
 }
 
@@ -234,7 +243,10 @@ mod tests {
         let zs = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20), (3, 30)], 1);
         // Manually set middle weight to 0
         let weights = vec![1, 0, 1];
-        let zs2 = ArrowZSet { data: zs.data, weights };
+        let zs2 = ArrowZSet {
+            data: zs.data,
+            weights,
+        };
         let compacted = zs2.compact();
         assert_eq!(compacted.num_rows(), 2);
         assert_eq!(compacted.weights, vec![1, 1]);

@@ -25,3 +25,18 @@ rockstream-plan = { workspace = true }
 
 [dev-dependencies.testcontainers]
 workspace = true
+
+[dev-dependencies.testcontainers-modules]
+workspace = true
+
+[dev-dependencies.reqwest]
+workspace = true
+
+[dev-dependencies.sha2]
+workspace = true
+
+[dev-dependencies.hmac]
+workspace = true
+
+[dev-dependencies.hex]
+workspace = true

@@ -28,7 +28,10 @@ pub struct NamedExpr {
 
 impl NamedExpr {
     pub fn new(name: impl Into<String>, expr: Expr) -> Self {
-        NamedExpr { name: name.into(), expr }
+        NamedExpr {
+            name: name.into(),
+            expr,
+        }
     }
 }
 
@@ -50,7 +53,10 @@ impl ProjectOp {
             .map(|ne| Field::new(&ne.name, DataType::Int64, false))
             .collect();
         let output_schema = Arc::new(Schema::new(fields));
-        ProjectOp { exprs, output_schema }
+        ProjectOp {
+            exprs,
+            output_schema,
+        }
     }
 
     /// Apply the projection to a single delta batch.
@@ -63,8 +69,8 @@ impl ProjectOp {
             .iter()
             .map(|ne| eval_to_array(&ne.expr, &input.data))
             .collect::<Result<Vec<_>, _>>()?;
-        let new_data = RecordBatch::try_new(self.output_schema.clone(), cols)
-            .map_err(OpError::arrow)?;
+        let new_data =
+            RecordBatch::try_new(self.output_schema.clone(), cols).map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(new_data, input.weights))
     }
 }
@@ -90,11 +96,14 @@ mod tests {
     fn project_a_b2() -> ProjectOp {
         ProjectOp::new(vec![
             NamedExpr::new("a", Expr::Column(0)),
-            NamedExpr::new("c", Expr::BinaryOp {
-                op: BinaryOp::Mul,
-                left: Box::new(Expr::Column(1)),
-                right: Box::new(lit(2)),
-            }),
+            NamedExpr::new(
+                "c",
+                Expr::BinaryOp {
+                    op: BinaryOp::Mul,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(lit(2)),
+                },
+            ),
         ])
     }
 
@@ -106,8 +115,18 @@ mod tests {
         assert_eq!(out.num_rows(), 2);
         assert_eq!(out.schema().field(0).name(), "a");
         assert_eq!(out.schema().field(1).name(), "c");
-        let a_col = out.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let c_col = out.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let a_col = out
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let c_col = out
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(a_col.value(0), 1);
         assert_eq!(c_col.value(0), 6); // 3*2
         assert_eq!(a_col.value(1), 2);

@@ -64,11 +64,7 @@ impl ViewSinkOp {
     /// Write one delta batch to storage.
     ///
     /// Each row becomes one key-value entry in the `view_output` namespace.
-    pub async fn write_epoch(
-        &self,
-        batch: &ArrowZSet,
-        epoch: Epoch,
-    ) -> Result<(), OpError> {
+    pub async fn write_epoch(&self, batch: &ArrowZSet, epoch: Epoch) -> Result<(), OpError> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -93,17 +89,12 @@ impl ViewSinkOp {
             "ViewSink: writing epoch"
         );
 
-        self.db
-            .write_batch(wb)
-            .await
-            .map_err(OpError::storage)
+        self.db.write_batch(wb).await.map_err(OpError::storage)
     }
 
     /// Convenience: write batch at the next auto-incremented epoch.
     pub async fn write_next_epoch(&self, batch: &ArrowZSet) -> Result<Epoch, OpError> {
-        let epoch = self
-            .epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let epoch = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.write_epoch(batch, epoch).await?;
         Ok(epoch)
     }
@@ -151,8 +142,7 @@ pub async fn read_view_output(
             let v = i64::from_be_bytes(vb[c * 8..(c + 1) * 8].try_into().unwrap());
             cols.push(v);
         }
-        let weight =
-            i64::from_be_bytes(vb[num_cols * 8..(num_cols + 1) * 8].try_into().unwrap());
+        let weight = i64::from_be_bytes(vb[num_cols * 8..(num_cols + 1) * 8].try_into().unwrap());
         rows.push((epoch, row_idx, cols, weight));
     }
     rows.sort();

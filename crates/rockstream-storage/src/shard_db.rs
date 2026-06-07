@@ -135,8 +135,21 @@ impl ShardDb {
     }
 
     /// Write a batch of operations atomically.
+    ///
+    /// Builds a `slatedb::WriteBatch` from the batch's `Vec<BatchOp>`, then
+    /// calls `Db::write()` once.  Multiple callers may merge their batches via
+    /// [`WriteBatch::merge_from`] before calling this to produce a single
+    /// atomic commit (group commit — v0.5).
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
-        self.db.write(batch.inner).await?;
+        let mut inner = slatedb::WriteBatch::new();
+        for op in batch.ops {
+            match op {
+                BatchOp::Put { key, value } => inner.put(&key, &value),
+                BatchOp::Delete { key } => inner.delete(&key),
+                BatchOp::Merge { key, value } => inner.merge(&key, &value),
+            }
+        }
+        self.db.write(inner).await?;
         Ok(())
     }
 
@@ -399,50 +412,75 @@ impl ShardDb {
     }
 }
 
+/// A single operation within a `WriteBatch`.
+///
+/// Stored as an owned enum so batches can be merged without knowing the
+/// internals of `slatedb::WriteBatch`.
+#[derive(Debug, Clone)]
+pub enum BatchOp {
+    /// Insert or overwrite a key.
+    Put { key: Vec<u8>, value: Vec<u8> },
+    /// Remove a key.
+    Delete { key: Vec<u8> },
+    /// Apply a merge (associative accumulation) to a key.
+    Merge { key: Vec<u8>, value: Vec<u8> },
+}
+
 /// Atomic write batch for multiple operations.
 ///
 /// All operations in a batch are committed atomically.
 /// Does NOT support range deletion.
+///
+/// Internally stores operations as a `Vec<BatchOp>` so that multiple batches
+/// can be coalesced (via [`merge_from`]) into a single atomic commit — the
+/// basis of group-commit (v0.5).
 pub struct WriteBatch {
-    inner: slatedb::WriteBatch,
-    count: usize,
+    ops: Vec<BatchOp>,
 }
 
 impl WriteBatch {
     /// Create a new empty write batch.
     pub fn new() -> Self {
-        Self {
-            inner: slatedb::WriteBatch::new(),
-            count: 0,
-        }
+        Self { ops: Vec::new() }
     }
 
     /// Add a put operation to the batch.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.inner.put(key, value);
-        self.count += 1;
+        self.ops.push(BatchOp::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        });
     }
 
     /// Add a delete operation to the batch.
     pub fn delete(&mut self, key: &[u8]) {
-        self.inner.delete(key);
-        self.count += 1;
+        self.ops.push(BatchOp::Delete { key: key.to_vec() });
     }
 
     /// Add a merge operation to the batch.
     pub fn merge(&mut self, key: &[u8], value: &[u8]) {
-        self.inner.merge(key, value);
-        self.count += 1;
+        self.ops.push(BatchOp::Merge {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        });
+    }
+
+    /// Consume all operations from `other` into this batch.
+    ///
+    /// Used by group commit to coalesce N per-operator batches into one
+    /// atomic `WriteBatch` before calling `ShardDb::write_batch()`.
+    pub fn merge_from(&mut self, other: WriteBatch) {
+        self.ops.extend(other.ops);
     }
 
     /// Returns the number of operations in the batch.
     pub fn len(&self) -> usize {
-        self.count
+        self.ops.len()
     }
 
     /// Returns true if the batch has no operations.
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.ops.is_empty()
     }
 }
 

@@ -30,10 +30,15 @@ impl MapOp {
     /// Create a map operator that evaluates `expr` and names the output column
     /// `output_name`.
     pub fn new(expr: Expr, output_name: impl Into<String>) -> Self {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(output_name.into().as_str(), DataType::Int64, false),
-        ]));
-        MapOp { expr, output_schema: schema }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            output_name.into().as_str(),
+            DataType::Int64,
+            false,
+        )]));
+        MapOp {
+            expr,
+            output_schema: schema,
+        }
     }
 
     /// Apply the map to a single delta batch.
@@ -42,8 +47,8 @@ impl MapOp {
             return Ok(ArrowZSet::empty(self.output_schema.clone()));
         }
         let col = eval_to_array(&self.expr, &input.data)?;
-        let new_data = RecordBatch::try_new(self.output_schema.clone(), vec![col])
-            .map_err(OpError::arrow)?;
+        let new_data =
+            RecordBatch::try_new(self.output_schema.clone(), vec![col]).map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(new_data, input.weights))
     }
 }
@@ -77,7 +82,12 @@ mod tests {
         let out = op.apply(input).unwrap();
         assert_eq!(out.num_rows(), 2);
         assert_eq!(out.schema().field(0).name(), "doubled");
-        let col = out.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let col = out
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(col.value(0), 6);
         assert_eq!(col.value(1), 10);
     }

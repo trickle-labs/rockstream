@@ -40,12 +40,18 @@ pub struct EpochOutput {
 impl EpochOutput {
     /// Create an epoch output with a single batch.
     pub fn single(epoch: Epoch, batch: ArrowZSet) -> Self {
-        EpochOutput { epoch, batches: vec![batch] }
+        EpochOutput {
+            epoch,
+            batches: vec![batch],
+        }
     }
 
     /// Create an empty epoch output (no rows to emit).
     pub fn empty(epoch: Epoch) -> Self {
-        EpochOutput { epoch, batches: Vec::new() }
+        EpochOutput {
+            epoch,
+            batches: Vec::new(),
+        }
     }
 
     /// Total number of rows across all batches in this output.

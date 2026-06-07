@@ -49,11 +49,14 @@ fn make_pipeline() -> LinearPipeline {
     };
     let project = ProjectOp::new(vec![
         NamedExpr::new("a", Expr::Column(0)),
-        NamedExpr::new("c", Expr::BinaryOp {
-            op: BinaryOp::Mul,
-            left: Box::new(Expr::Column(1)),
-            right: Box::new(lit(2)),
-        }),
+        NamedExpr::new(
+            "c",
+            Expr::BinaryOp {
+                op: BinaryOp::Mul,
+                left: Box::new(Expr::Column(1)),
+                right: Box::new(lit(2)),
+            },
+        ),
     ]);
     LinearPipeline::new()
         .push(Arc::new(FilterOp::new(predicate)))
@@ -87,9 +90,9 @@ async fn lfs_pipeline_filter_project_writes_and_persists() {
 
     // Input epochs (a, b) with weight +1
     let input_epochs: Vec<Vec<(i64, i64)>> = vec![
-        vec![(1, 6), (2, 3)],   // (1,6): b*2=12>10 ✓; (2,3): b*2=6≤10 ✗
-        vec![(3, 8), (4, 5)],   // (3,8): b*2=16>10 ✓; (4,5): b*2=10=10 ✗ (not >)
-        vec![(5, 7)],            // (5,7): b*2=14>10 ✓
+        vec![(1, 6), (2, 3)], // (1,6): b*2=12>10 ✓; (2,3): b*2=6≤10 ✗
+        vec![(3, 8), (4, 5)], // (3,8): b*2=16>10 ✓; (4,5): b*2=10=10 ✗ (not >)
+        vec![(5, 7)],         // (5,7): b*2=14>10 ✓
     ];
 
     // Process each epoch through the pipeline and write to the sink.
@@ -105,7 +108,9 @@ async fn lfs_pipeline_filter_project_writes_and_persists() {
     db.flush().await.unwrap();
 
     // Read back and verify.
-    let stored = read_view_output(db.as_ref(), OperatorId(42), 2).await.unwrap();
+    let stored = read_view_output(db.as_ref(), OperatorId(42), 2)
+        .await
+        .unwrap();
     // stored: Vec<(epoch, row_idx, [a, c], weight)>
     let stored_rows: BTreeMap<(i64, i64), i64> = stored
         .iter()
@@ -117,11 +122,9 @@ async fn lfs_pipeline_filter_project_writes_and_persists() {
 
     let expected = batch_expected(&input_epochs);
     assert_eq!(
-        stored_rows,
-        expected,
+        stored_rows, expected,
         "LFS pipeline output mismatch.\nstored: {:?}\nexpected: {:?}",
-        stored_rows,
-        expected
+        stored_rows, expected
     );
 
     // ── Close and reopen: data must survive restart ─────────────────────
@@ -137,7 +140,9 @@ async fn lfs_pipeline_filter_project_writes_and_persists() {
 
     // Reopen
     let db2 = open_shard_db(&dir).await;
-    let stored2 = read_view_output(db2.as_ref(), OperatorId(42), 2).await.unwrap();
+    let stored2 = read_view_output(db2.as_ref(), OperatorId(42), 2)
+        .await
+        .unwrap();
     let stored_rows2: BTreeMap<(i64, i64), i64> = stored2
         .iter()
         .map(|(_, _, cols, w)| ((cols[0], cols[1]), *w))
@@ -147,11 +152,9 @@ async fn lfs_pipeline_filter_project_writes_and_persists() {
         });
 
     assert_eq!(
-        stored_rows2,
-        expected,
+        stored_rows2, expected,
         "LFS data did not survive close/reopen.\nstored after restart: {:?}\nexpected: {:?}",
-        stored_rows2,
-        expected
+        stored_rows2, expected
     );
 }
 

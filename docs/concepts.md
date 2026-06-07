@@ -1969,6 +1969,62 @@ maintenance inside PostgreSQL), and **Snowflake dynamic tables**
 
 ---
 
+## v0.5 Implementation Reference — Algebraic Aggregates and Group Commit
+
+### Algebraic Aggregates (IVM-2)
+
+Starting from v0.5, RockStream maintains `SUM`, `COUNT(*)`, and `AVG` views
+incrementally using the DBSP aggregate delta rule.
+
+**Operator**: `AggregateOp`
+- **Input schema**: `(k: Int64, v: Int64)` — group key and value to aggregate.
+- **Output schema**: `(k: Int64, sum_v: Int64, count: Int64, avg_v: Int64)`
+  where `avg_v = sum_v / count` (truncating integer division).
+- **State**: an in-memory `HashMap<k, (sum, count)>` persisted to the `op_state`
+  namespace of `ShardDb` after each epoch commit.
+
+**DBSP delta rule**:
+```
+for each input delta (k, v, weight):
+  old = state[k]   -- (sum, count), or (0,0) if k is new
+  new_sum   = old.sum   + v * weight
+  new_count = old.count + weight
+  if old.count != 0 → emit (k, old.sum, old.count, avg(old)) with weight -1
+  if new_count != 0 → emit (k, new_sum, new_count, avg(new)) with weight +1
+  state[k] = (new_sum, new_count)  if new_count != 0, else remove k
+```
+
+This rule is proven correct by the oracle property test
+`oracle_aggregate_100k` (≥100k random insert/delete/group-churn scenarios).
+
+**Error codes**:
+- `RS-1015`: Group-commit queue full (capacity = `GROUP_COMMIT_MAX_BATCHES = 64`).
+  Back-pressure applied; reduce epoch rate or increase shard count.
+- `RS-1016`: Aggregate running sum overflowed `i64`.  Reduce value magnitudes
+  or switch to a wider numeric type.
+
+### Group Commit (shard-level epoch coalescing)
+
+Each epoch, all operator write-batch fragments are coalesced by `GroupCommit`
+into a single atomic `Db::write()` call:
+
+- **Named bound**: `GROUP_COMMIT_MAX_BATCHES = 64` pending batches.
+- **Fill-level metric**: `GroupCommit::fill_level()` — monitor to detect
+  back-pressure episodes.
+- **Durability events**: `GroupCommit::commit_count()` — total `Db::write()`
+  calls issued.  For N ≥ 5 operators per epoch, group commit reduces durability
+  events by a factor of N (proven ≥5× in `lfs_group_commit_reduces_durability_events`
+  and `minio_group_commit_reduces_durability_events`).
+
+### Persisted Frontier
+
+After each epoch commit, the shard writes its current epoch number to the
+`shard_meta` namespace (key `frontier`).  On restart, `load_frontier(db)`
+reads this value so the operator can resume from the correct epoch without
+re-processing already-committed data.
+
+---
+
 ## A Final Note
 
 The concepts in this guide are deliberately presented from the user's

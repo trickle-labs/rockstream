@@ -179,7 +179,6 @@ pub enum PlanNode {
     },
 
     // ── v0.4 additions ─────────────────────────────────────────────────────
-
     /// Materialize the input stream into a named view in shard storage (v0.4).
     ///
     /// Writes each output Z-set batch into the `view_output` namespace of the
@@ -551,7 +550,6 @@ pub enum OpKind {
     },
 
     // ── v0.4 additions ─────────────────────────────────────────────────────
-
     /// View-sink operator: writes Z-set deltas to shard view_output (v0.4).
     ViewSink {
         /// Name of the materialized view.

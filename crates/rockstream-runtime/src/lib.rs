@@ -21,4 +21,3 @@ mod tests {
         assert_eq!(rt.counters.shuffle_write_count(), 0);
     }
 }
-

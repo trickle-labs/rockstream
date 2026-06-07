@@ -64,7 +64,9 @@ pub struct EmbeddedRuntime {
 impl EmbeddedRuntime {
     /// Create a new embedded runtime.
     pub fn new() -> Self {
-        EmbeddedRuntime { counters: EmbeddedCounters::new() }
+        EmbeddedRuntime {
+            counters: EmbeddedCounters::new(),
+        }
     }
 
     /// Build a `CreditScheduler` pre-wired to this runtime's counters.
@@ -85,9 +87,9 @@ impl Default for EmbeddedRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::lit;
     use crate::filter::FilterOp;
     use crate::project::{NamedExpr, ProjectOp};
-    use crate::expr::lit;
     use crate::source::VecDeltaSource;
     use crate::zset::ArrowZSet;
     use rockstream_plan::{BinaryOp, Expr};
@@ -113,11 +115,14 @@ mod tests {
         sched.push_op(Arc::new(FilterOp::new(predicate)));
         sched.push_op(Arc::new(ProjectOp::new(vec![
             NamedExpr::new("a", Expr::Column(0)),
-            NamedExpr::new("c", Expr::BinaryOp {
-                op: BinaryOp::Mul,
-                left: Box::new(Expr::Column(1)),
-                right: Box::new(lit(2)),
-            }),
+            NamedExpr::new(
+                "c",
+                Expr::BinaryOp {
+                    op: BinaryOp::Mul,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(lit(2)),
+                },
+            ),
         ])));
 
         let (source_tx, mut sink_rx) = sched.build();

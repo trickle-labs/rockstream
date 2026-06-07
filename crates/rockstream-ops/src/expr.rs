@@ -27,12 +27,9 @@ pub fn eval_i64(expr: &Expr, batch: &RecordBatch) -> Result<Vec<i64>, OpError> {
                 return Err(OpError::column_out_of_bounds(*i, n));
             }
             let col = batch.column(*i);
-            let arr = col
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    OpError::column_type_mismatch("Int64", format!("{:?}", col.data_type()))
-                })?;
+            let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                OpError::column_type_mismatch("Int64", format!("{:?}", col.data_type()))
+            })?;
             Ok((0..arr.len()).map(|r| arr.value(r)).collect())
         }
 
@@ -84,9 +81,9 @@ pub fn eval_i64(expr: &Expr, batch: &RecordBatch) -> Result<Vec<i64>, OpError> {
             }
         },
 
-        Expr::ScalarUdf { .. } => {
-            Err(OpError::unimplemented("ScalarUdf expression evaluation (arrives v0.26+)"))
-        }
+        Expr::ScalarUdf { .. } => Err(OpError::unimplemented(
+            "ScalarUdf expression evaluation (arrives v0.26+)",
+        )),
     }
 }
 

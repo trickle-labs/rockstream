@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, Sender};
 
-use crate::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
 use crate::op::Operator;
+use crate::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
 use crate::zset::ArrowZSet;
 
 /// A linear-chain scheduler.
@@ -38,10 +38,7 @@ pub struct CreditScheduler {
 
 impl CreditScheduler {
     /// Create a new empty scheduler.
-    pub fn new(
-        grpc_call_count: Arc<AtomicU64>,
-        shuffle_write_count: Arc<AtomicU64>,
-    ) -> Self {
+    pub fn new(grpc_call_count: Arc<AtomicU64>, shuffle_write_count: Arc<AtomicU64>) -> Self {
         CreditScheduler {
             ops: Vec::new(),
             grpc_call_count,
@@ -90,7 +87,9 @@ impl CreditScheduler {
             };
             tokio::spawn(task.run());
 
-            prev_rx = if i + 1 < n { next_rx } else {
+            prev_rx = if i + 1 < n {
+                next_rx
+            } else {
                 // unused for last op; create a dummy
                 mpsc::channel::<ArrowZSet>(1).1
             };
@@ -103,9 +102,9 @@ impl CreditScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::lit;
     use crate::filter::FilterOp;
     use crate::project::{NamedExpr, ProjectOp};
-    use crate::expr::lit;
     use crate::zset::ArrowZSet;
     use rockstream_plan::{BinaryOp, Expr};
     use std::sync::atomic::AtomicU64;
@@ -129,11 +128,14 @@ mod tests {
 
         let project = ProjectOp::new(vec![
             NamedExpr::new("a", Expr::Column(0)),
-            NamedExpr::new("c", Expr::BinaryOp {
-                op: BinaryOp::Mul,
-                left: Box::new(Expr::Column(1)),
-                right: Box::new(lit(2)),
-            }),
+            NamedExpr::new(
+                "c",
+                Expr::BinaryOp {
+                    op: BinaryOp::Mul,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(lit(2)),
+                },
+            ),
         ]);
         sched.push_op(Arc::new(project));
         sched
@@ -154,10 +156,18 @@ mod tests {
 
         let out = sink_rx.recv().await.unwrap();
         assert_eq!(out.num_rows(), 1);
-        let a_col = out.data.column(0).as_any()
-            .downcast_ref::<arrow::array::Int64Array>().unwrap();
-        let c_col = out.data.column(1).as_any()
-            .downcast_ref::<arrow::array::Int64Array>().unwrap();
+        let a_col = out
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let c_col = out
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
         assert_eq!(a_col.value(0), 2);
         assert_eq!(c_col.value(0), 12);
     }

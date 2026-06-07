@@ -62,7 +62,10 @@ pub struct GenerateRowsSource {
 
 impl GenerateRowsSource {
     pub fn new(rows_per_epoch: usize, total_epochs: u64) -> Self {
-        GenerateRowsSource { rows_per_epoch, total_epochs }
+        GenerateRowsSource {
+            rows_per_epoch,
+            total_epochs,
+        }
     }
 
     pub async fn run(self, tx: Sender<ArrowZSet>) {
@@ -72,8 +75,7 @@ impl GenerateRowsSource {
         ]));
         let mut counter = 0i64;
         for epoch in 0..self.total_epochs {
-            let a_vals: Vec<i64> =
-                (counter..counter + self.rows_per_epoch as i64).collect();
+            let a_vals: Vec<i64> = (counter..counter + self.rows_per_epoch as i64).collect();
             let b_vals: Vec<i64> = a_vals.iter().map(|&a| a * 3).collect();
             counter += self.rows_per_epoch as i64;
             let cols: Vec<Arc<dyn arrow::array::Array>> = vec![
@@ -83,7 +85,11 @@ impl GenerateRowsSource {
             let data = RecordBatch::try_new(schema.clone(), cols).expect("gen rows");
             let weights = vec![1i64; a_vals.len()];
             let zset = ArrowZSet::new(data, weights);
-            debug!(epoch, rows = self.rows_per_epoch, "GenerateRowsSource: sending batch");
+            debug!(
+                epoch,
+                rows = self.rows_per_epoch,
+                "GenerateRowsSource: sending batch"
+            );
             if tx.send(zset).await.is_err() {
                 break;
             }

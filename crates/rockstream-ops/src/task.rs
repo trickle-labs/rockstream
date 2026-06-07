@@ -18,10 +18,10 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-use tracing::error;
 use crate::op::Operator;
 use crate::zset::ArrowZSet;
+use tokio::sync::mpsc;
+use tracing::error;
 
 /// Maximum number of in-flight batches between two adjacent operators.
 ///
@@ -80,8 +80,8 @@ impl OperatorTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::FilterOp;
     use crate::expr::lit;
+    use crate::filter::FilterOp;
     use crate::zset::ArrowZSet;
     use rockstream_plan::{BinaryOp, Expr};
     use std::sync::atomic::AtomicU64;
