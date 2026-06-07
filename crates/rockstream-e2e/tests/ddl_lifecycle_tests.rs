@@ -231,7 +231,10 @@ async fn test_mview_lifecycle_ivm_and_replacement() {
         .unwrap();
 
     let _clicks_rows = client
-        .query("SELECT * FROM mv_campaign_performance WHERE campaign_id = 10", &[])
+        .query(
+            "SELECT * FROM mv_campaign_performance WHERE campaign_id = 10",
+            &[],
+        )
         .await
         .unwrap();
 
