@@ -15,7 +15,11 @@ fn get_db_error_message(err: &tokio_postgres::Error) -> String {
     }
 }
 
-async fn start_gateway() -> (Client, testcontainers::ContainerAsync<GenericImage>, TempDir) {
+async fn start_gateway() -> (
+    Client,
+    testcontainers::ContainerAsync<GenericImage>,
+    TempDir,
+) {
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -90,10 +94,14 @@ async fn test_table_lifecycle_and_crdt_merging() {
     assert!(rows.iter().any(|r| r.get::<_, &str>("column_name") == "val"
         && r.get::<_, &str>("data_type") == "character varying"
         && r.get::<_, u32>("udt_oid") == 1043));
-    assert!(rows.iter().any(|r| r.get::<_, &str>("column_name") == "counter"
-        && r.get::<_, &str>("data_type") == "counter"));
-    assert!(rows.iter().any(|r| r.get::<_, &str>("column_name") == "max_reg"
-        && r.get::<_, &str>("data_type") == "max_register"));
+    assert!(rows
+        .iter()
+        .any(|r| r.get::<_, &str>("column_name") == "counter"
+            && r.get::<_, &str>("data_type") == "counter"));
+    assert!(rows
+        .iter()
+        .any(|r| r.get::<_, &str>("column_name") == "max_reg"
+            && r.get::<_, &str>("data_type") == "max_register"));
 
     // 3. Mutations & DML with RETURNING
     let dml_rows = client
@@ -109,7 +117,10 @@ async fn test_table_lifecycle_and_crdt_merging() {
 
     // 4. Update and Delete
     client
-        .execute("UPDATE my_table SET val = 'banana', counter = counter + 5 WHERE id = 1", &[])
+        .execute(
+            "UPDATE my_table SET val = 'banana', counter = counter + 5 WHERE id = 1",
+            &[],
+        )
         .await
         .unwrap();
 
@@ -192,17 +203,16 @@ async fn test_view_lifecycle_and_dependencies() {
         )
         .await
         .unwrap();
-    assert!(columns.iter().any(|c| c.get::<_, &str>("column_name") == "last_login"));
+    assert!(columns
+        .iter()
+        .any(|c| c.get::<_, &str>("column_name") == "last_login"));
 
     // 6. Deletion
     client
         .execute("DROP VIEW local_active_users", &[])
         .await
         .unwrap();
-    client
-        .execute("DROP VIEW active_users", &[])
-        .await
-        .unwrap();
+    client.execute("DROP VIEW active_users", &[]).await.unwrap();
 }
 
 #[tokio::test]
@@ -218,7 +228,10 @@ async fn test_mview_lifecycle_ivm_and_replacement() {
         .unwrap();
 
     // 1. Materialized View Definition
-    client.execute("SET BACKGROUND_DDL = ON", &[]).await.unwrap();
+    client
+        .execute("SET BACKGROUND_DDL = ON", &[])
+        .await
+        .unwrap();
 
     client
         .execute(
@@ -242,16 +255,23 @@ async fn test_mview_lifecycle_ivm_and_replacement() {
         .query("SHOW VIEW STATUS FOR NAMESPACE public", &[])
         .await
         .unwrap();
-    assert!(status_rows.iter().any(|r| r.get::<_, &str>("view_name") == "mv_campaign_performance"
-        && r.get::<_, &str>("status") == "RUNNING"));
+    assert!(status_rows.iter().any(
+        |r| r.get::<_, &str>("view_name") == "mv_campaign_performance"
+            && r.get::<_, &str>("status") == "RUNNING"
+    ));
 
     let bf_rows = client
-        .query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW mv_campaign_performance", &[])
+        .query(
+            "SHOW BACKFILL STATUS FOR MATERIALIZED VIEW mv_campaign_performance",
+            &[],
+        )
         .await
         .unwrap();
-    assert!(bf_rows.iter().any(|r| r.get::<_, &str>("view_name") == "mv_campaign_performance"
-        && r.get::<_, &str>("backfill_progress") == "1"
-        && r.get::<_, &str>("status") == "COMPLETED"));
+    assert!(bf_rows.iter().any(
+        |r| r.get::<_, &str>("view_name") == "mv_campaign_performance"
+            && r.get::<_, &str>("backfill_progress") == "1"
+            && r.get::<_, &str>("status") == "COMPLETED"
+    ));
 
     let usage_rows = client
         .query("SELECT freshness_lag_ms, state_bytes, memory_bytes FROM rockstream_catalog.view_resource_usage", &[])
@@ -261,12 +281,18 @@ async fn test_mview_lifecycle_ivm_and_replacement() {
 
     // 4. Incremental View Maintenance (IVM)
     client
-        .execute("INSERT INTO clicks (campaign_id, click_id, revenue) VALUES (10, 101, 1.5)", &[])
+        .execute(
+            "INSERT INTO clicks (campaign_id, click_id, revenue) VALUES (10, 101, 1.5)",
+            &[],
+        )
         .await
         .unwrap();
 
     let clicks_rows = client
-        .query("SELECT clicks FROM mv_campaign_performance WHERE campaign_id = 10", &[])
+        .query(
+            "SELECT clicks FROM mv_campaign_performance WHERE campaign_id = 10",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(clicks_rows.len(), 1);
@@ -283,8 +309,10 @@ async fn test_mview_lifecycle_ivm_and_replacement() {
         .query("SHOW VIEW STATUS FOR NAMESPACE public", &[])
         .await
         .unwrap();
-    assert!(paused_rows.iter().any(|r| r.get::<_, &str>("view_name") == "mv_campaign_performance"
-        && r.get::<_, &str>("status") == "PAUSED"));
+    assert!(paused_rows.iter().any(
+        |r| r.get::<_, &str>("view_name") == "mv_campaign_performance"
+            && r.get::<_, &str>("status") == "PAUSED"
+    ));
 
     client
         .execute("RESUME MATERIALIZED VIEW mv_campaign_performance", &[])
@@ -295,7 +323,8 @@ async fn test_mview_lifecycle_ivm_and_replacement() {
         .query("SHOW VIEW STATUS FOR NAMESPACE public", &[])
         .await
         .unwrap();
-    assert!(resumed_rows.iter().any(|r| r.get::<_, &str>("view_name") == "mv_campaign_performance"
+    assert!(resumed_rows.iter().any(|r| r.get::<_, &str>("view_name")
+        == "mv_campaign_performance"
         && r.get::<_, &str>("status") == "RUNNING"));
 
     // 6. Zero-Downtime Atomic Replacement
@@ -308,23 +337,37 @@ async fn test_mview_lifecycle_ivm_and_replacement() {
         .unwrap();
 
     let rep_status = client
-        .query("SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW mv_campaign_performance", &[])
+        .query(
+            "SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW mv_campaign_performance",
+            &[],
+        )
         .await
         .unwrap();
-    assert!(rep_status.iter().any(|r| r.get::<_, &str>("target_name") == "mv_campaign_performance"
+    assert!(rep_status.iter().any(|r| r.get::<_, &str>("target_name")
+        == "mv_campaign_performance"
         && r.get::<_, &str>("status") == "PENDING"));
 
     client
-        .execute("ALTER MATERIALIZED VIEW mv_campaign_performance APPLY REPLACEMENT", &[])
+        .execute(
+            "ALTER MATERIALIZED VIEW mv_campaign_performance APPLY REPLACEMENT",
+            &[],
+        )
         .await
         .unwrap();
 
     let rep_status_applied = client
-        .query("SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW mv_campaign_performance", &[])
+        .query(
+            "SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW mv_campaign_performance",
+            &[],
+        )
         .await
         .unwrap();
-    assert!(rep_status_applied.iter().any(|r| r.get::<_, &str>("target_name") == "mv_campaign_performance"
-        && r.get::<_, &str>("status") == "APPLIED"));
+    assert!(rep_status_applied
+        .iter()
+        .any(
+            |r| r.get::<_, &str>("target_name") == "mv_campaign_performance"
+                && r.get::<_, &str>("status") == "APPLIED"
+        ));
 
     // 7. Indexing
     client
@@ -336,13 +379,22 @@ async fn test_mview_lifecycle_ivm_and_replacement() {
         .unwrap();
 
     let explain_rows = client
-        .query("EXPLAIN INDEX SELECT * FROM mv_campaign_performance WHERE campaign_id = 10", &[])
+        .query(
+            "EXPLAIN INDEX SELECT * FROM mv_campaign_performance WHERE campaign_id = 10",
+            &[],
+        )
         .await
         .unwrap();
     assert!(!explain_rows.is_empty());
 
-    client.execute("REBUILD INDEX idx_campaign", &[]).await.unwrap();
-    client.execute("DROP INDEX idx_campaign", &[]).await.unwrap();
+    client
+        .execute("REBUILD INDEX idx_campaign", &[])
+        .await
+        .unwrap();
+    client
+        .execute("DROP INDEX idx_campaign", &[])
+        .await
+        .unwrap();
 
     // 8. Deletion
     client
@@ -406,7 +458,10 @@ async fn test_pgwire_language_features_coverage() {
 
     // 3.8 Optimistic write conflict (RS-2008)
     let conflict_res = client
-        .execute("INSERT INTO balances (account, amount) VALUES ('alice', CONFLICT)", &[])
+        .execute(
+            "INSERT INTO balances (account, amount) VALUES ('alice', CONFLICT)",
+            &[],
+        )
         .await;
     assert!(conflict_res.is_err());
     let err_msg = get_db_error_message(&conflict_res.unwrap_err());
@@ -425,7 +480,10 @@ async fn test_pgwire_language_features_coverage() {
         .unwrap();
 
     client
-        .execute("ALTER SOURCE kafka_orders DISMISS DEAD_LETTER_QUEUE WHERE error_code = 'RS-1003'", &[])
+        .execute(
+            "ALTER SOURCE kafka_orders DISMISS DEAD_LETTER_QUEUE WHERE error_code = 'RS-1003'",
+            &[],
+        )
         .await
         .unwrap();
 }
