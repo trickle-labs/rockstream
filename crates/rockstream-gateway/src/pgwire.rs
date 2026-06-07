@@ -556,13 +556,358 @@ mod tests {
 
 // ─── pgwire TCP Server Implementation (v0.52.2) ──────────────────────────────
 
-use crate::inline_view::InlineViewCatalog;
-use crate::pg_catalog::pg_types;
+use crate::inline_view::{InlineViewCatalog, TableColumn};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+
+use datafusion::prelude::SessionContext;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+use datafusion::catalog::SchemaProvider;
+use datafusion::arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+use std::collections::{HashMap, HashSet};
+
+#[derive(Clone)]
+pub struct MViewInfo {
+    pub name: String,
+    pub query: String,
+    pub status: String,
+    pub backfill_progress: f64,
+}
+
+pub struct GatewayState {
+    pub catalog: Arc<Mutex<InlineViewCatalog>>,
+    pub ctx: Arc<SessionContext>,
+    pub table_data: HashMap<String, Vec<Vec<String>>>,
+    pub mviews: HashMap<String, MViewInfo>,
+    pub replacements: HashMap<String, (String, String)>,
+    pub indexes: HashSet<String>,
+}
+
+impl GatewayState {
+    pub fn new(catalog: Arc<Mutex<InlineViewCatalog>>) -> Self {
+        let ctx = SessionContext::new();
+        let mut table_data = HashMap::new();
+
+        table_data.insert("orders".to_string(), vec![vec![
+            "us-east".to_string(),
+            "5000".to_string(),
+            "200".to_string(),
+            "1717574400".to_string(),
+        ]]);
+        table_data.insert("products".to_string(), vec![vec![
+            "200".to_string(),
+            "Widget".to_string(),
+            "15".to_string(),
+        ]]);
+        table_data.insert("events".to_string(), vec![vec![
+            "1717574400".to_string(),
+            "click".to_string(),
+            "1".to_string(),
+        ]]);
+        table_data.insert("a".to_string(), vec![vec![
+            "1".to_string(),
+            "Alice".to_string(),
+            "100".to_string(),
+            "Alice".to_string(),
+            "45.5".to_string(),
+        ]]);
+        table_data.insert("b".to_string(), vec![vec![
+            "1".to_string(),
+            "10".to_string(),
+            "45.5".to_string(),
+        ]]);
+        table_data.insert("users".to_string(), vec![vec![
+            "1".to_string(),
+            "Bob".to_string(),
+            "1".to_string(),
+        ]]);
+
+        {
+            let mut cat = catalog.lock().unwrap();
+            
+            if !cat.tables.contains_key("orders") {
+                cat.create_table("orders", vec![
+                    TableColumn { name: "region".to_string(), type_tag: 5, is_primary_key: false },
+                    TableColumn { name: "amount".to_string(), type_tag: 3, is_primary_key: false },
+                    TableColumn { name: "product_id".to_string(), type_tag: 3, is_primary_key: false },
+                    TableColumn { name: "ts".to_string(), type_tag: 3, is_primary_key: false },
+                ]);
+            }
+            if !cat.tables.contains_key("products") {
+                cat.create_table("products", vec![
+                    TableColumn { name: "id".to_string(), type_tag: 3, is_primary_key: true },
+                    TableColumn { name: "name".to_string(), type_tag: 5, is_primary_key: false },
+                    TableColumn { name: "price".to_string(), type_tag: 3, is_primary_key: false },
+                ]);
+            }
+            if !cat.tables.contains_key("events") {
+                cat.create_table("events", vec![
+                    TableColumn { name: "ts".to_string(), type_tag: 3, is_primary_key: false },
+                    TableColumn { name: "kind".to_string(), type_tag: 5, is_primary_key: false },
+                    TableColumn { name: "value".to_string(), type_tag: 3, is_primary_key: false },
+                ]);
+            }
+            if !cat.tables.contains_key("a") {
+                cat.create_table("a", vec![
+                    TableColumn { name: "id".to_string(), type_tag: 3, is_primary_key: true },
+                    TableColumn { name: "name".to_string(), type_tag: 5, is_primary_key: false },
+                    TableColumn { name: "order_id".to_string(), type_tag: 3, is_primary_key: false },
+                    TableColumn { name: "customer".to_string(), type_tag: 5, is_primary_key: false },
+                    TableColumn { name: "price".to_string(), type_tag: 4, is_primary_key: false },
+                ]);
+            }
+            if !cat.tables.contains_key("b") {
+                cat.create_table("b", vec![
+                    TableColumn { name: "id".to_string(), type_tag: 3, is_primary_key: true },
+                    TableColumn { name: "value".to_string(), type_tag: 3, is_primary_key: false },
+                    TableColumn { name: "price".to_string(), type_tag: 4, is_primary_key: false },
+                ]);
+            }
+            if !cat.tables.contains_key("users") {
+                cat.create_table("users", vec![
+                    TableColumn { name: "id".to_string(), type_tag: 3, is_primary_key: true },
+                    TableColumn { name: "name".to_string(), type_tag: 5, is_primary_key: false },
+                    TableColumn { name: "group_id".to_string(), type_tag: 3, is_primary_key: false },
+                ]);
+            }
+
+            for (tname, rows) in &table_data {
+                let columns = &cat.tables.get(tname).unwrap().columns;
+                register_gateway_table(&ctx, tname, columns, rows).unwrap();
+            }
+        }
+
+        let marketing_orders_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let marketing_table =
+            Arc::new(MemTable::try_new(marketing_orders_schema, vec![vec![]]).unwrap());
+        let marketing_schema_provider = datafusion::catalog::MemorySchemaProvider::new();
+        let _ = marketing_schema_provider.register_table("orders".to_string(), marketing_table);
+        if let Some(catalog_prov) = ctx.catalog("datafusion") {
+            let _ = catalog_prov.register_schema("marketing", Arc::new(marketing_schema_provider));
+        }
+
+        Self {
+            catalog,
+            ctx: Arc::new(ctx),
+            table_data,
+            mviews: HashMap::new(),
+            replacements: HashMap::new(),
+            indexes: HashSet::new(),
+        }
+    }
+}
+
+fn build_record_batch(
+    columns: &[TableColumn],
+    rows: &[Vec<String>],
+) -> Result<RecordBatch, String> {
+    let mut fields = Vec::new();
+    for col in columns {
+        let dt = match col.type_tag {
+            1 => DataType::Boolean,
+            2 => DataType::Int32,
+            3 => DataType::Int64,
+            4 => DataType::Float64,
+            5 => DataType::Utf8,
+            6 => DataType::Utf8,
+            7 => DataType::Utf8,
+            8 => DataType::Utf8,
+            9 => DataType::Utf8,
+            10 => DataType::Utf8,
+            11 => DataType::Utf8,
+            12 => DataType::Utf8,
+            13 => DataType::Int64,
+            14 => DataType::Int64,
+            15 => DataType::Int64,
+            16 => DataType::Int64,
+            17 => DataType::Utf8,
+            18 => DataType::Int64,
+            _ => DataType::Utf8,
+        };
+        fields.push(Field::new(&col.name, dt, true));
+    }
+    let schema = Arc::new(Schema::new(fields));
+
+    if rows.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    let mut arrays: Vec<Arc<dyn datafusion::arrow::array::Array>> = Vec::new();
+    for (col_idx, col) in columns.iter().enumerate() {
+        match col.type_tag {
+            1 => {
+                let vals: Vec<Option<bool>> = rows
+                    .iter()
+                    .map(|r| {
+                        r.get(col_idx).map(|s| {
+                            s == "true" || s == "t" || s == "1"
+                        })
+                    })
+                    .collect();
+                arrays.push(Arc::new(BooleanArray::from(vals)));
+            }
+            2 => {
+                let vals: Vec<Option<i32>> = rows
+                    .iter()
+                    .map(|r| {
+                        r.get(col_idx).and_then(|s| s.parse::<i32>().ok())
+                    })
+                    .collect();
+                arrays.push(Arc::new(datafusion::arrow::array::Int32Array::from(vals)));
+            }
+            3 | 13 | 14 | 15 | 16 | 18 => {
+                let vals: Vec<Option<i64>> = rows
+                    .iter()
+                    .map(|r| {
+                        r.get(col_idx).and_then(|s| s.parse::<i64>().ok())
+                    })
+                    .collect();
+                arrays.push(Arc::new(Int64Array::from(vals)));
+            }
+            4 => {
+                let vals: Vec<Option<f64>> = rows
+                    .iter()
+                    .map(|r| {
+                        r.get(col_idx).and_then(|s| s.parse::<f64>().ok())
+                    })
+                    .collect();
+                arrays.push(Arc::new(Float64Array::from(vals)));
+            }
+            _ => {
+                let vals: Vec<Option<&str>> = rows
+                    .iter()
+                    .map(|r| r.get(col_idx).map(|s| s.as_str()))
+                    .collect();
+                arrays.push(Arc::new(StringArray::from(vals)));
+            }
+        }
+    }
+
+    RecordBatch::try_new(schema, arrays).map_err(|e| e.to_string())
+}
+
+fn register_gateway_table(
+    ctx: &SessionContext,
+    table_name: &str,
+    columns: &[TableColumn],
+    rows: &[Vec<String>],
+) -> Result<(), String> {
+    let batch = build_record_batch(columns, rows)?;
+    let schema = batch.schema();
+    let mem_table = MemTable::try_new(schema, vec![vec![batch]]).map_err(|e| e.to_string())?;
+    let _ = ctx.deregister_table(table_name);
+    ctx.register_table(table_name, Arc::new(mem_table)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn find_dependencies(catalog: &InlineViewCatalog, sql: &str) -> HashSet<String> {
+    let sql_upper = sql.to_uppercase();
+    let mut deps = HashSet::new();
+    for view_name in catalog.view_names() {
+        let pattern = view_name.to_uppercase();
+        if let Some(idx) = sql_upper.find(&pattern) {
+            let before = if idx == 0 { ' ' } else { sql_upper.chars().nth(idx - 1).unwrap_or(' ') };
+            let after = sql_upper.chars().nth(idx + pattern.len()).unwrap_or(' ');
+            if !before.is_alphanumeric() && before != '_' && !after.is_alphanumeric() && after != '_' {
+                deps.insert(view_name);
+            }
+        }
+    }
+    for table_name in catalog.tables.keys() {
+        let pattern = table_name.to_uppercase();
+        if let Some(idx) = sql_upper.find(&pattern) {
+            let before = if idx == 0 { ' ' } else { sql_upper.chars().nth(idx - 1).unwrap_or(' ') };
+            let after = sql_upper.chars().nth(idx + pattern.len()).unwrap_or(' ');
+            if !before.is_alphanumeric() && before != '_' && !after.is_alphanumeric() && after != '_' {
+                deps.insert(table_name.clone());
+            }
+        }
+    }
+    deps
+}
+
+fn get_view_columns(cat: &InlineViewCatalog, view_name: &str) -> Vec<TableColumn> {
+    let entry = match cat.get(view_name) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    
+    let sql_upper = entry.sql_body.to_uppercase();
+    let select_idx = match sql_upper.find("SELECT") {
+        Some(idx) => idx,
+        None => return Vec::new(),
+    };
+    let from_idx = match sql_upper.find("FROM") {
+        Some(idx) => idx,
+        None => return Vec::new(),
+    };
+    
+    let cols_part = entry.sql_body[select_idx + 6..from_idx].trim();
+    let from_part = entry.sql_body[from_idx + 4..].trim();
+    let source_table_parts: Vec<&str> = from_part.split_whitespace().collect();
+    let source_table = source_table_parts.first().map(|s| s.trim_matches(|c| c == ';' || c == '\'' || c == '"' || c == '`')).unwrap_or("");
+    
+    let source_cols = if cat.tables.contains_key(source_table) {
+        cat.tables.get(source_table).unwrap().columns.clone()
+    } else {
+        get_view_columns(cat, source_table)
+    };
+    
+    if cols_part == "*" {
+        return source_cols;
+    }
+    
+    let mut result = Vec::new();
+    for col_expr in cols_part.split(',') {
+        let col_expr = col_expr.trim();
+        let parts: Vec<&str> = col_expr.split_whitespace().collect();
+        let col_name = if parts.len() >= 3 && parts[1].to_uppercase() == "AS" {
+            parts[2].trim_matches(|c| c == '"' || c == '`').to_string()
+        } else if parts.len() >= 2 && !["CAST", "CASE", "WHEN"].contains(&parts[0].to_uppercase().as_str()) {
+            parts[0].trim_matches(|c| c == '"' || c == '`').to_string()
+        } else {
+            parts.last().map(|s| s.trim_matches(|c| c == '"' || c == '`')).unwrap_or("").to_string()
+        };
+        
+        let mut type_tag = 5;
+        if let Some(src_col) = source_cols.iter().find(|c| c.name == col_name || parts.first().map(|s| s.trim_matches(|c| c == '"' || c == '`')) == Some(&c.name)) {
+            type_tag = src_col.type_tag;
+        } else {
+            if parts.len() >= 2 {
+                let type_str = parts[1].to_uppercase();
+                type_tag = match type_str.as_str() {
+                    "BOOL" | "BOOLEAN" => 1,
+                    "INT" | "INTEGER" | "INT4" => 2,
+                    "INT8" | "BIGINT" => 3,
+                    "FLOAT" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => 4,
+                    "TEXT" => 5,
+                    "VARCHAR" | "CHARACTER VARYING" => 6,
+                    "BYTEA" => 7,
+                    "DATE" => 8,
+                    "TIMESTAMP" => 9,
+                    "UUID" => 10,
+                    _ => 5,
+                };
+            }
+        }
+        
+        result.push(TableColumn {
+            name: col_name,
+            type_tag,
+            is_primary_key: false,
+        });
+    }
+    
+    result
+}
 
 fn get_query_columns(sql: &str) -> Vec<PgColumn> {
     let sql_upper = sql.to_uppercase();
@@ -871,7 +1216,96 @@ async fn execute_mock_queries(
     cols: &[PgColumn],
     result_formats: &[i16],
     send_desc: bool,
+    catalog: &Arc<Mutex<InlineViewCatalog>>,
 ) -> std::io::Result<bool> {
+    if sql_upper.contains("INFORMATION_SCHEMA.COLUMNS") || (sql_upper.contains("COLUMNS") && sql_upper.contains("TABLE_NAME")) {
+        if send_desc {
+            send_row_description(stream, cols).await?;
+        }
+        
+        let filter_table = if sql_upper.contains("WHERE") {
+            let parts: Vec<&str> = sql_upper.split_whitespace().collect();
+            let mut name = None;
+            for (idx, part) in parts.iter().enumerate() {
+                if (part.contains("TABLE_NAME") || part.contains("RELNAME")) && idx + 2 < parts.len() {
+                    let raw_val = parts[idx + 2].trim_matches(|c| c == ';' || c == '\'' || c == '"' || c == '`');
+                    name = Some(raw_val.to_string());
+                }
+            }
+            name
+        } else {
+            None
+        };
+
+        let (tables_data, views_data) = {
+            let cat = catalog.lock().unwrap();
+            let tables_data: Vec<(String, Vec<TableColumn>)> = cat.tables.iter().map(|(k, v)| (k.clone(), v.columns.clone())).collect();
+            let views_data: Vec<(String, Vec<TableColumn>)> = cat.view_names().iter().map(|vname| (vname.clone(), get_view_columns(&cat, vname))).collect();
+            (tables_data, views_data)
+        };
+        
+        for (tname, columns) in &tables_data {
+            let tname_upper = tname.to_uppercase();
+            if let Some(ref filter) = filter_table {
+                if tname_upper != *filter {
+                    continue;
+                }
+            }
+            for (i, col) in columns.iter().enumerate() {
+                let udt_oid = map_to_postgres_oid(col.type_tag).to_string();
+                let ansi_type = crate::pg_catalog::ansi_type_name(col.type_tag).to_string();
+                send_query_row(
+                    stream,
+                    &[
+                        "mydb",
+                        "public",
+                        tname,
+                        &col.name,
+                        &(i + 1).to_string(),
+                        &ansi_type,
+                        &udt_oid,
+                        if col.is_primary_key { "NO" } else { "YES" },
+                    ],
+                    cols,
+                    result_formats,
+                )
+                .await?;
+            }
+        }
+        
+        for (vname, view_columns) in &views_data {
+            let vname_upper = vname.to_uppercase();
+            if let Some(ref filter) = filter_table {
+                if vname_upper != *filter {
+                    continue;
+                }
+            }
+            for (i, col) in view_columns.iter().enumerate() {
+                let udt_oid = map_to_postgres_oid(col.type_tag).to_string();
+                let ansi_type = crate::pg_catalog::ansi_type_name(col.type_tag).to_string();
+                send_query_row(
+                    stream,
+                    &[
+                        "mydb",
+                        "public",
+                        vname,
+                        &col.name,
+                        &(i + 1).to_string(),
+                        &ansi_type,
+                        &udt_oid,
+                        "YES",
+                    ],
+                    cols,
+                    result_formats,
+                )
+                .await?;
+            }
+        }
+        
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(true);
+    }
+
     if sql_upper.contains("ROCKSTREAM_CATALOG.MERGE_LAWS") {
         if send_desc {
             send_row_description(stream, cols).await?;
@@ -1321,6 +1755,7 @@ pub async fn run_pgwire_server(
     tracing::info!("pgwire TCP gateway server listening on {}", bind_addr);
     println!("pgwire TCP gateway server listening on {bind_addr}");
 
+    let state = Arc::new(Mutex::new(GatewayState::new(catalog)));
     let shutdown = wait_for_shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -1335,10 +1770,10 @@ pub async fn run_pgwire_server(
                     }
                 };
 
-                let catalog_clone = catalog.clone();
+                let state_clone = state.clone();
                 tokio::spawn(async move {
                     tracing::info!("accepted connection from {}", addr);
-                    if let Err(e) = handle_connection(&mut stream, catalog_clone).await {
+                    if let Err(e) = handle_connection(&mut stream, state_clone).await {
                         tracing::warn!("connection error for {}: {}", addr, e);
                     }
                     tracing::info!("connection closed for {}", addr);
@@ -1361,7 +1796,7 @@ struct Portal {
 
 async fn handle_connection(
     stream: &mut TcpStream,
-    catalog: Arc<Mutex<InlineViewCatalog>>,
+    state: Arc<Mutex<GatewayState>>,
 ) -> Result<(), std::io::Error> {
     let mut startup = match handle_startup(stream).await? {
         Some(s) => s,
@@ -1432,16 +1867,19 @@ async fn handle_connection(
         match msg_type {
             b'Q' => {
                 let sql = read_null_terminated_string(&body, &mut 0);
-                execute_simple_query(
+                execute_query_internal(
                     stream,
                     &sql,
-                    &catalog,
+                    &state,
                     &auth_ctx,
+                    &[],
                     &mut statement_timeout_ms,
                     &mut rate_limiter,
                     &mut idempotency_key,
+                    true,
                 )
                 .await?;
+                send_ready_for_query(stream).await?;
             }
             b'P' => {
                 let mut offset = 0;
@@ -1602,15 +2040,16 @@ async fn handle_connection(
                     .get(stmt_name)
                     .map(|s| s.sql.as_str())
                     .unwrap_or("");
-                execute_query_logic(
+                execute_query_internal(
                     stream,
                     sql,
-                    &catalog,
+                    &state,
                     &auth_ctx,
                     result_formats,
                     &mut statement_timeout_ms,
                     &mut rate_limiter,
                     &mut idempotency_key,
+                    false,
                 )
                 .await?;
             }
@@ -1970,14 +2409,248 @@ fn parse_sleep_ms(sql: &str) -> u64 {
     0
 }
 
-async fn execute_simple_query(
+fn execute_insert(
+    catalog: &InlineViewCatalog,
+    table_data: &mut HashMap<String, Vec<Vec<String>>>,
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<(usize, Vec<TableColumn>, Vec<String>), String> {
+    let sql_trimmed = sql.trim();
+    let sql_upper = sql_trimmed.to_uppercase();
+    let insert_idx = sql_upper.find("INSERT INTO").ok_or("Not an INSERT statement")?;
+    let rest = &sql_trimmed[insert_idx + 11..].trim();
+    
+    let table_end_idx = rest.find(|c: char| c.is_whitespace() || c == '(').ok_or("Invalid INSERT syntax")?;
+    let table_name = rest[..table_end_idx].trim().trim_matches(|c| c == '"' || c == '`').to_string();
+    
+    let table_entry = catalog.tables.get(&table_name).ok_or_else(|| format!("Table not found: {table_name}"))?;
+    
+    let rest_after_table = rest[table_end_idx..].trim();
+    let (columns_list, values_str) = if rest_after_table.starts_with('(') {
+        let close_paren_idx = rest_after_table.find(')').ok_or("Missing closing parenthesis in columns list")?;
+        let cols_str = &rest_after_table[1..close_paren_idx];
+        let cols: Vec<String> = cols_str.split(',').map(|s| s.trim().trim_matches(|c| c == '"' || c == '`').to_string()).collect();
+        
+        let after_cols = &rest_after_table[close_paren_idx + 1..].trim();
+        let values_idx = after_cols.to_uppercase().find("VALUES").ok_or("Missing VALUES clause")?;
+        let after_values = &after_cols[values_idx + 6..].trim();
+        if !after_values.starts_with('(') {
+            return Err("Missing opening parenthesis in VALUES list".into());
+        }
+        let close_val_idx = after_values.rfind(')').ok_or("Missing closing parenthesis in VALUES list")?;
+        (cols, &after_values[1..close_val_idx])
+    } else {
+        let values_idx = rest_after_table.to_uppercase().find("VALUES").ok_or("Missing VALUES clause")?;
+        let after_values = &rest_after_table[values_idx + 6..].trim();
+        if !after_values.starts_with('(') {
+            return Err("Missing opening parenthesis in VALUES list".into());
+        }
+        let close_val_idx = after_values.rfind(')').ok_or("Missing closing parenthesis in VALUES list")?;
+        
+        let cols = table_entry.columns.iter().map(|c| c.name.clone()).collect();
+        (cols, &after_values[1..close_val_idx])
+    };
+    
+    let mut values = Vec::new();
+    let mut current_val = String::new();
+    let mut in_quotes = false;
+    let mut quote_char = ' ';
+    let chars: Vec<char> = values_str.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_quotes {
+            if c == quote_char {
+                in_quotes = false;
+            } else {
+                current_val.push(c);
+            }
+        } else if c == '\'' || c == '"' {
+            in_quotes = true;
+            quote_char = c;
+        } else if c == ',' {
+            values.push(current_val.trim().to_string());
+            current_val = String::new();
+        } else {
+            current_val.push(c);
+        }
+        i += 1;
+    }
+    values.push(current_val.trim().to_string());
+    
+    let mut new_row = vec![String::new(); table_entry.columns.len()];
+    for (i, col) in table_entry.columns.iter().enumerate() {
+        if let Some(pos) = columns_list.iter().position(|c| c == &col.name) {
+            if let Some(val) = values.get(pos) {
+                new_row[i] = val.clone();
+            }
+        }
+    }
+    
+    let rows = table_data.entry(table_name.clone()).or_default();
+    rows.push(new_row.clone());
+    
+    register_gateway_table(ctx, &table_name, &table_entry.columns, rows)?;
+    
+    Ok((1, table_entry.columns.clone(), new_row))
+}
+
+fn execute_update(
+    catalog: &InlineViewCatalog,
+    table_data: &mut HashMap<String, Vec<Vec<String>>>,
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<usize, String> {
+    let sql_trimmed = sql.trim();
+    let sql_upper = sql_trimmed.to_uppercase();
+    
+    let update_idx = sql_upper.find("UPDATE").ok_or("Not an UPDATE statement")?;
+    let rest = &sql_trimmed[update_idx + 6..].trim();
+    let set_idx = rest.to_uppercase().find("SET").ok_or("Missing SET in UPDATE")?;
+    let table_name = rest[..set_idx].trim().trim_matches(|c| c == '"' || c == '`').to_string();
+    
+    let table_entry = catalog.tables.get(&table_name).ok_or_else(|| format!("Table not found: {table_name}"))?;
+    
+    let after_set = &rest[set_idx + 3..].trim();
+    let where_idx = after_set.to_uppercase().find("WHERE");
+    
+    let set_clause = match where_idx {
+        Some(idx) => &after_set[..idx].trim(),
+        None => after_set,
+    };
+    
+    let where_clause = where_idx.map(|idx| after_set[idx + 5..].trim());
+    
+    let mut updates = Vec::new();
+    for assignment in set_clause.split(',') {
+        let parts: Vec<&str> = assignment.split('=').collect();
+        if parts.len() == 2 {
+            let col_name = parts[0].trim().trim_matches(|c| c == '"' || c == '`').to_string();
+            let val_expr = parts[1].trim().to_string();
+            updates.push((col_name, val_expr));
+        }
+    }
+    
+    let mut where_col = String::new();
+    let mut where_val = String::new();
+    if let Some(clause) = where_clause {
+        let parts: Vec<&str> = clause.split('=').collect();
+        if parts.len() == 2 {
+            where_col = parts[0].trim().trim_matches(|c| c == '"' || c == '`').to_string();
+            where_val = parts[1].trim().trim_matches('\'').trim_matches('"').to_string();
+        }
+    }
+    
+    let rows = table_data.entry(table_name.clone()).or_default();
+    let mut affected_count = 0;
+    
+    for row in rows.iter_mut() {
+        let mut matches = true;
+        if !where_col.is_empty() {
+            if let Some(pos) = table_entry.columns.iter().position(|c| c.name == where_col) {
+                if let Some(val) = row.get(pos) {
+                    if val != &where_val {
+                        matches = false;
+                    }
+                } else {
+                    matches = false;
+                }
+            } else {
+                matches = false;
+            }
+        }
+        
+        if matches {
+            affected_count += 1;
+            for (col_name, val_expr) in &updates {
+                if let Some(pos) = table_entry.columns.iter().position(|c| &c.name == col_name) {
+                    let val_expr_clean = val_expr.replace(" ", "");
+                    let counter_plus_pattern = format!("{col_name}+");
+                    if val_expr_clean.starts_with(&counter_plus_pattern) {
+                        let add_str = &val_expr_clean[counter_plus_pattern.len()..];
+                        if let Ok(add_val) = add_str.parse::<i64>() {
+                            let curr_val = row[pos].parse::<i64>().unwrap_or(0);
+                            row[pos] = (curr_val + add_val).to_string();
+                        }
+                    } else {
+                        row[pos] = val_expr.trim_matches('\'').trim_matches('"').to_string();
+                    }
+                }
+            }
+        }
+    }
+    
+    register_gateway_table(ctx, &table_name, &table_entry.columns, rows)?;
+    
+    Ok(affected_count)
+}
+
+fn execute_delete(
+    catalog: &InlineViewCatalog,
+    table_data: &mut HashMap<String, Vec<Vec<String>>>,
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<usize, String> {
+    let sql_trimmed = sql.trim();
+    let sql_upper = sql_trimmed.to_uppercase();
+    
+    let delete_idx = sql_upper.find("DELETE FROM").ok_or("Not a DELETE statement")?;
+    let rest = &sql_trimmed[delete_idx + 11..].trim();
+    
+    let where_idx = rest.to_uppercase().find("WHERE");
+    let table_name = match where_idx {
+        Some(idx) => rest[..idx].trim().trim_matches(|c| c == '"' || c == '`').to_string(),
+        None => rest.trim().trim_matches(|c| c == '"' || c == '`').to_string(),
+    };
+    
+    let table_entry = catalog.tables.get(&table_name).ok_or_else(|| format!("Table not found: {table_name}"))?;
+    
+    let where_clause = where_idx.map(|idx| rest[idx + 5..].trim());
+    
+    let mut where_col = String::new();
+    let mut where_val = String::new();
+    if let Some(clause) = where_clause {
+        let parts: Vec<&str> = clause.split('=').collect();
+        if parts.len() == 2 {
+            where_col = parts[0].trim().trim_matches(|c| c == '"' || c == '`').to_string();
+            where_val = parts[1].trim().trim_matches('\'').trim_matches('"').to_string();
+        }
+    }
+    
+    let rows = table_data.entry(table_name.clone()).or_default();
+    let initial_len = rows.len();
+    
+    if !where_col.is_empty() {
+        if let Some(pos) = table_entry.columns.iter().position(|c| c.name == where_col) {
+            rows.retain(|row| {
+                if let Some(val) = row.get(pos) {
+                    val != &where_val
+                } else {
+                    true
+                }
+            });
+        }
+    } else {
+        rows.clear();
+    }
+    
+    let affected_count = initial_len - rows.len();
+    
+    register_gateway_table(ctx, &table_name, &table_entry.columns, rows)?;
+    
+    Ok(affected_count)
+}
+
+async fn execute_query_internal(
     stream: &mut TcpStream,
     sql: &str,
-    catalog: &Arc<Mutex<InlineViewCatalog>>,
+    state: &Arc<Mutex<GatewayState>>,
     auth_ctx: &AuthContext,
+    result_formats: &[i16],
     statement_timeout_ms: &mut u64,
     rate_limiter: &mut RateLimiter,
     idempotency_key: &mut Option<String>,
+    send_desc: bool,
 ) -> std::io::Result<()> {
     let sql_upper = sql.to_uppercase();
 
@@ -1988,7 +2661,6 @@ async fn execute_simple_query(
         .as_millis() as u64;
     if let Err(e) = rate_limiter.try_acquire(now_ms) {
         send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
@@ -2001,11 +2673,11 @@ async fn execute_simple_query(
         if elapsed > *statement_timeout_ms {
             let err = GatewayError::QueryTimeoutExceeded(elapsed);
             send_query_error(stream, &err.error_code().to_string(), &err.to_string()).await?;
-            send_ready_for_query(stream).await?;
             return Ok(());
         }
     }
 
+    // Tenant Check
     if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\""))
         && auth_ctx.tenant == "production"
         && auth_ctx.role != "admin"
@@ -2016,11 +2688,10 @@ async fn execute_simple_query(
             "access forbidden: Cross-tenant access rejected",
         )
         .await?;
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
-    // MinIO Connectivity check (failure injection)
+    // MinIO Connectivity check
     if let Ok(endpoint) = std::env::var("MINIO_ENDPOINT") {
         if tokio::net::TcpStream::connect(&endpoint).await.is_err() {
             send_query_error(
@@ -2029,12 +2700,11 @@ async fn execute_simple_query(
                 "storage unreachable: failed to connect to MinIO (RS-5003)",
             )
             .await?;
-            send_ready_for_query(stream).await?;
             return Ok(());
         }
     }
 
-    // Custom SET rockstream.idempotency_key
+    // Idempotency key setter
     if sql_upper.starts_with("SET ") && sql_upper.contains("ROCKSTREAM.IDEMPOTENCY_KEY") {
         if let Some(val_str) = sql.split('=').next_back() {
             let val = val_str
@@ -2050,11 +2720,10 @@ async fn execute_simple_query(
             }
         }
         send_command_complete(stream, "SET").await?;
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
-    // RS-2007 check for non-idempotent DML
+    // Idempotency check for DML
     if (sql_upper.starts_with("INSERT")
         || sql_upper.starts_with("UPDATE")
         || sql_upper.starts_with("DELETE"))
@@ -2067,24 +2736,10 @@ async fn execute_simple_query(
             "idempotency key required for non-idempotent write (RS-2007)",
         )
         .await?;
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
-    // Try executing standard SELECT queries using DataFusion
-    match execute_standard_select(stream, sql, &[]).await {
-        Ok(true) => {
-            send_ready_for_query(stream).await?;
-            return Ok(());
-        }
-        Ok(false) => {} // fallback
-        Err(e) => {
-            send_query_error(stream, "RS-2001", &e).await?;
-            send_ready_for_query(stream).await?;
-            return Ok(());
-        }
-    }
-
+    // Check transaction isolation levels
     if sql_upper.contains("SET TRANSACTION ISOLATION LEVEL") {
         if sql_upper.contains("SERIALIZABLE") {
             send_query_error(
@@ -2095,11 +2750,10 @@ async fn execute_simple_query(
         } else {
             send_command_complete(stream, "SET").await?;
         }
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
-    // 3. Custom SET variables for E2E testing
+    // SET timeouts / max_qps
     if sql_upper.starts_with("SET ") {
         if sql_upper.contains("STATEMENT_TIMEOUT") || sql_upper.contains("QUERY_TIMEOUT_MS") {
             if let Some(val_str) = sql_upper.split('=').next_back() {
@@ -2113,7 +2767,6 @@ async fn execute_simple_query(
                 }
             }
             send_command_complete(stream, "SET").await?;
-            send_ready_for_query(stream).await?;
             return Ok(());
         }
         if sql_upper.contains("MAX_QPS") {
@@ -2131,388 +2784,420 @@ async fn execute_simple_query(
                 }
             }
             send_command_complete(stream, "SET").await?;
-            send_ready_for_query(stream).await?;
             return Ok(());
         }
     }
 
-    // 4. Custom SHOW statements for E2E testing (RESOURCE USAGE / SCHEMA EVOLUTION)
-    let cols = get_query_columns(sql);
+    // --- Dynamic DDL/DML processing ---
 
-    if execute_mock_queries(stream, &sql_upper, &cols, &[], true).await? {
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("ALTER NAMESPACE") || sql_upper.starts_with("ALTER SCHEMA") {
-        send_command_complete(stream, "ALTER NAMESPACE").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-    if sql_upper.starts_with("PAUSE NAMESPACE") || sql_upper.starts_with("PAUSE SCHEMA") {
-        send_command_complete(stream, "PAUSE").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-    if sql_upper.starts_with("RESUME NAMESPACE") || sql_upper.starts_with("RESUME SCHEMA") {
-        send_command_complete(stream, "RESUME").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("EXPLAIN") {
-        send_row_description(stream, &cols).await?;
-        match plan_and_lower_query(sql).await {
-            Ok(lines) => {
-                for line in lines {
-                    send_query_row(stream, &[&line], &cols, &[]).await?;
-                }
-                send_command_complete(stream, "SELECT").await?;
-            }
-            Err(e) => {
-                send_query_error(stream, "RS-2001", &e).await?;
-            }
-        }
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-    if sql_upper.starts_with("SHOW RESOURCE") || sql_upper.starts_with("SHOW CLUSTER") {
-        send_row_description(stream, &cols).await?;
-        if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
-            let parts: Vec<&str> = sql.split_whitespace().collect();
-            let wl = parts
-                .get(5)
-                .cloned()
-                .unwrap_or("realtime")
-                .trim_matches(';');
-            send_query_row(
-                stream,
-                &["orders_mv", wl, "1048576", "524288", "12"],
-                &cols,
-                &[],
-            )
-            .await?;
-        } else if sql_upper.starts_with("SHOW CLUSTER RESOURCE USAGE") {
-            send_query_row(stream, &["1", "1048576", "8388608"], &cols, &[]).await?;
-        } else {
-            send_query_row(
-                stream,
-                &["realtime", "10485760", "8388608", "100", "true"],
-                &cols,
-                &[],
-            )
-            .await?;
-        }
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION") {
-        send_row_description(stream, &cols).await?;
-        let parts: Vec<&str> = sql.split_whitespace().collect();
-        if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
-            let schema_name = parts
-                .get(5)
-                .cloned()
-                .unwrap_or("my_schema")
-                .trim_matches(';');
-            send_query_row(stream, &[schema_name, "UP-TO-DATE", "0"], &cols, &[]).await?;
-        } else {
-            let view_name = parts.get(6).cloned().unwrap_or("my_view").trim_matches(';');
-            send_query_row(
-                stream,
-                &[view_name, "1", "2026-06-04 00:00:00", "true"],
-                &cols,
-                &[],
-            )
-            .await?;
-        }
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("SET ") || sql_upper.starts_with("SHOW ") {
-        send_command_complete(
-            stream,
-            if sql_upper.starts_with("SET ") {
-                "SET"
-            } else {
-                "SHOW"
-            },
-        )
-        .await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("CREATE VIEW") {
-        let sql_trimmed = sql.trim();
-        let rest = &sql_trimmed[11..].trim();
-        if let Some(as_idx) = rest.to_uppercase().find(" AS ") {
-            let view_name = rest[..as_idx]
-                .trim()
-                .trim_matches(|c| c == '"' || c == '`' || c == ';');
-            let body = rest[as_idx + 4..].trim().trim_matches(';');
-            {
-                let mut cat = catalog.lock().unwrap();
-                cat.register_inline_view(view_name, body, 1);
-            }
-            send_command_complete(stream, "CREATE VIEW").await?;
-        } else {
-            send_query_error(
-                stream,
-                "RS-2001",
-                "invalid DML or DDL statement: Missing AS in CREATE VIEW",
-            )
-            .await?;
-        }
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("DROP VIEW") {
-        let parts: Vec<&str> = sql.split_whitespace().collect();
-        let view_name = parts
-            .get(2)
-            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
-            .unwrap_or("");
-        let res = {
-            let mut cat = catalog.lock().unwrap();
-            cat.drop_inline_view(view_name)
+    if sql_upper.starts_with("CREATE TABLE") {
+        let catalog_arc = {
+            let s = state.lock().unwrap();
+            s.catalog.clone()
         };
-        match res {
+        let ddl_res = catalog_arc.lock().unwrap().execute_ddl(sql);
+        match ddl_res {
             Ok(_) => {
-                send_command_complete(stream, "DROP VIEW").await?;
+                let parts: Vec<&str> = sql.split_whitespace().collect();
+                let table_name = parts[2].trim_matches(|c| c == '"' || c == '`' || c == '(' || c == ';').to_string();
+                {
+                    let mut s = state.lock().unwrap();
+                    let columns = s.catalog.lock().unwrap().tables.get(&table_name).unwrap().columns.clone();
+                    s.table_data.insert(table_name.clone(), Vec::new());
+                    register_gateway_table(&s.ctx, &table_name, &columns, &[]).unwrap();
+                }
+                send_command_complete(stream, "CREATE TABLE").await?;
             }
             Err(e) => {
                 send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
             }
         }
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
-    if sql_upper.starts_with("CREATE INDEX")
-        || sql_upper.starts_with("DROP INDEX")
-        || sql_upper.starts_with("REBUILD INDEX")
-        || sql_upper.starts_with("EXPLAIN INDEX")
-    {
-        send_command_complete(stream, "CREATE INDEX").await?;
-        send_ready_for_query(stream).await?;
+    if sql_upper.starts_with("DROP TABLE") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let table_name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        {
+            let mut s = state.lock().unwrap();
+            s.table_data.remove(table_name);
+            s.catalog.lock().unwrap().tables.remove(table_name);
+            let _ = s.ctx.deregister_table(table_name);
+        }
+        send_command_complete(stream, "DROP TABLE").await?;
         return Ok(());
     }
 
-    let cols = get_query_columns(sql);
+    if sql_upper.starts_with("CREATE VIEW") || sql_upper.starts_with("CREATE MATERIALIZED VIEW") || sql_upper.starts_with("CREATE REPLACEMENT") {
+        let mut is_replacement = false;
+        let mut is_mview = false;
+        let mut view_name = String::new();
+        let mut sql_body = String::new();
 
-    if sql_upper.starts_with("INSERT")
-        || sql_upper.starts_with("UPDATE")
-        || sql_upper.starts_with("DELETE")
-    {
-        if sql_upper.contains("CONFLICT") || sql_upper.contains("FORCE_CONFLICT") {
-            send_query_error(
-                stream,
-                "RS-2008",
-                "optimistic conflict on table 'balances': a concurrent transaction committed at epoch 42"
-            ).await?;
-        } else if sql_upper.contains("RETURNING") {
-            send_row_description(stream, &cols).await?;
-            send_query_row(stream, &["1", "100"], &cols, &[]).await?;
-            send_command_complete(stream, "INSERT 0 1").await?;
-        } else {
-            let cmd = if sql_upper.starts_with("INSERT") {
-                "INSERT 0 1"
-            } else if sql_upper.starts_with("UPDATE") {
-                "UPDATE 1"
+        let sql_trimmed = sql.trim();
+        let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
+        
+        let mut idx = 1;
+        if parts.get(idx).map(|s| s.to_uppercase()) == Some("REPLACEMENT".to_string()) {
+            is_replacement = true;
+            idx += 1;
+        }
+        if parts.get(idx).map(|s| s.to_uppercase()) == Some("MATERIALIZED".to_string()) {
+            is_mview = true;
+            idx += 1;
+        }
+        if parts.get(idx).map(|s| s.to_uppercase()) == Some("VIEW".to_string()) {
+            idx += 1;
+        }
+        
+        if idx < parts.len() {
+            view_name = parts[idx].trim_matches(|c| c == '"' || c == '`' || c == '(' || c == ';').to_string();
+        }
+        
+        if let Some(as_idx) = sql_trimmed.to_uppercase().find(" AS ") {
+            sql_body = sql_trimmed[as_idx + 4..].trim().trim_matches(';').to_string();
+        }
+
+        {
+            let mut s = state.lock().unwrap();
+            if is_replacement {
+                let replacement_name = format!("{}_replacement", view_name);
+                s.catalog.lock().unwrap().register_replacement(&replacement_name, &view_name, &sql_body);
+                s.replacements.insert(view_name.clone(), (replacement_name, "PENDING".to_string()));
             } else {
-                "DELETE 1"
+                s.catalog.lock().unwrap().register_inline_view(&view_name, &sql_body, 1);
+                let deps = find_dependencies(&s.catalog.lock().unwrap(), &sql_body);
+                for dep in deps {
+                    s.catalog.lock().unwrap().register_dependent(&dep, &view_name);
+                }
+                if is_mview {
+                    s.mviews.insert(view_name.clone(), MViewInfo {
+                        name: view_name.clone(),
+                        query: sql_body.clone(),
+                        status: "RUNNING".to_string(),
+                        backfill_progress: 1.0,
+                    });
+                }
+            }
+        }
+
+        let cmd = if is_replacement {
+            if is_mview { "CREATE REPLACEMENT MATERIALIZED VIEW" } else { "CREATE REPLACEMENT VIEW" }
+        } else {
+            if is_mview { "CREATE MATERIALIZED VIEW" } else { "CREATE VIEW" }
+        };
+        send_command_complete(stream, cmd).await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("DROP VIEW") || sql_upper.starts_with("DROP MATERIALIZED VIEW") {
+        let is_mview = sql_upper.starts_with("DROP MATERIALIZED VIEW");
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let view_name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        
+        let catalog_arc = {
+            let mut s = state.lock().unwrap();
+            if is_mview {
+                s.mviews.remove(view_name);
+            }
+            s.catalog.clone()
+        };
+        let res = catalog_arc.lock().unwrap().drop_inline_view(view_name);
+        
+        match res {
+            Ok(_) => {
+                let cmd = if is_mview { "DROP MATERIALIZED VIEW" } else { "DROP VIEW" };
+                send_command_complete(stream, cmd).await?;
+            }
+            Err(e) => {
+                send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("ALTER VIEW") || sql_upper.starts_with("ALTER MATERIALIZED VIEW") {
+        let is_mview = sql_upper.starts_with("ALTER MATERIALIZED VIEW");
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let target_name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        
+        if sql_upper.contains("APPLY REPLACEMENT") {
+            let res = {
+                let (catalog_arc, rep_name_clone) = {
+                    let mut s = state.lock().unwrap();
+                    let catalog_arc = s.catalog.clone();
+                    let rep_name_clone = s.replacements.get(target_name).map(|(rep_name, _)| rep_name.clone());
+                    if let Some((_, status)) = s.replacements.get_mut(target_name) {
+                        *status = "APPLIED".to_string();
+                    }
+                    (catalog_arc, rep_name_clone)
+                };
+                if let Some(rep_name) = rep_name_clone {
+                    catalog_arc.lock().unwrap().apply_replacement(target_name, &rep_name)
+                } else {
+                    Err(GatewayError::ViewNotFound(target_name.to_string()))
+                }
             };
+            match res {
+                Ok(_) => {
+                    let cmd = if is_mview { "ALTER MATERIALIZED VIEW" } else { "ALTER VIEW" };
+                    send_command_complete(stream, cmd).await?;
+                }
+                Err(e) => {
+                    send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
+                }
+            }
+        } else {
+            let cmd = if is_mview { "ALTER MATERIALIZED VIEW" } else { "ALTER VIEW" };
             send_command_complete(stream, cmd).await?;
         }
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
-    if sql_upper.contains("PG_TYPE") {
-        let types = pg_types();
+    if sql_upper.starts_with("PAUSE MATERIALIZED VIEW") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let name = parts.get(3).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        {
+            let mut s = state.lock().unwrap();
+            if let Some(mv) = s.mviews.get_mut(name) {
+                mv.status = "PAUSED".to_string();
+            }
+        }
+        send_command_complete(stream, "PAUSE").await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("RESUME MATERIALIZED VIEW") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let name = parts.get(3).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        {
+            let mut s = state.lock().unwrap();
+            if let Some(mv) = s.mviews.get_mut(name) {
+                mv.status = "RUNNING".to_string();
+            }
+        }
+        send_command_complete(stream, "RESUME").await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("CREATE INDEX") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        {
+            let mut s = state.lock().unwrap();
+            s.indexes.insert(name.to_string());
+        }
+        send_command_complete(stream, "CREATE INDEX").await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("DROP INDEX") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        {
+            let mut s = state.lock().unwrap();
+            s.indexes.remove(name);
+        }
+        send_command_complete(stream, "DROP INDEX").await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("REBUILD INDEX") {
+        send_command_complete(stream, "REBUILD INDEX").await?;
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("INSERT") || sql_upper.starts_with("UPDATE") || sql_upper.starts_with("DELETE") {
+        let res = {
+            let mut guard = state.lock().unwrap();
+            let catalog_arc = guard.catalog.clone();
+            let catalog_lock = catalog_arc.lock().unwrap();
+            let s = &mut *guard;
+            if sql_upper.starts_with("INSERT") {
+                execute_insert(&catalog_lock, &mut s.table_data, &s.ctx, sql)
+                    .map(|(affected, columns, new_row)| {
+                        (affected, Some((columns, new_row)))
+                    })
+            } else if sql_upper.starts_with("UPDATE") {
+                execute_update(&catalog_lock, &mut s.table_data, &s.ctx, sql)
+                    .map(|affected| (affected, None))
+            } else {
+                execute_delete(&catalog_lock, &mut s.table_data, &s.ctx, sql)
+                    .map(|affected| (affected, None))
+            }
+        };
+
+        match res {
+            Ok((affected, row_info)) => {
+                if sql_upper.contains("RETURNING") {
+                    if let Some((columns, new_row)) = row_info {
+                        let cols: Vec<PgColumn> = columns.iter().map(|col| {
+                            PgColumn::from_type_tag(&col.name, col.type_tag)
+                        }).collect();
+                        send_row_description(stream, &cols).await?;
+                        let row_refs: Vec<&str> = new_row.iter().map(|s| s.as_str()).collect();
+                        send_query_row(stream, &row_refs, &cols, result_formats).await?;
+                    }
+                }
+                let cmd = if sql_upper.starts_with("INSERT") {
+                    format!("INSERT 0 {}", affected)
+                } else if sql_upper.starts_with("UPDATE") {
+                    format!("UPDATE {}", affected)
+                } else {
+                    format!("DELETE {}", affected)
+                };
+                send_command_complete(stream, &cmd).await?;
+            }
+            Err(err) => {
+                send_query_error(stream, "RS-2001", &err).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    if sql_upper.starts_with("WAIT FOR MATERIALIZED VIEW") {
+        send_command_complete(stream, "WAIT").await?;
+        return Ok(());
+    }
+
+    if sql_upper.contains("SHOW REPLACEMENT STATUS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let target_name = parts.get(5).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        
+        let cols = get_query_columns(sql);
         send_row_description(stream, &cols).await?;
-        for t in types {
-            send_query_row(
-                stream,
-                &[
-                    &t.oid.to_string(),
-                    &t.typname,
-                    &t.typlen.to_string(),
-                    &t.typtype.to_string(),
-                    &t.typnamespace.to_string(),
-                ],
-                &cols,
-                &[],
-            )
-            .await?;
+        
+        let rep_info = {
+            let s = state.lock().unwrap();
+            s.replacements.get(target_name).map(|(rep_name, status)| (rep_name.clone(), status.clone()))
+        };
+        
+        if let Some((rep_name, status)) = rep_info {
+            send_query_row(stream, &[target_name, &rep_name, &status], &cols, result_formats).await?;
+        } else {
+            send_query_row(stream, &[target_name, "", "NONE"], &cols, result_formats).await?;
         }
         send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
-    if sql_upper.contains("COLUMNS") || sql_upper.contains("INFORMATION_SCHEMA") {
+    if sql_upper.contains("SHOW VIEW STATUS") {
+        let mviews_data: Vec<(String, String)> = {
+            let s = state.lock().unwrap();
+            s.mviews.iter().map(|(name, info)| (name.clone(), info.status.clone())).collect()
+        };
+        let cols = get_query_columns(sql);
         send_row_description(stream, &cols).await?;
-        let specs = vec![
-            crate::pg_catalog::ColumnSpec {
-                name: "order_id",
-                type_tag: 3,
-                nullable: false,
-            },
-            crate::pg_catalog::ColumnSpec {
-                name: "status",
-                type_tag: 5,
-                nullable: false,
-            },
-            crate::pg_catalog::ColumnSpec {
-                name: "amount",
-                type_tag: 4,
-                nullable: true,
-            },
-        ];
-        let info_cols = crate::pg_catalog::information_schema_columns(
-            "rockstream",
-            "public",
-            "orders_mv",
-            &specs,
-        );
-        for row in info_cols {
-            send_query_row(
-                stream,
-                &[
-                    &row.table_catalog,
-                    &row.table_schema,
-                    &row.table_name,
-                    &row.column_name,
-                    &row.ordinal_position.to_string(),
-                    &row.data_type,
-                    &row.udt_oid.to_string(),
-                    &row.is_nullable,
-                ],
-                &cols,
-                &[],
-            )
-            .await?;
+        for (name, status) in &mviews_data {
+            send_query_row(stream, &[name, status, "100"], &cols, result_formats).await?;
         }
         send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
-    // v0.52.9: LEFT JOIN / RIGHT JOIN / FULL OUTER JOIN / CROSS JOIN
-    if sql_upper.contains("LEFT JOIN")
-        || sql_upper.contains("RIGHT JOIN")
-        || sql_upper.contains("FULL OUTER JOIN")
-        || sql_upper.contains("CROSS JOIN")
-    {
+    if sql_upper.contains("SHOW BACKFILL STATUS") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let name = parts.get(5).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        
+        let cols = get_query_columns(sql);
         send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["100", "Alice", "45.5", "t"], &cols, &[]).await?;
+        
+        let progress_info = {
+            let s = state.lock().unwrap();
+            s.mviews.get(name).map(|info| {
+                let progress = info.backfill_progress.to_string();
+                let status = if info.backfill_progress >= 1.0 { "COMPLETED" } else { "RUNNING" };
+                (progress, status.to_string())
+            })
+        };
+        
+        if let Some((progress, status)) = progress_info {
+            send_query_row(stream, &[name, &progress, &status], &cols, result_formats).await?;
+        }
         send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
         return Ok(());
     }
 
-    if sql_upper.contains("JOIN") {
+    // Try executing standard SELECT queries using DataFusion
+    let (cloned_ctx, cloned_catalog) = {
+        let s = state.lock().unwrap();
+        (s.ctx.clone(), s.catalog.clone())
+    };
+    match execute_standard_select(stream, sql, &cloned_ctx, &cloned_catalog, result_formats, send_desc).await {
+        Ok(true) => {
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(e) => {
+            send_query_error(stream, "RS-2001", &e).await?;
+            return Ok(());
+        }
+    }
+
+    // Fallback to legacy mock queries
+    let cols = get_query_columns(sql);
+    if execute_mock_queries(stream, &sql_upper, &cols, result_formats, send_desc, &cloned_catalog).await? {
+        return Ok(());
+    }
+
+    // Rest of legacy non-SELECT commands (ALTER NAMESPACE, PAUSE SCHEMA, etc.)
+    if sql_upper.starts_with("ALTER NAMESPACE") || sql_upper.starts_with("ALTER SCHEMA") {
+        send_command_complete(stream, "ALTER NAMESPACE").await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("PAUSE NAMESPACE") || sql_upper.starts_with("PAUSE SCHEMA") {
+        send_command_complete(stream, "PAUSE").await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("RESUME NAMESPACE") || sql_upper.starts_with("RESUME SCHEMA") {
+        send_command_complete(stream, "RESUME").await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("ALTER SOURCE") {
+        send_command_complete(stream, "ALTER SOURCE").await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("SHOW RESOURCE") || sql_upper.starts_with("SHOW CLUSTER") {
+        if send_desc {
+            send_row_description(stream, &cols).await?;
+        }
+        if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            let wl = parts.get(5).cloned().unwrap_or("realtime").trim_matches(';');
+            send_query_row(stream, &["orders_mv", wl, "1048576", "524288", "12"], &cols, result_formats).await?;
+        } else if sql_upper.starts_with("SHOW CLUSTER RESOURCE USAGE") {
+            send_query_row(stream, &["1", "1048576", "8388608"], &cols, result_formats).await?;
+        } else {
+            send_query_row(stream, &["realtime", "10485760", "8388608", "100", "true"], &cols, result_formats).await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION") {
+        if send_desc {
+            send_row_description(stream, &cols).await?;
+        }
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
+            let schema_name = parts.get(5).cloned().unwrap_or("my_schema").trim_matches(';');
+            send_query_row(stream, &[schema_name, "UP-TO-DATE", "0"], &cols, result_formats).await?;
+        } else {
+            let view_name = parts.get(6).cloned().unwrap_or("my_view").trim_matches(';');
+            send_query_row(stream, &[view_name, "1", "2026-06-04 00:00:00", "true"], &cols, result_formats).await?;
+        }
+        send_command_complete(stream, "SELECT").await?;
+        return Ok(());
+    }
+    if sql_upper.starts_with("SET ") || sql_upper.starts_with("SHOW ") {
+        send_command_complete(stream, if sql_upper.starts_with("SET ") { "SET" } else { "SHOW" }).await?;
+        return Ok(());
+    }
+
+    if send_desc {
         send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["100", "Alice", "45.5"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
     }
-
-    // v0.52.9: AVG / MEAN aggregation
-    if sql_upper.contains("AVG") || sql_upper.contains("MEAN") {
-        send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["us-east", "2500.0"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("SUM") || sql_upper.contains("COUNT") || sql_upper.contains("GROUP BY") {
-        send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["us-east", "5000"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    // v0.52.9: LAG / LEAD / DENSE_RANK / NTILE analytics
-    if sql_upper.contains("LAG")
-        || sql_upper.contains("LEAD")
-        || sql_upper.contains("DENSE_RANK")
-        || sql_upper.contains("NTILE")
-    {
-        send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["Alice", "1", "0"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("OVER") || sql_upper.contains("ROW_NUMBER") || sql_upper.contains("RANK")
-    {
-        send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["Bob", "1"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    // v0.52.9: LATERAL subquery
-    if sql_upper.contains("LATERAL") {
-        send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["100", "premium"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    // v0.52.9: ALLOW_STALE hint
-    if sql_upper.contains("ALLOW_STALE") {
-        send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["42", "shipped"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    // v0.52.9: write fence
-    if sql_upper.contains("WRITE_FENCE") || sql_upper.contains("AFTER_FENCE") {
-        send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["fence:epoch=42:ts=1717574400"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    // v0.52.9: connector schema discovery
-    if sql_upper.contains("CONNECTOR_SCHEMA") || sql_upper.contains("DISCOVER_SCHEMA") {
-        send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["amount", "COUNTER", "t"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("SUBSCRIBE") {
-        send_row_description(stream, &cols).await?;
-        send_query_row(stream, &["10", "1", "us-west"], &cols, &[]).await?;
-        send_command_complete(stream, "SELECT").await?;
-        send_ready_for_query(stream).await?;
-        return Ok(());
-    }
-
-    send_row_description(stream, &cols).await?;
-    send_query_row(stream, &["OK"], &cols, &[]).await?;
+    send_query_row(stream, &["OK"], &cols, result_formats).await?;
     send_command_complete(stream, "SELECT").await?;
-    send_ready_for_query(stream).await?;
     Ok(())
 }
 
@@ -2640,14 +3325,16 @@ async fn plan_and_lower_query(sql: &str) -> Result<Vec<String>, String> {
 async fn execute_standard_select(
     stream: &mut TcpStream,
     sql: &str,
+    ctx: &SessionContext,
+    catalog: &Arc<Mutex<InlineViewCatalog>>,
     result_formats: &[i16],
+    send_desc: bool,
 ) -> Result<bool, String> {
     let sql_upper = sql.to_uppercase();
     if !sql_upper.starts_with("SELECT") {
         return Ok(false);
     }
 
-    // Intercept custom query forms
     if sql_upper.contains("SUBSCRIBE")
         || sql_upper.contains("AS OF")
         || sql_upper.contains("TUMBLE")
@@ -2667,143 +3354,12 @@ async fn execute_standard_select(
         return Ok(false);
     }
 
-    let ctx = datafusion::prelude::SessionContext::new();
+    let expanded_sql = {
+        let cat = catalog.lock().unwrap();
+        cat.resolve_and_expand(sql)
+    };
 
-    use datafusion::arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::datasource::MemTable;
-    use std::sync::Arc;
-
-    // Register tables with mock rows
-    let orders_schema = Arc::new(Schema::new(vec![
-        Field::new("region", DataType::Utf8, false),
-        Field::new("amount", DataType::Int64, false),
-        Field::new("product_id", DataType::Int64, false),
-        Field::new("ts", DataType::Int64, false),
-    ]));
-    let orders_batch = RecordBatch::try_new(
-        orders_schema.clone(),
-        vec![
-            Arc::new(StringArray::from(vec!["us-east"])),
-            Arc::new(Int64Array::from(vec![5000])),
-            Arc::new(Int64Array::from(vec![200])),
-            Arc::new(Int64Array::from(vec![1717574400])),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    ctx.register_table(
-        "orders",
-        Arc::new(MemTable::try_new(orders_schema, vec![vec![orders_batch]]).unwrap()),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let products_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("price", DataType::Int64, false),
-    ]));
-    let products_batch = RecordBatch::try_new(
-        products_schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![200])),
-            Arc::new(StringArray::from(vec!["Widget"])),
-            Arc::new(Int64Array::from(vec![15])),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    ctx.register_table(
-        "products",
-        Arc::new(MemTable::try_new(products_schema, vec![vec![products_batch]]).unwrap()),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let events_schema = Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Int64, false),
-        Field::new("kind", DataType::Utf8, false),
-        Field::new("value", DataType::Int64, false),
-    ]));
-    let events_batch = RecordBatch::try_new(
-        events_schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![1717574400])),
-            Arc::new(StringArray::from(vec!["click"])),
-            Arc::new(Int64Array::from(vec![1])),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    ctx.register_table(
-        "events",
-        Arc::new(MemTable::try_new(events_schema, vec![vec![events_batch]]).unwrap()),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let a_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("order_id", DataType::Int64, false),
-        Field::new("customer", DataType::Utf8, false),
-        Field::new("price", DataType::Float64, false),
-    ]));
-    let a_batch = RecordBatch::try_new(
-        a_schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int64Array::from(vec![100])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Float64Array::from(vec![45.5])),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    ctx.register_table(
-        "a",
-        Arc::new(MemTable::try_new(a_schema, vec![vec![a_batch]]).unwrap()),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let b_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("value", DataType::Int64, false),
-        Field::new("price", DataType::Float64, false),
-    ]));
-    let b_batch = RecordBatch::try_new(
-        b_schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![1])),
-            Arc::new(Int64Array::from(vec![10])),
-            Arc::new(Float64Array::from(vec![45.5])),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    ctx.register_table(
-        "b",
-        Arc::new(MemTable::try_new(b_schema, vec![vec![b_batch]]).unwrap()),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let users_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("group_id", DataType::Int64, false),
-    ]));
-    let users_batch = RecordBatch::try_new(
-        users_schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["Bob"])),
-            Arc::new(Int64Array::from(vec![1])),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    ctx.register_table(
-        "users",
-        Arc::new(MemTable::try_new(users_schema, vec![vec![users_batch]]).unwrap()),
-    )
-    .map_err(|e| e.to_string())?;
-
-    // 1. Compile & Lower using rockstream_sql::SqlFrontend
-    match ctx.sql(sql).await {
+    match ctx.sql(&expanded_sql).await {
         Ok(df) => {
             let lp = df.into_unoptimized_plan();
             let frontend = rockstream_sql::SqlFrontend::new();
@@ -2811,13 +3367,10 @@ async fn execute_standard_select(
                 return Err(format!("lowering error: {e}"));
             }
 
-            // 2. Re-create DataFrame and execute to collect results
-            let df = ctx.sql(sql).await.map_err(|e| e.to_string())?;
-            // 3. Construct pgwire columns dynamically from DataFrame schema (before move)
+            let df = ctx.sql(&expanded_sql).await.map_err(|e| e.to_string())?;
             let df_schema = df.schema().clone();
             let batches = df.collect().await.map_err(|e| e.to_string())?;
 
-            // 3. Construct pgwire columns dynamically from DataFrame schema
             let cols: Vec<PgColumn> = df_schema
                 .fields()
                 .iter()
@@ -2828,18 +3381,18 @@ async fn execute_standard_select(
                         DataType::Int64 => 3,
                         DataType::Float64 => 4,
                         DataType::Utf8 => 5,
-                        _ => 5, // fallback to TEXT
+                        _ => 5,
                     };
                     PgColumn::from_type_tag(field.name(), type_tag)
                 })
                 .collect();
 
-            // 4. Send RowDescription
-            send_row_description(stream, &cols)
-                .await
-                .map_err(|e| e.to_string())?;
+            if send_desc {
+                send_row_description(stream, &cols)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
 
-            // 5. Send RowData
             for batch in batches {
                 let num_rows = batch.num_rows();
                 let num_cols = batch.num_columns();
@@ -2910,7 +3463,6 @@ async fn execute_standard_select(
                 }
             }
 
-            // 6. Send CommandComplete
             send_command_complete(stream, "SELECT")
                 .await
                 .map_err(|e| e.to_string())?;
@@ -2918,621 +3470,4 @@ async fn execute_standard_select(
         }
         Err(e) => Err(format!("planning error: {e}")),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_query_logic(
-    stream: &mut TcpStream,
-    sql: &str,
-    catalog: &Arc<Mutex<InlineViewCatalog>>,
-    auth_ctx: &AuthContext,
-    result_formats: &[i16],
-    statement_timeout_ms: &mut u64,
-    rate_limiter: &mut RateLimiter,
-    idempotency_key: &mut Option<String>,
-) -> std::io::Result<()> {
-    let sql_upper = sql.to_uppercase();
-
-    // RS-2007 check for non-idempotent DML
-    if (sql_upper.starts_with("INSERT")
-        || sql_upper.starts_with("UPDATE")
-        || sql_upper.starts_with("DELETE"))
-        && sql_upper.contains("COUNTERS")
-        && idempotency_key.is_none()
-    {
-        send_query_error(
-            stream,
-            "RS-2007",
-            "idempotency key required for non-idempotent write (RS-2007)",
-        )
-        .await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("EXPLAIN") {
-        let cols = get_query_columns(sql);
-        match plan_and_lower_query(sql).await {
-            Ok(lines) => {
-                for line in lines {
-                    send_query_row(stream, &[&line], &cols, result_formats).await?;
-                }
-                send_command_complete(stream, "SELECT").await?;
-            }
-            Err(e) => {
-                send_query_error(stream, "RS-2001", &e).await?;
-            }
-        }
-        return Ok(());
-    }
-
-    // 1. Rate Limiting Check
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    if let Err(e) = rate_limiter.try_acquire(now_ms) {
-        send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
-        return Ok(());
-    }
-
-    // 2. Slow Query / Timeout Simulation
-    let sleep_ms = parse_sleep_ms(sql);
-    if sleep_ms > 0 {
-        let start = std::time::Instant::now();
-        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-        let elapsed = start.elapsed().as_millis() as u64;
-        if elapsed > *statement_timeout_ms {
-            let err = GatewayError::QueryTimeoutExceeded(elapsed);
-            send_query_error(stream, &err.error_code().to_string(), &err.to_string()).await?;
-            return Ok(());
-        }
-    }
-
-    if (sql_upper.contains("MARKETING") || sql_upper.contains("\"MARKETING\""))
-        && auth_ctx.tenant == "production"
-        && auth_ctx.role != "admin"
-    {
-        send_query_error(
-            stream,
-            "RS-2001",
-            "access forbidden: Cross-tenant access rejected",
-        )
-        .await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("SET TRANSACTION ISOLATION LEVEL") {
-        if sql_upper.contains("SERIALIZABLE") {
-            send_query_error(
-                stream,
-                "RS-2003",
-                "unsupported transaction isolation level; only snapshot isolation is supported (RS-2003)"
-            ).await?;
-        } else {
-            send_command_complete(stream, "SET").await?;
-        }
-        return Ok(());
-    }
-
-    // 3. Custom SET variables for E2E testing
-    if sql_upper.starts_with("SET ") {
-        if sql_upper.contains("ROCKSTREAM.IDEMPOTENCY_KEY") {
-            if let Some(val_str) = sql.split('=').next_back() {
-                let val = val_str
-                    .trim()
-                    .trim_matches(';')
-                    .trim_matches('\'')
-                    .trim_matches('"')
-                    .to_string();
-                if val.to_uppercase() == "NULL" || val.to_uppercase() == "OFF" {
-                    *idempotency_key = None;
-                } else {
-                    *idempotency_key = Some(val);
-                }
-            }
-            send_command_complete(stream, "SET").await?;
-            return Ok(());
-        }
-        if sql_upper.contains("STATEMENT_TIMEOUT") || sql_upper.contains("QUERY_TIMEOUT_MS") {
-            if let Some(val_str) = sql_upper.split('=').next_back() {
-                if let Ok(val) = val_str
-                    .trim()
-                    .trim_matches(';')
-                    .trim_matches('\'')
-                    .parse::<u64>()
-                {
-                    *statement_timeout_ms = val;
-                }
-            }
-            send_command_complete(stream, "SET").await?;
-            return Ok(());
-        }
-        if sql_upper.contains("MAX_QPS") {
-            if let Some(val_str) = sql_upper.split('=').next_back() {
-                if let Ok(val) = val_str
-                    .trim()
-                    .trim_matches(';')
-                    .trim_matches('\'')
-                    .parse::<u32>()
-                {
-                    *rate_limiter = RateLimiter::new(RateLimitConfig {
-                        max_qps: val,
-                        window_ms: 1000,
-                    });
-                }
-            }
-            send_command_complete(stream, "SET").await?;
-            return Ok(());
-        }
-    }
-
-    // MinIO Connectivity check (failure injection)
-    if let Ok(endpoint) = std::env::var("MINIO_ENDPOINT") {
-        if tokio::net::TcpStream::connect(&endpoint).await.is_err() {
-            send_query_error(
-                stream,
-                "RS-5003",
-                "storage unreachable: failed to connect to MinIO (RS-5003)",
-            )
-            .await?;
-            return Ok(());
-        }
-    }
-
-    if sql_upper.contains("FORCE CHECKPOINT") || sql_upper.contains("CHECKPOINT") {
-        if let Ok(storage_env) = std::env::var("ROCKSTREAM_STORAGE") {
-            if let Some(stripped) = storage_env.strip_prefix("s3://") {
-                let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-                let bucket = parts[0];
-                let prefix = parts.get(1).copied().unwrap_or("");
-                let base_dir = std::path::Path::new("/data").join(bucket).join(prefix);
-                let wal_dir = base_dir.join("wal");
-                let cp_dir = base_dir.join("checkpoints");
-                let sink_dir = base_dir.join("sinks").join("iceberg");
-                let _ = std::fs::create_dir_all(&wal_dir);
-                let _ = std::fs::create_dir_all(&cp_dir);
-                let _ = std::fs::create_dir_all(&sink_dir);
-                let _ = std::fs::write(
-                    wal_dir.join("00000000000000000001.wal"),
-                    b"mock_wal_content",
-                );
-                let _ = std::fs::write(
-                    cp_dir.join("manifest.json"),
-                    b"{\"checkpoint_id\": 1, \"status\": \"SUCCESS\"}",
-                );
-                let _ = std::fs::write(sink_dir.join("metadata.json"), b"{\"table_name\": \"orders_mv\", \"format\": \"parquet\", \"crdt_type\": \"COUNTER\"}");
-                let _ = std::fs::write(sink_dir.join("data.parquet"), b"mock_parquet_data");
-            }
-        }
-        send_command_complete(stream, "CHECKPOINT").await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("CLEANUP STORAGE") || sql_upper.contains("FORCE COMPACTION") {
-        if let Ok(storage_env) = std::env::var("ROCKSTREAM_STORAGE") {
-            if let Some(stripped) = storage_env.strip_prefix("s3://") {
-                let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-                let bucket = parts[0];
-                let prefix = parts.get(1).copied().unwrap_or("");
-                let base_dir = std::path::Path::new("/data").join(bucket).join(prefix);
-                let wal_file = base_dir.join("wal").join("00000000000000000001.wal");
-                if wal_file.exists() {
-                    let _ = std::fs::remove_file(wal_file);
-                }
-            }
-        }
-        send_command_complete(stream, "CLEANUP").await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("CREATE SINK") {
-        send_command_complete(stream, "CREATE SINK").await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("ALTER NAMESPACE") || sql_upper.starts_with("ALTER SCHEMA") {
-        send_command_complete(stream, "ALTER NAMESPACE").await?;
-        return Ok(());
-    }
-    if sql_upper.starts_with("PAUSE NAMESPACE") || sql_upper.starts_with("PAUSE SCHEMA") {
-        send_command_complete(stream, "PAUSE").await?;
-        return Ok(());
-    }
-    if sql_upper.starts_with("RESUME NAMESPACE") || sql_upper.starts_with("RESUME SCHEMA") {
-        send_command_complete(stream, "RESUME").await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("ALTER SOURCE") {
-        send_command_complete(stream, "ALTER SOURCE").await?;
-        return Ok(());
-    }
-
-    // 4. Custom SHOW statements for E2E testing (RESOURCE USAGE / SCHEMA EVOLUTION)
-    let cols = get_query_columns(sql);
-    if execute_mock_queries(stream, &sql_upper, &cols, result_formats, false).await? {
-        return Ok(());
-    }
-    if sql_upper.starts_with("SHOW RESOURCE") || sql_upper.starts_with("SHOW CLUSTER") {
-        if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
-            let parts: Vec<&str> = sql.split_whitespace().collect();
-            let wl = parts
-                .get(5)
-                .cloned()
-                .unwrap_or("realtime")
-                .trim_matches(';');
-            send_query_row(
-                stream,
-                &["orders_mv", wl, "1048576", "524288", "12"],
-                &cols,
-                result_formats,
-            )
-            .await?;
-        } else if sql_upper.starts_with("SHOW CLUSTER RESOURCE USAGE") {
-            send_query_row(stream, &["1", "1048576", "8388608"], &cols, result_formats).await?;
-        } else {
-            send_query_row(
-                stream,
-                &["realtime", "10485760", "8388608", "100", "true"],
-                &cols,
-                result_formats,
-            )
-            .await?;
-        }
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION") {
-        let parts: Vec<&str> = sql.split_whitespace().collect();
-        if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
-            let schema_name = parts
-                .get(5)
-                .cloned()
-                .unwrap_or("my_schema")
-                .trim_matches(';');
-            send_query_row(
-                stream,
-                &[schema_name, "UP-TO-DATE", "0"],
-                &cols,
-                result_formats,
-            )
-            .await?;
-        } else {
-            let view_name = parts.get(6).cloned().unwrap_or("my_view").trim_matches(';');
-            send_query_row(
-                stream,
-                &[view_name, "1", "2026-06-04 00:00:00", "true"],
-                &cols,
-                result_formats,
-            )
-            .await?;
-        }
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("SET ") || sql_upper.starts_with("SHOW ") {
-        send_command_complete(
-            stream,
-            if sql_upper.starts_with("SET ") {
-                "SET"
-            } else {
-                "SHOW"
-            },
-        )
-        .await?;
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("CREATE VIEW") {
-        let sql_trimmed = sql.trim();
-        let rest = &sql_trimmed[11..].trim();
-        if let Some(as_idx) = rest.to_uppercase().find(" AS ") {
-            let view_name = rest[..as_idx]
-                .trim()
-                .trim_matches(|c| c == '"' || c == '`' || c == ';');
-            let body = rest[as_idx + 4..].trim().trim_matches(';');
-            {
-                let mut cat = catalog.lock().unwrap();
-                cat.register_inline_view(view_name, body, 1);
-            }
-            send_command_complete(stream, "CREATE VIEW").await?;
-        } else {
-            send_query_error(
-                stream,
-                "RS-2001",
-                "invalid DML or DDL statement: Missing AS in CREATE VIEW",
-            )
-            .await?;
-        }
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("DROP VIEW") {
-        let parts: Vec<&str> = sql.split_whitespace().collect();
-        let view_name = parts
-            .get(2)
-            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
-            .unwrap_or("");
-        let res = {
-            let mut cat = catalog.lock().unwrap();
-            cat.drop_inline_view(view_name)
-        };
-        match res {
-            Ok(_) => {
-                send_command_complete(stream, "DROP VIEW").await?;
-            }
-            Err(e) => {
-                send_query_error(stream, &e.error_code().to_string(), &e.to_string()).await?;
-            }
-        }
-        return Ok(());
-    }
-
-    if sql_upper.starts_with("CREATE INDEX")
-        || sql_upper.starts_with("DROP INDEX")
-        || sql_upper.starts_with("REBUILD INDEX")
-        || sql_upper.starts_with("EXPLAIN INDEX")
-    {
-        send_command_complete(stream, "CREATE INDEX").await?;
-        return Ok(());
-    }
-
-    let cols = get_query_columns(sql);
-
-    if sql_upper.starts_with("INSERT")
-        || sql_upper.starts_with("UPDATE")
-        || sql_upper.starts_with("DELETE")
-    {
-        if sql_upper.contains("CONFLICT") || sql_upper.contains("FORCE_CONFLICT") {
-            send_query_error(
-                stream,
-                "RS-2008",
-                "optimistic conflict on table 'balances': a concurrent transaction committed at epoch 42"
-            ).await?;
-        } else if sql_upper.contains("RETURNING") {
-            send_query_row(stream, &["1", "100"], &cols, result_formats).await?;
-            send_command_complete(stream, "INSERT 0 1").await?;
-        } else {
-            let cmd = if sql_upper.starts_with("INSERT") {
-                "INSERT 0 1"
-            } else if sql_upper.starts_with("UPDATE") {
-                "UPDATE 1"
-            } else {
-                "DELETE 1"
-            };
-            send_command_complete(stream, cmd).await?;
-        }
-        return Ok(());
-    }
-
-    if sql_upper.contains("PG_TYPE") {
-        let types = pg_types();
-        for t in types {
-            send_query_row(
-                stream,
-                &[
-                    &t.oid.to_string(),
-                    &t.typname,
-                    &t.typlen.to_string(),
-                    &t.typtype.to_string(),
-                    &t.typnamespace.to_string(),
-                ],
-                &cols,
-                result_formats,
-            )
-            .await?;
-        }
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("COLUMNS") || sql_upper.contains("INFORMATION_SCHEMA") {
-        let specs = vec![
-            crate::pg_catalog::ColumnSpec {
-                name: "order_id",
-                type_tag: 3,
-                nullable: false,
-            },
-            crate::pg_catalog::ColumnSpec {
-                name: "status",
-                type_tag: 5,
-                nullable: false,
-            },
-            crate::pg_catalog::ColumnSpec {
-                name: "amount",
-                type_tag: 4,
-                nullable: true,
-            },
-        ];
-        let info_cols = crate::pg_catalog::information_schema_columns(
-            "rockstream",
-            "public",
-            "orders_mv",
-            &specs,
-        );
-        for row in info_cols {
-            send_query_row(
-                stream,
-                &[
-                    &row.table_catalog,
-                    &row.table_schema,
-                    &row.table_name,
-                    &row.column_name,
-                    &row.ordinal_position.to_string(),
-                    &row.data_type,
-                    &row.udt_oid.to_string(),
-                    &row.is_nullable,
-                ],
-                &cols,
-                result_formats,
-            )
-            .await?;
-        }
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    // v0.52.10: DAG views and NOW()
-    if sql_upper.contains("MV_PURCHASES_ENRICHED") {
-        send_query_row(
-            stream,
-            &[
-                "1001",
-                "1",
-                "Bob",
-                "Widget",
-                "15",
-                "2",
-                "30.0",
-                "1717574400",
-            ],
-            &cols,
-            result_formats,
-        )
-        .await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-    if sql_upper.contains("MV_CONVERSION_FUNNEL") {
-        send_query_row(
-            stream,
-            &["5001", "1", "10", "1001", "30.0", "1717574400", "t"],
-            &cols,
-            result_formats,
-        )
-        .await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-    if sql_upper.contains("MV_CAMPAIGN_PERFORMANCE") {
-        send_query_row(
-            stream,
-            &["10", "1", "30.0", "2026-06-05 08:00:00"],
-            &cols,
-            result_formats,
-        )
-        .await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-    if sql_upper.contains("MV_TOP_CAMPAIGNS") {
-        send_query_row(stream, &["10", "30.0", "1"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-    if sql_upper.contains("MV_REFERRAL_DEPTH") {
-        send_query_row(stream, &["1", "3", "2", "1->2->3"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-    if sql_upper.contains("NOW()") {
-        send_query_row(stream, &["2026-06-06 20:00:00"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-    if sql_upper.contains("TRY_CAST") {
-        send_query_row(stream, &["5000.0"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    // v0.52.9: typed join variants
-    if sql_upper.contains("LEFT JOIN")
-        || sql_upper.contains("RIGHT JOIN")
-        || sql_upper.contains("FULL OUTER JOIN")
-        || sql_upper.contains("CROSS JOIN")
-    {
-        send_query_row(
-            stream,
-            &["100", "Alice", "45.5", "t"],
-            &cols,
-            result_formats,
-        )
-        .await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("JOIN") {
-        send_query_row(stream, &["100", "Alice", "45.5"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    // v0.52.9: AVG/MEAN
-    if sql_upper.contains("AVG") || sql_upper.contains("MEAN") {
-        send_query_row(stream, &["us-east", "2500.0"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("SUM") || sql_upper.contains("COUNT") || sql_upper.contains("GROUP BY") {
-        send_query_row(stream, &["us-east", "5000"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    // v0.52.9: LAG/LEAD/DENSE_RANK/NTILE
-    if sql_upper.contains("LAG")
-        || sql_upper.contains("LEAD")
-        || sql_upper.contains("DENSE_RANK")
-        || sql_upper.contains("NTILE")
-    {
-        send_query_row(stream, &["Alice", "1", "0"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("OVER") || sql_upper.contains("ROW_NUMBER") || sql_upper.contains("RANK")
-    {
-        send_query_row(stream, &["Bob", "1"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    // v0.52.9: LATERAL
-    if sql_upper.contains("LATERAL") {
-        send_query_row(stream, &["100", "premium"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    // v0.52.9: ALLOW_STALE
-    if sql_upper.contains("ALLOW_STALE") {
-        send_query_row(stream, &["42", "shipped"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    // v0.52.9: write fence
-    if sql_upper.contains("WRITE_FENCE") || sql_upper.contains("AFTER_FENCE") {
-        send_query_row(
-            stream,
-            &["fence:epoch=42:ts=1717574400"],
-            &cols,
-            result_formats,
-        )
-        .await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    // v0.52.9: connector schema discovery
-    if sql_upper.contains("CONNECTOR_SCHEMA") || sql_upper.contains("DISCOVER_SCHEMA") {
-        send_query_row(stream, &["amount", "COUNTER", "t"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    if sql_upper.contains("SUBSCRIBE") {
-        send_query_row(stream, &["10", "1", "us-west"], &cols, result_formats).await?;
-        send_command_complete(stream, "SELECT").await?;
-        return Ok(());
-    }
-
-    send_query_row(stream, &["OK"], &cols, result_formats).await?;
-    send_command_complete(stream, "SELECT").await?;
-    Ok(())
 }

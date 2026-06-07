@@ -176,19 +176,26 @@ impl InlineViewCatalog {
     /// is sufficient to prove the macro expansion invariant in unit tests.
     pub fn resolve_and_expand(&self, sql: &str) -> String {
         let mut result = sql.to_string();
-        for (name, entry) in &self.views {
-            // Replace `FROM <name>` with `FROM (<body>) AS <name>`.
-            let from_pattern = format!("FROM {name}");
-            let from_replacement = format!("FROM ({}) AS {name}", entry.sql_body);
-            result = result.replace(&from_pattern, &from_replacement);
+        let mut prev = String::new();
+        let mut iterations = 0;
+        while result != prev && iterations < 10 {
+            prev = result.clone();
+            for (name, entry) in &self.views {
+                // Replace `FROM <name>` with `FROM (<body>) AS <name>`.
+                let from_pattern = format!("FROM {name}");
+                let from_replacement = format!("FROM ({}) AS {name}", entry.sql_body);
+                result = result.replace(&from_pattern, &from_replacement);
 
-            // Replace `JOIN <name>` similarly.
-            let join_pattern = format!("JOIN {name}");
-            let join_replacement = format!("JOIN ({}) AS {name}", entry.sql_body);
-            result = result.replace(&join_pattern, &join_replacement);
+                // Replace `JOIN <name>` similarly.
+                let join_pattern = format!("JOIN {name}");
+                let join_replacement = format!("JOIN ({}) AS {name}", entry.sql_body);
+                result = result.replace(&join_pattern, &join_replacement);
+            }
+            iterations += 1;
         }
         result
     }
+
 
     /// Simulate executing a `SELECT * FROM <view>` query via inline expansion.
     ///
