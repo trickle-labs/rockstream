@@ -135,13 +135,13 @@ We will start the single `rockstream` binary. In a production deployment, you wo
 Run the following command in your terminal. Since we are adhering to our token-optimization protocol, we prefix the shell command with `rtk` (if running in an environment with the Rust Token Killer proxy):
 
 ```bash
-rtk cargo run --release --bin rockstream -- start --role=all --storage=./rockstream-data
+cargo run --release --bin rockstream -- start --role=all --storage=./rockstream-data
 ```
 
 If you are running the pre-compiled binary directly:
 
 ```bash
-rtk rockstream start --role=all --storage=./rockstream-data
+rockstream start --role=all --storage=./rockstream-data
 ```
 
 Let's analyze the startup log output. You will see JSON logs formatted as follows:
@@ -660,7 +660,7 @@ If you want to view the physical operator graph of a view and check how it is sh
 Open your system terminal and run:
 
 ```bash
-rtk rockstream describe mv_conversion_funnel
+rockstream describe mv_conversion_funnel
 ```
 
 This prints a structured Unicode DAG showing the physical layout of the view:
@@ -683,7 +683,7 @@ This graph confirms that `mv_conversion_funnel` is running, is bound to the `cam
 To see the lowered operators and their merge laws, use the `explain` subcommand:
 
 ```bash
-rtk rockstream explain mv_campaign_performance
+rockstream explain mv_campaign_performance
 ```
 
 This prints the physical operator plan annotated with merge laws and warnings:
@@ -722,7 +722,7 @@ If you suspect that state is accumulating incorrectly or you want to inspect raw
 For example, to inspect keys in the join arrangement for `mv_conversion_funnel` on worker node `worker-01`, run:
 
 ```bash
-rtk rockstream debug arrangement mv_conversion_funnel 3f2a "user_id=1"
+rockstream debug arrangement mv_conversion_funnel 3f2a "user_id=1"
 ```
 
 This decodes the SlateDB keys and prints the raw arrangement records, their timestamp, and weight (+1 or -1). This is a powerful tool for troubleshooting complex state issues.
@@ -782,7 +782,7 @@ If the freshness lag of a workload starts to slip (e.g., if the lag exceeds 75% 
 To prevent the system from constantly scaling up and down due to tiny transient spikes in workload (a behavior known as *thrashing*), the auto-tuner uses a **hysteresis configuration** (with scale-up and scale-down thresholds). You can override this hysteresis using the `tune` subcommand:
 
 ```bash
-rtk rockstream tune --override hysteresis_up=0.85 hysteresis_down=0.40
+rockstream tune --override hysteresis_up=0.85 hysteresis_down=0.40
 ```
 
 This configures the system to scale up only when CPU utilization or lag exceeds 85%, and scale back down only when it falls below 40%, ensuring cluster stability.
@@ -845,7 +845,7 @@ This enables downstream engines like DuckDB, Trino, or Apache Spark to query the
 If you run into issues on a production cluster, you can use the CLI to compile a diagnostic support bundle:
 
 ```bash
-rtk rockstream support-bundle --output=/tmp/support-bundle.tar.gz
+rockstream support-bundle --output=/tmp/support-bundle.tar.gz
 ```
 
 This compiles system logs, worker CPU profiles, database catalogs, config overrides, and active audit history into a single compressed tarball. You can share this bundle with database administrators or the RockStream community to debug cluster issues efficiently.
