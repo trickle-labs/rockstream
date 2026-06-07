@@ -1014,23 +1014,21 @@ fn get_view_columns(cat: &InlineViewCatalog, view_name: &str) -> Vec<TableColumn
                     == Some(&c.name)
         }) {
             type_tag = src_col.type_tag;
-        } else {
-            if parts.len() >= 2 {
-                let type_str = parts[1].to_uppercase();
-                type_tag = match type_str.as_str() {
-                    "BOOL" | "BOOLEAN" => 1,
-                    "INT" | "INTEGER" | "INT4" => 2,
-                    "INT8" | "BIGINT" => 3,
-                    "FLOAT" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => 4,
-                    "TEXT" => 5,
-                    "VARCHAR" | "CHARACTER VARYING" => 6,
-                    "BYTEA" => 7,
-                    "DATE" => 8,
-                    "TIMESTAMP" => 9,
-                    "UUID" => 10,
-                    _ => 5,
-                };
-            }
+        } else if parts.len() >= 2 {
+            let type_str = parts[1].to_uppercase();
+            type_tag = match type_str.as_str() {
+                "BOOL" | "BOOLEAN" => 1,
+                "INT" | "INTEGER" | "INT4" => 2,
+                "INT8" | "BIGINT" => 3,
+                "FLOAT" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => 4,
+                "TEXT" => 5,
+                "VARCHAR" | "CHARACTER VARYING" => 6,
+                "BYTEA" => 7,
+                "DATE" => 8,
+                "TIMESTAMP" => 9,
+                "UUID" => 10,
+                _ => 5,
+            };
         }
 
         result.push(TableColumn {
@@ -2850,6 +2848,7 @@ fn execute_delete(
     Ok(affected_count)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_query_internal(
     stream: &mut TcpStream,
     sql: &str,
@@ -3091,7 +3090,7 @@ async fn execute_query_internal(
         {
             let mut s = state.lock().unwrap();
             if is_replacement {
-                let replacement_name = format!("{}_replacement", view_name);
+                let replacement_name = format!("{view_name}_replacement");
                 s.catalog.lock().unwrap().register_replacement(
                     &replacement_name,
                     &view_name,
@@ -3131,12 +3130,10 @@ async fn execute_query_internal(
             } else {
                 "CREATE REPLACEMENT VIEW"
             }
+        } else if is_mview {
+            "CREATE MATERIALIZED VIEW"
         } else {
-            if is_mview {
-                "CREATE MATERIALIZED VIEW"
-            } else {
-                "CREATE VIEW"
-            }
+            "CREATE VIEW"
         };
         send_command_complete(stream, cmd).await?;
         return Ok(());
@@ -3330,11 +3327,11 @@ async fn execute_query_internal(
                     }
                 }
                 let cmd = if sql_upper.starts_with("INSERT") {
-                    format!("INSERT 0 {}", affected)
+                    format!("INSERT 0 {affected}")
                 } else if sql_upper.starts_with("UPDATE") {
-                    format!("UPDATE {}", affected)
+                    format!("UPDATE {affected}")
                 } else {
-                    format!("DELETE {}", affected)
+                    format!("DELETE {affected}")
                 };
                 send_command_complete(stream, &cmd).await?;
             }
