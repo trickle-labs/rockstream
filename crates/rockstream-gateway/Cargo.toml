@@ -4,17 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Query gateway service for RockStream (pgwire, HTTP)"
+description = "PostgreSQL wire gateway service for RockStream"
 
+# Intentionally dependency-free scaffold at v0.1. The pgwire gateway is the
+# second pillar, built in the Postgres phase (v0.40+).
 [dependencies]
-rockstream-types = { workspace = true }
-rockstream-storage = { workspace = true }
-rockstream-sql = { workspace = true }
-rockstream-runtime = { workspace = true }
-datafusion = { workspace = true }
-object_store = { workspace = true }
-tokio = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-

@@ -1,32 +1,14 @@
 //! Batch reference engine and property-test harness for RockStream.
 //!
-//! Implements the DBSP soundness theorem assertion:
-//! `incremental(query, deltas) == batch(query, accumulated)`
+//! This crate will hold the DataFusion batch reference engine and the
+//! `proptest` harness that asserts the DBSP soundness property
+//! `incremental(query, deltas) == batch(query, accumulated)` for every operator
+//! and query.
 //!
-//! Also provides the **law property-test harness**: a generic test suite that
-//! every `LawBundle` implementation must pass to be considered correct. The
-//! harness verifies associativity, commutativity, identity, idempotence
-//! (where declared), serialization round-trip, and fail-closed malformed
-//! operand handling.
-
-pub mod aggregate_oracle;
-pub mod batch_oracle;
-pub mod bootstrap_oracle;
-pub mod distributed_recursive_oracle;
-pub mod fuzzer_oracle;
-pub mod join_oracle;
-pub mod lateral_srf_oracle;
-pub mod law_equiv_oracle;
-pub mod law_harness;
-pub mod min_max_oracle;
-pub mod nexmark_oracle;
-pub mod recursive_oracle;
-pub mod set_op_oracle;
-pub mod top_k_oracle;
-pub mod tpch_oracle;
-pub mod tumble_oracle;
-pub mod view_dag_oracle;
-pub mod window_oracle;
+//! Per the focused roadmap, the oracle harness is implemented in **v0.2**
+//! (runtime abstraction, simulation, and oracle) and then exercised by every
+//! later version's operator work. The crate is intentionally an empty scaffold
+//! at v0.1 ("workspace and CI").
 
 #[cfg(test)]
 mod tests {

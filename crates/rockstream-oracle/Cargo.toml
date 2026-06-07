@@ -6,19 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "Batch reference engine and property-test harness for RockStream correctness"
 
+# Intentionally dependency-free scaffold at v0.1. The DataFusion batch reference
+# and proptest harness are implemented in v0.2.
 [dependencies]
-arrow = { workspace = true }
-datafusion = { workspace = true }
-rockstream-types = { workspace = true }
-serde_json = { workspace = true }
-rockstream-plan = { workspace = true }
-
-[dev-dependencies]
-proptest = { workspace = true }
-tokio = { workspace = true }
-rockstream-diff = { workspace = true }
-rockstream-ops = { workspace = true }
-rockstream-plan = { workspace = true }
-rockstream-runtime = { workspace = true }
-rockstream-storage = { workspace = true }
-object_store = { workspace = true }

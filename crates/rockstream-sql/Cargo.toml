@@ -6,14 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "SQL frontend built on DataFusion for RockStream"
 
+# Intentionally dependency-free scaffold at v0.1. The DataFusion parse/bind/
+# optimize frontend, extension nodes, and `LogicalPlan -> PlanNode` lowering are
+# implemented test-first in v0.7.
 [dependencies]
-datafusion = { workspace = true }
-rockstream-types = { workspace = true }
-rockstream-plan = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-
-[dev-dependencies]
-rockstream-diff = { workspace = true }
-rockstream-runtime = { workspace = true }
-rand = { workspace = true }

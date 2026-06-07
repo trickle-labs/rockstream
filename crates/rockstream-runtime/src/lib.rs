@@ -1,36 +1,14 @@
-//! Worker process, circuit executor, scheduler, and exchange for RockStream.
+//! Worker process, scheduler, epoch-commit coordinator, and exchange for
+//! RockStream.
 //!
-//! Contains the per-worker runtime: operator scheduling, epoch coordination,
-//! and shuffle/exchange paths.
+//! This crate will hold the per-worker runtime: the async ownership-free
+//! scheduler with credit backpressure, the epoch-commit coordinator, and the
+//! exchange (shuffle) paths.
 //!
-//! v0.32 adds the frontier protocol: per-shard reporters, worker-level
-//! aggregators, cluster frontier publication, shuffle GC, and monotone
-//! partial-progress tokens.
-//!
-//! v0.34 adds the cluster checkpoint protocol: barrier injection, bounded
-//! alignment buffers, per-shard checkpoint creation, atomic cluster checkpoint
-//! commit, and old checkpoint GC.
-//!
-//! v0.38 adds the proactive scaling module: proactive splitter, worker drain
-//! coordinator, skew detector, virtual-bucket hasher, and cluster-pressure gauge.
-//!
-//! v0.39 adds the clone module: pipeline clone, blue/green plan replacement,
-//! compatible/incompatible schema workflows, and law-version upgrade path.
-
-pub mod auto_tuner;
-pub mod bench;
-pub mod checkpoint;
-pub mod clone;
-pub mod epoch_coordinator;
-pub mod exchange;
-pub mod explain;
-pub mod frontier;
-pub mod pipeline;
-pub mod recovery;
-pub mod scaling;
-pub mod segment_cache;
-pub mod split;
-pub mod support_bundle;
+//! Per the focused roadmap, the worker scheduler and embedded runtime profile
+//! arrive in **v0.4**, group commit and persisted frontier in **v0.5**, and the
+//! distributed exchange paths in the v0.16–v0.17 range. The crate is
+//! intentionally an empty scaffold at v0.1 ("workspace and CI").
 
 #[cfg(test)]
 mod tests {

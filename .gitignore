@@ -1,3 +1,6 @@
 /target
 output.txt
 /1
+
+# Coverage reports
+/lcov.info

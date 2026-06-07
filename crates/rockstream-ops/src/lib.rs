@@ -1,29 +1,14 @@
 //! Operator trait and per-operator implementations for RockStream.
 //!
-//! Each IVM operator (filter, project, aggregate, join, etc.) implements
-//! the `Operator` trait defined here.
-
-pub mod aggregate;
-pub mod distinct;
-pub mod distributed_recursive;
-pub mod epoch_output;
-pub mod filter;
-pub mod join;
-pub mod map;
-pub mod min_max;
-pub mod noop;
-pub mod operator;
-pub mod outer_join;
-pub mod project;
-pub mod recursive;
-pub mod row_codec;
-pub mod scheduler;
-pub mod set_ops;
-pub mod snapshot;
-pub mod task;
-pub mod top_k;
-pub mod tumble;
-pub mod window;
+//! This crate will hold the `Operator` trait, the `EpochOutput` type, the
+//! `OperatorTask` event loop, and the per-operator IVM implementations.
+//!
+//! Per the focused roadmap, operators are implemented test-first one slice at a
+//! time starting in **v0.4** (filter / project / map), followed by algebraic
+//! aggregates (v0.5), MIN/MAX (v0.6), joins (v0.8–v0.9), and the remaining
+//! operators in later versions. Each operator ships with an oracle property
+//! test (`incremental == batch`) before it is considered complete. The crate is
+//! intentionally an empty scaffold at v0.1 ("workspace and CI").
 
 #[cfg(test)]
 mod tests {

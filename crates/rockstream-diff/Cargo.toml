@@ -6,6 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "DiffCtx differentiation pass for RockStream IVM"
 
+# Intentionally dependency-free scaffold at v0.1. Dependencies are added as the
+# differentiation rules are implemented test-first from v0.4 onward.
 [dependencies]
-rockstream-types = { workspace = true }
-rockstream-plan = { workspace = true }

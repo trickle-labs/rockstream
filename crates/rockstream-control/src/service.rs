@@ -368,7 +368,11 @@ async fn send_message(writer: &mut tokio::net::tcp::OwnedWriteHalf, msg: &Contro
             }
         }
         Err(e) => {
-            tracing::error!(error = %e, "control: failed to serialize message");
+            tracing::error!(
+                code = %rockstream_types::error_code::RS_0001,
+                error = %e,
+                "control: failed to serialize message"
+            );
         }
     }
 }

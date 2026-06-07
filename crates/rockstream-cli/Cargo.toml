@@ -4,7 +4,23 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Operator CLI for RockStream administration"
+description = "The single `rockstream` binary: one CLI for every node role"
+default-run = "rockstream"
+
+[[bin]]
+name = "rockstream"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
 
 [dependencies]
 rockstream-types = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

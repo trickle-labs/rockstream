@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e approve clean
+.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage release
 
 # Build the workspace
 build:
@@ -17,7 +17,20 @@ fmt:
 	cargo fmt --all --check
 
 # Run all checks (what CI does)
-check: fmt clippy test
+check: fmt clippy test error-codes exit-criteria
+
+# Enforce that every logged error carries an RS-XXXX code.
+error-codes:
+	bash scripts/check-error-codes.sh
+
+# Enforce that every version marked Done has a complete sign-off.
+exit-criteria:
+	bash scripts/check-exit-criteria.sh
+
+# Generate an lcov coverage report for the workspace (requires cargo-llvm-cov).
+coverage:
+	cargo llvm-cov --workspace --lcov --output-path lcov.info
+	@echo "Coverage written to lcov.info"
 
 # End-to-end test: start a local process, run a no-op pipeline, verify artifacts.
 e2e: build
