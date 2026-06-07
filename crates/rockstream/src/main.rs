@@ -496,11 +496,13 @@ async fn run_tier1_control(bind_addr: &str, audit: Arc<rockstream_control::audit
 
     // In the real implementation this would run until a signal is received.
     // For v0.28 we run the noop pipeline once to demonstrate the audit trail,
-    // then stop.
+    // then stay alive so clients can connect to the control service.
     let result =
         rockstream_runtime::pipeline::run_noop_pipeline(std::path::Path::new("./data")).await;
     tracing::info!(epochs = result.epochs_completed, "noop pipeline completed");
 
+    tracing::info!("waiting for shutdown signal");
+    let _ = tokio::signal::ctrl_c().await;
     handle.shutdown();
 }
 
@@ -679,17 +681,20 @@ async fn run_tier2_all(
         .expect("failed to create support bundle");
     tracing::info!(path = %bundle_path.display(), "support bundle written");
 
-    // Deregister and shut down the control service.
+    // Deregister cleanly, then stay alive so other processes can connect.
     let dereg = serde_json::to_string(&WorkerMessage::Deregister {
         worker_id: WorkerId(1),
     })
     .unwrap()
         + "\n";
     stream.write_all(dereg.as_bytes()).await.ok();
-    ctrl_handle.shutdown();
 
     println!("RockStream completed (Tier 2 / all): {result:?}");
     println!("Workers registered: {}", catalog.len());
+
+    tracing::info!("waiting for shutdown signal");
+    let _ = tokio::signal::ctrl_c().await;
+    ctrl_handle.shutdown();
 }
 
 async fn run_gateway(
