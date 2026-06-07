@@ -1,5 +1,0 @@
-fixup: clippy --all-targets warnings in hyper_log_log.rs and top_k_tests.rs
-
-- needless_range_loop: use iter_mut().enumerate() instead of for i in 0..N
-- uninlined_format_args: inline ndv/ndv_union/ndv_a/ndv_b into format strings
-- unused import: remove hll_estimate_ndv from top_k_tests.rs

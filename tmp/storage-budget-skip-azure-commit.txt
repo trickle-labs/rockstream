@@ -1,8 +1,0 @@
-Skip bench_azure unless STORAGE_BUDGET_RUN_GATES=1
-
-Prevents hang when Criterion tries to initialize Azure client even when
-Azure credentials aren't set. Azure benchmarks now only run when explicitly
-enabled with STORAGE_BUDGET_RUN_GATES=1, matching gate_probes behavior.
-
-This allows `cargo bench` to run fast (~17-30s) by default, and only
-attempts Azure credential validation when the user explicitly opts in.

@@ -6,7 +6,16 @@ use testcontainers::core::{IntoContainerPort, Mount};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-use rockstream_e2e::ensure_image_built;
+use rockstream_e2e::{ensure_image_built, is_docker_available};
+
+macro_rules! skip_if_no_docker {
+    () => {
+        if !is_docker_available() {
+            eprintln!("Docker daemon not available, skipping E2E test");
+            return;
+        }
+    };
+}
 
 fn get_db_error_message(err: &tokio_postgres::Error) -> String {
     if let Some(db_err) = err.as_db_error() {
@@ -52,6 +61,10 @@ fn get_container_ip(container_id: &str) -> String {
 
 // Helper to assert help output of subcommands
 async fn assert_help(args: Vec<&str>, expected_substring: &str) {
+    if !is_docker_available() {
+        eprintln!("Docker daemon not available, skipping E2E test");
+        return;
+    }
     ensure_image_built();
 
     let image = GenericImage::new("rockstream", "test")
@@ -90,6 +103,7 @@ async fn test_cli_help_snapshots() {
 
 #[tokio::test]
 async fn test_start_role_matrix_all() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -145,6 +159,7 @@ async fn test_start_role_matrix_all() {
 
 #[tokio::test]
 async fn test_start_role_matrix_worker_missing_control() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -179,6 +194,7 @@ async fn test_start_role_matrix_worker_missing_control() {
 
 #[tokio::test]
 async fn test_start_role_matrix_gateway_and_frontier() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     for role in &["gateway", "frontier"] {
@@ -220,6 +236,7 @@ async fn test_start_role_matrix_gateway_and_frontier() {
 
 #[tokio::test]
 async fn test_bootstrap_flow() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     // 1. Bootstrap fails when control is absent
@@ -287,6 +304,7 @@ async fn test_bootstrap_flow() {
 
 #[tokio::test]
 async fn test_error_path_contract_tls() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     // Invalid combination of TLS flags (providing --tls-cert but omitting others)
@@ -311,6 +329,7 @@ async fn test_error_path_contract_tls() {
 
 #[tokio::test]
 async fn test_rolling_upgrade_smoke() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -369,6 +388,7 @@ async fn test_rolling_upgrade_smoke() {
 
 #[tokio::test]
 async fn test_gateway_pgwire_e2e() {
+    skip_if_no_docker!();
     ensure_image_built();
     eprintln!("DEBUG: ensure_image_built completed");
 
@@ -708,6 +728,7 @@ async fn test_gateway_pgwire_e2e() {
 
 #[tokio::test]
 async fn test_v0_52_3_production_beta_handoff() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -1022,6 +1043,7 @@ async fn test_v0_52_3_production_beta_handoff() {
 
 #[tokio::test]
 async fn test_v0_52_4_minio_durability_and_connectors() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -1255,6 +1277,7 @@ fn http_get_with_retry(
 /// - Suite broad enough that a change to any public surface fails somewhere.
 #[tokio::test]
 async fn test_v0_52_5_catalog_rest_server() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -1603,6 +1626,7 @@ async fn test_v0_52_5_catalog_rest_server() {
 
 #[tokio::test]
 async fn test_v0_52_6_sql_lowering_precision() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -1713,6 +1737,7 @@ async fn test_v0_52_6_sql_lowering_precision() {
 
 #[tokio::test]
 async fn test_v0_52_7_cli_diagnostics_and_tuning() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -1834,6 +1859,7 @@ async fn test_v0_52_7_cli_diagnostics_and_tuning() {
 
 #[tokio::test]
 async fn test_v0_52_8_comprehensive_language_features() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -2257,6 +2283,7 @@ async fn test_v0_52_8_comprehensive_language_features() {
 /// 21. audit_log: seq=9001, action non-empty, occurred_at_ms>0
 #[tokio::test]
 async fn test_v0_52_9_precise_language_features() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();
@@ -2937,6 +2964,7 @@ async fn test_v0_52_9_precise_language_features() {
 /// with precise value assertions, OID catalog mapping checks, and resource usage reflection.
 #[tokio::test]
 async fn test_v0_52_10_real_world_dag_and_language_features() {
+    skip_if_no_docker!();
     ensure_image_built();
 
     let temp_dir = TempDir::new().unwrap();

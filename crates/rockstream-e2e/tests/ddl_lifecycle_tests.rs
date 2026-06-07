@@ -88,12 +88,16 @@ async fn test_table_lifecycle_and_crdt_merging() {
         .await
         .unwrap();
 
-    assert!(rows
-        .iter()
-        .any(|r| r.get::<_, &str>("column_name") == "id"
-            && r.get::<_, &str>("data_type") == "integer"));
-    assert!(rows.iter().any(|r| r.get::<_, &str>("column_name") == "val"
-        && r.get::<_, &str>("data_type") == "character varying"));
+    assert!(
+        rows.iter()
+            .any(|r| r.get::<_, &str>("column_name") == "id"
+                && r.get::<_, &str>("data_type") == "integer")
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.get::<_, &str>("column_name") == "val"
+                && r.get::<_, &str>("data_type") == "character varying")
+    );
     assert!(rows
         .iter()
         .any(|r| r.get::<_, &str>("column_name") == "counter"));
