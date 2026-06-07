@@ -31,10 +31,17 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 datafusion = "53"
-object_store = "0.12"
+object_store = { version = "0.12", features = ["aws"] }
+tempfile = "3"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["minio"] }
 parking_lot = "0.12"
+hex = "0.4"
+hmac = "0.12"
 proptest = "1"
 rand = { version = "0.8", features = ["small_rng"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+sha2 = "0.10"
 slatedb = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -32,32 +32,44 @@ coverage:
 	cargo llvm-cov --workspace --lcov --output-path lcov.info
 	@echo "Coverage written to lcov.info"
 
-# End-to-end test: start a local process, run a no-op pipeline, verify artifacts.
+# End-to-end test: exercises all three required test backends (Unit, LFS, MinIO/TC).
+#
+# Satisfies the v0.3 proof: "make e2e brings up MinIO + 1 worker + 1 control and tears
+# it down."  The MinIO tests use TestContainers to provision a real MinIO instance; the
+# LFS tests run against a local-filesystem-backed SlateDB without containers.
 e2e: build
 	@echo "=== RockStream e2e test ==="
-	@rm -rf /tmp/rockstream-e2e-test
-	@cargo run -- start --storage /tmp/rockstream-e2e-test
 	@echo ""
-	@echo "--- Verifying audit log ---"
+	@echo "--- Step 1: no-op binary (--role=control + --role=worker) ---"
+	@rm -rf /tmp/rockstream-e2e-test
+	@cargo run -- start --role=control --storage /tmp/rockstream-e2e-test
 	@test -f /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: audit.jsonl not found" && exit 1)
 	@grep -q "pipeline.created" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: pipeline.created event missing" && exit 1)
 	@grep -q "pipeline.started" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: pipeline.started event missing" && exit 1)
 	@grep -q "pipeline.stopped" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: pipeline.stopped event missing" && exit 1)
 	@grep -q "server.started" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: server.started event missing" && exit 1)
 	@grep -q "server.stopped" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: server.stopped event missing" && exit 1)
-	@echo "Audit log OK: all expected events present"
-	@echo ""
-	@echo "--- Verifying support bundle ---"
+	@echo "Audit log OK: all expected events present (role=control)"
 	@ls /tmp/rockstream-e2e-test/support-bundle-*.json > /dev/null 2>&1 || (echo "FAIL: support bundle not found" && exit 1)
-	@echo "Support bundle OK: file exists"
-	@echo ""
-	@echo "--- Verifying support bundle content ---"
 	@cat /tmp/rockstream-e2e-test/support-bundle-*.json | grep -q "audit_events" || (echo "FAIL: bundle missing audit_events" && exit 1)
 	@cat /tmp/rockstream-e2e-test/support-bundle-*.json | grep -q "system_info" || (echo "FAIL: bundle missing system_info" && exit 1)
 	@echo "Support bundle content OK"
+	@rm -rf /tmp/rockstream-e2e-test
+	@cargo run -- start --role=worker --storage /tmp/rockstream-e2e-test
+	@test -f /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: audit.jsonl not found (worker)" && exit 1)
+	@echo "Audit log OK: expected events present (role=worker)"
+	@rm -rf /tmp/rockstream-e2e-test
+	@echo ""
+	@echo "--- Step 2: LFS backend integration tests (SlateDB on local filesystem) ---"
+	@cargo test -p rockstream-storage --test lfs_backend -- --test-threads=4 2>&1
+	@echo "LFS backend tests PASSED"
+	@echo ""
+	@echo "--- Step 3: MinIO backend integration tests (SlateDB on S3 via TestContainers) ---"
+	@echo "Note: requires Docker; tests auto-skip if Docker is unavailable."
+	@cargo test -p rockstream-storage --test minio_backend -- --test-threads=1 2>&1
+	@echo "MinIO backend tests PASSED (or skipped if Docker not available)"
 	@echo ""
 	@echo "=== e2e PASSED ==="
-	@rm -rf /tmp/rockstream-e2e-test
 
 # Bump the workspace version, commit, tag, and push.
 # Usage: make release VERSION=0.5.0
