@@ -35,6 +35,13 @@ credit for "mostly working". A version is done only when its proof is done.
   use `--no-verify`. Fix the root cause.
 - Make only changes this version requires. No speculative features, no drive-by
   refactors, no scope outside the two pillars (IVM engine + Postgres wire layer).
+- **Nothing may be deferred to a later version.** If the Scope or Proof requires
+  it, it is implemented now, in full. Partial implementations, stubs, and TODO
+  placeholders are build failures, not progress.
+- **Pick up all prior deferrals.** Before writing any new code, scan every
+  previous `sign-offs/v*.md` for items marked deferred, postponed, or out-of-scope.
+  Any such item whose topic overlaps this version's Scope **must** be implemented
+  in this version. Add it to the Plan and track it alongside the new work.
 
 ---
 
@@ -49,8 +56,11 @@ credit for "mostly working". A version is done only when its proof is done.
      phase and its exit gate, plus the cross-cutting Testing Strategy ladder.
    - [DESIGN.md](../../DESIGN.md) and [IVM.md](../../IVM.md) for any section the
      Scope references (e.g. `IVM-n` tags, DESIGN.md §-numbers).
-3. Read the previous version's `sign-offs/` file and the crates the Scope touches
-   so you build on the real current state, not an assumed one.
+3. Read **all** previous `sign-offs/v*.md` files. For each one, collect every item
+   explicitly marked as deferred, postponed, skipped, or out-of-scope. Any such
+   item whose topic overlaps this version's Scope is now a mandatory work item —
+   treat it the same as if it were listed in the roadmap row. Read the crates the
+   Scope touches so you build on the real current state, not an assumed one.
 4. Restate, in your own words, the **exact proof obligations** for this version.
    List every concrete claim in the Proof column as a checkable assertion. This
    list is your contract — nothing is "done" until every item is independently
@@ -62,6 +72,8 @@ credit for "mostly working". A version is done only when its proof is done.
 
 Produce a short, ordered implementation plan and track it with a todo list:
 
+- Begin with a **Deferred-Item Audit**: list every item collected in step 1.3
+  that must be picked up, and include each as an explicit slice in the plan.
 - Break the Scope into thin vertical slices, each ending in a green test.
 - For every new operator, pre-commit to its **oracle property test**
   (`incremental == batch`) before writing the operator.
@@ -174,7 +186,9 @@ Finish with a concise report containing:
 - The exact commands to reproduce the proof locally.
 - The full Definition-of-Done checklist, each item marked with how it was met.
 - Any new `RS-XXXX` codes, docs pages, metrics, and regression seeds added.
-- Anything deferred or out of scope, with justification.
+- Confirmation that **no item has been deferred**. If anything remains incomplete,
+  the version is **not done** — state exactly what is missing and do not declare
+  the version complete until it is resolved.
 
 If — and only if — every Proof claim is independently verified, every Definition
 of Done item holds, and the sign-off is complete, declare `${input:version}`
