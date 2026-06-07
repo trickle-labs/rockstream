@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Operator trait and per-operator implementations for RockStream"
 
+[[bench]]
+name = "minmax_bench"
+harness = false
+
 [dependencies]
 rockstream-types = { workspace = true }
 rockstream-plan = { workspace = true }
@@ -17,6 +21,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

@@ -116,7 +116,7 @@ These names orient readers; they are not calendar commitments.
 | Milestone | Version | Meaning |
 |---|---:|---|
 | Foundation Ready | v0.3 | Workspace, runtime abstraction, simulation, oracle harness, and the SlateDB determinism gate all pass. |
-| Single-Shard Alpha | v0.6 | A local engine maintains filter/aggregate/MIN-MAX views and survives crash-replay. |
+| Single-Shard Alpha ✅ Done | v0.6 | A local engine maintains filter/aggregate/MIN-MAX views and survives crash-replay. |
 | SQL Engine | v0.10 | Plain-SQL views with joins and set operations maintained incrementally on one shard. |
 | IVM Correct (Single-Shard) | v0.14 | TPC-H 22/22 incremental == batch; the engine is feature-complete and correct on one shard. |
 | Distributed Engine | v0.17 | Multi-shard execution with exchange; distributed output bit-identical to single-shard. |
@@ -149,7 +149,7 @@ integration with another process).
 |---|---|---|---|---|
 | v0.4 | Filter / project / map (IVM-1) ✅ Done | Z-set types `(row, weight: i64)`; `PlanNode` (`Source`/`Filter`/`Project`/`Map`/`ViewSink`/`Exchange` stub); `DiffCtx` linear-operator rules; `Operator` trait + `EpochOutput`; `OperatorTask` event loop; async ownership-free scheduler with credit backpressure; embedded runtime profile (in-process control/worker/gateway, no gRPC, no shuffle objects); built-in `GENERATE ROWS` source and a `Vec<RecordBatch>` delta source. | Oracle property test for `SELECT a, b*2 AS c FROM t WHERE c > 10` over random insert/delete sequences passes ≥100k scenarios; embedded hot path issues zero gRPC calls and creates zero shuffle objects. | Unit, LFS |
 | v0.5 | Algebraic aggregates and epoch commit (IVM-2) ✅ Done | `Aggregate` PlanNode + aggregate arrangement; `diff_aggregate` (group by key, merge `(Δsum, Δcount)`, emit `(old,-1) ⊎ (new,+1)`) for SUM/COUNT/AVG/COUNT(*); shard-level group commit coalescing fragments into one atomic `WriteBatch`; per-shard namespaces (`op_state`/`view_output`/`shard_meta`); persisted frontier. | Oracle property test for `SELECT k, SUM(v), COUNT(*), AVG(v) FROM t GROUP BY k` over random insert/update/delete + group churn; group commit reduces durability events ≥5× vs. one commit per operator (measured on LFS and MinIO). | Unit, LFS, MinIO |
-| v0.6 | MIN / MAX and crash-replay (IVM-3) | Indexed-multiset arrangement + cached extremum; `diff_minmax` (insert merges multiset and updates cache; delete of extremum prefix-scans for the replacement); WAL listing cache validated on the hot path. **Single-Shard Alpha.** | Oracle property test for groups churning across MIN/MAX transitions; cached extremum matches the multiset's true extremum after every batch. **Crash-replay**: `kill -9` injected mid-`WriteBatch`; on restart the shard replays from its persisted frontier to bit-identical output (verified on LFS and MinIO). | Unit, LFS, MinIO |
+| v0.6 | MIN / MAX and crash-replay (IVM-3) ✅ Done | Indexed-multiset arrangement + cached extremum; `diff_minmax` (insert merges multiset and updates cache; delete of extremum prefix-scans for the replacement); WAL listing cache validated on the hot path. **Single-Shard Alpha.** | Oracle property test for groups churning across MIN/MAX transitions; cached extremum matches the multiset's true extremum after every batch. **Crash-replay**: `kill -9` injected mid-`WriteBatch`; on restart the shard replays from its persisted frontier to bit-identical output (verified on LFS and MinIO). | Unit, LFS, MinIO |
 
 ### Phase 2 — SQL Frontend & Joins
 

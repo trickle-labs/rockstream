@@ -36,6 +36,36 @@ impl ShardPrefix {
     }
 }
 
+/// Arrangement discriminator byte for the MIN/MAX sorted multiset (IVM-3).
+///
+/// Used as a sub-namespace byte immediately after the `ShardPrefix` byte in
+/// MinMax arrangement keys to distinguish them from other operator state.
+pub const MINMAX_DISCRIMINATOR: u8 = 0x4D; // 'M'
+
+/// Compute the sort key for a value in the MIN/MAX multiset.
+///
+/// The encoding maps i64 values to `[u8; 8]` such that lexicographic byte
+/// order matches signed integer order:
+///   - For MIN (`invert = false`): smallest value → smallest sort key → first in scan.
+///   - For MAX (`invert = true`):  largest value  → smallest sort key → first in scan.
+///
+/// This lets `scan_prefix(group_prefix).next()` return the extremum in O(1).
+pub fn minmax_sort_key(v: i64, invert: bool) -> [u8; 8] {
+    let raw = (v as u64) ^ 0x8000_0000_0000_0000_u64;
+    if invert {
+        (!raw).to_be_bytes()
+    } else {
+        raw.to_be_bytes()
+    }
+}
+
+/// Decode a value from a sort key (inverse of [`minmax_sort_key`]).
+pub fn minmax_sort_key_decode(sort_key: [u8; 8], invert: bool) -> i64 {
+    let raw = u64::from_be_bytes(sort_key);
+    let xored = if invert { !raw } else { raw };
+    (xored ^ 0x8000_0000_0000_0000_u64) as i64
+}
+
 /// Encoder for shard-local keys.
 ///
 /// Format: `[prefix:1][operator_id:8][suffix...]`
@@ -92,6 +122,70 @@ impl ShardKeyEncoder {
     /// The frontier key for a shard.
     pub fn frontier_key() -> Vec<u8> {
         Self::meta_key(b"frontier")
+    }
+
+    // ─── MIN/MAX arrangement keys (IVM-3) ────────────────────────────────────
+
+    /// Encode a MIN/MAX multiset entry key.
+    ///
+    /// Format: `[0x01 (OpState)][0x4D][op_id:8][group_key:8][sort_key:8]`
+    ///
+    /// The `sort_key` is produced by [`minmax_sort_key`] and encodes the value
+    /// so that the extremum always occupies the first entry in a prefix scan.
+    pub fn minmax_multiset_key(op_id: u64, group_key: i64, sort_key: [u8; 8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 1 + 8 + 8 + 8);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.push(MINMAX_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(&group_key.to_be_bytes());
+        key.extend_from_slice(&sort_key);
+        key
+    }
+
+    /// Prefix for scanning all MIN/MAX multiset entries for a specific group.
+    ///
+    /// Format: `[0x01][0x4D][op_id:8][group_key:8]`
+    pub fn minmax_group_prefix(op_id: u64, group_key: i64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 1 + 8 + 8);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.push(MINMAX_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(&group_key.to_be_bytes());
+        key
+    }
+
+    /// Prefix for scanning all MIN/MAX multiset entries for an operator.
+    ///
+    /// Format: `[0x01][0x4D][op_id:8]`
+    pub fn minmax_operator_prefix(op_id: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 1 + 8);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.push(MINMAX_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key
+    }
+
+    /// Key for the cached extremum of a group.
+    ///
+    /// Format: `[0x02 (OpIndex)][0x4D][op_id:8][group_key:8]`
+    pub fn minmax_extremum_key(op_id: u64, group_key: i64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 1 + 8 + 8);
+        key.push(ShardPrefix::OpIndex.as_byte());
+        key.push(MINMAX_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(&group_key.to_be_bytes());
+        key
+    }
+
+    /// Prefix for scanning all cached extrema for an operator.
+    ///
+    /// Format: `[0x02][0x4D][op_id:8]`
+    pub fn minmax_extremum_op_prefix(op_id: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 1 + 8);
+        key.push(ShardPrefix::OpIndex.as_byte());
+        key.push(MINMAX_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key
     }
 
     /// The epoch marker key for a given epoch number.

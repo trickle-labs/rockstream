@@ -10,6 +10,9 @@
 //! `GroupCommit` for coalescing N per-operator `WriteBatch` fragments into
 //! one atomic `Db::write()`, per-shard op_state and shard_meta namespaces
 //! (already in storage), and persisted frontier helpers.
+//!
+//! v0.6: `MinMaxOp` — non-invertible MIN/MAX aggregates via indexed-multiset
+//! arrangement with cached extremum.  Crash-replay proved on LFS and MinIO.
 
 pub mod aggregate;
 pub mod embedded;
@@ -18,6 +21,7 @@ pub mod expr;
 pub mod filter;
 pub mod group_commit;
 pub mod map;
+pub mod minmax;
 pub mod op;
 pub mod pipeline;
 pub mod project;
@@ -32,6 +36,7 @@ pub use error::OpError;
 pub use filter::FilterOp;
 pub use group_commit::{GroupCommit, GROUP_COMMIT_MAX_BATCHES};
 pub use map::MapOp;
+pub use minmax::{persist_minmax_state, MinMaxKind, MinMaxOp, MinMaxState};
 pub use op::{EpochOutput, Operator};
 pub use project::ProjectOp;
 pub use scheduler::CreditScheduler;

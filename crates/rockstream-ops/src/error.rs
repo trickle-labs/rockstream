@@ -66,6 +66,14 @@ pub enum OpError {
     /// Aggregate running sum overflowed i64.
     #[error("[{code}] Aggregate sum overflow for group key {group_key}: next_steps: reduce value magnitudes or switch to a wider numeric type")]
     AggregateOverflow { group_key: i64, code: ErrorCode },
+
+    /// MIN/MAX multiset retraction underflow.
+    #[error("[{code}] MIN/MAX retraction underflow for group key {group_key}, value {value}: next_steps: ensure every retraction is matched by a prior insertion; check source event ordering")]
+    MinMaxRetractionUnderflow {
+        group_key: i64,
+        value: i64,
+        code: ErrorCode,
+    },
 }
 
 impl OpError {
@@ -139,6 +147,15 @@ impl OpError {
         Self::AggregateOverflow {
             group_key,
             code: RS_1016,
+        }
+    }
+
+    pub fn minmax_retraction_underflow(group_key: i64, value: i64) -> Self {
+        use rockstream_types::error_code::RS_1017;
+        Self::MinMaxRetractionUnderflow {
+            group_key,
+            value,
+            code: RS_1017,
         }
     }
 }

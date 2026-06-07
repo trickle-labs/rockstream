@@ -29,9 +29,18 @@
 //!   (SUM/COUNT/AVG) — the `SELECT k, SUM(v), COUNT(*), AVG(v) FROM t
 //!   GROUP BY k` query over ≥100k random insert/update/delete sequences
 //!   with group churn.
+//!
+//! ## v0.6 additions
+//!
+//! - [`minmax_oracle`]: Oracle property tests for `MinMaxOp` (MIN/MAX) —
+//!   `SELECT k, MIN(v) FROM t GROUP BY k` and `SELECT k, MAX(v) FROM t
+//!   GROUP BY k` over ≥100k random sequences with group churn and
+//!   extremum transitions.  Also asserts that the cached extremum equals
+//!   the true multiset extremum after every batch.
 
 pub mod aggregate_oracle;
 pub mod batch;
 pub mod filter_oracle;
 pub mod harness;
+pub mod minmax_oracle;
 pub mod zset;
