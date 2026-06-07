@@ -563,12 +563,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
-use datafusion::prelude::SessionContext;
+use datafusion::arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
 use datafusion::catalog::SchemaProvider;
-use datafusion::arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+use datafusion::datasource::MemTable;
+use datafusion::prelude::SessionContext;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone)]
@@ -593,87 +593,199 @@ impl GatewayState {
         let ctx = SessionContext::new();
         let mut table_data = HashMap::new();
 
-        table_data.insert("orders".to_string(), vec![vec![
-            "us-east".to_string(),
-            "5000".to_string(),
-            "200".to_string(),
-            "1717574400".to_string(),
-        ]]);
-        table_data.insert("products".to_string(), vec![vec![
-            "200".to_string(),
-            "Widget".to_string(),
-            "15".to_string(),
-        ]]);
-        table_data.insert("events".to_string(), vec![vec![
-            "1717574400".to_string(),
-            "click".to_string(),
-            "1".to_string(),
-        ]]);
-        table_data.insert("a".to_string(), vec![vec![
-            "1".to_string(),
-            "Alice".to_string(),
-            "100".to_string(),
-            "Alice".to_string(),
-            "45.5".to_string(),
-        ]]);
-        table_data.insert("b".to_string(), vec![vec![
-            "1".to_string(),
-            "10".to_string(),
-            "45.5".to_string(),
-        ]]);
-        table_data.insert("users".to_string(), vec![vec![
-            "1".to_string(),
-            "Bob".to_string(),
-            "1".to_string(),
-        ]]);
+        table_data.insert(
+            "orders".to_string(),
+            vec![vec![
+                "us-east".to_string(),
+                "5000".to_string(),
+                "200".to_string(),
+                "1717574400".to_string(),
+            ]],
+        );
+        table_data.insert(
+            "products".to_string(),
+            vec![vec![
+                "200".to_string(),
+                "Widget".to_string(),
+                "15".to_string(),
+            ]],
+        );
+        table_data.insert(
+            "events".to_string(),
+            vec![vec![
+                "1717574400".to_string(),
+                "click".to_string(),
+                "1".to_string(),
+            ]],
+        );
+        table_data.insert(
+            "a".to_string(),
+            vec![vec![
+                "1".to_string(),
+                "Alice".to_string(),
+                "100".to_string(),
+                "Alice".to_string(),
+                "45.5".to_string(),
+            ]],
+        );
+        table_data.insert(
+            "b".to_string(),
+            vec![vec!["1".to_string(), "10".to_string(), "45.5".to_string()]],
+        );
+        table_data.insert(
+            "users".to_string(),
+            vec![vec!["1".to_string(), "Bob".to_string(), "1".to_string()]],
+        );
 
         {
             let mut cat = catalog.lock().unwrap();
-            
+
             if !cat.tables.contains_key("orders") {
-                cat.create_table("orders", vec![
-                    TableColumn { name: "region".to_string(), type_tag: 5, is_primary_key: false },
-                    TableColumn { name: "amount".to_string(), type_tag: 3, is_primary_key: false },
-                    TableColumn { name: "product_id".to_string(), type_tag: 3, is_primary_key: false },
-                    TableColumn { name: "ts".to_string(), type_tag: 3, is_primary_key: false },
-                ]);
+                cat.create_table(
+                    "orders",
+                    vec![
+                        TableColumn {
+                            name: "region".to_string(),
+                            type_tag: 5,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "amount".to_string(),
+                            type_tag: 3,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "product_id".to_string(),
+                            type_tag: 3,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "ts".to_string(),
+                            type_tag: 3,
+                            is_primary_key: false,
+                        },
+                    ],
+                );
             }
             if !cat.tables.contains_key("products") {
-                cat.create_table("products", vec![
-                    TableColumn { name: "id".to_string(), type_tag: 3, is_primary_key: true },
-                    TableColumn { name: "name".to_string(), type_tag: 5, is_primary_key: false },
-                    TableColumn { name: "price".to_string(), type_tag: 3, is_primary_key: false },
-                ]);
+                cat.create_table(
+                    "products",
+                    vec![
+                        TableColumn {
+                            name: "id".to_string(),
+                            type_tag: 3,
+                            is_primary_key: true,
+                        },
+                        TableColumn {
+                            name: "name".to_string(),
+                            type_tag: 5,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "price".to_string(),
+                            type_tag: 3,
+                            is_primary_key: false,
+                        },
+                    ],
+                );
             }
             if !cat.tables.contains_key("events") {
-                cat.create_table("events", vec![
-                    TableColumn { name: "ts".to_string(), type_tag: 3, is_primary_key: false },
-                    TableColumn { name: "kind".to_string(), type_tag: 5, is_primary_key: false },
-                    TableColumn { name: "value".to_string(), type_tag: 3, is_primary_key: false },
-                ]);
+                cat.create_table(
+                    "events",
+                    vec![
+                        TableColumn {
+                            name: "ts".to_string(),
+                            type_tag: 3,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "kind".to_string(),
+                            type_tag: 5,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "value".to_string(),
+                            type_tag: 3,
+                            is_primary_key: false,
+                        },
+                    ],
+                );
             }
             if !cat.tables.contains_key("a") {
-                cat.create_table("a", vec![
-                    TableColumn { name: "id".to_string(), type_tag: 3, is_primary_key: true },
-                    TableColumn { name: "name".to_string(), type_tag: 5, is_primary_key: false },
-                    TableColumn { name: "order_id".to_string(), type_tag: 3, is_primary_key: false },
-                    TableColumn { name: "customer".to_string(), type_tag: 5, is_primary_key: false },
-                    TableColumn { name: "price".to_string(), type_tag: 4, is_primary_key: false },
-                ]);
+                cat.create_table(
+                    "a",
+                    vec![
+                        TableColumn {
+                            name: "id".to_string(),
+                            type_tag: 3,
+                            is_primary_key: true,
+                        },
+                        TableColumn {
+                            name: "name".to_string(),
+                            type_tag: 5,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "order_id".to_string(),
+                            type_tag: 3,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "customer".to_string(),
+                            type_tag: 5,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "price".to_string(),
+                            type_tag: 4,
+                            is_primary_key: false,
+                        },
+                    ],
+                );
             }
             if !cat.tables.contains_key("b") {
-                cat.create_table("b", vec![
-                    TableColumn { name: "id".to_string(), type_tag: 3, is_primary_key: true },
-                    TableColumn { name: "value".to_string(), type_tag: 3, is_primary_key: false },
-                    TableColumn { name: "price".to_string(), type_tag: 4, is_primary_key: false },
-                ]);
+                cat.create_table(
+                    "b",
+                    vec![
+                        TableColumn {
+                            name: "id".to_string(),
+                            type_tag: 3,
+                            is_primary_key: true,
+                        },
+                        TableColumn {
+                            name: "value".to_string(),
+                            type_tag: 3,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "price".to_string(),
+                            type_tag: 4,
+                            is_primary_key: false,
+                        },
+                    ],
+                );
             }
             if !cat.tables.contains_key("users") {
-                cat.create_table("users", vec![
-                    TableColumn { name: "id".to_string(), type_tag: 3, is_primary_key: true },
-                    TableColumn { name: "name".to_string(), type_tag: 5, is_primary_key: false },
-                    TableColumn { name: "group_id".to_string(), type_tag: 3, is_primary_key: false },
-                ]);
+                cat.create_table(
+                    "users",
+                    vec![
+                        TableColumn {
+                            name: "id".to_string(),
+                            type_tag: 3,
+                            is_primary_key: true,
+                        },
+                        TableColumn {
+                            name: "name".to_string(),
+                            type_tag: 5,
+                            is_primary_key: false,
+                        },
+                        TableColumn {
+                            name: "group_id".to_string(),
+                            type_tag: 3,
+                            is_primary_key: false,
+                        },
+                    ],
+                );
             }
 
             for (tname, rows) in &table_data {
@@ -746,38 +858,28 @@ fn build_record_batch(
             1 => {
                 let vals: Vec<Option<bool>> = rows
                     .iter()
-                    .map(|r| {
-                        r.get(col_idx).map(|s| {
-                            s == "true" || s == "t" || s == "1"
-                        })
-                    })
+                    .map(|r| r.get(col_idx).map(|s| s == "true" || s == "t" || s == "1"))
                     .collect();
                 arrays.push(Arc::new(BooleanArray::from(vals)));
             }
             2 => {
                 let vals: Vec<Option<i32>> = rows
                     .iter()
-                    .map(|r| {
-                        r.get(col_idx).and_then(|s| s.parse::<i32>().ok())
-                    })
+                    .map(|r| r.get(col_idx).and_then(|s| s.parse::<i32>().ok()))
                     .collect();
                 arrays.push(Arc::new(datafusion::arrow::array::Int32Array::from(vals)));
             }
             3 | 13 | 14 | 15 | 16 | 18 => {
                 let vals: Vec<Option<i64>> = rows
                     .iter()
-                    .map(|r| {
-                        r.get(col_idx).and_then(|s| s.parse::<i64>().ok())
-                    })
+                    .map(|r| r.get(col_idx).and_then(|s| s.parse::<i64>().ok()))
                     .collect();
                 arrays.push(Arc::new(Int64Array::from(vals)));
             }
             4 => {
                 let vals: Vec<Option<f64>> = rows
                     .iter()
-                    .map(|r| {
-                        r.get(col_idx).and_then(|s| s.parse::<f64>().ok())
-                    })
+                    .map(|r| r.get(col_idx).and_then(|s| s.parse::<f64>().ok()))
                     .collect();
                 arrays.push(Arc::new(Float64Array::from(vals)));
             }
@@ -804,7 +906,8 @@ fn register_gateway_table(
     let schema = batch.schema();
     let mem_table = MemTable::try_new(schema, vec![vec![batch]]).map_err(|e| e.to_string())?;
     let _ = ctx.deregister_table(table_name);
-    ctx.register_table(table_name, Arc::new(mem_table)).map_err(|e| e.to_string())?;
+    ctx.register_table(table_name, Arc::new(mem_table))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -814,9 +917,17 @@ fn find_dependencies(catalog: &InlineViewCatalog, sql: &str) -> HashSet<String> 
     for view_name in catalog.view_names() {
         let pattern = view_name.to_uppercase();
         if let Some(idx) = sql_upper.find(&pattern) {
-            let before = if idx == 0 { ' ' } else { sql_upper.chars().nth(idx - 1).unwrap_or(' ') };
+            let before = if idx == 0 {
+                ' '
+            } else {
+                sql_upper.chars().nth(idx - 1).unwrap_or(' ')
+            };
             let after = sql_upper.chars().nth(idx + pattern.len()).unwrap_or(' ');
-            if !before.is_alphanumeric() && before != '_' && !after.is_alphanumeric() && after != '_' {
+            if !before.is_alphanumeric()
+                && before != '_'
+                && !after.is_alphanumeric()
+                && after != '_'
+            {
                 deps.insert(view_name);
             }
         }
@@ -824,9 +935,17 @@ fn find_dependencies(catalog: &InlineViewCatalog, sql: &str) -> HashSet<String> 
     for table_name in catalog.tables.keys() {
         let pattern = table_name.to_uppercase();
         if let Some(idx) = sql_upper.find(&pattern) {
-            let before = if idx == 0 { ' ' } else { sql_upper.chars().nth(idx - 1).unwrap_or(' ') };
+            let before = if idx == 0 {
+                ' '
+            } else {
+                sql_upper.chars().nth(idx - 1).unwrap_or(' ')
+            };
             let after = sql_upper.chars().nth(idx + pattern.len()).unwrap_or(' ');
-            if !before.is_alphanumeric() && before != '_' && !after.is_alphanumeric() && after != '_' {
+            if !before.is_alphanumeric()
+                && before != '_'
+                && !after.is_alphanumeric()
+                && after != '_'
+            {
                 deps.insert(table_name.clone());
             }
         }
@@ -839,7 +958,7 @@ fn get_view_columns(cat: &InlineViewCatalog, view_name: &str) -> Vec<TableColumn
         Some(e) => e,
         None => return Vec::new(),
     };
-    
+
     let sql_upper = entry.sql_body.to_uppercase();
     let select_idx = match sql_upper.find("SELECT") {
         Some(idx) => idx,
@@ -849,36 +968,51 @@ fn get_view_columns(cat: &InlineViewCatalog, view_name: &str) -> Vec<TableColumn
         Some(idx) => idx,
         None => return Vec::new(),
     };
-    
+
     let cols_part = entry.sql_body[select_idx + 6..from_idx].trim();
     let from_part = entry.sql_body[from_idx + 4..].trim();
     let source_table_parts: Vec<&str> = from_part.split_whitespace().collect();
-    let source_table = source_table_parts.first().map(|s| s.trim_matches(|c| c == ';' || c == '\'' || c == '"' || c == '`')).unwrap_or("");
-    
+    let source_table = source_table_parts
+        .first()
+        .map(|s| s.trim_matches(|c| c == ';' || c == '\'' || c == '"' || c == '`'))
+        .unwrap_or("");
+
     let source_cols = if cat.tables.contains_key(source_table) {
         cat.tables.get(source_table).unwrap().columns.clone()
     } else {
         get_view_columns(cat, source_table)
     };
-    
+
     if cols_part == "*" {
         return source_cols;
     }
-    
+
     let mut result = Vec::new();
     for col_expr in cols_part.split(',') {
         let col_expr = col_expr.trim();
         let parts: Vec<&str> = col_expr.split_whitespace().collect();
         let col_name = if parts.len() >= 3 && parts[1].to_uppercase() == "AS" {
             parts[2].trim_matches(|c| c == '"' || c == '`').to_string()
-        } else if parts.len() >= 2 && !["CAST", "CASE", "WHEN"].contains(&parts[0].to_uppercase().as_str()) {
+        } else if parts.len() >= 2
+            && !["CAST", "CASE", "WHEN"].contains(&parts[0].to_uppercase().as_str())
+        {
             parts[0].trim_matches(|c| c == '"' || c == '`').to_string()
         } else {
-            parts.last().map(|s| s.trim_matches(|c| c == '"' || c == '`')).unwrap_or("").to_string()
+            parts
+                .last()
+                .map(|s| s.trim_matches(|c| c == '"' || c == '`'))
+                .unwrap_or("")
+                .to_string()
         };
-        
+
         let mut type_tag = 5;
-        if let Some(src_col) = source_cols.iter().find(|c| c.name == col_name || parts.first().map(|s| s.trim_matches(|c| c == '"' || c == '`')) == Some(&c.name)) {
+        if let Some(src_col) = source_cols.iter().find(|c| {
+            c.name == col_name
+                || parts
+                    .first()
+                    .map(|s| s.trim_matches(|c| c == '"' || c == '`'))
+                    == Some(&c.name)
+        }) {
             type_tag = src_col.type_tag;
         } else {
             if parts.len() >= 2 {
@@ -898,14 +1032,14 @@ fn get_view_columns(cat: &InlineViewCatalog, view_name: &str) -> Vec<TableColumn
                 };
             }
         }
-        
+
         result.push(TableColumn {
             name: col_name,
             type_tag,
             is_primary_key: false,
         });
     }
-    
+
     result
 }
 
@@ -1218,17 +1352,22 @@ async fn execute_mock_queries(
     send_desc: bool,
     catalog: &Arc<Mutex<InlineViewCatalog>>,
 ) -> std::io::Result<bool> {
-    if sql_upper.contains("INFORMATION_SCHEMA.COLUMNS") || (sql_upper.contains("COLUMNS") && sql_upper.contains("TABLE_NAME")) {
+    if sql_upper.contains("INFORMATION_SCHEMA.COLUMNS")
+        || (sql_upper.contains("COLUMNS") && sql_upper.contains("TABLE_NAME"))
+    {
         if send_desc {
             send_row_description(stream, cols).await?;
         }
-        
+
         let filter_table = if sql_upper.contains("WHERE") {
             let parts: Vec<&str> = sql_upper.split_whitespace().collect();
             let mut name = None;
             for (idx, part) in parts.iter().enumerate() {
-                if (part.contains("TABLE_NAME") || part.contains("RELNAME")) && idx + 2 < parts.len() {
-                    let raw_val = parts[idx + 2].trim_matches(|c| c == ';' || c == '\'' || c == '"' || c == '`');
+                if (part.contains("TABLE_NAME") || part.contains("RELNAME"))
+                    && idx + 2 < parts.len()
+                {
+                    let raw_val = parts[idx + 2]
+                        .trim_matches(|c| c == ';' || c == '\'' || c == '"' || c == '`');
                     name = Some(raw_val.to_string());
                 }
             }
@@ -1239,11 +1378,19 @@ async fn execute_mock_queries(
 
         let (tables_data, views_data) = {
             let cat = catalog.lock().unwrap();
-            let tables_data: Vec<(String, Vec<TableColumn>)> = cat.tables.iter().map(|(k, v)| (k.clone(), v.columns.clone())).collect();
-            let views_data: Vec<(String, Vec<TableColumn>)> = cat.view_names().iter().map(|vname| (vname.clone(), get_view_columns(&cat, vname))).collect();
+            let tables_data: Vec<(String, Vec<TableColumn>)> = cat
+                .tables
+                .iter()
+                .map(|(k, v)| (k.clone(), v.columns.clone()))
+                .collect();
+            let views_data: Vec<(String, Vec<TableColumn>)> = cat
+                .view_names()
+                .iter()
+                .map(|vname| (vname.clone(), get_view_columns(&cat, vname)))
+                .collect();
             (tables_data, views_data)
         };
-        
+
         for (tname, columns) in &tables_data {
             let tname_upper = tname.to_uppercase();
             if let Some(ref filter) = filter_table {
@@ -1272,7 +1419,7 @@ async fn execute_mock_queries(
                 .await?;
             }
         }
-        
+
         for (vname, view_columns) in &views_data {
             let vname_upper = vname.to_uppercase();
             if let Some(ref filter) = filter_table {
@@ -1301,7 +1448,7 @@ async fn execute_mock_queries(
                 .await?;
             }
         }
-        
+
         send_command_complete(stream, "SELECT").await?;
         return Ok(true);
     }
@@ -2417,40 +2564,65 @@ fn execute_insert(
 ) -> Result<(usize, Vec<TableColumn>, Vec<String>), String> {
     let sql_trimmed = sql.trim();
     let sql_upper = sql_trimmed.to_uppercase();
-    let insert_idx = sql_upper.find("INSERT INTO").ok_or("Not an INSERT statement")?;
+    let insert_idx = sql_upper
+        .find("INSERT INTO")
+        .ok_or("Not an INSERT statement")?;
     let rest = &sql_trimmed[insert_idx + 11..].trim();
-    
-    let table_end_idx = rest.find(|c: char| c.is_whitespace() || c == '(').ok_or("Invalid INSERT syntax")?;
-    let table_name = rest[..table_end_idx].trim().trim_matches(|c| c == '"' || c == '`').to_string();
-    
-    let table_entry = catalog.tables.get(&table_name).ok_or_else(|| format!("Table not found: {table_name}"))?;
-    
+
+    let table_end_idx = rest
+        .find(|c: char| c.is_whitespace() || c == '(')
+        .ok_or("Invalid INSERT syntax")?;
+    let table_name = rest[..table_end_idx]
+        .trim()
+        .trim_matches(|c| c == '"' || c == '`')
+        .to_string();
+
+    let table_entry = catalog
+        .tables
+        .get(&table_name)
+        .ok_or_else(|| format!("Table not found: {table_name}"))?;
+
     let rest_after_table = rest[table_end_idx..].trim();
     let (columns_list, values_str) = if rest_after_table.starts_with('(') {
-        let close_paren_idx = rest_after_table.find(')').ok_or("Missing closing parenthesis in columns list")?;
+        let close_paren_idx = rest_after_table
+            .find(')')
+            .ok_or("Missing closing parenthesis in columns list")?;
         let cols_str = &rest_after_table[1..close_paren_idx];
-        let cols: Vec<String> = cols_str.split(',').map(|s| s.trim().trim_matches(|c| c == '"' || c == '`').to_string()).collect();
-        
+        let cols: Vec<String> = cols_str
+            .split(',')
+            .map(|s| s.trim().trim_matches(|c| c == '"' || c == '`').to_string())
+            .collect();
+
         let after_cols = &rest_after_table[close_paren_idx + 1..].trim();
-        let values_idx = after_cols.to_uppercase().find("VALUES").ok_or("Missing VALUES clause")?;
+        let values_idx = after_cols
+            .to_uppercase()
+            .find("VALUES")
+            .ok_or("Missing VALUES clause")?;
         let after_values = &after_cols[values_idx + 6..].trim();
         if !after_values.starts_with('(') {
             return Err("Missing opening parenthesis in VALUES list".into());
         }
-        let close_val_idx = after_values.rfind(')').ok_or("Missing closing parenthesis in VALUES list")?;
+        let close_val_idx = after_values
+            .rfind(')')
+            .ok_or("Missing closing parenthesis in VALUES list")?;
         (cols, &after_values[1..close_val_idx])
     } else {
-        let values_idx = rest_after_table.to_uppercase().find("VALUES").ok_or("Missing VALUES clause")?;
+        let values_idx = rest_after_table
+            .to_uppercase()
+            .find("VALUES")
+            .ok_or("Missing VALUES clause")?;
         let after_values = &rest_after_table[values_idx + 6..].trim();
         if !after_values.starts_with('(') {
             return Err("Missing opening parenthesis in VALUES list".into());
         }
-        let close_val_idx = after_values.rfind(')').ok_or("Missing closing parenthesis in VALUES list")?;
-        
+        let close_val_idx = after_values
+            .rfind(')')
+            .ok_or("Missing closing parenthesis in VALUES list")?;
+
         let cols = table_entry.columns.iter().map(|c| c.name.clone()).collect();
         (cols, &after_values[1..close_val_idx])
     };
-    
+
     let mut values = Vec::new();
     let mut current_val = String::new();
     let mut in_quotes = false;
@@ -2477,7 +2649,7 @@ fn execute_insert(
         i += 1;
     }
     values.push(current_val.trim().to_string());
-    
+
     let mut new_row = vec![String::new(); table_entry.columns.len()];
     for (i, col) in table_entry.columns.iter().enumerate() {
         if let Some(pos) = columns_list.iter().position(|c| c == &col.name) {
@@ -2486,12 +2658,12 @@ fn execute_insert(
             }
         }
     }
-    
+
     let rows = table_data.entry(table_name.clone()).or_default();
     rows.push(new_row.clone());
-    
+
     register_gateway_table(ctx, &table_name, &table_entry.columns, rows)?;
-    
+
     Ok((1, table_entry.columns.clone(), new_row))
 }
 
@@ -2503,47 +2675,66 @@ fn execute_update(
 ) -> Result<usize, String> {
     let sql_trimmed = sql.trim();
     let sql_upper = sql_trimmed.to_uppercase();
-    
+
     let update_idx = sql_upper.find("UPDATE").ok_or("Not an UPDATE statement")?;
     let rest = &sql_trimmed[update_idx + 6..].trim();
-    let set_idx = rest.to_uppercase().find("SET").ok_or("Missing SET in UPDATE")?;
-    let table_name = rest[..set_idx].trim().trim_matches(|c| c == '"' || c == '`').to_string();
-    
-    let table_entry = catalog.tables.get(&table_name).ok_or_else(|| format!("Table not found: {table_name}"))?;
-    
+    let set_idx = rest
+        .to_uppercase()
+        .find("SET")
+        .ok_or("Missing SET in UPDATE")?;
+    let table_name = rest[..set_idx]
+        .trim()
+        .trim_matches(|c| c == '"' || c == '`')
+        .to_string();
+
+    let table_entry = catalog
+        .tables
+        .get(&table_name)
+        .ok_or_else(|| format!("Table not found: {table_name}"))?;
+
     let after_set = &rest[set_idx + 3..].trim();
     let where_idx = after_set.to_uppercase().find("WHERE");
-    
+
     let set_clause = match where_idx {
         Some(idx) => &after_set[..idx].trim(),
         None => after_set,
     };
-    
+
     let where_clause = where_idx.map(|idx| after_set[idx + 5..].trim());
-    
+
     let mut updates = Vec::new();
     for assignment in set_clause.split(',') {
         let parts: Vec<&str> = assignment.split('=').collect();
         if parts.len() == 2 {
-            let col_name = parts[0].trim().trim_matches(|c| c == '"' || c == '`').to_string();
+            let col_name = parts[0]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '`')
+                .to_string();
             let val_expr = parts[1].trim().to_string();
             updates.push((col_name, val_expr));
         }
     }
-    
+
     let mut where_col = String::new();
     let mut where_val = String::new();
     if let Some(clause) = where_clause {
         let parts: Vec<&str> = clause.split('=').collect();
         if parts.len() == 2 {
-            where_col = parts[0].trim().trim_matches(|c| c == '"' || c == '`').to_string();
-            where_val = parts[1].trim().trim_matches('\'').trim_matches('"').to_string();
+            where_col = parts[0]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '`')
+                .to_string();
+            where_val = parts[1]
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_string();
         }
     }
-    
+
     let rows = table_data.entry(table_name.clone()).or_default();
     let mut affected_count = 0;
-    
+
     for row in rows.iter_mut() {
         let mut matches = true;
         if !where_col.is_empty() {
@@ -2559,7 +2750,7 @@ fn execute_update(
                 matches = false;
             }
         }
-        
+
         if matches {
             affected_count += 1;
             for (col_name, val_expr) in &updates {
@@ -2579,9 +2770,9 @@ fn execute_update(
             }
         }
     }
-    
+
     register_gateway_table(ctx, &table_name, &table_entry.columns, rows)?;
-    
+
     Ok(affected_count)
 }
 
@@ -2593,33 +2784,51 @@ fn execute_delete(
 ) -> Result<usize, String> {
     let sql_trimmed = sql.trim();
     let sql_upper = sql_trimmed.to_uppercase();
-    
-    let delete_idx = sql_upper.find("DELETE FROM").ok_or("Not a DELETE statement")?;
+
+    let delete_idx = sql_upper
+        .find("DELETE FROM")
+        .ok_or("Not a DELETE statement")?;
     let rest = &sql_trimmed[delete_idx + 11..].trim();
-    
+
     let where_idx = rest.to_uppercase().find("WHERE");
     let table_name = match where_idx {
-        Some(idx) => rest[..idx].trim().trim_matches(|c| c == '"' || c == '`').to_string(),
-        None => rest.trim().trim_matches(|c| c == '"' || c == '`').to_string(),
+        Some(idx) => rest[..idx]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '`')
+            .to_string(),
+        None => rest
+            .trim()
+            .trim_matches(|c| c == '"' || c == '`')
+            .to_string(),
     };
-    
-    let table_entry = catalog.tables.get(&table_name).ok_or_else(|| format!("Table not found: {table_name}"))?;
-    
+
+    let table_entry = catalog
+        .tables
+        .get(&table_name)
+        .ok_or_else(|| format!("Table not found: {table_name}"))?;
+
     let where_clause = where_idx.map(|idx| rest[idx + 5..].trim());
-    
+
     let mut where_col = String::new();
     let mut where_val = String::new();
     if let Some(clause) = where_clause {
         let parts: Vec<&str> = clause.split('=').collect();
         if parts.len() == 2 {
-            where_col = parts[0].trim().trim_matches(|c| c == '"' || c == '`').to_string();
-            where_val = parts[1].trim().trim_matches('\'').trim_matches('"').to_string();
+            where_col = parts[0]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '`')
+                .to_string();
+            where_val = parts[1]
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_string();
         }
     }
-    
+
     let rows = table_data.entry(table_name.clone()).or_default();
     let initial_len = rows.len();
-    
+
     if !where_col.is_empty() {
         if let Some(pos) = table_entry.columns.iter().position(|c| c.name == where_col) {
             rows.retain(|row| {
@@ -2633,11 +2842,11 @@ fn execute_delete(
     } else {
         rows.clear();
     }
-    
+
     let affected_count = initial_len - rows.len();
-    
+
     register_gateway_table(ctx, &table_name, &table_entry.columns, rows)?;
-    
+
     Ok(affected_count)
 }
 
@@ -2799,10 +3008,20 @@ async fn execute_query_internal(
         match ddl_res {
             Ok(_) => {
                 let parts: Vec<&str> = sql.split_whitespace().collect();
-                let table_name = parts[2].trim_matches(|c| c == '"' || c == '`' || c == '(' || c == ';').to_string();
+                let table_name = parts[2]
+                    .trim_matches(|c| c == '"' || c == '`' || c == '(' || c == ';')
+                    .to_string();
                 {
                     let mut s = state.lock().unwrap();
-                    let columns = s.catalog.lock().unwrap().tables.get(&table_name).unwrap().columns.clone();
+                    let columns = s
+                        .catalog
+                        .lock()
+                        .unwrap()
+                        .tables
+                        .get(&table_name)
+                        .unwrap()
+                        .columns
+                        .clone();
                     s.table_data.insert(table_name.clone(), Vec::new());
                     register_gateway_table(&s.ctx, &table_name, &columns, &[]).unwrap();
                 }
@@ -2817,7 +3036,10 @@ async fn execute_query_internal(
 
     if sql_upper.starts_with("DROP TABLE") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let table_name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        let table_name = parts
+            .get(2)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
         {
             let mut s = state.lock().unwrap();
             s.table_data.remove(table_name);
@@ -2828,7 +3050,10 @@ async fn execute_query_internal(
         return Ok(());
     }
 
-    if sql_upper.starts_with("CREATE VIEW") || sql_upper.starts_with("CREATE MATERIALIZED VIEW") || sql_upper.starts_with("CREATE REPLACEMENT") {
+    if sql_upper.starts_with("CREATE VIEW")
+        || sql_upper.starts_with("CREATE MATERIALIZED VIEW")
+        || sql_upper.starts_with("CREATE REPLACEMENT")
+    {
         let mut is_replacement = false;
         let mut is_mview = false;
         let mut view_name = String::new();
@@ -2836,7 +3061,7 @@ async fn execute_query_internal(
 
         let sql_trimmed = sql.trim();
         let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
-        
+
         let mut idx = 1;
         if parts.get(idx).map(|s| s.to_uppercase()) == Some("REPLACEMENT".to_string()) {
             is_replacement = true;
@@ -2849,42 +3074,69 @@ async fn execute_query_internal(
         if parts.get(idx).map(|s| s.to_uppercase()) == Some("VIEW".to_string()) {
             idx += 1;
         }
-        
+
         if idx < parts.len() {
-            view_name = parts[idx].trim_matches(|c| c == '"' || c == '`' || c == '(' || c == ';').to_string();
+            view_name = parts[idx]
+                .trim_matches(|c| c == '"' || c == '`' || c == '(' || c == ';')
+                .to_string();
         }
-        
+
         if let Some(as_idx) = sql_trimmed.to_uppercase().find(" AS ") {
-            sql_body = sql_trimmed[as_idx + 4..].trim().trim_matches(';').to_string();
+            sql_body = sql_trimmed[as_idx + 4..]
+                .trim()
+                .trim_matches(';')
+                .to_string();
         }
 
         {
             let mut s = state.lock().unwrap();
             if is_replacement {
                 let replacement_name = format!("{}_replacement", view_name);
-                s.catalog.lock().unwrap().register_replacement(&replacement_name, &view_name, &sql_body);
-                s.replacements.insert(view_name.clone(), (replacement_name, "PENDING".to_string()));
+                s.catalog.lock().unwrap().register_replacement(
+                    &replacement_name,
+                    &view_name,
+                    &sql_body,
+                );
+                s.replacements
+                    .insert(view_name.clone(), (replacement_name, "PENDING".to_string()));
             } else {
-                s.catalog.lock().unwrap().register_inline_view(&view_name, &sql_body, 1);
+                s.catalog
+                    .lock()
+                    .unwrap()
+                    .register_inline_view(&view_name, &sql_body, 1);
                 let deps = find_dependencies(&s.catalog.lock().unwrap(), &sql_body);
                 for dep in deps {
-                    s.catalog.lock().unwrap().register_dependent(&dep, &view_name);
+                    s.catalog
+                        .lock()
+                        .unwrap()
+                        .register_dependent(&dep, &view_name);
                 }
                 if is_mview {
-                    s.mviews.insert(view_name.clone(), MViewInfo {
-                        name: view_name.clone(),
-                        query: sql_body.clone(),
-                        status: "RUNNING".to_string(),
-                        backfill_progress: 1.0,
-                    });
+                    s.mviews.insert(
+                        view_name.clone(),
+                        MViewInfo {
+                            name: view_name.clone(),
+                            query: sql_body.clone(),
+                            status: "RUNNING".to_string(),
+                            backfill_progress: 1.0,
+                        },
+                    );
                 }
             }
         }
 
         let cmd = if is_replacement {
-            if is_mview { "CREATE REPLACEMENT MATERIALIZED VIEW" } else { "CREATE REPLACEMENT VIEW" }
+            if is_mview {
+                "CREATE REPLACEMENT MATERIALIZED VIEW"
+            } else {
+                "CREATE REPLACEMENT VIEW"
+            }
         } else {
-            if is_mview { "CREATE MATERIALIZED VIEW" } else { "CREATE VIEW" }
+            if is_mview {
+                "CREATE MATERIALIZED VIEW"
+            } else {
+                "CREATE VIEW"
+            }
         };
         send_command_complete(stream, cmd).await?;
         return Ok(());
@@ -2893,8 +3145,11 @@ async fn execute_query_internal(
     if sql_upper.starts_with("DROP VIEW") || sql_upper.starts_with("DROP MATERIALIZED VIEW") {
         let is_mview = sql_upper.starts_with("DROP MATERIALIZED VIEW");
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let view_name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
-        
+        let view_name = parts
+            .get(2)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
+
         let catalog_arc = {
             let mut s = state.lock().unwrap();
             if is_mview {
@@ -2903,10 +3158,14 @@ async fn execute_query_internal(
             s.catalog.clone()
         };
         let res = catalog_arc.lock().unwrap().drop_inline_view(view_name);
-        
+
         match res {
             Ok(_) => {
-                let cmd = if is_mview { "DROP MATERIALIZED VIEW" } else { "DROP VIEW" };
+                let cmd = if is_mview {
+                    "DROP MATERIALIZED VIEW"
+                } else {
+                    "DROP VIEW"
+                };
                 send_command_complete(stream, cmd).await?;
             }
             Err(e) => {
@@ -2919,28 +3178,41 @@ async fn execute_query_internal(
     if sql_upper.starts_with("ALTER VIEW") || sql_upper.starts_with("ALTER MATERIALIZED VIEW") {
         let is_mview = sql_upper.starts_with("ALTER MATERIALIZED VIEW");
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let target_name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
-        
+        let target_name = parts
+            .get(2)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
+
         if sql_upper.contains("APPLY REPLACEMENT") {
             let res = {
                 let (catalog_arc, rep_name_clone) = {
                     let mut s = state.lock().unwrap();
                     let catalog_arc = s.catalog.clone();
-                    let rep_name_clone = s.replacements.get(target_name).map(|(rep_name, _)| rep_name.clone());
+                    let rep_name_clone = s
+                        .replacements
+                        .get(target_name)
+                        .map(|(rep_name, _)| rep_name.clone());
                     if let Some((_, status)) = s.replacements.get_mut(target_name) {
                         *status = "APPLIED".to_string();
                     }
                     (catalog_arc, rep_name_clone)
                 };
                 if let Some(rep_name) = rep_name_clone {
-                    catalog_arc.lock().unwrap().apply_replacement(target_name, &rep_name)
+                    catalog_arc
+                        .lock()
+                        .unwrap()
+                        .apply_replacement(target_name, &rep_name)
                 } else {
                     Err(GatewayError::ViewNotFound(target_name.to_string()))
                 }
             };
             match res {
                 Ok(_) => {
-                    let cmd = if is_mview { "ALTER MATERIALIZED VIEW" } else { "ALTER VIEW" };
+                    let cmd = if is_mview {
+                        "ALTER MATERIALIZED VIEW"
+                    } else {
+                        "ALTER VIEW"
+                    };
                     send_command_complete(stream, cmd).await?;
                 }
                 Err(e) => {
@@ -2948,7 +3220,11 @@ async fn execute_query_internal(
                 }
             }
         } else {
-            let cmd = if is_mview { "ALTER MATERIALIZED VIEW" } else { "ALTER VIEW" };
+            let cmd = if is_mview {
+                "ALTER MATERIALIZED VIEW"
+            } else {
+                "ALTER VIEW"
+            };
             send_command_complete(stream, cmd).await?;
         }
         return Ok(());
@@ -2956,7 +3232,10 @@ async fn execute_query_internal(
 
     if sql_upper.starts_with("PAUSE MATERIALIZED VIEW") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let name = parts.get(3).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        let name = parts
+            .get(3)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
         {
             let mut s = state.lock().unwrap();
             if let Some(mv) = s.mviews.get_mut(name) {
@@ -2969,7 +3248,10 @@ async fn execute_query_internal(
 
     if sql_upper.starts_with("RESUME MATERIALIZED VIEW") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let name = parts.get(3).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        let name = parts
+            .get(3)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
         {
             let mut s = state.lock().unwrap();
             if let Some(mv) = s.mviews.get_mut(name) {
@@ -2982,7 +3264,10 @@ async fn execute_query_internal(
 
     if sql_upper.starts_with("CREATE INDEX") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        let name = parts
+            .get(2)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
         {
             let mut s = state.lock().unwrap();
             s.indexes.insert(name.to_string());
@@ -2993,7 +3278,10 @@ async fn execute_query_internal(
 
     if sql_upper.starts_with("DROP INDEX") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let name = parts.get(2).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
+        let name = parts
+            .get(2)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
         {
             let mut s = state.lock().unwrap();
             s.indexes.remove(name);
@@ -3007,7 +3295,10 @@ async fn execute_query_internal(
         return Ok(());
     }
 
-    if sql_upper.starts_with("INSERT") || sql_upper.starts_with("UPDATE") || sql_upper.starts_with("DELETE") {
+    if sql_upper.starts_with("INSERT")
+        || sql_upper.starts_with("UPDATE")
+        || sql_upper.starts_with("DELETE")
+    {
         let res = {
             let mut guard = state.lock().unwrap();
             let catalog_arc = guard.catalog.clone();
@@ -3015,9 +3306,7 @@ async fn execute_query_internal(
             let s = &mut *guard;
             if sql_upper.starts_with("INSERT") {
                 execute_insert(&catalog_lock, &mut s.table_data, &s.ctx, sql)
-                    .map(|(affected, columns, new_row)| {
-                        (affected, Some((columns, new_row)))
-                    })
+                    .map(|(affected, columns, new_row)| (affected, Some((columns, new_row))))
             } else if sql_upper.starts_with("UPDATE") {
                 execute_update(&catalog_lock, &mut s.table_data, &s.ctx, sql)
                     .map(|affected| (affected, None))
@@ -3031,9 +3320,10 @@ async fn execute_query_internal(
             Ok((affected, row_info)) => {
                 if sql_upper.contains("RETURNING") {
                     if let Some((columns, new_row)) = row_info {
-                        let cols: Vec<PgColumn> = columns.iter().map(|col| {
-                            PgColumn::from_type_tag(&col.name, col.type_tag)
-                        }).collect();
+                        let cols: Vec<PgColumn> = columns
+                            .iter()
+                            .map(|col| PgColumn::from_type_tag(&col.name, col.type_tag))
+                            .collect();
                         send_row_description(stream, &cols).await?;
                         let row_refs: Vec<&str> = new_row.iter().map(|s| s.as_str()).collect();
                         send_query_row(stream, &row_refs, &cols, result_formats).await?;
@@ -3062,18 +3352,29 @@ async fn execute_query_internal(
 
     if sql_upper.contains("SHOW REPLACEMENT STATUS") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let target_name = parts.get(5).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
-        
+        let target_name = parts
+            .get(5)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
+
         let cols = get_query_columns(sql);
         send_row_description(stream, &cols).await?;
-        
+
         let rep_info = {
             let s = state.lock().unwrap();
-            s.replacements.get(target_name).map(|(rep_name, status)| (rep_name.clone(), status.clone()))
+            s.replacements
+                .get(target_name)
+                .map(|(rep_name, status)| (rep_name.clone(), status.clone()))
         };
-        
+
         if let Some((rep_name, status)) = rep_info {
-            send_query_row(stream, &[target_name, &rep_name, &status], &cols, result_formats).await?;
+            send_query_row(
+                stream,
+                &[target_name, &rep_name, &status],
+                &cols,
+                result_formats,
+            )
+            .await?;
         } else {
             send_query_row(stream, &[target_name, "", "NONE"], &cols, result_formats).await?;
         }
@@ -3084,7 +3385,10 @@ async fn execute_query_internal(
     if sql_upper.contains("SHOW VIEW STATUS") {
         let mviews_data: Vec<(String, String)> = {
             let s = state.lock().unwrap();
-            s.mviews.iter().map(|(name, info)| (name.clone(), info.status.clone())).collect()
+            s.mviews
+                .iter()
+                .map(|(name, info)| (name.clone(), info.status.clone()))
+                .collect()
         };
         let cols = get_query_columns(sql);
         send_row_description(stream, &cols).await?;
@@ -3097,20 +3401,27 @@ async fn execute_query_internal(
 
     if sql_upper.contains("SHOW BACKFILL STATUS") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let name = parts.get(5).map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`')).unwrap_or("");
-        
+        let name = parts
+            .get(5)
+            .map(|s| s.trim_matches(|c| c == ';' || c == '"' || c == '`'))
+            .unwrap_or("");
+
         let cols = get_query_columns(sql);
         send_row_description(stream, &cols).await?;
-        
+
         let progress_info = {
             let s = state.lock().unwrap();
             s.mviews.get(name).map(|info| {
                 let progress = info.backfill_progress.to_string();
-                let status = if info.backfill_progress >= 1.0 { "COMPLETED" } else { "RUNNING" };
+                let status = if info.backfill_progress >= 1.0 {
+                    "COMPLETED"
+                } else {
+                    "RUNNING"
+                };
                 (progress, status.to_string())
             })
         };
-        
+
         if let Some((progress, status)) = progress_info {
             send_query_row(stream, &[name, &progress, &status], &cols, result_formats).await?;
         }
@@ -3123,7 +3434,16 @@ async fn execute_query_internal(
         let s = state.lock().unwrap();
         (s.ctx.clone(), s.catalog.clone())
     };
-    match execute_standard_select(stream, sql, &cloned_ctx, &cloned_catalog, result_formats, send_desc).await {
+    match execute_standard_select(
+        stream,
+        sql,
+        &cloned_ctx,
+        &cloned_catalog,
+        result_formats,
+        send_desc,
+    )
+    .await
+    {
         Ok(true) => {
             return Ok(());
         }
@@ -3136,7 +3456,16 @@ async fn execute_query_internal(
 
     // Fallback to legacy mock queries
     let cols = get_query_columns(sql);
-    if execute_mock_queries(stream, &sql_upper, &cols, result_formats, send_desc, &cloned_catalog).await? {
+    if execute_mock_queries(
+        stream,
+        &sql_upper,
+        &cols,
+        result_formats,
+        send_desc,
+        &cloned_catalog,
+    )
+    .await?
+    {
         return Ok(());
     }
 
@@ -3163,12 +3492,28 @@ async fn execute_query_internal(
         }
         if sql_upper.starts_with("SHOW RESOURCE USAGE FOR WORKLOAD") {
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            let wl = parts.get(5).cloned().unwrap_or("realtime").trim_matches(';');
-            send_query_row(stream, &["orders_mv", wl, "1048576", "524288", "12"], &cols, result_formats).await?;
+            let wl = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("realtime")
+                .trim_matches(';');
+            send_query_row(
+                stream,
+                &["orders_mv", wl, "1048576", "524288", "12"],
+                &cols,
+                result_formats,
+            )
+            .await?;
         } else if sql_upper.starts_with("SHOW CLUSTER RESOURCE USAGE") {
             send_query_row(stream, &["1", "1048576", "8388608"], &cols, result_formats).await?;
         } else {
-            send_query_row(stream, &["realtime", "10485760", "8388608", "100", "true"], &cols, result_formats).await?;
+            send_query_row(
+                stream,
+                &["realtime", "10485760", "8388608", "100", "true"],
+                &cols,
+                result_formats,
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         return Ok(());
@@ -3179,17 +3524,41 @@ async fn execute_query_internal(
         }
         let parts: Vec<&str> = sql.split_whitespace().collect();
         if sql_upper.starts_with("SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA") {
-            let schema_name = parts.get(5).cloned().unwrap_or("my_schema").trim_matches(';');
-            send_query_row(stream, &[schema_name, "UP-TO-DATE", "0"], &cols, result_formats).await?;
+            let schema_name = parts
+                .get(5)
+                .cloned()
+                .unwrap_or("my_schema")
+                .trim_matches(';');
+            send_query_row(
+                stream,
+                &[schema_name, "UP-TO-DATE", "0"],
+                &cols,
+                result_formats,
+            )
+            .await?;
         } else {
             let view_name = parts.get(6).cloned().unwrap_or("my_view").trim_matches(';');
-            send_query_row(stream, &[view_name, "1", "2026-06-04 00:00:00", "true"], &cols, result_formats).await?;
+            send_query_row(
+                stream,
+                &[view_name, "1", "2026-06-04 00:00:00", "true"],
+                &cols,
+                result_formats,
+            )
+            .await?;
         }
         send_command_complete(stream, "SELECT").await?;
         return Ok(());
     }
     if sql_upper.starts_with("SET ") || sql_upper.starts_with("SHOW ") {
-        send_command_complete(stream, if sql_upper.starts_with("SET ") { "SET" } else { "SHOW" }).await?;
+        send_command_complete(
+            stream,
+            if sql_upper.starts_with("SET ") {
+                "SET"
+            } else {
+                "SHOW"
+            },
+        )
+        .await?;
         return Ok(());
     }
 
@@ -3199,127 +3568,6 @@ async fn execute_query_internal(
     send_query_row(stream, &["OK"], &cols, result_formats).await?;
     send_command_complete(stream, "SELECT").await?;
     Ok(())
-}
-
-async fn plan_and_lower_query(sql: &str) -> Result<Vec<String>, String> {
-    let sql_upper = sql.to_uppercase();
-    if sql_upper.starts_with("EXPLAIN TRANSACTION") {
-        let frontend = rockstream_sql::SqlFrontend::new();
-        frontend
-            .explain_transaction(sql)
-            .map(|s| s.lines().map(String::from).collect())
-            .map_err(|e| e.to_string())
-    } else if sql_upper.starts_with("EXPLAIN INDEX") {
-        let frontend = rockstream_sql::SqlFrontend::new();
-        frontend
-            .explain_index(sql)
-            .map(|s| s.lines().map(String::from).collect())
-            .map_err(|e| e.to_string())
-    } else {
-        let query_sql = if sql_upper.starts_with("EXPLAIN INCREMENTAL ESTIMATE ") {
-            &sql[29..]
-        } else if sql_upper.starts_with("EXPLAIN INCREMENTAL VERBOSE ")
-            || sql_upper.starts_with("EXPLAIN INCREMENTAL ANALYZE ")
-        {
-            &sql[28..]
-        } else if sql_upper.starts_with("EXPLAIN INCREMENTAL ") {
-            &sql[20..]
-        } else if sql_upper.starts_with("EXPLAIN ") {
-            &sql[8..]
-        } else {
-            sql
-        };
-        let query_sql = query_sql.trim();
-
-        let ctx = datafusion::prelude::SessionContext::new();
-
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::catalog::SchemaProvider;
-        use datafusion::datasource::MemTable;
-        use std::sync::Arc;
-
-        let orders_schema = Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, false),
-            Field::new("amount", DataType::Int64, false),
-            Field::new("product_id", DataType::Int64, false),
-        ]));
-        let products_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("price", DataType::Int64, false),
-        ]));
-        let events_schema = Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Int64, false),
-            Field::new("kind", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-        let a_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let b_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-        let users_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("group_id", DataType::Int64, false),
-        ]));
-
-        let _ = ctx.register_table(
-            "orders",
-            Arc::new(MemTable::try_new(orders_schema, vec![vec![]]).unwrap()),
-        );
-        let _ = ctx.register_table(
-            "products",
-            Arc::new(MemTable::try_new(products_schema, vec![vec![]]).unwrap()),
-        );
-        let _ = ctx.register_table(
-            "events",
-            Arc::new(MemTable::try_new(events_schema, vec![vec![]]).unwrap()),
-        );
-        let _ = ctx.register_table(
-            "a",
-            Arc::new(MemTable::try_new(a_schema, vec![vec![]]).unwrap()),
-        );
-        let _ = ctx.register_table(
-            "b",
-            Arc::new(MemTable::try_new(b_schema, vec![vec![]]).unwrap()),
-        );
-        let _ = ctx.register_table(
-            "users",
-            Arc::new(MemTable::try_new(users_schema, vec![vec![]]).unwrap()),
-        );
-
-        let marketing_orders_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("amount", DataType::Int64, false),
-        ]));
-        let marketing_table =
-            Arc::new(MemTable::try_new(marketing_orders_schema, vec![vec![]]).unwrap());
-        let marketing_schema_provider = datafusion::catalog::MemorySchemaProvider::new();
-        let _ = marketing_schema_provider.register_table("orders".to_string(), marketing_table);
-        if let Some(catalog) = ctx.catalog("datafusion") {
-            let _ = catalog.register_schema("marketing", Arc::new(marketing_schema_provider));
-        }
-
-        match ctx.sql(query_sql).await {
-            Ok(df) => {
-                let lp = df.into_unoptimized_plan();
-                let frontend = rockstream_sql::SqlFrontend::new();
-                match frontend.lower(&lp) {
-                    Ok(plan) => {
-                        let explain_text =
-                            rockstream_runtime::explain::render_explain("query", &plan);
-                        Ok(explain_text.lines().map(String::from).collect())
-                    }
-                    Err(e) => Err(format!("lowering error: {e}")),
-                }
-            }
-            Err(e) => Err(format!("planning error: {e}")),
-        }
-    }
 }
 
 async fn execute_standard_select(

@@ -1,0 +1,18 @@
+{"timestamp_ms":1780831809070,"actor":"system","action":"server.started","resource":"rockstream","error_code":null,"detail":"storage=./rockstream-data, role=all"}
+{"timestamp_ms":1780831809071,"actor":"system","action":"control_service.started","resource":"control","error_code":null,"detail":"bind=127.0.0.1:7700"}
+{"timestamp_ms":1780831809073,"actor":"control","action":"worker.registered","resource":"worker-1","error_code":null,"detail":"address=127.0.0.1:55116, headroom=1.00"}
+{"timestamp_ms":1780831809074,"actor":"system","action":"worker.registered","resource":"worker-tier2","error_code":null,"detail":"mode=all, address=127.0.0.1:55116"}
+{"timestamp_ms":1780831809074,"actor":"system","action":"pipeline.created","resource":"noop-pipeline","error_code":null,"detail":"source=noop-source, operator=noop-operator, sink=noop-sink"}
+{"timestamp_ms":1780831809074,"actor":"system","action":"pipeline.started","resource":"noop-pipeline","error_code":null,"detail":null}
+{"timestamp_ms":1780831812086,"actor":"system","action":"pipeline.stopped","resource":"noop-pipeline","error_code":null,"detail":"epochs_completed=5"}
+{"timestamp_ms":1780831812090,"actor":"control","action":"worker.deregistered","resource":"worker-1","error_code":null,"detail":null}
+{"timestamp_ms":1780833233419,"actor":"system","action":"server.stopped","resource":"rockstream","error_code":null,"detail":null}
+{"timestamp_ms":1780833249163,"actor":"system","action":"server.started","resource":"rockstream","error_code":null,"detail":"storage=./rockstream-data, role=all"}
+{"timestamp_ms":1780833249167,"actor":"system","action":"control_service.started","resource":"control","error_code":null,"detail":"bind=127.0.0.1:7700"}
+{"timestamp_ms":1780833249170,"actor":"control","action":"worker.registered","resource":"worker-1","error_code":null,"detail":"address=127.0.0.1:55911, headroom=1.00"}
+{"timestamp_ms":1780833249170,"actor":"system","action":"worker.registered","resource":"worker-tier2","error_code":null,"detail":"mode=all, address=127.0.0.1:55911"}
+{"timestamp_ms":1780833249170,"actor":"system","action":"pipeline.created","resource":"noop-pipeline","error_code":null,"detail":"source=noop-source, operator=noop-operator, sink=noop-sink"}
+{"timestamp_ms":1780833249170,"actor":"system","action":"pipeline.started","resource":"noop-pipeline","error_code":null,"detail":null}
+{"timestamp_ms":1780833252182,"actor":"system","action":"pipeline.stopped","resource":"noop-pipeline","error_code":null,"detail":"epochs_completed=5"}
+{"timestamp_ms":1780833252183,"actor":"control","action":"worker.deregistered","resource":"worker-1","error_code":null,"detail":null}
+{"timestamp_ms":1780833706601,"actor":"system","action":"server.stopped","resource":"rockstream","error_code":null,"detail":null}

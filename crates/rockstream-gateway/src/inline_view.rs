@@ -196,7 +196,6 @@ impl InlineViewCatalog {
         result
     }
 
-
     /// Simulate executing a `SELECT * FROM <view>` query via inline expansion.
     ///
     /// Returns the expanded SQL that would be passed to the query engine.
