@@ -22,8 +22,8 @@ pub mod wal_cache;
 
 pub use error::StorageError;
 pub use keys::{
-    minmax_sort_key, minmax_sort_key_decode, CatalogKeyEncoder, ShardKeyEncoder, ShardPrefix,
-    MINMAX_DISCRIMINATOR,
+    minmax_sort_key, minmax_sort_key_decode, CatalogKeyEncoder, JoinSide, ShardKeyEncoder,
+    ShardPrefix, MINMAX_DISCRIMINATOR,
 };
 pub use merge_registry::{MergeOperatorRegistry, SumCountMergeOperator};
 pub use reader::ShardReader;

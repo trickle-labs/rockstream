@@ -20,6 +20,7 @@ pub mod error;
 pub mod expr;
 pub mod filter;
 pub mod group_commit;
+pub mod join;
 pub mod map;
 pub mod minmax;
 pub mod op;
@@ -35,6 +36,7 @@ pub use aggregate::{load_frontier, persist_agg_state, persist_frontier, AggState
 pub use error::OpError;
 pub use filter::FilterOp;
 pub use group_commit::{GroupCommit, GROUP_COMMIT_MAX_BATCHES};
+pub use join::JoinOp;
 pub use map::MapOp;
 pub use minmax::{persist_minmax_state, MinMaxKind, MinMaxOp, MinMaxState};
 pub use op::{EpochOutput, Operator};

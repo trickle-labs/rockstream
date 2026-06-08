@@ -42,11 +42,33 @@ pub enum PlanNode {
         group_by: Vec<Expr>,
         aggregates: Vec<AggregateExpr>,
     },
-    /// Inner join on a condition.
+    /// Inner join on a condition (deprecated — use InnerJoin instead).
     Join {
         left: Box<PlanNode>,
         right: Box<PlanNode>,
         condition: Expr,
+    },
+    /// Inner equi-join with pre-computed key columns and dual arrangements (v0.8 — IVM-4).
+    ///
+    /// The join uses two separate arrangements (left_arr_id, right_arr_id) to
+    /// efficiently probe matching rows. The join key is computed from the column
+    /// indices in `left_keys` and `right_keys`.
+    ///
+    /// `semantics` carries metadata for specialized join handling (e.g. semijoins,
+    /// TPC-H specific optimizations).
+    InnerJoin {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        /// Column indices in the left input forming the join key.
+        left_keys: Vec<usize>,
+        /// Column indices in the right input forming the join key.
+        right_keys: Vec<usize>,
+        /// Operator ID for the left arrangement.
+        left_arr_id: OperatorId,
+        /// Operator ID for the right arrangement.
+        right_arr_id: OperatorId,
+        /// Join semantics and metadata.
+        semantics: JoinSemantics,
     },
     /// Union of two inputs.
     Union {
@@ -222,6 +244,19 @@ pub enum ExchangeKind {
     Single,
     /// Range-partition by the declared `partition_key`.
     Range,
+}
+
+/// Join semantics metadata for specialized join handling (v0.8 — IVM-4).
+///
+/// Carries metadata used for TPC-H optimizations and semi-join detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct JoinSemantics {
+    /// True if this join is nested inside a semi-join (e.g. TPC-H EC-01).
+    pub inside_semijoin: bool,
+    /// True if this join is a child of another join in the query tree.
+    pub is_join_child: bool,
+    /// True if the right side's old arrangement must be materialized (e.g. TPC-H Q07/Q21).
+    pub r_old_materialize: bool,
 }
 
 /// Policy for late-arriving rows in time-window operators.

@@ -27,12 +27,13 @@ use datafusion::common::DFSchema;
 #[allow(unused_imports)]
 use datafusion::logical_expr::expr::AggregateFunctionParams;
 use datafusion::logical_expr::{
-    expr::AggregateFunction, BinaryExpr, LogicalPlan, Operator as DfOp,
+    expr::AggregateFunction, BinaryExpr, JoinType, LogicalPlan, Operator as DfOp,
 };
 use datafusion::prelude::Expr as DfExpr;
 use datafusion::scalar::ScalarValue;
 
-use rockstream_plan::{AggregateExpr, AggregateFunc, BinaryOp, Expr, PlanNode};
+use rockstream_plan::{AggregateExpr, AggregateFunc, BinaryOp, Expr, JoinSemantics, PlanNode};
+use rockstream_types::ids::OperatorId;
 
 use crate::error::SqlError;
 
@@ -108,6 +109,46 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
                     node_type: format!("Extension::{}", ext.node.name()),
                 })
             }
+        }
+
+        // Inner equi-join (v0.8 — IVM-4).
+        LogicalPlan::Join(join) => {
+            // Only inner joins are supported; outer/semi/anti return RS-1013.
+            if join.join_type != JoinType::Inner {
+                return Err(SqlError::UnsupportedPlanNode {
+                    node_type: format!("Join:{:?}", join.join_type),
+                });
+            }
+
+            // Extract equi-join column indices from the on condition.
+            let on_cols = extract_equi_join_keys(&join.on, &join.left, &join.right)?;
+            let (left_keys, right_keys) = on_cols;
+
+            let left = lower(&join.left)?;
+            let right = lower(&join.right)?;
+
+            // Generate stable arrangement operator IDs from the join key columns.
+            // For now, use a simple hash of the key indices as the operator ID.
+            let left_arr_id = OperatorId(
+                hash_keys(&left_keys)
+                    .wrapping_mul(31)
+                    .wrapping_add(hash_keys(&right_keys)),
+            );
+            let right_arr_id = OperatorId(
+                hash_keys(&right_keys)
+                    .wrapping_mul(37)
+                    .wrapping_add(hash_keys(&left_keys)),
+            );
+
+            Ok(PlanNode::InnerJoin {
+                left: Box::new(left),
+                right: Box::new(right),
+                left_keys,
+                right_keys,
+                left_arr_id,
+                right_arr_id,
+                semantics: JoinSemantics::default(),
+            })
         }
 
         other => Err(SqlError::UnsupportedPlanNode {
@@ -344,6 +385,80 @@ fn expr_name(expr: &DfExpr) -> &'static str {
         DfExpr::Unnest(_) => "Unnest",
         _ => "Unknown",
     }
+}
+
+// ─── Join helpers ────────────────────────────────────────────────────────────
+
+/// Extract equi-join key column indices from DataFusion join condition.
+///
+/// Returns `(left_keys, right_keys)` where each is a Vec of column indices.
+/// The condition is typically a BinaryExpr with `Eq` operator comparing columns
+/// from left and right inputs.
+///
+/// For now, supports only simple equi-joins where the condition is a single
+/// `Eq` or conjunctions of `Eq` operators (via `And`).
+fn extract_equi_join_keys(
+    on_condition: &[(DfExpr, DfExpr)],
+    left_plan: &LogicalPlan,
+    right_plan: &LogicalPlan,
+) -> Result<(Vec<usize>, Vec<usize>), SqlError> {
+    if on_condition.is_empty() {
+        return Err(SqlError::UnsupportedPlanNode {
+            node_type: "join_no_equi_condition".to_string(),
+        });
+    }
+
+    let left_schema = left_plan.schema();
+    let right_schema = right_plan.schema();
+    let mut left_keys = Vec::new();
+    let mut right_keys = Vec::new();
+
+    for (left_expr, right_expr) in on_condition {
+        // Extract column index from left expression.
+        let left_idx = match left_expr {
+            DfExpr::Column(col) => {
+                left_schema
+                    .index_of_column(col)
+                    .map_err(|_| SqlError::UnsupportedPlanNode {
+                        node_type: "join_column_resolution".to_string(),
+                    })?
+            }
+            _ => {
+                return Err(SqlError::UnsupportedPlanNode {
+                    node_type: "join_non_column_key".to_string(),
+                })
+            }
+        };
+
+        // Extract column index from right expression.
+        let right_idx =
+            match right_expr {
+                DfExpr::Column(col) => right_schema.index_of_column(col).map_err(|_| {
+                    SqlError::UnsupportedPlanNode {
+                        node_type: "join_column_resolution".to_string(),
+                    }
+                })?,
+                _ => {
+                    return Err(SqlError::UnsupportedPlanNode {
+                        node_type: "join_non_column_key".to_string(),
+                    })
+                }
+            };
+
+        left_keys.push(left_idx);
+        right_keys.push(right_idx);
+    }
+
+    Ok((left_keys, right_keys))
+}
+
+/// Compute a simple hash of a Vec of column indices for operator ID generation.
+fn hash_keys(keys: &[usize]) -> u64 {
+    let mut hash = 0u64;
+    for &k in keys {
+        hash = hash.wrapping_mul(31).wrapping_add(k as u64);
+    }
+    hash.wrapping_add(1) // Ensure non-zero
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────

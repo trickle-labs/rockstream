@@ -42,6 +42,23 @@ impl ShardPrefix {
 /// MinMax arrangement keys to distinguish them from other operator state.
 pub const MINMAX_DISCRIMINATOR: u8 = 0x4D; // 'M'
 
+/// Left/right side discriminator for join arrangements (v0.8 — IVM-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSide {
+    Left,
+    Right,
+}
+
+impl JoinSide {
+    /// Two-byte discriminator for this side.
+    pub fn disc_bytes(self) -> [u8; 2] {
+        match self {
+            JoinSide::Left => [0x4A, 0x4C],  // "JL"
+            JoinSide::Right => [0x4A, 0x52], // "JR"
+        }
+    }
+}
+
 /// Compute the sort key for a value in the MIN/MAX multiset.
 ///
 /// The encoding maps i64 values to `[u8; 8]` such that lexicographic byte
@@ -96,6 +113,27 @@ impl ShardKeyEncoder {
         let operator_id = u64::from_be_bytes(key[1..9].try_into().ok()?);
         let suffix = &key[9..];
         Some((prefix, operator_id, suffix))
+    }
+
+    /// Encode a join arrangement key: `[0x01][side_disc:2][op_id:8][join_key][row_id:16]`
+    pub fn join_arr_key(side: JoinSide, op_id: u64, join_key: &[u8], row_id: u128) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 8 + join_key.len() + 16);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.extend_from_slice(&side.disc_bytes());
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(join_key);
+        key.extend_from_slice(&row_id.to_be_bytes());
+        key
+    }
+
+    /// Prefix for scanning all join arrangement entries for a single operator:
+    /// `[0x01][side_disc:2][op_id:8]`
+    pub fn join_arr_op_prefix(side: JoinSide, op_id: u64) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(1 + 2 + 8);
+        prefix.push(ShardPrefix::OpState.as_byte());
+        prefix.extend_from_slice(&side.disc_bytes());
+        prefix.extend_from_slice(&op_id.to_be_bytes());
+        prefix
     }
 
     /// Build the prefix bytes for scanning all keys of a given operator.
