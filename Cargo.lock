@@ -3943,6 +3943,7 @@ name = "rockstream-plan"
 version = "0.52.10"
 dependencies = [
  "rockstream-types",
+ "serde",
 ]
 
 [[package]]
@@ -3970,6 +3971,20 @@ dependencies = [
 [[package]]
 name = "rockstream-sql"
 version = "0.52.10"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "object_store 0.12.5",
+ "rockstream-plan",
+ "rockstream-storage",
+ "rockstream-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "rockstream-storage"

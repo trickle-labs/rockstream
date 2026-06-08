@@ -1,0 +1,392 @@
+//! Lowering pass: DataFusion `LogicalPlan` → RockStream `PlanNode` (v0.7).
+//!
+//! Transforms the DataFusion `LogicalPlan` produced by the SQL parser into
+//! the RockStream PlanIR (`PlanNode` tree).  Only the Phase 1 operator set
+//! is supported:
+//!
+//! | DataFusion plan node | PlanNode variant |
+//! |---|---|
+//! | `TableScan` | `Source` |
+//! | `Filter` | `Filter` |
+//! | `Projection` | `Project` |
+//! | `Aggregate` | `Aggregate` |
+//! | `SubqueryAlias` | transparent (strips alias) |
+//!
+//! Expression encoding (for `Expr::Literal` bytes):
+//! - Integer scalars (Int8/16/32/64) → 8-byte big-endian i64
+//! - Float64 → 8-byte big-endian f64 bits
+//! - Boolean → 1 byte (0 = false, 1 = true)
+//! - UTF-8 string → raw UTF-8 bytes
+//! - NULL → empty Vec
+//!
+//! Column references are resolved to 0-based indices using the *input
+//! plan's* output schema, so the lowered PlanNode is independent of column
+//! names.
+
+use datafusion::common::DFSchema;
+#[allow(unused_imports)]
+use datafusion::logical_expr::expr::AggregateFunctionParams;
+use datafusion::logical_expr::{
+    expr::AggregateFunction, BinaryExpr, LogicalPlan, Operator as DfOp,
+};
+use datafusion::prelude::Expr as DfExpr;
+use datafusion::scalar::ScalarValue;
+
+use rockstream_plan::{AggregateExpr, AggregateFunc, BinaryOp, Expr, PlanNode};
+
+use crate::error::SqlError;
+
+// ─── Public API ──────────────────────────────────────────────────────────────
+
+/// Lower a DataFusion `LogicalPlan` to a `PlanNode`.
+///
+/// The `plan` must have been produced by the DataFusion planner (optimized or
+/// unoptimized).  Only Phase 1 operators (Source / Filter / Project / Aggregate)
+/// are supported.  Other plan nodes return `RS-1013`.
+pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
+    match plan {
+        LogicalPlan::TableScan(scan) => Ok(PlanNode::Source {
+            name: scan.table_name.table().to_string(),
+        }),
+
+        LogicalPlan::Filter(filter) => {
+            let input = lower(&filter.input)?;
+            let predicate = lower_expr(&filter.predicate, filter.input.schema())?;
+            Ok(PlanNode::Filter {
+                input: Box::new(input),
+                predicate,
+            })
+        }
+
+        LogicalPlan::Projection(proj) => {
+            let input = lower(&proj.input)?;
+            let columns = proj
+                .expr
+                .iter()
+                .map(|e| lower_proj_expr(e, proj.input.schema()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PlanNode::Project {
+                input: Box::new(input),
+                columns,
+            })
+        }
+
+        LogicalPlan::Aggregate(agg) => {
+            let input = lower(&agg.input)?;
+            let input_schema = agg.input.schema();
+            let group_by = agg
+                .group_expr
+                .iter()
+                .map(|e| lower_expr(e, input_schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            let aggregates = agg
+                .aggr_expr
+                .iter()
+                .map(|e| lower_agg_expr(e, input_schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PlanNode::Aggregate {
+                input: Box::new(input),
+                group_by,
+                aggregates,
+            })
+        }
+
+        // Transparent wrappers — strip and lower the inner plan.
+        LogicalPlan::SubqueryAlias(alias) => lower(&alias.input),
+
+        // Extension node (e.g. IncAggregate) — currently transparent: lower
+        // the inner aggregate directly.  In v0.8+ these carry additional
+        // incremental metadata.
+        LogicalPlan::Extension(ext) => {
+            // We only know how to lower extension nodes that expose exactly
+            // one child input.  For now, return RS-1013 for anything else.
+            let inputs = ext.node.inputs();
+            if inputs.len() == 1 {
+                lower(inputs[0])
+            } else {
+                Err(SqlError::UnsupportedPlanNode {
+                    node_type: format!("Extension::{}", ext.node.name()),
+                })
+            }
+        }
+
+        other => Err(SqlError::UnsupportedPlanNode {
+            node_type: plan_node_name(other).to_string(),
+        }),
+    }
+}
+
+// ─── Expression lowering ─────────────────────────────────────────────────────
+
+/// Lower a scalar DataFusion expression to a `PlanNode` `Expr`.
+///
+/// `schema` is the **input** schema at the point where this expression is
+/// evaluated (used to resolve column names to 0-based indices).
+pub fn lower_expr(expr: &DfExpr, schema: &DFSchema) -> Result<Expr, SqlError> {
+    match expr {
+        DfExpr::Column(col) => {
+            let idx = schema
+                .index_of_column(col)
+                .map_err(|e| SqlError::UnsupportedPlanNode {
+                    node_type: format!("column_resolution:{e}"),
+                })?;
+            Ok(Expr::Column(idx))
+        }
+
+        DfExpr::Literal(scalar, _) => {
+            let bytes = encode_scalar(scalar)?;
+            Ok(Expr::Literal(bytes))
+        }
+
+        DfExpr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            let plan_op = lower_binary_op(op)?;
+            let l = lower_expr(left, schema)?;
+            let r = lower_expr(right, schema)?;
+            Ok(Expr::BinaryOp {
+                op: plan_op,
+                left: Box::new(l),
+                right: Box::new(r),
+            })
+        }
+
+        // Strip aliases (projection output aliases don't affect the expression).
+        DfExpr::Alias(alias) => lower_expr(&alias.expr, schema),
+
+        // Strip casts that don't change the logical value (e.g. Int32→Int64).
+        DfExpr::Cast(cast) => lower_expr(&cast.expr, schema),
+        DfExpr::TryCast(cast) => lower_expr(&cast.expr, schema),
+
+        other => Err(SqlError::UnsupportedPlanNode {
+            node_type: format!("expr:{}", expr_name(other)),
+        }),
+    }
+}
+
+/// Lower a projection expression.  Same as `lower_expr` but strips the outer
+/// `Alias` wrapper that DataFusion wraps around named output columns.
+pub fn lower_proj_expr(expr: &DfExpr, schema: &DFSchema) -> Result<Expr, SqlError> {
+    match expr {
+        DfExpr::Alias(alias) => lower_proj_expr(&alias.expr, schema),
+        other => lower_expr(other, schema),
+    }
+}
+
+// ─── Aggregate function lowering ─────────────────────────────────────────────
+
+/// Lower a DataFusion aggregate function expression to an `AggregateExpr`.
+pub fn lower_agg_expr(expr: &DfExpr, input_schema: &DFSchema) -> Result<AggregateExpr, SqlError> {
+    match expr {
+        DfExpr::AggregateFunction(AggregateFunction { func, params }) => {
+            let name = func.name().to_lowercase();
+            let func_kind = match name.as_str() {
+                "sum" => AggregateFunc::Sum,
+                "count" => AggregateFunc::Count,
+                "avg" => AggregateFunc::Avg,
+                "min" => AggregateFunc::Min,
+                "max" => AggregateFunc::Max,
+                other => {
+                    return Err(SqlError::UnsupportedPlanNode {
+                        node_type: format!("aggregate_function:{other}"),
+                    })
+                }
+            };
+
+            // For COUNT(*) DataFusion injects a `Literal(Int64(1))` argument.
+            // We keep it verbatim as `Literal(1i64.to_be_bytes())` which matches
+            // what the hand-coded PlanNode uses.
+            let input_expr = if params.args.is_empty() {
+                Expr::Literal(1i64.to_be_bytes().to_vec())
+            } else {
+                lower_expr(&params.args[0], input_schema)?
+            };
+
+            Ok(AggregateExpr {
+                func: func_kind,
+                input: input_expr,
+                distinct: params.distinct,
+            })
+        }
+
+        // Strip alias wrappers DataFusion may inject around aggregate expressions.
+        DfExpr::Alias(alias) => lower_agg_expr(&alias.expr, input_schema),
+
+        other => Err(SqlError::UnsupportedPlanNode {
+            node_type: format!("agg_expr:{}", expr_name(other)),
+        }),
+    }
+}
+
+// ─── Scalar encoding ─────────────────────────────────────────────────────────
+
+/// Encode a DataFusion `ScalarValue` as bytes for `Expr::Literal`.
+///
+/// All integer types are promoted to i64 and encoded as 8-byte big-endian.
+/// NULL values are encoded as empty bytes.
+pub fn encode_scalar(scalar: &ScalarValue) -> Result<Vec<u8>, SqlError> {
+    match scalar {
+        ScalarValue::Int8(Some(v)) => Ok((*v as i64).to_be_bytes().to_vec()),
+        ScalarValue::Int16(Some(v)) => Ok((*v as i64).to_be_bytes().to_vec()),
+        ScalarValue::Int32(Some(v)) => Ok((*v as i64).to_be_bytes().to_vec()),
+        ScalarValue::Int64(Some(v)) => Ok(v.to_be_bytes().to_vec()),
+        ScalarValue::UInt8(Some(v)) => Ok((*v as i64).to_be_bytes().to_vec()),
+        ScalarValue::UInt16(Some(v)) => Ok((*v as i64).to_be_bytes().to_vec()),
+        ScalarValue::UInt32(Some(v)) => Ok((*v as i64).to_be_bytes().to_vec()),
+        ScalarValue::UInt64(Some(v)) => Ok((*v as i64).to_be_bytes().to_vec()),
+        ScalarValue::Float64(Some(v)) => Ok(v.to_bits().to_be_bytes().to_vec()),
+        ScalarValue::Float32(Some(v)) => Ok(((*v as f64).to_bits()).to_be_bytes().to_vec()),
+        ScalarValue::Boolean(Some(b)) => Ok(vec![if *b { 1u8 } else { 0u8 }]),
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Ok(s.as_bytes().to_vec()),
+        // NULL variants — empty bytes
+        ScalarValue::Int8(None)
+        | ScalarValue::Int16(None)
+        | ScalarValue::Int32(None)
+        | ScalarValue::Int64(None)
+        | ScalarValue::UInt8(None)
+        | ScalarValue::UInt16(None)
+        | ScalarValue::UInt32(None)
+        | ScalarValue::UInt64(None)
+        | ScalarValue::Float32(None)
+        | ScalarValue::Float64(None)
+        | ScalarValue::Boolean(None)
+        | ScalarValue::Utf8(None)
+        | ScalarValue::LargeUtf8(None) => Ok(vec![]),
+        other => Err(SqlError::UnsupportedPlanNode {
+            node_type: format!("scalar:{other:?}"),
+        }),
+    }
+}
+
+// ─── Operator mapping ────────────────────────────────────────────────────────
+
+fn lower_binary_op(op: &DfOp) -> Result<BinaryOp, SqlError> {
+    match op {
+        DfOp::Eq => Ok(BinaryOp::Eq),
+        DfOp::NotEq => Ok(BinaryOp::Ne),
+        DfOp::Lt => Ok(BinaryOp::Lt),
+        DfOp::LtEq => Ok(BinaryOp::Le),
+        DfOp::Gt => Ok(BinaryOp::Gt),
+        DfOp::GtEq => Ok(BinaryOp::Ge),
+        DfOp::Plus => Ok(BinaryOp::Add),
+        DfOp::Minus => Ok(BinaryOp::Sub),
+        DfOp::Multiply => Ok(BinaryOp::Mul),
+        DfOp::Divide => Ok(BinaryOp::Div),
+        DfOp::And => Ok(BinaryOp::And),
+        DfOp::Or => Ok(BinaryOp::Or),
+        other => Err(SqlError::UnsupportedPlanNode {
+            node_type: format!("binary_op:{other:?}"),
+        }),
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn plan_node_name(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Projection(_) => "Projection",
+        LogicalPlan::Filter(_) => "Filter",
+        LogicalPlan::Aggregate(_) => "Aggregate",
+        LogicalPlan::Sort(_) => "Sort",
+        LogicalPlan::Join(_) => "Join",
+        LogicalPlan::Repartition(_) => "Repartition",
+        LogicalPlan::Union(_) => "Union",
+        LogicalPlan::TableScan(_) => "TableScan",
+        LogicalPlan::EmptyRelation(_) => "EmptyRelation",
+        LogicalPlan::Subquery(_) => "Subquery",
+        LogicalPlan::SubqueryAlias(_) => "SubqueryAlias",
+        LogicalPlan::Limit(_) => "Limit",
+        LogicalPlan::Extension(_) => "Extension",
+        LogicalPlan::Distinct(_) => "Distinct",
+        LogicalPlan::Window(_) => "Window",
+        LogicalPlan::Explain(_) => "Explain",
+        LogicalPlan::Analyze(_) => "Analyze",
+        LogicalPlan::Dml(_) => "Dml",
+        LogicalPlan::Ddl(_) => "Ddl",
+        LogicalPlan::Copy(_) => "Copy",
+        LogicalPlan::DescribeTable(_) => "DescribeTable",
+        LogicalPlan::Unnest(_) => "Unnest",
+        LogicalPlan::RecursiveQuery(_) => "RecursiveQuery",
+        LogicalPlan::Statement(_) => "Statement",
+        _ => "Unknown",
+    }
+}
+
+fn expr_name(expr: &DfExpr) -> &'static str {
+    match expr {
+        DfExpr::Column(_) => "Column",
+        DfExpr::Literal(..) => "Literal",
+        DfExpr::BinaryExpr(_) => "BinaryExpr",
+        DfExpr::Alias(_) => "Alias",
+        DfExpr::Cast(_) => "Cast",
+        DfExpr::TryCast(_) => "TryCast",
+        DfExpr::AggregateFunction(_) => "AggregateFunction",
+        DfExpr::WindowFunction(_) => "WindowFunction",
+        DfExpr::ScalarFunction(_) => "ScalarFunction",
+        DfExpr::Not(_) => "Not",
+        DfExpr::IsNull(_) => "IsNull",
+        DfExpr::IsNotNull(_) => "IsNotNull",
+        DfExpr::IsTrue(_) => "IsTrue",
+        DfExpr::IsFalse(_) => "IsFalse",
+        DfExpr::IsUnknown(_) => "IsUnknown",
+        DfExpr::IsNotTrue(_) => "IsNotTrue",
+        DfExpr::IsNotFalse(_) => "IsNotFalse",
+        DfExpr::IsNotUnknown(_) => "IsNotUnknown",
+        DfExpr::Negative(_) => "Negative",
+        DfExpr::Between(_) => "Between",
+        DfExpr::Case(_) => "Case",
+        DfExpr::InList(_) => "InList",
+        DfExpr::InSubquery(_) => "InSubquery",
+        DfExpr::ScalarSubquery(_) => "ScalarSubquery",
+        DfExpr::GroupingSet(_) => "GroupingSet",
+        DfExpr::Like(_) => "Like",
+        DfExpr::SimilarTo(_) => "SimilarTo",
+        DfExpr::Placeholder(_) => "Placeholder",
+        DfExpr::OuterReferenceColumn(_, _) => "OuterReferenceColumn",
+        DfExpr::Unnest(_) => "Unnest",
+        _ => "Unknown",
+    }
+}
+
+// ─── Unit tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::scalar::ScalarValue;
+
+    #[test]
+    fn encode_scalar_int64() {
+        let v = encode_scalar(&ScalarValue::Int64(Some(42))).unwrap();
+        assert_eq!(v, 42i64.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn encode_scalar_int32_promotes_to_i64() {
+        let v = encode_scalar(&ScalarValue::Int32(Some(10))).unwrap();
+        assert_eq!(v, 10i64.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn encode_scalar_bool() {
+        assert_eq!(
+            encode_scalar(&ScalarValue::Boolean(Some(true))).unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            encode_scalar(&ScalarValue::Boolean(Some(false))).unwrap(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn encode_scalar_null_is_empty() {
+        let v = encode_scalar(&ScalarValue::Int64(None)).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn binary_op_eq() {
+        assert_eq!(lower_binary_op(&DfOp::Eq).unwrap(), BinaryOp::Eq);
+        assert_eq!(lower_binary_op(&DfOp::Gt).unwrap(), BinaryOp::Gt);
+        assert_eq!(lower_binary_op(&DfOp::Plus).unwrap(), BinaryOp::Add);
+    }
+}

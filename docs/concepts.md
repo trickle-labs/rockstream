@@ -2025,6 +2025,120 @@ re-processing already-committed data.
 
 ---
 
+## SQL Frontend (v0.7)
+
+RockStream v0.7 adds a full SQL frontend built on [DataFusion](https://datafusion.apache.org/).
+You can now write views in standard SQL rather than constructing `PlanNode` trees by hand.
+
+### CREATE VIEW
+
+Register a named incremental view backed by storage:
+
+```sql
+CREATE VIEW orders_summary AS
+  SELECT region, SUM(amount) AS total, COUNT(*) AS n
+  FROM orders
+  GROUP BY region;
+```
+
+The SQL frontend:
+1. Parses the query using DataFusion's SQL parser.
+2. Lowers the DataFusion `LogicalPlan` to a RockStream `PlanNode` tree.
+3. Applies the distribution pass (inserts `Exchange[Loopback]` no-ops for
+   single-shard mode).
+4. Stores the plan and output schema in the `SchemaCatalog` (backed by
+   `ShardDb` under `CatalogType::View` keys).
+
+### Supported SQL (Phase 1 operator set)
+
+| SQL construct | PlanNode |
+|---|---|
+| `SELECT cols FROM t` | `Source` + `Project` |
+| `WHERE predicate` | `Filter` |
+| `GROUP BY k, SUM(v)` | `Aggregate[WeightAdd/v1]` |
+| `GROUP BY k, COUNT(*), AVG(v)` | `Aggregate[WeightAdd/v1]` |
+| `GROUP BY k, MIN(v), MAX(v)` | `Aggregate[IndexedMultiset/v1]` |
+
+Expressions supported in predicates and projections: column references,
+integer/boolean/string literals, `+`, `-`, `*`, `/`, `>`, `<`, `>=`, `<=`,
+`=`, `<>`, `AND`, `OR`.
+
+### Schema Evolution
+
+When you re-register a view with a new column list:
+
+- **Compatible** (accepted in-place, schema version increments):
+  - Same schema as before
+  - New nullable columns appended at the end
+- **Incompatible** (returns `RS-1002`):
+  - Any existing column renamed, removed, or reordered
+  - Any existing column type changed
+
+### EXPLAIN INCREMENTAL
+
+Show the annotated plan tree for a query without deploying it:
+
+```
+EXPLAIN INCREMENTAL
+──────────────────────────────────────────────────────
+✓ Aggregate  merge_law=WeightAdd/v1
+    Exchange[Loopback]  loopback (single-shard)
+      ⚠ Source[orders]  stateless
+```
+
+Stateless operators show `⚠` (no arrangement state).  Stateful algebraic
+aggregates show `✓ merge_law=WeightAdd/v1`.  Non-invertible aggregates (MIN/MAX)
+show `✗ extremum_requires_rmw`.
+
+### EXPLAIN INCREMENTAL ESTIMATE
+
+Produce a static cost estimate **without deploying any operators** or accessing
+storage.  Useful for capacity planning before creating a view:
+
+```
+EXPLAIN INCREMENTAL ESTIMATE
+───────────────────────────────────────────────────
+Operator                        state_bytes   epoch_ms
+───────────────────────────────────────────────────
+Source[orders]                            0       0.00
+Exchange[Loopback]                        0       0.00
+Aggregate                             24000      10.00
+───────────────────────────────────────────────────
+(estimates only; no operators deployed)
+```
+
+The estimate uses throughput floors from the Phase 1 exit criteria:
+
+| Operator | Throughput (in-memory) | State per group |
+|---|---|---|
+| Filter / Project | 5 M rows/s | 0 B |
+| Aggregate SUM/COUNT/AVG | 1 M rows/s | 24 B |
+| Aggregate MIN/MAX | 100 k rows/s | 32 B |
+
+### Custom Extension Nodes
+
+The frontend registers three DataFusion extension nodes for incremental
+operators.  In v0.7 these nodes are transparent (they lower to the same
+`PlanNode` as their standard DataFusion equivalents); in later versions they
+carry dual-arrangement markers, bilinear-join cost hints, and other
+incremental-specific metadata.
+
+| Extension node | Purpose |
+|---|---|
+| `IncAggregate` | GROUP BY maintained via DBSP arrangement |
+| `IncJoin` | Equi-join with dual arrangements (v0.8) |
+| `IncDistinct` | DISTINCT / set operations (v0.10) |
+
+### Error Codes
+
+- `RS-1002`: Incompatible schema change — rename, drop, or retype an existing
+  column.  Use a new view name or follow the blue/green procedure.
+- `RS-1012`: SQL parse error — check syntax against the supported SQL subset.
+- `RS-1013`: Unsupported plan node — the query uses a feature (e.g. subquery,
+  window function, lateral join) not yet supported by the incremental planner.
+
+---
+
 ## A Final Note
 
 The concepts in this guide are deliberately presented from the user's

@@ -9,6 +9,7 @@ pub mod explain;
 
 use rockstream_types::ids::OperatorId;
 use rockstream_types::merge_law::MergeLawId;
+use serde::{Deserialize, Serialize};
 
 /// Re-exported for backward compatibility — `NotMergeSafeReason` is now
 /// defined in `rockstream_types::explain`.
@@ -19,7 +20,7 @@ pub use rockstream_types::explain::NotMergeSafeReason;
 /// The plan IR is a tree of declarative operations that describe *what* to
 /// compute. The `DiffCtx` pass transforms this into a physical `OpNode` graph
 /// that describes *how* to compute it incrementally.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanNode {
     /// Read from a named source.
     Source { name: String },
@@ -208,7 +209,7 @@ pub enum PlanNode {
 }
 
 /// How an Exchange operator partitions data across shards (v0.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExchangeKind {
     /// Single-process loopback — no network, no shuffle objects.
     /// This is the only mode active in v0.4's embedded runtime.
@@ -227,7 +228,7 @@ pub enum ExchangeKind {
 ///
 /// A row is "late" if its event timestamp falls within a window that has
 /// already been closed by the watermark.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LateDataPolicy {
     /// Silently discard the late row. The closed window output is unchanged.
     Drop,
@@ -241,7 +242,7 @@ pub enum LateDataPolicy {
 ///
 /// This is intentionally minimal for v0.5. DataFusion expression integration
 /// comes in Phase 2 (v0.11+).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expr {
     /// A column reference by index.
     Column(usize),
@@ -272,7 +273,7 @@ pub enum Expr {
 }
 
 /// Binary operators for expressions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Eq,
     Ne,
@@ -289,7 +290,7 @@ pub enum BinaryOp {
 }
 
 /// An aggregate function expression.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateExpr {
     /// The aggregate function.
     pub func: AggregateFunc,
@@ -300,7 +301,7 @@ pub struct AggregateExpr {
 }
 
 /// Built-in aggregate functions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggregateFunc {
     Count,
     Sum,
@@ -331,7 +332,7 @@ pub enum AggregateFunc {
 ///
 /// These are the "JSON/unnest/generate_series style" functions from the v0.25
 /// scope.  More SRF variants will be added as the SQL surface grows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LateralFunc {
     /// `UNNEST(col)` — expands a column containing an array-like value
     /// (encoded as a sequence of length-prefixed entries) into one output
@@ -403,7 +404,7 @@ pub enum LateralFunc {
 ///
 /// If no `MergeLawId` is provided, the node is annotated with
 /// `not_merge_safe_reason=unknown_udaf_properties`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UdafSpec {
     /// Registered name of the UDAF (e.g. "my_sum").
     pub name: String,
@@ -419,7 +420,7 @@ pub struct UdafSpec {
 }
 
 /// A window function expression (v0.19).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowExpr {
     pub func: WindowFunc,
     pub partition_by: Vec<usize>,
@@ -427,7 +428,7 @@ pub struct WindowExpr {
 }
 
 /// Window functions supported in v0.19.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowFunc {
     RowNumber,
     Rank,
@@ -440,7 +441,7 @@ pub enum WindowFunc {
 }
 
 /// Window operator IVM strategy (v0.19).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowStrategy {
     PartitionRecompute,
     SlidingAggregate,
@@ -451,7 +452,7 @@ pub enum WindowStrategy {
 /// Each `OpNode` corresponds to a running operator instance with a unique
 /// `OperatorId`, an optional merge-law annotation, and references to its
 /// input(s).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpNode {
     /// Unique operator ID within the pipeline.
     pub id: OperatorId,
@@ -467,7 +468,7 @@ pub struct OpNode {
 }
 
 /// Physical operator kinds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpKind {
     /// Read from source.
     Source { name: String },

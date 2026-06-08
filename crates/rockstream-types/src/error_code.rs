@@ -84,6 +84,10 @@ pub const RS_1009: ErrorCode = ErrorCode::new(1009);
 pub const RS_1010: ErrorCode = ErrorCode::new(1010);
 /// View-on-view DAG contains a cycle; rejected at compile time.
 pub const RS_1011: ErrorCode = ErrorCode::new(1011);
+/// SQL statement could not be parsed (v0.7).
+pub const RS_1012: ErrorCode = ErrorCode::new(1012);
+/// Query contains a feature not supported by the incremental planner (v0.7).
+pub const RS_1013: ErrorCode = ErrorCode::new(1013);
 /// Inner-frontier stall in distributed recursion; per-shard recompute triggered (v0.33).
 pub const RS_1512: ErrorCode = ErrorCode::new(1512);
 /// Distributed recursion max-iteration cap exceeded without convergence (v0.33).
@@ -208,6 +212,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         1009 => "Non-monotone delta rejected in monotone recursion",
         1010 => "Bootstrap interrupted; connector position lost",
         1011 => "View-on-view DAG contains a cycle",
+        1012 => "SQL statement could not be parsed",
+        1013 => "Query contains a feature not yet supported by the incremental planner",
         1015 => "Group-commit queue full; back-pressure applied",
         1016 => "Aggregate running sum overflowed i64",
         1017 => "MIN/MAX multiset retraction underflow: value has no positive weight",
@@ -283,6 +289,8 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1009 => "Ensure the recursive query is monotone or restructure it; check EXPLAIN for recursion rules.",
         1010 => "Verify connector positions, reset offsets, or perform a full bootstrap rebuild.",
         1011 => "Resolve cycle in view dependencies; view-on-view relations must form a DAG.",
+        1012 => "Check SQL syntax; see docs/language-features.md for the supported SQL subset.",
+        1013 => "Simplify the query or check docs/language-features.md for the supported incremental SQL subset.",
         1015 => "Reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards.",
         1016 => "Reduce value magnitudes or switch to a wider numeric type.",
         1017 => "Ensure every retraction is matched by a prior insertion; check source event ordering and idempotency.",
@@ -361,7 +369,7 @@ mod tests {
             RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007,
             RS_2008, RS_2014, RS_2015, RS_2016, RS_3003, RS_4001, RS_4002, RS_5001, RS_5002,
             RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703,
-            RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017,
+            RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017, RS_1012, RS_1013,
         ];
         for code in codes {
             assert_ne!(
