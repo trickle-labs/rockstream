@@ -8,6 +8,18 @@ You are an expert developer. When modifying code, NEVER output the entire file. 
 - After every git commit make sure that the commit messages isn't garbled.
 - After creating or updating a pull request title or body make sure that they aren't garbled.
 
+## Test Output: Summary Lines Only
+
+After any `cargo test` run, extract only the summary — do not paste full passing test output into the conversation:
+
+```
+rtk cargo test ... 2>&1 | grep -E "^test .* (ok|FAILED|ignored)|^test result:|^FAILED$|^error"
+```
+
+Show full output **only for FAILED tests**. Passing test noise balloons the cache and gets re-read on every subsequent turn, multiplying token costs 10–30×.
+
+## RTK Wrapper
+
 Always use rtk wrapper for these high-verbosity commands:
 
 - `rtk git log` instead of `git log`
