@@ -32,7 +32,9 @@ use datafusion::logical_expr::{
 use datafusion::prelude::Expr as DfExpr;
 use datafusion::scalar::ScalarValue;
 
-use rockstream_plan::{AggregateExpr, AggregateFunc, BinaryOp, Expr, JoinSemantics, PlanNode};
+use rockstream_plan::{
+    AggregateExpr, AggregateFunc, BinaryOp, Expr, JoinSemantics, OuterJoinKind, PlanNode,
+};
 use rockstream_types::ids::OperatorId;
 
 use crate::error::SqlError;
@@ -111,44 +113,93 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
             }
         }
 
-        // Inner equi-join (v0.8 — IVM-4).
+        // Inner and outer/semi/anti equi-joins (v0.8/v0.9 — IVM-4/IVM-5).
         LogicalPlan::Join(join) => {
-            // Only inner joins are supported; outer/semi/anti return RS-1013.
-            if join.join_type != JoinType::Inner {
-                return Err(SqlError::UnsupportedPlanNode {
-                    node_type: format!("Join:{:?}", join.join_type),
-                });
+            // Map DataFusion JoinType to our join representation.
+            // For semi/anti joins, the on condition may be empty (DataFusion uses
+            // a filter instead); handle both cases.
+            let on = &join.on;
+            let on_result = if on.is_empty() {
+                // Semi/anti joins may use the filter field as the join condition.
+                // For now, return RS-1013 if no equi-keys are extractable.
+                Err(SqlError::UnsupportedPlanNode {
+                    node_type: "join_no_equi_condition_semi_anti".to_string(),
+                })
+            } else {
+                extract_equi_join_keys(on, &join.left, &join.right)
+            };
+
+            match join.join_type {
+                JoinType::Inner => {
+                    let (left_keys, right_keys) = on_result?;
+                    let left = lower(&join.left)?;
+                    let right = lower(&join.right)?;
+                    let left_arr_id = OperatorId(
+                        hash_keys(&left_keys)
+                            .wrapping_mul(31)
+                            .wrapping_add(hash_keys(&right_keys)),
+                    );
+                    let right_arr_id = OperatorId(
+                        hash_keys(&right_keys)
+                            .wrapping_mul(37)
+                            .wrapping_add(hash_keys(&left_keys)),
+                    );
+                    Ok(PlanNode::InnerJoin {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        left_keys,
+                        right_keys,
+                        left_arr_id,
+                        right_arr_id,
+                        semantics: JoinSemantics::default(),
+                    })
+                }
+
+                JoinType::Left => {
+                    let (left_keys, right_keys) = on_result?;
+                    lower_outer_join(OuterJoinKind::Left, join, left_keys, right_keys)
+                }
+
+                JoinType::Right => {
+                    let (left_keys, right_keys) = on_result?;
+                    lower_outer_join(OuterJoinKind::Right, join, left_keys, right_keys)
+                }
+
+                JoinType::Full => {
+                    let (left_keys, right_keys) = on_result?;
+                    lower_outer_join(OuterJoinKind::Full, join, left_keys, right_keys)
+                }
+
+                JoinType::LeftSemi => {
+                    // For LeftSemi, on may be empty if DataFusion uses filter.
+                    // Try on condition first, else try filter expression for keys.
+                    let (left_keys, right_keys) = if on.is_empty() {
+                        extract_semi_anti_keys_from_filter(&join.filter, &join.left, &join.right)?
+                    } else {
+                        on_result?
+                    };
+                    lower_outer_join(OuterJoinKind::Semi, join, left_keys, right_keys)
+                }
+
+                JoinType::LeftAnti => {
+                    let (left_keys, right_keys) = if on.is_empty() {
+                        extract_semi_anti_keys_from_filter(&join.filter, &join.left, &join.right)?
+                    } else {
+                        on_result?
+                    };
+                    lower_outer_join(OuterJoinKind::Anti, join, left_keys, right_keys)
+                }
+
+                JoinType::RightSemi
+                | JoinType::RightAnti
+                | JoinType::LeftMark
+                | JoinType::RightMark => {
+                    // Not required by TPC-H — return RS-1013.
+                    Err(SqlError::UnsupportedPlanNode {
+                        node_type: format!("Join:{:?}", join.join_type),
+                    })
+                }
             }
-
-            // Extract equi-join column indices from the on condition.
-            let on_cols = extract_equi_join_keys(&join.on, &join.left, &join.right)?;
-            let (left_keys, right_keys) = on_cols;
-
-            let left = lower(&join.left)?;
-            let right = lower(&join.right)?;
-
-            // Generate stable arrangement operator IDs from the join key columns.
-            // For now, use a simple hash of the key indices as the operator ID.
-            let left_arr_id = OperatorId(
-                hash_keys(&left_keys)
-                    .wrapping_mul(31)
-                    .wrapping_add(hash_keys(&right_keys)),
-            );
-            let right_arr_id = OperatorId(
-                hash_keys(&right_keys)
-                    .wrapping_mul(37)
-                    .wrapping_add(hash_keys(&left_keys)),
-            );
-
-            Ok(PlanNode::InnerJoin {
-                left: Box::new(left),
-                right: Box::new(right),
-                left_keys,
-                right_keys,
-                left_arr_id,
-                right_arr_id,
-                semantics: JoinSemantics::default(),
-            })
         }
 
         other => Err(SqlError::UnsupportedPlanNode {
@@ -459,6 +510,99 @@ fn hash_keys(keys: &[usize]) -> u64 {
         hash = hash.wrapping_mul(31).wrapping_add(k as u64);
     }
     hash.wrapping_add(1) // Ensure non-zero
+}
+
+/// Lower an outer/semi/anti join node to `PlanNode::OuterJoin`.
+fn lower_outer_join(
+    kind: OuterJoinKind,
+    join: &datafusion::logical_expr::Join,
+    left_keys: Vec<usize>,
+    right_keys: Vec<usize>,
+) -> Result<PlanNode, SqlError> {
+    let left = lower(&join.left)?;
+    let right = lower(&join.right)?;
+
+    let left_arr_id = OperatorId(
+        hash_keys(&left_keys)
+            .wrapping_mul(31)
+            .wrapping_add(hash_keys(&right_keys)),
+    );
+    let right_arr_id = OperatorId(
+        hash_keys(&right_keys)
+            .wrapping_mul(37)
+            .wrapping_add(hash_keys(&left_keys)),
+    );
+    let unmatched_arr_id = OperatorId(
+        hash_keys(&left_keys)
+            .wrapping_mul(41)
+            .wrapping_add(hash_keys(&right_keys))
+            .wrapping_add(0x4F5544), // "OUD" for Outer Unmatched Data
+    );
+
+    Ok(PlanNode::OuterJoin {
+        kind,
+        left: Box::new(left),
+        right: Box::new(right),
+        left_keys,
+        right_keys,
+        left_arr_id,
+        right_arr_id,
+        unmatched_arr_id,
+    })
+}
+
+/// Extract equi-join keys from a semi/anti join filter expression.
+///
+/// DataFusion sometimes places the equi-condition in the `filter` field for
+/// semi/anti joins instead of the `on` field.  This function extracts the
+/// column indices from the filter if it's a simple equi-expression.
+fn extract_semi_anti_keys_from_filter(
+    filter: &Option<datafusion::prelude::Expr>,
+    left_plan: &LogicalPlan,
+    right_plan: &LogicalPlan,
+) -> Result<(Vec<usize>, Vec<usize>), SqlError> {
+    use datafusion::logical_expr::BinaryExpr;
+
+    match filter {
+        Some(DfExpr::BinaryExpr(BinaryExpr { left, op, right })) => {
+            if *op != datafusion::logical_expr::Operator::Eq {
+                return Err(SqlError::UnsupportedPlanNode {
+                    node_type: "semi_anti_filter_non_eq".to_string(),
+                });
+            }
+            let left_schema = left_plan.schema();
+            let right_schema = right_plan.schema();
+            let left_idx =
+                match left.as_ref() {
+                    DfExpr::Column(col) => left_schema.index_of_column(col).map_err(|_| {
+                        SqlError::UnsupportedPlanNode {
+                            node_type: "semi_anti_column_resolution".to_string(),
+                        }
+                    })?,
+                    _ => {
+                        return Err(SqlError::UnsupportedPlanNode {
+                            node_type: "semi_anti_non_column_key".to_string(),
+                        })
+                    }
+                };
+            let right_idx = match right.as_ref() {
+                DfExpr::Column(col) => right_schema.index_of_column(col).map_err(|_| {
+                    SqlError::UnsupportedPlanNode {
+                        node_type: "semi_anti_column_resolution".to_string(),
+                    }
+                })?,
+                _ => {
+                    return Err(SqlError::UnsupportedPlanNode {
+                        node_type: "semi_anti_non_column_key".to_string(),
+                    })
+                }
+            };
+            Ok((vec![left_idx], vec![right_idx]))
+        }
+        _ => Err(SqlError::UnsupportedPlanNode {
+            node_type: "semi_anti_no_filter".to_string(),
+        }),
+    }
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────

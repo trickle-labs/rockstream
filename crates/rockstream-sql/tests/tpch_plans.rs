@@ -68,6 +68,14 @@ fn region_schema() -> SchemaRef {
     )]))
 }
 
+fn partsupp_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("ps_partkey", DataType::Int64, false),
+        Field::new("ps_suppkey", DataType::Int64, false),
+        Field::new("ps_availqty", DataType::Int64, false),
+    ]))
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Count `InnerJoin` nodes in a `PlanNode` tree.
@@ -75,6 +83,9 @@ fn count_inner_joins(plan: &PlanNode) -> usize {
     match plan {
         PlanNode::InnerJoin { left, right, .. } | PlanNode::Join { left, right, .. } => {
             1 + count_inner_joins(left) + count_inner_joins(right)
+        }
+        PlanNode::OuterJoin { left, right, .. } => {
+            count_inner_joins(left) + count_inner_joins(right)
         }
         PlanNode::Source { .. } | PlanNode::Snapshot { .. } | PlanNode::ViewRef { .. } => 0,
         PlanNode::Filter { input, .. }
@@ -92,6 +103,36 @@ fn count_inner_joins(plan: &PlanNode) -> usize {
     }
 }
 
+/// Count `OuterJoin` nodes in a `PlanNode` tree.
+fn count_outer_joins(plan: &PlanNode) -> usize {
+    match plan {
+        PlanNode::OuterJoin { left, right, .. } => {
+            1 + count_outer_joins(left) + count_outer_joins(right)
+        }
+        PlanNode::InnerJoin { left, right, .. } | PlanNode::Join { left, right, .. } => {
+            count_outer_joins(left) + count_outer_joins(right)
+        }
+        PlanNode::Source { .. } | PlanNode::Snapshot { .. } | PlanNode::ViewRef { .. } => 0,
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Map { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::TumbleWindow { input, .. }
+        | PlanNode::TopK { input, .. }
+        | PlanNode::Lateral { input, .. }
+        | PlanNode::ViewSink { child: input, .. }
+        | PlanNode::Exchange { child: input, .. } => count_outer_joins(input),
+        PlanNode::Union { left, right } => count_outer_joins(left) + count_outer_joins(right),
+        PlanNode::Recursion { base, step, .. } => count_outer_joins(base) + count_outer_joins(step),
+    }
+}
+
+/// True if the plan contains at least one OuterJoin node.
+fn has_outer_join(plan: &PlanNode) -> bool {
+    count_outer_joins(plan) > 0
+}
+
 /// True if the plan tree contains at least one `InnerJoin` node.
 fn has_inner_join(plan: &PlanNode) -> bool {
     count_inner_joins(plan) > 0
@@ -106,6 +147,7 @@ fn tpch_frontend() -> SqlFrontend {
     f.register_table("supplier", supplier_schema()).unwrap();
     f.register_table("nation", nation_schema()).unwrap();
     f.register_table("region", region_schema()).unwrap();
+    f.register_table("partsupp", partsupp_schema()).unwrap();
     f
 }
 
@@ -298,14 +340,84 @@ async fn non_equi_join_returns_rs1014() {
     assert!(result.is_ok(), "equi join should succeed: {result:?}");
 }
 
-/// RS-1014: an outer join returns RS-1013 (not yet supported in v0.8).
+/// v0.9: LEFT JOIN now succeeds and produces an OuterJoin plan node.
 #[tokio::test]
-async fn outer_join_returns_rs1013() {
+async fn outer_join_succeeds() {
     let frontend = tpch_frontend();
     let sql = "SELECT l_orderkey FROM orders LEFT JOIN lineitem ON o_orderkey = l_orderkey";
     let result = frontend.sql_to_plan_node(sql).await;
     assert!(
-        result.is_err(),
-        "outer join should fail in v0.8: {result:?}"
+        result.is_ok(),
+        "LEFT JOIN should succeed in v0.9: {result:?}"
+    );
+    let plan = result.unwrap();
+    assert!(
+        has_outer_join(&plan),
+        "LEFT JOIN plan should contain OuterJoin node: {plan:?}"
+    );
+}
+
+// ─── Q11: SemiJoin via IN subquery ────────────────────────────────────────────
+
+/// TPC-H Q11-like (SemiJoin via IN subquery).
+///
+/// `SELECT ps_partkey, SUM(ps_availqty) AS total
+///   FROM partsupp
+///   WHERE ps_suppkey IN (SELECT s_suppkey FROM supplier WHERE s_nationkey = 5)
+///   GROUP BY ps_partkey`
+///
+/// DataFusion rewrites the IN subquery as a LEFT SEMI JOIN.
+/// Proof: SQL lowers without error, plan contains at least one OuterJoin node.
+#[tokio::test]
+async fn tpch_q11_semi_join() {
+    let frontend = tpch_frontend();
+    let sql = "SELECT ps_partkey, SUM(ps_availqty) AS total \
+               FROM partsupp \
+               WHERE ps_suppkey IN ( \
+                 SELECT s_suppkey FROM supplier WHERE s_nationkey = 5 \
+               ) \
+               GROUP BY ps_partkey";
+    let result = frontend.sql_to_plan_node(sql).await;
+    assert!(
+        result.is_ok(),
+        "Q11 semi-join query should lower without error: {result:?}"
+    );
+    let plan = result.unwrap();
+    assert!(
+        has_outer_join(&plan),
+        "Q11 plan should contain an OuterJoin (semi) node: {plan:?}"
+    );
+}
+
+// ─── Q21: AntiJoin + SemiJoin ─────────────────────────────────────────────────
+
+/// TPC-H Q21-like (AntiJoin + SemiJoin).
+///
+/// Simplified version using EXISTS/NOT EXISTS subqueries.
+/// DataFusion should produce both SEMI and ANTI join nodes.
+/// Proof: SQL lowers without error, plan contains ≥1 OuterJoin node.
+#[tokio::test]
+async fn tpch_q21_anti_semi_join() {
+    let frontend = tpch_frontend();
+    // Use a simplified self-join that DataFusion can plan without needing
+    // correlated-subquery support beyond what's available.
+    let sql = "SELECT l1.l_orderkey \
+               FROM lineitem l1 \
+               WHERE EXISTS ( \
+                 SELECT 1 FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey \
+               ) AND NOT EXISTS ( \
+                 SELECT 1 FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey \
+                   AND l3.l_suppkey <> l1.l_suppkey \
+               )";
+    let result = frontend.sql_to_plan_node(sql).await;
+    assert!(
+        result.is_ok(),
+        "Q21 anti+semi query should lower without error: {result:?}"
+    );
+    let plan = result.unwrap();
+    let n = count_outer_joins(&plan);
+    assert!(
+        n >= 1,
+        "Q21 plan should contain ≥1 OuterJoin node, got {n}: {plan:?}"
     );
 }

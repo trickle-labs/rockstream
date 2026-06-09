@@ -70,6 +70,24 @@ pub enum PlanNode {
         /// Join semantics and metadata.
         semantics: JoinSemantics,
     },
+    /// Outer / semi / anti equi-join with dual arrangements and unmatched tracking (v0.9 — IVM-5).
+    ///
+    /// Uses the same dual arrangements as `InnerJoin` plus an `unmatched_arr_id` arrangement
+    /// tracking per-key match counts for correct NULL-padding retractions.
+    ///
+    /// For `Left`, `Full`, `Semi`, `Anti`: tracks right-side match counts per left-key.
+    /// For `Right`, `Full`: also tracks left-side match counts per right-key.
+    OuterJoin {
+        kind: OuterJoinKind,
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_arr_id: OperatorId,
+        right_arr_id: OperatorId,
+        /// Arrangement ID for the unmatched-row tracking state.
+        unmatched_arr_id: OperatorId,
+    },
     /// Union of two inputs.
     Union {
         left: Box<PlanNode>,
@@ -244,6 +262,16 @@ pub enum ExchangeKind {
     Single,
     /// Range-partition by the declared `partition_key`.
     Range,
+}
+
+/// Join kind for outer, semi, and anti joins (v0.9 — IVM-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OuterJoinKind {
+    Left,
+    Right,
+    Full,
+    Semi,
+    Anti,
 }
 
 /// Join semantics metadata for specialized join handling (v0.8 — IVM-4).
@@ -517,6 +545,12 @@ pub enum OpKind {
     Aggregate,
     /// Stateful join with dual arrangements.
     Join,
+    /// Outer / semi / anti equi-join (v0.9 — IVM-5).
+    OuterJoin {
+        kind: OuterJoinKind,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+    },
     /// Stateless union.
     Union,
     /// Emit to output sink.

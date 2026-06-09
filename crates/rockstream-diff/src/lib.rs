@@ -197,6 +197,32 @@ impl DiffCtx {
                 Ok(id)
             }
 
+            // ── OuterJoin (v0.9 — IVM-5) ─────────────────────────────────
+            PlanNode::OuterJoin {
+                left,
+                right,
+                kind,
+                left_keys,
+                right_keys,
+                ..
+            } => {
+                let left_id = self.diff_node(left, ops)?;
+                let right_id = self.diff_node(right, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::OuterJoin {
+                        kind: *kind,
+                        left_keys: left_keys.clone(),
+                        right_keys: right_keys.clone(),
+                    },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![left_id, right_id],
+                });
+                Ok(id)
+            }
+
             // ── Not yet implemented in v0.5 ───────────────────────────────
             other => Err(DiffError::UnsupportedNode(format!("{other:?}"))),
         }

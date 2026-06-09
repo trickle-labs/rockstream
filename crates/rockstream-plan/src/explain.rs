@@ -83,6 +83,10 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
         // v0.4 additions
         OpKind::ViewSink { view_name, pk } => format!("ViewSink[{view_name},pk={pk:?}]"),
         OpKind::Exchange { kind } => format!("Exchange[{kind:?}]"),
+        // v0.9 additions
+        OpKind::OuterJoin { kind, .. } => {
+            format!("OuterJoin[{kind:?}]  dual_arrangement+unmatched")
+        }
     };
 
     let shard_info = match level {

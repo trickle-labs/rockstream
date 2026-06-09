@@ -2129,13 +2129,51 @@ incremental-specific metadata.
 | `IncJoin` | Equi-join with dual arrangements (v0.8) |
 | `IncDistinct` | DISTINCT / set operations (v0.10) |
 
+### Outer, Semi, and Anti Joins (v0.9 — IVM-5)
+
+RockStream v0.9 adds full incremental support for five additional join types
+beyond the inner equi-join introduced in v0.8:
+
+| Join type | SQL syntax | Semantics |
+|---|---|---|
+| **Left outer** | `LEFT JOIN … ON …` | All left rows; NULL-pad right columns when unmatched |
+| **Right outer** | `RIGHT JOIN … ON …` | All right rows; NULL-pad left columns when unmatched |
+| **Full outer** | `FULL OUTER JOIN … ON …` | All rows from both sides; NULL-pad where unmatched |
+| **Semi** | `WHERE col IN (SELECT …)` or `WHERE EXISTS (SELECT …)` | Left rows that have at least one matching right row (right columns not emitted) |
+| **Anti** | `WHERE col NOT IN (SELECT …)` or `WHERE NOT EXISTS (SELECT …)` | Left rows that have no matching right row |
+
+#### NULL encoding
+
+Unmatched columns in outer-join output are encoded as `0i64` in the Arrow
+Int64 output schema.  The operator distinguishes NULL-pad rows from real zero
+values by tracking per-key match counts in the `right_key_weight` (and
+`left_key_weight` for RIGHT/FULL) maps.
+
+#### Incremental algorithm
+
+Each outer join variant extends the inner-join bilinear rule with match-count
+tracking:
+
+- **RIGHT_KEY_WEIGHT[k]** — net Z-set weight of all right rows for key `k`.
+  When this transitions from 0 to non-zero (a key gains its first right match),
+  any previously NULL-padded left rows for that key are retracted.  When it
+  transitions from non-zero to 0 (key loses its last right match), NULL-pad
+  rows are re-emitted.
+- **LEFT_KEY_WEIGHT[k]** — symmetric for RIGHT and FULL joins.
+
+The state persistence format uses the same arrangement key encoding as inner
+join (`[0x01][0x4A4C/0x4A52][op_id:8][key][row_id:16]`), plus two new prefixes
+for match-count state (`[0x01][0x4F52]` for right weights, `[0x01][0x4F4C]`
+for left weights).  All persistence uses only point puts — no range deletion.
+
 ### Error Codes
 
 - `RS-1002`: Incompatible schema change — rename, drop, or retype an existing
   column.  Use a new view name or follow the blue/green procedure.
 - `RS-1012`: SQL parse error — check syntax against the supported SQL subset.
-- `RS-1013`: Unsupported plan node — the query uses a feature (e.g. subquery,
-  window function, lateral join) not yet supported by the incremental planner.
+- `RS-1013`: Unsupported plan node — the query uses a feature not yet supported
+  by the incremental planner (e.g. `RightSemi`/`RightAnti` joins, correlated
+  subqueries with non-equi conditions, window functions with `GROUPS` framing).
 
 ---
 

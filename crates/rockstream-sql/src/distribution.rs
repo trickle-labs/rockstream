@@ -177,6 +177,60 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
             )
         }
 
+        // OuterJoin (v0.9): distribute children, return unpartitioned annotation.
+        PlanNode::OuterJoin {
+            kind,
+            left,
+            right,
+            left_keys,
+            right_keys,
+            left_arr_id,
+            right_arr_id,
+            unmatched_arr_id,
+        } => {
+            let (new_left, _) = distribute(*left);
+            let (new_right, _) = distribute(*right);
+            (
+                PlanNode::OuterJoin {
+                    kind,
+                    left_keys,
+                    right_keys,
+                    left_arr_id,
+                    right_arr_id,
+                    unmatched_arr_id,
+                    left: Box::new(new_left),
+                    right: Box::new(new_right),
+                },
+                DistributionAnnotation::unpartitioned(),
+            )
+        }
+
+        // InnerJoin (v0.8): distribute children, return unpartitioned annotation.
+        PlanNode::InnerJoin {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            left_arr_id,
+            right_arr_id,
+            semantics,
+        } => {
+            let (new_left, _) = distribute(*left);
+            let (new_right, _) = distribute(*right);
+            (
+                PlanNode::InnerJoin {
+                    left_keys,
+                    right_keys,
+                    left_arr_id,
+                    right_arr_id,
+                    semantics,
+                    left: Box::new(new_left),
+                    right: Box::new(new_right),
+                },
+                DistributionAnnotation::unpartitioned(),
+            )
+        }
+
         // All other nodes pass through unchanged with unpartitioned annotation.
         other => (other, DistributionAnnotation::unpartitioned()),
     }

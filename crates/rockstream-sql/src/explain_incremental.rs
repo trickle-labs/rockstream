@@ -83,6 +83,24 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<String>) {
             lines.push(format!("{indent}  ViewSink[{view_name}]"));
         }
 
+        // v0.9: outer / semi / anti join.
+        PlanNode::OuterJoin {
+            left, right, kind, ..
+        } => {
+            render_node(left, depth + 1, lines);
+            render_node(right, depth + 1, lines);
+            lines.push(format!(
+                "{indent}✓ OuterJoin[{kind:?}]  dual_arrangement+unmatched"
+            ));
+        }
+
+        // v0.8: inner equi-join.
+        PlanNode::InnerJoin { left, right, .. } => {
+            render_node(left, depth + 1, lines);
+            render_node(right, depth + 1, lines);
+            lines.push(format!("{indent}✓ InnerJoin  dual_arrangement"));
+        }
+
         other => {
             lines.push(format!("{indent}  {other:?}"));
         }
