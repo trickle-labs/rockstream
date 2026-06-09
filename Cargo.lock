@@ -3975,6 +3975,7 @@ dependencies = [
  "arrow",
  "datafusion",
  "object_store 0.12.5",
+ "rockstream-ops",
  "rockstream-plan",
  "rockstream-storage",
  "rockstream-types",

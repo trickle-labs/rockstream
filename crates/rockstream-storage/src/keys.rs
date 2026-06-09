@@ -42,6 +42,9 @@ impl ShardPrefix {
 /// MinMax arrangement keys to distinguish them from other operator state.
 pub const MINMAX_DISCRIMINATOR: u8 = 0x4D; // 'M'
 
+/// Distinct arrangement discriminator bytes (v0.10 — IVM-6): ASCII 'D', 'S'.
+pub const DISTINCT_DISCRIMINATOR: [u8; 2] = [0x44, 0x53];
+
 /// Left/right side discriminator for join arrangements (v0.8 — IVM-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinSide {
@@ -124,6 +127,35 @@ impl ShardKeyEncoder {
         key.extend_from_slice(join_key);
         key.extend_from_slice(&row_id.to_be_bytes());
         key
+    }
+
+    // ─── Distinct arrangement keys (IVM-6) ──────────────────────────────────
+
+    /// Encode a Distinct arrangement entry key.
+    ///
+    /// Format: `[0x01 (OpState)][0x44 0x53 ('DS')][op_id:8][row_hash:16]`
+    /// Value: `[weight:8 BE][row_bytes: n_cols * 8 BE]`
+    ///
+    /// The `row_hash` is a 128-bit hash of the full row content, used as a
+    /// compact and bounded key suffix.
+    pub fn distinct_key(op_id: u64, row_hash: u128) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 8 + 16);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.extend_from_slice(&DISTINCT_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(&row_hash.to_be_bytes());
+        key
+    }
+
+    /// Prefix for scanning all distinct arrangement entries for a single operator.
+    ///
+    /// Format: `[0x01][0x44 0x53][op_id:8]`
+    pub fn distinct_op_prefix(op_id: u64) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(1 + 2 + 8);
+        prefix.push(ShardPrefix::OpState.as_byte());
+        prefix.extend_from_slice(&DISTINCT_DISCRIMINATOR);
+        prefix.extend_from_slice(&op_id.to_be_bytes());
+        prefix
     }
 
     /// Prefix for scanning all join arrangement entries for a single operator:

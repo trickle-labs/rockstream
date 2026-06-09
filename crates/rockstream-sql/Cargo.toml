@@ -19,5 +19,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+rockstream-ops = { workspace = true }
 tempfile = { workspace = true }
 object_store = { workspace = true }

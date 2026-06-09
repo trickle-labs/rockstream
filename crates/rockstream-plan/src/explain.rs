@@ -87,6 +87,16 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
         OpKind::OuterJoin { kind, .. } => {
             format!("OuterJoin[{kind:?}]  dual_arrangement+unmatched")
         }
+        // v0.10 additions
+        OpKind::Distinct => "Distinct  merge_law=WeightAdd/v1  zero_crossing".to_string(),
+        OpKind::Intersect { all } => {
+            let sem = if *all { "ALL" } else { "SET" };
+            format!("Intersect[{sem}]  dual_arrangement  min_weight")
+        }
+        OpKind::Except { all } => {
+            let sem = if *all { "ALL" } else { "SET" };
+            format!("Except[{sem}]  dual_arrangement  subtract_weight")
+        }
     };
 
     let shard_info = match level {

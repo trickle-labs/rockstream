@@ -100,6 +100,10 @@ fn count_inner_joins(plan: &PlanNode) -> usize {
         | PlanNode::Exchange { child: input, .. } => count_inner_joins(input),
         PlanNode::Union { left, right } => count_inner_joins(left) + count_inner_joins(right),
         PlanNode::Recursion { base, step, .. } => count_inner_joins(base) + count_inner_joins(step),
+        PlanNode::Distinct { input, .. } => count_inner_joins(input),
+        PlanNode::Intersect { left, right, .. } | PlanNode::Except { left, right, .. } => {
+            count_inner_joins(left) + count_inner_joins(right)
+        }
     }
 }
 
@@ -125,6 +129,10 @@ fn count_outer_joins(plan: &PlanNode) -> usize {
         | PlanNode::Exchange { child: input, .. } => count_outer_joins(input),
         PlanNode::Union { left, right } => count_outer_joins(left) + count_outer_joins(right),
         PlanNode::Recursion { base, step, .. } => count_outer_joins(base) + count_outer_joins(step),
+        PlanNode::Distinct { input, .. } => count_outer_joins(input),
+        PlanNode::Intersect { left, right, .. } | PlanNode::Except { left, right, .. } => {
+            count_outer_joins(left) + count_outer_joins(right)
+        }
     }
 }
 

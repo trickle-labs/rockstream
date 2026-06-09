@@ -93,6 +93,50 @@ pub enum PlanNode {
         left: Box<PlanNode>,
         right: Box<PlanNode>,
     },
+
+    // ── v0.10 additions (IVM-6) ────────────────────────────────────────────
+    /// Deduplicate rows by full row content — weight-based, zero-crossing (v0.10 — IVM-6).
+    ///
+    /// Maintains a `row_hash → i64` weight arrangement.  Emits `(row, +1)` on
+    /// weight `0 → positive` (zero-crossing up) and `(row, -1)` on weight
+    /// `positive → 0` (zero-crossing down).  Explicit tombstones are written
+    /// for zero-crossing entries; compaction filters clean up obsolete operands.
+    ///
+    /// Bound: bounded by the cardinality of the input relation.  Fill level =
+    /// distinct key count; backpressure = epoch backpressure from scheduler.
+    Distinct {
+        input: Box<PlanNode>,
+        arr_id: OperatorId,
+    },
+    /// Intersection of two input relations — set or bag semantics (v0.10 — IVM-6).
+    ///
+    /// Maintains two distinct-style arrangements (one per side).  Emits deltas
+    /// at `min(left_weight, right_weight)` transitions.
+    /// - `all = false` (set): clamps weights to `{0, 1}` before computing min.
+    /// - `all = true` (bag): uses raw weights, `min(l, r)`.
+    ///
+    /// Bound: bounded by the cardinality of each input relation.
+    Intersect {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        all: bool,
+        left_arr_id: OperatorId,
+        right_arr_id: OperatorId,
+    },
+    /// Difference of two input relations — set or bag semantics (v0.10 — IVM-6).
+    ///
+    /// Emits deltas at `(left_weight − right_weight).max(0)` transitions.
+    /// - `all = false` (set): clamps weights to `{0, 1}` before computing difference.
+    /// - `all = true` (bag): uses raw weights.
+    ///
+    /// Bound: bounded by the cardinality of each input relation.
+    Except {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        all: bool,
+        left_arr_id: OperatorId,
+        right_arr_id: OperatorId,
+    },
     /// Window functions (v0.19).
     Window {
         input: Box<PlanNode>,
@@ -553,6 +597,12 @@ pub enum OpKind {
     },
     /// Stateless union.
     Union,
+    /// Distinct deduplication — weight-based, zero-crossing (v0.10 — IVM-6).
+    Distinct,
+    /// Intersect of two input arrangements — set or bag semantics (v0.10 — IVM-6).
+    Intersect { all: bool },
+    /// Except subtraction of two arrangements — set or bag semantics (v0.10 — IVM-6).
+    Except { all: bool },
     /// Emit to output sink.
     Sink { name: String },
     /// Window function operator (v0.19).

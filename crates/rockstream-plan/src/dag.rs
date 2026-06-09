@@ -56,6 +56,11 @@ fn collect_refs(plan: &PlanNode, out: &mut Vec<String>) {
             collect_refs(left, out);
             collect_refs(right, out);
         }
+        PlanNode::Distinct { input, .. } => collect_refs(input, out),
+        PlanNode::Intersect { left, right, .. } | PlanNode::Except { left, right, .. } => {
+            collect_refs(left, out);
+            collect_refs(right, out);
+        }
         PlanNode::Recursion { base, step, .. } => {
             collect_refs(base, out);
             collect_refs(step, out);

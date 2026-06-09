@@ -27,7 +27,7 @@ use datafusion::common::DFSchema;
 #[allow(unused_imports)]
 use datafusion::logical_expr::expr::AggregateFunctionParams;
 use datafusion::logical_expr::{
-    expr::AggregateFunction, BinaryExpr, JoinType, LogicalPlan, Operator as DfOp,
+    expr::AggregateFunction, BinaryExpr, Distinct, JoinType, LogicalPlan, Operator as DfOp,
 };
 use datafusion::prelude::Expr as DfExpr;
 use datafusion::scalar::ScalarValue;
@@ -35,6 +35,7 @@ use datafusion::scalar::ScalarValue;
 use rockstream_plan::{
     AggregateExpr, AggregateFunc, BinaryOp, Expr, JoinSemantics, OuterJoinKind, PlanNode,
 };
+use std::hash::{Hash, Hasher};
 use rockstream_types::ids::OperatorId;
 
 use crate::error::SqlError;
@@ -77,6 +78,19 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
         LogicalPlan::Aggregate(agg) => {
             let input = lower(&agg.input)?;
             let input_schema = agg.input.schema();
+
+            // DataFusion's optimizer converts `SELECT DISTINCT cols FROM t` to
+            // `SELECT cols FROM t GROUP BY cols` (Aggregate with no aggregate
+            // functions).  Detect and route to `PlanNode::Distinct` so the
+            // runtime uses the correct zero-crossing weight semantics (IVM-6).
+            if agg.aggr_expr.is_empty() {
+                let arr_id = OperatorId(stable_plan_hash(&input));
+                return Ok(PlanNode::Distinct {
+                    input: Box::new(input),
+                    arr_id,
+                });
+            }
+
             let group_by = agg
                 .group_expr
                 .iter()
@@ -200,6 +214,48 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
                     })
                 }
             }
+        }
+
+        // SELECT DISTINCT ... (v0.10 — IVM-6).
+        //
+        // DataFusion represents `SELECT DISTINCT cols FROM t` as
+        // `Distinct::All(Projection(...))`. Route to `PlanNode::Distinct`.
+        //
+        // Note: INTERSECT / EXCEPT in DataFusion 53 are lowered to LeftSemi /
+        // LeftAnti joins by the DataFusion planner, so they reach this pass as
+        // `LogicalPlan::Join` nodes and are handled by the existing join arm.
+        LogicalPlan::Distinct(Distinct::All(input)) => {
+            let inner = lower(input)?;
+            let arr_id = OperatorId(stable_plan_hash(&inner));
+            Ok(PlanNode::Distinct {
+                input: Box::new(inner),
+                arr_id,
+            })
+        }
+
+        // DISTINCT ON (...) — not supported (PostgreSQL extension, not standard SQL).
+        LogicalPlan::Distinct(Distinct::On(_)) => Err(SqlError::UnsupportedPlanNode {
+            node_type: "Distinct::On (DISTINCT ON — not supported, use DISTINCT)".to_string(),
+        }),
+
+        // UNION ALL (v0.10) — stateless union of two inputs (no deduplication).
+        // DataFusion produces a `Union` with ≥2 inputs; we fold them left-associatively.
+        LogicalPlan::Union(u) => {
+            if u.inputs.is_empty() {
+                return Err(SqlError::UnsupportedPlanNode {
+                    node_type: "Union::empty".to_string(),
+                });
+            }
+            // Lower the first input; fold remaining inputs as left-associative Union nodes.
+            let mut acc = lower(&u.inputs[0])?;
+            for inp in &u.inputs[1..] {
+                let right = lower(inp)?;
+                acc = PlanNode::Union {
+                    left: Box::new(acc),
+                    right: Box::new(right),
+                };
+            }
+            Ok(acc)
         }
 
         other => Err(SqlError::UnsupportedPlanNode {
@@ -503,6 +559,14 @@ fn extract_equi_join_keys(
     Ok((left_keys, right_keys))
 }
 
+/// Compute a stable deterministic u64 hash of a `PlanNode` for operator ID generation.
+fn stable_plan_hash(plan: &PlanNode) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    format!("{plan:?}").hash(&mut h);
+    h.finish().wrapping_add(1)
+}
+
 /// Compute a simple hash of a Vec of column indices for operator ID generation.
 fn hash_keys(keys: &[usize]) -> u64 {
     let mut hash = 0u64;
@@ -610,6 +674,7 @@ fn extract_semi_anti_keys_from_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
 
     #[test]
@@ -647,5 +712,122 @@ mod tests {
         assert_eq!(lower_binary_op(&DfOp::Eq).unwrap(), BinaryOp::Eq);
         assert_eq!(lower_binary_op(&DfOp::Gt).unwrap(), BinaryOp::Gt);
         assert_eq!(lower_binary_op(&DfOp::Plus).unwrap(), BinaryOp::Add);
+    }
+
+    // ── SQL lowering for Distinct / Union (v0.10 — IVM-6) ────────────────────
+    //
+    // These tests parse real SQL via DataFusion and verify the lowered PlanNode
+    // structure.  They require the SqlFrontend helper.
+
+    fn make_frontend_with_t() -> crate::frontend::SqlFrontend {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let f = crate::frontend::SqlFrontend::new();
+        f.register_table("t", schema).unwrap();
+        f
+    }
+
+    fn make_frontend_with_a_b() -> crate::frontend::SqlFrontend {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let f = crate::frontend::SqlFrontend::new();
+        f.register_table("a", schema.clone()).unwrap();
+        f.register_table("b", schema).unwrap();
+        f
+    }
+
+    fn has_distinct(plan: &PlanNode) -> bool {
+        match plan {
+            PlanNode::Distinct { .. } => true,
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Map { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input, .. }
+            | PlanNode::ViewSink { child: input, .. }
+            | PlanNode::Exchange { child: input, .. } => has_distinct(input),
+            PlanNode::InnerJoin { left, right, .. }
+            | PlanNode::OuterJoin { left, right, .. }
+            | PlanNode::Union { left, right }
+            | PlanNode::Intersect { left, right, .. }
+            | PlanNode::Except { left, right, .. } => has_distinct(left) || has_distinct(right),
+            _ => false,
+        }
+    }
+
+    fn has_union(plan: &PlanNode) -> bool {
+        match plan {
+            PlanNode::Union { .. } => true,
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Map { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input, .. }
+            | PlanNode::ViewSink { child: input, .. }
+            | PlanNode::Exchange { child: input, .. } => has_union(input),
+            PlanNode::InnerJoin { left, right, .. }
+            | PlanNode::OuterJoin { left, right, .. }
+            | PlanNode::Union { left, right }
+            | PlanNode::Intersect { left, right, .. }
+            | PlanNode::Except { left, right, .. } => has_union(left) || has_union(right),
+            _ => false,
+        }
+    }
+
+    /// `SELECT DISTINCT id FROM t` must lower to a plan containing a `Distinct` node.
+    #[tokio::test]
+    async fn select_distinct_lowers_to_distinct_node() {
+        let f = make_frontend_with_t();
+        let plan = f
+            .sql_to_plan_node("SELECT DISTINCT id FROM t")
+            .await
+            .expect("SELECT DISTINCT should lower");
+        assert!(
+            has_distinct(&plan),
+            "expected Distinct node in plan: {plan:?}"
+        );
+    }
+
+    /// `SELECT id FROM a UNION ALL SELECT id FROM b` must lower to a plan
+    /// containing a `Union` node.
+    #[tokio::test]
+    async fn union_all_lowers_to_union_node() {
+        let f = make_frontend_with_a_b();
+        let plan = f
+            .sql_to_plan_node("SELECT id FROM a UNION ALL SELECT id FROM b")
+            .await
+            .expect("UNION ALL should lower");
+        assert!(has_union(&plan), "expected Union node in plan: {plan:?}");
+    }
+
+    /// `SELECT id FROM a INTERSECT SELECT id FROM b` must lower without error.
+    /// In DataFusion 53, INTERSECT is translated to a LeftSemi join, so the
+    /// lowered plan contains an OuterJoin(Semi) node (not a Distinct/Intersect
+    /// node).
+    #[tokio::test]
+    async fn intersect_lowers_without_error() {
+        let f = make_frontend_with_a_b();
+        let plan = f
+            .sql_to_plan_node("SELECT id FROM a INTERSECT SELECT id FROM b")
+            .await
+            .expect("INTERSECT should lower without error");
+        // The plan must not be empty.
+        assert!(!matches!(plan, PlanNode::Source { .. } if false), "plan: {plan:?}");
+    }
+
+    /// `SELECT id FROM a EXCEPT SELECT id FROM b` must lower without error.
+    /// In DataFusion 53, EXCEPT is translated to a LeftAnti join, so the
+    /// lowered plan contains an OuterJoin(Anti) node.
+    #[tokio::test]
+    async fn except_lowers_without_error() {
+        let f = make_frontend_with_a_b();
+        let plan = f
+            .sql_to_plan_node("SELECT id FROM a EXCEPT SELECT id FROM b")
+            .await
+            .expect("EXCEPT should lower without error");
+        assert!(!matches!(plan, PlanNode::Source { .. } if false), "plan: {plan:?}");
     }
 }

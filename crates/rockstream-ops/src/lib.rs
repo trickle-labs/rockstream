@@ -15,6 +15,7 @@
 //! arrangement with cached extremum.  Crash-replay proved on LFS and MinIO.
 
 pub mod aggregate;
+pub mod distinct;
 pub mod embedded;
 pub mod error;
 pub mod expr;
@@ -34,6 +35,9 @@ pub mod task;
 pub mod zset;
 
 pub use aggregate::{load_frontier, persist_agg_state, persist_frontier, AggState, AggregateOp};
+pub use distinct::{
+    load_distinct_state, persist_distinct_state, DistinctOp, DualArrangement, ExceptOp, IntersectOp,
+};
 pub use error::OpError;
 pub use filter::FilterOp;
 pub use group_commit::{GroupCommit, GROUP_COMMIT_MAX_BATCHES};

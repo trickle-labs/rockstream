@@ -39,6 +39,7 @@
 //!   the true multiset extremum after every batch.
 
 pub mod aggregate_oracle;
+pub mod distinct_oracle;
 pub mod batch;
 pub mod filter_oracle;
 pub mod harness;

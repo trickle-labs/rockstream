@@ -231,6 +231,83 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
             )
         }
 
+        // Distinct (v0.10): full-row partitioning — hash of all output columns.
+        PlanNode::Distinct { input, arr_id } => {
+            let (new_input, _) = distribute(*input);
+            let needs_exchange = true; // always insert loopback in single-shard mode
+            let actual_input = if needs_exchange {
+                PlanNode::Exchange {
+                    kind: ExchangeKind::Loopback,
+                    child: Box::new(new_input),
+                }
+            } else {
+                new_input
+            };
+            (
+                PlanNode::Distinct {
+                    input: Box::new(actual_input),
+                    arr_id,
+                },
+                DistributionAnnotation::unpartitioned(),
+            )
+        }
+
+        // Intersect (v0.10): left and right must be co-located by full row hash.
+        PlanNode::Intersect {
+            left,
+            right,
+            all,
+            left_arr_id,
+            right_arr_id,
+        } => {
+            let (new_left, _) = distribute(*left);
+            let (new_right, _) = distribute(*right);
+            (
+                PlanNode::Intersect {
+                    left: Box::new(PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        child: Box::new(new_left),
+                    }),
+                    right: Box::new(PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        child: Box::new(new_right),
+                    }),
+                    all,
+                    left_arr_id,
+                    right_arr_id,
+                },
+                DistributionAnnotation::unpartitioned(),
+            )
+        }
+
+        // Except (v0.10): same as Intersect.
+        PlanNode::Except {
+            left,
+            right,
+            all,
+            left_arr_id,
+            right_arr_id,
+        } => {
+            let (new_left, _) = distribute(*left);
+            let (new_right, _) = distribute(*right);
+            (
+                PlanNode::Except {
+                    left: Box::new(PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        child: Box::new(new_left),
+                    }),
+                    right: Box::new(PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        child: Box::new(new_right),
+                    }),
+                    all,
+                    left_arr_id,
+                    right_arr_id,
+                },
+                DistributionAnnotation::unpartitioned(),
+            )
+        }
+
         // All other nodes pass through unchanged with unpartitioned annotation.
         other => (other, DistributionAnnotation::unpartitioned()),
     }
@@ -313,5 +390,74 @@ mod tests {
     fn distribution_annotation_by_columns() {
         let ann = DistributionAnnotation::by_columns(vec![0, 1]);
         assert_eq!(ann.partition_key, vec![0, 1]);
+    }
+
+    #[test]
+    fn distinct_inserts_loopback_exchange() {
+        use rockstream_types::ids::OperatorId;
+        let plan = PlanNode::Distinct {
+            input: Box::new(source("t")),
+            arr_id: OperatorId(0),
+        };
+        let result = apply_distribution(plan);
+        if let PlanNode::Distinct { input, .. } = &result {
+            assert!(
+                matches!(input.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                "expected Loopback before Distinct, got: {input:?}"
+            );
+        } else {
+            panic!("expected Distinct, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn intersect_inserts_loopback_on_both_sides() {
+        use rockstream_types::ids::OperatorId;
+        let plan = PlanNode::Intersect {
+            left: Box::new(source("l")),
+            right: Box::new(source("r")),
+            all: false,
+            left_arr_id: OperatorId(1),
+            right_arr_id: OperatorId(2),
+        };
+        let result = apply_distribution(plan);
+        if let PlanNode::Intersect { left, right, .. } = &result {
+            assert!(
+                matches!(left.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                "expected Loopback before Intersect left, got: {left:?}"
+            );
+            assert!(
+                matches!(right.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                "expected Loopback before Intersect right, got: {right:?}"
+            );
+        } else {
+            panic!("expected Intersect, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn except_inserts_loopback_on_both_sides() {
+        use rockstream_types::ids::OperatorId;
+        let plan = PlanNode::Except {
+            left: Box::new(source("l")),
+            right: Box::new(source("r")),
+            all: true,
+            left_arr_id: OperatorId(1),
+            right_arr_id: OperatorId(2),
+        };
+        let result = apply_distribution(plan);
+        if let PlanNode::Except { left, right, all, .. } = &result {
+            assert!(*all, "all flag preserved");
+            assert!(
+                matches!(left.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                "expected Loopback before Except left, got: {left:?}"
+            );
+            assert!(
+                matches!(right.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                "expected Loopback before Except right, got: {right:?}"
+            );
+        } else {
+            panic!("expected Except, got: {result:?}");
+        }
     }
 }

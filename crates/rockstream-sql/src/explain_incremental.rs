@@ -101,6 +101,32 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<String>) {
             lines.push(format!("{indent}✓ InnerJoin  dual_arrangement"));
         }
 
+        // v0.10: Distinct / Intersect / Except
+        PlanNode::Distinct { input, .. } => {
+            render_node(input, depth + 1, lines);
+            lines.push(format!(
+                "{indent}✓ Distinct  merge_law=WeightAdd/v1  zero_crossing"
+            ));
+        }
+
+        PlanNode::Intersect { left, right, all, .. } => {
+            render_node(left, depth + 1, lines);
+            render_node(right, depth + 1, lines);
+            let sem = if *all { "ALL" } else { "SET" };
+            lines.push(format!(
+                "{indent}✓ Intersect[{sem}]  dual_arrangement  min_weight"
+            ));
+        }
+
+        PlanNode::Except { left, right, all, .. } => {
+            render_node(left, depth + 1, lines);
+            render_node(right, depth + 1, lines);
+            let sem = if *all { "ALL" } else { "SET" };
+            lines.push(format!(
+                "{indent}✓ Except[{sem}]  dual_arrangement  subtract_weight"
+            ));
+        }
+
         other => {
             lines.push(format!("{indent}  {other:?}"));
         }
@@ -195,6 +221,54 @@ mod tests {
                 || !project_line.starts_with("  "),
             "project should be at depth 0: |{project_line}|"
         );
+    }
+
+    #[test]
+    fn explain_distinct_shows_zero_crossing() {
+        use rockstream_types::ids::OperatorId;
+        let plan = PlanNode::Distinct {
+            input: Box::new(PlanNode::Source {
+                name: "t".to_string(),
+            }),
+            arr_id: OperatorId(0),
+        };
+        let text = explain_incremental(&plan);
+        assert!(text.contains("Distinct"), "text: {text}");
+        assert!(text.contains("zero_crossing"), "text: {text}");
+        assert!(text.contains("WeightAdd/v1"), "text: {text}");
+        assert!(text.contains("✓"), "text: {text}");
+    }
+
+    #[test]
+    fn explain_intersect_set_shows_semantics() {
+        use rockstream_types::ids::OperatorId;
+        let plan = PlanNode::Intersect {
+            left: Box::new(PlanNode::Source { name: "l".to_string() }),
+            right: Box::new(PlanNode::Source { name: "r".to_string() }),
+            all: false,
+            left_arr_id: OperatorId(1),
+            right_arr_id: OperatorId(2),
+        };
+        let text = explain_incremental(&plan);
+        assert!(text.contains("Intersect[SET]"), "text: {text}");
+        assert!(text.contains("min_weight"), "text: {text}");
+        assert!(text.contains("✓"), "text: {text}");
+    }
+
+    #[test]
+    fn explain_except_all_shows_semantics() {
+        use rockstream_types::ids::OperatorId;
+        let plan = PlanNode::Except {
+            left: Box::new(PlanNode::Source { name: "l".to_string() }),
+            right: Box::new(PlanNode::Source { name: "r".to_string() }),
+            all: true,
+            left_arr_id: OperatorId(1),
+            right_arr_id: OperatorId(2),
+        };
+        let text = explain_incremental(&plan);
+        assert!(text.contains("Except[ALL]"), "text: {text}");
+        assert!(text.contains("subtract_weight"), "text: {text}");
+        assert!(text.contains("✓"), "text: {text}");
     }
 
     #[test]

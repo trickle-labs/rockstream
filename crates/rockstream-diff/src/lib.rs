@@ -223,6 +223,50 @@ impl DiffCtx {
                 Ok(id)
             }
 
+            // ── Distinct (v0.10 — IVM-6) ─────────────────────────────────
+            PlanNode::Distinct { input, .. } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Distinct,
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
+            // ── Intersect (v0.10 — IVM-6) ────────────────────────────────
+            PlanNode::Intersect { left, right, all, .. } => {
+                let left_id = self.diff_node(left, ops)?;
+                let right_id = self.diff_node(right, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Intersect { all: *all },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![left_id, right_id],
+                });
+                Ok(id)
+            }
+
+            // ── Except (v0.10 — IVM-6) ───────────────────────────────────
+            PlanNode::Except { left, right, all, .. } => {
+                let left_id = self.diff_node(left, ops)?;
+                let right_id = self.diff_node(right, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Except { all: *all },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![left_id, right_id],
+                });
+                Ok(id)
+            }
+
             // ── Not yet implemented in v0.5 ───────────────────────────────
             other => Err(DiffError::UnsupportedNode(format!("{other:?}"))),
         }
