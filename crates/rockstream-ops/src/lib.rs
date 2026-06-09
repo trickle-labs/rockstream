@@ -32,11 +32,15 @@ pub mod scheduler;
 pub mod sink;
 pub mod source;
 pub mod task;
+pub mod window;
 pub mod zset;
 
 pub use aggregate::{load_frontier, persist_agg_state, persist_frontier, AggState, AggregateOp};
 pub use distinct::{
     load_distinct_state, persist_distinct_state, DistinctOp, DualArrangement, ExceptOp, IntersectOp,
+};
+pub use window::{
+    load_window_state, persist_window_state, WindowOp, WINDOW_PARTITION_THRESHOLD,
 };
 pub use error::OpError;
 pub use filter::FilterOp;

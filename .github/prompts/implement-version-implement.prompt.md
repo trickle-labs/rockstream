@@ -30,6 +30,20 @@ and proof-claim → test mapping before writing any code.
 
 ---
 
+## Test Output: Summary Lines Only
+
+**After any `cargo test` run, extract only the summary — do not paste full passing
+test output into the conversation:**
+
+```bash
+rtk cargo test ... 2>&1 | grep -E "^test .* (ok|FAILED|ignored)|^test result:|^FAILED$|^error"
+```
+
+Show full output **only for FAILED tests**. Passing test noise balloons the cache
+and gets re-read on every subsequent turn, multiplying token costs 10–30×.
+
+---
+
 ## Phase 3: Implement (Test-first, in slices)
 
 Work one slice at a time. For each slice:

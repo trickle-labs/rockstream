@@ -25,8 +25,8 @@
 //! (the `AggState`): for each input delta `(k, v, w)`, the rule is:
 //! `Δagg(k) = (new_agg(k), +1) ⊎ (old_agg(k), -1)` when the state changes.
 
-use rockstream_plan::{OpKind, OpNode, PlanNode};
-use rockstream_types::ids::OperatorId;
+use rockstream_plan::{OpKind, OpNode, PlanNode, WindowFunc, WindowStrategy};
+use rockstream_types::{explain::NotMergeSafeReason, ids::OperatorId};
 
 /// Error returned by the differentiation pass.
 #[derive(Debug, thiserror::Error)]
@@ -267,6 +267,30 @@ impl DiffCtx {
                 Ok(id)
             }
 
+            // ── Window (v0.11 — IVM-7) ────────────────────────────────────────
+            PlanNode::Window { input, window_exprs } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                let strategy = if window_exprs.iter().any(|e| {
+                    matches!(
+                        e.func,
+                        WindowFunc::SlidingSum { .. } | WindowFunc::SlidingAvg { .. }
+                    )
+                }) {
+                    WindowStrategy::SlidingAggregate
+                } else {
+                    WindowStrategy::PartitionRecompute
+                };
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Window { strategy },
+                    merge_law: None,
+                    not_merge_safe_reason: Some(NotMergeSafeReason::PartitionRecomputation),
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
             // ── Not yet implemented in v0.5 ───────────────────────────────
             other => Err(DiffError::UnsupportedNode(format!("{other:?}"))),
         }
@@ -390,6 +414,61 @@ mod tests {
         let mut ctx = DiffCtx::new();
         let result = ctx.differentiate(&join);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn diff_window_emits_op_with_partition_recompute_reason() {
+        use rockstream_plan::{WindowExpr, WindowFunc, WindowStrategy};
+        use rockstream_types::explain::NotMergeSafeReason;
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::Window {
+            input: Box::new(src),
+            window_exprs: vec![WindowExpr {
+                func: WindowFunc::RowNumber,
+                partition_by: vec![0],
+                order_by: vec![1],
+            }],
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        let window_op = physical
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::Window { .. }))
+            .expect("Window op must be present");
+        assert_eq!(
+            window_op.kind,
+            OpKind::Window { strategy: WindowStrategy::PartitionRecompute }
+        );
+        assert_eq!(
+            window_op.not_merge_safe_reason,
+            Some(NotMergeSafeReason::PartitionRecomputation)
+        );
+    }
+
+    #[test]
+    fn diff_window_sliding_emits_sliding_aggregate_strategy() {
+        use rockstream_plan::{WindowExpr, WindowFunc, WindowStrategy};
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::Window {
+            input: Box::new(src),
+            window_exprs: vec![WindowExpr {
+                func: WindowFunc::SlidingSum { frame_rows: 3 },
+                partition_by: vec![0],
+                order_by: vec![1],
+            }],
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        let window_op = physical
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::Window { .. }))
+            .expect("Window op must be present");
+        assert_eq!(
+            window_op.kind,
+            OpKind::Window { strategy: WindowStrategy::SlidingAggregate }
+        );
     }
 
     #[test]

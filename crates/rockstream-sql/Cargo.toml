@@ -22,3 +22,4 @@ tracing = { workspace = true }
 rockstream-ops = { workspace = true }
 tempfile = { workspace = true }
 object_store = { workspace = true }
+hex = { workspace = true }

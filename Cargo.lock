@@ -3974,6 +3974,7 @@ version = "0.52.10"
 dependencies = [
  "arrow",
  "datafusion",
+ "hex",
  "object_store 0.12.5",
  "rockstream-ops",
  "rockstream-plan",

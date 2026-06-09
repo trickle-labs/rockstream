@@ -127,6 +127,14 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<String>) {
             ));
         }
 
+        // v0.11: Window (IVM-7)
+        PlanNode::Window { input, .. } => {
+            render_node(input, depth + 1, lines);
+            lines.push(format!(
+                "{indent}✗ Window[PartitionRecompute]  not_merge_safe_reason=partition_recomputation"
+            ));
+        }
+
         other => {
             lines.push(format!("{indent}  {other:?}"));
         }
@@ -269,6 +277,92 @@ mod tests {
         assert!(text.contains("Except[ALL]"), "text: {text}");
         assert!(text.contains("subtract_weight"), "text: {text}");
         assert!(text.contains("✓"), "text: {text}");
+    }
+
+    #[test]
+    fn explain_window_shows_partition_recompute() {
+        use rockstream_plan::WindowExpr;
+        let plan = PlanNode::Window {
+            input: Box::new(PlanNode::Source {
+                name: "t".to_string(),
+            }),
+            window_exprs: vec![WindowExpr {
+                func: rockstream_plan::WindowFunc::RowNumber,
+                partition_by: vec![0],
+                order_by: vec![1],
+            }],
+        };
+        let text = explain_incremental(&plan);
+        assert!(
+            text.contains("Window[PartitionRecompute]"),
+            "expected Window[PartitionRecompute]: {text}"
+        );
+        assert!(
+            text.contains("partition_recomputation"),
+            "expected partition_recomputation: {text}"
+        );
+    }
+
+    #[test]
+    fn explain_window_oversized_partition_fires_notice() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use rockstream_ops::window::{WindowOp, WINDOW_PARTITION_THRESHOLD};
+        use rockstream_ops::zset::ArrowZSet;
+        use rockstream_plan::WindowExpr;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("rn", DataType::Int64, false),
+        ]));
+        let op = WindowOp::new(
+            schema,
+            vec![WindowExpr {
+                func: rockstream_plan::WindowFunc::RowNumber,
+                partition_by: vec![],
+                order_by: vec![1],
+            }],
+        );
+
+        let n = WINDOW_PARTITION_THRESHOLD + 1;
+        let k_vals: Vec<i64> = vec![1; n];
+        let v_vals: Vec<i64> = (0..n as i64).collect();
+        let w_vals: Vec<i64> = vec![1; n];
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            input_schema,
+            vec![
+                Arc::new(Int64Array::from(k_vals)) as Arc<dyn arrow::array::Array>,
+                Arc::new(Int64Array::from(v_vals)) as Arc<dyn arrow::array::Array>,
+            ],
+        )
+        .unwrap();
+        op.process_epoch(ArrowZSet::new(data, w_vals), 1).unwrap();
+
+        let oversized = op.oversized_partition_keys();
+        assert!(
+            !oversized.is_empty(),
+            "expected at least one oversized partition"
+        );
+
+        // Build the NOTICE string.
+        let key_hex = hex::encode(&oversized[0]);
+        let notice = format!(
+            "NOTICE RS-5023: Window partition {} has {} rows (threshold: {})",
+            key_hex,
+            n,
+            WINDOW_PARTITION_THRESHOLD
+        );
+        assert!(
+            notice.contains("RS-5023"),
+            "RS-5023 NOTICE: {notice}"
+        );
     }
 
     #[test]

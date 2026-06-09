@@ -137,7 +137,7 @@ pub enum PlanNode {
         left_arr_id: OperatorId,
         right_arr_id: OperatorId,
     },
-    /// Window functions (v0.19).
+    /// Window functions (v0.11 — IVM-7).
     Window {
         input: Box<PlanNode>,
         window_exprs: Vec<WindowExpr>,
@@ -526,7 +526,7 @@ pub struct UdafSpec {
     pub description: String,
 }
 
-/// A window function expression (v0.19).
+/// A window function expression (v0.11 — IVM-7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowExpr {
     pub func: WindowFunc,
@@ -534,7 +534,7 @@ pub struct WindowExpr {
     pub order_by: Vec<usize>,
 }
 
-/// Window functions supported in v0.19.
+/// Window functions supported in v0.11 (IVM-7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowFunc {
     RowNumber,
@@ -547,7 +547,7 @@ pub enum WindowFunc {
     SlidingAvg { frame_rows: usize },
 }
 
-/// Window operator IVM strategy (v0.19).
+/// Window operator IVM strategy (v0.11 — IVM-7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowStrategy {
     PartitionRecompute,
@@ -605,7 +605,7 @@ pub enum OpKind {
     Except { all: bool },
     /// Emit to output sink.
     Sink { name: String },
-    /// Window function operator (v0.19).
+    /// Window function operator (v0.11 — IVM-7).
     Window { strategy: WindowStrategy },
     /// Tumbling time-window operator (v0.20).
     ///

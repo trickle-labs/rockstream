@@ -27,13 +27,16 @@ use datafusion::common::DFSchema;
 #[allow(unused_imports)]
 use datafusion::logical_expr::expr::AggregateFunctionParams;
 use datafusion::logical_expr::{
-    expr::AggregateFunction, BinaryExpr, Distinct, JoinType, LogicalPlan, Operator as DfOp,
+    expr::{AggregateFunction, WindowFunction},
+    BinaryExpr, Distinct, JoinType, LogicalPlan, Operator as DfOp,
+    WindowFunctionDefinition, WindowFrameBound, WindowFrameUnits,
 };
 use datafusion::prelude::Expr as DfExpr;
 use datafusion::scalar::ScalarValue;
 
 use rockstream_plan::{
     AggregateExpr, AggregateFunc, BinaryOp, Expr, JoinSemantics, OuterJoinKind, PlanNode,
+    WindowExpr, WindowFunc,
 };
 use std::hash::{Hash, Hasher};
 use rockstream_types::ids::OperatorId;
@@ -258,9 +261,142 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
             Ok(acc)
         }
 
+        // Window functions (v0.11 — IVM-7).
+        LogicalPlan::Window(w) => {
+            let input_node = lower(&w.input)?;
+            let input_schema = w.input.schema();
+            let window_exprs = w
+                .window_expr
+                .iter()
+                .map(|e| lower_window_expr(e, input_schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PlanNode::Window {
+                input: Box::new(input_node),
+                window_exprs,
+            })
+        }
+
         other => Err(SqlError::UnsupportedPlanNode {
             node_type: plan_node_name(other).to_string(),
         }),
+    }
+}
+
+// ─── Window expression lowering ──────────────────────────────────────────────
+
+/// Lower a DataFusion window expression to a `WindowExpr`.
+///
+/// `schema` is the INPUT schema (not the output schema of the Window node).
+fn lower_window_expr(expr: &DfExpr, schema: &datafusion::common::DFSchema) -> Result<WindowExpr, SqlError> {
+    let wf: &WindowFunction = match expr {
+        DfExpr::WindowFunction(wf) => wf.as_ref(),
+        other => {
+            return Err(SqlError::UnsupportedPlanNode {
+                node_type: format!("window_expr:{}", expr_name(other)),
+            });
+        }
+    };
+
+    let partition_by = wf
+        .params
+        .partition_by
+        .iter()
+        .filter_map(|e| {
+            if let DfExpr::Column(col) = e {
+                schema.index_of_column(col).ok()
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<usize>>();
+
+    let order_by = wf
+        .params
+        .order_by
+        .iter()
+        .filter_map(|sort| {
+            if let DfExpr::Column(col) = &sort.expr {
+                schema.index_of_column(col).ok()
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<usize>>();
+
+    let func = lower_window_func(wf, schema, &order_by)?;
+    Ok(WindowExpr { func, partition_by, order_by })
+}
+
+fn lower_window_func(
+    wf: &WindowFunction,
+    schema: &datafusion::common::DFSchema,
+    order_by: &[usize],
+) -> Result<WindowFunc, SqlError> {
+    match &wf.fun {
+        WindowFunctionDefinition::WindowUDF(udwf) => {
+            match udwf.name() {
+                "row_number" => Ok(WindowFunc::RowNumber),
+                "rank" => Ok(WindowFunc::Rank),
+                "dense_rank" => Ok(WindowFunc::DenseRank),
+                "lag" => {
+                    let offset = extract_lag_lead_offset(&wf.params.args, 1)?;
+                    Ok(WindowFunc::Lag { offset })
+                }
+                "lead" => {
+                    let offset = extract_lag_lead_offset(&wf.params.args, 1)?;
+                    Ok(WindowFunc::Lead { offset })
+                }
+                "ntile" => Err(SqlError::UnsupportedWindowFunction {
+                    fn_name: "NTILE".to_string(),
+                }),
+                name => Err(SqlError::UnsupportedWindowFunction {
+                    fn_name: name.to_uppercase(),
+                }),
+            }
+        }
+        WindowFunctionDefinition::AggregateUDF(udaf) => {
+            let frame = &wf.params.window_frame;
+            if frame.units != WindowFrameUnits::Rows {
+                return Err(SqlError::UnsupportedWindowFunction {
+                    fn_name: format!("{}_OVER_NON_ROWS_FRAME", udaf.name().to_uppercase()),
+                });
+            }
+            let frame_rows = match &frame.start_bound {
+                WindowFrameBound::Preceding(ScalarValue::UInt64(Some(n))) => *n as usize + 1,
+                WindowFrameBound::Preceding(ScalarValue::Int64(Some(n))) => *n as usize + 1,
+                WindowFrameBound::Preceding(_) => {
+                    // Unbounded preceding or other scalar — use whole partition.
+                    let _ = order_by;
+                    return Err(SqlError::UnsupportedWindowFunction {
+                        fn_name: format!("{}_UNBOUNDED_PRECEDING", udaf.name().to_uppercase()),
+                    });
+                }
+                _ => return Err(SqlError::UnsupportedWindowFunction {
+                    fn_name: format!("{}_FRAME", udaf.name().to_uppercase()),
+                }),
+            };
+            match udaf.name() {
+                "sum" | "SUM" => Ok(WindowFunc::SlidingSum { frame_rows }),
+                "avg" | "AVG" | "mean" => Ok(WindowFunc::SlidingAvg { frame_rows }),
+                name => Err(SqlError::UnsupportedWindowFunction {
+                    fn_name: name.to_uppercase(),
+                }),
+            }
+        }
+    }
+}
+
+/// Extract offset from LAG/LEAD args (args[1] is the offset literal).
+fn extract_lag_lead_offset(args: &[DfExpr], default: usize) -> Result<usize, SqlError> {
+    if args.len() < 2 {
+        return Ok(default);
+    }
+    match &args[1] {
+        DfExpr::Literal(ScalarValue::Int64(Some(n)), _) => Ok(*n as usize),
+        DfExpr::Literal(ScalarValue::Int32(Some(n)), _) => Ok(*n as usize),
+        DfExpr::Literal(ScalarValue::UInt64(Some(n)), _) => Ok(*n as usize),
+        DfExpr::Literal(ScalarValue::Null, _) => Ok(default),
+        _ => Ok(default),
     }
 }
 
@@ -829,5 +965,165 @@ mod tests {
             .await
             .expect("EXCEPT should lower without error");
         assert!(!matches!(plan, PlanNode::Source { .. } if false), "plan: {plan:?}");
+    }
+
+    // ─── Window lowering tests (v0.11 — IVM-7) ───────────────────────────────
+
+    fn make_frontend_kv() -> crate::frontend::SqlFrontend {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let f = crate::frontend::SqlFrontend::new();
+        f.register_table("t", schema).unwrap();
+        f
+    }
+
+    fn has_window(plan: &PlanNode) -> bool {
+        match plan {
+            PlanNode::Window { .. } => true,
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Map { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input, .. }
+            | PlanNode::Window { input, .. } => has_window(input),
+            PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => {
+                has_window(child)
+            }
+            PlanNode::InnerJoin { left, right, .. }
+            | PlanNode::OuterJoin { left, right, .. }
+            | PlanNode::Union { left, right }
+            | PlanNode::Intersect { left, right, .. }
+            | PlanNode::Except { left, right, .. } => has_window(left) || has_window(right),
+            _ => false,
+        }
+    }
+
+    fn find_window_exprs(plan: &PlanNode) -> Option<Vec<rockstream_plan::WindowExpr>> {
+        match plan {
+            PlanNode::Window { window_exprs, .. } => Some(window_exprs.clone()),
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Map { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input, .. }
+            | PlanNode::Window { input, .. } => find_window_exprs(input),
+            PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => {
+                find_window_exprs(child)
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn lower_window_row_number() {
+        let f = make_frontend_kv();
+        let plan = f
+            .sql_to_plan_node(
+                "SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn FROM t",
+            )
+            .await
+            .expect("ROW_NUMBER window should lower");
+        assert!(has_window(&plan), "expected Window node: {plan:?}");
+        let exprs = find_window_exprs(&plan).unwrap();
+        assert!(!exprs.is_empty());
+        assert!(
+            matches!(exprs[0].func, rockstream_plan::WindowFunc::RowNumber),
+            "expected RowNumber, got: {:?}",
+            exprs[0].func
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_window_rank() {
+        let f = make_frontend_kv();
+        let plan = f
+            .sql_to_plan_node("SELECT k, v, RANK() OVER (PARTITION BY k ORDER BY v) AS r FROM t")
+            .await
+            .expect("RANK window should lower");
+        assert!(has_window(&plan));
+        let exprs = find_window_exprs(&plan).unwrap();
+        assert!(matches!(exprs[0].func, rockstream_plan::WindowFunc::Rank));
+    }
+
+    #[tokio::test]
+    async fn lower_window_dense_rank() {
+        let f = make_frontend_kv();
+        let plan = f
+            .sql_to_plan_node(
+                "SELECT k, v, DENSE_RANK() OVER (PARTITION BY k ORDER BY v) AS dr FROM t",
+            )
+            .await
+            .expect("DENSE_RANK window should lower");
+        assert!(has_window(&plan));
+        let exprs = find_window_exprs(&plan).unwrap();
+        assert!(matches!(exprs[0].func, rockstream_plan::WindowFunc::DenseRank));
+    }
+
+    #[tokio::test]
+    async fn lower_window_lag() {
+        let f = make_frontend_kv();
+        let plan = f
+            .sql_to_plan_node("SELECT k, v, LAG(v, 1) OVER (PARTITION BY k ORDER BY v) AS l FROM t")
+            .await
+            .expect("LAG window should lower");
+        assert!(has_window(&plan));
+        let exprs = find_window_exprs(&plan).unwrap();
+        assert!(
+            matches!(exprs[0].func, rockstream_plan::WindowFunc::Lag { offset: 1 }),
+            "expected Lag{{offset:1}}, got {:?}",
+            exprs[0].func
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_window_lead() {
+        let f = make_frontend_kv();
+        let plan = f
+            .sql_to_plan_node("SELECT k, v, LEAD(v, 1) OVER (PARTITION BY k ORDER BY v) AS l FROM t")
+            .await
+            .expect("LEAD window should lower");
+        assert!(has_window(&plan));
+        let exprs = find_window_exprs(&plan).unwrap();
+        assert!(
+            matches!(exprs[0].func, rockstream_plan::WindowFunc::Lead { offset: 1 }),
+            "expected Lead{{offset:1}}, got {:?}",
+            exprs[0].func
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_window_sliding_sum() {
+        let f = make_frontend_kv();
+        let plan = f
+            .sql_to_plan_node(
+                "SELECT k, v, SUM(v) OVER (PARTITION BY k ORDER BY v ROWS 2 PRECEDING) AS s FROM t",
+            )
+            .await
+            .expect("SUM OVER ROWS window should lower");
+        assert!(has_window(&plan));
+        let exprs = find_window_exprs(&plan).unwrap();
+        assert!(
+            matches!(exprs[0].func, rockstream_plan::WindowFunc::SlidingSum { frame_rows: 3 }),
+            "expected SlidingSum{{frame_rows:3}}, got {:?}",
+            exprs[0].func
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_window_unsupported_returns_error() {
+        let f = make_frontend_kv();
+        // NTILE is not supported in v0.11 — should return RS-1016 error.
+        let result = f
+            .sql_to_plan_node("SELECT k, v, NTILE(4) OVER (ORDER BY v) AS bucket FROM t")
+            .await;
+        assert!(result.is_err(), "NTILE should return an error");
+        let err = result.unwrap_err();
+        let err_str = format!("{err}");
+        assert!(
+            err_str.contains("RS-1016") || err_str.contains("1016"),
+            "expected RS-1016 error, got: {err_str}"
+        );
     }
 }

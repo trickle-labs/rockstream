@@ -26,7 +26,7 @@
 //! In v0.7 "partitioned by X" always maps to a single Loopback exchange
 //! because there is only one shard.
 
-use rockstream_plan::{ExchangeKind, PlanNode};
+use rockstream_plan::{ExchangeKind, PlanNode, WindowExpr, WindowFunc};
 
 /// Annotation produced by the distribution pass for a single node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +308,23 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
             )
         }
 
+        // Window (v0.11): requires hash-partitioned input by partition_by columns.
+        // In single-shard mode, always insert a Loopback exchange on the input.
+        PlanNode::Window { input, window_exprs } => {
+            let (new_input, _) = distribute(*input);
+            let actual_input = PlanNode::Exchange {
+                kind: ExchangeKind::Loopback,
+                child: Box::new(new_input),
+            };
+            (
+                PlanNode::Window {
+                    input: Box::new(actual_input),
+                    window_exprs,
+                },
+                DistributionAnnotation::unpartitioned(),
+            )
+        }
+
         // All other nodes pass through unchanged with unpartitioned annotation.
         other => (other, DistributionAnnotation::unpartitioned()),
     }
@@ -432,6 +449,33 @@ mod tests {
             );
         } else {
             panic!("expected Intersect, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn window_inserts_loopback_exchange() {
+        let plan = PlanNode::Window {
+            input: Box::new(source("t")),
+            window_exprs: vec![WindowExpr {
+                func: WindowFunc::RowNumber,
+                partition_by: vec![0],
+                order_by: vec![1],
+            }],
+        };
+        let result = apply_distribution(plan);
+        if let PlanNode::Window { input, .. } = &result {
+            assert!(
+                matches!(
+                    input.as_ref(),
+                    PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        ..
+                    }
+                ),
+                "expected Loopback exchange before Window, got: {input:?}"
+            );
+        } else {
+            panic!("expected Window, got: {result:?}");
         }
     }
 

@@ -45,6 +45,9 @@ pub const MINMAX_DISCRIMINATOR: u8 = 0x4D; // 'M'
 /// Distinct arrangement discriminator bytes (v0.10 — IVM-6): ASCII 'D', 'S'.
 pub const DISTINCT_DISCRIMINATOR: [u8; 2] = [0x44, 0x53];
 
+/// Window arrangement discriminator bytes (v0.11 — IVM-7): ASCII 'W', 'N'.
+pub const WINDOW_DISCRIMINATOR: [u8; 2] = [0x57, 0x4E];
+
 /// Left/right side discriminator for join arrangements (v0.8 — IVM-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinSide {
@@ -84,6 +87,21 @@ pub fn minmax_sort_key_decode(sort_key: [u8; 8], invert: bool) -> i64 {
     let raw = u64::from_be_bytes(sort_key);
     let xored = if invert { !raw } else { raw };
     (xored ^ 0x8000_0000_0000_0000_u64) as i64
+}
+
+/// Encode an i64 sort key for window ordering.
+///
+/// XORs with `0x8000_0000_0000_0000` so that lexicographic byte order matches
+/// signed integer order: most-negative value → smallest bytes, most-positive
+/// value → largest bytes.  A prefix scan over `[OpState][WN][op_id][part_key]`
+/// returns rows in ascending order_key order.
+pub fn window_sort_key(v: i64) -> [u8; 8] {
+    ((v as u64) ^ 0x8000_0000_0000_0000_u64).to_be_bytes()
+}
+
+/// Decode a value from a window sort key (inverse of [`window_sort_key`]).
+pub fn window_sort_key_decode(sort_key: [u8; 8]) -> i64 {
+    (u64::from_be_bytes(sort_key) ^ 0x8000_0000_0000_0000_u64) as i64
 }
 
 /// Encoder for shard-local keys.
@@ -278,6 +296,76 @@ impl ShardKeyEncoder {
         key
     }
 
+    // ─── Window arrangement keys (IVM-7) ────────────────────────────────────
+
+    /// Encode a Window input arrangement entry key.
+    ///
+    /// Format: `[0x01 (OpState)][0x57 0x4E ('WN')][op_id:8][part_key][order_key][row_id:16]`
+    pub fn window_arr_key(
+        op_id: u64,
+        part_key: &[u8],
+        order_key: &[u8],
+        row_id: u128,
+    ) -> Vec<u8> {
+        let mut key =
+            Vec::with_capacity(1 + 2 + 8 + part_key.len() + order_key.len() + 16);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.extend_from_slice(&WINDOW_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(part_key);
+        key.extend_from_slice(order_key);
+        key.extend_from_slice(&row_id.to_be_bytes());
+        key
+    }
+
+    /// Prefix for scanning all input arrangement rows for one partition.
+    ///
+    /// Format: `[0x01][WN][op_id:8][part_key]`
+    pub fn window_arr_partition_prefix(op_id: u64, part_key: &[u8]) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(1 + 2 + 8 + part_key.len());
+        prefix.push(ShardPrefix::OpState.as_byte());
+        prefix.extend_from_slice(&WINDOW_DISCRIMINATOR);
+        prefix.extend_from_slice(&op_id.to_be_bytes());
+        prefix.extend_from_slice(part_key);
+        prefix
+    }
+
+    /// Prefix for scanning all input arrangement rows for one operator.
+    ///
+    /// Format: `[0x01][WN][op_id:8]`
+    pub fn window_arr_op_prefix(op_id: u64) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(1 + 2 + 8);
+        prefix.push(ShardPrefix::OpState.as_byte());
+        prefix.extend_from_slice(&WINDOW_DISCRIMINATOR);
+        prefix.extend_from_slice(&op_id.to_be_bytes());
+        prefix
+    }
+
+    /// Encode a Window output cache entry key.
+    ///
+    /// Format: `[0x02 (OpIndex)][WN][op_id:8][part_key][row_hash:16]`
+    pub fn window_prev_output_key(op_id: u64, part_key: &[u8], row_hash: u128) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 8 + part_key.len() + 16);
+        key.push(ShardPrefix::OpIndex.as_byte());
+        key.extend_from_slice(&WINDOW_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(part_key);
+        key.extend_from_slice(&row_hash.to_be_bytes());
+        key
+    }
+
+    /// Prefix for scanning all output cache entries for one partition.
+    ///
+    /// Format: `[0x02][WN][op_id:8][part_key]`
+    pub fn window_prev_output_partition_prefix(op_id: u64, part_key: &[u8]) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(1 + 2 + 8 + part_key.len());
+        prefix.push(ShardPrefix::OpIndex.as_byte());
+        prefix.extend_from_slice(&WINDOW_DISCRIMINATOR);
+        prefix.extend_from_slice(&op_id.to_be_bytes());
+        prefix.extend_from_slice(part_key);
+        prefix
+    }
+
     /// Decode an idempotency key.
     /// Returns (shard_id, key_hash) if it is a valid idempotency key.
     pub fn decode_idempotency_key(key: &[u8]) -> Option<(u32, [u8; 16])> {
@@ -461,6 +549,44 @@ mod tests {
         let k100 = ShardKeyEncoder::epoch_key(100);
         assert!(k1 < k2);
         assert!(k2 < k100);
+    }
+
+    #[test]
+    fn window_key_ordering_within_partition_preserves_order() {
+        let op_id = 7u64;
+        let part_key = b"pk1";
+
+        // Two rows in the same partition, different order_key values.
+        // Row A: order_key = -5 (negative), Row B: order_key = 42 (positive).
+        // Signed order: -5 < 42, so key_a < key_b lexicographically.
+        let order_key_a = window_sort_key(-5);
+        let order_key_b = window_sort_key(42);
+
+        let key_a = ShardKeyEncoder::window_arr_key(op_id, part_key, &order_key_a, 1);
+        let key_b = ShardKeyEncoder::window_arr_key(op_id, part_key, &order_key_b, 2);
+
+        assert!(
+            key_a < key_b,
+            "key for order_key=-5 must sort before key for order_key=42"
+        );
+
+        // Also verify sort key ordering for positive values.
+        let sk_low = window_sort_key(1);
+        let sk_mid = window_sort_key(100);
+        let sk_high = window_sort_key(i64::MAX);
+        assert!(sk_low < sk_mid);
+        assert!(sk_mid < sk_high);
+
+        // And negative ordering.
+        let sk_neg_large = window_sort_key(i64::MIN);
+        let sk_neg_small = window_sort_key(-1);
+        assert!(sk_neg_large < sk_neg_small);
+        assert!(sk_neg_small < sk_low);
+
+        // Partition prefix is a proper prefix of arr key.
+        let prefix = ShardKeyEncoder::window_arr_partition_prefix(op_id, part_key);
+        assert!(key_a.starts_with(&prefix));
+        assert!(key_b.starts_with(&prefix));
     }
 
     #[test]

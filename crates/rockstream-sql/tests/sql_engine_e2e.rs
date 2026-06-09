@@ -28,6 +28,7 @@ use rockstream_ops::aggregate::AggregateOp;
 use rockstream_ops::join::JoinOp;
 use rockstream_ops::op::Operator;
 use rockstream_ops::project::{NamedExpr, ProjectOp};
+use rockstream_ops::window::WindowOp;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_plan;
 use rockstream_sql::catalog::{ColumnDef, SchemaCatalog};
@@ -419,4 +420,178 @@ async fn sql_engine_create_view_join_group_by() {
         .close()
         .await
         .unwrap();
+}
+
+// ─── v0.11 Window e2e test ────────────────────────────────────────────────────
+
+/// SQL Engine e2e milestone test for window functions (v0.11 — IVM-7).
+///
+/// Proves:
+/// 1. SQL `SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) as rn FROM t`
+///    lowers to a `PlanNode::Window` containing `WindowFunc::RowNumber`.
+/// 2. Processing incremental deltas through `WindowOp` accumulates to the correct
+///    net state at every epoch boundary (verified against an in-process oracle).
+#[tokio::test]
+async fn sql_engine_window_row_number_over_view() {
+    use std::collections::HashMap;
+    use arrow::array::ArrayRef;
+    use rockstream_plan::PlanNode;
+
+    // Set up SqlFrontend with table t(k INT, v INT).
+    let t_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let frontend = SqlFrontend::new();
+    frontend.register_table("t", t_schema.clone()).unwrap();
+
+    // Lower the window SQL.
+    let sql = "SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn FROM t";
+    let plan = frontend
+        .sql_to_plan_node(sql)
+        .await
+        .expect("window SQL should lower without error");
+
+    // Verify the plan contains a Window node.
+    fn has_window(plan: &PlanNode) -> bool {
+        match plan {
+            PlanNode::Window { .. } => true,
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Map { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input, .. }
+            | PlanNode::Window { input, .. } => has_window(input),
+            PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => has_window(child),
+            PlanNode::InnerJoin { left, right, .. }
+            | PlanNode::OuterJoin { left, right, .. }
+            | PlanNode::Union { left, right }
+            | PlanNode::Intersect { left, right, .. }
+            | PlanNode::Except { left, right, .. } => has_window(left) || has_window(right),
+            _ => false,
+        }
+    }
+    assert!(has_window(&plan), "plan must contain Window node: {plan:?}");
+
+    // Set up WindowOp directly: partition by k (col 0), order by v (col 1).
+    let out_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+        Field::new("rn", DataType::Int64, false),
+    ]));
+    let rn_expr = rockstream_plan::WindowExpr {
+        func: rockstream_plan::WindowFunc::RowNumber,
+        partition_by: vec![0],
+        order_by: vec![1],
+    };
+    let op = WindowOp::new(out_schema, vec![rn_expr]);
+
+    // Helper to make input ZSet from (k, v, weight) tuples.
+    fn make_t(rows: &[(i64, i64, i64)]) -> ArrowZSet {
+        let k: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let v: Vec<i64> = rows.iter().map(|r| r.1).collect();
+        let w: Vec<i64> = rows.iter().map(|r| r.2).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(k)) as ArrayRef,
+                Arc::new(Int64Array::from(v)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        ArrowZSet::new(data, w)
+    }
+
+    // Accumulate output ZSet deltas.
+    let mut output_state: HashMap<(i64, i64, i64), i64> = HashMap::new();
+
+    fn acc_out(state: &mut HashMap<(i64, i64, i64), i64>, zset: &ArrowZSet) {
+        if zset.is_empty() {
+            return;
+        }
+        let k_col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let v_col = zset.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let r_col = zset.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..zset.num_rows() {
+            let key = (k_col.value(i), v_col.value(i), r_col.value(i));
+            *state.entry(key).or_insert(0) += zset.weights[i];
+        }
+    }
+
+    fn live_rows(state: &HashMap<(i64, i64, i64), i64>) -> Vec<(i64, i64, i64)> {
+        let mut rows: Vec<(i64, i64, i64)> = state
+            .iter()
+            .filter(|(_, &w)| w > 0)
+            .map(|(&r, _)| r)
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    // Batch oracle: compute ROW_NUMBER from accumulated state.
+    let mut input_acc: std::collections::BTreeMap<(i64, i64), i64> = Default::default();
+
+    fn batch_rn(acc: &std::collections::BTreeMap<(i64, i64), i64>) -> Vec<(i64, i64, i64)> {
+        use std::collections::HashMap;
+        let mut parts: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (&(k, v), &w) in acc {
+            if w > 0 {
+                parts.entry(k).or_default().push(v);
+            }
+        }
+        let mut out = vec![];
+        for (k, mut vs) in parts {
+            vs.sort();
+            for (i, v) in vs.iter().enumerate() {
+                out.push((k, *v, (i + 1) as i64));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn acc_input(acc: &mut std::collections::BTreeMap<(i64, i64), i64>, rows: &[(i64, i64, i64)]) {
+        for &(k, v, w) in rows {
+            let entry = acc.entry((k, v)).or_insert(0);
+            *entry += w;
+            if *entry == 0 {
+                acc.remove(&(k, v));
+            }
+        }
+    }
+
+    // Epoch 1: insert (1,10), (1,20), (2,30).
+    let e1_rows = [(1i64, 10i64, 1i64), (1, 20, 1), (2, 30, 1)];
+    acc_input(&mut input_acc, &e1_rows);
+    let out1 = op.process_epoch(make_t(&e1_rows), 1).unwrap();
+    acc_out(&mut output_state, &out1);
+    assert_eq!(live_rows(&output_state), batch_rn(&input_acc), "epoch 1 mismatch");
+
+    // Epoch 2: insert (1,15), (2,25); delete (1,20).
+    let e2_rows = [(1, 15, 1), (2, 25, 1), (1, 20, -1)];
+    acc_input(&mut input_acc, &e2_rows);
+    let out2 = op.process_epoch(make_t(&e2_rows), 2).unwrap();
+    acc_out(&mut output_state, &out2);
+    assert_eq!(live_rows(&output_state), batch_rn(&input_acc), "epoch 2 mismatch");
+
+    // Epoch 3: insert (1,5).
+    let e3_rows = [(1, 5, 1)];
+    acc_input(&mut input_acc, &e3_rows);
+    let out3 = op.process_epoch(make_t(&e3_rows), 3).unwrap();
+    acc_out(&mut output_state, &out3);
+    assert_eq!(live_rows(&output_state), batch_rn(&input_acc), "epoch 3 mismatch");
+
+    // Verify specific values at end of epoch 3:
+    // k=1: v=5,10,15 with rn=1,2,3; k=2: v=25,30 with rn=1,2.
+    let final_state = live_rows(&output_state);
+    assert!(final_state.contains(&(1, 5, 1)));
+    assert!(final_state.contains(&(1, 10, 2)));
+    assert!(final_state.contains(&(1, 15, 3)));
+    assert!(final_state.contains(&(2, 25, 1)));
+    assert!(final_state.contains(&(2, 30, 2)));
+    assert_eq!(final_state.len(), 5);
 }
