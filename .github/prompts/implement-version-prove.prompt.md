@@ -13,9 +13,6 @@ test mapping before running any proofs.
 ## ⚡ Ground Rules (non-negotiable)
 
 - Prefix every shell command with `rtk` (e.g. `rtk cargo test`, `rtk git status`).
-- Never use HEREDOC. For multi-line commit/PR/sign-off bodies, write a temp file
-  and use `git commit -F` / `--body-file`; then re-read it to confirm it is not
-  garbled.
 - Do not weaken, skip (`#[ignore]`), or delete tests to make a build pass. Do not
   use `--no-verify`. Fix the root cause.
 - **Nothing may be deferred to a later version.**

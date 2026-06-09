@@ -13,9 +13,6 @@ table before writing the sign-off.
 ## ⚡ Ground Rules (non-negotiable)
 
 - Prefix every shell command with `rtk` (e.g. `rtk cargo test`, `rtk git status`).
-- Never use HEREDOC. For multi-line commit/PR/sign-off bodies, write a temp file
-  and use `git commit -F` / `--body-file`; then re-read it to confirm it is not
-  garbled.
 - **Nothing may be deferred to a later version.** If anything remains incomplete,
   the version is not done.
 

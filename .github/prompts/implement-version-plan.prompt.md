@@ -12,9 +12,6 @@ obligations agreed. Start by reading the `${input:version}` row from
 ## ⚡ Ground Rules (non-negotiable)
 
 - Prefix every shell command with `rtk` (e.g. `rtk cargo test`, `rtk git status`).
-- Never use HEREDOC. For multi-line commit/PR/sign-off bodies, write a temp file
-  and use `git commit -F` / `--body-file`; then re-read it to confirm it is not
-  garbled.
 - One binary, one CLI, one config: every role is a flag on the same `rockstream`
   binary. `main` must remain runnable through it at the end of this version.
 - No code path may depend on SlateDB range deletion. Cleanup is scan-and-delete
