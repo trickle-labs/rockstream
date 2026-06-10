@@ -53,26 +53,41 @@ fn make_input(rows: &[(i64, i64, i64)]) -> ArrowZSet {
     ArrowZSet::new(data, w)
 }
 
-fn accumulate(
-    state: &mut std::collections::HashMap<(i64, i64, i64), i64>,
-    zset: &ArrowZSet,
-) {
+fn accumulate(state: &mut std::collections::HashMap<(i64, i64, i64), i64>, zset: &ArrowZSet) {
     if zset.is_empty() {
         return;
     }
-    let wid_col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let t_col = zset.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let v_col = zset.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+    let wid_col = zset
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let t_col = zset
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let v_col = zset
+        .data
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     for i in 0..zset.num_rows() {
-        *state.entry((wid_col.value(i), t_col.value(i), v_col.value(i))).or_insert(0) +=
-            zset.weights[i];
+        *state
+            .entry((wid_col.value(i), t_col.value(i), v_col.value(i)))
+            .or_insert(0) += zset.weights[i];
     }
 }
 
-fn live_rows(
-    state: &std::collections::HashMap<(i64, i64, i64), i64>,
-) -> Vec<(i64, i64, i64)> {
-    let mut rows: Vec<_> = state.iter().filter(|(_, &w)| w > 0).map(|(&k, _)| k).collect();
+fn live_rows(state: &std::collections::HashMap<(i64, i64, i64), i64>) -> Vec<(i64, i64, i64)> {
+    let mut rows: Vec<_> = state
+        .iter()
+        .filter(|(_, &w)| w > 0)
+        .map(|(&k, _)| k)
+        .collect();
     rows.sort();
     rows
 }
@@ -97,18 +112,27 @@ async fn lfs_tumble_window_state_persists() {
         let op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
 
         // Epoch 1: rows in window [0, 1000).
-        let out1 = op.process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1).unwrap();
+        let out1 = op
+            .process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1)
+            .unwrap();
         accumulate(&mut net_state, &out1);
 
         // Epoch 2: rows in window [1000, 2000).
-        let out2 = op.process_epoch(make_input(&[(1100, 30, 1), (1800, 40, 1)]), 2).unwrap();
+        let out2 = op
+            .process_epoch(make_input(&[(1100, 30, 1), (1800, 40, 1)]), 2)
+            .unwrap();
         accumulate(&mut net_state, &out2);
 
         assert_eq!(op.fill_level(), 4, "4 rows in arrangement after epoch 2");
 
         persist_tumble_window_state(&db, &op, op_id).await.unwrap();
         db.flush().await.unwrap();
-        Arc::try_unwrap(db).ok().expect("single owner").close().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
     }
 
     // ── Epoch 3: reopen, load, verify fill level ─────────────────────────
@@ -132,9 +156,17 @@ async fn lfs_tumble_window_state_persists() {
         accumulate(&mut net_state, &out3);
 
         let live = live_rows(&net_state);
-        assert!(live.contains(&(1000, 1900, 50)), "epoch 3 row (1000, 1900, 50) present");
+        assert!(
+            live.contains(&(1000, 1900, 50)),
+            "epoch 3 row (1000, 1900, 50) present"
+        );
 
-        Arc::try_unwrap(db).ok().expect("single owner").close().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
     }
 }
 
@@ -150,7 +182,8 @@ async fn lfs_tumble_window_crash_replay() {
     {
         let db = open_shard(&dir).await;
         let op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
-        op.process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1).unwrap();
+        op.process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1)
+            .unwrap();
         assert_eq!(op.fill_level(), 2);
         persist_tumble_window_state(&db, &op, op_id).await.unwrap();
         // Simulate crash: drop without flush.
@@ -180,7 +213,9 @@ async fn lfs_tumble_window_crash_replay() {
         let mut crash_state: std::collections::HashMap<(i64, i64, i64), i64> = Default::default();
         // Build epoch 1 output for comparison.
         let init_op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
-        let init_out = init_op.process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1).unwrap();
+        let init_out = init_op
+            .process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1)
+            .unwrap();
         accumulate(&mut crash_state, &init_out);
         // Epoch 2: add t=600 (>= watermark=500, not late).
         let out2 = op.process_epoch(make_input(&[(600, 30, 1)]), 2).unwrap();
@@ -190,15 +225,27 @@ async fn lfs_tumble_window_crash_replay() {
         // Non-crash path.
         let fresh_op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
         let mut fresh_state: std::collections::HashMap<(i64, i64, i64), i64> = Default::default();
-        let f1 = fresh_op.process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1).unwrap();
+        let f1 = fresh_op
+            .process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1)
+            .unwrap();
         accumulate(&mut fresh_state, &f1);
-        let f2 = fresh_op.process_epoch(make_input(&[(600, 30, 1)]), 2).unwrap();
+        let f2 = fresh_op
+            .process_epoch(make_input(&[(600, 30, 1)]), 2)
+            .unwrap();
         accumulate(&mut fresh_state, &f2);
         let fresh_live = live_rows(&fresh_state);
 
-        assert_eq!(crash_live, fresh_live, "crash-replay net state bit-identical to non-crash path");
+        assert_eq!(
+            crash_live, fresh_live,
+            "crash-replay net state bit-identical to non-crash path"
+        );
 
-        Arc::try_unwrap(db).ok().expect("single owner").close().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
     }
 }
 
@@ -230,7 +277,8 @@ async fn lfs_tumble_window_no_early_eviction() {
         let op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
 
         // Epoch 1: rows in window [0, 1000).
-        op.process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1).unwrap();
+        op.process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1)
+            .unwrap();
 
         // Epoch 2: advance watermark past window_end (5000 > 0 + 1000 = 1000).
         op.process_epoch(make_input(&[(5000, 99, 1)]), 2).unwrap();
@@ -239,7 +287,12 @@ async fn lfs_tumble_window_no_early_eviction() {
 
         persist_tumble_window_state(&db, &op, op_id).await.unwrap();
         db.flush().await.unwrap();
-        Arc::try_unwrap(db).ok().expect("single owner").close().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
     }
 
     // Reopen: scan window [0, 1000) state; it should still be present.
@@ -269,6 +322,11 @@ async fn lfs_tumble_window_no_early_eviction() {
             "must not evict when frontier < window_end"
         );
 
-        Arc::try_unwrap(db).ok().expect("single owner").close().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
     }
 }

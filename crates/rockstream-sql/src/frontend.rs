@@ -30,7 +30,7 @@ use crate::{
     error::SqlError,
     estimate::{explain_incremental_estimate, format_estimate, EstimateRow},
     explain_incremental::explain_incremental,
-    lower::lower,
+    lower::lower_with_views,
 };
 
 // ─── SqlFrontend ─────────────────────────────────────────────────────────────
@@ -42,6 +42,7 @@ use crate::{
 /// and provides the methods below.
 pub struct SqlFrontend {
     ctx: SessionContext,
+    snapshot_tables: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Default for SqlFrontend {
@@ -59,7 +60,10 @@ impl SqlFrontend {
     pub fn new() -> Self {
         let config = SessionConfig::new();
         let ctx = SessionContext::new_with_config(config);
-        Self { ctx }
+        Self {
+            ctx,
+            snapshot_tables: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
     }
 
     /// Register an empty in-memory table with the given Arrow schema.
@@ -73,6 +77,16 @@ impl SqlFrontend {
         Ok(())
     }
 
+    /// Register an empty in-memory table as a snapshot source.
+    pub fn register_snapshot_table(&self, name: &str, schema: SchemaRef) -> Result<(), SqlError> {
+        self.register_table(name, schema)?;
+        self.snapshot_tables
+            .lock()
+            .unwrap()
+            .insert(name.to_string());
+        Ok(())
+    }
+
     /// Parse SQL and return the **optimized** `PlanNode`.
     ///
     /// The SQL must be a single `SELECT` statement.  `CREATE VIEW` statements
@@ -82,7 +96,8 @@ impl SqlFrontend {
             message: e.to_string(),
         })?;
         let logical = df.into_optimized_plan()?;
-        lower(&logical)
+        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        lower_with_views(&logical, &Default::default(), &snapshot_sources)
     }
 
     /// Parse SQL and return the **unoptimized** `PlanNode`.
@@ -96,7 +111,40 @@ impl SqlFrontend {
             message: e.to_string(),
         })?;
         let logical = df.into_unoptimized_plan();
-        lower(&logical)
+        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        lower_with_views(&logical, &Default::default(), &snapshot_sources)
+    }
+
+    /// Parse SQL with catalog-defined views and return the **optimized** `PlanNode`.
+    pub async fn sql_to_plan_node_with_catalog(
+        &self,
+        sql: &str,
+        catalog: &SchemaCatalog,
+    ) -> Result<PlanNode, SqlError> {
+        let df = self.ctx.sql(sql).await.map_err(|e| SqlError::ParseError {
+            message: e.to_string(),
+        })?;
+        let logical = df.into_optimized_plan()?;
+        let registered_views: std::collections::HashSet<String> =
+            catalog.list_view_names().await?.into_iter().collect();
+        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        lower_with_views(&logical, &registered_views, &snapshot_sources)
+    }
+
+    /// Parse SQL with catalog-defined views and return the **unoptimized** `PlanNode`.
+    pub async fn sql_to_unoptimized_plan_node_with_catalog(
+        &self,
+        sql: &str,
+        catalog: &SchemaCatalog,
+    ) -> Result<PlanNode, SqlError> {
+        let df = self.ctx.sql(sql).await.map_err(|e| SqlError::ParseError {
+            message: e.to_string(),
+        })?;
+        let logical = df.into_unoptimized_plan();
+        let registered_views: std::collections::HashSet<String> =
+            catalog.list_view_names().await?.into_iter().collect();
+        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        lower_with_views(&logical, &registered_views, &snapshot_sources)
     }
 
     /// Parse a `CREATE VIEW name AS <query>` statement and store the view in
@@ -113,7 +161,18 @@ impl SqlFrontend {
         query_sql: &str,
         columns: Vec<ColumnDef>,
     ) -> Result<(), SqlError> {
-        let plan_node = self.sql_to_plan_node(query_sql).await?;
+        let df = self
+            .ctx
+            .sql(query_sql)
+            .await
+            .map_err(|e| SqlError::ParseError {
+                message: e.to_string(),
+            })?;
+        let logical = df.into_optimized_plan()?;
+        let registered_views: std::collections::HashSet<String> =
+            catalog.list_view_names().await?.into_iter().collect();
+        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        let plan_node = lower_with_views(&logical, &registered_views, &snapshot_sources)?;
         catalog
             .register_view(name, query_sql, &plan_node, columns)
             .await

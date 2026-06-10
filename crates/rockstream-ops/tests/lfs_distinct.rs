@@ -25,7 +25,7 @@ use object_store::local::LocalFileSystem;
 use rockstream_ops::distinct::{load_distinct_state, persist_distinct_state, DistinctOp};
 use rockstream_ops::op::Operator;
 use rockstream_ops::zset::ArrowZSet;
-use rockstream_storage::{ShardDb, WriteBatch};
+use rockstream_storage::ShardDb;
 use rockstream_types::ids::OperatorId;
 use tempfile::TempDir;
 
@@ -45,10 +45,7 @@ fn make_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
     let w: Vec<i64> = rows.iter().map(|(_, _, w)| *w).collect();
     let data = RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(Int64Array::from(k)),
-            Arc::new(Int64Array::from(v)),
-        ],
+        vec![Arc::new(Int64Array::from(k)), Arc::new(Int64Array::from(v))],
     )
     .unwrap();
     ArrowZSet::new(data, w)
@@ -60,8 +57,18 @@ fn collect_positive_kv(zset: &ArrowZSet) -> BTreeMap<(i64, i64), i64> {
     if zset.is_empty() {
         return out;
     }
-    let k_col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let v_col = zset.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let k_col = zset
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let v_col = zset
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     for i in 0..zset.num_rows() {
         if zset.weights[i] > 0 {
             out.insert((k_col.value(i), v_col.value(i)), zset.weights[i]);
@@ -95,7 +102,9 @@ async fn lfs_distinct_state_persists_across_reopen() {
         let op = DistinctOp::new(schema.clone());
 
         // Insert (1,10), (2,20) → both should appear in output (weight 0→1).
-        let out1 = op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)])).unwrap();
+        let out1 = op
+            .process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+            .unwrap();
         let positive = collect_positive_kv(&out1);
         assert_eq!(positive.len(), 2, "both rows emitted on first insert");
 
@@ -122,7 +131,9 @@ async fn lfs_distinct_state_persists_across_reopen() {
         let db = open_shard(&dir).await;
 
         // Load the persisted arrangement.
-        let op = load_distinct_state(&db, schema.clone(), op_id).await.unwrap();
+        let op = load_distinct_state(&db, schema.clone(), op_id)
+            .await
+            .unwrap();
 
         // Verify fill level matches pre-close state.
         assert_eq!(op.fill_level(), 2, "2 live distinct rows after reload");
@@ -136,13 +147,27 @@ async fn lfs_distinct_state_persists_across_reopen() {
         let pairs: Vec<_> = if out.is_empty() {
             vec![]
         } else {
-            let k_col = out.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let v_col = out.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let k_col = out
+                .data
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let v_col = out
+                .data
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
             (0..out.num_rows())
                 .map(|i| ((k_col.value(i), v_col.value(i)), out.weights[i]))
                 .collect()
         };
-        assert_eq!(pairs, vec![((1, 10), -1)], "weight 1→0 after reload: emit -1");
+        assert_eq!(
+            pairs,
+            vec![((1, 10), -1)],
+            "weight 1→0 after reload: emit -1"
+        );
 
         Arc::try_unwrap(db)
             .ok()
@@ -172,7 +197,8 @@ async fn lfs_distinct_crash_replay_bit_identical() {
         let db = open_shard(&dir).await;
         let op = DistinctOp::new(schema.clone());
 
-        op.process_delta(make_batch(&[(10, 100, 1), (20, 200, 1), (30, 300, 1)])).unwrap();
+        op.process_delta(make_batch(&[(10, 100, 1), (20, 200, 1), (30, 300, 1)]))
+            .unwrap();
         op.process_delta(make_batch(&[(10, 100, 1)])).unwrap(); // weight 1→2 for (10,100)
 
         assert_eq!(op.fill_level(), 3);
@@ -190,7 +216,9 @@ async fn lfs_distinct_crash_replay_bit_identical() {
         let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
         let db = Arc::new(ShardDb::builder("shard", store).build().await.unwrap());
 
-        let op = load_distinct_state(&db, schema.clone(), op_id).await.unwrap();
+        let op = load_distinct_state(&db, schema.clone(), op_id)
+            .await
+            .unwrap();
 
         // After WAL replay: 3 distinct rows, (10,100) has weight 2.
         assert_eq!(op.fill_level(), 3, "all 3 rows recovered from WAL");
@@ -230,7 +258,8 @@ async fn lfs_distinct_no_range_delete() {
     let db = open_shard(&dir).await;
     let op = DistinctOp::new(schema.clone());
 
-    op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)])).unwrap();
+    op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
 
     // Call persist — this should write point Puts only.
     persist_distinct_state(&db, &op, op_id).await.unwrap();

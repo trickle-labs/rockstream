@@ -109,7 +109,9 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<String>) {
             ));
         }
 
-        PlanNode::Intersect { left, right, all, .. } => {
+        PlanNode::Intersect {
+            left, right, all, ..
+        } => {
             render_node(left, depth + 1, lines);
             render_node(right, depth + 1, lines);
             let sem = if *all { "ALL" } else { "SET" };
@@ -118,7 +120,9 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<String>) {
             ));
         }
 
-        PlanNode::Except { left, right, all, .. } => {
+        PlanNode::Except {
+            left, right, all, ..
+        } => {
             render_node(left, depth + 1, lines);
             render_node(right, depth + 1, lines);
             let sem = if *all { "ALL" } else { "SET" };
@@ -149,7 +153,9 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<String>) {
         }
 
         // v0.12: TopK (IVM-9)
-        PlanNode::TopK { input, k, rank_col, .. } => {
+        PlanNode::TopK {
+            input, k, rank_col, ..
+        } => {
             render_node(input, depth + 1, lines);
             lines.push(format!(
                 "{indent}✓ TopK[k={k},rank_col={rank_col}]  buffer=K+epsilon  delta_swap"
@@ -272,8 +278,12 @@ mod tests {
     fn explain_intersect_set_shows_semantics() {
         use rockstream_types::ids::OperatorId;
         let plan = PlanNode::Intersect {
-            left: Box::new(PlanNode::Source { name: "l".to_string() }),
-            right: Box::new(PlanNode::Source { name: "r".to_string() }),
+            left: Box::new(PlanNode::Source {
+                name: "l".to_string(),
+            }),
+            right: Box::new(PlanNode::Source {
+                name: "r".to_string(),
+            }),
             all: false,
             left_arr_id: OperatorId(1),
             right_arr_id: OperatorId(2),
@@ -288,8 +298,12 @@ mod tests {
     fn explain_except_all_shows_semantics() {
         use rockstream_types::ids::OperatorId;
         let plan = PlanNode::Except {
-            left: Box::new(PlanNode::Source { name: "l".to_string() }),
-            right: Box::new(PlanNode::Source { name: "r".to_string() }),
+            left: Box::new(PlanNode::Source {
+                name: "l".to_string(),
+            }),
+            right: Box::new(PlanNode::Source {
+                name: "r".to_string(),
+            }),
             all: true,
             left_arr_id: OperatorId(1),
             right_arr_id: OperatorId(2),
@@ -376,21 +390,18 @@ mod tests {
         let key_hex = hex::encode(&oversized[0]);
         let notice = format!(
             "NOTICE RS-5023: Window partition {} has {} rows (threshold: {})",
-            key_hex,
-            n,
-            WINDOW_PARTITION_THRESHOLD
+            key_hex, n, WINDOW_PARTITION_THRESHOLD
         );
-        assert!(
-            notice.contains("RS-5023"),
-            "RS-5023 NOTICE: {notice}"
-        );
+        assert!(notice.contains("RS-5023"), "RS-5023 NOTICE: {notice}");
     }
 
     #[test]
     fn explain_incremental_tumble_window() {
         use rockstream_plan::LateDataPolicy;
         let plan = PlanNode::TumbleWindow {
-            input: Box::new(PlanNode::Source { name: "t".to_string() }),
+            input: Box::new(PlanNode::Source {
+                name: "t".to_string(),
+            }),
             time_col: 0,
             window_size_ms: 5000,
             late_data_policy: LateDataPolicy::Drop,
@@ -398,14 +409,19 @@ mod tests {
         let text = explain_incremental(&plan);
         assert!(text.contains("TumbleWindow"), "text: {text}");
         assert!(text.contains("5000ms"), "expected window size: {text}");
-        assert!(text.contains("watermark_policy"), "expected watermark_policy: {text}");
+        assert!(
+            text.contains("watermark_policy"),
+            "expected watermark_policy: {text}"
+        );
         assert!(!text.is_empty(), "must produce non-empty EXPLAIN text");
     }
 
     #[test]
     fn explain_incremental_topk() {
         let plan = PlanNode::TopK {
-            input: Box::new(PlanNode::Source { name: "t".to_string() }),
+            input: Box::new(PlanNode::Source {
+                name: "t".to_string(),
+            }),
             k: 10,
             rank_col: 2,
             partition_by: vec![0],

@@ -5,7 +5,7 @@
 //! 1. `minio_topk_random_changes` — random insert/update/delete sequence on MinIO backend;
 //!    result after each epoch matches batch oracle.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
@@ -66,8 +66,20 @@ fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
         year += 1;
     }
     let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let dpm: [u32; 12] =
-        [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let dpm: [u32; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 0u32;
     for &d in &dpm {
         if days < d {
@@ -147,7 +159,12 @@ fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
 
 async fn open_shard_minio(port: u16, path: &str) -> Arc<ShardDb> {
     let store = minio_object_store(port);
-    Arc::new(ShardDb::builder(path, store).build().await.expect("failed to open ShardDb on MinIO"))
+    Arc::new(
+        ShardDb::builder(path, store)
+            .build()
+            .await
+            .expect("failed to open ShardDb on MinIO"),
+    )
 }
 
 fn schema_kv() -> Arc<Schema> {
@@ -173,21 +190,36 @@ fn make_input(rows: &[(i64, i64, i64)]) -> ArrowZSet {
 }
 
 fn accumulate_vals(state: &mut HashMap<i64, i64>, zset: &ArrowZSet) {
-    if zset.is_empty() { return; }
-    let col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    if zset.is_empty() {
+        return;
+    }
+    let col = zset
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     for i in 0..zset.num_rows() {
         *state.entry(col.value(i)).or_insert(0) += zset.weights[i];
     }
 }
 
 fn live_vals(state: &HashMap<i64, i64>) -> Vec<i64> {
-    let mut vals: Vec<i64> = state.iter().filter(|(_, &w)| w > 0).map(|(&v, _)| v).collect();
+    let mut vals: Vec<i64> = state
+        .iter()
+        .filter(|(_, &w)| w > 0)
+        .map(|(&v, _)| v)
+        .collect();
     vals.sort_by(|a, b| b.cmp(a));
     vals
 }
 
 fn batch_topk(input_state: &HashMap<i64, i64>, k: usize) -> Vec<i64> {
-    let mut present: Vec<i64> = input_state.iter().filter(|(_, &w)| w > 0).map(|(&v, _)| v).collect();
+    let mut present: Vec<i64> = input_state
+        .iter()
+        .filter(|(_, &w)| w > 0)
+        .map(|(&v, _)| v)
+        .collect();
     present.sort_by(|a, b| b.cmp(a));
     present.into_iter().take(k).collect()
 }
@@ -213,11 +245,11 @@ async fn minio_topk_random_changes() {
     // Epoch sequences: insert/update/delete pattern.
     let epochs: Vec<Vec<(i64, i64, i64)>> = vec![
         vec![(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1), (2, 5, 1)],
-        vec![(9, 6, 1)],         // v=9 outranks v=6
-        vec![(10, 1, -1)],       // delete rank-1
-        vec![(5, 7, 1)],         // insert v=5 (below current k-th=9? no, top-3 is [9,8,6])
-        vec![(8, 2, -1)],        // delete rank-1 from {9,8,6}
-        vec![(7, 8, 1)],         // insert v=7
+        vec![(9, 6, 1)],   // v=9 outranks v=6
+        vec![(10, 1, -1)], // delete rank-1
+        vec![(5, 7, 1)],   // insert v=5 (below current k-th=9? no, top-3 is [9,8,6])
+        vec![(8, 2, -1)],  // delete rank-1 from {9,8,6}
+        vec![(7, 8, 1)],   // insert v=7
     ];
 
     for (epoch_idx, rows) in epochs.iter().enumerate() {
@@ -235,7 +267,8 @@ async fn minio_topk_random_changes() {
         let batch_live = batch_topk(&input_state, k);
 
         assert_eq!(
-            incr_live, batch_live,
+            incr_live,
+            batch_live,
             "incremental top-K != batch top-K at epoch {}",
             epoch_idx + 1
         );
@@ -247,7 +280,11 @@ async fn minio_topk_random_changes() {
     let op2 = load_topk_state(&db, schema_kv(), k, 0, vec![], op_id)
         .await
         .unwrap();
-    assert_eq!(op2.fill_level(), op.fill_level(), "fill level matches after MinIO reload");
+    assert_eq!(
+        op2.fill_level(),
+        op.fill_level(),
+        "fill level matches after MinIO reload"
+    );
 
     // One more epoch after reload.
     let mut incr_output2 = incr_output.clone();
@@ -256,5 +293,8 @@ async fn minio_topk_random_changes() {
     *input_state.entry(11).or_insert(0) += 1;
     let incr_live2 = live_vals(&incr_output2);
     let batch_live2 = batch_topk(&input_state, k);
-    assert_eq!(incr_live2, batch_live2, "top-K correct after MinIO reload + one epoch");
+    assert_eq!(
+        incr_live2, batch_live2,
+        "top-K correct after MinIO reload + one epoch"
+    );
 }

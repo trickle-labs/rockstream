@@ -30,7 +30,6 @@ use rockstream_ops::op::Operator;
 use rockstream_ops::project::{NamedExpr, ProjectOp};
 use rockstream_ops::window::WindowOp;
 use rockstream_ops::zset::ArrowZSet;
-use rockstream_plan;
 use rockstream_sql::catalog::{ColumnDef, SchemaCatalog};
 use rockstream_sql::SqlFrontend;
 use rockstream_storage::ShardDb;
@@ -121,8 +120,8 @@ fn col(name: &str, dt: &str) -> ColumnDef {
 ///
 /// Returns a BTreeMap<region, sum_amount> for all regions with positive weight.
 fn batch_oracle(
-    orders_acc: &BTreeMap<(i64, i64), i64>,    // (region, id) → weight
-    lineitem_acc: &BTreeMap<(i64, i64), i64>,  // (order_id, amount) → weight
+    orders_acc: &BTreeMap<(i64, i64), i64>, // (region, id) → weight
+    lineitem_acc: &BTreeMap<(i64, i64), i64>, // (order_id, amount) → weight
 ) -> BTreeMap<i64, i64> {
     let mut region_sum: BTreeMap<i64, i64> = BTreeMap::new();
 
@@ -150,8 +149,18 @@ fn accumulate_kv(acc: &mut BTreeMap<(i64, i64), i64>, batch: &ArrowZSet) {
     if batch.is_empty() {
         return;
     }
-    let k_col = batch.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let v_col = batch.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let k_col = batch
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let v_col = batch
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     for i in 0..batch.num_rows() {
         let key = (k_col.value(i), v_col.value(i));
         let entry = acc.entry(key).or_insert(0);
@@ -175,8 +184,18 @@ fn collect_agg_output(acc: &mut BTreeMap<i64, i64>, batch: &ArrowZSet) {
     if batch.is_empty() {
         return;
     }
-    let k_col = batch.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let sum_col = batch.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let k_col = batch
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sum_col = batch
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
 
     // Pass 1: retractions — remove old state for each retracted key.
     for i in 0..batch.num_rows() {
@@ -210,7 +229,9 @@ async fn sql_engine_create_view_join_group_by() {
 
     let frontend = SqlFrontend::new();
     frontend.register_table("orders", orders_schema()).unwrap();
-    frontend.register_table("lineitem", lineitem_schema()).unwrap();
+    frontend
+        .register_table("lineitem", lineitem_schema())
+        .unwrap();
 
     let query = "SELECT o.region, SUM(l.amount) \
                  FROM orders o JOIN lineitem l ON o.id = l.order_id \
@@ -243,7 +264,8 @@ async fn sql_engine_create_view_join_group_by() {
 
     fn has_join(p: &rockstream_plan::PlanNode) -> bool {
         match p {
-            rockstream_plan::PlanNode::InnerJoin { .. } | rockstream_plan::PlanNode::OuterJoin { .. } => true,
+            rockstream_plan::PlanNode::InnerJoin { .. }
+            | rockstream_plan::PlanNode::OuterJoin { .. } => true,
             rockstream_plan::PlanNode::Filter { input, .. }
             | rockstream_plan::PlanNode::Project { input, .. }
             | rockstream_plan::PlanNode::Distinct { input, .. }
@@ -299,8 +321,8 @@ async fn sql_engine_create_view_join_group_by() {
     // Join output schema: (region=0, id=1, order_id=2, amount=3).
     let join_op = JoinOp::new(
         OperatorId(10),
-        vec![1],  // left_keys: orders.id
-        vec![0],  // right_keys: lineitem.order_id
+        vec![1], // left_keys: orders.id
+        vec![0], // right_keys: lineitem.order_id
     );
 
     // Project: extract (region=col0, amount=col3) → (k=col0, v=col1) for AggregateOp.
@@ -312,9 +334,9 @@ async fn sql_engine_create_view_join_group_by() {
     let agg_op = AggregateOp::new(OperatorId(20));
 
     // Accumulators for oracle comparison.
-    let mut orders_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();    // (region, id) → weight
-    let mut lineitem_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();  // (order_id, amount) → weight
-    let mut agg_output_state: BTreeMap<i64, i64> = BTreeMap::new();     // region → current_sum
+    let mut orders_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new(); // (region, id) → weight
+    let mut lineitem_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new(); // (order_id, amount) → weight
+    let mut agg_output_state: BTreeMap<i64, i64> = BTreeMap::new(); // region → current_sum
 
     // Epoch 0: insert orders(region=1,id=100),(region=2,id=200)
     //          and lineitem(order_id=100,amount=500),(order_id=200,amount=300)
@@ -433,9 +455,9 @@ async fn sql_engine_create_view_join_group_by() {
 ///    net state at every epoch boundary (verified against an in-process oracle).
 #[tokio::test]
 async fn sql_engine_window_row_number_over_view() {
-    use std::collections::HashMap;
     use arrow::array::ArrayRef;
     use rockstream_plan::PlanNode;
+    use std::collections::HashMap;
 
     // Set up SqlFrontend with table t(k INT, v INT).
     let t_schema = Arc::new(Schema::new(vec![
@@ -462,7 +484,9 @@ async fn sql_engine_window_row_number_over_view() {
             | PlanNode::Aggregate { input, .. }
             | PlanNode::Distinct { input, .. }
             | PlanNode::Window { input, .. } => has_window(input),
-            PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => has_window(child),
+            PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => {
+                has_window(child)
+            }
             PlanNode::InnerJoin { left, right, .. }
             | PlanNode::OuterJoin { left, right, .. }
             | PlanNode::Union { left, right }
@@ -513,9 +537,24 @@ async fn sql_engine_window_row_number_over_view() {
         if zset.is_empty() {
             return;
         }
-        let k_col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let v_col = zset.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let r_col = zset.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let k_col = zset
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = zset
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let r_col = zset
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..zset.num_rows() {
             let key = (k_col.value(i), v_col.value(i), r_col.value(i));
             *state.entry(key).or_insert(0) += zset.weights[i];
@@ -569,21 +608,33 @@ async fn sql_engine_window_row_number_over_view() {
     acc_input(&mut input_acc, &e1_rows);
     let out1 = op.process_epoch(make_t(&e1_rows), 1).unwrap();
     acc_out(&mut output_state, &out1);
-    assert_eq!(live_rows(&output_state), batch_rn(&input_acc), "epoch 1 mismatch");
+    assert_eq!(
+        live_rows(&output_state),
+        batch_rn(&input_acc),
+        "epoch 1 mismatch"
+    );
 
     // Epoch 2: insert (1,15), (2,25); delete (1,20).
     let e2_rows = [(1, 15, 1), (2, 25, 1), (1, 20, -1)];
     acc_input(&mut input_acc, &e2_rows);
     let out2 = op.process_epoch(make_t(&e2_rows), 2).unwrap();
     acc_out(&mut output_state, &out2);
-    assert_eq!(live_rows(&output_state), batch_rn(&input_acc), "epoch 2 mismatch");
+    assert_eq!(
+        live_rows(&output_state),
+        batch_rn(&input_acc),
+        "epoch 2 mismatch"
+    );
 
     // Epoch 3: insert (1,5).
     let e3_rows = [(1, 5, 1)];
     acc_input(&mut input_acc, &e3_rows);
     let out3 = op.process_epoch(make_t(&e3_rows), 3).unwrap();
     acc_out(&mut output_state, &out3);
-    assert_eq!(live_rows(&output_state), batch_rn(&input_acc), "epoch 3 mismatch");
+    assert_eq!(
+        live_rows(&output_state),
+        batch_rn(&input_acc),
+        "epoch 3 mismatch"
+    );
 
     // Verify specific values at end of epoch 3:
     // k=1: v=5,10,15 with rn=1,2,3; k=2: v=25,30 with rn=1,2.

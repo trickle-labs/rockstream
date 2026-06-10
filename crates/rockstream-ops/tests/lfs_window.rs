@@ -71,8 +71,18 @@ fn accumulate_v_rn(state: &mut std::collections::HashMap<(i64, i64), i64>, zset:
     if zset.is_empty() {
         return;
     }
-    let v_col = zset.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let rn_col = zset.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+    let v_col = zset
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let rn_col = zset
+        .data
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     for i in 0..zset.num_rows() {
         let key = (v_col.value(i), rn_col.value(i));
         *state.entry(key).or_insert(0) += zset.weights[i];
@@ -99,7 +109,11 @@ async fn open_shard(dir: &TempDir) -> Arc<ShardDb> {
 fn expected_rn(v_values: &[i64]) -> Vec<(i64, i64)> {
     let mut sorted = v_values.to_vec();
     sorted.sort();
-    sorted.iter().enumerate().map(|(i, &v)| (v, (i + 1) as i64)).collect()
+    sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (v, (i + 1) as i64))
+        .collect()
 }
 
 // ─── Test 1: State persists across close/reopen ────────────────────────────
@@ -116,7 +130,9 @@ async fn lfs_window_state_persists_across_reopen() {
         let op = WindowOp::new(kv_rn_schema(), vec![rn_expr()]);
 
         // Epoch 1: insert 3 rows (one partition, v=10,20,30).
-        let out1 = op.process_epoch(make_input(&[(1, 10, 1), (1, 20, 1), (1, 30, 1)]), 1).unwrap();
+        let out1 = op
+            .process_epoch(make_input(&[(1, 10, 1), (1, 20, 1), (1, 30, 1)]), 1)
+            .unwrap();
         accumulate_v_rn(&mut net_state, &out1);
         assert_eq!(
             live_v_rn(&net_state),
@@ -125,7 +141,9 @@ async fn lfs_window_state_persists_across_reopen() {
         );
 
         // Epoch 2: insert 2 more rows (v=5, v=25).
-        let out2 = op.process_epoch(make_input(&[(1, 5, 1), (1, 25, 1)]), 2).unwrap();
+        let out2 = op
+            .process_epoch(make_input(&[(1, 5, 1), (1, 25, 1)]), 2)
+            .unwrap();
         accumulate_v_rn(&mut net_state, &out2);
         assert_eq!(
             live_v_rn(&net_state),
@@ -199,10 +217,9 @@ async fn lfs_window_crash_replay_bit_identical() {
         let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
         let db = Arc::new(ShardDb::builder("shard", store).build().await.unwrap());
 
-        let op =
-            load_window_state(&db, kv_rn_schema(), vec![rn_expr()], op_id)
-                .await
-                .unwrap();
+        let op = load_window_state(&db, kv_rn_schema(), vec![rn_expr()], op_id)
+            .await
+            .unwrap();
 
         assert_eq!(op.fill_level(), 3, "3 rows recovered from WAL");
 
@@ -211,8 +228,9 @@ async fn lfs_window_crash_replay_bit_identical() {
         // Epoch 1 output is NOT available after crash (it was not persisted to net state).
         // We reconstruct it from a fresh op to simulate the "initial" epoch 1 output.
         let init_op = WindowOp::new(kv_rn_schema(), vec![rn_expr()]);
-        let init_out =
-            init_op.process_epoch(make_input(&[(1, 30, 1), (1, 10, 1), (1, 20, 1)]), 1).unwrap();
+        let init_out = init_op
+            .process_epoch(make_input(&[(1, 30, 1), (1, 10, 1), (1, 20, 1)]), 1)
+            .unwrap();
         accumulate_v_rn(&mut crash_state, &init_out);
 
         let out = op.process_epoch(make_input(&[(1, 15, 1)]), 2).unwrap();
@@ -226,7 +244,9 @@ async fn lfs_window_crash_replay_bit_identical() {
             .process_epoch(make_input(&[(1, 30, 1), (1, 10, 1), (1, 20, 1)]), 1)
             .unwrap();
         accumulate_v_rn(&mut fresh_state, &f1);
-        let f2 = fresh_op.process_epoch(make_input(&[(1, 15, 1)]), 2).unwrap();
+        let f2 = fresh_op
+            .process_epoch(make_input(&[(1, 15, 1)]), 2)
+            .unwrap();
         accumulate_v_rn(&mut fresh_state, &f2);
         let fresh_live = live_v_rn(&fresh_state);
 

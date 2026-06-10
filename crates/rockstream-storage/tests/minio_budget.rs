@@ -26,7 +26,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
@@ -132,15 +131,17 @@ async fn create_minio_bucket(port: u16, bucket: &str) {
         "host:127.0.0.1:{port}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
     );
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    let canonical_request = format!(
-        "PUT\n/{bucket}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical_request =
+        format!("PUT\n/{bucket}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{date_stamp}/{region}/{service}/aws4_request\n{}",
         sha256_hex(canonical_request.as_bytes())
     );
     let signing_key = {
-        let k_date = hmac_sha256(format!("AWS4{MINIO_PASS}").as_bytes(), date_stamp.as_bytes());
+        let k_date = hmac_sha256(
+            format!("AWS4{MINIO_PASS}").as_bytes(),
+            date_stamp.as_bytes(),
+        );
         let k_region = hmac_sha256(&k_date, region.as_bytes());
         let k_service = hmac_sha256(&k_region, service.as_bytes());
         hmac_sha256(&k_service, b"aws4_request")
@@ -248,7 +249,11 @@ async fn minio_wal_listing_cache_hit_ratio() {
     let cache = WalListingCache::new();
     cache.populate(file_names.clone());
 
-    assert_eq!(cache.list_call_count(), 1, "exactly 1 LIST call on populate");
+    assert_eq!(
+        cache.list_call_count(),
+        1,
+        "exactly 1 LIST call on populate"
+    );
 
     // Hot-path reads: serve from cache, no additional LIST calls.
     let n_hot_reads = 1000usize;
@@ -279,7 +284,9 @@ async fn minio_wal_listing_cache_hit_ratio() {
     eprintln!(
         "minio_wal_listing_cache_hit_ratio: {:.2}% hit ratio \
          ({}/{} accesses served from cache)",
-        hit_ratio * 100.0, n_hot_reads, total_accesses
+        hit_ratio * 100.0,
+        n_hot_reads,
+        total_accesses
     );
 
     Arc::try_unwrap(db)
@@ -533,7 +540,8 @@ async fn minio_write_amplification() {
     assert_eq!(
         entries.len(),
         keys_per_epoch,
-        "epoch 0 data must be visible (got {} entries)", entries.len()
+        "epoch 0 data must be visible (got {} entries)",
+        entries.len()
     );
 
     Arc::try_unwrap(db)

@@ -77,8 +77,18 @@ mod proptest_oracle {
         if batch.is_empty() {
             return;
         }
-        let k_col = batch.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let v_col = batch.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let k_col = batch
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = batch
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             let key = (k_col.value(i), v_col.value(i));
             let entry = acc.entry(key).or_insert(0);
@@ -92,16 +102,28 @@ mod proptest_oracle {
     // ─── Output accumulation ──────────────────────────────────────────────────
 
     /// Accumulate output ZSet deltas into net state.
-    fn accumulate_output(
-        state: &mut BTreeMap<(i64, i64, i64), i64>,
-        batch: &ArrowZSet,
-    ) {
+    fn accumulate_output(state: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
         if batch.is_empty() {
             return;
         }
-        let k_col = batch.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let v_col = batch.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let r_col = batch.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let k_col = batch
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = batch
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let r_col = batch
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             let key = (k_col.value(i), v_col.value(i), r_col.value(i));
             let entry = state.entry(key).or_insert(0);
@@ -239,7 +261,7 @@ mod proptest_oracle {
             vs.sort();
             let n = vs.len();
             for i in 0..n {
-                let start = if i + 1 >= frame { i + 1 - frame } else { 0 };
+                let start = (i + 1).saturating_sub(frame);
                 let sum: i64 = vs[start..=i].iter().sum();
                 out.push((k, vs[i], sum));
             }
@@ -251,8 +273,7 @@ mod proptest_oracle {
     // ─── Proptest strategies ──────────────────────────────────────────────────
 
     fn arb_delta_row() -> impl Strategy<Value = DeltaRow> {
-        (1i64..=4, 1i64..=20, prop_oneof![Just(1i64), Just(-1i64)])
-            .prop_map(|(k, v, w)| (k, v, w))
+        (1i64..=4, 1i64..=20, prop_oneof![Just(1i64), Just(-1i64)]).prop_map(|(k, v, w)| (k, v, w))
     }
 
     fn arb_epoch(max_rows: usize) -> impl Strategy<Value = Vec<DeltaRow>> {
@@ -292,9 +313,9 @@ mod proptest_oracle {
                 batch
             };
 
-            let out = op.process_epoch(delta, epoch_idx as u64 + 1).map_err(|e| {
-                TestCaseError::Fail(format!("process_epoch failed: {e}").into())
-            })?;
+            let out = op
+                .process_epoch(delta, epoch_idx as u64 + 1)
+                .map_err(|e| TestCaseError::Fail(format!("process_epoch failed: {e}").into()))?;
 
             // Track cost metrics.
             total_recomputed_rows += op.fill_level();

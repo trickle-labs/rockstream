@@ -3,12 +3,23 @@
 //! Every user-visible failure from the SQL frontend carries an RS-XXXX code
 //! with actionable next_steps text.
 
-use rockstream_types::error_code::{ErrorCode, RS_1002, RS_1012, RS_1013, RS_1016};
+use rockstream_types::error_code::{
+    ErrorCode, RS_0001, RS_0003, RS_1002, RS_1011, RS_1012, RS_1013, RS_1016,
+};
 use thiserror::Error;
 
 /// Errors produced by the SQL frontend, lowering pass, and schema catalog.
 #[derive(Debug, Error)]
 pub enum SqlError {
+    /// View-on-view DAG contains a cycle.
+    ///
+    /// RS-1011: resolve cycle in view dependencies; view-on-view relations must form a DAG.
+    #[error("[RS-1011] Cycle detected in view dependencies: view '{view_name}' forms a cycle via path: {cycle_path:?}")]
+    CycleDetected {
+        view_name: String,
+        cycle_path: Vec<String>,
+    },
+
     /// SQL statement could not be parsed.
     ///
     /// RS-1012: check SQL syntax; see docs/language-features.md for the
@@ -58,13 +69,14 @@ impl SqlError {
     /// The RS-XXXX error code for this error.
     pub fn error_code(&self) -> ErrorCode {
         match self {
+            Self::CycleDetected { .. } => RS_1011,
             Self::ParseError { .. } => RS_1012,
             Self::UnsupportedPlanNode { .. } => RS_1013,
             Self::UnsupportedWindowFunction { .. } => RS_1016,
             Self::IncompatibleSchemaChange { .. } => RS_1002,
-            Self::Storage(_) => rockstream_types::error_code::RS_0003,
+            Self::Storage(_) => RS_0003,
             Self::DataFusion(_) => RS_1012,
-            Self::Serde(_) => rockstream_types::error_code::RS_0001,
+            Self::Serde(_) => RS_0001,
         }
     }
 }

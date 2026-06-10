@@ -67,8 +67,20 @@ fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
         year += 1;
     }
     let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let dpm: [u32; 12] =
-        [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let dpm: [u32; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 0u32;
     for &d in &dpm {
         if days < d {
@@ -148,7 +160,12 @@ fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
 
 async fn open_shard_minio(port: u16, path: &str) -> Arc<ShardDb> {
     let store = minio_object_store(port);
-    Arc::new(ShardDb::builder(path, store).build().await.expect("failed to open ShardDb on MinIO"))
+    Arc::new(
+        ShardDb::builder(path, store)
+            .build()
+            .await
+            .expect("failed to open ShardDb on MinIO"),
+    )
 }
 
 fn input_schema() -> Arc<Schema> {
@@ -191,19 +208,28 @@ async fn minio_tumble_window_late_data_and_ttl() {
     let op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
 
     // Epoch 1: rows in window [0, 1000).
-    let out1 = op.process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1).unwrap();
+    let out1 = op
+        .process_epoch(make_input(&[(100, 10, 1), (500, 20, 1)]), 1)
+        .unwrap();
     assert!(!out1.is_empty(), "epoch 1 must produce output");
 
     // Epoch 2: advance watermark past window end (t=5000 > window_end=1000).
     let _out2 = op.process_epoch(make_input(&[(5000, 99, 1)]), 2).unwrap();
-    assert!(op.watermark_ms() >= 5000, "watermark must be >= 5000 after epoch 2");
+    assert!(
+        op.watermark_ms() >= 5000,
+        "watermark must be >= 5000 after epoch 2"
+    );
 
     // Persist to MinIO.
     persist_tumble_window_state(&db, &op, op_id).await.unwrap();
 
     // Epoch 3: late row for window [0, 1000) — t=50 < watermark=5000 → dropped.
     let out3 = op.process_epoch(make_input(&[(50, 77, 1)]), 3).unwrap();
-    assert!(out3.is_empty(), "late row must be dropped, got {} rows", out3.num_rows());
+    assert!(
+        out3.is_empty(),
+        "late row must be dropped, got {} rows",
+        out3.num_rows()
+    );
 
     // Reload from MinIO and verify state.
     let op2 = load_tumble_window_state(
@@ -217,7 +243,11 @@ async fn minio_tumble_window_late_data_and_ttl() {
     .await
     .unwrap();
 
-    assert_eq!(op2.fill_level(), op.fill_level(), "fill level matches after reload");
+    assert_eq!(
+        op2.fill_level(),
+        op.fill_level(),
+        "fill level matches after reload"
+    );
 
     // Verify compaction filter refuses early deletion of window [0, 1000) state
     // when frontier has NOT advanced past window_end.

@@ -28,8 +28,8 @@ use datafusion::common::DFSchema;
 use datafusion::logical_expr::expr::AggregateFunctionParams;
 use datafusion::logical_expr::{
     expr::{AggregateFunction, WindowFunction},
-    BinaryExpr, Distinct, JoinType, LogicalPlan, Operator as DfOp,
-    WindowFunctionDefinition, WindowFrameBound, WindowFrameUnits,
+    BinaryExpr, Distinct, JoinType, LogicalPlan, Operator as DfOp, WindowFrameBound,
+    WindowFrameUnits, WindowFunctionDefinition,
 };
 use datafusion::prelude::Expr as DfExpr;
 use datafusion::scalar::ScalarValue;
@@ -38,8 +38,8 @@ use rockstream_plan::{
     AggregateExpr, AggregateFunc, BinaryOp, Expr, JoinSemantics, OuterJoinKind, PlanNode,
     WindowExpr, WindowFunc,
 };
-use std::hash::{Hash, Hasher};
 use rockstream_types::ids::OperatorId;
+use std::hash::{Hash, Hasher};
 
 use crate::error::SqlError;
 
@@ -287,7 +287,10 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
 /// Lower a DataFusion window expression to a `WindowExpr`.
 ///
 /// `schema` is the INPUT schema (not the output schema of the Window node).
-fn lower_window_expr(expr: &DfExpr, schema: &datafusion::common::DFSchema) -> Result<WindowExpr, SqlError> {
+fn lower_window_expr(
+    expr: &DfExpr,
+    schema: &datafusion::common::DFSchema,
+) -> Result<WindowExpr, SqlError> {
     let wf: &WindowFunction = match expr {
         DfExpr::WindowFunction(wf) => wf.as_ref(),
         other => {
@@ -324,36 +327,38 @@ fn lower_window_expr(expr: &DfExpr, schema: &datafusion::common::DFSchema) -> Re
         .collect::<Vec<usize>>();
 
     let func = lower_window_func(wf, schema, &order_by)?;
-    Ok(WindowExpr { func, partition_by, order_by })
+    Ok(WindowExpr {
+        func,
+        partition_by,
+        order_by,
+    })
 }
 
 fn lower_window_func(
     wf: &WindowFunction,
-    schema: &datafusion::common::DFSchema,
+    _schema: &datafusion::common::DFSchema,
     order_by: &[usize],
 ) -> Result<WindowFunc, SqlError> {
     match &wf.fun {
-        WindowFunctionDefinition::WindowUDF(udwf) => {
-            match udwf.name() {
-                "row_number" => Ok(WindowFunc::RowNumber),
-                "rank" => Ok(WindowFunc::Rank),
-                "dense_rank" => Ok(WindowFunc::DenseRank),
-                "lag" => {
-                    let offset = extract_lag_lead_offset(&wf.params.args, 1)?;
-                    Ok(WindowFunc::Lag { offset })
-                }
-                "lead" => {
-                    let offset = extract_lag_lead_offset(&wf.params.args, 1)?;
-                    Ok(WindowFunc::Lead { offset })
-                }
-                "ntile" => Err(SqlError::UnsupportedWindowFunction {
-                    fn_name: "NTILE".to_string(),
-                }),
-                name => Err(SqlError::UnsupportedWindowFunction {
-                    fn_name: name.to_uppercase(),
-                }),
+        WindowFunctionDefinition::WindowUDF(udwf) => match udwf.name() {
+            "row_number" => Ok(WindowFunc::RowNumber),
+            "rank" => Ok(WindowFunc::Rank),
+            "dense_rank" => Ok(WindowFunc::DenseRank),
+            "lag" => {
+                let offset = extract_lag_lead_offset(&wf.params.args, 1)?;
+                Ok(WindowFunc::Lag { offset })
             }
-        }
+            "lead" => {
+                let offset = extract_lag_lead_offset(&wf.params.args, 1)?;
+                Ok(WindowFunc::Lead { offset })
+            }
+            "ntile" => Err(SqlError::UnsupportedWindowFunction {
+                fn_name: "NTILE".to_string(),
+            }),
+            name => Err(SqlError::UnsupportedWindowFunction {
+                fn_name: name.to_uppercase(),
+            }),
+        },
         WindowFunctionDefinition::AggregateUDF(udaf) => {
             let frame = &wf.params.window_frame;
             if frame.units != WindowFrameUnits::Rows {
@@ -371,9 +376,11 @@ fn lower_window_func(
                         fn_name: format!("{}_UNBOUNDED_PRECEDING", udaf.name().to_uppercase()),
                     });
                 }
-                _ => return Err(SqlError::UnsupportedWindowFunction {
-                    fn_name: format!("{}_FRAME", udaf.name().to_uppercase()),
-                }),
+                _ => {
+                    return Err(SqlError::UnsupportedWindowFunction {
+                        fn_name: format!("{}_FRAME", udaf.name().to_uppercase()),
+                    })
+                }
             };
             match udaf.name() {
                 "sum" | "SUM" => Ok(WindowFunc::SlidingSum { frame_rows }),
@@ -805,6 +812,299 @@ fn extract_semi_anti_keys_from_filter(
     }
 }
 
+/// Lower a DataFusion `LogicalPlan` to a `PlanNode` resolving view and snapshot references.
+pub fn lower_with_views(
+    plan: &LogicalPlan,
+    registered_views: &std::collections::HashSet<String>,
+    snapshot_sources: &std::collections::HashSet<String>,
+) -> Result<PlanNode, SqlError> {
+    let lowered = lower(plan)?;
+    Ok(resolve_views_and_snapshots(
+        lowered,
+        registered_views,
+        snapshot_sources,
+    ))
+}
+
+fn resolve_views_and_snapshots(
+    node: PlanNode,
+    registered_views: &std::collections::HashSet<String>,
+    snapshot_sources: &std::collections::HashSet<String>,
+) -> PlanNode {
+    match node {
+        PlanNode::Source { name } => {
+            if registered_views.contains(&name) {
+                PlanNode::ViewRef { view_name: name }
+            } else if snapshot_sources.contains(&name) {
+                PlanNode::Snapshot {
+                    source_name: name,
+                    batch_size: 1000,
+                }
+            } else {
+                PlanNode::Source { name }
+            }
+        }
+        PlanNode::Filter { input, predicate } => PlanNode::Filter {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            predicate,
+        },
+        PlanNode::Project { input, columns } => PlanNode::Project {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            columns,
+        },
+        PlanNode::Map { input, func } => PlanNode::Map {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            func,
+        },
+        PlanNode::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => PlanNode::Aggregate {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            group_by,
+            aggregates,
+        },
+        PlanNode::Join {
+            left,
+            right,
+            condition,
+        } => PlanNode::Join {
+            left: Box::new(resolve_views_and_snapshots(
+                *left,
+                registered_views,
+                snapshot_sources,
+            )),
+            right: Box::new(resolve_views_and_snapshots(
+                *right,
+                registered_views,
+                snapshot_sources,
+            )),
+            condition,
+        },
+        PlanNode::InnerJoin {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            left_arr_id,
+            right_arr_id,
+            semantics,
+        } => PlanNode::InnerJoin {
+            left: Box::new(resolve_views_and_snapshots(
+                *left,
+                registered_views,
+                snapshot_sources,
+            )),
+            right: Box::new(resolve_views_and_snapshots(
+                *right,
+                registered_views,
+                snapshot_sources,
+            )),
+            left_keys,
+            right_keys,
+            left_arr_id,
+            right_arr_id,
+            semantics,
+        },
+        PlanNode::OuterJoin {
+            kind,
+            left,
+            right,
+            left_keys,
+            right_keys,
+            left_arr_id,
+            right_arr_id,
+            unmatched_arr_id,
+        } => PlanNode::OuterJoin {
+            kind,
+            left: Box::new(resolve_views_and_snapshots(
+                *left,
+                registered_views,
+                snapshot_sources,
+            )),
+            right: Box::new(resolve_views_and_snapshots(
+                *right,
+                registered_views,
+                snapshot_sources,
+            )),
+            left_keys,
+            right_keys,
+            left_arr_id,
+            right_arr_id,
+            unmatched_arr_id,
+        },
+        PlanNode::Union { left, right } => PlanNode::Union {
+            left: Box::new(resolve_views_and_snapshots(
+                *left,
+                registered_views,
+                snapshot_sources,
+            )),
+            right: Box::new(resolve_views_and_snapshots(
+                *right,
+                registered_views,
+                snapshot_sources,
+            )),
+        },
+        PlanNode::Distinct { input, arr_id } => PlanNode::Distinct {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            arr_id,
+        },
+        PlanNode::Intersect {
+            left,
+            right,
+            all,
+            left_arr_id,
+            right_arr_id,
+        } => PlanNode::Intersect {
+            left: Box::new(resolve_views_and_snapshots(
+                *left,
+                registered_views,
+                snapshot_sources,
+            )),
+            right: Box::new(resolve_views_and_snapshots(
+                *right,
+                registered_views,
+                snapshot_sources,
+            )),
+            all,
+            left_arr_id,
+            right_arr_id,
+        },
+        PlanNode::Except {
+            left,
+            right,
+            all,
+            left_arr_id,
+            right_arr_id,
+        } => PlanNode::Except {
+            left: Box::new(resolve_views_and_snapshots(
+                *left,
+                registered_views,
+                snapshot_sources,
+            )),
+            right: Box::new(resolve_views_and_snapshots(
+                *right,
+                registered_views,
+                snapshot_sources,
+            )),
+            all,
+            left_arr_id,
+            right_arr_id,
+        },
+        PlanNode::Window {
+            input,
+            window_exprs,
+        } => PlanNode::Window {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            window_exprs,
+        },
+        PlanNode::TumbleWindow {
+            input,
+            time_col,
+            window_size_ms,
+            late_data_policy,
+        } => PlanNode::TumbleWindow {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            time_col,
+            window_size_ms,
+            late_data_policy,
+        },
+        PlanNode::TopK {
+            input,
+            k,
+            rank_col,
+            partition_by,
+        } => PlanNode::TopK {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            k,
+            rank_col,
+            partition_by,
+        },
+        PlanNode::Recursion {
+            base,
+            step,
+            max_iterations,
+            monotone,
+        } => PlanNode::Recursion {
+            base: Box::new(resolve_views_and_snapshots(
+                *base,
+                registered_views,
+                snapshot_sources,
+            )),
+            step: Box::new(resolve_views_and_snapshots(
+                *step,
+                registered_views,
+                snapshot_sources,
+            )),
+            max_iterations,
+            monotone,
+        },
+        PlanNode::Snapshot { .. } | PlanNode::ViewRef { .. } => node,
+        PlanNode::Lateral { input, func } => PlanNode::Lateral {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            func,
+        },
+        PlanNode::ViewSink {
+            view_name,
+            pk,
+            child,
+        } => PlanNode::ViewSink {
+            view_name,
+            pk,
+            child: Box::new(resolve_views_and_snapshots(
+                *child,
+                registered_views,
+                snapshot_sources,
+            )),
+        },
+        PlanNode::Exchange { kind, child } => PlanNode::Exchange {
+            kind,
+            child: Box::new(resolve_views_and_snapshots(
+                *child,
+                registered_views,
+                snapshot_sources,
+            )),
+        },
+    }
+}
+
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -866,9 +1166,8 @@ mod tests {
     }
 
     fn make_frontend_with_a_b() -> crate::frontend::SqlFrontend {
-        let schema = std::sync::Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let f = crate::frontend::SqlFrontend::new();
         f.register_table("a", schema.clone()).unwrap();
         f.register_table("b", schema).unwrap();
@@ -951,7 +1250,10 @@ mod tests {
             .await
             .expect("INTERSECT should lower without error");
         // The plan must not be empty.
-        assert!(!matches!(plan, PlanNode::Source { .. } if false), "plan: {plan:?}");
+        assert!(
+            !matches!(plan, PlanNode::Source { .. } if false),
+            "plan: {plan:?}"
+        );
     }
 
     /// `SELECT id FROM a EXCEPT SELECT id FROM b` must lower without error.
@@ -964,7 +1266,10 @@ mod tests {
             .sql_to_plan_node("SELECT id FROM a EXCEPT SELECT id FROM b")
             .await
             .expect("EXCEPT should lower without error");
-        assert!(!matches!(plan, PlanNode::Source { .. } if false), "plan: {plan:?}");
+        assert!(
+            !matches!(plan, PlanNode::Source { .. } if false),
+            "plan: {plan:?}"
+        );
     }
 
     // ─── Window lowering tests (v0.11 — IVM-7) ───────────────────────────────
@@ -1058,7 +1363,10 @@ mod tests {
             .expect("DENSE_RANK window should lower");
         assert!(has_window(&plan));
         let exprs = find_window_exprs(&plan).unwrap();
-        assert!(matches!(exprs[0].func, rockstream_plan::WindowFunc::DenseRank));
+        assert!(matches!(
+            exprs[0].func,
+            rockstream_plan::WindowFunc::DenseRank
+        ));
     }
 
     #[tokio::test]
@@ -1071,7 +1379,10 @@ mod tests {
         assert!(has_window(&plan));
         let exprs = find_window_exprs(&plan).unwrap();
         assert!(
-            matches!(exprs[0].func, rockstream_plan::WindowFunc::Lag { offset: 1 }),
+            matches!(
+                exprs[0].func,
+                rockstream_plan::WindowFunc::Lag { offset: 1 }
+            ),
             "expected Lag{{offset:1}}, got {:?}",
             exprs[0].func
         );
@@ -1081,13 +1392,18 @@ mod tests {
     async fn lower_window_lead() {
         let f = make_frontend_kv();
         let plan = f
-            .sql_to_plan_node("SELECT k, v, LEAD(v, 1) OVER (PARTITION BY k ORDER BY v) AS l FROM t")
+            .sql_to_plan_node(
+                "SELECT k, v, LEAD(v, 1) OVER (PARTITION BY k ORDER BY v) AS l FROM t",
+            )
             .await
             .expect("LEAD window should lower");
         assert!(has_window(&plan));
         let exprs = find_window_exprs(&plan).unwrap();
         assert!(
-            matches!(exprs[0].func, rockstream_plan::WindowFunc::Lead { offset: 1 }),
+            matches!(
+                exprs[0].func,
+                rockstream_plan::WindowFunc::Lead { offset: 1 }
+            ),
             "expected Lead{{offset:1}}, got {:?}",
             exprs[0].func
         );
@@ -1105,7 +1421,10 @@ mod tests {
         assert!(has_window(&plan));
         let exprs = find_window_exprs(&plan).unwrap();
         assert!(
-            matches!(exprs[0].func, rockstream_plan::WindowFunc::SlidingSum { frame_rows: 3 }),
+            matches!(
+                exprs[0].func,
+                rockstream_plan::WindowFunc::SlidingSum { frame_rows: 3 }
+            ),
             "expected SlidingSum{{frame_rows:3}}, got {:?}",
             exprs[0].func
         );

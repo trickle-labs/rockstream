@@ -45,7 +45,9 @@ pub struct WatermarkState {
 
 impl WatermarkState {
     pub fn new() -> Self {
-        Self { watermark_ms: i64::MIN }
+        Self {
+            watermark_ms: i64::MIN,
+        }
     }
 
     pub fn merge(self, other: Self) -> Self {
@@ -86,7 +88,7 @@ impl CompactionFilter {
             return false;
         }
         // Check discriminator bytes.
-        if key[0] != 0x01 || &key[1..3] != &TW_DISCRIMINATOR {
+        if key[0] != 0x01 || key[1..3] != TW_DISCRIMINATOR {
             return false;
         }
         // op_id is bytes 3..11; window_id is bytes 11..19.
@@ -94,9 +96,7 @@ impl CompactionFilter {
         let window_end = window_id.saturating_add(self.window_size_ms);
 
         // Condition 1: TTL — window has expired including lateness allowance.
-        let ttl_satisfied = window_end
-            .saturating_add(self.allowed_lateness_ms)
-            < self.watermark_ms;
+        let ttl_satisfied = window_end.saturating_add(self.allowed_lateness_ms) < self.watermark_ms;
 
         // Condition 2: frontier gate — input frontier has advanced past window_end.
         let frontier_satisfied = self.frontier_ms > window_end;
@@ -223,11 +223,10 @@ impl TumbleWindowOp {
             };
 
             // Late-data check.
-            if event_time_ms < state.watermark.watermark_ms {
-                match self.late_data_policy {
-                    LateDataPolicy::Drop => continue,
-                    _ => {} // Other policies not yet implemented; treat as drop.
-                }
+            if event_time_ms < state.watermark.watermark_ms
+                && self.late_data_policy == LateDataPolicy::Drop
+            {
+                continue;
             }
 
             // Assign to window.
@@ -239,7 +238,9 @@ impl TumbleWindowOp {
             }
 
             // Advance watermark (MaxRegister).
-            state.watermark = state.watermark.merge(WatermarkState { watermark_ms: event_time_ms });
+            state.watermark = state.watermark.merge(WatermarkState {
+                watermark_ms: event_time_ms,
+            });
 
             let group_key = encode_row(&row_vals);
             let window = state.windows.entry(window_id).or_default();
@@ -281,8 +282,11 @@ impl TumbleWindowOp {
                 .unwrap_or_default();
 
             // Get previous emitted state (clone to avoid borrow conflict).
-            let old_emitted: EmittedMap =
-                state.prev_output.get(&window_id).cloned().unwrap_or_default();
+            let old_emitted: EmittedMap = state
+                .prev_output
+                .get(&window_id)
+                .cloned()
+                .unwrap_or_default();
 
             // Retract rows no longer present.
             for (key, old_vals) in &old_emitted {
@@ -328,7 +332,11 @@ impl TumbleWindowOp {
 fn floor_div(a: i64, b: i64) -> i64 {
     let d = a / b;
     // If they have different signs and there's a remainder, subtract 1.
-    if (a ^ b) < 0 && d * b != a { d - 1 } else { d }
+    if (a ^ b) < 0 && d * b != a {
+        d - 1
+    } else {
+        d
+    }
 }
 
 fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i64> {
@@ -426,24 +434,26 @@ pub async fn persist_tumble_window_state(
     op: &TumbleWindowOp,
     op_id: OperatorId,
 ) -> Result<(), OpError> {
-    let state = op.state.lock().unwrap();
-    let mut batch = WriteBatch::new();
-    let oid = op_id.0;
+    let batch = {
+        let state = op.state.lock().unwrap();
+        let mut batch = WriteBatch::new();
+        let oid = op_id.0;
 
-    // Write window entries.
-    for (&window_id, window_map) in &state.windows {
-        for (group_key, (row_vals, weight)) in window_map {
-            let key = ShardKeyEncoder::tumble_window_key(oid, window_id, group_key);
-            let value = encode_window_value(row_vals, *weight);
-            batch.put(&key, &value);
+        // Write window entries.
+        for (&window_id, window_map) in &state.windows {
+            for (group_key, (row_vals, weight)) in window_map {
+                let key = ShardKeyEncoder::tumble_window_key(oid, window_id, group_key);
+                let value = encode_window_value(row_vals, *weight);
+                batch.put(&key, &value);
+            }
         }
-    }
 
-    // Write watermark.
-    let wm_key = ShardKeyEncoder::watermark_key(oid);
-    batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
+        // Write watermark.
+        let wm_key = ShardKeyEncoder::watermark_key(oid);
+        batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
+        batch
+    };
 
-    drop(state);
     db.write_batch(batch).await.map_err(OpError::storage)?;
     Ok(())
 }
@@ -461,12 +471,15 @@ pub async fn load_tumble_window_state(
     let n_input_cols = op.n_input_cols;
     let oid = op_id.0;
 
-    let mut st = op.state.lock().unwrap();
-
-    // Load window entries.
+    // Load window entries and watermark before locking state.
     let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
     let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
     let prefix_len = prefix.len(); // 1 + 2 + 8 = 11
+
+    let wm_key = ShardKeyEncoder::watermark_key(oid);
+    let wm_bytes = db.get(&wm_key).await.ok().flatten();
+
+    let mut st = op.state.lock().unwrap();
 
     for (key, value) in entries {
         if let Some((row_vals, weight)) = decode_window_value(&value, n_input_cols) {
@@ -474,7 +487,8 @@ pub async fn load_tumble_window_state(
             if key.len() < prefix_len + 8 {
                 continue;
             }
-            let window_id = i64::from_be_bytes(key[prefix_len..prefix_len + 8].try_into().unwrap_or([0; 8]));
+            let window_id =
+                i64::from_be_bytes(key[prefix_len..prefix_len + 8].try_into().unwrap_or([0; 8]));
             let group_key = key[prefix_len + 8..].to_vec();
             st.windows
                 .entry(window_id)
@@ -483,9 +497,7 @@ pub async fn load_tumble_window_state(
         }
     }
 
-    // Load watermark.
-    let wm_key = ShardKeyEncoder::watermark_key(oid);
-    if let Ok(Some(bytes)) = db.get(&wm_key).await {
+    if let Some(bytes) = wm_bytes {
         if bytes.len() >= 8 {
             let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
             st.watermark = WatermarkState { watermark_ms: wm };
@@ -556,17 +568,37 @@ mod tests {
         if zset.is_empty() {
             return;
         }
-        let wid_col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let t_col = zset.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let v_col = zset.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let wid_col = zset
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let t_col = zset
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = zset
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..zset.num_rows() {
-            *state.entry((wid_col.value(i), t_col.value(i), v_col.value(i))).or_insert(0) +=
-                zset.weights[i];
+            *state
+                .entry((wid_col.value(i), t_col.value(i), v_col.value(i)))
+                .or_insert(0) += zset.weights[i];
         }
     }
 
     fn live_rows(state: &HashMap<(i64, i64, i64), i64>) -> Vec<(i64, i64, i64)> {
-        let mut rows: Vec<_> = state.iter().filter(|(_, &w)| w > 0).map(|(&k, _)| k).collect();
+        let mut rows: Vec<_> = state
+            .iter()
+            .filter(|(_, &w)| w > 0)
+            .map(|(&k, _)| k)
+            .collect();
         rows.sort();
         rows
     }
@@ -577,10 +609,9 @@ mod tests {
         let op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
 
         // Epoch 1: two rows in window 0 [0, 1000), one row in window 1 [1000, 2000).
-        let out1 = op.process_epoch(
-            make_input(&[(100, 10, 1), (500, 20, 1), (1500, 30, 1)]),
-            1,
-        ).unwrap();
+        let out1 = op
+            .process_epoch(make_input(&[(100, 10, 1), (500, 20, 1), (1500, 30, 1)]), 1)
+            .unwrap();
 
         let mut net: HashMap<(i64, i64, i64), i64> = Default::default();
         accumulate(&mut net, &out1);
@@ -588,19 +619,28 @@ mod tests {
         let live = live_rows(&net);
         // window_id=0: (0, 100, 10), (0, 500, 20)
         // window_id=1000: (1000, 1500, 30)
-        assert!(live.contains(&(0, 100, 10)), "expected (0, 100, 10) in output");
-        assert!(live.contains(&(0, 500, 20)), "expected (0, 500, 20) in output");
-        assert!(live.contains(&(1000, 1500, 30)), "expected (1000, 1500, 30) in output");
+        assert!(
+            live.contains(&(0, 100, 10)),
+            "expected (0, 100, 10) in output"
+        );
+        assert!(
+            live.contains(&(0, 500, 20)),
+            "expected (0, 500, 20) in output"
+        );
+        assert!(
+            live.contains(&(1000, 1500, 30)),
+            "expected (1000, 1500, 30) in output"
+        );
 
         // Epoch 2: add one row in window 1 (t=1600 >= watermark=1500, not late).
-        let out2 = op.process_epoch(
-            make_input(&[(1600, 40, 1)]),
-            2,
-        ).unwrap();
+        let out2 = op.process_epoch(make_input(&[(1600, 40, 1)]), 2).unwrap();
 
         accumulate(&mut net, &out2);
         let live2 = live_rows(&net);
-        assert!(live2.contains(&(1000, 1600, 40)), "expected (1000, 1600, 40) in epoch 2");
+        assert!(
+            live2.contains(&(1000, 1600, 40)),
+            "expected (1000, 1600, 40) in epoch 2"
+        );
         assert_eq!(op.fill_level(), 4, "4 positive-weight rows total");
     }
 
@@ -641,7 +681,11 @@ mod tests {
         let out3 = op.process_epoch(make_input(&[(50, 10, 1)]), 3).unwrap();
 
         // The late row must NOT appear in the output.
-        assert!(out3.is_empty(), "late row must not appear in output; got {} rows", out3.num_rows());
+        assert!(
+            out3.is_empty(),
+            "late row must not appear in output; got {} rows",
+            out3.num_rows()
+        );
     }
 
     #[test]

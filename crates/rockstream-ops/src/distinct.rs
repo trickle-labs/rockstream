@@ -360,10 +360,8 @@ impl IntersectOp {
             }
         }
 
-        self.fill_level.store(
-            state.left_count() + state.right_count(),
-            Ordering::Relaxed,
-        );
+        self.fill_level
+            .store(state.left_count() + state.right_count(), Ordering::Relaxed);
         drop(state);
 
         build_output(&self.schema, out_rows)
@@ -443,10 +441,8 @@ impl ExceptOp {
             }
         }
 
-        self.fill_level.store(
-            state.left_count() + state.right_count(),
-            Ordering::Relaxed,
-        );
+        self.fill_level
+            .store(state.left_count() + state.right_count(), Ordering::Relaxed);
         drop(state);
 
         build_output(&self.schema, out_rows)
@@ -488,7 +484,7 @@ fn encode_distinct_value(weight: i64, vals: &[i64]) -> Vec<u8> {
 
 /// Decode a distinct storage value into (weight, row_vals).
 fn decode_distinct_value(bytes: &[u8]) -> Option<(i64, Vec<i64>)> {
-    if bytes.len() < 8 || (bytes.len() - 8) % 8 != 0 {
+    if bytes.len() < 8 || !(bytes.len() - 8).is_multiple_of(8) {
         return None;
     }
     let weight = i64::from_be_bytes(bytes[0..8].try_into().ok()?);
@@ -512,20 +508,22 @@ pub async fn persist_distinct_state(
     op: &DistinctOp,
     op_id: OperatorId,
 ) -> Result<(), OpError> {
-    let state = op.state.lock().unwrap();
-    let mut batch = WriteBatch::new();
+    let batch = {
+        let state = op.state.lock().unwrap();
+        let mut batch = WriteBatch::new();
 
-    for (row_bytes, (weight, vals)) in &state.entries {
-        if *weight == 0 {
-            continue;
+        for (row_bytes, (weight, vals)) in &state.entries {
+            if *weight == 0 {
+                continue;
+            }
+            let hash = row_hash_u128(row_bytes);
+            let key = ShardKeyEncoder::distinct_key(op_id.0, hash);
+            let value = encode_distinct_value(*weight, vals);
+            batch.put(&key, &value);
         }
-        let hash = row_hash_u128(row_bytes);
-        let key = ShardKeyEncoder::distinct_key(op_id.0, hash);
-        let value = encode_distinct_value(*weight, vals);
-        batch.put(&key, &value);
-    }
+        batch
+    };
 
-    drop(state);
     db.write_batch(batch).await.map_err(OpError::storage)?;
     Ok(())
 }
@@ -540,10 +538,7 @@ pub async fn load_distinct_state(
     op_id: OperatorId,
 ) -> Result<DistinctOp, OpError> {
     let prefix = ShardKeyEncoder::distinct_op_prefix(op_id.0);
-    let entries = db
-        .scan_prefix(&prefix)
-        .await
-        .map_err(OpError::storage)?;
+    let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
 
     let op = DistinctOp::new(schema);
     let mut state = op.state.lock().unwrap();
@@ -598,8 +593,18 @@ mod tests {
         if zset.is_empty() {
             return out;
         }
-        let k_col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let v_col = zset.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let k_col = zset
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = zset
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..zset.num_rows() {
             out.push(((k_col.value(i), v_col.value(i)), zset.weights[i]));
         }
@@ -656,7 +661,8 @@ mod tests {
     #[test]
     fn distinct_fill_level_tracks_entries() {
         let op = DistinctOp::new(kv_schema());
-        op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)])).unwrap();
+        op.process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+            .unwrap();
         assert_eq!(op.fill_level(), 2);
         op.process_delta(make_batch(&[(1, 10, -1)])).unwrap();
         assert_eq!(op.fill_level(), 1);
@@ -687,7 +693,8 @@ mod tests {
         let op = IntersectOp::new(kv_schema(), false);
         let empty = ArrowZSet::empty(kv_schema());
         // Epoch 1: both sides present → output +1
-        op.process_epoch(make_batch(&[(1, 10, 1)]), make_batch(&[(1, 10, 1)])).unwrap();
+        op.process_epoch(make_batch(&[(1, 10, 1)]), make_batch(&[(1, 10, 1)]))
+            .unwrap();
         // Epoch 2: retract right → output -1
         let out = op.process_epoch(empty, make_batch(&[(1, 10, -1)])).unwrap();
         let pairs = kv_pairs(&out);
@@ -721,7 +728,9 @@ mod tests {
     #[test]
     fn except_set_both_present_no_output() {
         let op = ExceptOp::new(kv_schema(), false);
-        let out = op.process_epoch(make_batch(&[(1, 10, 1)]), make_batch(&[(1, 10, 1)])).unwrap();
+        let out = op
+            .process_epoch(make_batch(&[(1, 10, 1)]), make_batch(&[(1, 10, 1)]))
+            .unwrap();
         assert!(out.is_empty(), "both present: no output for EXCEPT SET");
     }
 
@@ -730,9 +739,12 @@ mod tests {
         let op = ExceptOp::new(kv_schema(), false);
         let empty = ArrowZSet::empty(kv_schema());
         // Both present: no output
-        op.process_epoch(make_batch(&[(1, 10, 1)]), make_batch(&[(1, 10, 1)])).unwrap();
+        op.process_epoch(make_batch(&[(1, 10, 1)]), make_batch(&[(1, 10, 1)]))
+            .unwrap();
         // Retract right: output +1
-        let out = op.process_epoch(empty.clone(), make_batch(&[(1, 10, -1)])).unwrap();
+        let out = op
+            .process_epoch(empty.clone(), make_batch(&[(1, 10, -1)]))
+            .unwrap();
         let pairs = kv_pairs(&out);
         assert_eq!(pairs, vec![((1, 10), 1)]);
     }
@@ -766,7 +778,8 @@ mod tests {
     fn intersect_fill_level_sums_both_sides() {
         let op = IntersectOp::new(kv_schema(), false);
         let empty = ArrowZSet::empty(kv_schema());
-        op.process_epoch(make_batch(&[(1, 10, 1), (2, 20, 1)]), empty.clone()).unwrap();
+        op.process_epoch(make_batch(&[(1, 10, 1), (2, 20, 1)]), empty.clone())
+            .unwrap();
         op.process_epoch(empty, make_batch(&[(1, 10, 1)])).unwrap();
         assert_eq!(op.fill_level(), 3); // 2 left + 1 right
     }

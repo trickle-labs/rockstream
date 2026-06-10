@@ -26,7 +26,7 @@
 //! In v0.7 "partitioned by X" always maps to a single Loopback exchange
 //! because there is only one shard.
 
-use rockstream_plan::{ExchangeKind, PlanNode, WindowExpr, WindowFunc};
+use rockstream_plan::{ExchangeKind, PlanNode};
 
 /// Annotation produced by the distribution pass for a single node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,7 +310,10 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
 
         // Window (v0.11): requires hash-partitioned input by partition_by columns.
         // In single-shard mode, always insert a Loopback exchange on the input.
-        PlanNode::Window { input, window_exprs } => {
+        PlanNode::Window {
+            input,
+            window_exprs,
+        } => {
             let (new_input, _) = distribute(*input);
             let actual_input = PlanNode::Exchange {
                 kind: ExchangeKind::Loopback,
@@ -379,7 +382,9 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rockstream_plan::{AggregateExpr, AggregateFunc, ExchangeKind, Expr, PlanNode};
+    use rockstream_plan::{
+        AggregateExpr, AggregateFunc, ExchangeKind, Expr, PlanNode, WindowExpr, WindowFunc,
+    };
 
     fn source(name: &str) -> PlanNode {
         PlanNode::Source {
@@ -463,7 +468,13 @@ mod tests {
         let result = apply_distribution(plan);
         if let PlanNode::Distinct { input, .. } = &result {
             assert!(
-                matches!(input.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                matches!(
+                    input.as_ref(),
+                    PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        ..
+                    }
+                ),
                 "expected Loopback before Distinct, got: {input:?}"
             );
         } else {
@@ -484,11 +495,23 @@ mod tests {
         let result = apply_distribution(plan);
         if let PlanNode::Intersect { left, right, .. } = &result {
             assert!(
-                matches!(left.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                matches!(
+                    left.as_ref(),
+                    PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        ..
+                    }
+                ),
                 "expected Loopback before Intersect left, got: {left:?}"
             );
             assert!(
-                matches!(right.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                matches!(
+                    right.as_ref(),
+                    PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        ..
+                    }
+                ),
                 "expected Loopback before Intersect right, got: {right:?}"
             );
         } else {
@@ -534,14 +557,29 @@ mod tests {
             right_arr_id: OperatorId(2),
         };
         let result = apply_distribution(plan);
-        if let PlanNode::Except { left, right, all, .. } = &result {
+        if let PlanNode::Except {
+            left, right, all, ..
+        } = &result
+        {
             assert!(*all, "all flag preserved");
             assert!(
-                matches!(left.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                matches!(
+                    left.as_ref(),
+                    PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        ..
+                    }
+                ),
                 "expected Loopback before Except left, got: {left:?}"
             );
             assert!(
-                matches!(right.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                matches!(
+                    right.as_ref(),
+                    PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        ..
+                    }
+                ),
                 "expected Loopback before Except right, got: {right:?}"
             );
         } else {
@@ -562,7 +600,13 @@ mod tests {
         let result = apply_distribution(plan);
         if let PlanNode::TumbleWindow { input, .. } = result {
             assert!(
-                matches!(input.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                matches!(
+                    input.as_ref(),
+                    PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        ..
+                    }
+                ),
                 "expected Loopback before TumbleWindow input, got: {input:?}"
             );
         } else {
@@ -582,7 +626,13 @@ mod tests {
         let result = apply_distribution(plan);
         if let PlanNode::TopK { input, .. } = result {
             assert!(
-                matches!(input.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                matches!(
+                    input.as_ref(),
+                    PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        ..
+                    }
+                ),
                 "expected Loopback before TopK input, got: {input:?}"
             );
         } else {

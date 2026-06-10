@@ -73,8 +73,18 @@ mod proptest_oracle {
         if batch.is_empty() {
             return;
         }
-        let k_col = batch.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let v_col = batch.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let k_col = batch
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = batch
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             let key = (k_col.value(i), v_col.value(i));
             let w = batch.weights[i];
@@ -170,8 +180,7 @@ mod proptest_oracle {
     // ─── Strategies ──────────────────────────────────────────────────────────
 
     fn arb_delta_row() -> impl Strategy<Value = DeltaRow> {
-        (1i64..=5, 1i64..=5, prop_oneof![Just(1i64), Just(-1i64)])
-            .prop_map(|(k, v, w)| (k, v, w))
+        (1i64..=5, 1i64..=5, prop_oneof![Just(1i64), Just(-1i64)]).prop_map(|(k, v, w)| (k, v, w))
     }
 
     fn arb_epoch(max_rows: usize) -> impl Strategy<Value = Vec<DeltaRow>> {

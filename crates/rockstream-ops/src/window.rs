@@ -13,6 +13,8 @@
 //! Metric: `fill_level()` = total rows in arrangement; `oversized_partition_keys()`
 //! = partitions exceeding the threshold (RS-5023 NOTICE in EXPLAIN).
 
+#![allow(clippy::needless_range_loop)]
+
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -189,11 +191,19 @@ fn eval_window_batch(
             WindowFunc::SlidingSum { frame_rows } => {
                 let val_col = expr.order_by.first().copied().unwrap_or(0);
                 for i in 0..n {
-                    let start = if i + 1 >= *frame_rows { i + 1 - frame_rows } else { 0 };
+                    let start = if i + 1 >= *frame_rows {
+                        i + 1 - frame_rows
+                    } else {
+                        0
+                    };
                     let mut sum = 0i64;
                     for j in start..=i {
                         let v = &sorted_rows[j].1;
-                        sum += if val_col < n_input_cols { v[val_col] } else { 0 };
+                        sum += if val_col < n_input_cols {
+                            v[val_col]
+                        } else {
+                            0
+                        };
                     }
                     out[i] = sum;
                 }
@@ -202,12 +212,20 @@ fn eval_window_batch(
             WindowFunc::SlidingAvg { frame_rows } => {
                 let val_col = expr.order_by.first().copied().unwrap_or(0);
                 for i in 0..n {
-                    let start = if i + 1 >= *frame_rows { i + 1 - frame_rows } else { 0 };
+                    let start = if i + 1 >= *frame_rows {
+                        i + 1 - frame_rows
+                    } else {
+                        0
+                    };
                     let count = (i - start + 1) as i64;
                     let mut sum = 0i64;
                     for j in start..=i {
                         let v = &sorted_rows[j].1;
-                        sum += if val_col < n_input_cols { v[val_col] } else { 0 };
+                        sum += if val_col < n_input_cols {
+                            v[val_col]
+                        } else {
+                            0
+                        };
                     }
                     out[i] = if count > 0 { sum / count } else { 0 };
                 }
@@ -274,7 +292,6 @@ pub struct WindowOp {
     n_input_cols: usize,
     window_exprs: Vec<WindowExpr>,
     state: Mutex<WindowState>,
-    db: Option<(Arc<ShardDb>, u64)>,
     fill_level: Arc<AtomicUsize>,
     oversized_partitions: Mutex<Vec<Vec<u8>>>,
 }
@@ -288,7 +305,6 @@ impl WindowOp {
             n_input_cols,
             window_exprs,
             state: Mutex::new(WindowState::new()),
-            db: None,
             fill_level: Arc::new(AtomicUsize::new(0)),
             oversized_partitions: Mutex::new(Vec::new()),
         }
@@ -298,8 +314,8 @@ impl WindowOp {
     pub fn new_with_db(
         schema: SchemaRef,
         window_exprs: Vec<WindowExpr>,
-        db: Arc<ShardDb>,
-        op_id: u64,
+        _db: Arc<ShardDb>,
+        _op_id: u64,
     ) -> Self {
         let n_input_cols = schema.fields().len().saturating_sub(window_exprs.len());
         Self {
@@ -307,7 +323,6 @@ impl WindowOp {
             n_input_cols,
             window_exprs,
             state: Mutex::new(WindowState::new()),
-            db: Some((db, op_id)),
             fill_level: Arc::new(AtomicUsize::new(0)),
             oversized_partitions: Mutex::new(Vec::new()),
         }
@@ -334,8 +349,7 @@ impl WindowOp {
         let mut affected: HashMap<Vec<u8>, ()> = HashMap::new();
         for row_idx in 0..delta.num_rows() {
             let input_vals = extract_vals(&delta.data, row_idx, n_in);
-            let part_key =
-                encode_cols(&self.partition_key_vals(&input_vals));
+            let part_key = encode_cols(&self.partition_key_vals(&input_vals));
             affected.insert(part_key, ());
         }
 
@@ -361,7 +375,7 @@ impl WindowOp {
         let mut all_output: Vec<(Vec<i64>, i64)> = Vec::new();
         let mut new_oversized: Vec<Vec<u8>> = Vec::new();
 
-        for (part_key, _) in &affected {
+        for part_key in affected.keys() {
             let rows_in_part: Vec<(Vec<u8>, Vec<i64>)> = {
                 let part = state.arrangement.get(part_key);
                 // Only include rows with positive accumulated weight.
@@ -384,7 +398,7 @@ impl WindowOp {
 
             // Retract previous output for this partition.
             if let Some(prev) = state.prev_output.get(part_key) {
-                for (_, out_vals) in prev {
+                for out_vals in prev.values() {
                     all_output.push((out_vals.clone(), -1));
                 }
             }
@@ -554,29 +568,31 @@ pub async fn persist_window_state(
     op: &WindowOp,
     op_id: OperatorId,
 ) -> Result<(), OpError> {
-    let state = op.state.lock().unwrap();
-    let mut batch = WriteBatch::new();
-    let oid = op_id.0;
+    let batch = {
+        let state = op.state.lock().unwrap();
+        let mut batch = WriteBatch::new();
+        let oid = op_id.0;
 
-    // Write arrangement entries (all weights, including zero/negative, for crash-replay).
-    for (part_key, part_map) in &state.arrangement {
-        for (row_id, (order_key, input_vals, weight)) in part_map {
-            let key = ShardKeyEncoder::window_arr_key(oid, part_key, order_key, *row_id);
-            let value = encode_arr_value(order_key, input_vals, *weight);
-            batch.put(&key, &value);
+        // Write arrangement entries (all weights, including zero/negative, for crash-replay).
+        for (part_key, part_map) in &state.arrangement {
+            for (row_id, (order_key, input_vals, weight)) in part_map {
+                let key = ShardKeyEncoder::window_arr_key(oid, part_key, order_key, *row_id);
+                let value = encode_arr_value(order_key, input_vals, *weight);
+                batch.put(&key, &value);
+            }
         }
-    }
 
-    // Write output cache entries.
-    for (part_key, out_map) in &state.prev_output {
-        for (out_hash, out_vals) in out_map {
-            let key = ShardKeyEncoder::window_prev_output_key(oid, part_key, *out_hash);
-            let value = encode_output_value(out_vals);
-            batch.put(&key, &value);
+        // Write output cache entries.
+        for (part_key, out_map) in &state.prev_output {
+            for (out_hash, out_vals) in out_map {
+                let key = ShardKeyEncoder::window_prev_output_key(oid, part_key, *out_hash);
+                let value = encode_output_value(out_vals);
+                batch.put(&key, &value);
+            }
         }
-    }
+        batch
+    };
 
-    drop(state);
     db.write_batch(batch).await.map_err(OpError::storage)?;
     Ok(())
 }
@@ -592,15 +608,28 @@ pub async fn load_window_state(
     let n_output_cols = schema.fields().len();
     let oid = op_id.0;
 
-    let op = WindowOp::new(schema, window_exprs);
-    let mut state = op.state.lock().unwrap();
-
-    // Load arrangement from OpState prefix.
+    // Load arrangement from OpState prefix before locking state.
     let arr_prefix = ShardKeyEncoder::window_arr_op_prefix(oid);
     let arr_entries = db
         .scan_prefix(&arr_prefix)
         .await
         .map_err(OpError::storage)?;
+
+    // Load output cache from OpIndex prefix before locking state.
+    let out_prefix_base = {
+        let mut p = Vec::with_capacity(1 + 2 + 8);
+        p.push(0x02u8); // OpIndex
+        p.extend_from_slice(&[0x57, 0x4E]);
+        p.extend_from_slice(&oid.to_be_bytes());
+        p
+    };
+    let out_entries = db
+        .scan_prefix(&out_prefix_base)
+        .await
+        .map_err(OpError::storage)?;
+
+    let op = WindowOp::new(schema, window_exprs);
+    let mut state = op.state.lock().unwrap();
 
     // We need to extract part_key from the stored key.
     // Key format: [0x01][WN][op_id:8][part_key][order_key][row_id:16]
@@ -625,19 +654,6 @@ pub async fn load_window_state(
                 .insert(row_id, (order_key, input_vals, weight));
         }
     }
-
-    // Load output cache from OpIndex prefix.
-    let out_prefix_base = {
-        let mut p = Vec::with_capacity(1 + 2 + 8);
-        p.push(0x02u8); // OpIndex
-        p.extend_from_slice(&[0x57, 0x4E]);
-        p.extend_from_slice(&oid.to_be_bytes());
-        p
-    };
-    let out_entries = db
-        .scan_prefix(&out_prefix_base)
-        .await
-        .map_err(OpError::storage)?;
 
     for (key, value) in out_entries {
         if let Some(out_vals) = decode_output_value(&value, n_output_cols) {
@@ -711,9 +727,24 @@ mod tests {
         if zset.is_empty() {
             return vec![];
         }
-        let k_col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let v_col = zset.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let r_col = zset.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let k_col = zset
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = zset
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let r_col = zset
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let mut rows = vec![];
         for i in 0..zset.num_rows() {
             if zset.weights[i] > 0 {
@@ -795,13 +826,7 @@ mod tests {
     fn window_row_number_basic() {
         // 5 rows in one partition, ordered by v = 10,20,30,40,50.
         let op = WindowOp::new(schema_kv_rn(), vec![rn_expr()]);
-        let delta = make_input(&[
-            (1, 30, 1),
-            (1, 10, 1),
-            (1, 50, 1),
-            (1, 20, 1),
-            (1, 40, 1),
-        ]);
+        let delta = make_input(&[(1, 30, 1), (1, 10, 1), (1, 50, 1), (1, 20, 1), (1, 40, 1)]);
         let out = op.process_epoch(delta, 1).unwrap();
         let rows = collect_output(&out);
         // Output should be (k, v, rn). Sort by v to check row numbers.
@@ -820,9 +845,12 @@ mod tests {
         // Rank: 1,1,3,3,5,5 (gap after ties)
         let op = WindowOp::new(schema_kv_rn(), vec![rank_expr()]);
         let delta = make_input(&[
-            (1, 10, 1), (2, 10, 1),
-            (3, 20, 1), (4, 20, 1),
-            (5, 30, 1), (6, 30, 1),
+            (1, 10, 1),
+            (2, 10, 1),
+            (3, 20, 1),
+            (4, 20, 1),
+            (5, 30, 1),
+            (6, 30, 1),
         ]);
         let out = op.process_epoch(delta, 1).unwrap();
         let rows = collect_output(&out);
@@ -842,9 +870,12 @@ mod tests {
         // DenseRank: 1,1,2,2,3,3 (no gaps)
         let op = WindowOp::new(schema_kv_rn(), vec![dense_rank_expr()]);
         let delta = make_input(&[
-            (1, 10, 1), (2, 10, 1),
-            (3, 20, 1), (4, 20, 1),
-            (5, 30, 1), (6, 30, 1),
+            (1, 10, 1),
+            (2, 10, 1),
+            (3, 20, 1),
+            (4, 20, 1),
+            (5, 30, 1),
+            (6, 30, 1),
         ]);
         let out = op.process_epoch(delta, 1).unwrap();
         let rows = collect_output(&out);
@@ -889,9 +920,7 @@ mod tests {
         // 5 rows ordered by v = 1,2,3,4,5; frame=3
         // SlidingSum: 1, 1+2=3, 1+2+3=6, 2+3+4=9, 3+4+5=12
         let op = WindowOp::new(schema_kv_result(), vec![sliding_sum_expr(3)]);
-        let delta = make_input(&[
-            (1, 1, 1), (1, 2, 1), (1, 3, 1), (1, 4, 1), (1, 5, 1),
-        ]);
+        let delta = make_input(&[(1, 1, 1), (1, 2, 1), (1, 3, 1), (1, 4, 1), (1, 5, 1)]);
         let out = op.process_epoch(delta, 1).unwrap();
         let rows = collect_output(&out);
         let mut by_v: Vec<(i64, i64)> = rows.iter().map(|(_, v, r)| (*v, *r)).collect();
@@ -904,9 +933,7 @@ mod tests {
         // 5 rows ordered by v = 10,20,30,40,50; frame=3
         // SlidingAvg: 10/1=10, (10+20)/2=15, (10+20+30)/3=20, (20+30+40)/3=30, (30+40+50)/3=40
         let op = WindowOp::new(schema_kv_result(), vec![sliding_avg_expr(3)]);
-        let delta = make_input(&[
-            (1, 10, 1), (1, 20, 1), (1, 30, 1), (1, 40, 1), (1, 50, 1),
-        ]);
+        let delta = make_input(&[(1, 10, 1), (1, 20, 1), (1, 30, 1), (1, 40, 1), (1, 50, 1)]);
         let out = op.process_epoch(delta, 1).unwrap();
         let rows = collect_output(&out);
         let mut by_v: Vec<(i64, i64)> = rows.iter().map(|(_, v, r)| (*v, *r)).collect();
@@ -950,13 +977,14 @@ mod tests {
         // Verify that cost is proportional to the touched partition, not all rows.
         use std::time::Instant;
 
-        let op = WindowOp::new(schema_kv_rn(), vec![
-            WindowExpr {
+        let op = WindowOp::new(
+            schema_kv_rn(),
+            vec![WindowExpr {
                 func: WindowFunc::RowNumber,
                 partition_by: vec![0], // partition by k
                 order_by: vec![1],
-            }
-        ]);
+            }],
+        );
 
         // Epoch 1: fill partition k=0 with 1000 rows, partition k=1 with 1000 rows.
         let rows_p0: Vec<(i64, i64, i64)> = (0..1000).map(|i| (0, i, 1)).collect();

@@ -25,7 +25,7 @@
 //! (the `AggState`): for each input delta `(k, v, w)`, the rule is:
 //! `Δagg(k) = (new_agg(k), +1) ⊎ (old_agg(k), -1)` when the state changes.
 
-use rockstream_plan::{LateDataPolicy, OpKind, OpNode, PlanNode, WindowFunc, WindowStrategy};
+use rockstream_plan::{OpKind, OpNode, PlanNode, WindowFunc, WindowStrategy};
 use rockstream_types::{explain::NotMergeSafeReason, ids::OperatorId};
 
 /// Error returned by the differentiation pass.
@@ -238,7 +238,9 @@ impl DiffCtx {
             }
 
             // ── Intersect (v0.10 — IVM-6) ────────────────────────────────
-            PlanNode::Intersect { left, right, all, .. } => {
+            PlanNode::Intersect {
+                left, right, all, ..
+            } => {
                 let left_id = self.diff_node(left, ops)?;
                 let right_id = self.diff_node(right, ops)?;
                 let id = self.next_op_id();
@@ -253,7 +255,9 @@ impl DiffCtx {
             }
 
             // ── Except (v0.10 — IVM-6) ───────────────────────────────────
-            PlanNode::Except { left, right, all, .. } => {
+            PlanNode::Except {
+                left, right, all, ..
+            } => {
                 let left_id = self.diff_node(left, ops)?;
                 let right_id = self.diff_node(right, ops)?;
                 let id = self.next_op_id();
@@ -268,7 +272,10 @@ impl DiffCtx {
             }
 
             // ── Window (v0.11 — IVM-7) ────────────────────────────────────────
-            PlanNode::Window { input, window_exprs } => {
+            PlanNode::Window {
+                input,
+                window_exprs,
+            } => {
                 let input_id = self.diff_node(input, ops)?;
                 let id = self.next_op_id();
                 let strategy = if window_exprs.iter().any(|e| {
@@ -332,6 +339,40 @@ impl DiffCtx {
                     merge_law: None,
                     not_merge_safe_reason: None,
                     inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
+            // ── Snapshot (v0.13) ──────────────────────────────────────────
+            PlanNode::Snapshot {
+                source_name,
+                batch_size,
+            } => {
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Snapshot {
+                        source_name: source_name.clone(),
+                        batch_size: *batch_size,
+                    },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![],
+                });
+                Ok(id)
+            }
+
+            // ── ViewRef (v0.13) ───────────────────────────────────────────
+            PlanNode::ViewRef { view_name } => {
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::ViewRef {
+                        view_name: view_name.clone(),
+                    },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![],
                 });
                 Ok(id)
             }
@@ -461,7 +502,10 @@ mod tests {
         let mut ctx = DiffCtx::new();
         let physical = ctx.differentiate(&plan).unwrap();
         assert_eq!(physical.ops.len(), 2);
-        let tw_op = physical.ops.iter().find(|op| matches!(op.kind, OpKind::TumbleWindow { .. }));
+        let tw_op = physical
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::TumbleWindow { .. }));
         assert!(tw_op.is_some(), "must contain exactly one TumbleWindow op");
         if let OpKind::TumbleWindow { window_size_ms, .. } = &tw_op.unwrap().kind {
             assert_eq!(*window_size_ms, 1000);
@@ -480,9 +524,17 @@ mod tests {
         let mut ctx = DiffCtx::new();
         let physical = ctx.differentiate(&plan).unwrap();
         assert_eq!(physical.ops.len(), 2);
-        let tk_op = physical.ops.iter().find(|op| matches!(op.kind, OpKind::TopK { .. }));
+        let tk_op = physical
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::TopK { .. }));
         assert!(tk_op.is_some(), "must contain exactly one TopK op");
-        if let OpKind::TopK { k, rank_col, partition_by } = &tk_op.unwrap().kind {
+        if let OpKind::TopK {
+            k,
+            rank_col,
+            partition_by,
+        } = &tk_op.unwrap().kind
+        {
             assert_eq!(*k, 5);
             assert_eq!(*rank_col, 1);
             assert_eq!(*partition_by, vec![0]);
@@ -524,7 +576,9 @@ mod tests {
             .expect("Window op must be present");
         assert_eq!(
             window_op.kind,
-            OpKind::Window { strategy: WindowStrategy::PartitionRecompute }
+            OpKind::Window {
+                strategy: WindowStrategy::PartitionRecompute
+            }
         );
         assert_eq!(
             window_op.not_merge_safe_reason,
@@ -553,7 +607,9 @@ mod tests {
             .expect("Window op must be present");
         assert_eq!(
             window_op.kind,
-            OpKind::Window { strategy: WindowStrategy::SlidingAggregate }
+            OpKind::Window {
+                strategy: WindowStrategy::SlidingAggregate
+            }
         );
     }
 

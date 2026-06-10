@@ -31,9 +31,9 @@ mod proptest_oracle {
 
     fn schema_vpk() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("v", DataType::Int64, false),   // rank_col = 0
+            Field::new("v", DataType::Int64, false), // rank_col = 0
             Field::new("id", DataType::Int64, false),
-            Field::new("pk", DataType::Int64, false),  // partition_col = 2
+            Field::new("pk", DataType::Int64, false), // partition_col = 2
         ]))
     }
 
@@ -58,13 +58,30 @@ mod proptest_oracle {
 
     /// Accumulate (pk, v, id) → net_weight into the given map.
     fn accumulate_state(acc: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
-        if batch.is_empty() { return; }
-        let v_col = batch.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let id_col = batch.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let pk_col = batch.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        if batch.is_empty() {
+            return;
+        }
+        let v_col = batch
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let id_col = batch
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let pk_col = batch
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..batch.num_rows() {
-            *acc.entry((pk_col.value(i), v_col.value(i), id_col.value(i))).or_insert(0) +=
-                batch.weights[i];
+            *acc.entry((pk_col.value(i), v_col.value(i), id_col.value(i)))
+                .or_insert(0) += batch.weights[i];
         }
     }
 
@@ -81,11 +98,16 @@ mod proptest_oracle {
     ///
     /// Per partition: sort by v descending, then full row bytes ascending
     /// (same tiebreaker as TopKOp::process_epoch), take K.
-    fn batch_topk(state: &BTreeMap<(i64, i64, i64), i64>, k: usize) -> BTreeMap<(i64, i64, i64), i64> {
+    fn batch_topk(
+        state: &BTreeMap<(i64, i64, i64), i64>,
+        k: usize,
+    ) -> BTreeMap<(i64, i64, i64), i64> {
         // Group by partition key.
         let mut by_pk: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
         for (&(pk, v, id), &w) in state {
-            if w <= 0 { continue; }
+            if w <= 0 {
+                continue;
+            }
             by_pk.entry(pk).or_default().push((v, id));
         }
 
@@ -93,9 +115,8 @@ mod proptest_oracle {
         for (pk, mut rows) in by_pk {
             // Sort by v descending, then full row bytes ascending (matches TopKOp sort).
             rows.sort_by(|a, b| {
-                b.0.cmp(&a.0).then_with(|| {
-                    encode_row_key(a.0, a.1, pk).cmp(&encode_row_key(b.0, b.1, pk))
-                })
+                b.0.cmp(&a.0)
+                    .then_with(|| encode_row_key(a.0, a.1, pk).cmp(&encode_row_key(b.0, b.1, pk)))
             });
             for (v, id) in rows.into_iter().take(k) {
                 result.insert((pk, v, id), 1);
@@ -106,18 +127,38 @@ mod proptest_oracle {
 
     /// Accumulate incremental output into a running top-K state map.
     fn accumulate_output(out: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
-        if batch.is_empty() { return; }
-        let v_col = batch.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let id_col = batch.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let pk_col = batch.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        if batch.is_empty() {
+            return;
+        }
+        let v_col = batch
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let id_col = batch
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let pk_col = batch
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..batch.num_rows() {
-            *out.entry((pk_col.value(i), v_col.value(i), id_col.value(i))).or_insert(0) +=
-                batch.weights[i];
+            *out.entry((pk_col.value(i), v_col.value(i), id_col.value(i)))
+                .or_insert(0) += batch.weights[i];
         }
     }
 
     fn positive_entries(map: &BTreeMap<(i64, i64, i64), i64>) -> BTreeMap<(i64, i64, i64), i64> {
-        map.iter().filter(|(_, &w)| w > 0).map(|(&k, &w)| (k, w)).collect()
+        map.iter()
+            .filter(|(_, &w)| w > 0)
+            .map(|(&k, &w)| (k, w))
+            .collect()
     }
 
     // ─── Oracle strategy ──────────────────────────────────────────────────────
@@ -127,9 +168,9 @@ mod proptest_oracle {
         prop::collection::vec(
             prop::collection::vec(
                 (
-                    1i64..=20i64,  // rank_value
-                    1i64..=30i64,  // id (unique per row in a epoch)
-                    1i64..=3i64,   // partition_key
+                    1i64..=20i64, // rank_value
+                    1i64..=30i64, // id (unique per row in a epoch)
+                    1i64..=3i64,  // partition_key
                     prop_oneof![Just(1i64), Just(-1i64)],
                 )
                     .prop_map(|(v, id, pk, w)| (v, id, pk, w)),

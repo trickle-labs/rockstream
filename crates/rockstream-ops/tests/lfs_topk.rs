@@ -46,15 +46,26 @@ fn make_input(rows: &[(i64, i64, i64)]) -> ArrowZSet {
 }
 
 fn accumulate_vals(state: &mut HashMap<i64, i64>, zset: &ArrowZSet) {
-    if zset.is_empty() { return; }
-    let col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    if zset.is_empty() {
+        return;
+    }
+    let col = zset
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     for i in 0..zset.num_rows() {
         *state.entry(col.value(i)).or_insert(0) += zset.weights[i];
     }
 }
 
 fn live_vals(state: &HashMap<i64, i64>) -> Vec<i64> {
-    let mut vals: Vec<i64> = state.iter().filter(|(_, &w)| w > 0).map(|(&v, _)| v).collect();
+    let mut vals: Vec<i64> = state
+        .iter()
+        .filter(|(_, &w)| w > 0)
+        .map(|(&v, _)| v)
+        .collect();
     vals.sort_by(|a, b| b.cmp(a));
     vals
 }
@@ -78,7 +89,12 @@ async fn lfs_topk_state_persists() {
         let db = open_shard(&dir).await;
         let op = TopKOp::new(schema_kv(), k, 0, vec![]);
 
-        let out1 = op.process_epoch(make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1)]), 1).unwrap();
+        let out1 = op
+            .process_epoch(
+                make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1)]),
+                1,
+            )
+            .unwrap();
         accumulate_vals(&mut net_state, &out1);
         assert_eq!(live_vals(&net_state), vec![10, 8, 6]);
 
@@ -90,7 +106,12 @@ async fn lfs_topk_state_persists() {
 
         persist_topk_state(&db, &op, op_id).await.unwrap();
         db.flush().await.unwrap();
-        Arc::try_unwrap(db).ok().expect("single owner").close().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
     }
 
     // ── Epoch 3: reopen, load, verify top-K is correct ───────────────────
@@ -107,7 +128,12 @@ async fn lfs_topk_state_persists() {
         accumulate_vals(&mut net_state, &out3);
         assert_eq!(live_vals(&net_state), vec![9, 8, 6]);
 
-        Arc::try_unwrap(db).ok().expect("single owner").close().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
     }
 }
 
@@ -123,7 +149,11 @@ async fn lfs_topk_crash_replay() {
     {
         let db = open_shard(&dir).await;
         let op = TopKOp::new(schema_kv(), k, 0, vec![]);
-        op.process_epoch(make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1)]), 1).unwrap();
+        op.process_epoch(
+            make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1)]),
+            1,
+        )
+        .unwrap();
         assert_eq!(op.fill_level(), 4);
         persist_topk_state(&db, &op, op_id).await.unwrap();
         // Simulate crash: drop without flush.
@@ -144,7 +174,12 @@ async fn lfs_topk_crash_replay() {
         let mut crash_state: HashMap<i64, i64> = Default::default();
         // Reconstruct epoch 1 output.
         let init_op = TopKOp::new(schema_kv(), k, 0, vec![]);
-        let init_out = init_op.process_epoch(make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1)]), 1).unwrap();
+        let init_out = init_op
+            .process_epoch(
+                make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1)]),
+                1,
+            )
+            .unwrap();
         accumulate_vals(&mut crash_state, &init_out);
         // Epoch 2: insert v=7, outranks v=6.
         let out2 = op.process_epoch(make_input(&[(7, 5, 1)]), 2).unwrap();
@@ -154,16 +189,29 @@ async fn lfs_topk_crash_replay() {
         // Non-crash path.
         let fresh_op = TopKOp::new(schema_kv(), k, 0, vec![]);
         let mut fresh_state: HashMap<i64, i64> = Default::default();
-        let f1 = fresh_op.process_epoch(make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1)]), 1).unwrap();
+        let f1 = fresh_op
+            .process_epoch(
+                make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1)]),
+                1,
+            )
+            .unwrap();
         accumulate_vals(&mut fresh_state, &f1);
         let f2 = fresh_op.process_epoch(make_input(&[(7, 5, 1)]), 2).unwrap();
         accumulate_vals(&mut fresh_state, &f2);
         let fresh_live = live_vals(&fresh_state);
 
-        assert_eq!(crash_live, fresh_live, "crash-replay bit-identical to non-crash path");
+        assert_eq!(
+            crash_live, fresh_live,
+            "crash-replay bit-identical to non-crash path"
+        );
         assert_eq!(crash_live, vec![10, 8, 7]);
 
-        Arc::try_unwrap(db).ok().expect("single owner").close().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
     }
 }
 

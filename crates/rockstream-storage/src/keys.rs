@@ -310,14 +310,8 @@ impl ShardKeyEncoder {
     /// Encode a Window input arrangement entry key.
     ///
     /// Format: `[0x01 (OpState)][0x57 0x4E ('WN')][op_id:8][part_key][order_key][row_id:16]`
-    pub fn window_arr_key(
-        op_id: u64,
-        part_key: &[u8],
-        order_key: &[u8],
-        row_id: u128,
-    ) -> Vec<u8> {
-        let mut key =
-            Vec::with_capacity(1 + 2 + 8 + part_key.len() + order_key.len() + 16);
+    pub fn window_arr_key(op_id: u64, part_key: &[u8], order_key: &[u8], row_id: u128) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 8 + part_key.len() + order_key.len() + 16);
         key.push(ShardPrefix::OpState.as_byte());
         key.extend_from_slice(&WINDOW_DISCRIMINATOR);
         key.extend_from_slice(&op_id.to_be_bytes());
@@ -722,7 +716,10 @@ mod tests {
 
         // Two keys with different window_id sort in ascending window_id order.
         let key_b = ShardKeyEncoder::tumble_window_key(op_id, window_id_b, group_key);
-        assert!(key_a < key_b, "window_id=1000 must sort before window_id=2000");
+        assert!(
+            key_a < key_b,
+            "window_id=1000 must sort before window_id=2000"
+        );
 
         // Op prefix is a proper prefix of window key.
         let op_prefix = ShardKeyEncoder::tumble_window_op_prefix(op_id);

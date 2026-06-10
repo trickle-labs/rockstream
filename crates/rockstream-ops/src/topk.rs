@@ -104,12 +104,7 @@ pub struct TopKOp {
 
 impl TopKOp {
     /// Create an in-memory TopKOp (no LFS persistence).
-    pub fn new(
-        schema: SchemaRef,
-        k: usize,
-        rank_col: usize,
-        partition_by: Vec<usize>,
-    ) -> Self {
+    pub fn new(schema: SchemaRef, k: usize, rank_col: usize, partition_by: Vec<usize>) -> Self {
         let n_input_cols = schema.fields().len();
         Self {
             schema,
@@ -150,7 +145,10 @@ impl TopKOp {
             let part_key = self.partition_key_bytes(&row_vals);
             let row_id = row_id_hash(&row_vals);
 
-            let part = state.partitions.entry(part_key.clone()).or_insert_with(PartitionState::new);
+            let part = state
+                .partitions
+                .entry(part_key.clone())
+                .or_insert_with(PartitionState::new);
 
             // Update the buffer entry's net_weight (handles over-retractions correctly).
             // Buffer admits all new entries up to 2K positive-weight entries.
@@ -169,20 +167,43 @@ impl TopKOp {
                 }
             } else if w < 0 {
                 // Over-retraction: track the debt so future insertions cancel correctly.
-                part.buffer.insert(row_id, BufferEntry { rank_value, row_vals, net_weight: w });
+                part.buffer.insert(
+                    row_id,
+                    BufferEntry {
+                        rank_value,
+                        row_vals,
+                        net_weight: w,
+                    },
+                );
             } else {
                 // New positive-weight entry.
                 if positive_count < buffer_limit {
-                    part.buffer.insert(row_id, BufferEntry { rank_value, row_vals, net_weight: w });
+                    part.buffer.insert(
+                        row_id,
+                        BufferEntry {
+                            rank_value,
+                            row_vals,
+                            net_weight: w,
+                        },
+                    );
                 } else {
                     // Buffer full: insert only if new entry outranks the worst positive-weight entry.
                     let new_sort_key = encode_row(&row_vals);
-                    if let Some((worst_id, worst_rv, worst_key)) = self.buffer_worst_positive(&part.buffer) {
+                    if let Some((worst_id, worst_rv, worst_key)) =
+                        self.buffer_worst_positive(&part.buffer)
+                    {
                         let new_beats_worst = rank_value > worst_rv
                             || (rank_value == worst_rv && new_sort_key < worst_key);
                         if new_beats_worst {
                             part.buffer.remove(&worst_id);
-                            part.buffer.insert(row_id, BufferEntry { rank_value, row_vals: row_vals, net_weight: w });
+                            part.buffer.insert(
+                                row_id,
+                                BufferEntry {
+                                    rank_value,
+                                    row_vals,
+                                    net_weight: w,
+                                },
+                            );
                         }
                     }
                 }
@@ -208,7 +229,10 @@ impl TopKOp {
                 .filter(|(_, e)| e.net_weight > 0)
                 .map(|(&rid, e)| (e.rank_value, rid, e.row_vals.clone()))
                 .collect();
-            sorted.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2))));
+            sorted.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2)))
+            });
             let new_topk: HashMap<u128, Vec<i64>> = sorted
                 .iter()
                 .take(self.k)
@@ -242,7 +266,11 @@ impl TopKOp {
     fn partition_key_bytes(&self, row_vals: &[i64]) -> Vec<u8> {
         let mut key = Vec::with_capacity(self.partition_by.len() * 8);
         for &col in &self.partition_by {
-            let v = if col < self.n_input_cols { row_vals[col] } else { 0 };
+            let v = if col < self.n_input_cols {
+                row_vals[col]
+            } else {
+                0
+            };
             key.extend_from_slice(&v.to_be_bytes());
         }
         key
@@ -250,7 +278,10 @@ impl TopKOp {
 
     /// Find the worst positive-weight entry in the buffer by (rank_value desc, encode_row asc).
     /// Returns (row_id, rank_value, sort_key_bytes) of the worst (last in sort order).
-    fn buffer_worst_positive(&self, buffer: &HashMap<u128, BufferEntry>) -> Option<(u128, i64, Vec<u8>)> {
+    fn buffer_worst_positive(
+        &self,
+        buffer: &HashMap<u128, BufferEntry>,
+    ) -> Option<(u128, i64, Vec<u8>)> {
         buffer
             .iter()
             .filter(|(_, e)| e.net_weight > 0)
@@ -260,7 +291,6 @@ impl TopKOp {
                 // Smallest in desc order = lowest rank_value, then largest bytes.
                 a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2))
             })
-            .map(|(rid, rv, key)| (rid, rv, key))
     }
 }
 
@@ -379,19 +409,21 @@ pub async fn persist_topk_state(
     op: &TopKOp,
     op_id: OperatorId,
 ) -> Result<(), OpError> {
-    let state = op.state.lock().unwrap();
-    let mut batch = WriteBatch::new();
-    let oid = op_id.0;
+    let batch = {
+        let state = op.state.lock().unwrap();
+        let mut batch = WriteBatch::new();
+        let oid = op_id.0;
 
-    for (part_key, part) in &state.partitions {
-        for (&row_id, entry) in &part.buffer {
-            let key = ShardKeyEncoder::topk_key(oid, part_key, entry.rank_value, row_id);
-            let value = encode_topk_value(entry.rank_value, entry.net_weight, &entry.row_vals);
-            batch.put(&key, &value);
+        for (part_key, part) in &state.partitions {
+            for (&row_id, entry) in &part.buffer {
+                let key = ShardKeyEncoder::topk_key(oid, part_key, entry.rank_value, row_id);
+                let value = encode_topk_value(entry.rank_value, entry.net_weight, &entry.row_vals);
+                batch.put(&key, &value);
+            }
         }
-    }
+        batch
+    };
 
-    drop(state);
     db.write_batch(batch).await.map_err(OpError::storage)?;
     Ok(())
 }
@@ -409,12 +441,12 @@ pub async fn load_topk_state(
     let n_input_cols = op.n_input_cols;
     let oid = op_id.0;
 
-    let mut st = op.state.lock().unwrap();
-
     let prefix = ShardKeyEncoder::topk_op_prefix(oid);
     let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
     // Key format: [0x01][TK][op_id:8][part_key:var][value_desc:8][row_id:16]
     let prefix_len = prefix.len(); // 1 + 2 + 8 = 11
+
+    let mut st = op.state.lock().unwrap();
 
     for (key, value) in entries {
         if key.len() < prefix_len + 8 + 16 {
@@ -432,7 +464,14 @@ pub async fn load_topk_state(
                     .entry(part_key)
                     .or_insert_with(PartitionState::new)
                     .buffer
-                    .insert(row_id, BufferEntry { rank_value, row_vals, net_weight });
+                    .insert(
+                        row_id,
+                        BufferEntry {
+                            rank_value,
+                            row_vals,
+                            net_weight,
+                        },
+                    );
             }
         }
     }
@@ -445,7 +484,10 @@ pub async fn load_topk_state(
             .filter(|(_, e)| e.net_weight > 0)
             .map(|(&rid, e)| (e.rank_value, rid, e.row_vals.clone()))
             .collect();
-        sorted.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2))));
+        sorted.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2)))
+        });
         part.emitted = sorted
             .iter()
             .take(k)
@@ -489,7 +531,12 @@ mod tests {
     }
 
     fn live_vals(zset: &ArrowZSet) -> Vec<i64> {
-        let col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let col = zset
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let mut vals: Vec<(i64, i64)> = (0..zset.num_rows())
             .map(|i| (col.value(i), zset.weights[i]))
             .filter(|(_, w)| *w > 0)
@@ -500,15 +547,26 @@ mod tests {
     }
 
     fn accumulate_vals(state: &mut HashMap<i64, i64>, zset: &ArrowZSet) {
-        if zset.is_empty() { return; }
-        let col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        if zset.is_empty() {
+            return;
+        }
+        let col = zset
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..zset.num_rows() {
             *state.entry(col.value(i)).or_insert(0) += zset.weights[i];
         }
     }
 
     fn live_from_map(state: &HashMap<i64, i64>) -> Vec<i64> {
-        let mut vals: Vec<i64> = state.iter().filter(|(_, &w)| w > 0).map(|(&v, _)| v).collect();
+        let mut vals: Vec<i64> = state
+            .iter()
+            .filter(|(_, &w)| w > 0)
+            .map(|(&v, _)| v)
+            .collect();
         vals.sort_by(|a, b| b.cmp(a));
         vals
     }
@@ -519,10 +577,12 @@ mod tests {
         let op = TopKOp::new(schema_kv(), k, 0, vec![]);
 
         // Insert K+2 rows in non-monotone order: values [1, 10, 5, 7, 3].
-        let out = op.process_epoch(
-            make_input(&[(1, 1, 1), (10, 2, 1), (5, 3, 1), (7, 4, 1), (3, 5, 1)]),
-            1,
-        ).unwrap();
+        let out = op
+            .process_epoch(
+                make_input(&[(1, 1, 1), (10, 2, 1), (5, 3, 1), (7, 4, 1), (3, 5, 1)]),
+                1,
+            )
+            .unwrap();
 
         let mut state: HashMap<i64, i64> = Default::default();
         accumulate_vals(&mut state, &out);
@@ -538,10 +598,19 @@ mod tests {
         let op = TopKOp::new(schema_kv(), k, 0, vec![]);
 
         // Insert 6 rows: [10, 8, 6, 4, 2, 1].
-        let out1 = op.process_epoch(
-            make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1), (4, 4, 1), (2, 5, 1), (1, 6, 1)]),
-            1,
-        ).unwrap();
+        let out1 = op
+            .process_epoch(
+                make_input(&[
+                    (10, 1, 1),
+                    (8, 2, 1),
+                    (6, 3, 1),
+                    (4, 4, 1),
+                    (2, 5, 1),
+                    (1, 6, 1),
+                ]),
+                1,
+            )
+            .unwrap();
         let mut net: HashMap<i64, i64> = Default::default();
         accumulate_vals(&mut net, &out1);
         assert_eq!(live_from_map(&net), vec![10, 8, 6]);
@@ -568,10 +637,9 @@ mod tests {
         let op = TopKOp::new(schema_kv(), k, 0, vec![]);
 
         // Insert K rows: [10, 8, 6].
-        let out1 = op.process_epoch(
-            make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1)]),
-            1,
-        ).unwrap();
+        let out1 = op
+            .process_epoch(make_input(&[(10, 1, 1), (8, 2, 1), (6, 3, 1)]), 1)
+            .unwrap();
         let mut net: HashMap<i64, i64> = Default::default();
         accumulate_vals(&mut net, &out1);
         assert_eq!(live_from_map(&net), vec![10, 8, 6]);
@@ -584,7 +652,12 @@ mod tests {
         assert_eq!(live2, vec![10, 8, 7], "v=7 displaces v=6: {live2:?}");
 
         // Verify delta contains one retraction (v=6) and one insertion (v=7).
-        let v_col = out2.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let v_col = out2
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let retractions: Vec<i64> = (0..out2.num_rows())
             .filter(|&i| out2.weights[i] < 0)
             .map(|i| v_col.value(i))
@@ -593,7 +666,15 @@ mod tests {
             .filter(|&i| out2.weights[i] > 0)
             .map(|i| v_col.value(i))
             .collect();
-        assert_eq!(retractions, vec![6], "expected retraction of v=6: {retractions:?}");
-        assert_eq!(insertions, vec![7], "expected insertion of v=7: {insertions:?}");
+        assert_eq!(
+            retractions,
+            vec![6],
+            "expected retraction of v=6: {retractions:?}"
+        );
+        assert_eq!(
+            insertions,
+            vec![7],
+            "expected insertion of v=7: {insertions:?}"
+        );
     }
 }

@@ -24,6 +24,7 @@
 //! that a `PlanNode` serializes to bytes, survives a `ShardDb` close/reopen
 //! cycle, and deserializes to an equal `PlanNode`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,54 @@ use rockstream_storage::{keys::CatalogType, CatalogKeyEncoder, ShardDb, WriteBat
 use rockstream_types::schema_evolution::SchemaChangeKind;
 
 use crate::error::SqlError;
+
+// Helper to recursively collect dependencies of a plan.
+fn collect_dependencies(plan: &PlanNode, registered: &HashSet<String>, out: &mut Vec<String>) {
+    match plan {
+        PlanNode::ViewRef { view_name } => {
+            out.push(view_name.clone());
+        }
+        PlanNode::Source { name } => {
+            if registered.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        PlanNode::Snapshot { source_name, .. } => {
+            if registered.contains(source_name) {
+                out.push(source_name.clone());
+            }
+        }
+        PlanNode::Filter { input, .. } => collect_dependencies(input, registered, out),
+        PlanNode::Project { input, .. } => collect_dependencies(input, registered, out),
+        PlanNode::Map { input, .. } => collect_dependencies(input, registered, out),
+        PlanNode::Aggregate { input, .. } => collect_dependencies(input, registered, out),
+        PlanNode::Window { input, .. } => collect_dependencies(input, registered, out),
+        PlanNode::TumbleWindow { input, .. } => collect_dependencies(input, registered, out),
+        PlanNode::TopK { input, .. } => collect_dependencies(input, registered, out),
+        PlanNode::Join { left, right, .. }
+        | PlanNode::InnerJoin { left, right, .. }
+        | PlanNode::OuterJoin { left, right, .. } => {
+            collect_dependencies(left, registered, out);
+            collect_dependencies(right, registered, out);
+        }
+        PlanNode::Union { left, right } => {
+            collect_dependencies(left, registered, out);
+            collect_dependencies(right, registered, out);
+        }
+        PlanNode::Distinct { input, .. } => collect_dependencies(input, registered, out),
+        PlanNode::Intersect { left, right, .. } | PlanNode::Except { left, right, .. } => {
+            collect_dependencies(left, registered, out);
+            collect_dependencies(right, registered, out);
+        }
+        PlanNode::Recursion { base, step, .. } => {
+            collect_dependencies(base, registered, out);
+            collect_dependencies(step, registered, out);
+        }
+        PlanNode::Lateral { input, .. } => collect_dependencies(input, registered, out),
+        PlanNode::ViewSink { child, .. } => collect_dependencies(child, registered, out),
+        PlanNode::Exchange { child, .. } => collect_dependencies(child, registered, out),
+    }
+}
 
 // ─── Column definition ───────────────────────────────────────────────────────
 
@@ -122,6 +171,18 @@ impl SchemaCatalog {
         Self { db }
     }
 
+    /// Load all registered views from the catalog.
+    pub async fn load_all_views(&self) -> Result<HashMap<String, PlanNode>, SqlError> {
+        let prefix = CatalogKeyEncoder::namespace_prefix(CatalogType::View, DEFAULT_NAMESPACE);
+        let entries = self.db.scan_prefix(&prefix).await?;
+        let mut views = HashMap::new();
+        for (_key, value) in entries {
+            let entry: ViewEntry = serde_json::from_slice(&value)?;
+            views.insert(entry.name, entry.plan);
+        }
+        Ok(views)
+    }
+
     /// Register a new view or update an existing one.
     ///
     /// - If no view with `name` exists: insert it with `schema_version = 1`.
@@ -136,6 +197,62 @@ impl SchemaCatalog {
         plan: &PlanNode,
         columns: Vec<ColumnDef>,
     ) -> Result<(), SqlError> {
+        // Build the dependency graph of all views, including the new one.
+        let mut all_views = self.load_all_views().await?;
+        all_views.insert(name.to_string(), plan.clone());
+
+        let view_names: HashSet<String> = all_views.keys().cloned().collect();
+        let mut adj = HashMap::new();
+        for (vname, vplan) in &all_views {
+            let mut deps = Vec::new();
+            collect_dependencies(vplan, &view_names, &mut deps);
+            adj.insert(vname.clone(), deps);
+        }
+
+        // DFS to detect cycles
+        let mut visited = HashSet::new();
+        let mut rec_stack = HashSet::new();
+        let mut cycle_path = Vec::new();
+
+        fn dfs(
+            node: &str,
+            adj: &HashMap<String, Vec<String>>,
+            visited: &mut HashSet<String>,
+            rec_stack: &mut HashSet<String>,
+            path: &mut Vec<String>,
+        ) -> bool {
+            visited.insert(node.to_string());
+            rec_stack.insert(node.to_string());
+            path.push(node.to_string());
+
+            if let Some(neighbors) = adj.get(node) {
+                for neighbor in neighbors {
+                    if !visited.contains(neighbor) {
+                        if dfs(neighbor, adj, visited, rec_stack, path) {
+                            return true;
+                        }
+                    } else if rec_stack.contains(neighbor) {
+                        path.push(neighbor.clone());
+                        return true;
+                    }
+                }
+            }
+
+            rec_stack.remove(node);
+            path.pop();
+            false
+        }
+
+        for vname in all_views.keys() {
+            if !visited.contains(vname)
+                && dfs(vname, &adj, &mut visited, &mut rec_stack, &mut cycle_path) {
+                    return Err(SqlError::CycleDetected {
+                        view_name: name.to_string(),
+                        cycle_path,
+                    });
+                }
+        }
+
         let key = view_key(name);
 
         if let Some(existing_bytes) = self.db.get(&key).await? {

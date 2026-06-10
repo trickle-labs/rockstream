@@ -26,6 +26,11 @@ pub trait Operator: Send + Sync {
 
     /// Human-readable name for logging and metrics.
     fn name(&self) -> &str;
+
+    /// Whether this operator has finished its work (e.g. bootstrap/snapshot complete).
+    fn is_complete(&self) -> bool {
+        false
+    }
 }
 
 /// Output produced by an operator for one epoch.
