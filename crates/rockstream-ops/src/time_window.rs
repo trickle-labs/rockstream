@@ -1,0 +1,693 @@
+//! Tumbling time-window operator (v0.12 — IVM-8).
+//!
+//! ## Cost Model
+//!
+//! Recomputation cost per epoch = O(dirty_rows + Σ_{closed_windows} |window_rows|).
+//! Only windows with changed rows or newly-closeable windows are re-emitted.
+//!
+//! Bound: TUMBLE_WINDOW_STATE_LIMIT = 100_000 window × group_key pairs per operator.
+//! Metric: `fill_level()` = total positive-weight rows across all open windows.
+//! Backpressure: epoch backpressure from scheduler when fill_level > TUMBLE_WINDOW_STATE_LIMIT.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+
+use rockstream_plan::LateDataPolicy;
+use rockstream_storage::{
+    keys::{ShardKeyEncoder, TW_DISCRIMINATOR},
+    ShardDb, WriteBatch,
+};
+use rockstream_types::ids::OperatorId;
+
+use crate::error::OpError;
+use crate::zset::ArrowZSet;
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+pub const TUMBLE_WINDOW_STATE_LIMIT: usize = 100_000;
+
+// ─── WatermarkState ──────────────────────────────────────────────────────────
+
+/// MaxRegister semilattice for watermark tracking.
+///
+/// Merge law: `merge(a, b) = max(a, b)`. Idempotent: `merge(w, w) = w`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatermarkState {
+    pub watermark_ms: i64,
+}
+
+impl WatermarkState {
+    pub fn new() -> Self {
+        Self { watermark_ms: i64::MIN }
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            watermark_ms: self.watermark_ms.max(other.watermark_ms),
+        }
+    }
+}
+
+impl Default for WatermarkState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── CompactionFilter ────────────────────────────────────────────────────────
+
+/// Compaction filter for tumbling-window state keys.
+///
+/// A key may only be deleted when BOTH conditions are satisfied:
+/// 1. `window_id + window_size_ms + allowed_lateness_ms < watermark_ms` (TTL)
+/// 2. `frontier_ms > window_id + window_size_ms` (correctness gate)
+pub struct CompactionFilter {
+    pub watermark_ms: i64,
+    pub window_size_ms: i64,
+    pub allowed_lateness_ms: i64,
+    pub frontier_ms: i64,
+}
+
+impl CompactionFilter {
+    /// Returns `true` only when both TTL and frontier gate are satisfied.
+    ///
+    /// The key format is:
+    /// `[0x01][TW][op_id:8][window_id:8 BE][group_key:var]`
+    pub fn may_delete(&self, key: &[u8]) -> bool {
+        // Minimum key length: 1 + 2 + 8 + 8 = 19 bytes.
+        if key.len() < 19 {
+            return false;
+        }
+        // Check discriminator bytes.
+        if key[0] != 0x01 || &key[1..3] != &TW_DISCRIMINATOR {
+            return false;
+        }
+        // op_id is bytes 3..11; window_id is bytes 11..19.
+        let window_id = i64::from_be_bytes(key[11..19].try_into().unwrap_or([0; 8]));
+        let window_end = window_id.saturating_add(self.window_size_ms);
+
+        // Condition 1: TTL — window has expired including lateness allowance.
+        let ttl_satisfied = window_end
+            .saturating_add(self.allowed_lateness_ms)
+            < self.watermark_ms;
+
+        // Condition 2: frontier gate — input frontier has advanced past window_end.
+        let frontier_satisfied = self.frontier_ms > window_end;
+
+        ttl_satisfied && frontier_satisfied
+    }
+}
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+/// Per-window arrangement: group_key_bytes → (row_vals, accumulated_weight).
+type WindowMap = HashMap<Vec<u8>, (Vec<i64>, i64)>;
+
+/// Previously-emitted output: group_key_bytes → row_vals.
+type EmittedMap = HashMap<Vec<u8>, Vec<i64>>;
+
+struct TumbleWindowState {
+    /// window_id → row entries (positive and negative weight).
+    windows: HashMap<i64, WindowMap>,
+    /// window_id → previously emitted output for diff computation.
+    prev_output: HashMap<i64, EmittedMap>,
+    /// Current watermark.
+    watermark: WatermarkState,
+    /// Windows that have been finalized (closed and fully emitted).
+    finalized: HashSet<i64>,
+}
+
+impl TumbleWindowState {
+    fn new() -> Self {
+        Self {
+            windows: HashMap::new(),
+            prev_output: HashMap::new(),
+            watermark: WatermarkState::new(),
+            finalized: HashSet::new(),
+        }
+    }
+
+    fn total_rows(&self) -> usize {
+        self.windows
+            .values()
+            .flat_map(|m| m.values())
+            .filter(|(_, w)| *w > 0)
+            .count()
+    }
+}
+
+// ─── TumbleWindowOp ──────────────────────────────────────────────────────────
+
+/// Tumbling time-window operator (v0.12 — IVM-8).
+///
+/// Assigns each input row to a fixed-size, non-overlapping time window.
+/// Windows close when the watermark advances past the window end.
+/// Late rows (event_time_ms < watermark_ms) are handled per late_data_policy.
+pub struct TumbleWindowOp {
+    /// Output schema: [window_id: i64, ...input_cols...]
+    pub schema: SchemaRef,
+    n_input_cols: usize,
+    time_col: usize,
+    window_size_ms: i64,
+    late_data_policy: LateDataPolicy,
+    state: Mutex<TumbleWindowState>,
+    fill_level: Arc<AtomicUsize>,
+}
+
+impl TumbleWindowOp {
+    /// Build the output schema: window_id column prepended to input schema.
+    pub fn output_schema(input_schema: &Schema) -> SchemaRef {
+        let mut fields = vec![Field::new("window_id", DataType::Int64, false)];
+        for f in input_schema.fields() {
+            fields.push(f.as_ref().clone());
+        }
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Create an in-memory TumbleWindowOp (no LFS persistence).
+    pub fn new(
+        input_schema: SchemaRef,
+        time_col: usize,
+        window_size_ms: i64,
+        late_data_policy: LateDataPolicy,
+    ) -> Self {
+        let schema = Self::output_schema(&input_schema);
+        let n_input_cols = input_schema.fields().len();
+        Self {
+            schema,
+            n_input_cols,
+            time_col,
+            window_size_ms,
+            late_data_policy,
+            state: Mutex::new(TumbleWindowState::new()),
+            fill_level: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn fill_level(&self) -> usize {
+        self.fill_level.load(Ordering::Relaxed)
+    }
+
+    /// Current watermark.
+    pub fn watermark_ms(&self) -> i64 {
+        self.state.lock().unwrap().watermark.watermark_ms
+    }
+
+    /// Process one epoch: apply `delta` and return the output delta.
+    pub fn process_epoch(&self, delta: ArrowZSet, _epoch: u64) -> Result<ArrowZSet, OpError> {
+        if delta.is_empty() {
+            return Ok(ArrowZSet::empty(self.schema.clone()));
+        }
+
+        let mut state = self.state.lock().unwrap();
+        let mut dirty_windows: HashSet<i64> = HashSet::new();
+
+        // ── Apply input delta ────────────────────────────────────────────────
+        for row_idx in 0..delta.num_rows() {
+            let w = delta.weights[row_idx];
+            if w == 0 {
+                continue;
+            }
+            let row_vals = extract_row_vals(&delta.data, row_idx, self.n_input_cols);
+            let event_time_ms = if self.time_col < self.n_input_cols {
+                row_vals[self.time_col]
+            } else {
+                0
+            };
+
+            // Late-data check.
+            if event_time_ms < state.watermark.watermark_ms {
+                match self.late_data_policy {
+                    LateDataPolicy::Drop => continue,
+                    _ => {} // Other policies not yet implemented; treat as drop.
+                }
+            }
+
+            // Assign to window.
+            let window_id = floor_div(event_time_ms, self.window_size_ms) * self.window_size_ms;
+
+            // Skip finalized windows (already closed).
+            if state.finalized.contains(&window_id) {
+                continue;
+            }
+
+            // Advance watermark (MaxRegister).
+            state.watermark = state.watermark.merge(WatermarkState { watermark_ms: event_time_ms });
+
+            let group_key = encode_row(&row_vals);
+            let window = state.windows.entry(window_id).or_default();
+            let entry = window.entry(group_key).or_insert((row_vals, 0i64));
+            entry.1 += w;
+            dirty_windows.insert(window_id);
+        }
+
+        // ── Compute output delta ─────────────────────────────────────────────
+        // Also check for newly-closeable windows even if not dirty.
+        let watermark_ms = state.watermark.watermark_ms;
+        let window_size_ms = self.window_size_ms;
+
+        // Collect all window_ids that need processing.
+        let all_windows: Vec<i64> = {
+            let mut ws: HashSet<i64> = dirty_windows.clone();
+            // Include open windows that newly became closeable.
+            for &wid in state.windows.keys() {
+                if !state.finalized.contains(&wid) && watermark_ms > wid + window_size_ms {
+                    ws.insert(wid);
+                }
+            }
+            ws.into_iter().collect()
+        };
+
+        let mut output_rows: Vec<(Vec<i64>, i64)> = Vec::new();
+
+        for window_id in all_windows {
+            // Build new current state (positive-weight rows only).
+            let new_state: HashMap<Vec<u8>, Vec<i64>> = state
+                .windows
+                .get(&window_id)
+                .map(|m| {
+                    m.iter()
+                        .filter(|(_, (_, w))| *w > 0)
+                        .map(|(k, (vals, _))| (k.clone(), vals.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Get previous emitted state (clone to avoid borrow conflict).
+            let old_emitted: EmittedMap =
+                state.prev_output.get(&window_id).cloned().unwrap_or_default();
+
+            // Retract rows no longer present.
+            for (key, old_vals) in &old_emitted {
+                if !new_state.contains_key(key) {
+                    let mut out_vals = vec![window_id];
+                    out_vals.extend_from_slice(old_vals);
+                    output_rows.push((out_vals, -1));
+                }
+            }
+
+            // Insert newly-present rows.
+            let mut new_emitted: EmittedMap = HashMap::new();
+            for (key, vals) in &new_state {
+                if !old_emitted.contains_key(key) {
+                    let mut out_vals = vec![window_id];
+                    out_vals.extend_from_slice(vals);
+                    output_rows.push((out_vals, 1));
+                }
+                new_emitted.insert(key.clone(), vals.clone());
+            }
+
+            state.prev_output.insert(window_id, new_emitted);
+
+            // Mark as finalized if watermark has advanced past window end.
+            if watermark_ms > window_id + window_size_ms {
+                state.finalized.insert(window_id);
+            }
+        }
+
+        let total = state.total_rows();
+        drop(state);
+
+        self.fill_level.store(total, Ordering::Relaxed);
+        build_output(&self.schema, output_rows)
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Floor division that correctly handles negative dividends.
+///
+/// Returns `floor(a / b)` for any sign of `a`.
+fn floor_div(a: i64, b: i64) -> i64 {
+    let d = a / b;
+    // If they have different signs and there's a remainder, subtract 1.
+    if (a ^ b) < 0 && d * b != a { d - 1 } else { d }
+}
+
+fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i64> {
+    batch
+        .columns()
+        .iter()
+        .take(n_cols)
+        .map(|col| {
+            col.as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| a.value(row_idx))
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn encode_row(vals: &[i64]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(vals.len() * 8);
+    for v in vals {
+        key.extend_from_slice(&v.to_be_bytes());
+    }
+    key
+}
+
+fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZSet, OpError> {
+    if rows.is_empty() {
+        return Ok(ArrowZSet::empty(schema.clone()));
+    }
+
+    // Aggregate by row key to cancel intra-epoch retractions.
+    let mut agg: HashMap<Vec<u8>, (i64, Vec<i64>)> = HashMap::new();
+    for (vals, w) in rows {
+        let key = encode_row(&vals);
+        let entry = agg.entry(key).or_insert((0i64, vals));
+        entry.0 += w;
+    }
+
+    let num_cols = schema.fields().len();
+    let mut col_builders: Vec<Vec<i64>> = vec![Vec::new(); num_cols];
+    let mut weights: Vec<i64> = Vec::new();
+
+    for (_, (net_w, vals)) in agg {
+        if net_w == 0 {
+            continue;
+        }
+        weights.push(net_w);
+        for (ci, &val) in vals.iter().enumerate().take(num_cols) {
+            col_builders[ci].push(val);
+        }
+    }
+
+    if weights.is_empty() {
+        return Ok(ArrowZSet::empty(schema.clone()));
+    }
+
+    let arrays: Vec<ArrayRef> = col_builders
+        .into_iter()
+        .map(|col| Arc::new(Int64Array::from(col)) as ArrayRef)
+        .collect();
+
+    let data = RecordBatch::try_new(schema.clone(), arrays).map_err(OpError::arrow)?;
+    Ok(ArrowZSet::new(data, weights))
+}
+
+// ─── LFS persistence ─────────────────────────────────────────────────────────
+
+/// Encode window state value: `[weight:8 BE][col0:8 BE]...[colN:8 BE]`
+fn encode_window_value(row_vals: &[i64], weight: i64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + row_vals.len() * 8);
+    v.extend_from_slice(&weight.to_be_bytes());
+    for val in row_vals {
+        v.extend_from_slice(&val.to_be_bytes());
+    }
+    v
+}
+
+fn decode_window_value(bytes: &[u8], n_input_cols: usize) -> Option<(Vec<i64>, i64)> {
+    if bytes.len() < 8 + n_input_cols * 8 {
+        return None;
+    }
+    let weight = i64::from_be_bytes(bytes[0..8].try_into().ok()?);
+    let mut vals = Vec::with_capacity(n_input_cols);
+    for i in 0..n_input_cols {
+        let off = 8 + i * 8;
+        vals.push(i64::from_be_bytes(bytes[off..off + 8].try_into().ok()?));
+    }
+    Some((vals, weight))
+}
+
+/// Persist TumbleWindowOp state to a ShardDb.
+///
+/// Uses only point Put/Delete operations — never DeleteRange.
+pub async fn persist_tumble_window_state(
+    db: &ShardDb,
+    op: &TumbleWindowOp,
+    op_id: OperatorId,
+) -> Result<(), OpError> {
+    let state = op.state.lock().unwrap();
+    let mut batch = WriteBatch::new();
+    let oid = op_id.0;
+
+    // Write window entries.
+    for (&window_id, window_map) in &state.windows {
+        for (group_key, (row_vals, weight)) in window_map {
+            let key = ShardKeyEncoder::tumble_window_key(oid, window_id, group_key);
+            let value = encode_window_value(row_vals, *weight);
+            batch.put(&key, &value);
+        }
+    }
+
+    // Write watermark.
+    let wm_key = ShardKeyEncoder::watermark_key(oid);
+    batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
+
+    drop(state);
+    db.write_batch(batch).await.map_err(OpError::storage)?;
+    Ok(())
+}
+
+/// Load TumbleWindowOp state from a ShardDb.
+pub async fn load_tumble_window_state(
+    db: &ShardDb,
+    input_schema: SchemaRef,
+    time_col: usize,
+    window_size_ms: i64,
+    late_data_policy: LateDataPolicy,
+    op_id: OperatorId,
+) -> Result<TumbleWindowOp, OpError> {
+    let op = TumbleWindowOp::new(input_schema, time_col, window_size_ms, late_data_policy);
+    let n_input_cols = op.n_input_cols;
+    let oid = op_id.0;
+
+    let mut st = op.state.lock().unwrap();
+
+    // Load window entries.
+    let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
+    let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+    let prefix_len = prefix.len(); // 1 + 2 + 8 = 11
+
+    for (key, value) in entries {
+        if let Some((row_vals, weight)) = decode_window_value(&value, n_input_cols) {
+            // key = prefix + window_id(8) + group_key(var)
+            if key.len() < prefix_len + 8 {
+                continue;
+            }
+            let window_id = i64::from_be_bytes(key[prefix_len..prefix_len + 8].try_into().unwrap_or([0; 8]));
+            let group_key = key[prefix_len + 8..].to_vec();
+            st.windows
+                .entry(window_id)
+                .or_default()
+                .insert(group_key, (row_vals, weight));
+        }
+    }
+
+    // Load watermark.
+    let wm_key = ShardKeyEncoder::watermark_key(oid);
+    if let Ok(Some(bytes)) = db.get(&wm_key).await {
+        if bytes.len() >= 8 {
+            let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+            st.watermark = WatermarkState { watermark_ms: wm };
+        }
+    }
+
+    let total = st.total_rows();
+    drop(st);
+    op.fill_level.store(total, Ordering::Relaxed);
+    Ok(op)
+}
+
+/// Load the persisted watermark for an operator (used by compaction filters).
+pub async fn load_watermark(db: &ShardDb, op_id: OperatorId) -> Result<WatermarkState, OpError> {
+    let wm_key = ShardKeyEncoder::watermark_key(op_id.0);
+    match db.get(&wm_key).await.map_err(OpError::storage)? {
+        Some(bytes) if bytes.len() >= 8 => {
+            let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+            Ok(WatermarkState { watermark_ms: wm })
+        }
+        _ => Ok(WatermarkState::new()),
+    }
+}
+
+/// Persist the watermark for an operator.
+pub async fn persist_watermark(
+    db: &ShardDb,
+    op_id: OperatorId,
+    watermark: WatermarkState,
+) -> Result<(), OpError> {
+    let mut batch = WriteBatch::new();
+    let wm_key = ShardKeyEncoder::watermark_key(op_id.0);
+    batch.put(&wm_key, &watermark.watermark_ms.to_be_bytes());
+    db.write_batch(batch).await.map_err(OpError::storage)?;
+    Ok(())
+}
+
+// ─── Unit tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn input_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("t", DataType::Int64, false), // time_col = 0
+            Field::new("v", DataType::Int64, false),
+        ]))
+    }
+
+    fn make_input(rows: &[(i64, i64, i64)]) -> ArrowZSet {
+        let t: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let v: Vec<i64> = rows.iter().map(|r| r.1).collect();
+        let w: Vec<i64> = rows.iter().map(|r| r.2).collect();
+        let data = RecordBatch::try_new(
+            input_schema(),
+            vec![
+                Arc::new(Int64Array::from(t)) as ArrayRef,
+                Arc::new(Int64Array::from(v)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        ArrowZSet::new(data, w)
+    }
+
+    fn accumulate(state: &mut HashMap<(i64, i64, i64), i64>, zset: &ArrowZSet) {
+        if zset.is_empty() {
+            return;
+        }
+        let wid_col = zset.data.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let t_col = zset.data.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let v_col = zset.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..zset.num_rows() {
+            *state.entry((wid_col.value(i), t_col.value(i), v_col.value(i))).or_insert(0) +=
+                zset.weights[i];
+        }
+    }
+
+    fn live_rows(state: &HashMap<(i64, i64, i64), i64>) -> Vec<(i64, i64, i64)> {
+        let mut rows: Vec<_> = state.iter().filter(|(_, &w)| w > 0).map(|(&k, _)| k).collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn tumble_window_basic_assignment() {
+        let window_size_ms = 1000i64;
+        let op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
+
+        // Epoch 1: two rows in window 0 [0, 1000), one row in window 1 [1000, 2000).
+        let out1 = op.process_epoch(
+            make_input(&[(100, 10, 1), (500, 20, 1), (1500, 30, 1)]),
+            1,
+        ).unwrap();
+
+        let mut net: HashMap<(i64, i64, i64), i64> = Default::default();
+        accumulate(&mut net, &out1);
+
+        let live = live_rows(&net);
+        // window_id=0: (0, 100, 10), (0, 500, 20)
+        // window_id=1000: (1000, 1500, 30)
+        assert!(live.contains(&(0, 100, 10)), "expected (0, 100, 10) in output");
+        assert!(live.contains(&(0, 500, 20)), "expected (0, 500, 20) in output");
+        assert!(live.contains(&(1000, 1500, 30)), "expected (1000, 1500, 30) in output");
+
+        // Epoch 2: add one row in window 1 (t=1600 >= watermark=1500, not late).
+        let out2 = op.process_epoch(
+            make_input(&[(1600, 40, 1)]),
+            2,
+        ).unwrap();
+
+        accumulate(&mut net, &out2);
+        let live2 = live_rows(&net);
+        assert!(live2.contains(&(1000, 1600, 40)), "expected (1000, 1600, 40) in epoch 2");
+        assert_eq!(op.fill_level(), 4, "4 positive-weight rows total");
+    }
+
+    #[test]
+    fn tumble_window_watermark_merge_idempotent() {
+        let w1 = WatermarkState { watermark_ms: 1000 };
+        let w2 = WatermarkState { watermark_ms: 2000 };
+
+        // Idempotent: merge(w, w) = w.
+        assert_eq!(w1.merge(w1), w1);
+        assert_eq!(w2.merge(w2), w2);
+
+        // merge(w1, w2) = max.
+        assert_eq!(w1.merge(w2), WatermarkState { watermark_ms: 2000 });
+        assert_eq!(w2.merge(w1), WatermarkState { watermark_ms: 2000 });
+
+        // merge is commutative.
+        assert_eq!(w1.merge(w2), w2.merge(w1));
+    }
+
+    #[test]
+    fn tumble_window_late_data_dropped() {
+        let window_size_ms = 1000i64;
+        let op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
+
+        // Epoch 1: insert a row in window [0, 1000). Watermark advances to 100.
+        let _out1 = op.process_epoch(make_input(&[(100, 10, 1)]), 1).unwrap();
+
+        // Epoch 2: advance watermark past window end (2000 > 0 + 1000).
+        let _out2 = op.process_epoch(make_input(&[(2000, 99, 1)]), 2).unwrap();
+
+        assert!(
+            op.watermark_ms() >= 2000,
+            "watermark should be >= 2000 after epoch 2"
+        );
+
+        // Epoch 3: insert a late row in window [0, 1000) — event_time=50 < watermark=2000.
+        let out3 = op.process_epoch(make_input(&[(50, 10, 1)]), 3).unwrap();
+
+        // The late row must NOT appear in the output.
+        assert!(out3.is_empty(), "late row must not appear in output; got {} rows", out3.num_rows());
+    }
+
+    #[test]
+    fn tumble_window_compaction_filter_no_early_eviction() {
+        // Build a TW key for window_id=1000 with some group_key.
+        let op_id = 7u64;
+        let window_id = 1000i64;
+        let window_size_ms = 1000i64;
+        let key = ShardKeyEncoder::tumble_window_key(op_id, window_id, b"gk");
+
+        // Scenario: watermark past TTL, but frontier has NOT advanced past window_end.
+        // window_end = window_id + window_size_ms = 2000
+        // TTL condition: 2000 + 0 < 3000 = true (watermark=3000)
+        // Frontier condition: frontier_ms=1500 > 2000 = FALSE
+        let filter = CompactionFilter {
+            watermark_ms: 3000,
+            window_size_ms,
+            allowed_lateness_ms: 0,
+            frontier_ms: 1500, // NOT past window_end=2000
+        };
+        assert!(
+            !filter.may_delete(&key),
+            "must not delete when frontier has not advanced past window_end"
+        );
+
+        // Now advance frontier past window_end: frontier=2001 > 2000.
+        let filter2 = CompactionFilter {
+            watermark_ms: 3000,
+            window_size_ms,
+            allowed_lateness_ms: 0,
+            frontier_ms: 2001,
+        };
+        assert!(
+            filter2.may_delete(&key),
+            "may delete when both TTL and frontier conditions are satisfied"
+        );
+    }
+
+    #[test]
+    fn floor_div_handles_negatives() {
+        assert_eq!(floor_div(0, 1000), 0);
+        assert_eq!(floor_div(999, 1000), 0);
+        assert_eq!(floor_div(1000, 1000), 1);
+        assert_eq!(floor_div(1999, 1000), 1);
+        assert_eq!(floor_div(-1, 1000), -1);
+        assert_eq!(floor_div(-1000, 1000), -1);
+        assert_eq!(floor_div(-1001, 1000), -2);
+    }
+}

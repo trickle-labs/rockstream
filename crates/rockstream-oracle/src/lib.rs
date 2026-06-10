@@ -45,5 +45,6 @@ pub mod filter_oracle;
 pub mod harness;
 pub mod minmax_oracle;
 pub mod outer_join_oracle;
+pub mod topk_oracle;
 pub mod window_oracle;
 pub mod zset;

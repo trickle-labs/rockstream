@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 208020c9273db8d460f99eea8e2a2766eed306e755902f497ef65edf99425977 # shrinks to epochs = [[(13, 1, 2, 1)], [(14, 1, 2, 1)], [(13, 9, 2, 1)], [(14, 2, 2, 1)], [(14, 3, 2, 1), (13, 3, 2, 1)]], k = 5
+cc 270b42b8f463e2acd2ab8291887f680a856e82d1c8233bca5c6afc2233df112a # shrinks to epochs = [[(9, 7, 3, -1)], [(9, 7, 3, 1)]], k = 1

@@ -25,7 +25,7 @@
 //! (the `AggState`): for each input delta `(k, v, w)`, the rule is:
 //! `Δagg(k) = (new_agg(k), +1) ⊎ (old_agg(k), -1)` when the state changes.
 
-use rockstream_plan::{OpKind, OpNode, PlanNode, WindowFunc, WindowStrategy};
+use rockstream_plan::{LateDataPolicy, OpKind, OpNode, PlanNode, WindowFunc, WindowStrategy};
 use rockstream_types::{explain::NotMergeSafeReason, ids::OperatorId};
 
 /// Error returned by the differentiation pass.
@@ -291,6 +291,51 @@ impl DiffCtx {
                 Ok(id)
             }
 
+            // ── TumbleWindow (v0.12 — IVM-8) ─────────────────────────────
+            PlanNode::TumbleWindow {
+                input,
+                window_size_ms,
+                late_data_policy,
+                ..
+            } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::TumbleWindow {
+                        window_size_ms: *window_size_ms,
+                        late_data_policy: late_data_policy.clone(),
+                    },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
+            // ── TopK (v0.12 — IVM-9) ─────────────────────────────────────
+            PlanNode::TopK {
+                input,
+                k,
+                rank_col,
+                partition_by,
+            } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::TopK {
+                        k: *k,
+                        rank_col: *rank_col,
+                        partition_by: partition_by.clone(),
+                    },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
             // ── Not yet implemented in v0.5 ───────────────────────────────
             other => Err(DiffError::UnsupportedNode(format!("{other:?}"))),
         }
@@ -401,6 +446,47 @@ mod tests {
         assert!(matches!(physical.ops[0].kind, OpKind::Source { .. }));
         assert!(matches!(physical.ops[1].kind, OpKind::Aggregate));
         assert_eq!(physical.ops[1].inputs, vec![OperatorId(0)]);
+    }
+
+    #[test]
+    fn diff_tumble_window_emits_tumble_window_op() {
+        use rockstream_plan::LateDataPolicy;
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::TumbleWindow {
+            input: Box::new(src),
+            time_col: 0,
+            window_size_ms: 1000,
+            late_data_policy: LateDataPolicy::Drop,
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        assert_eq!(physical.ops.len(), 2);
+        let tw_op = physical.ops.iter().find(|op| matches!(op.kind, OpKind::TumbleWindow { .. }));
+        assert!(tw_op.is_some(), "must contain exactly one TumbleWindow op");
+        if let OpKind::TumbleWindow { window_size_ms, .. } = &tw_op.unwrap().kind {
+            assert_eq!(*window_size_ms, 1000);
+        }
+    }
+
+    #[test]
+    fn diff_topk_emits_topk_op() {
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::TopK {
+            input: Box::new(src),
+            k: 5,
+            rank_col: 1,
+            partition_by: vec![0],
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        assert_eq!(physical.ops.len(), 2);
+        let tk_op = physical.ops.iter().find(|op| matches!(op.kind, OpKind::TopK { .. }));
+        assert!(tk_op.is_some(), "must contain exactly one TopK op");
+        if let OpKind::TopK { k, rank_col, partition_by } = &tk_op.unwrap().kind {
+            assert_eq!(*k, 5);
+            assert_eq!(*rank_col, 1);
+            assert_eq!(*partition_by, vec![0]);
+        }
     }
 
     #[test]

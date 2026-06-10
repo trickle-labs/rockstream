@@ -32,6 +32,8 @@ pub mod scheduler;
 pub mod sink;
 pub mod source;
 pub mod task;
+pub mod time_window;
+pub mod topk;
 pub mod window;
 pub mod zset;
 
@@ -42,6 +44,11 @@ pub use distinct::{
 pub use window::{
     load_window_state, persist_window_state, WindowOp, WINDOW_PARTITION_THRESHOLD,
 };
+pub use time_window::{
+    load_tumble_window_state, load_watermark, persist_tumble_window_state, persist_watermark,
+    CompactionFilter, TumbleWindowOp, WatermarkState, TUMBLE_WINDOW_STATE_LIMIT,
+};
+pub use topk::{load_topk_state, persist_topk_state, TopKOp, TOPK_BUFFER_LIMIT};
 pub use error::OpError;
 pub use filter::FilterOp;
 pub use group_commit::{GroupCommit, GROUP_COMMIT_MAX_BATCHES};

@@ -325,6 +325,50 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
             )
         }
 
+        // TumbleWindow (v0.12 — IVM-8): insert Loopback exchange; partitioned by time.
+        PlanNode::TumbleWindow {
+            input,
+            time_col,
+            window_size_ms,
+            late_data_policy,
+        } => {
+            let (new_input, _) = distribute(*input);
+            (
+                PlanNode::TumbleWindow {
+                    input: Box::new(PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        child: Box::new(new_input),
+                    }),
+                    time_col,
+                    window_size_ms,
+                    late_data_policy,
+                },
+                DistributionAnnotation::unpartitioned(),
+            )
+        }
+
+        // TopK (v0.12 — IVM-9): requires hash-partitioned input by partition_by columns.
+        PlanNode::TopK {
+            input,
+            k,
+            rank_col,
+            partition_by,
+        } => {
+            let (new_input, _) = distribute(*input);
+            (
+                PlanNode::TopK {
+                    input: Box::new(PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        child: Box::new(new_input),
+                    }),
+                    k,
+                    rank_col,
+                    partition_by,
+                },
+                DistributionAnnotation::unpartitioned(),
+            )
+        }
+
         // All other nodes pass through unchanged with unpartitioned annotation.
         other => (other, DistributionAnnotation::unpartitioned()),
     }
@@ -502,6 +546,47 @@ mod tests {
             );
         } else {
             panic!("expected Except, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn distribution_tumble_window_plan() {
+        use rockstream_plan::LateDataPolicy;
+        let plan = PlanNode::TumbleWindow {
+            input: Box::new(source("t")),
+            time_col: 0,
+            window_size_ms: 1000,
+            late_data_policy: LateDataPolicy::Drop,
+        };
+        // Should not panic; should insert a Loopback exchange.
+        let result = apply_distribution(plan);
+        if let PlanNode::TumbleWindow { input, .. } = result {
+            assert!(
+                matches!(input.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                "expected Loopback before TumbleWindow input, got: {input:?}"
+            );
+        } else {
+            panic!("expected TumbleWindow after distribution pass");
+        }
+    }
+
+    #[test]
+    fn distribution_topk_plan() {
+        let plan = PlanNode::TopK {
+            input: Box::new(source("t")),
+            k: 3,
+            rank_col: 0,
+            partition_by: vec![],
+        };
+        // Should not panic; should insert a Loopback exchange.
+        let result = apply_distribution(plan);
+        if let PlanNode::TopK { input, .. } = result {
+            assert!(
+                matches!(input.as_ref(), PlanNode::Exchange { kind: ExchangeKind::Loopback, .. }),
+                "expected Loopback before TopK input, got: {input:?}"
+            );
+        } else {
+            panic!("expected TopK after distribution pass");
         }
     }
 }

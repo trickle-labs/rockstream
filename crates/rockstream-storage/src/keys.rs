@@ -48,6 +48,15 @@ pub const DISTINCT_DISCRIMINATOR: [u8; 2] = [0x44, 0x53];
 /// Window arrangement discriminator bytes (v0.11 — IVM-7): ASCII 'W', 'N'.
 pub const WINDOW_DISCRIMINATOR: [u8; 2] = [0x57, 0x4E];
 
+/// Tumbling-window partial-state discriminator bytes (v0.12 — IVM-8): ASCII 'T', 'W'.
+pub const TW_DISCRIMINATOR: [u8; 2] = [0x54, 0x57];
+
+/// Watermark state discriminator bytes (v0.12 — IVM-8): ASCII 'W', 'M'.
+pub const WM_DISCRIMINATOR: [u8; 2] = [0x57, 0x4D];
+
+/// Top-K buffer discriminator bytes (v0.12 — IVM-9): ASCII 'T', 'K'.
+pub const TK_DISCRIMINATOR: [u8; 2] = [0x54, 0x4B];
+
 /// Left/right side discriminator for join arrangements (v0.8 — IVM-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinSide {
@@ -366,6 +375,110 @@ impl ShardKeyEncoder {
         prefix
     }
 
+    // ─── Tumbling-window keys (IVM-8) ────────────────────────────────────────
+
+    /// Encode a tumbling-window partial-state key.
+    ///
+    /// Format: `[0x01 (OpState)][0x54 0x57 ('TW')][op_id:8][window_id:8 BE ms][group_key:var]`
+    pub fn tumble_window_key(op_id: u64, window_id: i64, group_key: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 8 + 8 + group_key.len());
+        key.push(ShardPrefix::OpState.as_byte());
+        key.extend_from_slice(&TW_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(&window_id.to_be_bytes());
+        key.extend_from_slice(group_key);
+        key
+    }
+
+    /// Prefix for scanning all partial-state keys for an operator.
+    ///
+    /// Format: `[0x01][TW][op_id:8]`
+    pub fn tumble_window_op_prefix(op_id: u64) -> Vec<u8> {
+        let mut p = Vec::with_capacity(1 + 2 + 8);
+        p.push(ShardPrefix::OpState.as_byte());
+        p.extend_from_slice(&TW_DISCRIMINATOR);
+        p.extend_from_slice(&op_id.to_be_bytes());
+        p
+    }
+
+    /// Prefix for scanning all partial-state keys for a specific window.
+    ///
+    /// Format: `[0x01][TW][op_id:8][window_id:8 BE]`
+    pub fn tumble_window_window_prefix(op_id: u64, window_id: i64) -> Vec<u8> {
+        let mut p = Vec::with_capacity(1 + 2 + 8 + 8);
+        p.push(ShardPrefix::OpState.as_byte());
+        p.extend_from_slice(&TW_DISCRIMINATOR);
+        p.extend_from_slice(&op_id.to_be_bytes());
+        p.extend_from_slice(&window_id.to_be_bytes());
+        p
+    }
+
+    /// Key for the watermark MaxRegister state of an operator.
+    ///
+    /// Format: `[0x06 (ShardMeta)][0x57 0x4D ('WM')][op_id:8]`
+    /// Value: `[watermark_ms:8 BE]`
+    pub fn watermark_key(op_id: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 8);
+        key.push(ShardPrefix::ShardMeta.as_byte());
+        key.extend_from_slice(&WM_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key
+    }
+
+    // ─── Top-K keys (IVM-9) ─────────────────────────────────────────────────
+
+    /// Compute value_desc_bytes for Top-K lexicographic ordering.
+    ///
+    /// Inverts the XOR-flip sort key so that highest value → smallest bytes
+    /// → first in a prefix scan.
+    pub fn topk_value_desc_bytes(v: i64) -> [u8; 8] {
+        (!((v as u64) ^ 0x8000_0000_0000_0000_u64)).to_be_bytes()
+    }
+
+    /// Decode a value from value_desc_bytes (inverse of [`topk_value_desc_bytes`]).
+    pub fn topk_value_desc_decode(bytes: [u8; 8]) -> i64 {
+        let raw = !u64::from_be_bytes(bytes);
+        (raw ^ 0x8000_0000_0000_0000_u64) as i64
+    }
+
+    /// Encode a Top-K buffer entry key.
+    ///
+    /// Format: `[0x01 (OpState)][0x54 0x4B ('TK')][op_id:8][partition_key:var][value_desc_bytes:8][row_id:16]`
+    pub fn topk_key(op_id: u64, partition_key: &[u8], value: i64, row_id: u128) -> Vec<u8> {
+        let vd = Self::topk_value_desc_bytes(value);
+        let mut key = Vec::with_capacity(1 + 2 + 8 + partition_key.len() + 8 + 16);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.extend_from_slice(&TK_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(partition_key);
+        key.extend_from_slice(&vd);
+        key.extend_from_slice(&row_id.to_be_bytes());
+        key
+    }
+
+    /// Prefix for scanning all Top-K entries for one partition of an operator.
+    ///
+    /// Format: `[0x01][TK][op_id:8][partition_key]`
+    pub fn topk_partition_prefix(op_id: u64, partition_key: &[u8]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(1 + 2 + 8 + partition_key.len());
+        p.push(ShardPrefix::OpState.as_byte());
+        p.extend_from_slice(&TK_DISCRIMINATOR);
+        p.extend_from_slice(&op_id.to_be_bytes());
+        p.extend_from_slice(partition_key);
+        p
+    }
+
+    /// Prefix for scanning all Top-K entries for an operator.
+    ///
+    /// Format: `[0x01][TK][op_id:8]`
+    pub fn topk_op_prefix(op_id: u64) -> Vec<u8> {
+        let mut p = Vec::with_capacity(1 + 2 + 8);
+        p.push(ShardPrefix::OpState.as_byte());
+        p.extend_from_slice(&TK_DISCRIMINATOR);
+        p.extend_from_slice(&op_id.to_be_bytes());
+        p
+    }
+
     /// Decode an idempotency key.
     /// Returns (shard_id, key_hash) if it is a valid idempotency key.
     pub fn decode_idempotency_key(key: &[u8]) -> Option<(u32, [u8; 16])> {
@@ -587,6 +700,80 @@ mod tests {
         let prefix = ShardKeyEncoder::window_arr_partition_prefix(op_id, part_key);
         assert!(key_a.starts_with(&prefix));
         assert!(key_b.starts_with(&prefix));
+    }
+
+    #[test]
+    fn tumble_window_key_roundtrip() {
+        let op_id = 5u64;
+        let window_id_a = 1000i64; // window start ms
+        let window_id_b = 2000i64;
+        let group_key = b"gk1";
+
+        // Encode/decode: prefix is correct length and value bytes parse back.
+        let key_a = ShardKeyEncoder::tumble_window_key(op_id, window_id_a, group_key);
+        // prefix: 1 + 2 + 8 = 11, then window_id: 8, then group_key
+        assert_eq!(key_a[0], ShardPrefix::OpState.as_byte());
+        assert_eq!(&key_a[1..3], &TW_DISCRIMINATOR);
+        let decoded_op = u64::from_be_bytes(key_a[3..11].try_into().unwrap());
+        assert_eq!(decoded_op, op_id);
+        let decoded_win = i64::from_be_bytes(key_a[11..19].try_into().unwrap());
+        assert_eq!(decoded_win, window_id_a);
+        assert_eq!(&key_a[19..], group_key);
+
+        // Two keys with different window_id sort in ascending window_id order.
+        let key_b = ShardKeyEncoder::tumble_window_key(op_id, window_id_b, group_key);
+        assert!(key_a < key_b, "window_id=1000 must sort before window_id=2000");
+
+        // Op prefix is a proper prefix of window key.
+        let op_prefix = ShardKeyEncoder::tumble_window_op_prefix(op_id);
+        assert!(key_a.starts_with(&op_prefix));
+
+        // Window prefix is a proper prefix of keys in that window.
+        let win_prefix = ShardKeyEncoder::tumble_window_window_prefix(op_id, window_id_a);
+        assert!(key_a.starts_with(&win_prefix));
+        assert!(!key_b.starts_with(&win_prefix));
+
+        // Watermark key uses ShardMeta prefix.
+        let wm = ShardKeyEncoder::watermark_key(op_id);
+        assert_eq!(wm[0], ShardPrefix::ShardMeta.as_byte());
+        assert_eq!(&wm[1..3], &WM_DISCRIMINATOR);
+        let decoded_op2 = u64::from_be_bytes(wm[3..11].try_into().unwrap());
+        assert_eq!(decoded_op2, op_id);
+    }
+
+    #[test]
+    fn topk_key_scan_order() {
+        let op_id = 9u64;
+        let part_key = b"p1";
+
+        // Insert keys for values [10, 5, 20, 1] with distinct row_ids.
+        let vals_and_ids: Vec<(i64, u128)> = vec![(10, 1), (5, 2), (20, 3), (1, 4)];
+        let mut keys: Vec<(Vec<u8>, i64)> = vals_and_ids
+            .iter()
+            .map(|&(v, rid)| (ShardKeyEncoder::topk_key(op_id, part_key, v, rid), v))
+            .collect();
+
+        // Sort lexicographically (as a DB scan would).
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Expect descending value order: [20, 10, 5, 1].
+        let sorted_vals: Vec<i64> = keys.iter().map(|(_, v)| *v).collect();
+        assert_eq!(sorted_vals, vec![20, 10, 5, 1]);
+
+        // Partition prefix is a proper prefix of all keys.
+        let prefix = ShardKeyEncoder::topk_partition_prefix(op_id, part_key);
+        for (k, _) in &keys {
+            assert!(k.starts_with(&prefix));
+        }
+    }
+
+    #[test]
+    fn topk_value_desc_bytes_roundtrip() {
+        for v in [-i64::MAX, -1i64, 0, 1, i64::MAX] {
+            let bytes = ShardKeyEncoder::topk_value_desc_bytes(v);
+            let decoded = ShardKeyEncoder::topk_value_desc_decode(bytes);
+            assert_eq!(decoded, v, "roundtrip failed for v={v}");
+        }
     }
 
     #[test]
