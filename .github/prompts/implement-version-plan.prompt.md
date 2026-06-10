@@ -63,5 +63,5 @@ Once every Proof claim is mapped to a test:
 1. Write the plan to `.claude/${input:version}-plan.md` — vertical slices list
    and proof-claim → test mapping. This file survives the upcoming compaction.
 2. Output **exactly** this message and nothing else:
-   > "Phase 2 done. Plan saved to `.claude/${input:version}-plan.md`. Run `/compact` now, then run `/implement-version-implement` with version `${input:version}`."
+   > "Phase 2 done. Plan saved to `.claude/${input:version}-plan.md`. Run `/compact` now, then run `/implement-version-implement-3a` with version `${input:version}`."
 3. Stop. Do not proceed. Do not read any further prompt files.
