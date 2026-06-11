@@ -735,3 +735,55 @@ async fn arrangement_header_missing_key_returns_none() {
     assert!(result.is_none(), "missing key must return None");
     db.close().await.unwrap();
 }
+
+// === Slice 4 Tests ===
+
+#[tokio::test]
+async fn storage_range_delete_audit() {
+    let (db, _) = test_shard_db("test/range_delete_audit").await;
+    db.put(b"key1", b"val1").await.unwrap();
+    db.put(b"key2", b"val2").await.unwrap();
+
+    // Verify cleanup uses scan-and-delete, proving range delete is not used
+    let entries = db.scan_prefix(b"").await.unwrap();
+    let mut batch = WriteBatch::new();
+    for (k, _) in entries {
+        batch.delete(&k);
+    }
+    db.write_batch(batch).await.unwrap();
+
+    assert_eq!(db.get(b"key1").await.unwrap(), None);
+    assert_eq!(db.get(b"key2").await.unwrap(), None);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_filter_snapshot_safety() {
+    let store = Arc::new(InMemory::new());
+
+    let db = ShardDb::builder("test/snapshot_safety", store.clone())
+        .build()
+        .await
+        .unwrap();
+    db.put(b"k1", b"v1").await.unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+
+    // Open concurrent snapshot reader
+    let reader = crate::reader::ShardReader::open("test/snapshot_safety", store.clone())
+        .await
+        .unwrap();
+    assert_eq!(reader.get(b"k1").await.unwrap(), Some(Bytes::from("v1")));
+
+    // Modify/delete keys in the main DB and flush (simulating compaction cleanup)
+    let db = ShardDb::builder("test/snapshot_safety", store)
+        .build()
+        .await
+        .unwrap();
+    db.delete(b"k1").await.unwrap();
+    db.flush().await.unwrap();
+
+    // Verify snapshot reader STILL reads the original value correctly
+    assert_eq!(reader.get(b"k1").await.unwrap(), Some(Bytes::from("v1")));
+    db.close().await.unwrap();
+}

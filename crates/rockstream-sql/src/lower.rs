@@ -52,9 +52,20 @@ use crate::error::SqlError;
 /// are supported.  Other plan nodes return `RS-1013`.
 pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
     match plan {
-        LogicalPlan::TableScan(scan) => Ok(PlanNode::Source {
-            name: scan.table_name.table().to_string(),
-        }),
+        LogicalPlan::TableScan(scan) => {
+            let src = PlanNode::Source {
+                name: scan.table_name.table().to_string(),
+            };
+            if let Some(ref proj) = scan.projection {
+                let columns = proj.iter().map(|&idx| Expr::Column(idx)).collect();
+                Ok(PlanNode::Project {
+                    input: Box::new(src),
+                    columns,
+                })
+            } else {
+                Ok(src)
+            }
+        }
 
         LogicalPlan::Filter(filter) => {
             let input = lower(&filter.input)?;

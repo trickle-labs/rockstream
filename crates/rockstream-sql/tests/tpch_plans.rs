@@ -76,6 +76,17 @@ fn partsupp_schema() -> SchemaRef {
     ]))
 }
 
+fn part_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("p_partkey", DataType::Int64, false),
+        Field::new("p_size", DataType::Int64, false),
+        Field::new("p_retailprice", DataType::Int64, false),
+        Field::new("p_brand", DataType::Int64, false),
+        Field::new("p_type", DataType::Int64, false),
+        Field::new("p_container", DataType::Int64, false),
+    ]))
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Count `InnerJoin` nodes in a `PlanNode` tree.
@@ -156,6 +167,7 @@ fn tpch_frontend() -> SqlFrontend {
     f.register_table("nation", nation_schema()).unwrap();
     f.register_table("region", region_schema()).unwrap();
     f.register_table("partsupp", partsupp_schema()).unwrap();
+    f.register_table("part", part_schema()).unwrap();
     f
 }
 

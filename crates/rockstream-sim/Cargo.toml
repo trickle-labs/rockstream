@@ -20,3 +20,4 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+rockstream-oracle = { path = "../rockstream-oracle" }

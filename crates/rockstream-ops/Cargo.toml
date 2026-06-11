@@ -10,6 +10,10 @@ description = "Operator trait and per-operator implementations for RockStream"
 name = "minmax_bench"
 harness = false
 
+[[bench]]
+name = "perf_regression"
+harness = false
+
 [dependencies]
 rockstream-types = { workspace = true }
 rockstream-plan = { workspace = true }

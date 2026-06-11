@@ -12,6 +12,7 @@ rockstream-ops = { workspace = true }
 rockstream-plan = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
+rockstream-sql = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

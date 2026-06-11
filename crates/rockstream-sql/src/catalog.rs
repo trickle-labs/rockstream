@@ -245,12 +245,13 @@ impl SchemaCatalog {
 
         for vname in all_views.keys() {
             if !visited.contains(vname)
-                && dfs(vname, &adj, &mut visited, &mut rec_stack, &mut cycle_path) {
-                    return Err(SqlError::CycleDetected {
-                        view_name: name.to_string(),
-                        cycle_path,
-                    });
-                }
+                && dfs(vname, &adj, &mut visited, &mut rec_stack, &mut cycle_path)
+            {
+                return Err(SqlError::CycleDetected {
+                    view_name: name.to_string(),
+                    cycle_path,
+                });
+            }
         }
 
         let key = view_key(name);
