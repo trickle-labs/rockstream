@@ -74,8 +74,27 @@ containers.
   **both** a local-filesystem-backend test **and** a MinIO-backend test.
 - Every new distributed-coordination path ships at least one seeded `SimRuntime`
   test; a fault found by simulation is checked in as a permanent regression seed.
+- Every new distributed-coordination *protocol* (from v0.18 onward) ships a green
+  FizzBee model (`formal/*.fizz`) with its safety, liveness, and `exists`-coverage
+  assertions, plus the paired runtime `assert!`, before it is done
+  ([FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.5, §3.6).
 - No code path may depend on SlateDB range deletion; a test asserts this.
 
+**Formal verification (binding from v0.18).** Distributed-coordination protocols
+are model-checked in [FizzBee] **before** their Rust implementation, per
+[FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md). FizzBee is not a fourth test
+backend — it is a design-time correctness oracle that sits one level above
+`SimRuntime`. The contract is explicit: every safety/liveness invariant proved
+in a `.fizz` model becomes a paired runtime `assert!` in the implementation
+([FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6), and every FizzBee
+counterexample is archived in `formal/findings.md` and translated into a
+permanent `SimRuntime` regression seed before the model is fixed. The
+`formal-verify` CI job runs the full spec suite on every PR that touches a
+coordination crate (`rockstream-runtime`, `-control`, `-connectors`,
+`-storage`) or `DESIGN.md`; a red model blocks merge. The full model→version
+mapping is the *Formal Verification Track (FizzBee)* section below.
+
+[FizzBee]: https://fizzbee.io
 [TestContainers]: https://testcontainers.com/
 
 ---
@@ -100,6 +119,10 @@ Every version must satisfy this baseline before it can be marked done:
   never acceptable.
 - Any new distributed-coordination path has at least one seeded `SimRuntime`
   test before it is done.
+- Any change to a distributed-coordination protocol (epoch commit, frontier
+  aggregation, 2PC sink, lease/fencing) has a green FizzBee model and its paired
+  runtime `assert!` ([FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6); from
+  v0.18 onward, `make verify` is part of the gate.
 - `main` remains runnable through the single `rockstream` binary.
 - A sign-off file `sign-offs/vX.Y.md` exists with all checklist items marked.
 
@@ -120,8 +143,8 @@ These names orient readers; they are not calendar commitments.
 | SQL Engine (Phase 2 entry) | v0.10 | Plain-SQL views with joins and set operations maintained incrementally on one shard. |
 | IVM Correct (Single-Shard) | v0.14 | TPC-H 22/22 incremental == batch; the engine is feature-complete and correct on one shard. |
 | Distributed Engine | v0.17 | Multi-shard execution with exchange; distributed output bit-identical to single-shard. |
-| Progress-Tracked | v0.19 | Frontier protocol correct across multi-input operators; bounded shuffle storage. |
-| Fault-Tolerant | v0.22 | Exactly-once end-to-end; 24h chaos with zero loss/duplicates; recovery SLOs met. |
+| Progress-Tracked | v0.19 | Frontier protocol correct across multi-input operators; bounded shuffle storage; FizzBee M2 frontier-aggregation model green. |
+| Fault-Tolerant | v0.22 | Exactly-once end-to-end; 24h chaos with zero loss/duplicates; recovery SLOs met; all four FizzBee models (M1–M4) green. |
 | Postgres Pillar | v0.26 | Read, write, subscribe, and read-your-writes over the Postgres wire protocol. |
 | Production Ready | v0.30 | Minimal connectors, observability, security, rolling upgrades; surface frozen for 1.0. |
 
@@ -181,16 +204,16 @@ integration with another process).
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.18 | Frontier protocol | `rockstream-types::Frontier` antichain with product-order timestamps and meet/join/advance property tests; per-shard frontier reporter bundled into every epoch commit; control-plane frontier aggregator consuming per-shard summaries and publishing the per-operator cluster frontier; separable `--role=frontier`. | `SimRuntime`: arbitrary frontier-report reorderings converge to the same cluster vector frontier as serial delivery; a frontier-aggregation stress test over thousands of shards × hundreds of operators converges without the control plane subscribing to each shard feed. | Unit, LFS, TC |
-| v0.19 | Frontier consumers and exchange GC | Operator frontier consumers using the input frontier to close windows, detect convergence, and release shuffle inbox entries; exchange GC reclaiming outbox/inbox entries via bounded scan-and-delete or snapshot-safe compaction filters; control-plane-derived `min_epoch_ms`/`max_epoch_ms`/initial parallelism from the declared freshness target (simple, bounded). **Progress-Tracked** milestone. | A join over two sources at different ingestion rates produces correct output with no premature emission and no infinite buffering; shuffle storage usage stays bounded under sustained throughput (measured against MinIO). | Unit, LFS, MinIO, TC |
+| v0.18 | Frontier protocol | `rockstream-types::Frontier` antichain with product-order timestamps and meet/join/advance property tests; per-shard frontier reporter bundled into every epoch commit; control-plane frontier aggregator consuming per-shard summaries and publishing the per-operator cluster frontier; separable `--role=frontier`. **FizzBee toolchain bootstrap** (catch-up from Phase 0, FIZZBEE_TEST_PLAN.md §4.0): `formal/` directory, pinned FizzBee binary, `make verify`, the `formal-verify` CI job, and `formal/conventions.md`. **M1 retro-model** `formal/m1_epoch_commit.fizz` (the epoch-commit/`WriteBatch` protocol already shipped in v0.5/v0.6/v0.15) back-filling its paired assertions. **M2 model** `formal/m2_frontier_agg.fizz`: `Shard`/`FrontierAggregator`/`ObjectStore`/`ControlPlane` roles; per-shard report via the explicit message-set mechanism; publisher lease via `ObjectStore.cas` with a fencing token. | `SimRuntime`: arbitrary frontier-report reorderings converge to the same cluster vector frontier as serial delivery; a frontier-aggregation stress test over thousands of shards × hundreds of operators converges without the control plane subscribing to each shard feed. **FizzBee**: `make verify` is green in CI; M1 safety M1-S1…S5, liveness M1-L1, and coverage COV-M1 pass; M2 safety M2-S1…S4 (meet order-independence, pessimistic staleness, single-publisher, stale-write rejection), liveness M2-L1…L2 (`liveness: nondeterministic`), and coverage COV-M2 pass; each invariant maps to a paired runtime `assert!` in `rockstream-control`. | Unit, LFS, TC |
+| v0.19 | Frontier consumers and exchange GC | Operator frontier consumers using the input frontier to close windows, detect convergence, and release shuffle inbox entries; exchange GC reclaiming outbox/inbox entries via bounded scan-and-delete or snapshot-safe compaction filters; control-plane-derived `min_epoch_ms`/`max_epoch_ms`/initial parallelism from the declared freshness target (simple, bounded). **M2 multi-source antichain variant** (FIZZBEE_TEST_PLAN.md D5.4): a fixed-length integer-vector frontier proving the meet is correct for the vector `FreshnessToken`, not just scalar source-epochs; findings recorded in `formal/findings.md` with paired `SimRuntime` regression seeds. **Progress-Tracked** milestone. | A join over two sources at different ingestion rates produces correct output with no premature emission and no infinite buffering; shuffle storage usage stays bounded under sustained throughput (measured against MinIO). **FizzBee**: the M2 multi-source meet model is green and its `SimRuntime` mirror (arbitrary frontier-report reorderings converge to the same cluster vector frontier) passes; the M2 §3.6 mapping rows are populated. | Unit, LFS, MinIO, TC |
 
 ### Phase 6 — Fault Tolerance & Exactly-Once
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.20 | Cluster checkpoints and recovery | Cluster checkpoint coordinator (barrier injection at sources; bounded barrier alignment tied to shuffle credits; one per-shard `Checkpoint` after all local operators commit through the barrier; atomic cluster-checkpoint commit; old-checkpoint GC); recovery driver bringing up every shard via `DbReader` pinned to its per-shard checkpoint, then re-electing writers. | Checkpointing under slow input and credit exhaustion never grows unbounded and either succeeds or reports `RECOVERING`; recovery from a cluster checkpoint reproduces pre-failure state bit-identically (verified on LFS and MinIO). | Unit, LFS, MinIO, TC |
-| v0.21 | Exactly-once sinks and resilience | Exactly-once sink protocol (`pre_commit`/`commit`); transactional Kafka sink; object-store sink via `_pending/` → atomic rename; per-connector source-epoch with persisted partition→offset map recorded in the epoch commit; worker self-fencing on control-plane partition (DESIGN.md §11.6); object-store brownout buffering + backpressure (DESIGN.md §11.7). | `SimRuntime`: 2PC sink crash points (pre-commit/between/commit) all recover idempotently; a network-partitioned worker fences before the new owner commits; a 50-epoch object-store blackout produces zero loss and zero duplicates; the Kafka sink delivers exactly once under injected broker faults. | Unit, LFS, MinIO, TC |
-| v0.22 | Chaos and recovery SLO gate | Chaos suite (random process kills, partitions, disk-full, object-store throttling) with output compared against a non-faulty reference; continuous simulation soak CI job running new seeds against `main`; recovery-time instrumentation. **Fault-Tolerant** milestone. | A 24-hour chaos run on a 32-shard cluster has zero data loss and zero duplicates with output matching reference; recovery from full outage in <60 s for state <1 TB; at `target_shard_state_bytes` (20 GB): failure detection ≤5 s p99, shard reassignment ≤30 s p99, freshness recovery ≤60 s p99; ≥100k seeded `SimRuntime` runs pass and the soak job has its first regression-seed corpus. | Unit, LFS, MinIO, TC |
+| v0.20 | Cluster checkpoints and recovery | Cluster checkpoint coordinator (barrier injection at sources; bounded barrier alignment tied to shuffle credits; one per-shard `Checkpoint` after all local operators commit through the barrier; atomic cluster-checkpoint commit; old-checkpoint GC); recovery driver bringing up every shard via `DbReader` pinned to its per-shard checkpoint, then re-electing writers. **M4 model** `formal/m4_self_fencing.fizz` (modeled before the self-fencing code in v0.21, FIZZBEE_TEST_PLAN.md §4.3, M4 first): `Worker`×2–3/`Shard`/`ControlPlane`/`ObjectStore`; `can_reach_control` flag; failure-detector `mark_dead`; `Shard.fence_epoch` CAS on every commit; `CheckpointCoordinator` role composed with M1's `cluster_committed` predicate. | Checkpointing under slow input and credit exhaustion never grows unbounded and either succeeds or reports `RECOVERING`; recovery from a cluster checkpoint reproduces pre-failure state bit-identically (verified on LFS and MinIO). **FizzBee**: M4 safety M4-S1…S4 (single-writer/no split-brain, self-fence precedence, lease uniqueness, object-store-only block), liveness M4-L1…L2 (`liveness: nondeterministic`), and coverage COV-M4 pass, justifying the recovery driver's writer re-election; paired runtime `assert!`s scheduled in `rockstream-runtime`. | Unit, LFS, MinIO, TC |
+| v0.21 | Exactly-once sinks and resilience | Exactly-once sink protocol (`pre_commit`/`commit`); transactional Kafka sink; object-store sink via `_pending/` → atomic rename; per-connector source-epoch with persisted partition→offset map recorded in the epoch commit; worker self-fencing on control-plane partition (DESIGN.md §11.6); object-store brownout buffering + backpressure (DESIGN.md §11.7). **M3 model** `formal/m3_sink_2pc.fizz`: `SinkConnector`/`ExternalSystem`/`Shard`/`CheckpointCoordinator`/`ControlPlane`/`ObjectStore`; three parameterized sub-models, one per `SinkIdempotencyProfile` (`NativeIdempotent`/`FencingTokenRequired`/`CheckBeforeCommit`); explicit duplicate-delivery injection; crash yield points before/between/during the 2PC steps. **M1 duplication variant** confirming idempotent replay (M1-S5) under explicit message duplication. | `SimRuntime`: 2PC sink crash points (pre-commit/between/commit) all recover idempotently; a network-partitioned worker fences before the new owner commits; a 50-epoch object-store blackout produces zero loss and zero duplicates; the Kafka sink delivers exactly once under injected broker faults. **FizzBee**: M3 safety M3-S1…S4 (no duplicate, no lost, checkpoint-coupled, recovery-dispatch idempotency for all three profiles), liveness M3-L1, and coverage COV-M3 pass; M3-S3 is composed with M1's `cluster_committed` predicate; the partitioned-worker self-fence matches M4-S2; paired runtime `assert!`s land in `rockstream-connectors` and `rockstream-runtime`. | Unit, LFS, MinIO, TC |
+| v0.22 | Chaos and recovery SLO gate | Chaos suite (random process kills, partitions, disk-full, object-store throttling) with output compared against a non-faulty reference; continuous simulation soak CI job running new seeds against `main`; recovery-time instrumentation. **Continuous formal verification** (FIZZBEE_TEST_PLAN.md §4.4): every FizzBee counterexample archived in `formal/findings.md` with its trace and paired `SimRuntime` regression seed; the `formal-verify` path-coupling check fails any coordination-crate or `DESIGN.md` change that lands without a corresponding model touch; a pre-release relaxed-bounds sweep (`NUM_WORKERS=3`, `NUM_SHARDS=3`, `MAX_EPOCH=4`). **Fault-Tolerant** milestone. | A 24-hour chaos run on a 32-shard cluster has zero data loss and zero duplicates with output matching reference; recovery from full outage in <60 s for state <1 TB; at `target_shard_state_bytes` (20 GB): failure detection ≤5 s p99, shard reassignment ≤30 s p99, freshness recovery ≤60 s p99; ≥100k seeded `SimRuntime` runs pass and the soak job has its first regression-seed corpus. **FizzBee**: all four models (M1–M4) are green at CI-fast and at the relaxed pre-release bounds; every archived counterexample replays clean as a permanent regression seed; the `formal-verify` gate is wired to the same merge gate as `cargo test`. **Fault-Tolerant** requires all four models green. | Unit, LFS, MinIO, TC |
 
 ### Phase 7 — PostgreSQL Wire Gateway
 
@@ -207,24 +230,51 @@ integration with another process).
 |---|---|---|---|---|
 | v0.27 | Kafka and Postgres CDC connectors | Kafka source (consumer-group; offsets in the control plane) and Postgres logical-replication source (`pgoutput`); the §13.3 connector contract (`discover_schema`/`start_snapshot`/`poll_delta`/`commit_offset`/`prepare`/`commit`/`abort`/`should_flush`, opaque `OffsetToken`, `watermark`, `credits_available()`); dead-letter queue (`RS-1003` events → DLQ sink; `rockstream_catalog.dead_letter_queue` with replay/dismiss). | An end-to-end Postgres CDC → IVM → Kafka pipeline runs against TestContainers (Postgres + Kafka + MinIO); a Kafka source closes a tumbling window correctly under deliberate clock skew; under downstream saturation, consumption tracks credits with bounded inbox memory; decode errors land in the DLQ and `REPLAY` re-processes them after a fix. | Unit, LFS, MinIO, TC |
 | v0.28 | Object-store sink, schema evolution, observability | Object-store/Parquet sink (idempotent rename); connector schema-version publication with incompatible-drift block (`RS-1002`) before any offset advances; Prometheus metrics (per-operator throughput/latency/state, shuffle bytes, frontier lag, checkpoint duration); OpenTelemetry per-epoch and source-to-sink traces; admin CLI (`pipeline`, `cluster status/scale`, `cluster workers`, `shard`, `checkpoint`, `debug arrangement`). | A schema-incompatible upstream change blocks consumption with `RS-1002` before any offset advances; the Parquet sink writes idempotently under crash-mid-flush (verified on MinIO); metrics and traces are emitted and scrapeable in a TestContainers integration run. | Unit, LFS, MinIO, TC |
-| v0.29 | Security and rolling upgrades | mTLS everywhere (worker↔control, worker↔worker, gateway↔client) with documented rotation; at-rest encryption via object-store features; `CREATE SECRET` with envelope encryption and worker-side resolution; storage-format version gate on shard open (`RS-5001`); N→N+1 rolling upgrade one worker at a time; full `RS-XXXX` doc pages with `next_steps` (CI-enforced); simulation CI gate (safety + liveness). | Unauthenticated/cross-tenant requests are rejected with `actor` audited; a rolling N→N+1 upgrade loses no epochs and the format-version gate fires on an incompatible binary; every registered error code has a published doc page with non-empty `next_steps`. | Unit, LFS, MinIO, TC |
+| v0.29 | Security and rolling upgrades | mTLS everywhere (worker↔control, worker↔worker, gateway↔client) with documented rotation; at-rest encryption via object-store features; `CREATE SECRET` with envelope encryption and worker-side resolution; storage-format version gate on shard open (`RS-5001`); N→N+1 rolling upgrade one worker at a time; full `RS-XXXX` doc pages with `next_steps` (CI-enforced); simulation CI gate (safety + liveness). | Unauthenticated/cross-tenant requests are rejected with `actor` audited; a rolling N→N+1 upgrade loses no epochs and the format-version gate fires on an incompatible binary; every registered error code has a published doc page with non-empty `next_steps`. The `formal-verify` job (all four FizzBee models, M1–M4) is part of the release gate alongside the simulation CI gate. | Unit, LFS, MinIO, TC |
 | v0.30 | Production soak and surface freeze | 24-hour end-to-end exactly-once soak (Postgres CDC → IVM → Kafka at 100k rows/s); multi-day availability run on a 32–64-shard cluster; disaster-recovery runbook executed; independent security review; public-surface audit and classification (SQL subset, CLI, system tables, metrics, error codes) with the stable surface frozen and minimal. **Production Ready** milestone → 1.0 gate. | The 24-hour E2E soak shows zero loss and zero duplicates; ≥99.9% availability over the multi-day soak; the DR procedure completes successfully; the security review passes; the stable public surface is frozen, classified, and documented. | Unit, LFS, MinIO, TC |
+
+---
+
+## Formal Verification Track (FizzBee)
+
+[FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) is the authoritative specification
+for design-time formal verification. Because v0.1–v0.17 shipped before the
+FizzBee toolchain existed, its Phase 0 toolchain and the M1 epoch-commit model
+are folded into v0.18 as catch-up; the remaining models are then woven into the
+versions that build each protocol — always **modeled before the Rust code**, so
+the design is verified before the implementation exists.
+
+| Version | FizzBee deliverable | Models / specs | Invariants | Gate |
+|---|---|---|---|---|
+| v0.18 | Toolchain bootstrap (D0.1–D0.4) + M1 retro-model (D1.1–D1.5) + M2 scalar model (D5.1–D5.3) | `formal/conventions.md`, `formal/m1_epoch_commit.fizz`, `formal/m2_frontier_agg.fizz`, `fizz.yaml`, `formal-verify` CI job | M1-S1…S5, M1-L1, COV-M1; M2-S1…S4, M2-L1…L2, COV-M2 | `make verify` green; M1 + M2 models green; paired `assert!`s in `rockstream-storage`, `-runtime`, `-control` |
+| v0.19 | M2 multi-source antichain variant (D5.4–D5.5) | `formal/m2_frontier_agg.fizz` (vector frontier) | M2-S1 over the vector `FreshnessToken` | Multi-source meet model green; §3.6 M2 rows populated; `SimRuntime` reordering mirror passes |
+| v0.20 | M4 self-fencing model (D6.1–D6.2) | `formal/m4_self_fencing.fizz` | M4-S1…S4, M4-L1…L2, COV-M4 | M4 model green (justifies writer re-election); paired `assert!`s in `rockstream-runtime` |
+| v0.21 | M3 sink-2PC model (D6.3–D6.4) + M1 duplication variant (D6.5) | `formal/m3_sink_2pc.fizz` (×3 idempotency profiles), `formal/m1_epoch_commit.fizz` (duplication) | M3-S1…S4, M3-L1, COV-M3; M1-S5 under duplication | M3 model green (M3-S3 composed with M1 `cluster_committed`); paired `assert!`s in `rockstream-connectors`, `-runtime` |
+| v0.22 | Continuous verification + findings (D6.6, DC.1–DC.4) | all `.fizz` specs, `formal/findings.md` | all M1–M4 safety + liveness | All four models green at CI-fast and relaxed bounds; path-coupling check live; counterexamples replayed forever as regression seeds |
+| v0.23–v0.30 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M4 | A coordination-protocol change without a model touch fails CI; the v0.30 surface freeze re-runs the relaxed-bounds sweep |
+
+Every row above maps each FizzBee invariant to a paired runtime `assert!` per
+[FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6; CI cross-checks that every
+mapped invariant has both a green FizzBee assertion and a present runtime
+`assert!`. A FizzBee counterexample for any protocol becomes a named
+`SimRuntime` regression seed before the model is fixed, and is replayed on every
+build thereafter.
 
 ---
 
 ## How This Roadmap Maps to the Plan
 
-| Plan phase | Roadmap versions |
-|---|---|
-| Phase 0 — Foundation | v0.1 – v0.3 |
-| Phase 1 — Single-Shard IVM Core | v0.4 – v0.6 |
-| Phase 2 — SQL Frontend & Joins | v0.7 – v0.10 |
-| Phase 3 — Essential Operators & Soak | v0.11 – v0.14 |
-| Phase 4 — Multi-Shard & Exchange | v0.15 – v0.17 |
-| Phase 5 — Frontier Protocol | v0.18 – v0.19 |
-| Phase 6 — Fault Tolerance & Exactly-Once | v0.20 – v0.22 |
-| Phase 7 — PostgreSQL Wire Gateway | v0.23 – v0.26 |
-| Phase 8 — Minimal Connectors & Hardening | v0.27 – v0.30 |
+| Plan phase | Roadmap versions | FizzBee model (FIZZBEE_TEST_PLAN.md) |
+|---|---|---|
+| Phase 0 — Foundation | v0.1 – v0.3 | Toolchain folded into v0.18 (catch-up) |
+| Phase 1 — Single-Shard IVM Core | v0.4 – v0.6 | M1 epoch-commit (retro-modeled in v0.18) |
+| Phase 2 — SQL Frontend & Joins | v0.7 – v0.10 | — |
+| Phase 3 — Essential Operators & Soak | v0.11 – v0.14 | — |
+| Phase 4 — Multi-Shard & Exchange | v0.15 – v0.17 | — |
+| Phase 5 — Frontier Protocol | v0.18 – v0.19 | M2 frontier aggregation |
+| Phase 6 — Fault Tolerance & Exactly-Once | v0.20 – v0.22 | M3 sink 2PC, M4 self-fencing |
+| Phase 7 — PostgreSQL Wire Gateway | v0.23 – v0.26 | Continuous verification |
+| Phase 8 — Minimal Connectors & Hardening | v0.27 – v0.30 | Continuous verification + relaxed-bounds sweep |
 
 Thirty versions at ~6 person-weeks each is the full path from an empty
 repository to a production-ready, two-pillar 1.0. The order is fixed:
