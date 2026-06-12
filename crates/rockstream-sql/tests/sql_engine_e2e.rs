@@ -482,8 +482,7 @@ async fn sql_engine_window_row_number_over_view() {
             | PlanNode::Project { input, .. }
             | PlanNode::Map { input, .. }
             | PlanNode::Aggregate { input, .. }
-            | PlanNode::Distinct { input, .. }
-            | PlanNode::Window { input, .. } => has_window(input),
+            | PlanNode::Distinct { input, .. } => has_window(input),
             PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => {
                 has_window(child)
             }

@@ -14,9 +14,9 @@ use rockstream_types::audit::AuditEvent;
 use rockstream_types::error_code::{ErrorCode, RS_0002, RS_0003};
 use serde::Serialize;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts
@@ -67,6 +67,8 @@ pub struct StartOptions {
     pub storage: PathBuf,
     /// Requested node role.
     pub role: String,
+    /// Control service URL.
+    pub control: Option<String>,
 }
 
 /// The result of a successful `rockstream start` no-op run.
@@ -127,27 +129,6 @@ fn validate_role(role: &str) -> Result<(), CliError> {
     }
 }
 
-/// Append an audit event as one JSON line to an open writer.
-fn write_audit_line(writer: &mut impl Write, event: &AuditEvent) -> Result<(), CliError> {
-    let line = serde_json::to_string(event).map_err(|e| {
-        CliError::new(
-            RS_0003,
-            format!("could not serialize audit event: {e}"),
-            "This is an internal error; please report it with the support bundle.",
-        )
-    })?;
-    writer
-        .write_all(line.as_bytes())
-        .and_then(|()| writer.write_all(b"\n"))
-        .map_err(|e| {
-            CliError::new(
-                RS_0003,
-                format!("could not write audit log: {e}"),
-                "Check that the storage directory is writable and the disk is not full.",
-            )
-        })
-}
-
 /// Run `rockstream start` as an embedded no-op node.
 ///
 /// Creates the storage directory, writes an audit log recording the node and
@@ -156,6 +137,14 @@ fn write_audit_line(writer: &mut impl Write, event: &AuditEvent) -> Result<(), C
 pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let started_ms = now_ms();
     validate_role(&opts.role)?;
+
+    if (opts.role == "worker" || opts.role == "gateway") && opts.control.is_none() {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_0002,
+            format!("role `{}` requires --control=<url>", opts.role),
+            "Provide the control plane URL via the --control argument.",
+        ));
+    }
 
     fs::create_dir_all(&opts.storage).map_err(|e| {
         CliError::new(
@@ -168,19 +157,115 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         )
     })?;
 
-    // Embedded no-op node lifecycle. Every control-plane action is audited.
-    let events = vec![
-        AuditEvent::now(SYSTEM_ACTOR, "server.started", "rockstream")
-            .with_detail(format!("role={}", opts.role)),
-        AuditEvent::now(SYSTEM_ACTOR, "pipeline.created", "noop-pipeline")
-            .with_detail("embedded no-op pipeline"),
-        AuditEvent::now(SYSTEM_ACTOR, "pipeline.started", "noop-pipeline"),
-        AuditEvent::now(SYSTEM_ACTOR, "pipeline.stopped", "noop-pipeline"),
-        AuditEvent::now(SYSTEM_ACTOR, "server.stopped", "rockstream"),
-    ];
-
     let audit_path = opts.storage.join("audit.jsonl");
-    write_audit_log(&audit_path, &events)?;
+    let audit_log = rockstream_control::audit::FileAuditLog::open(&audit_path).map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("could not open audit log: {e}"),
+            "Check storage directory permissions.",
+        )
+    })?;
+
+    // Log baseline startup events
+    let _ = audit_log.append(
+        &AuditEvent::now(SYSTEM_ACTOR, "server.started", "rockstream")
+            .with_detail(format!("role={}", opts.role)),
+    );
+    let _ = audit_log.append(
+        &AuditEvent::now(SYSTEM_ACTOR, "pipeline.created", "noop-pipeline")
+            .with_detail("embedded no-op pipeline"),
+    );
+    let _ = audit_log.append(&AuditEvent::now(
+        SYSTEM_ACTOR,
+        "pipeline.started",
+        "noop-pipeline",
+    ));
+
+    // Start services in a tokio runtime
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
+
+    rt.block_on(async {
+        let mut control_handle = None;
+        let mut worker_handle = None;
+        let mut control_url = opts.control.clone();
+
+        if opts.role == "all" {
+            let catalog = rockstream_control::TopologyCatalog::new();
+            let manager = rockstream_control::ShardManager::new();
+            let service = rockstream_control::ControlService::new(catalog)
+                .with_shard_manager(manager)
+                .with_audit(Arc::new(
+                    rockstream_control::audit::FileAuditLog::open(&audit_path).unwrap(),
+                ));
+            let handle = service.start("127.0.0.1:0").await.unwrap();
+            control_url = Some(handle.addr.to_string());
+            control_handle = Some(handle);
+        } else if opts.role == "control" {
+            let catalog = rockstream_control::TopologyCatalog::new();
+            let manager = rockstream_control::ShardManager::new();
+            let service = rockstream_control::ControlService::new(catalog)
+                .with_shard_manager(manager)
+                .with_audit(Arc::new(
+                    rockstream_control::audit::FileAuditLog::open(&audit_path).unwrap(),
+                ));
+            let handle = service.start("127.0.0.1:8000").await.unwrap();
+            control_handle = Some(handle);
+        }
+
+        if opts.role == "worker" || opts.role == "all" {
+            let url = control_url.as_deref().unwrap_or("127.0.0.1:8000");
+            let (client, handle) = rockstream_runtime::start_worker_client(1, url, &opts.storage)
+                .await
+                .unwrap();
+
+            if opts.role == "all" {
+                // Wait for worker registration handshake
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                // Acquire shard 1 lease to demonstrate fencing setup
+                let _ = client
+                    .request_shard(rockstream_types::ids::ShardId(1))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            worker_handle = Some(handle);
+        }
+
+        // Allow live interactions to complete
+        let sleep_ms = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(50);
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+
+        if let Some(wh) = worker_handle {
+            wh.abort();
+        }
+        if let Some(ch) = control_handle {
+            ch.shutdown();
+        }
+    });
+
+    let _ = audit_log.append(&AuditEvent::now(
+        SYSTEM_ACTOR,
+        "pipeline.stopped",
+        "noop-pipeline",
+    ));
+    let _ = audit_log.append(&AuditEvent::now(
+        SYSTEM_ACTOR,
+        "server.stopped",
+        "rockstream",
+    ));
+
+    let events = audit_log.read_all().map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("could not read audit events: {e}"),
+            "Check audit log file readability.",
+        )
+    })?;
 
     let bundle_path = write_support_bundle(&opts.storage, &opts.role, started_ms, &events)?;
 
@@ -189,20 +274,6 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         bundle_path,
         events_written: events.len(),
     })
-}
-
-fn write_audit_log(audit_path: &Path, events: &[AuditEvent]) -> Result<(), CliError> {
-    let mut file = fs::File::create(audit_path).map_err(|e| {
-        CliError::new(
-            RS_0003,
-            format!("could not create audit log {}: {e}", audit_path.display()),
-            "Check that the storage directory is writable and the disk is not full.",
-        )
-    })?;
-    for event in events {
-        write_audit_line(&mut file, event)?;
-    }
-    Ok(())
 }
 
 fn write_support_bundle(
@@ -272,10 +343,11 @@ mod tests {
         let opts = StartOptions {
             storage: dir.path().to_path_buf(),
             role: "all".to_string(),
+            control: None,
         };
         let outcome = run_start(&opts).unwrap();
 
-        assert_eq!(outcome.events_written, 5);
+        assert!(outcome.events_written >= 5);
 
         let audit = fs::read_to_string(&outcome.audit_path).unwrap();
         for expected in [
@@ -284,6 +356,8 @@ mod tests {
             "pipeline.started",
             "pipeline.stopped",
             "server.stopped",
+            "worker.registered",
+            "shard.lease_granted",
         ] {
             assert!(audit.contains(expected), "audit log missing {expected}");
         }
@@ -305,8 +379,21 @@ mod tests {
         let opts = StartOptions {
             storage: nested.clone(),
             role: "all".to_string(),
+            control: None,
         };
         run_start(&opts).unwrap();
         assert!(nested.join("audit.jsonl").exists());
+    }
+
+    #[test]
+    fn worker_or_gateway_role_without_control_fails_with_rs_0002() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StartOptions {
+            storage: dir.path().to_path_buf(),
+            role: "worker".to_string(),
+            control: None,
+        };
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(err.code.to_string(), "RS-0002");
     }
 }

@@ -297,11 +297,10 @@ mod tests {
 
         let view_ref_op = ViewRefOp::new(db.clone(), op_id, schema.clone(), 0);
 
-        for epoch in 0..10 {
+        for expected in expected_epochs.iter() {
             let out = view_ref_op
                 .process_delta(ArrowZSet::empty(schema.clone()))
                 .unwrap();
-            let expected = &expected_epochs[epoch];
             assert_eq!(out.num_rows(), expected.len());
 
             let k_col = out
@@ -316,8 +315,8 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            for idx in 0..out.num_rows() {
-                let (_, exp_k, exp_v, exp_w) = expected[idx];
+            for (idx, &(_, exp_k, exp_v, exp_w)) in expected.iter().enumerate().take(out.num_rows())
+            {
                 assert_eq!(k_col.value(idx), exp_k);
                 assert_eq!(v_col.value(idx), exp_v);
                 assert_eq!(out.weights[idx], exp_w);

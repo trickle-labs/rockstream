@@ -65,6 +65,7 @@ fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes:
 /// - Checkpoint creation for consistent snapshots
 ///
 /// No code path uses range deletion.
+#[derive(Clone)]
 pub struct ShardDb {
     db: Db,
 }

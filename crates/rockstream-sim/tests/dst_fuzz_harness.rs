@@ -1,7 +1,7 @@
 //! DST simulation fuzz harness under SimRuntime (v0.14).
 
 use rockstream_oracle::sql_fuzzer;
-use rockstream_sim::{Runtime, SeedOutcome, SimRuntime, SoakRunner};
+use rockstream_sim::{Runtime, SeedOutcome, SoakRunner};
 
 #[test]
 fn dst_fuzz_harness_seeds() {

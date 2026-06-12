@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("SlateDB error: {0}")]
-    Slate(#[from] slatedb::Error),
+    Slate(slatedb::Error),
 
     #[error("key encoding error: {0}")]
     KeyEncoding(String),
@@ -29,4 +29,21 @@ pub enum StorageError {
     /// RS-5003: stored operand fails validation for the merge law.
     #[error("RS-5003: operand corruption for law {law_name} ({law_id}): invalid bytes")]
     OperandCorruption { law_id: u16, law_name: String },
+
+    /// RS-3001: writer was fenced out by a newer writer.
+    #[error("RS-3001: shard writer fenced out: lease lost")]
+    Fenced,
+}
+
+impl From<slatedb::Error> for StorageError {
+    fn from(err: slatedb::Error) -> Self {
+        if matches!(
+            err.kind(),
+            slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
+        ) {
+            StorageError::Fenced
+        } else {
+            StorageError::Slate(err)
+        }
+    }
 }

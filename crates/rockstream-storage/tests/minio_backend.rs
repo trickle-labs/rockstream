@@ -34,11 +34,10 @@ use object_store::ObjectStore;
 use rockstream_storage::{
     keys::{CatalogKeyEncoder, CatalogType, ShardKeyEncoder, ShardPrefix},
     merge_registry::MergeOperatorRegistry,
-    ShardDb, WriteBatch,
+    ShardDb, StorageError, WriteBatch,
 };
 use sha2::{Digest, Sha256};
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::minio::MinIO;
 
 // ─── constants ───────────────────────────────────────────────────────────────
 
@@ -165,13 +164,50 @@ async fn create_minio_bucket(port: u16, bucket: &str) {
     );
 }
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+use testcontainers::{core::WaitFor, Image};
+
+#[derive(Debug, Clone)]
+pub struct MinIO2024 {
+    env_vars: HashMap<String, String>,
+}
+
+impl Default for MinIO2024 {
+    fn default() -> Self {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("MINIO_CONSOLE_ADDRESS".to_owned(), ":9001".to_owned());
+        Self { env_vars }
+    }
+}
+
+impl Image for MinIO2024 {
+    fn name(&self) -> &str {
+        "minio/minio"
+    }
+
+    fn tag(&self) -> &str {
+        "RELEASE.2024-11-07T00-52-20Z"
+    }
+
+    fn ready_conditions(&self) -> Vec<WaitFor> {
+        vec![WaitFor::message_on_stderr("API:")]
+    }
+
+    fn env_vars(
+        &self,
+    ) -> impl IntoIterator<Item = (impl Into<Cow<'_, str>>, impl Into<Cow<'_, str>>)> {
+        &self.env_vars
+    }
+
+    fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
+        vec!["server", "/data"]
+    }
+}
+
 /// Start a MinIO container and return `(container, s3_port)`.
-///
-/// Uses `testcontainers_modules::minio::MinIO` (wraps `quay.io/minio/minio`)
-/// for correct image, command, and wait condition.  The test bucket is then
-/// created via a SigV4-signed S3 `CreateBucket` request.
-async fn start_minio() -> (testcontainers::ContainerAsync<MinIO>, u16) {
-    let container = MinIO::default()
+async fn start_minio() -> (testcontainers::ContainerAsync<MinIO2024>, u16) {
+    let container = MinIO2024::default()
         .start()
         .await
         .expect("failed to start MinIO container; is Docker running?");
@@ -190,6 +226,7 @@ fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
             .with_secret_access_key(MINIO_PASS)
             .with_region("us-east-1")
             .with_allow_http(true)
+            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
             .build()
             .expect("failed to build S3 object store for MinIO"),
     )
@@ -407,4 +444,56 @@ async fn minio_e2e_worker_and_control_roles() {
     worker_db.close().await.unwrap();
 
     // Container is dropped here — MinIO is torn down by TestContainers.
+}
+
+// ─── SlateDB MinIO Fencing ──────────────────────────────────────────────────
+
+/// **Fencing proof — MinIO backend.**
+///
+/// Verifies that when a second writer opens the same path on a real MinIO/S3 bucket,
+/// the first writer is fenced out and subsequent write attempts fail with
+/// `StorageError::Fenced` (RS-3001).
+#[tokio::test]
+async fn fencing_minio() {
+    if !docker_available() {
+        eprintln!("SKIP fencing_minio: Docker not available");
+        return;
+    }
+
+    let (_container, port) = start_minio().await;
+    let store = minio_object_store(port);
+
+    // 1. Open writer 1, write a key, and flush to establish the manifest.
+    let db1 = ShardDb::builder("fencing-shard", store.clone())
+        .build()
+        .await
+        .unwrap();
+    db1.put(b"key1", b"val1").await.unwrap();
+    db1.flush().await.unwrap();
+
+    // 2. Open writer 2 on the same prefix, write a key, and flush.
+    // This increments the manifest epoch and fences out writer 1 on the object store.
+    let db2 = ShardDb::builder("fencing-shard", store.clone())
+        .build()
+        .await
+        .unwrap();
+    db2.put(b"key2", b"val2").await.unwrap();
+    db2.flush().await.unwrap();
+
+    // 3. Attempt to write with writer 1. This should fail because it has been fenced out.
+    let result = db1.put(b"key3", b"val3").await;
+    assert!(
+        result.is_err(),
+        "Writer 1 should have been fenced out by writer 2 on MinIO"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, StorageError::Fenced),
+        "Expected StorageError::Fenced on MinIO, got: {:?}",
+        err
+    );
+
+    // 4. Clean close.
+    let _ = db1.close().await;
+    db2.close().await.unwrap();
 }

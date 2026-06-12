@@ -530,22 +530,6 @@ mod tests {
         ArrowZSet::new(data, w)
     }
 
-    fn live_vals(zset: &ArrowZSet) -> Vec<i64> {
-        let col = zset
-            .data
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let mut vals: Vec<(i64, i64)> = (0..zset.num_rows())
-            .map(|i| (col.value(i), zset.weights[i]))
-            .filter(|(_, w)| *w > 0)
-            .map(|(v, _)| (v, v))
-            .collect();
-        vals.sort_by(|a, b| b.0.cmp(&a.0));
-        vals.iter().map(|(v, _)| *v).collect()
-    }
-
     fn accumulate_vals(state: &mut HashMap<i64, i64>, zset: &ArrowZSet) {
         if zset.is_empty() {
             return;

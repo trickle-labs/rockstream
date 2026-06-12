@@ -503,9 +503,9 @@ async fn run_df_batch(ctx: &SessionContext, query: &str) -> BTreeMap<Vec<i64>, i
             col_arrays.push(col);
         }
         for i in 0..num_rows {
-            let mut row = Vec::new();
-            for j in 0..num_cols {
-                row.push(col_arrays[j].value(i));
+            let mut row = Vec::with_capacity(col_arrays.len());
+            for col in &col_arrays {
+                row.push(col.value(i));
             }
             *results.entry(row).or_insert(0) += 1;
         }
@@ -668,9 +668,9 @@ async fn test_tpch_queries_incremental_vs_batch() {
                 );
             }
             for i in 0..out_0.num_rows() {
-                let mut row = Vec::new();
-                for j in 0..num_cols {
-                    row.push(col_arrays[j].value(i));
+                let mut row = Vec::with_capacity(col_arrays.len());
+                for col in &col_arrays {
+                    row.push(col.value(i));
                 }
                 *inc_acc.entry(row).or_insert(0) += out_0.weights[i];
             }
@@ -727,9 +727,9 @@ async fn test_tpch_queries_incremental_vs_batch() {
                 );
             }
             for i in 0..out_1.num_rows() {
-                let mut row = Vec::new();
-                for j in 0..num_cols {
-                    row.push(col_arrays[j].value(i));
+                let mut row = Vec::with_capacity(col_arrays.len());
+                for col in &col_arrays {
+                    row.push(col.value(i));
                 }
                 *inc_acc.entry(row).or_insert(0) += out_1.weights[i];
             }
@@ -786,9 +786,9 @@ async fn test_tpch_queries_incremental_vs_batch() {
                 );
             }
             for i in 0..out_2.num_rows() {
-                let mut row = Vec::new();
-                for j in 0..num_cols {
-                    row.push(col_arrays[j].value(i));
+                let mut row = Vec::with_capacity(col_arrays.len());
+                for col in &col_arrays {
+                    row.push(col.value(i));
                 }
                 *inc_acc.entry(row).or_insert(0) += out_2.weights[i];
             }

@@ -27,9 +27,13 @@ enum Command {
         #[arg(long)]
         storage: std::path::PathBuf,
 
-        /// Node role. v0.1 runs the embedded `all` profile regardless of role.
+        /// Node role.
         #[arg(long, default_value = "all")]
         role: String,
+
+        /// Control service URL (required for worker and gateway roles).
+        #[arg(long)]
+        control: Option<String>,
     },
 }
 
@@ -44,8 +48,16 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Start { storage, role } => {
-            let opts = StartOptions { storage, role };
+        Command::Start {
+            storage,
+            role,
+            control,
+        } => {
+            let opts = StartOptions {
+                storage,
+                role,
+                control,
+            };
             match run_start(&opts) {
                 Ok(outcome) => {
                     tracing::info!(

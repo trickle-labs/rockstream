@@ -46,70 +46,67 @@ fn bench_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("filter_performance");
     let op = make_filter_op();
 
-    for &batch_size in &[10_000usize] {
-        group.throughput(Throughput::Elements(batch_size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("filter_in_memory", batch_size),
-            &batch_size,
-            |b, &n| {
-                let rows: Vec<(i64, i64, i64)> =
-                    (0..n as i64).map(|i| (i % 5, i * 7 % 1000, 1)).collect();
-                let batch = make_kv_batch(&rows);
-                b.iter(|| {
-                    let _ = op.process_delta(batch.clone()).unwrap();
-                });
-            },
-        );
-    }
+    let batch_size = 10_000usize;
+    group.throughput(Throughput::Elements(batch_size as u64));
+    group.bench_with_input(
+        BenchmarkId::new("filter_in_memory", batch_size),
+        &batch_size,
+        |b, &n| {
+            let rows: Vec<(i64, i64, i64)> =
+                (0..n as i64).map(|i| (i % 5, i * 7 % 1000, 1)).collect();
+            let batch = make_kv_batch(&rows);
+            b.iter(|| {
+                let _ = op.process_delta(batch.clone()).unwrap();
+            });
+        },
+    );
     group.finish();
 }
 
 fn bench_aggregate(c: &mut Criterion) {
     let mut group = c.benchmark_group("aggregate_performance");
 
-    for &batch_size in &[10_000usize] {
-        group.throughput(Throughput::Elements(batch_size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("aggregate_in_memory", batch_size),
-            &batch_size,
-            |b, &n| {
-                let op = AggregateOp::new(OperatorId(10));
-                let rows: Vec<(i64, i64, i64)> =
-                    (0..n as i64).map(|i| (i % 5, i * 7 % 1000, 1)).collect();
-                let batch = make_kv_batch(&rows);
-                b.iter(|| {
-                    let _ = op.process_delta(batch.clone()).unwrap();
-                });
-            },
-        );
-    }
+    let batch_size = 10_000usize;
+    group.throughput(Throughput::Elements(batch_size as u64));
+    group.bench_with_input(
+        BenchmarkId::new("aggregate_in_memory", batch_size),
+        &batch_size,
+        |b, &n| {
+            let op = AggregateOp::new(OperatorId(10));
+            let rows: Vec<(i64, i64, i64)> =
+                (0..n as i64).map(|i| (i % 5, i * 7 % 1000, 1)).collect();
+            let batch = make_kv_batch(&rows);
+            b.iter(|| {
+                let _ = op.process_delta(batch.clone()).unwrap();
+            });
+        },
+    );
     group.finish();
 }
 
 fn bench_join(c: &mut Criterion) {
     let mut group = c.benchmark_group("join_performance");
 
-    for &batch_size in &[10_000usize] {
-        group.throughput(Throughput::Elements(batch_size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("join_in_memory", batch_size),
-            &batch_size,
-            |b, &n| {
-                let op = JoinOp::with_schema(OperatorId(20), vec![0], vec![0], 2, 2);
-                let left_rows: Vec<(i64, i64, i64)> =
-                    (0..n as i64).map(|i| (i % 10, i * 3 % 100, 1)).collect();
-                let right_rows: Vec<(i64, i64, i64)> =
-                    (0..n as i64).map(|i| (i % 10, i * 5 % 100, 1)).collect();
-                let left_batch = make_kv_batch(&left_rows);
-                let right_batch = make_kv_batch(&right_rows);
-                b.iter(|| {
-                    let _ = op
-                        .process_epoch(left_batch.clone(), right_batch.clone())
-                        .unwrap();
-                });
-            },
-        );
-    }
+    let batch_size = 10_000usize;
+    group.throughput(Throughput::Elements(batch_size as u64));
+    group.bench_with_input(
+        BenchmarkId::new("join_in_memory", batch_size),
+        &batch_size,
+        |b, &n| {
+            let op = JoinOp::with_schema(OperatorId(20), vec![0], vec![0], 2, 2);
+            let left_rows: Vec<(i64, i64, i64)> =
+                (0..n as i64).map(|i| (i % 10, i * 3 % 100, 1)).collect();
+            let right_rows: Vec<(i64, i64, i64)> =
+                (0..n as i64).map(|i| (i % 10, i * 5 % 100, 1)).collect();
+            let left_batch = make_kv_batch(&left_rows);
+            let right_batch = make_kv_batch(&right_rows);
+            b.iter(|| {
+                let _ = op
+                    .process_epoch(left_batch.clone(), right_batch.clone())
+                    .unwrap();
+            });
+        },
+    );
     group.finish();
 }
 

@@ -283,7 +283,8 @@ pub fn generate_random_query(seed: u64) -> String {
         }
         _ => {
             // Lag Window
-            "SELECT id, val, LAG(id, 1) OVER (PARTITION BY category ORDER BY id) FROM t1".to_string()
+            "SELECT id, val, LAG(id, 1) OVER (PARTITION BY category ORDER BY id) FROM t1"
+                .to_string()
         }
     }
 }

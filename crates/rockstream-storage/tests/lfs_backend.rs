@@ -21,7 +21,7 @@ use rockstream_storage::{
     keys::{ShardKeyEncoder, ShardPrefix},
     merge_registry::MergeOperatorRegistry,
     reader::ShardReader,
-    ShardDb, WriteBatch,
+    ShardDb, StorageError, WriteBatch,
 };
 use tempfile::TempDir;
 
@@ -409,4 +409,48 @@ async fn lfs_wal_entries_visible_before_flush() {
     assert_eq!(v, Some(Bytes::from("seen")));
 
     db.close().await.unwrap();
+}
+
+// ─── SlateDB Fencing ────────────────────────────────────────────────────────
+
+/// **Fencing proof — LFS backend.**
+///
+/// Verifies that when a second writer opens the same path on the local filesystem,
+/// the first writer is fenced out and subsequent write attempts fail with
+/// `StorageError::Fenced` (RS-3001).
+#[tokio::test]
+async fn fencing_lfs() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+
+    // 1. Open writer 1 and write a key.
+    let db1 = ShardDb::builder("shard", store.clone())
+        .build()
+        .await
+        .unwrap();
+    db1.put(b"key1", b"val1").await.unwrap();
+
+    // 2. Open writer 2 on the same prefix. This should fence out writer 1.
+    let db2 = ShardDb::builder("shard", store.clone())
+        .build()
+        .await
+        .unwrap();
+    db2.put(b"key2", b"val2").await.unwrap();
+
+    // 3. Attempt to write with writer 1. This should fail because it has been fenced out.
+    let result = db1.put(b"key3", b"val3").await;
+    assert!(
+        result.is_err(),
+        "Writer 1 should have been fenced out by writer 2"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, StorageError::Fenced),
+        "Expected StorageError::Fenced, got: {:?}",
+        err
+    );
+
+    // 4. Closing the fenced writer should also handle the error or be safe.
+    let _ = db1.close().await;
+    db2.close().await.unwrap();
 }

@@ -9,5 +9,14 @@ description = "Worker process, scheduler, epoch-commit coordinator, and exchange
 [dependencies]
 rockstream-ops = { workspace = true }
 rockstream-types = { workspace = true }
+rockstream-storage = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+object_store = { workspace = true }
+
+[dev-dependencies]
+rockstream-control = { workspace = true }
+tempfile = { workspace = true }

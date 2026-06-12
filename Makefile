@@ -42,21 +42,23 @@ e2e: build
 	@echo ""
 	@echo "--- Step 1: no-op binary (--role=control + --role=worker) ---"
 	@rm -rf /tmp/rockstream-e2e-test
-	@cargo run -- start --role=control --storage /tmp/rockstream-e2e-test
-	@test -f /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: audit.jsonl not found" && exit 1)
-	@grep -q "pipeline.created" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: pipeline.created event missing" && exit 1)
-	@grep -q "pipeline.started" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: pipeline.started event missing" && exit 1)
-	@grep -q "pipeline.stopped" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: pipeline.stopped event missing" && exit 1)
-	@grep -q "server.started" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: server.started event missing" && exit 1)
-	@grep -q "server.stopped" /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: server.stopped event missing" && exit 1)
+	@mkdir -p /tmp/rockstream-e2e-test
+	@ROCKSTREAM_E2E_SLEEP_MS=4000 ./target/debug/rockstream start --role=control --storage /tmp/rockstream-e2e-test/control > /tmp/control.stdout 2>&1 & CONTROL_PID=$$! ; \
+	sleep 1 ; \
+	ROCKSTREAM_E2E_SLEEP_MS=1000 ./target/debug/rockstream start --role=worker --control=127.0.0.1:8000 --storage /tmp/rockstream-e2e-test/worker ; \
+	wait $$CONTROL_PID
+	@test -f /tmp/rockstream-e2e-test/control/audit.jsonl || (echo "FAIL: control audit.jsonl not found" && exit 1)
+	@grep -q "pipeline.created" /tmp/rockstream-e2e-test/control/audit.jsonl || (echo "FAIL: pipeline.created event missing" && exit 1)
+	@grep -q "pipeline.started" /tmp/rockstream-e2e-test/control/audit.jsonl || (echo "FAIL: pipeline.started event missing" && exit 1)
+	@grep -q "pipeline.stopped" /tmp/rockstream-e2e-test/control/audit.jsonl || (echo "FAIL: pipeline.stopped event missing" && exit 1)
+	@grep -q "server.started" /tmp/rockstream-e2e-test/control/audit.jsonl || (echo "FAIL: server.started event missing" && exit 1)
+	@grep -q "server.stopped" /tmp/rockstream-e2e-test/control/audit.jsonl || (echo "FAIL: server.stopped event missing" && exit 1)
 	@echo "Audit log OK: all expected events present (role=control)"
-	@ls /tmp/rockstream-e2e-test/support-bundle-*.json > /dev/null 2>&1 || (echo "FAIL: support bundle not found" && exit 1)
-	@cat /tmp/rockstream-e2e-test/support-bundle-*.json | grep -q "audit_events" || (echo "FAIL: bundle missing audit_events" && exit 1)
-	@cat /tmp/rockstream-e2e-test/support-bundle-*.json | grep -q "system_info" || (echo "FAIL: bundle missing system_info" && exit 1)
+	@ls /tmp/rockstream-e2e-test/control/support-bundle-*.json > /dev/null 2>&1 || (echo "FAIL: support bundle not found" && exit 1)
+	@cat /tmp/rockstream-e2e-test/control/support-bundle-*.json | grep -q "audit_events" || (echo "FAIL: bundle missing audit_events" && exit 1)
+	@cat /tmp/rockstream-e2e-test/control/support-bundle-*.json | grep -q "system_info" || (echo "FAIL: bundle missing system_info" && exit 1)
 	@echo "Support bundle content OK"
-	@rm -rf /tmp/rockstream-e2e-test
-	@cargo run -- start --role=worker --storage /tmp/rockstream-e2e-test
-	@test -f /tmp/rockstream-e2e-test/audit.jsonl || (echo "FAIL: audit.jsonl not found (worker)" && exit 1)
+	@test -f /tmp/rockstream-e2e-test/worker/audit.jsonl || (echo "FAIL: audit.jsonl not found (worker)" && exit 1)
 	@echo "Audit log OK: expected events present (role=worker)"
 	@rm -rf /tmp/rockstream-e2e-test
 	@echo ""

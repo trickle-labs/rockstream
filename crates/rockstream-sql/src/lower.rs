@@ -1192,7 +1192,6 @@ mod tests {
             | PlanNode::Project { input, .. }
             | PlanNode::Map { input, .. }
             | PlanNode::Aggregate { input, .. }
-            | PlanNode::Distinct { input, .. }
             | PlanNode::ViewSink { child: input, .. }
             | PlanNode::Exchange { child: input, .. } => has_distinct(input),
             PlanNode::InnerJoin { left, right, .. }
@@ -1216,7 +1215,6 @@ mod tests {
             | PlanNode::Exchange { child: input, .. } => has_union(input),
             PlanNode::InnerJoin { left, right, .. }
             | PlanNode::OuterJoin { left, right, .. }
-            | PlanNode::Union { left, right }
             | PlanNode::Intersect { left, right, .. }
             | PlanNode::Except { left, right, .. } => has_union(left) || has_union(right),
             _ => false,
@@ -1302,8 +1300,7 @@ mod tests {
             | PlanNode::Project { input, .. }
             | PlanNode::Map { input, .. }
             | PlanNode::Aggregate { input, .. }
-            | PlanNode::Distinct { input, .. }
-            | PlanNode::Window { input, .. } => has_window(input),
+            | PlanNode::Distinct { input, .. } => has_window(input),
             PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => {
                 has_window(child)
             }
@@ -1323,8 +1320,7 @@ mod tests {
             | PlanNode::Project { input, .. }
             | PlanNode::Map { input, .. }
             | PlanNode::Aggregate { input, .. }
-            | PlanNode::Distinct { input, .. }
-            | PlanNode::Window { input, .. } => find_window_exprs(input),
+            | PlanNode::Distinct { input, .. } => find_window_exprs(input),
             PlanNode::ViewSink { child, .. } | PlanNode::Exchange { child, .. } => {
                 find_window_exprs(child)
             }

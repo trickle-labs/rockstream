@@ -3861,10 +3861,13 @@ name = "rockstream-cli"
 version = "0.52.10"
 dependencies = [
  "clap",
+ "rockstream-control",
+ "rockstream-runtime",
  "rockstream-types",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3951,8 +3954,15 @@ dependencies = [
 name = "rockstream-runtime"
 version = "0.52.10"
 dependencies = [
+ "object_store 0.12.5",
+ "parking_lot",
+ "rockstream-control",
  "rockstream-ops",
+ "rockstream-storage",
  "rockstream-types",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -3965,8 +3975,11 @@ dependencies = [
  "bytes",
  "parking_lot",
  "rand 0.8.6",
+ "rockstream-control",
  "rockstream-oracle",
+ "rockstream-runtime",
  "rockstream-types",
+ "tempfile",
  "tokio",
 ]
 
