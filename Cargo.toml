@@ -28,6 +28,9 @@ repository = "https://github.com/trickle-labs/rockstream"
 arrow = "58"
 async-trait = "0.1"
 bytes = "1"
+prost = "0.13"
+tonic = "0.12"
+futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 datafusion = "53"

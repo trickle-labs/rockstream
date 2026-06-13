@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package rockstream.shuffle;
+
+service ShuffleService {
+  // A bidirectional stream to send and receive shuffle batches.
+  // Multiplexes batches for all active exchanges and shards.
+  rpc ShuffleStream(stream ShuffleFrame) returns (stream ShuffleAck);
+}
+
+message ShuffleFrame {
+  uint64 exchange_id = 1;
+  uint32 src_shard = 2;
+  uint32 target_shard = 3;
+  uint64 epoch = 4;
+  uint64 seq = 5;
+  bytes payload = 6; // Serialized Arrow IPC RecordBatch
+}
+
+message ShuffleAck {
+  uint64 exchange_id = 1;
+  uint32 src_shard = 2;
+  uint32 target_shard = 3;
+  uint64 epoch = 4;
+  uint64 seq = 5;
+  uint32 credit_grant = 6; // Additional credit granted to the sender
+}

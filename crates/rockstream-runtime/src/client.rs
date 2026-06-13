@@ -149,7 +149,11 @@ pub async fn start_worker_client(
         let reg_msg = WorkerMessage::Register(reg);
         let reg_line = serde_json::to_string(&reg_msg).unwrap() + "\n";
         if let Err(e) = writer.write_all(reg_line.as_bytes()).await {
-            tracing::error!("Failed to write registration to control plane: {:?}", e);
+            tracing::error!(
+                code = %rockstream_types::error_code::RS_0001,
+                "Failed to write registration to control plane: {:?}",
+                e
+            );
             return;
         }
 
@@ -164,7 +168,11 @@ pub async fn start_worker_client(
                             if let Ok(line) = serde_json::to_string(&msg) {
                                 let line = line + "\n";
                                 if let Err(e) = writer_tx.write_all(line.as_bytes()).await {
-                                    tracing::error!("Worker client write error: {:?}", e);
+                                    tracing::error!(
+                                        code = %rockstream_types::error_code::RS_0001,
+                                        "Worker client write error: {:?}",
+                                        e
+                                    );
                                     break;
                                 }
                             }
@@ -207,7 +215,12 @@ pub async fn start_worker_client(
             let msg: ControlMessage = match serde_json::from_str(&line) {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::error!("Invalid message from control plane: {:?}, raw: {}", e, line);
+                    tracing::error!(
+                        code = %rockstream_types::error_code::RS_0001,
+                        "Invalid message from control plane: {:?}, raw: {}",
+                        e,
+                        line
+                    );
                     continue;
                 }
             };
@@ -241,6 +254,7 @@ pub async fn start_worker_client(
                         }
                         Err(e) => {
                             tracing::error!(
+                                code = %rockstream_types::error_code::RS_0003,
                                 "Failed to open ShardDb for {:?}: {:?}",
                                 lease.shard_id,
                                 e

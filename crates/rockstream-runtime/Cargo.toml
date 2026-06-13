@@ -16,6 +16,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
 object_store = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+arrow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"
+protobuf-src = "2.1"
 
 [dev-dependencies]
 rockstream-control = { workspace = true }

@@ -13,6 +13,8 @@ pub use rockstream_ops::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
 pub mod client;
 pub use client::{start_worker_client, ShardState, WorkerClientHandle};
 
+pub mod exchange;
+
 #[cfg(test)]
 mod tests {
     use super::*;
