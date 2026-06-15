@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage release
+.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage release verify
 
 # Build the workspace
 build:
@@ -17,7 +17,13 @@ fmt:
 	cargo fmt --all --check
 
 # Run all checks (what CI does)
-check: fmt clippy test error-codes exit-criteria
+check: fmt clippy test error-codes exit-criteria verify
+
+# Run formal verification specs
+verify:
+	fizz formal/smoke.fizz
+	fizz formal/m1_epoch_commit.fizz
+	fizz formal/m2_frontier_agg.fizz
 
 # Enforce that every logged error carries an RS-XXXX code.
 error-codes:

@@ -6,3 +6,4 @@ output.txt
 /lcov.info
 
 .github
+/formal/out/

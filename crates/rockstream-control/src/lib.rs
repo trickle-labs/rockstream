@@ -6,6 +6,7 @@
 //! ## Modules
 //!
 //! - [`audit`] — File-backed audit log (JSONL)
+//! - [`frontier`] — Frontier aggregation and ClusterFrontier publishing (v0.18)
 //! - [`topology`] — In-memory worker registry / topology catalog
 //! - [`placement`] — Capacity-aware shard and operator placement
 //! - [`scheduler`] — Shard scheduling: distributes shards across workers
@@ -14,6 +15,7 @@
 //! - [`tls`] — mTLS configuration scaffolding
 
 pub mod audit;
+pub mod frontier;
 pub mod placement;
 pub mod scheduler;
 pub mod service;
@@ -22,6 +24,7 @@ pub mod tls;
 pub mod topology;
 
 // Re-export commonly used top-level types.
+pub use frontier::{AggregatorError, FrontierAggregator};
 pub use placement::PlacementAlgorithm;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use service::{ControlService, ControlServiceHandle};

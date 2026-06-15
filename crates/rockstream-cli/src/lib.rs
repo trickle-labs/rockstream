@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts
 /// written against later versions parse, but they run the same embedded node.
-pub const KNOWN_ROLES: &[&str] = &["all", "control", "worker", "gateway"];
+pub const KNOWN_ROLES: &[&str] = &["all", "control", "worker", "gateway", "frontier"];
 
 /// The actor recorded for actions taken by the node itself.
 const SYSTEM_ACTOR: &str = "system";
@@ -146,6 +146,15 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         ));
     }
 
+    // `frontier` role also requires a control URL so it can subscribe to shard reports.
+    if opts.role == "frontier" && opts.control.is_none() {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_0002,
+            "role `frontier` requires --control=<url>",
+            "Provide the control plane URL via the --control argument.",
+        ));
+    }
+
     fs::create_dir_all(&opts.storage).map_err(|e| {
         CliError::new(
             RS_0003,
@@ -231,6 +240,22 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             worker_handle = Some(handle);
+        }
+
+        if opts.role == "frontier" {
+            // Start an in-process FrontierAggregator and emit audit events.
+            let aggregator = rockstream_control::FrontierAggregator::new();
+            // Emit audit event for this control-plane action.
+            let event = AuditEvent::now("system", "frontier.aggregator.started", "frontier")
+                .with_detail(format!("control={}", opts.control.as_deref().unwrap_or("")));
+            let _ = audit_log.append(&event);
+            // Fill-level metric snapshot at startup.
+            let fill = aggregator.fill_level();
+            tracing::info!(
+                registered = fill.registered,
+                capacity = fill.capacity,
+                "frontier aggregator started"
+            );
         }
 
         // Allow live interactions to complete
@@ -325,7 +350,7 @@ mod tests {
 
     #[test]
     fn unknown_role_is_rejected_with_rs_0002() {
-        let err = validate_role("frontier").unwrap_err();
+        let err = validate_role("bogus").unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
         assert!(err.next_steps.contains("all"));
     }
@@ -395,5 +420,26 @@ mod tests {
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
+    }
+
+    /// Slice 6: `--role=frontier` without `--control` must fail with RS-0002.
+    #[test]
+    fn frontier_role_without_control_fails_with_rs_0002() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StartOptions {
+            storage: dir.path().to_path_buf(),
+            role: "frontier".to_string(),
+            control: None,
+        };
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(err.code.to_string(), "RS-0002");
+        assert!(err.message.contains("frontier"));
+    }
+
+    /// Slice 6: `frontier` is a valid (known) role.
+    #[test]
+    fn frontier_role_is_known() {
+        assert!(KNOWN_ROLES.contains(&"frontier"));
+        assert!(validate_role("frontier").is_ok());
     }
 }

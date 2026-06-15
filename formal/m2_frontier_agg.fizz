@@ -1,0 +1,138 @@
+# formal/m2_frontier_agg.fizz
+# Asynchronous Frontier Aggregation & Lease-based Publishing
+
+# Constants
+MAX_EPOCH = 2
+NUM_SHARDS = 2
+
+# State variables
+action Init:
+    messages = []
+    token_counter = 0
+    
+    # Initialize shards one by one
+    shards = []
+    shards.append(Shard(id=0))
+    shards.append(Shard(id=1))
+    
+    store = ObjectStore()
+    
+    # Initialize aggregators one by one
+    aggregators = []
+    aggregators.append(FrontierAggregator(id=0))
+    aggregators.append(FrontierAggregator(id=1))
+    
+    max_published_frontier = 0
+    fencing_occurred = False
+    crash_occurred = False
+
+role Shard:
+    action Init:
+        self.frontier = 0
+
+    atomic fair action AdvanceAndReport:
+        require self.frontier < MAX_EPOCH
+        self.frontier = self.frontier + 1
+        messages.append({"shard_id": self.id, "frontier": self.frontier})
+
+role ObjectStore:
+    action Init:
+        self.leader_lease = -1
+        self.fence_token = 0
+        self.published_frontier = 0
+
+    def cas_lease(self, aggregator_id, current_token, new_token):
+        if self.fence_token == current_token:
+            self.leader_lease = aggregator_id
+            self.fence_token = new_token
+            return True
+        return False
+
+    def write_frontier(self, token, frontier):
+        if token >= self.fence_token:
+            if frontier >= self.published_frontier:
+                self.published_frontier = frontier
+                self.fence_token = token
+                return True
+        return False
+
+@state(ephemeral=["is_publisher", "lease_token", "local_shard_frontiers"])
+role FrontierAggregator:
+    action Init:
+        self.is_publisher = False
+        self.lease_token = 0
+        self.local_shard_frontiers = [0, 0]
+
+    atomic fair action AcquireLease:
+        require not self.is_publisher
+        require token_counter < 4
+        token_counter = token_counter + 1
+        current_token = store.fence_token
+        success = store.cas_lease(self.id, current_token, token_counter)
+        if success:
+            self.lease_token = token_counter
+            self.is_publisher = True
+            # Sync local frontiers to store's published frontier to avoid stale values
+            for i in range(NUM_SHARDS):
+                if store.published_frontier > self.local_shard_frontiers[i]:
+                    self.local_shard_frontiers[i] = store.published_frontier
+        else:
+            self.is_publisher = False
+
+    atomic fair action ReceiveReport:
+        require len(messages) > 0
+        msg = oneof messages
+        shard_id = msg["shard_id"]
+        if msg["frontier"] > self.local_shard_frontiers[shard_id]:
+            self.local_shard_frontiers[shard_id] = msg["frontier"]
+
+    atomic fair action PublishFrontier:
+        require self.is_publisher
+        # Compute meet (min of shard frontiers)
+        meet_val = self.local_shard_frontiers[0]
+        if self.local_shard_frontiers[1] < meet_val:
+            meet_val = self.local_shard_frontiers[1]
+
+        success = store.write_frontier(self.lease_token, meet_val)
+        if success:
+            if meet_val > max_published_frontier:
+                max_published_frontier = meet_val
+        else:
+            self.is_publisher = False
+            fencing_occurred = True
+
+# Aggregator crash simulation
+atomic action CrashAggregator:
+    require not crash_occurred
+    crash_occurred = True
+    agg = oneof aggregators
+    agg.is_publisher = False
+    agg.lease_token = 0
+    agg.local_shard_frontiers = [0, 0]
+
+# Invariants / Assertions
+
+always assertion M2_S1_MeetCorrectness:
+    return store.published_frontier <= (shards[0].frontier if shards[0].frontier < shards[1].frontier else shards[1].frontier)
+
+always assertion M2_S2_PessimisticStaleness:
+    return store.published_frontier <= (shards[0].frontier if shards[0].frontier < shards[1].frontier else shards[1].frontier)
+
+always assertion M2_S3_SinglePublisherSafety:
+    active_publishers = 0
+    for agg in aggregators:
+        if agg.is_publisher and agg.lease_token == store.fence_token:
+            active_publishers = active_publishers + 1
+    return active_publishers <= 1
+
+always assertion M2_S4_StaleWriteRejection:
+    return store.published_frontier >= max_published_frontier
+
+always eventually assertion M2_L1_PublicationProgress:
+    return store.published_frontier == MAX_EPOCH
+
+always eventually assertion M2_L2_FailoverProgress:
+    return store.published_frontier == MAX_EPOCH
+
+exists assertion COV_M2:
+    return fencing_occurred

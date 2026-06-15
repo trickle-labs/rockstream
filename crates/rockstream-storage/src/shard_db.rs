@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::ObjectStore;
+use rockstream_types::frontier::ShardFrontierReport;
+use rockstream_types::ids::ShardId;
 use rockstream_types::merge_law::{ArrangementHeader, MergeLawId};
 use slatedb::config::Settings;
 use slatedb::Db;
@@ -69,6 +71,7 @@ fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes:
 pub struct ShardDb {
     db: Db,
     object_store: Arc<dyn ObjectStore>,
+    last_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Builder for creating a `ShardDb`.
@@ -101,9 +104,20 @@ impl ShardDbBuilder {
             .with_merge_operator(Arc::new(SumCountMergeOperator))
             .build()
             .await?;
+        let frontier_key = ShardKeyEncoder::frontier_key();
+        let initial_epoch = if let Some(bytes) = db.get(&frontier_key).await? {
+            if bytes.len() == 8 {
+                u64::from_be_bytes(bytes[..8].try_into().unwrap())
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         Ok(ShardDb {
             db,
             object_store: self.object_store,
+            last_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
         })
     }
 }
@@ -121,11 +135,38 @@ impl ShardDb {
 
     /// Get the value for a key, if it exists.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
-        Ok(self.db.get(key).await?)
+        let val = self.db.get(key).await?;
+        if key == ShardKeyEncoder::frontier_key() {
+            if let Some(ref bytes) = val {
+                if bytes.len() == 8 {
+                    let epoch = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+                    let old_epoch = self.last_epoch.load(Ordering::SeqCst);
+                    assert!(
+                        epoch >= old_epoch,
+                        "M1-S2: committed_epoch read must be non-decreasing (got {}, was {})",
+                        epoch,
+                        old_epoch
+                    );
+                    self.last_epoch.store(epoch, Ordering::SeqCst);
+                }
+            }
+        }
+        Ok(val)
     }
 
     /// Put a key-value pair.
     pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        if key == ShardKeyEncoder::frontier_key() && value.len() == 8 {
+            let new_epoch = u64::from_be_bytes(value[..8].try_into().unwrap());
+            let old_epoch = self.last_epoch.load(Ordering::SeqCst);
+            assert!(
+                new_epoch >= old_epoch,
+                "M1-S2: committed_epoch must be non-decreasing (got {}, was {})",
+                new_epoch,
+                old_epoch
+            );
+            self.last_epoch.store(new_epoch, Ordering::SeqCst);
+        }
         self.db.put(key, value).await?;
         Ok(())
     }
@@ -151,6 +192,22 @@ impl ShardDb {
     /// [`WriteBatch::merge_from`] before calling this to produce a single
     /// atomic commit (group commit — v0.5).
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        let frontier_key = ShardKeyEncoder::frontier_key();
+        for op in &batch.ops {
+            if let BatchOp::Put { key, value } = op {
+                if key == &frontier_key && value.len() == 8 {
+                    let new_epoch = u64::from_be_bytes(value[..8].try_into().unwrap());
+                    let old_epoch = self.last_epoch.load(Ordering::SeqCst);
+                    assert!(
+                        new_epoch >= old_epoch,
+                        "M1-S2: committed_epoch must be non-decreasing (got {}, was {})",
+                        new_epoch,
+                        old_epoch
+                    );
+                    self.last_epoch.store(new_epoch, Ordering::SeqCst);
+                }
+            }
+        }
         let mut inner = slatedb::WriteBatch::new();
         for op in batch.ops {
             match op {
@@ -281,6 +338,34 @@ impl ShardDb {
     ) {
         let key = ShardKeyEncoder::idempotency_key(shard_id, key_hash);
         batch.put(&key, &epoch.to_be_bytes());
+    }
+
+    /// Durably commit `epoch` as the new frontier for shard `shard_id`.
+    ///
+    /// Writes the frontier key (`ShardKeyEncoder::frontier_key()`) with the
+    /// big-endian u64 encoding of `epoch`, then returns a `ShardFrontierReport`
+    /// indicating the new committed epoch on this shard.
+    ///
+    /// # Invariants (M1-S2)
+    ///
+    /// The `epoch` must be ≥ the previously committed epoch.  This is enforced
+    /// by the `assert!` inside [`ShardDb::put`].  Callers must ensure epochs
+    /// are presented in non-decreasing order.
+    ///
+    /// # Note
+    ///
+    /// The returned `ShardFrontierReport` should be forwarded to the
+    /// `FrontierAggregator` in the control plane so that the cluster frontier
+    /// can advance.
+    pub async fn commit_epoch(
+        &self,
+        shard_id: ShardId,
+        epoch: rockstream_types::timestamp::Epoch,
+    ) -> Result<ShardFrontierReport, StorageError> {
+        let key = ShardKeyEncoder::frontier_key();
+        // M1-S2: non-decreasing epoch assertion is enforced inside put().
+        self.put(&key, &epoch.to_be_bytes()).await?;
+        Ok(ShardFrontierReport { shard_id, epoch })
     }
 
     /// Close the database, flushing any pending writes.
@@ -509,10 +594,78 @@ mod no_range_delete_assertion {
     /// to NOT use it - cleanup is done via scan-and-delete.
     #[test]
     fn no_range_delete_api_exposed() {
-        // ShardDb has: get, put, delete, merge, write_batch, scan_prefix, flush, close.
+        // ShardDb has: get, put, delete, merge, write_batch, scan_prefix, flush, close,
+        // commit_epoch.
         // WriteBatch has: put, delete, merge.
         // None of these are range operations.
         // This is a documentation test - the real enforcement is that the types
         // don't expose any range-delete method.
+    }
+}
+
+#[cfg(test)]
+mod frontier_reporter_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use rockstream_types::ids::ShardId;
+
+    async fn open_test_db() -> ShardDb {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        ShardDb::builder("test-shard", store).build().await.unwrap()
+    }
+
+    /// Slice 5: commit_epoch returns a correct ShardFrontierReport and
+    /// durably records the epoch as the frontier key.
+    #[tokio::test]
+    async fn commit_epoch_returns_frontier_report() {
+        let db = open_test_db().await;
+        let shard_id = ShardId(7);
+
+        let report = db.commit_epoch(shard_id, 42).await.unwrap();
+        assert_eq!(report.shard_id, shard_id);
+        assert_eq!(report.epoch, 42);
+
+        // Verify the epoch was durably written as the frontier key.
+        let key = ShardKeyEncoder::frontier_key();
+        let bytes = db.get(&key).await.unwrap().unwrap();
+        let stored = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+        assert_eq!(stored, 42);
+    }
+
+    /// Slice 5: commit_epoch is monotone — advancing epoch always succeeds.
+    #[tokio::test]
+    async fn commit_epoch_is_non_decreasing() {
+        let db = open_test_db().await;
+        let shard_id = ShardId(1);
+
+        let r1 = db.commit_epoch(shard_id, 10).await.unwrap();
+        assert_eq!(r1.epoch, 10);
+
+        let r2 = db.commit_epoch(shard_id, 20).await.unwrap();
+        assert_eq!(r2.epoch, 20);
+
+        let r3 = db.commit_epoch(shard_id, 20).await.unwrap(); // same epoch is ok
+        assert_eq!(r3.epoch, 20);
+    }
+
+    /// Slice 5: confirm no range-delete path is used by commit_epoch.
+    #[tokio::test]
+    async fn commit_epoch_uses_no_range_delete() {
+        // commit_epoch calls put() internally — which is a point write.
+        // This test documents and asserts that claim by inspecting its
+        // observable effects: only the frontier key is touched.
+        let db = open_test_db().await;
+        let shard_id = ShardId(99);
+        db.commit_epoch(shard_id, 5).await.unwrap();
+
+        // Only the frontier key should be set; scanning the shard_meta prefix
+        // should yield exactly one entry.
+        let prefix = ShardKeyEncoder::namespace_prefix(crate::keys::ShardPrefix::ShardMeta);
+        let entries = db.scan_prefix(&prefix).await.unwrap();
+        assert!(
+            entries.len() == 1,
+            "commit_epoch must write exactly the frontier key, got {} entries",
+            entries.len()
+        );
     }
 }

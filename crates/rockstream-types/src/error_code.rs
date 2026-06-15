@@ -183,6 +183,11 @@ pub const RS_5019: ErrorCode = ErrorCode::new(5019);
 /// Incompatible upstream schema evolution detected.
 pub const RS_6001: ErrorCode = ErrorCode::new(6001);
 
+// 8xxx: Frontier aggregation (v0.18)
+/// Frontier aggregator shard registry is full; new shard reports are rejected.
+/// next_steps: scale out aggregators or reduce shard count.
+pub const RS_8001: ErrorCode = ErrorCode::new(8001);
+
 /// Metadata for a registered error code.
 pub struct ErrorCodeMeta {
     /// The error code.
@@ -255,6 +260,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         5018 => "Resource usage budget warning (80% threshold reached)",
         5019 => "Resource usage budget critical (95% threshold reached)",
         6001 => "Incompatible upstream schema evolution detected",
+        8001 => "Frontier aggregator shard registry is full; new shard reports rejected",
         _ => "Unknown error",
     }
 }
@@ -334,6 +340,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         5018 => "Examine view resource usage and plan to scale out cluster capacity or adjust memory limits.",
         5019 => "Immediately free unused view resources or scale cluster capacity to prevent pipeline stalls.",
         6001 => "Apply view replacement or run manual migration to match the new upstream schema.",
+        8001 => "Scale out frontier aggregators (add more nodes with --role=frontier) or reduce shard count below the configured limit.",
         _ => "See documentation for this error code.",
     }
 }
@@ -375,7 +382,7 @@ mod tests {
             RS_2008, RS_2014, RS_2015, RS_2016, RS_3003, RS_3009, RS_3010, RS_4001, RS_4002,
             RS_5001, RS_5002, RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701,
             RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017, RS_1012,
-            RS_1013,
+            RS_1013, RS_8001,
         ];
         for code in codes {
             assert_ne!(
