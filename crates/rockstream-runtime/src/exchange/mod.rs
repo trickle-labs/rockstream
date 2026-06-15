@@ -1,3 +1,4 @@
+pub mod durable;
 pub mod flow_control;
 pub mod loopback;
 pub mod multiplexer;

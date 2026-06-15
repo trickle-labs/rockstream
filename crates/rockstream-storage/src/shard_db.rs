@@ -68,6 +68,7 @@ fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes:
 #[derive(Clone)]
 pub struct ShardDb {
     db: Db,
+    object_store: Arc<dyn ObjectStore>,
 }
 
 /// Builder for creating a `ShardDb`.
@@ -95,16 +96,24 @@ impl ShardDbBuilder {
 
     /// Build and open the shard database.
     pub async fn build(self) -> Result<ShardDb, StorageError> {
-        let db = Db::builder(self.path.as_str(), self.object_store)
+        let db = Db::builder(self.path.as_str(), self.object_store.clone())
             .with_settings(self.settings)
             .with_merge_operator(Arc::new(SumCountMergeOperator))
             .build()
             .await?;
-        Ok(ShardDb { db })
+        Ok(ShardDb {
+            db,
+            object_store: self.object_store,
+        })
     }
 }
 
 impl ShardDb {
+    /// Get the underlying object store.
+    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
+        self.object_store.clone()
+    }
+
     /// Create a builder for opening a shard database.
     pub fn builder(path: impl Into<String>, object_store: Arc<dyn ObjectStore>) -> ShardDbBuilder {
         ShardDbBuilder::new(path, object_store)

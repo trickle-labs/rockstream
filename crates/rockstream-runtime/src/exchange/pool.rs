@@ -49,8 +49,9 @@ impl ShuffleClientPool {
             format!("http://{}", addr)
         };
 
-        let endpoint =
-            Channel::from_shared(url).map_err(|e| format!("Invalid gRPC URL: {:?}", e))?;
+        let endpoint = Channel::from_shared(url)
+            .map_err(|e| format!("Invalid gRPC URL: {:?}", e))?
+            .connect_timeout(std::time::Duration::from_millis(250));
 
         let channel = endpoint
             .connect()

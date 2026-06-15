@@ -3,6 +3,8 @@
 //! Asserts that worker heartbeats, shard lease assignment, and network partition
 //! fencing are correct under fault injection via `buggify!`.
 
+#![cfg(feature = "simulation")]
+
 use std::time::Duration;
 
 use rockstream_control::{ControlService, ShardManager, TopologyCatalog};
