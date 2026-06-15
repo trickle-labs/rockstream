@@ -4,3 +4,5 @@ output.txt
 
 # Coverage reports
 /lcov.info
+
+.github
