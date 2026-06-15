@@ -28,6 +28,8 @@ use rockstream_types::ids::OperatorId;
 
 use crate::error::OpError;
 use crate::zset::ArrowZSet;
+use crate::op::Operator;
+
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -122,6 +124,8 @@ struct TumbleWindowState {
     watermark: WatermarkState,
     /// Windows that have been finalized (closed and fully emitted).
     finalized: HashSet<i64>,
+    /// The current input frontier progress token.
+    input_frontier: Option<rockstream_types::frontier::FreshnessToken>,
 }
 
 impl TumbleWindowState {
@@ -131,6 +135,7 @@ impl TumbleWindowState {
             prev_output: HashMap::new(),
             watermark: WatermarkState::new(),
             finalized: HashSet::new(),
+            input_frontier: None,
         }
     }
 
@@ -197,16 +202,25 @@ impl TumbleWindowOp {
 
     /// Current watermark.
     pub fn watermark_ms(&self) -> i64 {
-        self.state.lock().unwrap().watermark.watermark_ms
+        let state = self.state.lock().unwrap();
+        state
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(state.watermark.watermark_ms)
     }
 
     /// Process one epoch: apply `delta` and return the output delta.
     pub fn process_epoch(&self, delta: ArrowZSet, _epoch: u64) -> Result<ArrowZSet, OpError> {
-        if delta.is_empty() {
+        if delta.is_empty() && delta.frontier.is_none() {
             return Ok(ArrowZSet::empty(self.schema.clone()));
         }
 
         let mut state = self.state.lock().unwrap();
+        if let Some(ref frontier) = delta.frontier {
+            state.input_frontier = Some(frontier.clone());
+        }
+
         let mut dirty_windows: HashSet<i64> = HashSet::new();
 
         // ── Apply input delta ────────────────────────────────────────────────
@@ -222,8 +236,14 @@ impl TumbleWindowOp {
                 0
             };
 
+            let current_watermark = state
+                .input_frontier
+                .as_ref()
+                .and_then(|f| f.watermark_ms())
+                .unwrap_or(state.watermark.watermark_ms);
+
             // Late-data check.
-            if event_time_ms < state.watermark.watermark_ms
+            if event_time_ms < current_watermark
                 && self.late_data_policy == LateDataPolicy::Drop
             {
                 continue;
@@ -251,8 +271,13 @@ impl TumbleWindowOp {
 
         // ── Compute output delta ─────────────────────────────────────────────
         // Also check for newly-closeable windows even if not dirty.
-        let watermark_ms = state.watermark.watermark_ms;
+        let watermark_ms = state
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(state.watermark.watermark_ms);
         let window_size_ms = self.window_size_ms;
+
 
         // Collect all window_ids that need processing.
         let all_windows: Vec<i64> = {
@@ -323,6 +348,28 @@ impl TumbleWindowOp {
         build_output(&self.schema, output_rows)
     }
 }
+
+impl Operator for TumbleWindowOp {
+    fn name(&self) -> &str {
+        "TumbleWindowOp"
+    }
+
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_epoch(delta, 0)
+    }
+
+    fn push_input_frontier(&self, frontier: rockstream_types::frontier::FreshnessToken) -> Result<(), OpError> {
+        let mut state = self.state.lock().unwrap();
+        state.input_frontier = Some(frontier);
+        Ok(())
+    }
+
+    fn input_frontier(&self) -> Option<rockstream_types::frontier::FreshnessToken> {
+        let state = self.state.lock().unwrap();
+        state.input_frontier.clone()
+    }
+}
+
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -734,4 +781,36 @@ mod tests {
         assert_eq!(floor_div(-1000, 1000), -1);
         assert_eq!(floor_div(-1001, 1000), -2);
     }
+
+    #[test]
+    fn tumble_window_frontier_advancement_closes_window() {
+        use rockstream_types::frontier::{FreshnessToken, SourceProgress};
+        use rockstream_types::ids::SourceId;
+        use std::collections::BTreeMap;
+
+        let window_size_ms = 1000i64;
+        let op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
+
+        // Epoch 1: Add row at t=100, no frontier yet.
+        let out1 = op.process_epoch(make_input(&[(100, 10, 1)]), 1).unwrap();
+        assert_eq!(out1.num_rows(), 1);
+
+        // Epoch 2: Empty input but with FreshnessToken frontier advancing watermark past window end (watermark=1500 > 1000).
+        let mut source_progress = BTreeMap::new();
+        source_progress.insert(SourceId(1), SourceProgress::new(1, Some(1500)));
+        let token = FreshnessToken::new(source_progress, 999);
+
+        let mut input_empty = make_input(&[]);
+        input_empty = input_empty.with_frontier(token);
+
+        let _out2 = op.process_epoch(input_empty, 2).unwrap();
+        // The window [0, 1000) should be closed and finalized. Let's verify that watermark advanced.
+        assert_eq!(op.watermark_ms(), 1500);
+
+        // The state should now have finalized window_id = 0.
+        let state = op.state.lock().unwrap();
+        assert!(state.finalized.contains(&0i64));
+    }
 }
+
+

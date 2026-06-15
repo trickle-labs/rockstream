@@ -2,81 +2,14 @@
   "sourceInfo": {
     "fileName": "m2_frontier_agg.fizz",
     "start": {
-      "line": 5,
+      "line": 2,
       "column": 1
     },
     "end": {
-      "line": 139
+      "line": 143
     }
   },
   "invariants": [
-    {
-      "sourceInfo": {
-        "start": {
-          "line": 115,
-          "column": 1
-        },
-        "end": {
-          "line": 118
-        }
-      },
-      "name": "M2_S1_MeetCorrectness",
-      "temporalOperators": [
-        "always"
-      ],
-      "block": {
-        "sourceInfo": {
-          "start": {
-            "line": 116,
-            "column": 5
-          },
-          "end": {
-            "line": 118
-          }
-        },
-        "flow": "FLOW_ATOMIC",
-        "stmts": [
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 116,
-                "column": 5
-              },
-              "end": {
-                "line": 118
-              }
-            },
-            "returnStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 116,
-                  "column": 5
-                },
-                "end": {
-                  "line": 116,
-                  "column": 126
-                }
-              },
-              "pyExpr": "store.published_frontier <= (shards[0].frontier if shards[0].frontier < shards[1].frontier else shards[1].frontier)",
-              "expr": {
-                "sourceInfo": {
-                  "start": {
-                    "line": 116,
-                    "column": 12
-                  },
-                  "end": {
-                    "line": 116,
-                    "column": 126
-                  }
-                },
-                "pyExpr": "store.published_frontier <= (shards[0].frontier if shards[0].frontier < shards[1].frontier else shards[1].frontier)"
-              }
-            }
-          }
-        ]
-      },
-      "pyCode": "def M2_S1_MeetCorrectness():\n    return store.published_frontier <= (shards[0].frontier if shards[0].frontier < shards[1].frontier else shards[1].frontier)\n\n"
-    },
     {
       "sourceInfo": {
         "start": {
@@ -87,7 +20,7 @@
           "line": 121
         }
       },
-      "name": "M2_S2_PessimisticStaleness",
+      "name": "M2_S1_MeetCorrectness",
       "temporalOperators": [
         "always"
       ],
@@ -121,10 +54,10 @@
                 },
                 "end": {
                   "line": 119,
-                  "column": 126
+                  "column": 99
                 }
               },
-              "pyExpr": "store.published_frontier <= (shards[0].frontier if shards[0].frontier < shards[1].frontier else shards[1].frontier)",
+              "pyExpr": "vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)",
               "expr": {
                 "sourceInfo": {
                   "start": {
@@ -133,16 +66,16 @@
                   },
                   "end": {
                     "line": 119,
-                    "column": 126
+                    "column": 99
                   }
                 },
-                "pyExpr": "store.published_frontier <= (shards[0].frontier if shards[0].frontier < shards[1].frontier else shards[1].frontier)"
+                "pyExpr": "vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)"
               }
             }
           }
         ]
       },
-      "pyCode": "def M2_S2_PessimisticStaleness():\n    return store.published_frontier <= (shards[0].frontier if shards[0].frontier < shards[1].frontier else shards[1].frontier)\n\n"
+      "pyCode": "def M2_S1_MeetCorrectness():\n    return vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)\n\n"
     },
     {
       "sourceInfo": {
@@ -151,10 +84,10 @@
           "column": 1
         },
         "end": {
-          "line": 128
+          "line": 124
         }
       },
-      "name": "M2_S3_SinglePublisherSafety",
+      "name": "M2_S2_PessimisticStaleness",
       "temporalOperators": [
         "always"
       ],
@@ -165,7 +98,7 @@
             "column": 5
           },
           "end": {
-            "line": 128
+            "line": 124
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -177,11 +110,10 @@
                 "column": 5
               },
               "end": {
-                "line": 123,
-                "column": 4
+                "line": 124
               }
             },
-            "pyStmt": {
+            "returnStmt": {
               "sourceInfo": {
                 "start": {
                   "line": 122,
@@ -189,6 +121,74 @@
                 },
                 "end": {
                   "line": 122,
+                  "column": 99
+                }
+              },
+              "pyExpr": "vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 122,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 122,
+                    "column": 99
+                  }
+                },
+                "pyExpr": "vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M2_S2_PessimisticStaleness():\n    return vector_ge(vector_meet(shards[0].frontier, shards[1].frontier), store.published_frontier)\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 124,
+          "column": 1
+        },
+        "end": {
+          "line": 131
+        }
+      },
+      "name": "M2_S3_SinglePublisherSafety",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 125,
+            "column": 5
+          },
+          "end": {
+            "line": 131
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 125,
+                "column": 5
+              },
+              "end": {
+                "line": 126,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 125,
+                  "column": 5
+                },
+                "end": {
+                  "line": 125,
                   "column": 25
                 }
               },
@@ -198,22 +198,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 123,
+                "line": 126,
                 "column": 5
               },
               "end": {
-                "line": 126,
+                "line": 129,
                 "column": 4
               }
             },
             "forStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 123,
+                  "line": 126,
                   "column": 5
                 },
                 "end": {
-                  "line": 126,
+                  "line": 129,
                   "column": 4
                 }
               },
@@ -224,11 +224,11 @@
               "block": {
                 "sourceInfo": {
                   "start": {
-                    "line": 124,
+                    "line": 127,
                     "column": 9
                   },
                   "end": {
-                    "line": 126,
+                    "line": 129,
                     "column": 4
                   }
                 },
@@ -236,22 +236,22 @@
                   {
                     "sourceInfo": {
                       "start": {
-                        "line": 124,
+                        "line": 127,
                         "column": 9
                       },
                       "end": {
-                        "line": 126,
+                        "line": 129,
                         "column": 4
                       }
                     },
                     "ifStmt": {
                       "sourceInfo": {
                         "start": {
-                          "line": 124,
+                          "line": 127,
                           "column": 9
                         },
                         "end": {
-                          "line": 126,
+                          "line": 129,
                           "column": 4
                         }
                       },
@@ -259,11 +259,11 @@
                         {
                           "sourceInfo": {
                             "start": {
-                              "line": 124,
+                              "line": 127,
                               "column": 12
                             },
                             "end": {
-                              "line": 126,
+                              "line": 129,
                               "column": 4
                             }
                           },
@@ -271,11 +271,11 @@
                           "block": {
                             "sourceInfo": {
                               "start": {
-                                "line": 125,
+                                "line": 128,
                                 "column": 13
                               },
                               "end": {
-                                "line": 126,
+                                "line": 129,
                                 "column": 4
                               }
                             },
@@ -283,22 +283,22 @@
                               {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 125,
+                                    "line": 128,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 126,
+                                    "line": 129,
                                     "column": 4
                                   }
                                 },
                                 "pyStmt": {
                                   "sourceInfo": {
                                     "start": {
-                                      "line": 125,
+                                      "line": 128,
                                       "column": 13
                                     },
                                     "end": {
-                                      "line": 125,
+                                      "line": 128,
                                       "column": 53
                                     }
                                   },
@@ -310,11 +310,11 @@
                           "conditionExpr": {
                             "sourceInfo": {
                               "start": {
-                                "line": 124,
+                                "line": 127,
                                 "column": 12
                               },
                               "end": {
-                                "line": 124,
+                                "line": 127,
                                 "column": 68
                               }
                             },
@@ -329,11 +329,11 @@
               "iterExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 123,
+                    "line": 126,
                     "column": 16
                   },
                   "end": {
-                    "line": 123,
+                    "line": 126,
                     "column": 26
                   }
                 },
@@ -341,73 +341,6 @@
               }
             }
           },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 126,
-                "column": 5
-              },
-              "end": {
-                "line": 128
-              }
-            },
-            "returnStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 126,
-                  "column": 5
-                },
-                "end": {
-                  "line": 126,
-                  "column": 33
-                }
-              },
-              "pyExpr": "active_publishers <= 1",
-              "expr": {
-                "sourceInfo": {
-                  "start": {
-                    "line": 126,
-                    "column": 12
-                  },
-                  "end": {
-                    "line": 126,
-                    "column": 33
-                  }
-                },
-                "pyExpr": "active_publishers <= 1"
-              }
-            }
-          }
-        ]
-      },
-      "pyCode": "def M2_S3_SinglePublisherSafety():\n    active_publishers = 0\n    for agg in aggregators:\n        if agg.is_publisher and agg.lease_token == store.fence_token:\n            active_publishers = active_publishers + 1\n    return active_publishers <= 1\n\n"
-    },
-    {
-      "sourceInfo": {
-        "start": {
-          "line": 128,
-          "column": 1
-        },
-        "end": {
-          "line": 131
-        }
-      },
-      "name": "M2_S4_StaleWriteRejection",
-      "temporalOperators": [
-        "always"
-      ],
-      "block": {
-        "sourceInfo": {
-          "start": {
-            "line": 129,
-            "column": 5
-          },
-          "end": {
-            "line": 131
-          }
-        },
-        "flow": "FLOW_ATOMIC",
-        "stmts": [
           {
             "sourceInfo": {
               "start": {
@@ -426,10 +359,10 @@
                 },
                 "end": {
                   "line": 129,
-                  "column": 61
+                  "column": 33
                 }
               },
-              "pyExpr": "store.published_frontier >= max_published_frontier",
+              "pyExpr": "active_publishers <= 1",
               "expr": {
                 "sourceInfo": {
                   "start": {
@@ -438,16 +371,16 @@
                   },
                   "end": {
                     "line": 129,
-                    "column": 61
+                    "column": 33
                   }
                 },
-                "pyExpr": "store.published_frontier >= max_published_frontier"
+                "pyExpr": "active_publishers <= 1"
               }
             }
           }
         ]
       },
-      "pyCode": "def M2_S4_StaleWriteRejection():\n    return store.published_frontier >= max_published_frontier\n\n"
+      "pyCode": "def M2_S3_SinglePublisherSafety():\n    active_publishers = 0\n    for agg in aggregators:\n        if agg.is_publisher and agg.lease_token == store.fence_token:\n            active_publishers = active_publishers + 1\n    return active_publishers <= 1\n\n"
     },
     {
       "sourceInfo": {
@@ -459,10 +392,9 @@
           "line": 134
         }
       },
-      "name": "M2_L1_PublicationProgress",
+      "name": "M2_S4_StaleWriteRejection",
       "temporalOperators": [
-        "always",
-        "eventually"
+        "always"
       ],
       "block": {
         "sourceInfo": {
@@ -494,10 +426,10 @@
                 },
                 "end": {
                   "line": 132,
-                  "column": 48
+                  "column": 70
                 }
               },
-              "pyExpr": "store.published_frontier == MAX_EPOCH",
+              "pyExpr": "vector_ge(store.published_frontier, max_published_frontier)",
               "expr": {
                 "sourceInfo": {
                   "start": {
@@ -506,16 +438,16 @@
                   },
                   "end": {
                     "line": 132,
-                    "column": 48
+                    "column": 70
                   }
                 },
-                "pyExpr": "store.published_frontier == MAX_EPOCH"
+                "pyExpr": "vector_ge(store.published_frontier, max_published_frontier)"
               }
             }
           }
         ]
       },
-      "pyCode": "def M2_L1_PublicationProgress():\n    return store.published_frontier == MAX_EPOCH\n\n"
+      "pyCode": "def M2_S4_StaleWriteRejection():\n    return vector_ge(store.published_frontier, max_published_frontier)\n\n"
     },
     {
       "sourceInfo": {
@@ -527,7 +459,7 @@
           "line": 137
         }
       },
-      "name": "M2_L2_FailoverProgress",
+      "name": "M2_L1_PublicationProgress",
       "temporalOperators": [
         "always",
         "eventually"
@@ -562,10 +494,10 @@
                 },
                 "end": {
                   "line": 135,
-                  "column": 48
+                  "column": 61
                 }
               },
-              "pyExpr": "store.published_frontier == MAX_EPOCH",
+              "pyExpr": "store.published_frontier == [MAX_EPOCH, MAX_EPOCH]",
               "expr": {
                 "sourceInfo": {
                   "start": {
@@ -574,16 +506,16 @@
                   },
                   "end": {
                     "line": 135,
-                    "column": 48
+                    "column": 61
                   }
                 },
-                "pyExpr": "store.published_frontier == MAX_EPOCH"
+                "pyExpr": "store.published_frontier == [MAX_EPOCH, MAX_EPOCH]"
               }
             }
           }
         ]
       },
-      "pyCode": "def M2_L2_FailoverProgress():\n    return store.published_frontier == MAX_EPOCH\n\n"
+      "pyCode": "def M2_L1_PublicationProgress():\n    return store.published_frontier == [MAX_EPOCH, MAX_EPOCH]\n\n"
     },
     {
       "sourceInfo": {
@@ -592,12 +524,13 @@
           "column": 1
         },
         "end": {
-          "line": 139
+          "line": 140
         }
       },
-      "name": "COV_M2",
+      "name": "M2_L2_FailoverProgress",
       "temporalOperators": [
-        "exists"
+        "always",
+        "eventually"
       ],
       "block": {
         "sourceInfo": {
@@ -606,7 +539,7 @@
             "column": 5
           },
           "end": {
-            "line": 139
+            "line": 140
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -618,7 +551,7 @@
                 "column": 5
               },
               "end": {
-                "line": 139
+                "line": 140
               }
             },
             "returnStmt": {
@@ -629,10 +562,10 @@
                 },
                 "end": {
                   "line": 138,
-                  "column": 27
+                  "column": 61
                 }
               },
-              "pyExpr": "fencing_occurred",
+              "pyExpr": "store.published_frontier == [MAX_EPOCH, MAX_EPOCH]",
               "expr": {
                 "sourceInfo": {
                   "start": {
@@ -641,6 +574,73 @@
                   },
                   "end": {
                     "line": 138,
+                    "column": 61
+                  }
+                },
+                "pyExpr": "store.published_frontier == [MAX_EPOCH, MAX_EPOCH]"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M2_L2_FailoverProgress():\n    return store.published_frontier == [MAX_EPOCH, MAX_EPOCH]\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 140,
+          "column": 1
+        },
+        "end": {
+          "line": 143
+        }
+      },
+      "name": "COV_M2",
+      "temporalOperators": [
+        "exists"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 141,
+            "column": 5
+          },
+          "end": {
+            "line": 143
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 141,
+                "column": 5
+              },
+              "end": {
+                "line": 143
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 141,
+                  "column": 5
+                },
+                "end": {
+                  "line": 141,
+                  "column": 27
+                }
+              },
+              "pyExpr": "fencing_occurred",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 141,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 141,
                     "column": 27
                   }
                 },
@@ -650,18 +650,18 @@
           }
         ]
       },
-      "pyCode": "def COV_M2():\n    return fencing_occurred\n"
+      "pyCode": "def COV_M2():\n    return fencing_occurred\n\n"
     }
   ],
   "actions": [
     {
       "sourceInfo": {
         "start": {
-          "line": 9,
+          "line": 16,
           "column": 1
         },
         "end": {
-          "line": 29
+          "line": 36
         }
       },
       "name": "Init",
@@ -672,11 +672,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 10,
+            "line": 17,
             "column": 5
           },
           "end": {
-            "line": 29
+            "line": 36
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -684,47 +684,47 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 10,
+                "line": 17,
                 "column": 5
               },
               "end": {
-                "line": 11,
+                "line": 18,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 10,
+                  "line": 17,
                   "column": 5
                 },
                 "end": {
-                  "line": 10,
-                  "column": 17
+                  "line": 17,
+                  "column": 37
                 }
               },
-              "code": "messages = []"
+              "code": "messages = {0: [0, 0], 1: [0, 0]}"
             }
           },
           {
             "sourceInfo": {
               "start": {
-                "line": 11,
+                "line": 18,
                 "column": 5
               },
               "end": {
-                "line": 14,
+                "line": 21,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 11,
+                  "line": 18,
                   "column": 5
                 },
                 "end": {
-                  "line": 11,
+                  "line": 18,
                   "column": 21
                 }
               },
@@ -734,22 +734,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 14,
+                "line": 21,
                 "column": 5
               },
               "end": {
-                "line": 15,
+                "line": 22,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 14,
+                  "line": 21,
                   "column": 5
                 },
                 "end": {
-                  "line": 14,
+                  "line": 21,
                   "column": 15
                 }
               },
@@ -759,22 +759,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 15,
+                "line": 22,
                 "column": 5
               },
               "end": {
-                "line": 16,
+                "line": 23,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 15,
+                  "line": 22,
                   "column": 5
                 },
                 "end": {
-                  "line": 15,
+                  "line": 22,
                   "column": 30
                 }
               },
@@ -783,11 +783,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 15,
+                      "line": 22,
                       "column": 19
                     },
                     "end": {
-                      "line": 15,
+                      "line": 22,
                       "column": 29
                     }
                   },
@@ -795,11 +795,11 @@
                   "expr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 15,
+                        "line": 22,
                         "column": 19
                       },
                       "end": {
-                        "line": 15,
+                        "line": 22,
                         "column": 29
                       }
                     },
@@ -813,22 +813,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 16,
+                "line": 23,
                 "column": 5
               },
               "end": {
-                "line": 18,
+                "line": 25,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 16,
+                  "line": 23,
                   "column": 5
                 },
                 "end": {
-                  "line": 16,
+                  "line": 23,
                   "column": 30
                 }
               },
@@ -837,11 +837,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 16,
+                      "line": 23,
                       "column": 19
                     },
                     "end": {
-                      "line": 16,
+                      "line": 23,
                       "column": 29
                     }
                   },
@@ -849,11 +849,11 @@
                   "expr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 16,
+                        "line": 23,
                         "column": 19
                       },
                       "end": {
-                        "line": 16,
+                        "line": 23,
                         "column": 29
                       }
                     },
@@ -867,22 +867,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 18,
+                "line": 25,
                 "column": 5
               },
               "end": {
-                "line": 21,
+                "line": 28,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 18,
+                  "line": 25,
                   "column": 5
                 },
                 "end": {
-                  "line": 18,
+                  "line": 25,
                   "column": 25
                 }
               },
@@ -895,22 +895,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 21,
+                "line": 28,
                 "column": 5
               },
               "end": {
-                "line": 22,
+                "line": 29,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 21,
+                  "line": 28,
                   "column": 5
                 },
                 "end": {
-                  "line": 21,
+                  "line": 28,
                   "column": 20
                 }
               },
@@ -920,22 +920,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 22,
+                "line": 29,
                 "column": 5
               },
               "end": {
-                "line": 23,
+                "line": 30,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 22,
+                  "line": 29,
                   "column": 5
                 },
                 "end": {
-                  "line": 22,
+                  "line": 29,
                   "column": 48
                 }
               },
@@ -944,11 +944,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 22,
+                      "line": 29,
                       "column": 24
                     },
                     "end": {
-                      "line": 22,
+                      "line": 29,
                       "column": 47
                     }
                   },
@@ -956,11 +956,11 @@
                   "expr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 22,
+                        "line": 29,
                         "column": 24
                       },
                       "end": {
-                        "line": 22,
+                        "line": 29,
                         "column": 47
                       }
                     },
@@ -974,22 +974,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 23,
+                "line": 30,
                 "column": 5
               },
               "end": {
-                "line": 25,
+                "line": 32,
                 "column": 4
               }
             },
             "callStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 23,
+                  "line": 30,
                   "column": 5
                 },
                 "end": {
-                  "line": 23,
+                  "line": 30,
                   "column": 48
                 }
               },
@@ -998,11 +998,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 23,
+                      "line": 30,
                       "column": 24
                     },
                     "end": {
-                      "line": 23,
+                      "line": 30,
                       "column": 47
                     }
                   },
@@ -1010,11 +1010,11 @@
                   "expr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 23,
+                        "line": 30,
                         "column": 24
                       },
                       "end": {
-                        "line": 23,
+                        "line": 30,
                         "column": 47
                       }
                     },
@@ -1028,47 +1028,47 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 25,
+                "line": 32,
                 "column": 5
               },
               "end": {
-                "line": 26,
+                "line": 33,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 25,
+                  "line": 32,
                   "column": 5
                 },
                 "end": {
-                  "line": 25,
-                  "column": 30
+                  "line": 32,
+                  "column": 35
                 }
               },
-              "code": "max_published_frontier = 0"
+              "code": "max_published_frontier = [0, 0]"
             }
           },
           {
             "sourceInfo": {
               "start": {
-                "line": 26,
+                "line": 33,
                 "column": 5
               },
               "end": {
-                "line": 27,
+                "line": 34,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 26,
+                  "line": 33,
                   "column": 5
                 },
                 "end": {
-                  "line": 26,
+                  "line": 33,
                   "column": 28
                 }
               },
@@ -1078,21 +1078,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 27,
+                "line": 34,
                 "column": 5
               },
               "end": {
-                "line": 29
+                "line": 36
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 27,
+                  "line": 34,
                   "column": 5
                 },
                 "end": {
-                  "line": 27,
+                  "line": 34,
                   "column": 26
                 }
               },
@@ -1105,11 +1105,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 105,
+          "line": 106,
           "column": 1
         },
         "end": {
-          "line": 115
+          "line": 118
         }
       },
       "name": "CrashAggregator",
@@ -1120,11 +1120,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 106,
+            "line": 107,
             "column": 5
           },
           "end": {
-            "line": 115
+            "line": 118
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1132,22 +1132,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 106,
+                "line": 107,
                 "column": 5
               },
               "end": {
-                "line": 107,
+                "line": 108,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 106,
+                  "line": 107,
                   "column": 5
                 },
                 "end": {
-                  "line": 106,
+                  "line": 107,
                   "column": 30
                 }
               },
@@ -1155,11 +1155,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 106,
+                    "line": 107,
                     "column": 13
                   },
                   "end": {
-                    "line": 106,
+                    "line": 107,
                     "column": 30
                   }
                 },
@@ -1170,22 +1170,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 107,
+                "line": 108,
                 "column": 5
               },
               "end": {
-                "line": 108,
+                "line": 109,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 107,
+                  "line": 108,
                   "column": 5
                 },
                 "end": {
-                  "line": 107,
+                  "line": 108,
                   "column": 25
                 }
               },
@@ -1195,22 +1195,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 108,
+                "line": 109,
                 "column": 5
               },
               "end": {
-                "line": 109,
+                "line": 110,
                 "column": 4
               }
             },
             "anyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 108,
+                  "line": 109,
                   "column": 5
                 },
                 "end": {
-                  "line": 108,
+                  "line": 109,
                   "column": 27
                 }
               },
@@ -1221,11 +1221,11 @@
               "iterExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 108,
+                    "line": 109,
                     "column": 17
                   },
                   "end": {
-                    "line": 108,
+                    "line": 109,
                     "column": 27
                   }
                 },
@@ -1236,22 +1236,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 109,
+                "line": 110,
                 "column": 5
               },
               "end": {
-                "line": 110,
+                "line": 111,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 109,
+                  "line": 110,
                   "column": 5
                 },
                 "end": {
-                  "line": 109,
+                  "line": 110,
                   "column": 28
                 }
               },
@@ -1261,22 +1261,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 110,
+                "line": 111,
                 "column": 5
               },
               "end": {
-                "line": 111,
+                "line": 112,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 110,
+                  "line": 111,
                   "column": 5
                 },
                 "end": {
-                  "line": 110,
+                  "line": 111,
                   "column": 23
                 }
               },
@@ -1286,25 +1286,25 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 111,
+                "line": 112,
                 "column": 5
               },
               "end": {
-                "line": 115
+                "line": 118
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 111,
+                  "line": 112,
                   "column": 5
                 },
                 "end": {
-                  "line": 111,
-                  "column": 38
+                  "line": 112,
+                  "column": 48
                 }
               },
-              "code": "agg.local_shard_frontiers = [0, 0]"
+              "code": "agg.local_shard_frontiers = [[0, 0], [0, 0]]"
             }
           }
         ]
@@ -1315,7 +1315,55 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 5,
+          "line": 2,
+          "column": 1
+        },
+        "end": {
+          "line": 3
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 2,
+            "column": 1
+          },
+          "end": {
+            "line": 2,
+            "column": 13
+          }
+        },
+        "code": "MAX_EPOCH = 1"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 3,
+          "column": 1
+        },
+        "end": {
+          "line": 4
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 3,
+            "column": 1
+          },
+          "end": {
+            "line": 3,
+            "column": 14
+          }
+        },
+        "code": "NUM_SHARDS = 2"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 4,
           "column": 1
         },
         "end": {
@@ -1325,15 +1373,15 @@
       "pyStmt": {
         "sourceInfo": {
           "start": {
-            "line": 5,
+            "line": 4,
             "column": 1
           },
           "end": {
-            "line": 5,
-            "column": 13
+            "line": 4,
+            "column": 15
           }
         },
-        "code": "MAX_EPOCH = 2"
+        "code": "NUM_SOURCES = 2"
       }
     },
     {
@@ -1353,11 +1401,56 @@
             "column": 1
           },
           "end": {
-            "line": 6,
-            "column": 14
+            "line": 9
           }
         },
-        "code": "NUM_SHARDS = 2"
+        "code": "def vector_meet(v1, v2):\n    return [v1[0] if v1[0] < v2[0] else v2[0], v1[1] if v1[1] < v2[1] else v2[1]]\n\n"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 9,
+          "column": 1
+        },
+        "end": {
+          "line": 12
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 9,
+            "column": 1
+          },
+          "end": {
+            "line": 12
+          }
+        },
+        "code": "def vector_join(v1, v2):\n    return [v1[0] if v1[0] > v2[0] else v2[0], v1[1] if v1[1] > v2[1] else v2[1]]\n\n"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 12,
+          "column": 1
+        },
+        "end": {
+          "line": 16
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 12,
+            "column": 1
+          },
+          "end": {
+            "line": 16
+          }
+        },
+        "code": "def vector_ge(v1, v2):\n    return v1[0] >= v2[0] and v1[1] >= v2[1]\n\n# State variables\n"
       }
     }
   ],
@@ -1365,11 +1458,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 29,
+          "line": 36,
           "column": 1
         },
         "end": {
-          "line": 38
+          "line": 46
         }
       },
       "name": "Shard",
@@ -1377,11 +1470,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 30,
+              "line": 37,
               "column": 5
             },
             "end": {
-              "line": 33,
+              "line": 40,
               "column": 4
             }
           },
@@ -1393,11 +1486,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 31,
+                "line": 38,
                 "column": 9
               },
               "end": {
-                "line": 33,
+                "line": 40,
                 "column": 4
               }
             },
@@ -1406,26 +1499,26 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 31,
+                    "line": 38,
                     "column": 9
                   },
                   "end": {
-                    "line": 33,
+                    "line": 40,
                     "column": 4
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 31,
+                      "line": 38,
                       "column": 9
                     },
                     "end": {
-                      "line": 31,
-                      "column": 25
+                      "line": 38,
+                      "column": 30
                     }
                   },
-                  "code": "self.frontier = 0"
+                  "code": "self.frontier = [0, 0]"
                 }
               }
             ]
@@ -1434,11 +1527,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 33,
+              "line": 40,
               "column": 5
             },
             "end": {
-              "line": 38
+              "line": 46
             }
           },
           "name": "AdvanceAndReport",
@@ -1446,11 +1539,11 @@
           "fairness": {
             "sourceInfo": {
               "start": {
-                "line": 33,
+                "line": 40,
                 "column": 12
               },
               "end": {
-                "line": 33,
+                "line": 40,
                 "column": 15
               }
             },
@@ -1459,11 +1552,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 34,
+                "line": 41,
                 "column": 9
               },
               "end": {
-                "line": 38
+                "line": 46
               }
             },
             "flow": "FLOW_ATOMIC",
@@ -1471,117 +1564,129 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 34,
+                    "line": 41,
                     "column": 9
                   },
                   "end": {
-                    "line": 35,
+                    "line": 42,
+                    "column": 8
+                  }
+                },
+                "anyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 41,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 41,
+                      "column": 44
+                    }
+                  },
+                  "loopVars": [
+                    "source_id"
+                  ],
+                  "pyExpr": "range(NUM_SOURCES)",
+                  "iterExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 41,
+                        "column": 27
+                      },
+                      "end": {
+                        "line": 41,
+                        "column": 44
+                      }
+                    },
+                    "pyExpr": "range(NUM_SOURCES)"
+                  }
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 42,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 43,
                     "column": 8
                   }
                 },
                 "requireStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 34,
+                      "line": 42,
                       "column": 9
                     },
                     "end": {
-                      "line": 34,
-                      "column": 41
+                      "line": 42,
+                      "column": 52
                     }
                   },
-                  "condition": "self.frontier < MAX_EPOCH",
+                  "condition": "self.frontier[source_id] < MAX_EPOCH",
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 34,
+                        "line": 42,
                         "column": 17
                       },
                       "end": {
-                        "line": 34,
-                        "column": 41
+                        "line": 42,
+                        "column": 52
                       }
                     },
-                    "pyExpr": "self.frontier < MAX_EPOCH"
+                    "pyExpr": "self.frontier[source_id] < MAX_EPOCH"
                   }
                 }
               },
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 35,
+                    "line": 43,
                     "column": 9
                   },
                   "end": {
-                    "line": 36,
+                    "line": 44,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 35,
+                      "line": 43,
                       "column": 9
                     },
                     "end": {
-                      "line": 35,
-                      "column": 41
+                      "line": 43,
+                      "column": 63
                     }
                   },
-                  "code": "self.frontier = self.frontier + 1"
+                  "code": "self.frontier[source_id] = self.frontier[source_id] + 1"
                 }
               },
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 36,
+                    "line": 44,
                     "column": 9
                   },
                   "end": {
-                    "line": 38
+                    "line": 46
                   }
                 },
-                "callStmt": {
+                "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 36,
+                      "line": 44,
                       "column": 9
                     },
                     "end": {
-                      "line": 36,
-                      "column": 73
+                      "line": 44,
+                      "column": 64
                     }
                   },
-                  "name": "append",
-                  "args": [
-                    {
-                      "sourceInfo": {
-                        "start": {
-                          "line": 36,
-                          "column": 25
-                        },
-                        "end": {
-                          "line": 36,
-                          "column": 72
-                        }
-                      },
-                      "pyExpr": "{\"shard_id\": self.id, \"frontier\": self.frontier}",
-                      "expr": {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 36,
-                            "column": 25
-                          },
-                          "end": {
-                            "line": 36,
-                            "column": 72
-                          }
-                        },
-                        "pyExpr": "{\"shard_id\": self.id, \"frontier\": self.frontier}"
-                      }
-                    }
-                  ],
-                  "receiver": "messages"
+                  "code": "messages[self.id] = [self.frontier[0], self.frontier[1]]"
                 }
               }
             ]
@@ -1592,11 +1697,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 38,
+          "line": 46,
           "column": 1
         },
         "end": {
-          "line": 59
+          "line": 67
         }
       },
       "name": "ObjectStore",
@@ -1604,11 +1709,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 39,
+              "line": 47,
               "column": 5
             },
             "end": {
-              "line": 44,
+              "line": 52,
               "column": 4
             }
           },
@@ -1620,11 +1725,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 40,
+                "line": 48,
                 "column": 9
               },
               "end": {
-                "line": 44,
+                "line": 52,
                 "column": 4
               }
             },
@@ -1633,22 +1738,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 40,
+                    "line": 48,
                     "column": 9
                   },
                   "end": {
-                    "line": 41,
+                    "line": 49,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 40,
+                      "line": 48,
                       "column": 9
                     },
                     "end": {
-                      "line": 40,
+                      "line": 48,
                       "column": 30
                     }
                   },
@@ -1658,22 +1763,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 41,
+                    "line": 49,
                     "column": 9
                   },
                   "end": {
-                    "line": 42,
+                    "line": 50,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 41,
+                      "line": 49,
                       "column": 9
                     },
                     "end": {
-                      "line": 41,
+                      "line": 49,
                       "column": 28
                     }
                   },
@@ -1683,26 +1788,26 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 42,
+                    "line": 50,
                     "column": 9
                   },
                   "end": {
-                    "line": 44,
+                    "line": 52,
                     "column": 4
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 42,
+                      "line": 50,
                       "column": 9
                     },
                     "end": {
-                      "line": 42,
-                      "column": 35
+                      "line": 50,
+                      "column": 40
                     }
                   },
-                  "code": "self.published_frontier = 0"
+                  "code": "self.published_frontier = [0, 0]"
                 }
               }
             ]
@@ -1713,22 +1818,22 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 44,
+              "line": 52,
               "column": 5
             },
             "end": {
-              "line": 51,
+              "line": 59,
               "column": 4
             }
           },
           "pyStmt": {
             "sourceInfo": {
               "start": {
-                "line": 44,
+                "line": 52,
                 "column": 5
               },
               "end": {
-                "line": 51,
+                "line": 59,
                 "column": 4
               }
             },
@@ -1738,24 +1843,24 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 51,
+              "line": 59,
               "column": 5
             },
             "end": {
-              "line": 59
+              "line": 67
             }
           },
           "pyStmt": {
             "sourceInfo": {
               "start": {
-                "line": 51,
+                "line": 59,
                 "column": 5
               },
               "end": {
-                "line": 59
+                "line": 67
               }
             },
-            "code": "def write_frontier(self, token, frontier):\n        if token >= self.fence_token:\n            if frontier >= self.published_frontier:\n                self.published_frontier = frontier\n                self.fence_token = token\n                return True\n        return False\n\n"
+            "code": "def write_frontier(self, token, frontier):\n        if token >= self.fence_token:\n            if vector_ge(frontier, self.published_frontier):\n                self.published_frontier = frontier\n                self.fence_token = token\n                return True\n        return False\n\n"
           }
         }
       ]
@@ -1763,11 +1868,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 60,
+          "line": 68,
           "column": 1
         },
         "end": {
-          "line": 105
+          "line": 106
         }
       },
       "name": "FrontierAggregator",
@@ -1775,11 +1880,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 61,
+              "line": 69,
               "column": 5
             },
             "end": {
-              "line": 66,
+              "line": 74,
               "column": 4
             }
           },
@@ -1791,234 +1896,16 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 62,
+                "line": 70,
                 "column": 9
               },
               "end": {
-                "line": 66,
+                "line": 74,
                 "column": 4
               }
             },
             "flow": "FLOW_ATOMIC",
             "stmts": [
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 62,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 63,
-                    "column": 8
-                  }
-                },
-                "pyStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 62,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 62,
-                      "column": 33
-                    }
-                  },
-                  "code": "self.is_publisher = False"
-                }
-              },
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 63,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 64,
-                    "column": 8
-                  }
-                },
-                "pyStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 63,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 63,
-                      "column": 28
-                    }
-                  },
-                  "code": "self.lease_token = 0"
-                }
-              },
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 64,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 66,
-                    "column": 4
-                  }
-                },
-                "pyStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 64,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 64,
-                      "column": 43
-                    }
-                  },
-                  "code": "self.local_shard_frontiers = [0, 0]"
-                }
-              }
-            ]
-          }
-        },
-        {
-          "sourceInfo": {
-            "start": {
-              "line": 66,
-              "column": 5
-            },
-            "end": {
-              "line": 82,
-              "column": 4
-            }
-          },
-          "name": "AcquireLease",
-          "flow": "FLOW_ATOMIC",
-          "fairness": {
-            "sourceInfo": {
-              "start": {
-                "line": 66,
-                "column": 12
-              },
-              "end": {
-                "line": 66,
-                "column": 15
-              }
-            },
-            "level": "FAIRNESS_LEVEL_WEAK"
-          },
-          "block": {
-            "sourceInfo": {
-              "start": {
-                "line": 67,
-                "column": 9
-              },
-              "end": {
-                "line": 82,
-                "column": 4
-              }
-            },
-            "flow": "FLOW_ATOMIC",
-            "stmts": [
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 67,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 68,
-                    "column": 8
-                  }
-                },
-                "requireStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 67,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 67,
-                      "column": 37
-                    }
-                  },
-                  "condition": "not self.is_publisher",
-                  "conditionExpr": {
-                    "sourceInfo": {
-                      "start": {
-                        "line": 67,
-                        "column": 17
-                      },
-                      "end": {
-                        "line": 67,
-                        "column": 37
-                      }
-                    },
-                    "pyExpr": "not self.is_publisher"
-                  }
-                }
-              },
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 68,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 69,
-                    "column": 8
-                  }
-                },
-                "requireStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 68,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 68,
-                      "column": 33
-                    }
-                  },
-                  "condition": "token_counter < 4",
-                  "conditionExpr": {
-                    "sourceInfo": {
-                      "start": {
-                        "line": 68,
-                        "column": 17
-                      },
-                      "end": {
-                        "line": 68,
-                        "column": 33
-                      }
-                    },
-                    "pyExpr": "token_counter < 4"
-                  }
-                }
-              },
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 69,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 70,
-                    "column": 8
-                  }
-                },
-                "pyStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 69,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 69,
-                      "column": 41
-                    }
-                  },
-                  "code": "token_counter = token_counter + 1"
-                }
-              },
               {
                 "sourceInfo": {
                   "start": {
@@ -2038,10 +1925,10 @@
                     },
                     "end": {
                       "line": 70,
-                      "column": 41
+                      "column": 33
                     }
                   },
-                  "code": "current_token = store.fence_token"
+                  "code": "self.is_publisher = False"
                 }
               },
               {
@@ -2055,7 +1942,7 @@
                     "column": 8
                   }
                 },
-                "callStmt": {
+                "pyStmt": {
                   "sourceInfo": {
                     "start": {
                       "line": 71,
@@ -2063,6 +1950,224 @@
                     },
                     "end": {
                       "line": 71,
+                      "column": 28
+                    }
+                  },
+                  "code": "self.lease_token = 0"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 72,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 74,
+                    "column": 4
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 72,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 72,
+                      "column": 53
+                    }
+                  },
+                  "code": "self.local_shard_frontiers = [[0, 0], [0, 0]]"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 74,
+              "column": 5
+            },
+            "end": {
+              "line": 89,
+              "column": 4
+            }
+          },
+          "name": "AcquireLease",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "sourceInfo": {
+              "start": {
+                "line": 74,
+                "column": 12
+              },
+              "end": {
+                "line": 74,
+                "column": 15
+              }
+            },
+            "level": "FAIRNESS_LEVEL_WEAK"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 75,
+                "column": 9
+              },
+              "end": {
+                "line": 89,
+                "column": 4
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 75,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 76,
+                    "column": 8
+                  }
+                },
+                "requireStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 75,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 75,
+                      "column": 37
+                    }
+                  },
+                  "condition": "not self.is_publisher",
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 75,
+                        "column": 17
+                      },
+                      "end": {
+                        "line": 75,
+                        "column": 37
+                      }
+                    },
+                    "pyExpr": "not self.is_publisher"
+                  }
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 76,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 77,
+                    "column": 8
+                  }
+                },
+                "requireStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 76,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 76,
+                      "column": 33
+                    }
+                  },
+                  "condition": "token_counter < 4",
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 76,
+                        "column": 17
+                      },
+                      "end": {
+                        "line": 76,
+                        "column": 33
+                      }
+                    },
+                    "pyExpr": "token_counter < 4"
+                  }
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 77,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 78,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 77,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 77,
+                      "column": 41
+                    }
+                  },
+                  "code": "token_counter = token_counter + 1"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 78,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 79,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 78,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 78,
+                      "column": 41
+                    }
+                  },
+                  "code": "current_token = store.fence_token"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 79,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 80,
+                    "column": 8
+                  }
+                },
+                "callStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 79,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 79,
                       "column": 72
                     }
                   },
@@ -2074,11 +2179,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 71,
+                          "line": 79,
                           "column": 35
                         },
                         "end": {
-                          "line": 71,
+                          "line": 79,
                           "column": 41
                         }
                       },
@@ -2086,11 +2191,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 71,
+                            "line": 79,
                             "column": 35
                           },
                           "end": {
-                            "line": 71,
+                            "line": 79,
                             "column": 41
                           }
                         },
@@ -2100,11 +2205,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 71,
+                          "line": 79,
                           "column": 44
                         },
                         "end": {
-                          "line": 71,
+                          "line": 79,
                           "column": 56
                         }
                       },
@@ -2112,11 +2217,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 71,
+                            "line": 79,
                             "column": 44
                           },
                           "end": {
-                            "line": 71,
+                            "line": 79,
                             "column": 56
                           }
                         },
@@ -2126,11 +2231,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 71,
+                          "line": 79,
                           "column": 59
                         },
                         "end": {
-                          "line": 71,
+                          "line": 79,
                           "column": 71
                         }
                       },
@@ -2138,11 +2243,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 71,
+                            "line": 79,
                             "column": 59
                           },
                           "end": {
-                            "line": 71,
+                            "line": 79,
                             "column": 71
                           }
                         },
@@ -2156,22 +2261,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 72,
+                    "line": 80,
                     "column": 9
                   },
                   "end": {
-                    "line": 82,
+                    "line": 89,
                     "column": 4
                   }
                 },
                 "ifStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 72,
+                      "line": 80,
                       "column": 9
                     },
                     "end": {
-                      "line": 82,
+                      "line": 89,
                       "column": 4
                     }
                   },
@@ -2179,11 +2284,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 72,
+                          "line": 80,
                           "column": 12
                         },
                         "end": {
-                          "line": 79,
+                          "line": 86,
                           "column": 8
                         }
                       },
@@ -2191,11 +2296,11 @@
                       "block": {
                         "sourceInfo": {
                           "start": {
-                            "line": 73,
+                            "line": 81,
                             "column": 13
                           },
                           "end": {
-                            "line": 79,
+                            "line": 86,
                             "column": 8
                           }
                         },
@@ -2203,22 +2308,22 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 73,
+                                "line": 81,
                                 "column": 13
                               },
                               "end": {
-                                "line": 74,
+                                "line": 82,
                                 "column": 12
                               }
                             },
                             "pyStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 73,
+                                  "line": 81,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 73,
+                                  "line": 81,
                                   "column": 44
                                 }
                               },
@@ -2228,22 +2333,22 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 74,
+                                "line": 82,
                                 "column": 13
                               },
                               "end": {
-                                "line": 76,
+                                "line": 84,
                                 "column": 12
                               }
                             },
                             "pyStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 74,
+                                  "line": 82,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 74,
+                                  "line": 82,
                                   "column": 36
                                 }
                               },
@@ -2253,22 +2358,22 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 76,
+                                "line": 84,
                                 "column": 13
                               },
                               "end": {
-                                "line": 79,
+                                "line": 86,
                                 "column": 8
                               }
                             },
                             "forStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 76,
+                                  "line": 84,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 79,
+                                  "line": 86,
                                   "column": 8
                                 }
                               },
@@ -2279,11 +2384,11 @@
                               "block": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 77,
+                                    "line": 85,
                                     "column": 17
                                   },
                                   "end": {
-                                    "line": 79,
+                                    "line": 86,
                                     "column": 8
                                   }
                                 },
@@ -2291,92 +2396,26 @@
                                   {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 77,
+                                        "line": 85,
                                         "column": 17
                                       },
                                       "end": {
-                                        "line": 79,
+                                        "line": 86,
                                         "column": 8
                                       }
                                     },
-                                    "ifStmt": {
+                                    "pyStmt": {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 77,
+                                          "line": 85,
                                           "column": 17
                                         },
                                         "end": {
-                                          "line": 79,
-                                          "column": 8
+                                          "line": 85,
+                                          "column": 116
                                         }
                                       },
-                                      "branches": [
-                                        {
-                                          "sourceInfo": {
-                                            "start": {
-                                              "line": 77,
-                                              "column": 20
-                                            },
-                                            "end": {
-                                              "line": 79,
-                                              "column": 8
-                                            }
-                                          },
-                                          "condition": "store.published_frontier > self.local_shard_frontiers[i]",
-                                          "block": {
-                                            "sourceInfo": {
-                                              "start": {
-                                                "line": 78,
-                                                "column": 21
-                                              },
-                                              "end": {
-                                                "line": 79,
-                                                "column": 8
-                                              }
-                                            },
-                                            "stmts": [
-                                              {
-                                                "sourceInfo": {
-                                                  "start": {
-                                                    "line": 78,
-                                                    "column": 21
-                                                  },
-                                                  "end": {
-                                                    "line": 79,
-                                                    "column": 8
-                                                  }
-                                                },
-                                                "pyStmt": {
-                                                  "sourceInfo": {
-                                                    "start": {
-                                                      "line": 78,
-                                                      "column": 21
-                                                    },
-                                                    "end": {
-                                                      "line": 78,
-                                                      "column": 76
-                                                    }
-                                                  },
-                                                  "code": "self.local_shard_frontiers[i] = store.published_frontier"
-                                                }
-                                              }
-                                            ]
-                                          },
-                                          "conditionExpr": {
-                                            "sourceInfo": {
-                                              "start": {
-                                                "line": 77,
-                                                "column": 20
-                                              },
-                                              "end": {
-                                                "line": 77,
-                                                "column": 75
-                                              }
-                                            },
-                                            "pyExpr": "store.published_frontier > self.local_shard_frontiers[i]"
-                                          }
-                                        }
-                                      ]
+                                      "code": "self.local_shard_frontiers[i] = vector_join(self.local_shard_frontiers[i], store.published_frontier)"
                                     }
                                   }
                                 ]
@@ -2384,11 +2423,11 @@
                               "iterExpr": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 76,
+                                    "line": 84,
                                     "column": 22
                                   },
                                   "end": {
-                                    "line": 76,
+                                    "line": 84,
                                     "column": 38
                                   }
                                 },
@@ -2401,11 +2440,11 @@
                       "conditionExpr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 72,
+                            "line": 80,
                             "column": 12
                           },
                           "end": {
-                            "line": 72,
+                            "line": 80,
                             "column": 18
                           }
                         },
@@ -2415,242 +2454,15 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 79,
-                          "column": 9
-                        },
-                        "end": {
-                          "line": 82,
-                          "column": 4
-                        }
-                      },
-                      "condition": "True",
-                      "block": {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 80,
-                            "column": 13
-                          },
-                          "end": {
-                            "line": 82,
-                            "column": 4
-                          }
-                        },
-                        "stmts": [
-                          {
-                            "sourceInfo": {
-                              "start": {
-                                "line": 80,
-                                "column": 13
-                              },
-                              "end": {
-                                "line": 82,
-                                "column": 4
-                              }
-                            },
-                            "pyStmt": {
-                              "sourceInfo": {
-                                "start": {
-                                  "line": 80,
-                                  "column": 13
-                                },
-                                "end": {
-                                  "line": 80,
-                                  "column": 37
-                                }
-                              },
-                              "code": "self.is_publisher = False"
-                            }
-                          }
-                        ]
-                      },
-                      "conditionExpr": {
-                        "pyExpr": "True"
-                      }
-                    }
-                  ]
-                }
-              }
-            ]
-          }
-        },
-        {
-          "sourceInfo": {
-            "start": {
-              "line": 82,
-              "column": 5
-            },
-            "end": {
-              "line": 89,
-              "column": 4
-            }
-          },
-          "name": "ReceiveReport",
-          "flow": "FLOW_ATOMIC",
-          "fairness": {
-            "sourceInfo": {
-              "start": {
-                "line": 82,
-                "column": 12
-              },
-              "end": {
-                "line": 82,
-                "column": 15
-              }
-            },
-            "level": "FAIRNESS_LEVEL_WEAK"
-          },
-          "block": {
-            "sourceInfo": {
-              "start": {
-                "line": 83,
-                "column": 9
-              },
-              "end": {
-                "line": 89,
-                "column": 4
-              }
-            },
-            "flow": "FLOW_ATOMIC",
-            "stmts": [
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 83,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 84,
-                    "column": 8
-                  }
-                },
-                "requireStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 83,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 83,
-                      "column": 33
-                    }
-                  },
-                  "condition": "len(messages) > 0",
-                  "conditionExpr": {
-                    "sourceInfo": {
-                      "start": {
-                        "line": 83,
-                        "column": 17
-                      },
-                      "end": {
-                        "line": 83,
-                        "column": 33
-                      }
-                    },
-                    "pyExpr": "len(messages) > 0"
-                  }
-                }
-              },
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 84,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 85,
-                    "column": 8
-                  }
-                },
-                "anyStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 84,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 84,
-                      "column": 28
-                    }
-                  },
-                  "loopVars": [
-                    "msg"
-                  ],
-                  "pyExpr": "messages",
-                  "iterExpr": {
-                    "sourceInfo": {
-                      "start": {
-                        "line": 84,
-                        "column": 21
-                      },
-                      "end": {
-                        "line": 84,
-                        "column": 28
-                      }
-                    },
-                    "pyExpr": "messages"
-                  }
-                }
-              },
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 85,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 86,
-                    "column": 8
-                  }
-                },
-                "pyStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 85,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 85,
-                      "column": 34
-                    }
-                  },
-                  "code": "shard_id = msg[\"shard_id\"]"
-                }
-              },
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 86,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 89,
-                    "column": 4
-                  }
-                },
-                "ifStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 86,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 89,
-                      "column": 4
-                    }
-                  },
-                  "branches": [
-                    {
-                      "sourceInfo": {
-                        "start": {
                           "line": 86,
-                          "column": 12
+                          "column": 9
                         },
                         "end": {
                           "line": 89,
                           "column": 4
                         }
                       },
-                      "condition": "msg[\"frontier\"] > self.local_shard_frontiers[shard_id]",
+                      "condition": "True",
                       "block": {
                         "sourceInfo": {
                           "start": {
@@ -2682,26 +2494,16 @@
                                 },
                                 "end": {
                                   "line": 87,
-                                  "column": 66
+                                  "column": 37
                                 }
                               },
-                              "code": "self.local_shard_frontiers[shard_id] = msg[\"frontier\"]"
+                              "code": "self.is_publisher = False"
                             }
                           }
                         ]
                       },
                       "conditionExpr": {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 86,
-                            "column": 12
-                          },
-                          "end": {
-                            "line": 86,
-                            "column": 65
-                          }
-                        },
-                        "pyExpr": "msg[\"frontier\"] > self.local_shard_frontiers[shard_id]"
+                        "pyExpr": "True"
                       }
                     }
                   ]
@@ -2717,10 +2519,11 @@
               "column": 5
             },
             "end": {
-              "line": 105
+              "line": 93,
+              "column": 4
             }
           },
-          "name": "PublishFrontier",
+          "name": "ReceiveReport",
           "flow": "FLOW_ATOMIC",
           "fairness": {
             "sourceInfo": {
@@ -2742,7 +2545,8 @@
                 "column": 9
               },
               "end": {
-                "line": 105
+                "line": 93,
+                "column": 4
               }
             },
             "flow": "FLOW_ATOMIC",
@@ -2754,11 +2558,11 @@
                     "column": 9
                   },
                   "end": {
-                    "line": 92,
+                    "line": 91,
                     "column": 8
                   }
                 },
-                "requireStmt": {
+                "anyStmt": {
                   "sourceInfo": {
                     "start": {
                       "line": 90,
@@ -2766,6 +2570,112 @@
                     },
                     "end": {
                       "line": 90,
+                      "column": 42
+                    }
+                  },
+                  "loopVars": [
+                    "shard_id"
+                  ],
+                  "pyExpr": "range(NUM_SHARDS)",
+                  "iterExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 90,
+                        "column": 26
+                      },
+                      "end": {
+                        "line": 90,
+                        "column": 42
+                      }
+                    },
+                    "pyExpr": "range(NUM_SHARDS)"
+                  }
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 91,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 93,
+                    "column": 4
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 91,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 91,
+                      "column": 116
+                    }
+                  },
+                  "code": "self.local_shard_frontiers[shard_id] = vector_join(self.local_shard_frontiers[shard_id], messages[shard_id])"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 93,
+              "column": 5
+            },
+            "end": {
+              "line": 106
+            }
+          },
+          "name": "PublishFrontier",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "sourceInfo": {
+              "start": {
+                "line": 93,
+                "column": 12
+              },
+              "end": {
+                "line": 93,
+                "column": 15
+              }
+            },
+            "level": "FAIRNESS_LEVEL_WEAK"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 94,
+                "column": 9
+              },
+              "end": {
+                "line": 106
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 94,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 96,
+                    "column": 8
+                  }
+                },
+                "requireStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 94,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 94,
                       "column": 33
                     }
                   },
@@ -2773,11 +2683,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 90,
+                        "line": 94,
                         "column": 17
                       },
                       "end": {
-                        "line": 90,
+                        "line": 94,
                         "column": 33
                       }
                     },
@@ -2788,127 +2698,11 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 92,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 93,
-                    "column": 8
-                  }
-                },
-                "pyStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 92,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 92,
-                      "column": 48
-                    }
-                  },
-                  "code": "meet_val = self.local_shard_frontiers[0]"
-                }
-              },
-              {
-                "sourceInfo": {
-                  "start": {
-                    "line": 93,
-                    "column": 9
-                  },
-                  "end": {
-                    "line": 96,
-                    "column": 8
-                  }
-                },
-                "ifStmt": {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 93,
-                      "column": 9
-                    },
-                    "end": {
-                      "line": 96,
-                      "column": 8
-                    }
-                  },
-                  "branches": [
-                    {
-                      "sourceInfo": {
-                        "start": {
-                          "line": 93,
-                          "column": 12
-                        },
-                        "end": {
-                          "line": 96,
-                          "column": 8
-                        }
-                      },
-                      "condition": "self.local_shard_frontiers[1] < meet_val",
-                      "block": {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 94,
-                            "column": 13
-                          },
-                          "end": {
-                            "line": 96,
-                            "column": 8
-                          }
-                        },
-                        "stmts": [
-                          {
-                            "sourceInfo": {
-                              "start": {
-                                "line": 94,
-                                "column": 13
-                              },
-                              "end": {
-                                "line": 96,
-                                "column": 8
-                              }
-                            },
-                            "pyStmt": {
-                              "sourceInfo": {
-                                "start": {
-                                  "line": 94,
-                                  "column": 13
-                                },
-                                "end": {
-                                  "line": 94,
-                                  "column": 52
-                                }
-                              },
-                              "code": "meet_val = self.local_shard_frontiers[1]"
-                            }
-                          }
-                        ]
-                      },
-                      "conditionExpr": {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 93,
-                            "column": 12
-                          },
-                          "end": {
-                            "line": 93,
-                            "column": 51
-                          }
-                        },
-                        "pyExpr": "self.local_shard_frontiers[1] < meet_val"
-                      }
-                    }
-                  ]
-                }
-              },
-              {
-                "sourceInfo": {
-                  "start": {
                     "line": 96,
                     "column": 9
                   },
                   "end": {
-                    "line": 97,
+                    "line": 98,
                     "column": 8
                   }
                 },
@@ -2920,6 +2714,88 @@
                     },
                     "end": {
                       "line": 96,
+                      "column": 92
+                    }
+                  },
+                  "vars": [
+                    "meet_val"
+                  ],
+                  "name": "vector_meet",
+                  "args": [
+                    {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 96,
+                          "column": 32
+                        },
+                        "end": {
+                          "line": 96,
+                          "column": 60
+                        }
+                      },
+                      "pyExpr": "self.local_shard_frontiers[0]",
+                      "expr": {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 96,
+                            "column": 32
+                          },
+                          "end": {
+                            "line": 96,
+                            "column": 60
+                          }
+                        },
+                        "pyExpr": "self.local_shard_frontiers[0]"
+                      }
+                    },
+                    {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 96,
+                          "column": 63
+                        },
+                        "end": {
+                          "line": 96,
+                          "column": 91
+                        }
+                      },
+                      "pyExpr": "self.local_shard_frontiers[1]",
+                      "expr": {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 96,
+                            "column": 63
+                          },
+                          "end": {
+                            "line": 96,
+                            "column": 91
+                          }
+                        },
+                        "pyExpr": "self.local_shard_frontiers[1]"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 98,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 99,
+                    "column": 8
+                  }
+                },
+                "callStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 98,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 98,
                       "column": 66
                     }
                   },
@@ -2931,11 +2807,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 96,
+                          "line": 98,
                           "column": 40
                         },
                         "end": {
-                          "line": 96,
+                          "line": 98,
                           "column": 55
                         }
                       },
@@ -2943,11 +2819,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 96,
+                            "line": 98,
                             "column": 40
                           },
                           "end": {
-                            "line": 96,
+                            "line": 98,
                             "column": 55
                           }
                         },
@@ -2957,11 +2833,11 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 96,
+                          "line": 98,
                           "column": 58
                         },
                         "end": {
-                          "line": 96,
+                          "line": 98,
                           "column": 65
                         }
                       },
@@ -2969,11 +2845,11 @@
                       "expr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 96,
+                            "line": 98,
                             "column": 58
                           },
                           "end": {
-                            "line": 96,
+                            "line": 98,
                             "column": 65
                           }
                         },
@@ -2987,32 +2863,32 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 97,
+                    "line": 99,
                     "column": 9
                   },
                   "end": {
-                    "line": 105
+                    "line": 106
                   }
                 },
                 "ifStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 97,
+                      "line": 99,
                       "column": 9
                     },
                     "end": {
-                      "line": 105
+                      "line": 106
                     }
                   },
                   "branches": [
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 97,
+                          "line": 99,
                           "column": 12
                         },
                         "end": {
-                          "line": 100,
+                          "line": 101,
                           "column": 8
                         }
                       },
@@ -3020,11 +2896,11 @@
                       "block": {
                         "sourceInfo": {
                           "start": {
-                            "line": 98,
+                            "line": 100,
                             "column": 13
                           },
                           "end": {
-                            "line": 100,
+                            "line": 101,
                             "column": 8
                           }
                         },
@@ -3032,89 +2908,80 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 98,
+                                "line": 100,
                                 "column": 13
                               },
                               "end": {
-                                "line": 100,
+                                "line": 101,
                                 "column": 8
                               }
                             },
-                            "ifStmt": {
+                            "callStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 98,
+                                  "line": 100,
                                   "column": 13
                                 },
                                 "end": {
                                   "line": 100,
-                                  "column": 8
+                                  "column": 82
                                 }
                               },
-                              "branches": [
+                              "vars": [
+                                "max_published_frontier"
+                              ],
+                              "name": "vector_join",
+                              "args": [
                                 {
                                   "sourceInfo": {
                                     "start": {
-                                      "line": 98,
-                                      "column": 16
+                                      "line": 100,
+                                      "column": 50
                                     },
                                     "end": {
                                       "line": 100,
-                                      "column": 8
+                                      "column": 71
                                     }
                                   },
-                                  "condition": "meet_val > max_published_frontier",
-                                  "block": {
+                                  "pyExpr": "max_published_frontier",
+                                  "expr": {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 99,
-                                        "column": 17
+                                        "line": 100,
+                                        "column": 50
                                       },
                                       "end": {
                                         "line": 100,
-                                        "column": 8
+                                        "column": 71
                                       }
                                     },
-                                    "stmts": [
-                                      {
-                                        "sourceInfo": {
-                                          "start": {
-                                            "line": 99,
-                                            "column": 17
-                                          },
-                                          "end": {
-                                            "line": 100,
-                                            "column": 8
-                                          }
-                                        },
-                                        "pyStmt": {
-                                          "sourceInfo": {
-                                            "start": {
-                                              "line": 99,
-                                              "column": 17
-                                            },
-                                            "end": {
-                                              "line": 99,
-                                              "column": 49
-                                            }
-                                          },
-                                          "code": "max_published_frontier = meet_val"
-                                        }
-                                      }
-                                    ]
+                                    "pyExpr": "max_published_frontier"
+                                  }
+                                },
+                                {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 100,
+                                      "column": 74
+                                    },
+                                    "end": {
+                                      "line": 100,
+                                      "column": 81
+                                    }
                                   },
-                                  "conditionExpr": {
+                                  "pyExpr": "meet_val",
+                                  "expr": {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 98,
-                                        "column": 16
+                                        "line": 100,
+                                        "column": 74
                                       },
                                       "end": {
-                                        "line": 98,
-                                        "column": 48
+                                        "line": 100,
+                                        "column": 81
                                       }
                                     },
-                                    "pyExpr": "meet_val > max_published_frontier"
+                                    "pyExpr": "meet_val"
                                   }
                                 }
                               ]
@@ -3125,11 +2992,11 @@
                       "conditionExpr": {
                         "sourceInfo": {
                           "start": {
-                            "line": 97,
+                            "line": 99,
                             "column": 12
                           },
                           "end": {
-                            "line": 97,
+                            "line": 99,
                             "column": 18
                           }
                         },
@@ -3139,44 +3006,44 @@
                     {
                       "sourceInfo": {
                         "start": {
-                          "line": 100,
+                          "line": 101,
                           "column": 9
                         },
                         "end": {
-                          "line": 105
+                          "line": 106
                         }
                       },
                       "condition": "True",
                       "block": {
                         "sourceInfo": {
                           "start": {
-                            "line": 101,
+                            "line": 102,
                             "column": 13
                           },
                           "end": {
-                            "line": 105
+                            "line": 106
                           }
                         },
                         "stmts": [
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 101,
+                                "line": 102,
                                 "column": 13
                               },
                               "end": {
-                                "line": 102,
+                                "line": 103,
                                 "column": 12
                               }
                             },
                             "pyStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 101,
+                                  "line": 102,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 101,
+                                  "line": 102,
                                   "column": 37
                                 }
                               },
@@ -3186,21 +3053,21 @@
                           {
                             "sourceInfo": {
                               "start": {
-                                "line": 102,
+                                "line": 103,
                                 "column": 13
                               },
                               "end": {
-                                "line": 105
+                                "line": 106
                               }
                             },
                             "pyStmt": {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 102,
+                                  "line": 103,
                                   "column": 13
                                 },
                                 "end": {
-                                  "line": 102,
+                                  "line": 103,
                                   "column": 35
                                 }
                               },
@@ -3224,11 +3091,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 59,
+              "line": 67,
               "column": 1
             },
             "end": {
-              "line": 60
+              "line": 68
             }
           },
           "name": "state",
@@ -3236,11 +3103,11 @@
             {
               "sourceInfo": {
                 "start": {
-                  "line": 59,
+                  "line": 67,
                   "column": 8
                 },
                 "end": {
-                  "line": 59,
+                  "line": 67,
                   "column": 73
                 }
               },
@@ -3248,11 +3115,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 59,
+                    "line": 67,
                     "column": 8
                   },
                   "end": {
-                    "line": 59,
+                    "line": 67,
                     "column": 73
                   }
                 },

@@ -11,11 +11,122 @@
 //! - `CompleteThroughToken` — emitted by monotone (semilattice) laws to signal
 //!   partial progress ahead of the cluster frontier.
 
-use crate::ids::{OperatorId, ShardId, WorkerId};
+use crate::ids::{OperatorId, ShardId, WorkerId, SourceId};
 use crate::merge_law::MergeLawId;
 use crate::timestamp::Epoch;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
+
+/// Progress details for a single source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SourceProgress {
+    pub source_epoch: Epoch,
+    pub event_time_watermark_ms: Option<i64>,
+}
+
+impl SourceProgress {
+    pub fn new(source_epoch: Epoch, event_time_watermark_ms: Option<i64>) -> Self {
+        Self {
+            source_epoch,
+            event_time_watermark_ms,
+        }
+    }
+}
+
+impl Lattice for SourceProgress {
+    fn meet(&self, other: &Self) -> Self {
+        if self.source_epoch < other.source_epoch {
+            *self
+        } else if self.source_epoch > other.source_epoch {
+            *other
+        } else {
+            Self {
+                source_epoch: self.source_epoch,
+                event_time_watermark_ms: match (self.event_time_watermark_ms, other.event_time_watermark_ms) {
+                    (Some(w1), Some(w2)) => Some(std::cmp::min(w1, w2)),
+                    (Some(w1), None) => Some(w1),
+                    (None, Some(w2)) => Some(w2),
+                    (None, None) => None,
+                },
+            }
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        if self.source_epoch > other.source_epoch {
+            *self
+        } else if self.source_epoch < other.source_epoch {
+            *other
+        } else {
+            Self {
+                source_epoch: self.source_epoch,
+                event_time_watermark_ms: match (self.event_time_watermark_ms, other.event_time_watermark_ms) {
+                    (Some(w1), Some(w2)) => Some(std::cmp::max(w1, w2)),
+                    (Some(w1), None) => Some(w1),
+                    (None, Some(w2)) => Some(w2),
+                    (None, None) => None,
+                },
+            }
+        }
+    }
+}
+
+/// A vector-valued progress token representing progress across multiple sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessToken {
+    pub source_progress: BTreeMap<SourceId, SourceProgress>,
+    pub cluster_frontier_hash: u64,
+}
+
+impl FreshnessToken {
+    pub fn new(source_progress: BTreeMap<SourceId, SourceProgress>, cluster_frontier_hash: u64) -> Self {
+        Self {
+            source_progress,
+            cluster_frontier_hash,
+        }
+    }
+
+    /// Retrieve the minimum event_time_watermark_ms across all sources.
+    pub fn watermark_ms(&self) -> Option<i64> {
+        self.source_progress
+            .values()
+            .filter_map(|p| p.event_time_watermark_ms)
+            .min()
+    }
+}
+
+impl Lattice for FreshnessToken {
+    fn meet(&self, other: &Self) -> Self {
+        let mut source_progress = BTreeMap::new();
+        for (id, p1) in &self.source_progress {
+            if let Some(p2) = other.source_progress.get(id) {
+                source_progress.insert(*id, p1.meet(p2));
+            }
+        }
+        let cluster_frontier_hash = self.cluster_frontier_hash ^ other.cluster_frontier_hash;
+        Self {
+            source_progress,
+            cluster_frontier_hash,
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut source_progress = self.source_progress.clone();
+        for (id, p2) in &other.source_progress {
+            if let Some(p1) = source_progress.get(id) {
+                source_progress.insert(*id, p1.join(p2));
+            } else {
+                source_progress.insert(*id, *p2);
+            }
+        }
+        let cluster_frontier_hash = self.cluster_frontier_hash ^ other.cluster_frontier_hash;
+        Self {
+            source_progress,
+            cluster_frontier_hash,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Antichain<T> {
@@ -314,6 +425,43 @@ mod tests {
         assert_eq!(v1.meet(&v2.join(&v3)), v1.meet(&v2).join(&v1.meet(&v3)));
         assert_eq!(f1.join(&f2.meet(&f3)), f1.join(&f2).meet(&f1.join(&f3)));
         assert_eq!(v1.join(&v2.meet(&v3)), v1.join(&v2).meet(&v1.join(&v3)));
+    }
+
+    #[test]
+    fn test_freshness_token_lattice_properties() {
+        use crate::ids::SourceId;
+        use std::collections::BTreeMap;
+
+        let s1 = SourceId(1);
+        let s2 = SourceId(2);
+
+        let p1 = SourceProgress::new(10, Some(100));
+        let p2 = SourceProgress::new(20, Some(200));
+        let p3 = SourceProgress::new(15, Some(150));
+
+        let mut map_a = BTreeMap::new();
+        map_a.insert(s1, p1);
+        map_a.insert(s2, p2);
+        let tok_a = FreshnessToken::new(map_a, 12345);
+
+        let mut map_b = BTreeMap::new();
+        map_b.insert(s1, p3);
+        let tok_b = FreshnessToken::new(map_b, 67890);
+
+        // Meet (intersection, element-wise min)
+        let meet = tok_a.meet(&tok_b);
+        assert_eq!(meet.source_progress.len(), 1);
+        assert_eq!(meet.source_progress.get(&s1), Some(&p1)); // min of 10 and 15 is 10
+
+        // Join (union, element-wise max)
+        let join = tok_a.join(&tok_b);
+        assert_eq!(join.source_progress.len(), 2);
+        assert_eq!(join.source_progress.get(&s1), Some(&p3)); // max of 10 and 15 is 15
+        assert_eq!(join.source_progress.get(&s2), Some(&p2));
+
+        // Commutativity
+        assert_eq!(tok_a.meet(&tok_b).source_progress, tok_b.meet(&tok_a).source_progress);
+        assert_eq!(tok_a.join(&tok_b).source_progress, tok_b.join(&tok_a).source_progress);
     }
 }
 

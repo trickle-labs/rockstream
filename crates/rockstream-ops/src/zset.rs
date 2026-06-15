@@ -30,6 +30,8 @@ pub struct ArrowZSet {
     pub data: RecordBatch,
     /// Per-row delta weights. `weights[i]` corresponds to `data.column(j)[i]`.
     pub weights: Vec<i64>,
+    /// Optional progress frontier associated with this Z-set.
+    pub frontier: Option<rockstream_types::frontier::FreshnessToken>,
 }
 
 impl ArrowZSet {
@@ -45,7 +47,16 @@ impl ArrowZSet {
             data.num_rows(),
             weights.len()
         );
-        ArrowZSet { data, weights }
+        ArrowZSet {
+            data,
+            weights,
+            frontier: None,
+        }
+    }
+
+    pub fn with_frontier(mut self, frontier: rockstream_types::frontier::FreshnessToken) -> Self {
+        self.frontier = Some(frontier);
+        self
     }
 
     /// Number of rows in this batch.
@@ -77,6 +88,7 @@ impl ArrowZSet {
         ArrowZSet {
             data,
             weights: Vec::new(),
+            frontier: None,
         }
     }
 
@@ -95,7 +107,11 @@ impl ArrowZSet {
         ];
         let data = RecordBatch::try_new(schema, cols).expect("from_ab_rows");
         let weights = vec![weight; rows.len()];
-        ArrowZSet { data, weights }
+        ArrowZSet {
+            data,
+            weights,
+            frontier: None,
+        }
     }
 
     /// Build an `ArrowZSet` from `(a: i64, b: i64, weight: i64)` triples.
@@ -115,7 +131,11 @@ impl ArrowZSet {
             Arc::new(Int64Array::from(b_vals)),
         ];
         let data = RecordBatch::try_new(schema, cols).expect("from_ab_weighted");
-        ArrowZSet { data, weights }
+        ArrowZSet {
+            data,
+            weights,
+            frontier: None,
+        }
     }
 
     /// Compact the Z-set: remove rows whose weight is zero.
@@ -142,6 +162,7 @@ impl ArrowZSet {
         ArrowZSet {
             data: new_data,
             weights: new_weights,
+            frontier: self.frontier,
         }
     }
 
@@ -221,9 +242,11 @@ impl ArrowZSet {
         Ok(ArrowZSet {
             data: new_data,
             weights: new_weights,
+            frontier: self.frontier.clone(),
         })
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -246,7 +269,9 @@ mod tests {
         let zs2 = ArrowZSet {
             data: zs.data,
             weights,
+            frontier: None,
         };
+
         let compacted = zs2.compact();
         assert_eq!(compacted.num_rows(), 2);
         assert_eq!(compacted.weights, vec![1, 1]);

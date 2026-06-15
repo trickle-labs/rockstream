@@ -58,9 +58,23 @@ impl OperatorTask {
     /// Returns when the input channel is closed and drained.
     pub async fn run(mut self) {
         while let Some(batch) = self.input_rx.recv().await {
+            let frontier = batch.frontier.clone();
+            if let Some(ref f) = frontier {
+                if let Err(e) = self.op.push_input_frontier(f.clone()) {
+                    error!(
+                        operator = self.op.name(),
+                        error = %e,
+                        "RS-0001: failed to push input frontier"
+                    );
+                }
+            }
+
             match self.op.process_delta(batch) {
-                Ok(output) => {
-                    if !output.is_empty() && self.output_tx.send(output).await.is_err() {
+                Ok(mut output) => {
+                    if let Some(f) = frontier {
+                        output = output.with_frontier(f);
+                    }
+                    if (!output.is_empty() || output.frontier.is_some()) && self.output_tx.send(output).await.is_err() {
                         // Downstream closed; stop processing.
                         break;
                     }
