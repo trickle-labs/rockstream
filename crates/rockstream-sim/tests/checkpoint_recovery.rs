@@ -58,7 +58,10 @@ fn noop_commit(
 }
 
 async fn open_shard_db(path: &str, store: Arc<dyn ObjectStore>) -> ShardDb {
-    ShardDb::builder(path.to_string(), store).build().await.unwrap()
+    ShardDb::builder(path.to_string(), store)
+        .build()
+        .await
+        .unwrap()
 }
 
 fn docker_available() -> bool {
@@ -132,7 +135,11 @@ async fn test_checkpoint_alignment_bounded_lfs() {
         .unwrap();
 
     // After completion, credits are released.
-    assert_eq!(coord.credits_used(), 0, "credits must be fully released after round");
+    assert_eq!(
+        coord.credits_used(),
+        0,
+        "credits must be fully released after round"
+    );
 
     // Can begin a new round now.
     let id2 = coord.begin_checkpoint(noop_inject).unwrap();
@@ -278,8 +285,10 @@ const MINIO_USER: &str = "minioadmin";
 const MINIO_PASS: &str = "minioadmin";
 const MINIO_BUCKET: &str = "rockstream-checkpoint-test";
 
-async fn start_minio() -> (testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO>, u16)
-{
+async fn start_minio() -> (
+    testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO>,
+    u16,
+) {
     let container = testcontainers_modules::minio::MinIO::default()
         .start()
         .await
@@ -320,7 +329,10 @@ async fn create_minio_bucket_raw(port: u16, bucket: &str) {
         mac.update(data);
         mac.finalize().into_bytes().to_vec()
     };
-    let k_date = hmac_fn(format!("AWS4{MINIO_PASS}").as_bytes(), date_stamp.as_bytes());
+    let k_date = hmac_fn(
+        format!("AWS4{MINIO_PASS}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
     let k_region = hmac_fn(&k_date, b"us-east-1");
     let k_service = hmac_fn(&k_region, b"s3");
     let signing_key = hmac_fn(&k_service, b"aws4_request");
@@ -360,8 +372,20 @@ fn epoch_ymd(secs: u64) -> (u32, u32, u32) {
         year += 1;
     }
     let leap = is_leap(year);
-    let dpm: [u32; 12] =
-        [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let dpm: [u32; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1u32;
     let mut day = days;
     for (i, &d) in dpm.iter().enumerate() {
@@ -377,7 +401,11 @@ fn epoch_ymd(secs: u64) -> (u32, u32, u32) {
 
 fn epoch_hms(secs: u64) -> (u32, u32, u32) {
     let sod = secs % 86400;
-    ((sod / 3600) as u32, ((sod % 3600) / 60) as u32, (sod % 60) as u32)
+    (
+        (sod / 3600) as u32,
+        ((sod % 3600) / 60) as u32,
+        (sod % 60) as u32,
+    )
 }
 
 fn is_leap(y: u32) -> bool {
@@ -449,9 +477,17 @@ async fn test_recovery_bit_identical_minio() {
 
     // Assert bit-identical state.
     let alpha = recovered.reader.get(b"minio/key/alpha").await.unwrap();
-    assert_eq!(alpha.as_deref(), Some(b"beta".as_ref()), "alpha must be 'beta'");
+    assert_eq!(
+        alpha.as_deref(),
+        Some(b"beta".as_ref()),
+        "alpha must be 'beta'"
+    );
     let gamma = recovered.reader.get(b"minio/key/gamma").await.unwrap();
-    assert_eq!(gamma.as_deref(), Some(b"delta".as_ref()), "gamma must be 'delta'");
+    assert_eq!(
+        gamma.as_deref(),
+        Some(b"delta".as_ref()),
+        "gamma must be 'delta'"
+    );
 }
 
 /// SST/checkpoint count stays bounded after N checkpoint rounds (MinIO).
@@ -492,8 +528,12 @@ async fn test_checkpoint_gc_bounded_minio() {
 
     for round in 0..N_ROUNDS {
         // Write data to both shards.
-        db0.put(format!("round/{round}/key").as_bytes(), b"val").await.unwrap();
-        db1.put(format!("round/{round}/key").as_bytes(), b"val").await.unwrap();
+        db0.put(format!("round/{round}/key").as_bytes(), b"val")
+            .await
+            .unwrap();
+        db1.put(format!("round/{round}/key").as_bytes(), b"val")
+            .await
+            .unwrap();
         db0.flush().await.unwrap();
         db1.flush().await.unwrap();
 
@@ -562,8 +602,8 @@ async fn test_checkpoint_gc_bounded_minio() {
 #[test]
 fn test_self_fence_on_partition() {
     use rockstream_runtime::{assert_single_lease_holder, assert_valid_writer, SelfFenceGuard};
-    use rockstream_sim::buggify::{buggify_disable, buggify_init};
     use rockstream_sim::buggify;
+    use rockstream_sim::buggify::{buggify_disable, buggify_init};
     use rockstream_types::ids::{LeaseToken, WorkerId};
 
     // Fixed seed for deterministic replay.
@@ -577,7 +617,10 @@ fn test_self_fence_on_partition() {
     // Simulate w1's heartbeat loop: buggify injects partition (probability 1.0
     // under sim), so can_reach_control becomes false.
     let inject_partition = buggify!("control.partition", 1.0);
-    assert!(inject_partition, "buggify must inject partition in simulation");
+    assert!(
+        inject_partition,
+        "buggify must inject partition in simulation"
+    );
 
     // Simulate the self-fence deadline check (M4-S2 paired assertion).
     // Create a guard with an immediate deadline to simulate deadline exceeded.
@@ -631,8 +674,8 @@ fn test_self_fence_on_partition() {
 #[cfg(feature = "simulation")]
 #[test]
 fn test_checkpoint_under_slow_input() {
-    use rockstream_sim::buggify::{buggify_disable, buggify_init};
     use rockstream_sim::buggify;
+    use rockstream_sim::buggify::{buggify_disable, buggify_init};
 
     buggify_init(42424242);
 
@@ -654,7 +697,10 @@ fn test_checkpoint_under_slow_input() {
         matches!(err, CoordinatorError::AlignmentTimeout),
         "expected AlignmentTimeout (RS-3602) for credit-full coordinator, got {err:?}"
     );
-    assert!(err.to_string().contains("RS-3602"), "error must contain RS-3602: {err}");
+    assert!(
+        err.to_string().contains("RS-3602"),
+        "error must contain RS-3602: {err}"
+    );
 
     // Credits still bounded: never exceeded max_credits.
     assert!(
@@ -670,7 +716,11 @@ fn test_checkpoint_under_slow_input() {
         .unwrap();
 
     // After completion, credits are released and a new round can begin.
-    assert_eq!(coord.credits_used(), 0, "credits fully released after slow round");
+    assert_eq!(
+        coord.credits_used(),
+        0,
+        "credits fully released after slow round"
+    );
     let id2 = coord.begin_checkpoint(noop_inject).unwrap();
     assert_eq!(id2, CheckpointId(2), "second round has id 2");
 
@@ -693,19 +743,21 @@ fn test_checkpoint_under_slow_input() {
 #[test]
 fn test_partitioned_worker_self_fences_before_sink_commit() {
     use rockstream_connectors::{
-        KafkaSink, SinkConnector,
-        assert_epoch_committed_only_after_cluster_checkpoint,
+        assert_epoch_committed_only_after_cluster_checkpoint, KafkaSink, SinkConnector,
     };
     use rockstream_runtime::SelfFenceGuard;
-    use rockstream_sim::buggify::{buggify_disable, buggify_init};
     use rockstream_sim::buggify;
+    use rockstream_sim::buggify::{buggify_disable, buggify_init};
     use rockstream_types::ids::ConnectorId;
 
     buggify_init(55555);
 
     // Inject partition: w1 cannot reach control plane.
     let partition_active = buggify!("control.partition", 1.0);
-    assert!(partition_active, "buggify must inject partition in simulation");
+    assert!(
+        partition_active,
+        "buggify must inject partition in simulation"
+    );
 
     // w1's SelfFenceGuard: use short deadline for test.
     let mut w1_guard = SelfFenceGuard::with_deadline(Duration::from_millis(5));
@@ -753,14 +805,11 @@ fn test_partitioned_worker_self_fences_before_sink_commit() {
 #[cfg(feature = "simulation")]
 #[test]
 fn test_2pc_crash_before_precommit() {
-    use rockstream_connectors::{
-        KafkaSink, SinkConnector,
-        assert_recovery_dispatch_idempotent,
-    };
-    use rockstream_sim::buggify::{buggify_disable, buggify_init};
+    use rockstream_connectors::{assert_recovery_dispatch_idempotent, KafkaSink, SinkConnector};
     use rockstream_sim::buggify;
+    use rockstream_sim::buggify::{buggify_disable, buggify_init};
     use rockstream_types::ids::ConnectorId;
-    use rockstream_types::sink::{RecoveryAction, SinkState, SinkIdempotencyProfile};
+    use rockstream_types::sink::{RecoveryAction, SinkIdempotencyProfile, SinkState};
 
     buggify_init(11111);
 
@@ -773,14 +822,20 @@ fn test_2pc_crash_before_precommit() {
 
     // Crash before pre-commit: sink is Idle. Recovery action is Noop.
     let sink_state = SinkState::Idle;
-    let recovery_action = RecoveryAction::from_sink_state(
-        &sink_state, 1, SinkIdempotencyProfile::CheckBeforeCommit,
+    let recovery_action =
+        RecoveryAction::from_sink_state(&sink_state, 1, SinkIdempotencyProfile::CheckBeforeCommit);
+    assert_eq!(
+        recovery_action,
+        RecoveryAction::Noop,
+        "crash before precommit → Noop"
     );
-    assert_eq!(recovery_action, RecoveryAction::Noop, "crash before precommit → Noop");
 
     // Perform recovery; must not change delivered set.
     sink.recover(recovery_action.clone()).unwrap();
-    assert!(!sink.check_epoch_delivered(1), "epoch must not be delivered after Noop");
+    assert!(
+        !sink.check_epoch_delivered(1),
+        "epoch must not be delivered after Noop"
+    );
 
     // Verify M3-S4 assertion: Noop → final state must be Idle.
     assert_recovery_dispatch_idempotent(connector_id, &recovery_action, &SinkState::Idle);
@@ -795,14 +850,11 @@ fn test_2pc_crash_before_precommit() {
 #[cfg(feature = "simulation")]
 #[test]
 fn test_2pc_crash_between_precommit_commit() {
-    use rockstream_connectors::{
-        KafkaSink, SinkConnector,
-        assert_recovery_dispatch_idempotent,
-    };
-    use rockstream_sim::buggify::{buggify_disable, buggify_init};
+    use rockstream_connectors::{assert_recovery_dispatch_idempotent, KafkaSink, SinkConnector};
     use rockstream_sim::buggify;
+    use rockstream_sim::buggify::{buggify_disable, buggify_init};
     use rockstream_types::ids::ConnectorId;
-    use rockstream_types::sink::{RecoveryAction, SinkState, SinkIdempotencyProfile};
+    use rockstream_types::sink::{RecoveryAction, SinkIdempotencyProfile, SinkState};
 
     buggify_init(22222);
 
@@ -833,7 +885,10 @@ fn test_2pc_crash_between_precommit_commit() {
     sink.staged_epochs_clear_for_test();
 
     sink.recover(recovery_action.clone()).unwrap();
-    assert!(sink.check_epoch_delivered(3), "epoch must be delivered after recovery");
+    assert!(
+        sink.check_epoch_delivered(3),
+        "epoch must be delivered after recovery"
+    );
 
     // M3-S4: RerunCommit → final state must be Committed.
     assert_recovery_dispatch_idempotent(connector_id, &recovery_action, &SinkState::Committed);
@@ -848,14 +903,11 @@ fn test_2pc_crash_between_precommit_commit() {
 #[cfg(feature = "simulation")]
 #[test]
 fn test_2pc_crash_during_commit() {
-    use rockstream_connectors::{
-        KafkaSink, SinkConnector,
-        assert_recovery_dispatch_idempotent,
-    };
-    use rockstream_sim::buggify::{buggify_disable, buggify_init};
+    use rockstream_connectors::{assert_recovery_dispatch_idempotent, KafkaSink, SinkConnector};
     use rockstream_sim::buggify;
+    use rockstream_sim::buggify::{buggify_disable, buggify_init};
     use rockstream_types::ids::ConnectorId;
-    use rockstream_types::sink::{RecoveryAction, SinkState, SinkIdempotencyProfile};
+    use rockstream_types::sink::{RecoveryAction, SinkIdempotencyProfile, SinkState};
 
     buggify_init(33333);
 
@@ -899,7 +951,7 @@ fn test_2pc_crash_during_commit() {
 /// loss and zero duplicates.
 #[test]
 fn test_object_store_brownout_50epochs() {
-    use rockstream_sim::{ObjectStoreBrownoutGuard, LOCAL_BUFFER_MAX_EPOCHS, BrownoutStatus};
+    use rockstream_sim::{BrownoutStatus, ObjectStoreBrownoutGuard, LOCAL_BUFFER_MAX_EPOCHS};
 
     const TOTAL_EPOCHS: usize = 50;
     let mut guard = ObjectStoreBrownoutGuard::new(LOCAL_BUFFER_MAX_EPOCHS);
@@ -938,7 +990,10 @@ fn test_object_store_brownout_50epochs() {
     );
 
     // Some epochs were blocked (source paused).
-    assert!(blocked > 0, "backpressure must be applied during 50-epoch brownout");
+    assert!(
+        blocked > 0,
+        "backpressure must be applied during 50-epoch brownout"
+    );
     assert!(buffered > 0, "some epochs must be buffered");
 
     // Brownout ends.
@@ -956,5 +1011,8 @@ fn test_object_store_brownout_50epochs() {
     );
 
     // Confirm guard is healthy after recovery.
-    assert!(guard.try_commit_epoch().is_ok(), "commits succeed after brownout recovery");
+    assert!(
+        guard.try_commit_epoch().is_ok(),
+        "commits succeed after brownout recovery"
+    );
 }

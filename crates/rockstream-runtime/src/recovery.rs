@@ -71,7 +71,11 @@ impl std::fmt::Display for RecoveryError {
                 "RS-3605: no committed cluster checkpoint found; \
                  next_steps: ensure at least one checkpoint round completes before recovery"
             ),
-            Self::BudgetExceeded { shard_id, elapsed, budget } => write!(
+            Self::BudgetExceeded {
+                shard_id,
+                elapsed,
+                budget,
+            } => write!(
                 f,
                 "RS-3610: shard {shard_id} recovery exceeded budget \
                  ({elapsed:?} > {budget:?}); \
@@ -188,7 +192,11 @@ impl RecoveryDriver {
 
     /// Returns the currently loaded checkpoint id, if any.
     pub fn loaded_checkpoint_id(&self) -> Option<CheckpointId> {
-        self.inner.lock().checkpoint.as_ref().map(|c| c.checkpoint_id)
+        self.inner
+            .lock()
+            .checkpoint
+            .as_ref()
+            .map(|c| c.checkpoint_id)
     }
 
     /// Returns the current recovery progress (fill-level metric).
@@ -239,11 +247,9 @@ impl RecoveryDriver {
             (cp, budget)
         };
 
-        let psc = checkpoint
-            .shards
-            .get(&shard_id)
-            .cloned()
-            .ok_or_else(|| RecoveryError::StorageError(format!("shard {shard_id} not in checkpoint")))?;
+        let psc = checkpoint.shards.get(&shard_id).cloned().ok_or_else(|| {
+            RecoveryError::StorageError(format!("shard {shard_id} not in checkpoint"))
+        })?;
 
         let started = Instant::now();
 
@@ -332,10 +338,9 @@ impl RecoveryDriver {
                 .get(&shard_id)
                 .cloned()
                 .unwrap_or_else(|| format!("shard/{}", shard_id.0));
-            let object_store = object_stores
-                .get(&shard_id)
-                .cloned()
-                .ok_or_else(|| RecoveryError::StorageError(format!("no object_store for {shard_id}")))?;
+            let object_store = object_stores.get(&shard_id).cloned().ok_or_else(|| {
+                RecoveryError::StorageError(format!("no object_store for {shard_id}"))
+            })?;
             let (expected, current) = tokens
                 .get(&shard_id)
                 .copied()
@@ -402,7 +407,10 @@ mod tests {
 
     #[test]
     fn progress_fraction_with_no_shards_is_one() {
-        let p = RecoveryProgress { recovered: 0, total: 0 };
+        let p = RecoveryProgress {
+            recovered: 0,
+            total: 0,
+        };
         assert_eq!(p.fraction(), 1.0);
     }
 
@@ -412,13 +420,7 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let err = driver
-            .recover_shard(
-                ShardId(0),
-                "shard/0",
-                store,
-                LeaseToken(1),
-                LeaseToken(1),
-            )
+            .recover_shard(ShardId(0), "shard/0", store, LeaseToken(1), LeaseToken(1))
             .await
             .unwrap_err();
         assert_eq!(err, RecoveryError::NoCheckpointAvailable);
@@ -444,12 +446,19 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(err, RecoveryError::LeaseReacquisitionFailed { shard_id: ShardId(0) });
+        assert_eq!(
+            err,
+            RecoveryError::LeaseReacquisitionFailed {
+                shard_id: ShardId(0)
+            }
+        );
     }
 
     #[test]
     fn recovery_error_messages_contain_rs_codes() {
-        assert!(RecoveryError::NoCheckpointAvailable.to_string().contains("RS-3605"));
+        assert!(RecoveryError::NoCheckpointAvailable
+            .to_string()
+            .contains("RS-3605"));
         assert!(RecoveryError::BudgetExceeded {
             shard_id: ShardId(0),
             elapsed: Duration::from_secs(5),
@@ -457,8 +466,10 @@ mod tests {
         }
         .to_string()
         .contains("RS-3610"));
-        assert!(RecoveryError::LeaseReacquisitionFailed { shard_id: ShardId(0) }
-            .to_string()
-            .contains("RS-3611"));
+        assert!(RecoveryError::LeaseReacquisitionFailed {
+            shard_id: ShardId(0)
+        }
+        .to_string()
+        .contains("RS-3611"));
     }
 }

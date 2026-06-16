@@ -152,15 +152,15 @@ pub struct CheckpointCoordinator {
 impl CheckpointCoordinator {
     /// Create a coordinator for the given set of shards.
     pub fn new(shards: Vec<ShardId>) -> Self {
-        Self::with_config(shards, DEFAULT_ALIGNMENT_MAX_CREDITS, DEFAULT_RETENTION_HORIZON)
+        Self::with_config(
+            shards,
+            DEFAULT_ALIGNMENT_MAX_CREDITS,
+            DEFAULT_RETENTION_HORIZON,
+        )
     }
 
     /// Create with custom alignment credit limit and retention horizon.
-    pub fn with_config(
-        shards: Vec<ShardId>,
-        max_credits: usize,
-        retention_horizon: u64,
-    ) -> Self {
+    pub fn with_config(shards: Vec<ShardId>, max_credits: usize, retention_horizon: u64) -> Self {
         Self {
             inner: Arc::new(Mutex::new(CoordinatorInner {
                 shards,
@@ -194,10 +194,7 @@ impl CheckpointCoordinator {
     /// credits are exhausted or a round is already in progress.
     ///
     /// An audit event `checkpoint.started` is emitted.
-    pub fn begin_checkpoint<F>(
-        &self,
-        inject_barrier: F,
-    ) -> Result<CheckpointId, CoordinatorError>
+    pub fn begin_checkpoint<F>(&self, inject_barrier: F) -> Result<CheckpointId, CoordinatorError>
     where
         F: Fn(ShardId, CheckpointBarrier),
     {
@@ -256,10 +253,7 @@ impl CheckpointCoordinator {
             credits_held: acquired,
         });
 
-        tracing::info!(
-            checkpoint_id = checkpoint_id.0,
-            "audit: checkpoint.started"
-        );
+        tracing::info!(checkpoint_id = checkpoint_id.0, "audit: checkpoint.started");
 
         Ok(checkpoint_id)
     }
@@ -316,8 +310,11 @@ impl CheckpointCoordinator {
         // All shards confirmed — build and commit the manifest.
         let checkpoint_id = round.checkpoint_id;
         let mut manifest = ClusterCheckpoint::new(checkpoint_id);
-        let confirmations: Vec<(ShardId, PerShardCheckpoint)> =
-            round.confirmations.iter().map(|(&sid, psc)| (sid, psc.clone())).collect();
+        let confirmations: Vec<(ShardId, PerShardCheckpoint)> = round
+            .confirmations
+            .iter()
+            .map(|(&sid, psc)| (sid, psc.clone()))
+            .collect();
         let credits_held = round.credits_held;
         guard.in_progress = None;
 
@@ -435,22 +432,17 @@ mod tests {
         let id = coord.begin_checkpoint(noop_inject).unwrap();
 
         coord
-            .record_shard_checkpoint(
-                ShardId(0),
-                PerShardCheckpoint::new(id, 100),
-                noop_commit,
-            )
+            .record_shard_checkpoint(ShardId(0), PerShardCheckpoint::new(id, 100), noop_commit)
             .unwrap();
 
         let result = coord
-            .record_shard_checkpoint(
-                ShardId(1),
-                PerShardCheckpoint::new(id, 200),
-                noop_commit,
-            )
+            .record_shard_checkpoint(ShardId(1), PerShardCheckpoint::new(id, 200), noop_commit)
             .unwrap();
 
-        assert!(result.is_some(), "should return manifest on last confirmation");
+        assert!(
+            result.is_some(),
+            "should return manifest on last confirmation"
+        );
         let manifest = result.unwrap();
         assert_eq!(manifest.checkpoint_id, id);
         assert_eq!(manifest.shards.len(), 2);
@@ -545,7 +537,10 @@ mod tests {
                 noop_commit,
             )
             .unwrap_err();
-        assert!(matches!(err, CoordinatorError::StaleConfirmation { .. }), "{err}");
+        assert!(
+            matches!(err, CoordinatorError::StaleConfirmation { .. }),
+            "{err}"
+        );
     }
 
     // ── GC ────────────────────────────────────────────────────────────────────
@@ -558,17 +553,17 @@ mod tests {
             let id = coord.begin_checkpoint(noop_inject).unwrap();
             assert_eq!(id.0, i);
             coord
-                .record_shard_checkpoint(
-                    ShardId(0),
-                    PerShardCheckpoint::new(id, i),
-                    noop_commit,
-                )
+                .record_shard_checkpoint(ShardId(0), PerShardCheckpoint::new(id, i), noop_commit)
                 .unwrap();
         }
 
         // With retention_horizon=2 and 5 committed, only ckpt-3..=5 should remain.
         let committed = coord.committed_checkpoints();
-        assert!(committed.len() <= 3, "expected ≤3 but got {}", committed.len());
+        assert!(
+            committed.len() <= 3,
+            "expected ≤3 but got {}",
+            committed.len()
+        );
         let min_id = committed.iter().map(|c| c.checkpoint_id.0).min().unwrap();
         assert!(min_id >= 3, "expected min_id ≥ 3 but got {min_id}");
     }

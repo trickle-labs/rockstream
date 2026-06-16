@@ -140,3 +140,59 @@ The `DuplicateCommit` actions snapshot `persisted_epoch_{0,1}` before the
 duplicate, then attempt to re-apply the commit. Since `persisted_epoch` is
 already at the committed value, the max operation is a no-op, and M1-S5
 asserts the snapshot equals the post-duplicate state.
+
+---
+
+## D6.6 — Continuous Verification Bootstrap (v0.22)
+
+**Date**: 2026-06-16
+**Deliverable**: FIZZBEE_TEST_PLAN.md §4.4 DC.1–DC.4 (v0.22 Chaos and Recovery SLO Gate)
+
+### 1. Summary
+
+No counterexamples were found during M3 or M4 model construction. The §3.6
+invariant→runtime-assertion table in FIZZBEE_TEST_PLAN.md is fully populated
+for M1–M4. The v0.22 release establishes continuous formal verification as a
+permanent CI gate through DC.1–DC.4.
+
+### 2. BUGGIFY Site → SimRuntime Regression Seed Map
+
+| FizzBee coverage assertion | BUGGIFY site | SimRuntime regression seed |
+|---|---|---|
+| COV-M3 (crash between pre-commit and commit) | `buggify!("sink.crash_between_precommit_commit", 1.0)` in `crates/rockstream-connectors/src/sink_connector.rs` | `test_2pc_crash_between_precommit_commit` in `crates/rockstream-sim/tests/checkpoint_recovery.rs` |
+| COV-M4 (partitioned worker fence-rejected on commit) | `buggify!("control.partition", 1.0)` in `crates/rockstream-runtime/src/fence.rs` | `test_self_fence_on_partition` in `crates/rockstream-sim/tests/checkpoint_recovery.rs` |
+| COV-M1 (worker crashes mid-commit, different worker recovers) | `buggify!("storage.write_batch_partial_fail", 1.0)` in `crates/rockstream-storage/src/shard_db.rs` | `test_checkpoint_recovery_bit_identical_lfs` in `crates/rockstream-sim/tests/checkpoint_recovery.rs` |
+| COV-M2 (two FrontierAggregators contend for publisher lease) | `buggify!("control.frontier_aggregator_failover", 1.0)` in `crates/rockstream-control/src/frontier.rs` | `test_frontier_publisher_fencing` in `crates/rockstream-sim/tests/control_sim.rs` |
+
+### 3. Continuous Verification Gates (DC.1–DC.4)
+
+- **DC.1** ✅: `formal-verify` CI job added to `.github/workflows/ci.yml`. Runs
+  `make verify` (all four FizzBee models M1–M4) on every PR touching `formal/`,
+  `DESIGN.md`, or any coordination crate (`rockstream-runtime`, `-control`,
+  `-connectors`, `-storage`). Wired to the same merge gate as `cargo test`.
+
+- **DC.2** ✅: `scripts/check-path-coupling.sh` fails any PR that changes a
+  coordination crate or `DESIGN.md` without a corresponding touch to
+  `formal/*.fizz` or `FIZZBEE_TEST_PLAN.md`. Runs as `check-path-coupling`
+  step in the `check` CI job and as `make path-coupling` locally.
+
+- **DC.3** ✅: This entry establishes the archival workflow. No counterexample
+  has been found to date. When a counterexample is found in the future, the
+  procedure is:
+  1. Archive it here with its full trace.
+  2. Write a named `SimRuntime` regression seed in `chaos_tests.rs` (or the
+     relevant test file) that reproduces the trace before fixing the model.
+  3. Fix the model (or the Rust implementation if the model exposed a real bug).
+  4. Verify the regression seed passes on the fixed code and mark it permanent.
+
+- **DC.4** ✅: `make verify-relaxed` target added to `Makefile`. Re-runs all
+  four specs with `NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4` to widen coverage
+  beyond the CI-fast minimums. Used as a pre-release gate alongside `make verify`.
+
+### 4. Recovery SLO Proof Tests Added (v0.22)
+
+| Proof claim | Test | File |
+|---|---|---|
+| P1 — chaos output matches non-faulty reference | `proof_chaos_output_matches_reference_run` | `chaos_tests.rs` |
+| P2 — full-outage recovery < 60 s | `proof_recovery_from_full_outage_within_60s` | `chaos_tests.rs` |
+| P3 — failure detection ≤ 5 s, shard reassignment ≤ 30 s, freshness recovery ≤ 60 s p99 | `proof_recovery_slos_all_met` | `chaos_tests.rs` |

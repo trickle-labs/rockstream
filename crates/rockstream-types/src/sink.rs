@@ -125,7 +125,10 @@ pub struct SinkEpochKey {
 
 impl SinkEpochKey {
     pub fn new(connector_id: ConnectorId, epoch: Epoch) -> Self {
-        Self { connector_id, epoch }
+        Self {
+            connector_id,
+            epoch,
+        }
     }
 
     /// Encode the key to bytes: `[0x06, 0xSK, connector_id(8 BE), epoch(8 BE)]`.
@@ -169,7 +172,10 @@ pub struct SourceEpochKey {
 
 impl SourceEpochKey {
     pub fn new(connector_id: ConnectorId, source_epoch: Epoch) -> Self {
-        Self { connector_id, source_epoch }
+        Self {
+            connector_id,
+            source_epoch,
+        }
     }
 }
 
@@ -241,8 +247,11 @@ mod tests {
 
     #[test]
     fn sink_state_needs_recovery_commit() {
-        assert!(SinkState::PreCommitted { staged_rows: 5, pending_handle: vec![] }
-            .needs_recovery_commit());
+        assert!(SinkState::PreCommitted {
+            staged_rows: 5,
+            pending_handle: vec![]
+        }
+        .needs_recovery_commit());
         assert!(!SinkState::Idle.needs_recovery_commit());
         assert!(!SinkState::Committed.needs_recovery_commit());
     }
@@ -271,7 +280,10 @@ mod tests {
     fn recovery_action_pre_committed_returns_rerun() {
         let handle = b"kafka-txn-id-7".to_vec();
         let action = RecoveryAction::from_sink_state(
-            &SinkState::PreCommitted { staged_rows: 10, pending_handle: handle.clone() },
+            &SinkState::PreCommitted {
+                staged_rows: 10,
+                pending_handle: handle.clone(),
+            },
             3,
             SinkIdempotencyProfile::CheckBeforeCommit,
         );
@@ -287,8 +299,14 @@ mod tests {
 
     #[test]
     fn sink_idempotency_profile_display() {
-        assert_eq!(SinkIdempotencyProfile::NativeIdempotent.to_string(), "native_idempotent");
-        assert_eq!(SinkIdempotencyProfile::CheckBeforeCommit.to_string(), "check_before_commit");
+        assert_eq!(
+            SinkIdempotencyProfile::NativeIdempotent.to_string(),
+            "native_idempotent"
+        );
+        assert_eq!(
+            SinkIdempotencyProfile::CheckBeforeCommit.to_string(),
+            "check_before_commit"
+        );
         assert_eq!(
             SinkIdempotencyProfile::FencingTokenRequired.to_string(),
             "fencing_token_required"

@@ -79,7 +79,10 @@ impl std::fmt::Display for SinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PreCommitFailed { epoch, reason } => {
-                write!(f, "RS-4003: sink pre-commit failed for epoch {epoch}: {reason}")
+                write!(
+                    f,
+                    "RS-4003: sink pre-commit failed for epoch {epoch}: {reason}"
+                )
             }
             Self::CommitFailed { epoch, reason } => {
                 write!(f, "RS-4004: sink commit failed for epoch {epoch}: {reason}")
@@ -269,7 +272,10 @@ mod tests {
         assert_recovery_dispatch_idempotent(
             ConnectorId(1),
             &RecoveryAction::Noop,
-            &SinkState::PreCommitted { staged_rows: 5, pending_handle: vec![] },
+            &SinkState::PreCommitted {
+                staged_rows: 5,
+                pending_handle: vec![],
+            },
         );
     }
 
@@ -308,25 +314,18 @@ mod tests {
             ConnectorId(1),
             3,
             5,
-            &SinkState::PreCommitted { staged_rows: 1, pending_handle: vec![] },
+            &SinkState::PreCommitted {
+                staged_rows: 1,
+                pending_handle: vec![],
+            },
         );
-        assert_no_lost_delivery_after_checkpoint(
-            ConnectorId(1),
-            3,
-            5,
-            &SinkState::Committed,
-        );
+        assert_no_lost_delivery_after_checkpoint(ConnectorId(1), 3, 5, &SinkState::Committed);
     }
 
     #[test]
     #[should_panic(expected = "RS-4004")]
     fn assert_no_lost_delivery_panics_when_idle_and_committed() {
-        assert_no_lost_delivery_after_checkpoint(
-            ConnectorId(1),
-            3,
-            5,
-            &SinkState::Idle,
-        );
+        assert_no_lost_delivery_after_checkpoint(ConnectorId(1), 3, 5, &SinkState::Idle);
     }
 
     #[test]
@@ -367,7 +366,10 @@ mod tests {
             cid,
             1,
             1,
-            &SinkState::PreCommitted { staged_rows: 5, pending_handle: vec![] },
+            &SinkState::PreCommitted {
+                staged_rows: 5,
+                pending_handle: vec![],
+            },
         );
     }
 }

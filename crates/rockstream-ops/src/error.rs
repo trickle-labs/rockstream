@@ -165,6 +165,9 @@ impl OpError {
 
     pub fn topk_buffer_overflow(limit: usize) -> Self {
         use rockstream_types::error_code::RS_1018;
-        Self::TopKBufferOverflow { limit, code: RS_1018 }
+        Self::TopKBufferOverflow {
+            limit,
+            code: RS_1018,
+        }
     }
 }

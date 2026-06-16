@@ -258,7 +258,10 @@ mod tests {
         let mut reg = SourceEpochRegistry::new(ConnectorId(6));
         let entry = reg.prepare_commit(BTreeMap::new());
         // Manually corrupt the epoch to skip ahead.
-        let bad_entry = SourceEpochEntry { source_epoch: 5, partition_offsets: BTreeMap::new() };
+        let bad_entry = SourceEpochEntry {
+            source_epoch: 5,
+            partition_offsets: BTreeMap::new(),
+        };
         reg.commit_epoch(bad_entry);
         let _ = entry; // suppress unused warning
     }

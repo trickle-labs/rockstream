@@ -31,10 +31,8 @@ use rockstream_types::sink::{RecoveryAction, SinkIdempotencyProfile, SinkState};
 use rockstream_types::timestamp::Epoch;
 
 use crate::sink_connector::{
-    SinkConnector, SinkError,
-    assert_epoch_committed_only_after_cluster_checkpoint,
-    assert_no_duplicate_delivery,
-    assert_recovery_dispatch_idempotent,
+    assert_epoch_committed_only_after_cluster_checkpoint, assert_no_duplicate_delivery,
+    assert_recovery_dispatch_idempotent, SinkConnector, SinkError,
 };
 
 /// Default maximum number of pending (pre-committed) epochs before backpressure.
@@ -117,7 +115,8 @@ impl SinkConnector for ObjectStoreSink {
         }
         // Write to `_pending/{epoch}/part-0` (simulated as bytes in memory).
         let pending_path = format!("_pending/{epoch}/part-0");
-        self.pending.insert(epoch, pending_path.clone().into_bytes());
+        self.pending
+            .insert(epoch, pending_path.clone().into_bytes());
         self.pending_epochs_count += 1;
         Ok(SinkState::PreCommitted {
             staged_rows: row_count,
@@ -167,7 +166,11 @@ impl SinkConnector for ObjectStoreSink {
     fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError> {
         match &action {
             RecoveryAction::Noop => Ok(()),
-            RecoveryAction::RerunCommit { epoch, profile: _, pending_handle } => {
+            RecoveryAction::RerunCommit {
+                epoch,
+                profile: _,
+                pending_handle,
+            } => {
                 let epoch = *epoch;
                 // NativeIdempotent: check if final path exists.
                 if self.final_exists(epoch) {

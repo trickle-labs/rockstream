@@ -711,7 +711,10 @@ mod frontier_reporter_tests {
         db.flush().await.unwrap();
 
         let h1 = db.create_checkpoint().await.unwrap();
-        assert_ne!(h1.shard_checkpoint_id, 0, "shard_checkpoint_id must be non-zero");
+        assert_ne!(
+            h1.shard_checkpoint_id, 0,
+            "shard_checkpoint_id must be non-zero"
+        );
 
         // Write more data and take a second checkpoint.
         db.put(b"ckpt/test/key2", b"value2").await.unwrap();

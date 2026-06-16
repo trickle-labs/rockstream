@@ -179,10 +179,7 @@ pub enum AlignmentError {
     ///
     /// RS-3601: "Checkpoint alignment buffer overflowed; bounded buffer
     /// capacity exceeded."
-    CreditExhausted {
-        used: usize,
-        max: usize,
-    },
+    CreditExhausted { used: usize, max: usize },
     /// The alignment window timed out before all shards confirmed.
     ///
     /// RS-3602: "Cluster checkpoint recovery in progress."
@@ -254,11 +251,11 @@ impl AlignmentCreditTracker {
     /// Release one credit after a shard confirmation is received.
     pub fn release(&self) {
         // Saturating to 0 to guard against double-release bugs.
-        let prev = self.credits_used.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let prev = self
+            .credits_used
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
         let _ = prev; // fetch_update always returns Ok when closure is Some
     }
 

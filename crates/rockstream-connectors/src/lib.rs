@@ -12,11 +12,9 @@ pub mod source_epoch;
 pub use kafka_sink::KafkaSink;
 pub use object_store_sink::ObjectStoreSink;
 pub use sink_connector::{
-    SinkConnector, SinkError,
-    assert_epoch_committed_only_after_cluster_checkpoint,
-    assert_no_duplicate_delivery,
-    assert_no_lost_delivery_after_checkpoint,
-    assert_recovery_dispatch_idempotent,
+    assert_epoch_committed_only_after_cluster_checkpoint, assert_no_duplicate_delivery,
+    assert_no_lost_delivery_after_checkpoint, assert_recovery_dispatch_idempotent, SinkConnector,
+    SinkError,
 };
 pub use source_epoch::{OffsetToken, SourceEpochEntry, SourceEpochRegistry};
 

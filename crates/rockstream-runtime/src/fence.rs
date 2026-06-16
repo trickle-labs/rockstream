@@ -229,7 +229,7 @@ mod tests {
         let mut guard = SelfFenceGuard::with_deadline(deadline);
         guard.tick(false); // starts isolation clock
         assert!(!guard.must_self_fence()); // not yet expired
-        // Busy-wait until deadline passes.
+                                           // Busy-wait until deadline passes.
         std::thread::sleep(deadline + Duration::from_millis(5));
         assert!(guard.must_self_fence());
     }

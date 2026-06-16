@@ -21,7 +21,9 @@ pub use fence::{
 };
 
 pub mod recovery;
-pub use recovery::{RecoveryDriver, RecoveryError, RecoveryProgress, DEFAULT_SHARD_RECOVERY_BUDGET};
+pub use recovery::{
+    RecoveryDriver, RecoveryError, RecoveryProgress, DEFAULT_SHARD_RECOVERY_BUDGET,
+};
 
 #[cfg(test)]
 mod tests {

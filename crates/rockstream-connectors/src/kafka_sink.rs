@@ -24,10 +24,8 @@ use rockstream_types::sink::{RecoveryAction, SinkIdempotencyProfile, SinkState};
 use rockstream_types::timestamp::Epoch;
 
 use crate::sink_connector::{
-    SinkConnector, SinkError,
-    assert_no_duplicate_delivery,
-    assert_epoch_committed_only_after_cluster_checkpoint,
-    assert_recovery_dispatch_idempotent,
+    assert_epoch_committed_only_after_cluster_checkpoint, assert_no_duplicate_delivery,
+    assert_recovery_dispatch_idempotent, SinkConnector, SinkError,
 };
 
 /// Maximum number of epochs that may be in the staged (pre-committed) state
@@ -154,17 +152,17 @@ impl SinkConnector for KafkaSink {
     fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError> {
         match &action {
             RecoveryAction::Noop => Ok(()),
-            RecoveryAction::RerunCommit { epoch, profile: _, pending_handle } => {
+            RecoveryAction::RerunCommit {
+                epoch,
+                profile: _,
+                pending_handle,
+            } => {
                 let epoch = *epoch;
                 // CheckBeforeCommit: check the Kafka topic first.
                 if self.check_epoch_delivered(epoch) {
                     // Already delivered; mark as committed (idempotent no-op).
                     let final_state = SinkState::Committed;
-                    assert_recovery_dispatch_idempotent(
-                        self.connector_id,
-                        &action,
-                        &final_state,
-                    );
+                    assert_recovery_dispatch_idempotent(self.connector_id, &action, &final_state);
                     return Ok(());
                 }
                 // Not yet delivered: begin a new transaction and commit.

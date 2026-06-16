@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage release verify
+.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage release verify verify-relaxed path-coupling
 
 # Build the workspace
 build:
@@ -17,14 +17,29 @@ fmt:
 	cargo fmt --all --check
 
 # Run all checks (what CI does)
-check: fmt clippy test error-codes exit-criteria verify
+check: fmt clippy test error-codes exit-criteria verify path-coupling
 
 # Run formal verification specs
 verify:
 	fizz formal/smoke.fizz
 	fizz formal/m1_epoch_commit.fizz
 	fizz formal/m2_frontier_agg.fizz
+	fizz formal/m3_sink_2pc.fizz
 	fizz formal/m4_self_fencing.fizz
+
+# Run formal verification specs at relaxed pre-release bounds (DC.4).
+# Widens coverage beyond CI-fast minimums: NUM_WORKERS=3, NUM_SHARDS=3, MAX_EPOCH=4.
+verify-relaxed:
+	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/smoke.fizz
+	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/m1_epoch_commit.fizz
+	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/m2_frontier_agg.fizz
+	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/m3_sink_2pc.fizz
+	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/m4_self_fencing.fizz
+
+# Path-coupling check: any change to a coordination crate or DESIGN.md requires
+# a corresponding touch to formal/*.fizz or FIZZBEE_TEST_PLAN.md (DC.2).
+path-coupling:
+	bash scripts/check-path-coupling.sh
 
 # Enforce that every logged error carries an RS-XXXX code.
 error-codes:

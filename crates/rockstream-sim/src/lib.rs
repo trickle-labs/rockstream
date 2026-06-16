@@ -35,7 +35,9 @@ pub mod wire_version;
 
 pub use brownout::{BrownoutStatus, ObjectStoreBrownoutGuard, LOCAL_BUFFER_MAX_EPOCHS};
 pub use buggify::buggify_enabled;
-pub use chaos::{run_chaos_scenario, ChaosConfig, ChaosResult};
+pub use chaos::{
+    run_chaos_reference, run_chaos_scenario, ChaosConfig, ChaosResult, RecoveryTimings,
+};
 pub use clock::{Clock, SimClock, TokioClock};
 pub use compaction::{
     apply_tombstone_gc, simulate_donor_cleanup, simulate_split_migration, SimEntry,
