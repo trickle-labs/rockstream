@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
+use testcontainers::runners::AsyncRunner;
 
 use rockstream_control::checkpoint::{CheckpointCoordinator, CoordinatorError};
 use rockstream_runtime::{RecoveryDriver, RecoveryError};
