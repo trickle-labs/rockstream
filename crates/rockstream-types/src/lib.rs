@@ -7,6 +7,7 @@
 pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
+pub mod checkpoint;
 pub mod config;
 pub mod connector;
 pub mod dlq;

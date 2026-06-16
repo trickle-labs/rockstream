@@ -15,6 +15,7 @@
 //! - [`tls`] — mTLS configuration scaffolding
 
 pub mod audit;
+pub mod checkpoint;
 pub mod config_deriver;
 pub mod frontier;
 pub mod placement;
@@ -25,6 +26,7 @@ pub mod tls;
 pub mod topology;
 
 // Re-export commonly used top-level types.
+pub use checkpoint::{CheckpointCoordinator, CoordinatorError, DEFAULT_ALIGNMENT_MAX_CREDITS};
 pub use frontier::{AggregatorError, FrontierAggregator};
 pub use placement::PlacementAlgorithm;
 pub use scheduler::{ShardAssignment, ShardScheduler};

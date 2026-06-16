@@ -15,6 +15,11 @@ pub use client::{start_worker_client, ShardState, WorkerClientHandle};
 
 pub mod exchange;
 
+pub mod fence;
+pub use fence::{
+    assert_single_lease_holder, assert_valid_writer, SelfFenceGuard, DEFAULT_SELF_FENCE_DEADLINE,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

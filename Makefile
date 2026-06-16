@@ -24,6 +24,7 @@ verify:
 	fizz formal/smoke.fizz
 	fizz formal/m1_epoch_commit.fizz
 	fizz formal/m2_frontier_agg.fizz
+	fizz formal/m4_self_fencing.fizz
 
 # Enforce that every logged error carries an RS-XXXX code.
 error-codes:

@@ -570,8 +570,8 @@ every row has both a green FizzBee assertion and a present runtime `assert!`.
 | M2-S1, M2-S2 | Assert published frontier `≤` true frontier; assert meet associativity before publish and after read. | `rockstream-control` |
 | M2-S3, M2-S4 | Assert single CAS-holder of `frontier/leader`; assert `sync:true` flush before lease-handoff read. | `rockstream-control` |
 | M3-S1–S4 | Assert idempotency-key uniqueness before `prepare`; assert one external artifact per key after recovery. | `rockstream-connectors` |
-| M4-S1–S3 | Assert fence-epoch rejection on stale write; assert single lease holder per shard. | `rockstream-runtime` |
-| M4-S2 | Assert worker terminates before `self_fence_after` deadline when control unreachable. | `rockstream-runtime` |
+| M4-S1, M4-S3 | `assert!(mgr.is_valid_writer(shard_id, token), …)` before every epoch commit in `crates/rockstream-runtime/src/fence.rs`; `assert_single_lease_holder` checked after every `acquire`/`force_acquire` call. Spec: `formal/m4_self_fencing.fizz` M4-S1, M4-S3. | `rockstream-runtime` |
+| M4-S2 | `assert!(isolation_steps < SELF_FENCE_AFTER, …)` in heartbeat loop (`crates/rockstream-runtime/src/fence.rs`); worker panics (self-fences) at deadline when `can_reach_control == false`. Spec: `formal/m4_self_fencing.fizz` M4-S2. | `rockstream-runtime` |
 | All liveness (M1-L1…M4-L2) | Liveness checked in `SimRuntime` as "a recoverable fault commits a new epoch within the recovery budget" ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 8 sim gate). | `rockstream-sim` |
 
 ---
