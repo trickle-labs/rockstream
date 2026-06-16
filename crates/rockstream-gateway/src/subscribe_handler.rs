@@ -132,17 +132,20 @@ impl std::error::Error for SubscribeError {}
 /// Deliver the current snapshot for `view_name` by scanning the registry for
 /// rows that have been written.  Used by `AS OF NOW WITH SNAPSHOT`.
 ///
+/// `col_names`: column names for the table, used to apply WHERE and projection.
 /// In production this would scan `ShardDb::scan_prefix("view_output/{view}/")`.
 /// For the test harness we accept a pre-built snapshot vector.
 pub fn deliver_snapshot(
     snapshot_rows: Vec<(Bytes, Bytes)>,
     current_epoch: u64,
     req: &SubscribeRequest,
+    col_names: &[&str],
 ) -> Vec<SubscribeRow> {
     snapshot_rows
         .into_iter()
+        .filter(|(_key, val)| passes_where(val, req.where_clause.as_deref(), col_names))
         .map(|(_key, val)| {
-            let projected = apply_projection(&val, req.projection.as_deref());
+            let projected = apply_projection(&val, req.projection.as_deref(), col_names);
             SubscribeRow {
                 mz_timestamp: current_epoch,
                 mz_diff: 1,
@@ -156,24 +159,34 @@ pub fn deliver_snapshot(
 
 /// State held by a single live-tail subscriber.
 #[derive(Debug)]
-pub struct SubscriberHandle {    pub table_name: String,
+pub struct SubscriberHandle {
+    pub table_name: String,
     pub last_sent_epoch: u64,
     /// Fill-level metric: epochs behind the head of the log.
     pub backlog_epochs: Arc<AtomicU64>,
     pub req: SubscribeRequest,
+    /// Column names for the table (used for WHERE and name-based projection).
+    pub col_names: Vec<String>,
 }
 
 impl SubscriberHandle {
-    pub fn new(table_name: String, start_epoch: u64, req: SubscribeRequest) -> Self {
+    pub fn new(
+        table_name: String,
+        start_epoch: u64,
+        req: SubscribeRequest,
+        col_names: Vec<String>,
+    ) -> Self {
         Self {
             table_name,
             last_sent_epoch: start_epoch,
             backlog_epochs: Arc::new(AtomicU64::new(0)),
             req,
+            col_names,
         }
     }
 
     /// Poll the registry for new entries since `last_sent_epoch`.
+    /// Applies server-side WHERE filter and name-based column projection.
     /// Returns `Ok(rows)` or `Err(SubscribeError::ConsumerTooSlow)`.
     pub fn poll(
         &mut self,
@@ -199,10 +212,18 @@ impl SubscriberHandle {
             return Err(SubscribeError::ConsumerTooSlow);
         }
 
+        let col_names_ref: Vec<&str> = self.col_names.iter().map(|s| s.as_str()).collect();
         let mut rows = Vec::with_capacity(entries.len());
         for entry in &entries {
+            if !passes_where(
+                &entry.encoded_row,
+                self.req.where_clause.as_deref(),
+                &col_names_ref,
+            ) {
+                continue;
+            }
             let projected =
-                apply_projection(&entry.encoded_row, self.req.projection.as_deref());
+                apply_projection(&entry.encoded_row, self.req.projection.as_deref(), &col_names_ref);
             rows.push(SubscribeRow {
                 mz_timestamp: entry.epoch,
                 mz_diff: entry.mz_diff,
@@ -226,6 +247,7 @@ pub fn start_from_epoch(
     registry: &SubscribeRegistry,
     req: &SubscribeRequest,
     start_epoch: u64,
+    col_names: Vec<String>,
 ) -> Result<SubscriberHandle, SubscribeError> {
     let table_name = req.view_name.clone();
 
@@ -240,7 +262,7 @@ pub fn start_from_epoch(
     }
     // Replay: start at one epoch before start_epoch so that poll() includes start_epoch.
     let replay_from = start_epoch.saturating_sub(1);
-    Ok(SubscriberHandle::new(table_name, replay_from, req.clone()))
+    Ok(SubscriberHandle::new(table_name, replay_from, req.clone(), col_names))
 }
 
 /// Run the full subscribe lifecycle (snapshot + live tail) for a request.
@@ -248,6 +270,7 @@ pub fn start_from_epoch(
 /// `snapshot_rows`: caller-provided snapshot (from ShardDb scan in production).
 /// `current_epoch`: epoch at which the snapshot was taken.
 /// `registry`: shared change log.
+/// `col_names`: column names for WHERE/projection resolution.
 /// `on_row`: callback invoked for each emitted row.
 /// `stop`: async predicate; loop exits when it returns `true`.
 ///
@@ -257,6 +280,7 @@ pub async fn run_subscribe<F, S>(
     snapshot_rows: Vec<(Bytes, Bytes)>,
     current_epoch: u64,
     registry: &SubscribeRegistry,
+    col_names: Vec<String>,
     mut on_row: F,
     mut stop: S,
 ) -> Result<(), SubscribeError>
@@ -264,10 +288,12 @@ where
     F: FnMut(SubscribeRow),
     S: FnMut() -> bool,
 {
+    let col_names_ref: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+
     let start_epoch = match &req.start {
         SubscribeStart::NowWithSnapshot => {
             // Deliver snapshot.
-            for row in deliver_snapshot(snapshot_rows, current_epoch, req) {
+            for row in deliver_snapshot(snapshot_rows, current_epoch, req, &col_names_ref) {
                 on_row(row);
             }
             current_epoch
@@ -288,8 +314,16 @@ where
                 .unwrap_or_default();
             let mut last = e.saturating_sub(1);
             for entry in &replay {
+                if !passes_where(
+                    &entry.encoded_row,
+                    req.where_clause.as_deref(),
+                    &col_names_ref,
+                ) {
+                    last = entry.epoch;
+                    continue;
+                }
                 let projected =
-                    apply_projection(&entry.encoded_row, req.projection.as_deref());
+                    apply_projection(&entry.encoded_row, req.projection.as_deref(), &col_names_ref);
                 on_row(SubscribeRow {
                     mz_timestamp: entry.epoch,
                     mz_diff: entry.mz_diff,
@@ -302,7 +336,8 @@ where
     };
 
     // Live-tail loop.
-    let mut handle = SubscriberHandle::new(req.view_name.clone(), start_epoch, req.clone());
+    let mut handle =
+        SubscriberHandle::new(req.view_name.clone(), start_epoch, req.clone(), col_names);
     loop {
         if stop() {
             break;
@@ -371,21 +406,36 @@ pub fn passes_where(
 
 // ── Column projection (S6 prep) ───────────────────────────────────────────────
 
-/// Apply column projection to a tab-separated encoded row.
-/// Columns not in `projection` are dropped; order follows `projection`.
-pub fn apply_projection(encoded_row: &Bytes, projection: Option<&[String]>) -> Bytes {
+/// Apply column projection to a tab-separated encoded row using column names.
+///
+/// `col_names` is the ordered list of all column names for the row.
+/// `projection` specifies which columns to keep (by name, in the order requested).
+/// If `projection` is `None`, the row is returned unchanged.
+pub fn apply_projection(
+    encoded_row: &Bytes,
+    projection: Option<&[String]>,
+    col_names: &[&str],
+) -> Bytes {
     let Some(cols) = projection else {
         return encoded_row.clone();
     };
-    // We can't project by name here without knowing all column names;
-    // for now, treat projection as index-based: parse `col0`, `col1`, ... format.
-    // Full name-based projection is wired in S6 with the catalog.
-    // For now: return the row unchanged (projection hook is in place).
-    let _ = cols;
-    encoded_row.clone()
+    let fields: Vec<&str> = std::str::from_utf8(encoded_row)
+        .unwrap_or("")
+        .split('\t')
+        .collect();
+    let projected: Vec<&str> = cols
+        .iter()
+        .filter_map(|col| {
+            col_names
+                .iter()
+                .position(|&c| c.eq_ignore_ascii_case(col))
+                .and_then(|idx| fields.get(idx).copied())
+        })
+        .collect();
+    Bytes::from(projected.join("\t"))
 }
 
-// ── Tests (S3 / S4 / S5 green gates) ─────────────────────────────────────────
+// ── Tests (S3 / S4 / S5 green gates + S6) ────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -425,7 +475,7 @@ mod tests {
         let n = 5;
         let snapshot = make_snapshot(n);
         let req = parse_subscribe("SUBSCRIBE orders_mv AS OF NOW WITH SNAPSHOT").unwrap();
-        let rows = deliver_snapshot(snapshot, 10, &req);
+        let rows = deliver_snapshot(snapshot, 10, &req, &[]);
         assert_eq!(rows.len(), n);
         for row in &rows {
             assert_eq!(row.mz_diff, 1);
@@ -438,7 +488,7 @@ mod tests {
     fn subscribe_live_tail_emits_deltas() {
         let registry = SubscribeRegistry::new();
         let req = parse_subscribe("SUBSCRIBE orders_mv").unwrap();
-        let mut handle = SubscriberHandle::new("orders_mv".to_string(), 0, req);
+        let mut handle = SubscriberHandle::new("orders_mv".to_string(), 0, req, vec![]);
 
         // Nothing yet.
         let rows = handle.poll(&registry).unwrap();
@@ -484,7 +534,7 @@ mod tests {
         );
         let req = parse_subscribe("SUBSCRIBE orders_mv AS OF EPOCH 3").unwrap();
 
-        let mut handle = start_from_epoch(&registry, &req, 3).unwrap();
+        let mut handle = start_from_epoch(&registry, &req, 3, vec![]).unwrap();
         // Poll collects epochs 3-5.
         let rows = handle.poll(&registry).unwrap();
         assert_eq!(rows.len(), 3, "expected epochs 3-5");
@@ -512,13 +562,78 @@ mod tests {
             }
         }
         let req = parse_subscribe("SUBSCRIBE orders_mv AS OF EPOCH 1").unwrap();
-        let err = start_from_epoch(&reg, &req, 1).unwrap_err();
+        let err = start_from_epoch(&reg, &req, 1, vec![]).unwrap_err();
         match err {
             SubscribeError::EpochBeforeRetention { requested, earliest } => {
                 assert_eq!(requested, 1);
                 assert!(earliest > 1, "earliest should be > 1 after eviction");
             }
             other => panic!("expected EpochBeforeRetention, got {other:?}"),
+        }
+    }
+
+    // S6 green gate: WHERE filter removes rows that don't match the predicate.
+    #[test]
+    fn subscribe_where_filters_rows() {
+        // 10 rows with format "{id}\tname{id}", col_names = ["id", "name"]
+        let registry = SubscribeRegistry::new();
+        let col_names_owned = vec!["id".to_string(), "name".to_string()];
+        for i in 1u64..=10 {
+            registry.push(
+                "t",
+                ChangeEntry {
+                    epoch: i,
+                    row_key: Bytes::from(format!("k{i}")),
+                    mz_diff: 1,
+                    encoded_row: Bytes::from(format!("{i}\tname{i}")),
+                },
+            );
+        }
+        // WHERE id > 5 → only rows 6-10 pass
+        let req = parse_subscribe("SUBSCRIBE t WHERE id > 5").unwrap();
+        let mut handle = SubscriberHandle::new("t".to_string(), 0, req, col_names_owned);
+        let rows = handle.poll(&registry).unwrap();
+        assert_eq!(rows.len(), 5, "expected 5 rows with id > 5, got {}", rows.len());
+        for row in &rows {
+            let id: u64 = std::str::from_utf8(&row.encoded_row)
+                .unwrap()
+                .split('\t')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(id > 5, "expected id > 5, got {id}");
+        }
+    }
+
+    // S6 green gate: projection selects only the named columns.
+    #[test]
+    fn subscribe_projection_selects_columns() {
+        // Rows with format "{id}\t{name}\t{value}", col_names = ["id", "name", "value"]
+        // projection = ["id", "value"] → each output row has 2 fields, no "name"
+        let registry = SubscribeRegistry::new();
+        let col_names_owned = vec!["id".to_string(), "name".to_string(), "value".to_string()];
+        for i in 1u64..=3 {
+            registry.push(
+                "t",
+                ChangeEntry {
+                    epoch: i,
+                    row_key: Bytes::from(format!("k{i}")),
+                    mz_diff: 1,
+                    encoded_row: Bytes::from(format!("{i}\tname{i}\tval{i}")),
+                },
+            );
+        }
+        let req = parse_subscribe("SUBSCRIBE t (id, value)").unwrap();
+        let mut handle = SubscriberHandle::new("t".to_string(), 0, req, col_names_owned);
+        let rows = handle.poll(&registry).unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            let s = std::str::from_utf8(&row.encoded_row).unwrap();
+            let fields: Vec<&str> = s.split('\t').collect();
+            assert_eq!(fields.len(), 2, "expected 2 projected fields, got {:?}", fields);
+            // Should NOT contain "name" values
+            assert!(!fields[0].starts_with("name"), "first field should be id, not name");
         }
     }
 }

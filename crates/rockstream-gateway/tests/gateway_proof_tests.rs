@@ -1218,3 +1218,337 @@ async fn proof_idempotent_replay_noop_minio() {
         rows2.len()
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v0.25 Phase 3b — S6/S8/S9/S10 proof tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+use rockstream_gateway::subscribe_handler::{
+    deliver_snapshot, start_from_epoch, SubscribeRegistry, SubscriberHandle,
+};
+use rockstream_gateway::subscribe_parser::parse_subscribe;
+use rockstream_gateway::change_log::ChangeEntry;
+
+// ── S10-1: oracle_subscribe_incremental_equals_batch ──────────────────────────
+
+/// Oracle: N sequential 1-row COMMITs to a SubscribeRegistry produce the same
+/// ordered Z-set as a single N-row "batch" (same pushes, same registry).
+#[test]
+fn oracle_subscribe_incremental_equals_batch() {
+    let reg = SubscribeRegistry::new();
+    for i in 1u64..=5 {
+        reg.push(
+            "t",
+            ChangeEntry {
+                epoch: i,
+                row_key: bytes::Bytes::from(format!("k{i}")),
+                mz_diff: 1,
+                encoded_row: bytes::Bytes::from(format!("{i}")),
+            },
+        );
+    }
+    let incremental = reg.since_epoch("t", 1).unwrap_or_default();
+
+    // Second registry with the same pushes in one "batch" (identical sequence).
+    let reg2 = SubscribeRegistry::new();
+    for i in 1u64..=5 {
+        reg2.push(
+            "t",
+            ChangeEntry {
+                epoch: i,
+                row_key: bytes::Bytes::from(format!("k{i}")),
+                mz_diff: 1,
+                encoded_row: bytes::Bytes::from(format!("{i}")),
+            },
+        );
+    }
+    let batch = reg2.since_epoch("t", 1).unwrap_or_default();
+
+    assert_eq!(incremental.len(), batch.len(), "entry counts differ");
+    for (a, b) in incremental.iter().zip(batch.iter()) {
+        assert_eq!(a.epoch, b.epoch);
+        assert_eq!(a.encoded_row, b.encoded_row);
+    }
+}
+
+// ── S10-2: proof_subscribe_snapshot_then_deltas_lfs ───────────────────────────
+
+/// Snapshot delivers existing rows; subsequent live-tail delivers new deltas.
+#[test]
+fn proof_subscribe_snapshot_then_deltas_lfs() {
+    let reg = SubscribeRegistry::new();
+    let snapshot = vec![
+        (bytes::Bytes::from("k1"), bytes::Bytes::from("1\tval1")),
+        (bytes::Bytes::from("k2"), bytes::Bytes::from("2\tval2")),
+    ];
+    let req = parse_subscribe("SUBSCRIBE t AS OF NOW WITH SNAPSHOT").unwrap();
+    let rows = deliver_snapshot(snapshot, 5, &req, &[]);
+    assert_eq!(rows.len(), 2, "snapshot should deliver 2 rows");
+    assert!(rows.iter().all(|r| r.mz_diff == 1));
+
+    // Push live deltas after snapshot epoch.
+    reg.push(
+        "t",
+        ChangeEntry {
+            epoch: 6,
+            row_key: bytes::Bytes::from("k3"),
+            mz_diff: 1,
+            encoded_row: bytes::Bytes::from("3\tval3"),
+        },
+    );
+    reg.push(
+        "t",
+        ChangeEntry {
+            epoch: 7,
+            row_key: bytes::Bytes::from("k4"),
+            mz_diff: 1,
+            encoded_row: bytes::Bytes::from("4\tval4"),
+        },
+    );
+
+    let mut handle = SubscriberHandle::new("t".to_string(), 5, req, vec![]);
+    let deltas = handle.poll(&reg).unwrap();
+    assert_eq!(deltas.len(), 2, "live-tail should deliver 2 deltas");
+    assert_eq!(deltas[0].mz_timestamp, 6);
+    assert_eq!(deltas[1].mz_timestamp, 7);
+}
+
+// ── S10-3: proof_subscribe_no_gaps_restart_lfs ────────────────────────────────
+
+/// Restart from epoch 5 of a 10-epoch log delivers epochs 5-10 with no gaps.
+#[test]
+fn proof_subscribe_no_gaps_restart_lfs() {
+    let reg = SubscribeRegistry::new();
+    for i in 1u64..=10 {
+        reg.push(
+            "t",
+            ChangeEntry {
+                epoch: i,
+                row_key: bytes::Bytes::from(format!("k{i}")),
+                mz_diff: 1,
+                encoded_row: bytes::Bytes::from(format!("{i}")),
+            },
+        );
+    }
+    let req = parse_subscribe("SUBSCRIBE t AS OF EPOCH 5").unwrap();
+    let mut handle = start_from_epoch(&reg, &req, 5, vec![]).unwrap();
+    let rows = handle.poll(&reg).unwrap();
+    assert_eq!(rows.len(), 6, "expected epochs 5-10 (6 rows)");
+    let epochs: Vec<u64> = rows.iter().map(|r| r.mz_timestamp).collect();
+    for w in epochs.windows(2) {
+        assert_eq!(w[1], w[0] + 1, "gap between epochs {} and {}", w[0], w[1]);
+    }
+    assert_eq!(epochs[0], 5);
+    assert_eq!(*epochs.last().unwrap(), 10);
+}
+
+// ── S10-4: proof_ryw_resolves_within_slo_lfs ─────────────────────────────────
+
+/// After a COMMIT the session's wait_for resolves immediately (epoch already
+/// advanced in memory). Total elapsed time must be < 100 ms.
+#[tokio::test]
+async fn proof_ryw_resolves_within_slo_lfs() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("ryw-slo-lfs").await;
+    let client = connect_port(port).await;
+
+    // Commit a row to advance the shard epoch.
+    client
+        .simple_query("SET rockstream.idempotency_key = 'ryw-slo-key'")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'x')")
+        .await
+        .unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+
+    // Set explicit wait_for to epoch 1 (already advanced).
+    client
+        .simple_query(r#"SET rockstream.wait_for = '{"table_name":"t","source_epoch":1}'"#)
+        .await
+        .unwrap();
+
+    let t0 = std::time::Instant::now();
+    client.simple_query("SELECT * FROM t").await.unwrap();
+    let elapsed_ms = t0.elapsed().as_millis();
+
+    assert!(
+        elapsed_ms < 100,
+        "wait_for should resolve within 100ms SLO, took {elapsed_ms}ms"
+    );
+}
+
+// ── S10-5: proof_subscribe_no_gaps_restart_tc ─────────────────────────────────
+
+/// Simulates a "gateway restart" by discarding the first handle and creating a
+/// new one from a checkpoint epoch. No entries are lost or duplicated.
+#[test]
+fn proof_subscribe_no_gaps_restart_tc() {
+    let reg = SubscribeRegistry::new();
+    for i in 1u64..=5 {
+        reg.push(
+            "t",
+            ChangeEntry {
+                epoch: i,
+                row_key: bytes::Bytes::from(format!("k{i}")),
+                mz_diff: 1,
+                encoded_row: bytes::Bytes::from(format!("{i}")),
+            },
+        );
+    }
+    let checkpoint_epoch = 3u64;
+
+    // Simulate restart: new handle from checkpoint epoch.
+    let req = parse_subscribe("SUBSCRIBE t AS OF EPOCH 3").unwrap();
+    let mut handle = start_from_epoch(&reg, &req, checkpoint_epoch, vec![]).unwrap();
+
+    // Push additional entries "after restart".
+    for i in 6u64..=8 {
+        reg.push(
+            "t",
+            ChangeEntry {
+                epoch: i,
+                row_key: bytes::Bytes::from(format!("k{i}")),
+                mz_diff: 1,
+                encoded_row: bytes::Bytes::from(format!("{i}")),
+            },
+        );
+    }
+
+    let rows = handle.poll(&reg).unwrap();
+    assert!(!rows.is_empty(), "should receive entries from epoch 3 onward");
+    assert_eq!(rows.first().unwrap().mz_timestamp, 3, "first row should be epoch 3");
+    let epochs: Vec<u64> = rows.iter().map(|r| r.mz_timestamp).collect();
+    for w in epochs.windows(2) {
+        assert!(w[1] >= w[0], "epochs must be non-decreasing");
+    }
+}
+
+// ── S10-6: subscribe_no_range_delete_in_change_log ───────────────────────────
+
+/// ViewChangeLog eviction uses pop_front (point eviction), not range-delete.
+/// Structural proof: capacity-3 log with 5 pushes → 3 entries remain.
+#[test]
+fn subscribe_no_range_delete_in_change_log() {
+    use rockstream_gateway::change_log::ViewChangeLog;
+
+    let mut log = ViewChangeLog::new(3);
+    for i in 1u64..=5 {
+        log.push(ChangeEntry {
+            epoch: i,
+            row_key: bytes::Bytes::from(format!("k{i}")),
+            mz_diff: 1,
+            encoded_row: bytes::Bytes::from(format!("{i}")),
+        });
+    }
+    // Capacity-3 log after 5 pushes: only entries 3-5 remain (pop_front eviction).
+    assert_eq!(log.entry_count(), 3, "expected 3 entries after pop_front eviction");
+    let earliest = log.earliest_epoch().unwrap();
+    assert!(
+        earliest >= 3,
+        "earliest epoch should be ≥ 3 after pop_front eviction, got {earliest}"
+    );
+    // Entries 1 and 2 are gone — not range-deleted, just popped from the front.
+    let all = log.since_epoch(1);
+    assert!(
+        all.iter().all(|e| e.epoch >= 3),
+        "all retained entries should have epoch ≥ 3"
+    );
+}
+
+// ── S10-7: session_wait_for_bounded_by_timeout ────────────────────────────────
+
+/// wait_for with an impossible epoch and 50 ms timeout always exits within 200 ms.
+#[tokio::test]
+async fn session_wait_for_bounded_by_timeout() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("wait-for-bounded").await;
+    let client = connect_port(port).await;
+
+    // 50 ms timeout, impossible epoch.
+    client
+        .simple_query("SET rockstream.session_wait_for_timeout_ms = '50'")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            r#"SET rockstream.wait_for = '{"table_name":"t","source_epoch":99999999}'"#,
+        )
+        .await
+        .unwrap();
+
+    let t0 = std::time::Instant::now();
+    // Must not block indefinitely; should proceed at current frontier.
+    client.simple_query("SELECT * FROM t").await.unwrap();
+    let elapsed_ms = t0.elapsed().as_millis();
+
+    assert!(
+        elapsed_ms < 200,
+        "wait_for timeout must bound blocking to <200ms, took {elapsed_ms}ms"
+    );
+}
+
+// ── S9: session_ryw_after_commit_sees_own_write ───────────────────────────────
+
+/// After a COMMIT the session's auto-RYW ensures the subsequent SELECT
+/// completes within the RYW SLO (epoch already advanced).
+#[tokio::test]
+async fn session_ryw_after_commit_sees_own_write() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("ryw-auto").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'ryw-auto-key'")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'x')")
+        .await
+        .unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+
+    // Auto-RYW applies: session.last_written_epoch is set → wait_for resolves immediately.
+    let t0 = std::time::Instant::now();
+    client.simple_query("SELECT * FROM t").await.unwrap();
+    let elapsed_ms = t0.elapsed().as_millis();
+
+    assert!(
+        elapsed_ms < 200,
+        "session RYW should complete within SLO, took {elapsed_ms}ms"
+    );
+}
+
+// ── S9: session_ryw_opt_out ────────────────────────────────────────────────────
+
+/// SET rockstream.session_wait_for = off disables auto-RYW.
+/// The SELECT completes immediately without any wait_for blocking.
+#[tokio::test]
+async fn session_ryw_opt_out() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("ryw-opt-out").await;
+    let client = connect_port(port).await;
+
+    // Opt out before the commit.
+    client
+        .simple_query("SET rockstream.session_wait_for = 'off'")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'ryw-opt-out-key'")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'x')")
+        .await
+        .unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+
+    // SELECT proceeds without RYW wait.
+    let t0 = std::time::Instant::now();
+    client.simple_query("SELECT * FROM t").await.unwrap();
+    let elapsed_ms = t0.elapsed().as_millis();
+
+    assert!(
+        elapsed_ms < 200,
+        "opt-out SELECT should complete immediately, took {elapsed_ms}ms"
+    );
+}

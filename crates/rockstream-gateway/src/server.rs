@@ -32,9 +32,30 @@ use tokio::net::TcpListener;
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogStubs, CatalogTable,
 };
-use crate::session::SessionState;
+use crate::session::{FreshnessToken, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
+
+// ── S9 metrics ────────────────────────────────────────────────────────────────
+
+/// Total number of session RYW / explicit wait_for triggers.
+pub static SESSION_WAIT_FOR_TRIGGERED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Cumulative milliseconds spent satisfying wait_for epochs.
+pub static SESSION_WAIT_FOR_SATISFIED_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Number of wait_for calls that timed out (RS-2012).
+pub static SESSION_WAIT_FOR_TIMEOUT_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// ── S8 WaitResult ─────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+enum WaitResult {
+    Satisfied { elapsed_ms: u64 },
+    TimedOut,
+    NoStorage,
+}
 
 // ── Postgres Type from OID helper ─────────────────────────────────────────────
 
@@ -93,6 +114,30 @@ impl GatewayHandler {
             write_buffers: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             shard_db: Some(shard_db),
+        }
+    }
+
+    /// Wait until the shard's frontier epoch reaches `target_epoch` or `timeout_ms` elapses.
+    ///
+    /// Polls the in-memory `last_epoch` AtomicU64 every 10 ms.
+    /// Returns immediately with `NoStorage` if no shard is configured.
+    async fn wait_for_epoch(&self, target_epoch: u64, timeout_ms: u64) -> WaitResult {
+        let Some(shard_db) = &self.shard_db else {
+            return WaitResult::NoStorage;
+        };
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let current = shard_db.last_epoch().load(Ordering::SeqCst);
+            if current >= target_epoch {
+                return WaitResult::Satisfied {
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+            if start.elapsed() >= timeout {
+                return WaitResult::TimedOut;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
@@ -194,7 +239,46 @@ impl GatewayHandler {
         }
 
         // SELECT … FROM <view> [LIMIT n]
+        // Apply explicit wait_for or session RYW before reading (S8/S9).
         if ql.contains("from ") {
+            if let Some(id) = conn_id {
+                let (wait_token, timeout_ms) = {
+                    let mut session = self
+                        .sessions
+                        .entry(id.to_string())
+                        .or_insert_with(SessionState::new);
+                    // Explicit wait_for takes priority; fall back to session RYW.
+                    let explicit = session.wait_for_token.take();
+                    let auto = if session.session_wait_for_enabled {
+                        session.last_written_epoch.clone()
+                    } else {
+                        None
+                    };
+                    let timeout = session.session_wait_for_timeout_ms;
+                    (explicit.or(auto), timeout)
+                    // RefMut drops here — must not hold across await
+                };
+                if let Some(token) = wait_token {
+                    SESSION_WAIT_FOR_TRIGGERED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    match self.wait_for_epoch(token.source_epoch, timeout_ms).await {
+                        WaitResult::Satisfied { elapsed_ms } => {
+                            SESSION_WAIT_FOR_SATISFIED_MS
+                                .fetch_add(elapsed_ms, Ordering::Relaxed);
+                        }
+                        WaitResult::TimedOut => {
+                            SESSION_WAIT_FOR_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                "[RS-2012] wait.read_your_writes_timeout: \
+                                 wait_for epoch {} timed out after {timeout_ms}ms — \
+                                 proceeding at current frontier",
+                                token.source_epoch
+                            );
+                        }
+                        WaitResult::NoStorage => {}
+                    }
+                }
+            }
+
             if let Some(view_name) = extract_view_name_from_select(q) {
                 if !view_name.starts_with("pg_") && !view_name.starts_with("information_schema") {
                     let limit = extract_limit(q);
@@ -405,6 +489,21 @@ impl GatewayHandler {
                     session.source_epoch_envelope = Some(n);
                 }
             }
+            "wait_for" => {
+                // Accepts JSON: {"table_name":"t","source_epoch":42}
+                let json_str = val_raw.trim_matches('\'');
+                if let Ok(token) = serde_json::from_str::<FreshnessToken>(json_str) {
+                    session.wait_for_token = Some(token);
+                }
+            }
+            "session_wait_for" => {
+                session.session_wait_for_enabled = val_raw.trim_matches('\'') != "off";
+            }
+            "session_wait_for_timeout_ms" => {
+                if let Ok(n) = val_raw.trim_matches('\'').parse::<u64>() {
+                    session.session_wait_for_timeout_ms = n;
+                }
+            }
             _ => {}
         }
         drop(session);
@@ -528,9 +627,18 @@ impl GatewayHandler {
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
 
-        // Update session's last_written_epoch
+        // Update session's last_written_epoch with a FreshnessToken (S7).
+        let table_name = ops
+            .iter()
+            .last()
+            .map(|op| match op {
+                DmlOp::Insert { table, .. } => table.clone(),
+                DmlOp::Update { table, .. } => table.clone(),
+                DmlOp::Delete { table, .. } => table.clone(),
+            })
+            .unwrap_or_default();
         if let Some(mut session) = self.sessions.get_mut(conn_id) {
-            session.last_written_epoch = Some(epoch);
+            session.last_written_epoch = Some(FreshnessToken::new(table_name, epoch));
         }
 
         Ok(vec![promote_response(Response::TransactionEnd(
