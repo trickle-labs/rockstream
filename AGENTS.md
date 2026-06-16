@@ -10,7 +10,7 @@ You are an expert developer. When modifying code, NEVER output the entire file. 
 
 ## Test Output: Summary Lines Only
 
-After any `cargo test` run, extract only the summary — do not paste full passing test output into the conversation:
+After any test run, extract only the summary — do not paste full passing test output into the conversation:
 
 ```
 rtk cargo test ... 2>&1 | grep -E "^test .* (ok|FAILED|ignored)|^test result:|^FAILED$|^error"
@@ -20,18 +20,18 @@ Show full output **only for FAILED tests**. Passing test noise balloons the cach
 
 ## RTK Wrapper
 
-Always use rtk wrapper for all potentially high-verbosity commands:
+Always use rtk wrapper for all commands. Examples:
 
-- `rtk git log` instead of `git log`
-- `rtk git status` instead of `git status`
-- `rtk git diff` instead of `git diff`
-- `rtk find "*.md" .` instead of `find . -name "*.md"`
-- `rtk read <file>` instead of `cat <file>` (for large files >10K lines)
-- `rtk ls .` instead of `ls -la`
 - `rtk grep "pattern"` instead of `grep -r "pattern"`
+- `rtk read <file>` instead of `cat <file>`
+- `rtk ls` instead of `ls`
+- `rtk find "*.md" .` instead of `find . -name "*.md"`
 - `rtk cargo test` instead of `cargo test`
 - `rtk cargo build` instead of `cargo build`
 - `rtk cargo clippy` instead of `cargo clippy`
+- `rtk git log` instead of `git log`
+- `rtk git status` instead of `git status`
+- `rtk git diff` instead of `git diff`
 - `rtk gh pr view <num>` instead of `gh pr view <num>`
 - `rtk gh pr checks <num>` instead of `gh pr checks <num>`
 
