@@ -204,6 +204,11 @@ pub enum ControlMessage {
     /// Published by the control plane after all workers have reported their
     /// pressure samples; consumers (HPA adapters) read this gauge (v0.38).
     ClusterPressureGauge(ClusterWorkerPressure),
+    /// Notification that the global cluster frontier has advanced.
+    ClusterFrontierAdvanced {
+        /// The new cluster frontier epoch.
+        epoch: u64,
+    },
 }
 
 /// Lifecycle state of a worker node (v0.38 drain protocol).

@@ -76,3 +76,50 @@ pub async fn delete_inbox(
         .await
         .map_err(|e| format!("Failed to delete inbox: {:?}", e))
 }
+
+/// Garbage collects shuffle inbox and outbox entries in the shard database for epochs up to and including `up_to_epoch`.
+pub async fn gc_exchange_storage(db: &ShardDb, up_to_epoch: u64) -> Result<(), String> {
+    let mut batch = rockstream_storage::WriteBatch::new();
+
+    // Scan and GC Inbox
+    let inbox_prefix = [ShardPrefix::ShuffleInbox.as_byte()];
+    let inbox_entries = db
+        .scan_prefix(&inbox_prefix)
+        .await
+        .map_err(|e| format!("Failed to scan inbox keys for GC: {:?}", e))?;
+    for (key, _) in inbox_entries {
+        if let Some((_, _, suffix)) = ShardKeyEncoder::decode(&key) {
+            if suffix.len() >= 12 {
+                let epoch = u64::from_be_bytes(suffix[4..12].try_into().unwrap());
+                if epoch <= up_to_epoch {
+                    batch.delete(&key);
+                }
+            }
+        }
+    }
+
+    // Scan and GC Outbox
+    let outbox_prefix = [ShardPrefix::ShuffleOutbox.as_byte()];
+    let outbox_entries = db
+        .scan_prefix(&outbox_prefix)
+        .await
+        .map_err(|e| format!("Failed to scan outbox keys for GC: {:?}", e))?;
+    for (key, _) in outbox_entries {
+        if let Some((_, _, suffix)) = ShardKeyEncoder::decode(&key) {
+            if suffix.len() >= 12 {
+                let epoch = u64::from_be_bytes(suffix[4..12].try_into().unwrap());
+                if epoch <= up_to_epoch {
+                    batch.delete(&key);
+                }
+            }
+        }
+    }
+
+    if !batch.is_empty() {
+        db.write_batch(batch)
+            .await
+            .map_err(|e| format!("Failed to write GC batch: {:?}", e))?;
+    }
+
+    Ok(())
+}

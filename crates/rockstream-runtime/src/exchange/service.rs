@@ -20,10 +20,21 @@ pub struct ExchangeInlet {
 }
 
 /// A registry of active local exchange destinations (e.g. operators waiting for shuffle inputs).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ExchangeRegistry {
     inlets: Arc<RwLock<HashMap<(u64, u32), ExchangeInlet>>>,
     active_shards: Arc<RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>>,
+    cluster_frontier: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Default for ExchangeRegistry {
+    fn default() -> Self {
+        Self {
+            inlets: Arc::new(RwLock::new(HashMap::new())),
+            active_shards: Arc::new(RwLock::new(HashMap::new())),
+            cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
 }
 
 impl ExchangeRegistry {
@@ -39,7 +50,45 @@ impl ExchangeRegistry {
         ExchangeRegistry {
             inlets: Arc::new(RwLock::new(HashMap::new())),
             active_shards,
+            cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Get the current cluster frontier.
+    pub fn cluster_frontier(&self) -> u64 {
+        self.cluster_frontier
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Advance the cluster frontier and trigger GC on all active shards.
+    pub async fn advance_cluster_frontier(&self, epoch: u64) -> Result<(), String> {
+        let mut old = self
+            .cluster_frontier
+            .load(std::sync::atomic::Ordering::SeqCst);
+        while epoch > old {
+            match self.cluster_frontier.compare_exchange_weak(
+                old,
+                epoch,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    // Trigger GC on all active shards
+                    let dbs: Vec<rockstream_storage::shard_db::ShardDb> = {
+                        let shards = self.active_shards.read();
+                        shards.values().filter_map(|s| s.db.clone()).collect()
+                    };
+                    for db in dbs {
+                        crate::exchange::persistence::gc_exchange_storage(&db, epoch).await?;
+                    }
+                    break;
+                }
+                Err(current) => {
+                    old = current;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Retrieve the ShardDb for a given shard.
@@ -659,5 +708,55 @@ mod tests {
         db2_recovered.close().await.unwrap();
         let _ = tx_close.send(());
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_exchange_garbage_collection() {
+        use crate::exchange::persistence::{gc_exchange_storage, persist_inbox, persist_outbox};
+        use object_store::memory::InMemory;
+        use rockstream_storage::shard_db::ShardDb;
+
+        let store = Arc::new(InMemory::new());
+        let db = ShardDb::builder("db", store).build().await.unwrap();
+
+        // Persist some inbox entries
+        persist_inbox(&db, 100, 1, 1, 1, b"payload1").await.unwrap();
+        persist_inbox(&db, 100, 1, 2, 1, b"payload2").await.unwrap();
+        persist_inbox(&db, 100, 1, 3, 1, b"payload3").await.unwrap();
+
+        // Persist some outbox entries
+        persist_outbox(&db, 200, 2, 1, 1, b"payload1")
+            .await
+            .unwrap();
+        persist_outbox(&db, 200, 2, 2, 1, b"payload2")
+            .await
+            .unwrap();
+        persist_outbox(&db, 200, 2, 3, 1, b"payload3")
+            .await
+            .unwrap();
+
+        // Check they exist
+        let inbox_prefix = [0x04];
+        let outbox_prefix = [0x05];
+        assert_eq!(db.scan_prefix(&inbox_prefix).await.unwrap().len(), 3);
+        assert_eq!(db.scan_prefix(&outbox_prefix).await.unwrap().len(), 3);
+
+        // Run GC up to epoch 2
+        gc_exchange_storage(&db, 2).await.unwrap();
+
+        // Verify only epoch 3 remains
+        let inbox_entries = db.scan_prefix(&inbox_prefix).await.unwrap();
+        assert_eq!(inbox_entries.len(), 1);
+        let outbox_entries = db.scan_prefix(&outbox_prefix).await.unwrap();
+        assert_eq!(outbox_entries.len(), 1);
+
+        if let Some((_, _, suffix)) =
+            rockstream_storage::keys::ShardKeyEncoder::decode(&inbox_entries[0].0)
+        {
+            let epoch = u64::from_be_bytes(suffix[4..12].try_into().unwrap());
+            assert_eq!(epoch, 3);
+        } else {
+            panic!("failed to decode key");
+        }
     }
 }

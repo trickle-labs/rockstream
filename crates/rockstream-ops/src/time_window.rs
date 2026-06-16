@@ -27,9 +27,8 @@ use rockstream_storage::{
 use rockstream_types::ids::OperatorId;
 
 use crate::error::OpError;
-use crate::zset::ArrowZSet;
 use crate::op::Operator;
-
+use crate::zset::ArrowZSet;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -243,9 +242,7 @@ impl TumbleWindowOp {
                 .unwrap_or(state.watermark.watermark_ms);
 
             // Late-data check.
-            if event_time_ms < current_watermark
-                && self.late_data_policy == LateDataPolicy::Drop
-            {
+            if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
                 continue;
             }
 
@@ -277,7 +274,6 @@ impl TumbleWindowOp {
             .and_then(|f| f.watermark_ms())
             .unwrap_or(state.watermark.watermark_ms);
         let window_size_ms = self.window_size_ms;
-
 
         // Collect all window_ids that need processing.
         let all_windows: Vec<i64> = {
@@ -358,7 +354,10 @@ impl Operator for TumbleWindowOp {
         self.process_epoch(delta, 0)
     }
 
-    fn push_input_frontier(&self, frontier: rockstream_types::frontier::FreshnessToken) -> Result<(), OpError> {
+    fn push_input_frontier(
+        &self,
+        frontier: rockstream_types::frontier::FreshnessToken,
+    ) -> Result<(), OpError> {
         let mut state = self.state.lock().unwrap();
         state.input_frontier = Some(frontier);
         Ok(())
@@ -369,7 +368,6 @@ impl Operator for TumbleWindowOp {
         state.input_frontier.clone()
     }
 }
-
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -812,5 +810,3 @@ mod tests {
         assert!(state.finalized.contains(&0i64));
     }
 }
-
-

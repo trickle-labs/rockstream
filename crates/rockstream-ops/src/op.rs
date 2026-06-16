@@ -34,7 +34,10 @@ pub trait Operator: Send + Sync {
 
     /// Push the input frontier (progress token) to this operator.
     /// Default implementation does nothing (for stateless operators).
-    fn push_input_frontier(&self, _frontier: rockstream_types::frontier::FreshnessToken) -> Result<(), OpError> {
+    fn push_input_frontier(
+        &self,
+        _frontier: rockstream_types::frontier::FreshnessToken,
+    ) -> Result<(), OpError> {
         Ok(())
     }
 

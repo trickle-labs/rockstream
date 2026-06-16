@@ -15,6 +15,7 @@
 //! - [`tls`] — mTLS configuration scaffolding
 
 pub mod audit;
+pub mod config_deriver;
 pub mod frontier;
 pub mod placement;
 pub mod scheduler;

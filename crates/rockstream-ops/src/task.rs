@@ -74,7 +74,9 @@ impl OperatorTask {
                     if let Some(f) = frontier {
                         output = output.with_frontier(f);
                     }
-                    if (!output.is_empty() || output.frontier.is_some()) && self.output_tx.send(output).await.is_err() {
+                    if (!output.is_empty() || output.frontier.is_some())
+                        && self.output_tx.send(output).await.is_err()
+                    {
                         // Downstream closed; stop processing.
                         break;
                     }

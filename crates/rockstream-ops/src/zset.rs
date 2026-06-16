@@ -247,7 +247,6 @@ impl ArrowZSet {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

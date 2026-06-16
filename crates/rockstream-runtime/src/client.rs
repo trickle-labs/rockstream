@@ -301,6 +301,25 @@ pub async fn start_worker_client(
                         }
                     }
                 }
+                ControlMessage::ClusterFrontierAdvanced { epoch } => {
+                    tracing::info!("Cluster frontier advanced to {}", epoch);
+                    let dbs: Vec<rockstream_storage::ShardDb> = active_shards_clone
+                        .read()
+                        .values()
+                        .filter_map(|state| state.db.clone())
+                        .collect();
+                    for db in dbs {
+                        if let Err(e) =
+                            crate::exchange::persistence::gc_exchange_storage(&db, epoch).await
+                        {
+                            tracing::error!(
+                                code = %rockstream_types::error_code::RS_0003,
+                                "Failed to gc exchange storage: {:?}",
+                                e
+                            );
+                        }
+                    }
+                }
                 ControlMessage::Shutdown => {
                     tracing::info!("Control plane requested shutdown");
                     break;

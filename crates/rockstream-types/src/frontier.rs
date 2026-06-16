@@ -11,7 +11,7 @@
 //! - `CompleteThroughToken` — emitted by monotone (semilattice) laws to signal
 //!   partial progress ahead of the cluster frontier.
 
-use crate::ids::{OperatorId, ShardId, WorkerId, SourceId};
+use crate::ids::{OperatorId, ShardId, SourceId, WorkerId};
 use crate::merge_law::MergeLawId;
 use crate::timestamp::Epoch;
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,10 @@ impl Lattice for SourceProgress {
         } else {
             Self {
                 source_epoch: self.source_epoch,
-                event_time_watermark_ms: match (self.event_time_watermark_ms, other.event_time_watermark_ms) {
+                event_time_watermark_ms: match (
+                    self.event_time_watermark_ms,
+                    other.event_time_watermark_ms,
+                ) {
                     (Some(w1), Some(w2)) => Some(std::cmp::min(w1, w2)),
                     (Some(w1), None) => Some(w1),
                     (None, Some(w2)) => Some(w2),
@@ -61,7 +64,10 @@ impl Lattice for SourceProgress {
         } else {
             Self {
                 source_epoch: self.source_epoch,
-                event_time_watermark_ms: match (self.event_time_watermark_ms, other.event_time_watermark_ms) {
+                event_time_watermark_ms: match (
+                    self.event_time_watermark_ms,
+                    other.event_time_watermark_ms,
+                ) {
                     (Some(w1), Some(w2)) => Some(std::cmp::max(w1, w2)),
                     (Some(w1), None) => Some(w1),
                     (None, Some(w2)) => Some(w2),
@@ -80,7 +86,10 @@ pub struct FreshnessToken {
 }
 
 impl FreshnessToken {
-    pub fn new(source_progress: BTreeMap<SourceId, SourceProgress>, cluster_frontier_hash: u64) -> Self {
+    pub fn new(
+        source_progress: BTreeMap<SourceId, SourceProgress>,
+        cluster_frontier_hash: u64,
+    ) -> Self {
         Self {
             source_progress,
             cluster_frontier_hash,
@@ -460,8 +469,14 @@ mod tests {
         assert_eq!(join.source_progress.get(&s2), Some(&p2));
 
         // Commutativity
-        assert_eq!(tok_a.meet(&tok_b).source_progress, tok_b.meet(&tok_a).source_progress);
-        assert_eq!(tok_a.join(&tok_b).source_progress, tok_b.join(&tok_a).source_progress);
+        assert_eq!(
+            tok_a.meet(&tok_b).source_progress,
+            tok_b.meet(&tok_a).source_progress
+        );
+        assert_eq!(
+            tok_a.join(&tok_b).source_progress,
+            tok_b.join(&tok_a).source_progress
+        );
     }
 }
 

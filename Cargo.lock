@@ -4165,15 +4165,25 @@ dependencies = [
 name = "rockstream-sim"
 version = "0.52.10"
 dependencies = [
+ "arrow",
  "async-trait",
  "bytes",
+ "hex",
+ "hmac",
+ "object_store 0.12.5",
  "parking_lot",
  "rand 0.8.6",
+ "reqwest",
  "rockstream-control",
+ "rockstream-ops",
  "rockstream-oracle",
  "rockstream-runtime",
+ "rockstream-storage",
  "rockstream-types",
+ "sha2",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
 ]
 
