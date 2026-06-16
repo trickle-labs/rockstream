@@ -102,6 +102,16 @@ pub struct RecoveredShard {
     pub elapsed: Duration,
 }
 
+impl std::fmt::Debug for RecoveredShard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveredShard")
+            .field("shard_id", &self.shard_id)
+            .field("checkpoint", &self.checkpoint)
+            .field("elapsed", &self.elapsed)
+            .finish_non_exhaustive()
+    }
+}
+
 // ─── RecoveryProgress ────────────────────────────────────────────────────────
 
 /// Fill-level metric for recovery progress.

@@ -1,12 +1,24 @@
 //! Source and sink connector implementations for RockStream.
 //!
-//! This crate will hold the source and sink connector contracts and the
-//! built-in connectors.
-//!
-//! Per the focused roadmap, the built-in `GENERATE ROWS` source and a
-//! `Vec<RecordBatch>` delta source arrive in **v0.4**; external connectors
-//! (Kafka, Postgres CDC) follow in the connector phase. The crate is
-//! intentionally an empty scaffold at v0.1 ("workspace and CI").
+//! This crate holds the source and sink connector contracts and the
+//! built-in connectors (v0.21: sink 2PC protocol, source-epoch registry,
+//! Kafka sink, object-store sink, M3 paired runtime assertions).
+
+pub mod kafka_sink;
+pub mod object_store_sink;
+pub mod sink_connector;
+pub mod source_epoch;
+
+pub use kafka_sink::KafkaSink;
+pub use object_store_sink::ObjectStoreSink;
+pub use sink_connector::{
+    SinkConnector, SinkError,
+    assert_epoch_committed_only_after_cluster_checkpoint,
+    assert_no_duplicate_delivery,
+    assert_no_lost_delivery_after_checkpoint,
+    assert_recovery_dispatch_idempotent,
+};
+pub use source_epoch::{OffsetToken, SourceEpochEntry, SourceEpochRegistry};
 
 #[cfg(test)]
 mod tests {

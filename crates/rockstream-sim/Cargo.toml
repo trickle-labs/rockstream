@@ -33,5 +33,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 rockstream-storage = { workspace = true }
 rockstream-ops = { workspace = true }
+rockstream-connectors = { workspace = true }
 reqwest = { workspace = true }
 

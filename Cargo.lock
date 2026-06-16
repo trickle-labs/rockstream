@@ -4055,6 +4055,9 @@ dependencies = [
 [[package]]
 name = "rockstream-connectors"
 version = "0.52.10"
+dependencies = [
+ "rockstream-types",
+]
 
 [[package]]
 name = "rockstream-control"
@@ -4174,6 +4177,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "reqwest",
+ "rockstream-connectors",
  "rockstream-control",
  "rockstream-ops",
  "rockstream-oracle",

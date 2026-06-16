@@ -69,3 +69,74 @@ The FizzBee model checker was run headlessly over the spec:
 The invariants proven in FizzBee map directly to assertions in `crates/rockstream-types/src/frontier.rs` and operator tasks in `crates/rockstream-ops/src/task.rs` to enforce:
 1. Vector-meet lattice properties (commutativity, associativity, monotonicity).
 2. Monotone advancement of operator input frontiers.
+
+---
+
+## M3 Sink 2PC Model (`formal/m3_sink_2pc.fizz`)
+
+**Date**: 2026-06-16
+**Specification File**: [`formal/m3_sink_2pc.fizz`](formal/m3_sink_2pc.fizz)
+**Status**: DEFINED ✅ (awaiting `make verify` in CI — fizz toolchain not in local env)
+**Deliverables**: D6.3 (model), D6.4 (invariants + M3-S3 × M1 composition)
+
+### 1. Model Overview
+
+The M3 model covers the 2PC exactly-once sink protocol across three
+`SinkIdempotencyProfile` sub-models: `NativeIdempotent`, `FencingTokenRequired`,
+and `CheckBeforeCommit`. Roles: `SinkConnector`, `ExternalSystem`, `Shard`,
+`CheckpointCoordinator`, `ControlPlane`, `ObjectStore`.
+
+The model captures:
+- Explicit crash yield points: before `pre_commit`, between `pre_commit` and
+  `commit`, and during `commit`.
+- Explicit duplicate-delivery injection (M1-S5 / COV-M3 surface).
+- M3-S3 composition with M1's `cluster_committed` predicate.
+
+### 2. Invariants
+
+| ID | Invariant | Type |
+|---|---|---|
+| M3-S1 | No duplicate delivery | `always` |
+| M3-S2 | No lost delivery after cluster checkpoint | `always` |
+| M3-S3 | Checkpoint-coupled commit (composed with M1 `cluster_committed`) | `always` |
+| M3-S4 | Recovery dispatch idempotency for all three profiles | `always` |
+| M3-L1 | Delivery progress under fair actions | `always eventually` |
+| COV-M3 | Sink crash between pre-commit and commit is reachable | `exists` |
+
+### 3. Counterexamples Found
+
+None during manual model construction. Key design decisions:
+- `SinkCommit` action requires `cluster_committed >= staged_epoch` (M3-S3).
+- The `ExternalSystem.delivered_epochs` is a set: membership guarantees at-most-once (M3-S1).
+- `RecoverFromCrash` restores `staged_epoch` from durable `sink_state/` (M3-S4).
+
+### 4. Paired Runtime Assertions
+
+| FizzBee invariant | Runtime assertion | Location |
+|---|---|---|
+| M3-S1 | `assert_no_duplicate_delivery` | `rockstream-connectors/sink_connector.rs` |
+| M3-S2 | `assert_no_lost_delivery_after_checkpoint` | `rockstream-connectors/sink_connector.rs` |
+| M3-S3 | `assert_epoch_committed_only_after_cluster_checkpoint` | `rockstream-connectors/sink_connector.rs` |
+| M3-S4 | `assert_recovery_dispatch_idempotent` | `rockstream-connectors/sink_connector.rs` |
+
+---
+
+## M1 Duplication Variant (`formal/m1_epoch_commit.fizz`, D6.5)
+
+**Date**: 2026-06-16
+**Specification File**: [`formal/m1_epoch_commit.fizz`](formal/m1_epoch_commit.fizz)
+**Status**: DEFINED ✅ (awaiting `make verify` in CI)
+**Deliverable**: D6.5
+
+### 1. Overview
+
+Added `DuplicateCommit0` and `DuplicateCommit1` actions to the M1 model.
+These re-deliver an already-committed epoch's commit message. The M1-S5
+assertion verifies the shard state is unchanged after the duplicate.
+
+### 2. Key Design
+
+The `DuplicateCommit` actions snapshot `persisted_epoch_{0,1}` before the
+duplicate, then attempt to re-apply the commit. Since `persisted_epoch` is
+already at the committed value, the max operation is a no-op, and M1-S5
+asserts the snapshot equals the post-duplicate state.

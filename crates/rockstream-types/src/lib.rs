@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod rendezvous;
 pub mod schema_evolution;
 pub mod secret;
+pub mod sink;
 pub mod state_budget;
 pub mod topology;
 pub mod view_lifecycle;

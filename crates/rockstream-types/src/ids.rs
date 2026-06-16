@@ -70,6 +70,11 @@ define_id!(
     SourceId, u64, "src"
 );
 
+define_id!(
+    /// Identifies a connector (source or sink) instance.
+    ConnectorId, u64, "connector"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

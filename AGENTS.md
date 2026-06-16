@@ -20,7 +20,7 @@ Show full output **only for FAILED tests**. Passing test noise balloons the cach
 
 ## RTK Wrapper
 
-Always use rtk wrapper for these high-verbosity commands:
+Always use rtk wrapper for all potentially high-verbosity commands:
 
 - `rtk git log` instead of `git log`
 - `rtk git status` instead of `git status`

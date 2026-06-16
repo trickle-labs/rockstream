@@ -6,6 +6,5 @@ rust-version.workspace = true
 license.workspace = true
 description = "Source and sink connector implementations for RockStream"
 
-# Intentionally dependency-free scaffold at v0.1. Built-in sources arrive in
-# v0.4; external connectors follow in the connector phase.
 [dependencies]
+rockstream-types = { path = "../rockstream-types" }
