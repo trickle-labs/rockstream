@@ -12,7 +12,7 @@ use object_store::ObjectStore;
 use rockstream_types::frontier::ShardFrontierReport;
 use rockstream_types::ids::ShardId;
 use rockstream_types::merge_law::{ArrangementHeader, MergeLawId};
-use slatedb::config::Settings;
+use slatedb::config::{CheckpointOptions, CheckpointScope, Settings};
 use slatedb::Db;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -368,6 +368,25 @@ impl ShardDb {
         Ok(ShardFrontierReport { shard_id, epoch })
     }
 
+    /// Create a SlateDB checkpoint for this shard and return a [`CheckpointHandle`].
+    ///
+    /// Called by the worker after a `CheckpointBarrier` epoch completes for all
+    /// local operators. The returned `shard_checkpoint_id` is the SlateDB
+    /// `manifest_id` and is reported to the `CheckpointCoordinator` as part of
+    /// a `PerShardCheckpoint`.
+    ///
+    /// Uses `CheckpointScope::Durable` so only durably flushed writes are
+    /// included, avoiding any dependency on WAL-only entries.
+    pub async fn create_checkpoint(&self) -> Result<CheckpointHandle, StorageError> {
+        let result = self
+            .db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await?;
+        Ok(CheckpointHandle {
+            shard_checkpoint_id: result.manifest_id,
+        })
+    }
+
     /// Close the database, flushing any pending writes.
     pub async fn close(self) -> Result<(), StorageError> {
         self.db.close().await?;
@@ -505,6 +524,18 @@ impl ShardDb {
 
         Ok(results)
     }
+}
+
+/// A handle to a SlateDB checkpoint created by [`ShardDb::create_checkpoint`].
+///
+/// The `shard_checkpoint_id` corresponds to the SlateDB `manifest_id` at the
+/// time the checkpoint was created. It is reported to the
+/// `CheckpointCoordinator` as part of a `PerShardCheckpoint` and later used by
+/// the `RecoveryDriver` to open a `ShardReader` pinned to this exact snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointHandle {
+    /// The SlateDB manifest ID for this checkpoint.
+    pub shard_checkpoint_id: u64,
 }
 
 /// A single operation within a `WriteBatch`.
@@ -666,6 +697,31 @@ mod frontier_reporter_tests {
             entries.len() == 1,
             "commit_epoch must write exactly the frontier key, got {} entries",
             entries.len()
+        );
+    }
+
+    /// Slice 5: `create_checkpoint` returns a non-zero shard_checkpoint_id and
+    /// a second call after writing new data returns an id ≥ the first.
+    #[tokio::test]
+    async fn create_checkpoint_returns_valid_handle() {
+        let db = open_test_db().await;
+
+        // Write some data before taking the checkpoint.
+        db.put(b"ckpt/test/key", b"value").await.unwrap();
+        db.flush().await.unwrap();
+
+        let h1 = db.create_checkpoint().await.unwrap();
+        assert_ne!(h1.shard_checkpoint_id, 0, "shard_checkpoint_id must be non-zero");
+
+        // Write more data and take a second checkpoint.
+        db.put(b"ckpt/test/key2", b"value2").await.unwrap();
+        db.flush().await.unwrap();
+        let h2 = db.create_checkpoint().await.unwrap();
+        assert!(
+            h2.shard_checkpoint_id >= h1.shard_checkpoint_id,
+            "second checkpoint id ({}) must be >= first ({})",
+            h2.shard_checkpoint_id,
+            h1.shard_checkpoint_id
         );
     }
 }

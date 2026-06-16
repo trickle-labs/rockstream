@@ -20,6 +20,9 @@ pub use fence::{
     assert_single_lease_holder, assert_valid_writer, SelfFenceGuard, DEFAULT_SELF_FENCE_DEADLINE,
 };
 
+pub mod recovery;
+pub use recovery::{RecoveryDriver, RecoveryError, RecoveryProgress, DEFAULT_SHARD_RECOVERY_BUDGET};
+
 #[cfg(test)]
 mod tests {
     use super::*;
