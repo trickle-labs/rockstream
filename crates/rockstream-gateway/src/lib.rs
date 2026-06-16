@@ -15,11 +15,14 @@
 //! - `error`          — `GatewayError`
 
 pub mod catalog_stubs;
+pub mod change_log;
 pub mod error;
 pub mod multi_shard_reader;
 pub mod protocol;
 pub mod server;
 pub mod session;
+pub mod subscribe_handler;
+pub mod subscribe_parser;
 pub mod view_reader;
 pub mod write_buffer;
 

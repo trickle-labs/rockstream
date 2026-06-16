@@ -149,6 +149,12 @@ pub const RS_2016: ErrorCode = ErrorCode::new(2016);
 pub const RS_2019: ErrorCode = ErrorCode::new(2019);
 /// RETURNING sub-select shape not supported in this context (v0.24).
 pub const RS_2013: ErrorCode = ErrorCode::new(2013);
+/// Session wait-for deadline exceeded; query proceeded at current frontier (v0.25).
+/// next_steps: "Increase session_wait_for_timeout or reduce write latency."
+pub const RS_2012: ErrorCode = ErrorCode::new(2012);
+/// Subscribe consumer fell behind the change-log retention window (v0.25).
+/// next_steps: "Reconnect with AS OF NOW WITH SNAPSHOT or increase CHANGE_LOG_MAX_ENTRIES."
+pub const RS_2020: ErrorCode = ErrorCode::new(2020);
 
 // 3xxx: Merge / arrangement
 /// Merge operand malformed (fail-closed: never silently overwrites).
@@ -286,6 +292,9 @@ pub fn description(code: ErrorCode) -> &'static str {
         5019 => "Resource usage budget critical (95% threshold reached)",
         6001 => "Incompatible upstream schema evolution detected",
         8001 => "Frontier aggregator shard registry is full; new shard reports rejected",
+        2019 => "Shard write buffer full; backpressure applied",
+        2012 => "Session wait-for deadline exceeded; query proceeded at current frontier",
+        2020 => "Subscribe consumer fell behind the change-log retention window",
         _ => "Unknown error",
     }
 }
