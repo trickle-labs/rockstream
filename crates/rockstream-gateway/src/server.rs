@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use futures::{stream, Sink, StreamExt};
 use futures::SinkExt;
+use futures::{stream, Sink, StreamExt};
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::portal::Portal;
@@ -29,7 +29,9 @@ use pgwire::messages::copy::{
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
-use crate::catalog_stubs::{arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogStubs, CatalogTable};
+use crate::catalog_stubs::{
+    arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogStubs, CatalogTable,
+};
 use crate::session::SessionState;
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
@@ -130,7 +132,9 @@ impl GatewayHandler {
 
         // Transaction control
         if ql == "begin" || ql == "begin;" || ql.starts_with("begin ") {
-            return Some(Ok(vec![Response::TransactionStart(Tag::new("BEGIN").with_rows(0))]));
+            return Some(Ok(vec![Response::TransactionStart(
+                Tag::new("BEGIN").with_rows(0),
+            )]));
         }
 
         // COMMIT and ROLLBACK are handled in dispatch_async (need write buffer access).
@@ -203,17 +207,33 @@ impl GatewayHandler {
     }
 
     /// Read rows from a view and build a pgwire `Response::Query`.
-    async fn read_view_response(&self, view_name: &str, limit: Option<usize>) -> PgWireResult<Vec<Response<'static>>> {
+    async fn read_view_response(
+        &self,
+        view_name: &str,
+        limit: Option<usize>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
         let schema_fields: Vec<FieldInfo> = if let Some(cv) = self.catalog.get_view(view_name) {
             cv.columns
                 .iter()
                 .map(|c| {
                     let oid = arrow_type_to_pg_oid(&c.data_type);
-                    FieldInfo::new(c.name.clone(), None, None, pg_type_from_oid(oid), FieldFormat::Text)
+                    FieldInfo::new(
+                        c.name.clone(),
+                        None,
+                        None,
+                        pg_type_from_oid(oid),
+                        FieldFormat::Text,
+                    )
                 })
                 .collect()
         } else {
-            vec![FieldInfo::new("result".to_string(), None, None, Type::TEXT, FieldFormat::Text)]
+            vec![FieldInfo::new(
+                "result".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )]
         };
 
         let raw_rows = self
@@ -231,12 +251,17 @@ impl GatewayHandler {
             let fields: Vec<&str> = row_str.split('\t').collect();
             for i in 0..col_count {
                 let val: Option<&str> = fields.get(i).copied();
-                encoder.encode_field(&val).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                encoder
+                    .encode_field(&val)
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             }
             encoder.finish()
         });
 
-        Ok(vec![Response::Query(QueryResponse::new(schema, data_stream))])
+        Ok(vec![Response::Query(QueryResponse::new(
+            schema,
+            data_stream,
+        ))])
     }
 
     fn handle_create_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
@@ -312,7 +337,9 @@ impl GatewayHandler {
         // Check for duplicate (non-IF NOT EXISTS)
         if self.catalog.get_table(&table_name).is_some() {
             if if_not_exists {
-                return Ok(vec![Response::Execution(Tag::new("CREATE TABLE").with_rows(0))]);
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE TABLE").with_rows(0),
+                )]);
             }
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -329,7 +356,9 @@ impl GatewayHandler {
             columns: cols,
         });
 
-        Ok(vec![Response::Execution(Tag::new("CREATE TABLE").with_rows(0))])
+        Ok(vec![Response::Execution(
+            Tag::new("CREATE TABLE").with_rows(0),
+        )])
     }
 
     /// Handle `SET rockstream.<var> = <value>` — update per-connection session state.
@@ -355,7 +384,10 @@ impl GatewayHandler {
         let var_name = after_set[..eq_pos].trim();
         let val_raw = after_set[eq_pos + 1..].trim().trim_end_matches(';');
 
-        let mut session = self.sessions.entry(id.to_string()).or_insert_with(SessionState::new);
+        let mut session = self
+            .sessions
+            .entry(id.to_string())
+            .or_insert_with(SessionState::new);
 
         match var_name {
             "idempotency_key" => {
@@ -382,23 +414,32 @@ impl GatewayHandler {
     /// COMMIT handler: flush write buffer to ShardDb atomically.
     async fn handle_commit(&self, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
         let Some(conn_id) = conn_id else {
-            return Ok(vec![promote_response(Response::TransactionEnd(Tag::new("COMMIT").with_rows(0)))]);
+            return Ok(vec![promote_response(Response::TransactionEnd(
+                Tag::new("COMMIT").with_rows(0),
+            ))]);
         };
 
         let mut entry = self.write_buffers.entry(conn_id.to_string()).or_default();
         if entry.is_empty() {
-            return Ok(vec![promote_response(Response::TransactionEnd(Tag::new("COMMIT").with_rows(0)))]);
+            return Ok(vec![promote_response(Response::TransactionEnd(
+                Tag::new("COMMIT").with_rows(0),
+            ))]);
         }
 
         let Some(shard_db) = &self.shard_db else {
             // No shard — discard buffer, return COMMIT (best effort without storage)
             entry.clear();
-            return Ok(vec![promote_response(Response::TransactionEnd(Tag::new("COMMIT").with_rows(0)))]);
+            return Ok(vec![promote_response(Response::TransactionEnd(
+                Tag::new("COMMIT").with_rows(0),
+            ))]);
         };
 
         // ── Idempotency check ─────────────────────────────────────────────────
         let (idempotency_key, source_epoch_envelope) = {
-            let session = self.sessions.entry(conn_id.to_string()).or_insert_with(SessionState::new);
+            let session = self
+                .sessions
+                .entry(conn_id.to_string())
+                .or_insert_with(SessionState::new);
             (session.idempotency_key, session.source_epoch_envelope)
         };
         if idempotency_key.is_none() && source_epoch_envelope.is_none() {
@@ -421,7 +462,9 @@ impl GatewayHandler {
                 }
                 Ok(None) => {} // proceed
                 Err(e) => {
-                    return Err(PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))));
+                    return Err(PgWireError::ApiError(Box::new(
+                        crate::error::GatewayError::Storage(e),
+                    )));
                 }
             }
         }
@@ -437,11 +480,22 @@ impl GatewayHandler {
         let mut batch = rockstream_storage::WriteBatch::new();
         for op in &ops {
             match op {
-                DmlOp::Insert { table, row_key, values_tsv, .. } => {
+                DmlOp::Insert {
+                    table,
+                    row_key,
+                    values_tsv,
+                    ..
+                } => {
                     let key = format!("view_output/{table}/{row_key}");
                     batch.put(key.as_bytes(), values_tsv.as_bytes());
                 }
-                DmlOp::Update { table, old_row_key, new_row_key, new_tsv, .. } => {
+                DmlOp::Update {
+                    table,
+                    old_row_key,
+                    new_row_key,
+                    new_tsv,
+                    ..
+                } => {
                     let old_key = format!("view_output/{table}/{old_row_key}");
                     let new_key = format!("view_output/{table}/{new_row_key}");
                     batch.delete(old_key.as_bytes());
@@ -459,7 +513,9 @@ impl GatewayHandler {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            rockstream_storage::ShardDb::put_idempotency_key(&mut batch, 0, key_hash, epoch, now_ms);
+            rockstream_storage::ShardDb::put_idempotency_key(
+                &mut batch, 0, key_hash, epoch, now_ms,
+            );
         }
         // Advance shard frontier
         batch.put(
@@ -489,19 +545,25 @@ impl GatewayHandler {
                 entry.clear();
             }
         }
-        Ok(vec![promote_response(Response::TransactionEnd(Tag::new("ROLLBACK").with_rows(0)))])
+        Ok(vec![promote_response(Response::TransactionEnd(
+            Tag::new("ROLLBACK").with_rows(0),
+        ))])
     }
 
     /// INSERT handler: accumulate rows in the write buffer.
-    async fn handle_insert(&self, q: &str, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
+    async fn handle_insert(
+        &self,
+        q: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
         // Parse INSERT INTO <table> [(cols)] VALUES (v1, v2, ...) [RETURNING ...]
         let returning = q.to_lowercase().contains(" returning ");
         let (table, cols, values) = match parse_insert(q) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(), "42601".to_owned(), e,
-                ))))]);
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e),
+                )))]);
             }
         };
 
@@ -519,21 +581,32 @@ impl GatewayHandler {
         if let Some(id) = conn_id {
             let mut entry = self.write_buffers.entry(id.to_string()).or_default();
             if let Err(e) = entry.push(op) {
-                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(), "53400".to_owned(), e.to_string(),
-                ))))]);
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
+                )))]);
             }
         }
 
         if returning {
             // Auto-commit single INSERT … RETURNING outside explicit transaction
             let schema_fields = if let Some(ct) = self.catalog.get_table(&table) {
-                ct.columns.iter().map(|c| {
-                    let oid = arrow_type_to_pg_oid(&c.data_type);
-                    FieldInfo::new(c.name.clone(), None, None, pg_type_from_oid(oid), FieldFormat::Text)
-                }).collect::<Vec<_>>()
+                ct.columns
+                    .iter()
+                    .map(|c| {
+                        let oid = arrow_type_to_pg_oid(&c.data_type);
+                        FieldInfo::new(
+                            c.name.clone(),
+                            None,
+                            None,
+                            pg_type_from_oid(oid),
+                            FieldFormat::Text,
+                        )
+                    })
+                    .collect::<Vec<_>>()
             } else {
-                cols.iter().map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text)).collect()
+                cols.iter()
+                    .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+                    .collect()
             };
             let schema = Arc::new(schema_fields);
             let schema_ref = schema.clone();
@@ -541,33 +614,49 @@ impl GatewayHandler {
             let stream = Box::pin(stream::once(async move {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
                 for v in &row_values {
-                    encoder.encode_field(v).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                    encoder
+                        .encode_field(v)
+                        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
                 }
                 encoder.finish()
             }));
-            return Ok(vec![promote_response(Response::Query(QueryResponse::new(schema, stream)))]);
+            return Ok(vec![promote_response(Response::Query(QueryResponse::new(
+                schema, stream,
+            )))]);
         }
 
-        Ok(vec![promote_response(Response::Execution(Tag::new("INSERT 0 1").with_rows(1)))])
+        Ok(vec![promote_response(Response::Execution(
+            Tag::new("INSERT 0 1").with_rows(1),
+        ))])
     }
 
     /// UPDATE handler: accumulate in write buffer.
-    async fn handle_update(&self, q: &str, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
+    async fn handle_update(
+        &self,
+        q: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
         let (table, set_pairs, where_pairs) = match parse_update(q) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(), "42601".to_owned(), e,
-                ))))]);
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e),
+                )))]);
             }
         };
 
         // Build old row key from WHERE clause, new values from SET clause
-        let (old_cols, old_vals): (Vec<_>, Vec<_>) = where_pairs.iter().map(|(c, v)| (c.clone(), v.clone())).unzip();
+        let (old_cols, old_vals): (Vec<_>, Vec<_>) = where_pairs
+            .iter()
+            .map(|(c, v)| (c.clone(), v.clone()))
+            .unzip();
         let old_row_key = build_row_key(&old_cols, &old_vals);
         let old_tsv = old_vals.join("\t");
 
-        let (new_cols, new_vals): (Vec<_>, Vec<_>) = set_pairs.iter().map(|(c, v)| (c.clone(), v.clone())).unzip();
+        let (new_cols, new_vals): (Vec<_>, Vec<_>) = set_pairs
+            .iter()
+            .map(|(c, v)| (c.clone(), v.clone()))
+            .unzip();
         let new_row_key = build_row_key(&new_cols, &new_vals);
         let new_tsv = new_vals.join("\t");
 
@@ -582,27 +671,36 @@ impl GatewayHandler {
         if let Some(id) = conn_id {
             let mut entry = self.write_buffers.entry(id.to_string()).or_default();
             if let Err(e) = entry.push(op) {
-                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(), "53400".to_owned(), e.to_string(),
-                ))))]);
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
+                )))]);
             }
         }
 
-        Ok(vec![promote_response(Response::Execution(Tag::new("UPDATE 1").with_rows(1)))])
+        Ok(vec![promote_response(Response::Execution(
+            Tag::new("UPDATE 1").with_rows(1),
+        ))])
     }
 
     /// DELETE handler: accumulate in write buffer.
-    async fn handle_delete(&self, q: &str, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
+    async fn handle_delete(
+        &self,
+        q: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
         let (table, where_pairs) = match parse_delete(q) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(), "42601".to_owned(), e,
-                ))))]);
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e),
+                )))]);
             }
         };
 
-        let (cols, vals): (Vec<_>, Vec<_>) = where_pairs.iter().map(|(c, v)| (c.clone(), v.clone())).unzip();
+        let (cols, vals): (Vec<_>, Vec<_>) = where_pairs
+            .iter()
+            .map(|(c, v)| (c.clone(), v.clone()))
+            .unzip();
         let row_key = build_row_key(&cols, &vals);
 
         let op = DmlOp::Delete { table, row_key };
@@ -610,13 +708,15 @@ impl GatewayHandler {
         if let Some(id) = conn_id {
             let mut entry = self.write_buffers.entry(id.to_string()).or_default();
             if let Err(e) = entry.push(op) {
-                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(), "53400".to_owned(), e.to_string(),
-                ))))]);
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
+                )))]);
             }
         }
 
-        Ok(vec![promote_response(Response::Execution(Tag::new("DELETE 1").with_rows(1)))])
+        Ok(vec![promote_response(Response::Execution(
+            Tag::new("DELETE 1").with_rows(1),
+        ))])
     }
 }
 
@@ -642,7 +742,9 @@ impl SimpleQueryHandler for GatewayHandler {
             } else {
                 use rand::Rng;
                 let id = format!("{:032x}", rand::thread_rng().gen::<u128>());
-                client.metadata_mut().insert("_rs_conn_id".to_string(), id.clone());
+                client
+                    .metadata_mut()
+                    .insert("_rs_conn_id".to_string(), id.clone());
                 id
             }
         };
@@ -665,11 +767,8 @@ impl SimpleQueryHandler for GatewayHandler {
                     .unwrap_or(1);
 
                 // 1. CopyOutResponse
-                let copy_out_resp = MsgCopyOutResponse::new(
-                    0,
-                    col_count as i16,
-                    vec![0i16; col_count],
-                );
+                let copy_out_resp =
+                    MsgCopyOutResponse::new(0, col_count as i16, vec![0i16; col_count]);
                 client
                     .feed(PgWireBackendMessage::CopyOutResponse(copy_out_resp))
                     .await?;
@@ -679,7 +778,9 @@ impl SimpleQueryHandler for GatewayHandler {
                     let mut data = row.clone();
                     data.push(b'\n');
                     let copy_data = MsgCopyData::new(bytes::Bytes::from(data));
-                    client.feed(PgWireBackendMessage::CopyData(copy_data)).await?;
+                    client
+                        .feed(PgWireBackendMessage::CopyData(copy_data))
+                        .await?;
                 }
 
                 // 3. CopyDone
@@ -754,8 +855,13 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let responses = self.dispatch_async(portal.statement.statement.as_str()).await?;
-        Ok(responses.into_iter().next().unwrap_or(Response::Execution(Tag::new("OK"))))
+        let responses = self
+            .dispatch_async(portal.statement.statement.as_str())
+            .await?;
+        Ok(responses
+            .into_iter()
+            .next()
+            .unwrap_or(Response::Execution(Tag::new("OK"))))
     }
 }
 
@@ -828,7 +934,11 @@ impl GatewayServer {
     ) -> Self {
         GatewayServer {
             addr,
-            handler: Arc::new(GatewayHandler::with_shard_db(catalog, view_reader, shard_db)),
+            handler: Arc::new(GatewayHandler::with_shard_db(
+                catalog,
+                view_reader,
+                shard_db,
+            )),
         }
     }
 
@@ -872,9 +982,7 @@ impl GatewayServer {
                 };
                 let factory_ref = factory.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        pgwire::tokio::process_socket(socket, None, factory_ref).await
-                    {
+                    if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
                         tracing::debug!("gateway connection error: {e}");
                     }
                 });
@@ -954,7 +1062,11 @@ fn extract_view_name_from_select(q: &str) -> Option<String> {
     } else {
         raw
     };
-    if name.is_empty() { None } else { Some(name.to_string()) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Extract LIMIT value from a query string.
@@ -975,7 +1087,11 @@ fn parse_copy_to_stdout_view(q: &str) -> Option<String> {
     let to_pos = after_copy_lower.find(" to ")?;
     let after_copy_orig = q[q.to_lowercase().find("copy ")? + 5..].trim_start();
     let raw = after_copy_orig[..to_pos].trim();
-    if raw.is_empty() { None } else { Some(raw.to_string()) }
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
 }
 
 /// Build FieldInfo list for a query (for DESCRIBE).
@@ -1019,7 +1135,11 @@ fn parse_create_view_name(q: &str) -> Option<String> {
     let as_pos = after.to_lowercase().find(" as ")?;
     let raw = after[..as_pos].trim().trim_matches('"');
     let name = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"');
-    if name.is_empty() { None } else { Some(name.to_string()) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Extract the SELECT SQL from `CREATE … AS <select>`.
@@ -1081,12 +1201,19 @@ fn parse_create_table_columns(after_table_name: &str) -> Vec<CatalogColumn> {
             // Normalize multi-word types (e.g. "DOUBLE PRECISION")
             let full_type = if pg_type == "DOUBLE" {
                 let next = tokens.next().map(|s| s.to_uppercase()).unwrap_or_default();
-                if next == "PRECISION" { "DOUBLE PRECISION".to_string() } else { pg_type }
+                if next == "PRECISION" {
+                    "DOUBLE PRECISION".to_string()
+                } else {
+                    pg_type
+                }
             } else {
                 pg_type
             };
             let arrow_type = pg_type_to_arrow(&full_type);
-            Some(CatalogColumn { name: col_name, data_type: arrow_type.to_string() })
+            Some(CatalogColumn {
+                name: col_name,
+                data_type: arrow_type.to_string(),
+            })
         })
         .collect()
 }
@@ -1152,7 +1279,9 @@ fn parse_insert(q: &str) -> Result<(String, Vec<String>, Vec<String>), String> {
     // Optional column list is everything before VALUES
     let before_values_lower = rest_lower[..values_pos_lower].trim();
     let (cols, _) = if before_values_lower.starts_with('(') {
-        let close = before_values_lower.rfind(')').ok_or("missing ) in column list")?;
+        let close = before_values_lower
+            .rfind(')')
+            .ok_or("missing ) in column list")?;
         let col_str = &before_values_lower[1..close];
         let cols: Vec<String> = col_str.split(',').map(|c| c.trim().to_string()).collect();
         (cols, ())
@@ -1170,7 +1299,8 @@ fn parse_insert(q: &str) -> Result<(String, Vec<String>, Vec<String>), String> {
     let values: Vec<String> = parse_value_list(vals_str);
 
     // Strip trailing semicolon if present from last value
-    let values: Vec<String> = values.into_iter()
+    let values: Vec<String> = values
+        .into_iter()
         .map(|v| v.trim_end_matches(';').trim().to_string())
         .collect();
 
@@ -1193,7 +1323,9 @@ fn parse_update(q: &str) -> Result<(String, Vec<(String, String)>, Vec<(String, 
 
     // SET clause
     let set_pos = ql.find(" set ").ok_or("missing SET")?;
-    let where_pos = ql.find(" where ").ok_or("missing WHERE (v0.24 requires WHERE)")?;
+    let where_pos = ql
+        .find(" where ")
+        .ok_or("missing WHERE (v0.24 requires WHERE)")?;
 
     let set_str_lower = &ql[set_pos + 5..where_pos];
     let set_str_orig = &q[set_pos + 5..where_pos];
@@ -1211,14 +1343,19 @@ fn parse_update(q: &str) -> Result<(String, Vec<(String, String)>, Vec<(String, 
 /// Returns `(table, where_pairs)`.
 fn parse_delete(q: &str) -> Result<(String, Vec<(String, String)>), String> {
     let ql = q.to_lowercase();
-    let after = ql.strip_prefix("delete from ").ok_or("not DELETE FROM")?.trim_start();
+    let after = ql
+        .strip_prefix("delete from ")
+        .ok_or("not DELETE FROM")?
+        .trim_start();
 
     let name_end = after
         .find(|c: char| c.is_whitespace() || c == ';')
         .unwrap_or(after.len());
     let table = after[..name_end].trim().to_lowercase();
 
-    let where_pos = ql.find(" where ").ok_or("missing WHERE (v0.24 requires WHERE)")?;
+    let where_pos = ql
+        .find(" where ")
+        .ok_or("missing WHERE (v0.24 requires WHERE)")?;
     let where_str = &q[where_pos + 7..].trim_end_matches(';');
     let where_pairs = parse_kv_list(where_str);
 
@@ -1234,7 +1371,11 @@ fn parse_kv_list(s: &str) -> Vec<(String, String)> {
             let eq = part.find('=')?;
             let col = part[..eq].trim().to_lowercase();
             let val = part[eq + 1..].trim().trim_matches('\'').to_string();
-            if col.is_empty() { None } else { Some((col, val)) }
+            if col.is_empty() {
+                None
+            } else {
+                Some((col, val))
+            }
         })
         .collect()
 }

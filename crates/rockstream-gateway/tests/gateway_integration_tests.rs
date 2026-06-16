@@ -34,15 +34,9 @@ impl ViewReader for NoopViewReader {
 
 /// Start a GatewayServer with the given catalog on a random port. Returns the
 /// address and a background task handle.
-async fn start_gateway(
-    catalog: CatalogStubs,
-) -> (String, tokio::task::JoinHandle<()>) {
+async fn start_gateway(catalog: CatalogStubs) -> (String, tokio::task::JoinHandle<()>) {
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server = GatewayServer::with_catalog(
-        addr,
-        Arc::new(catalog),
-        Arc::new(NoopViewReader),
-    );
+    let server = GatewayServer::with_catalog(addr, Arc::new(catalog), Arc::new(NoopViewReader));
     let (local_addr, handle) = server.serve_background().await.unwrap();
     (local_addr.to_string(), handle)
 }
@@ -50,7 +44,10 @@ async fn start_gateway(
 /// Connect with tokio-postgres to `host:port`.
 async fn connect(addr: &str) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=test dbname=test", addr.split(':').last().unwrap()),
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            addr.split(':').last().unwrap()
+        ),
         NoTls,
     )
     .await
@@ -87,8 +84,14 @@ async fn proof_pg_catalog_schema_reflection_queries() {
         name: "orders_mv".to_string(),
         sql: "SELECT id, amount FROM orders WHERE amount > 0".to_string(),
         columns: vec![
-            CatalogColumn { name: "id".to_string(), data_type: "Int64".to_string() },
-            CatalogColumn { name: "amount".to_string(), data_type: "Float64".to_string() },
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            CatalogColumn {
+                name: "amount".to_string(),
+                data_type: "Float64".to_string(),
+            },
         ],
     });
 
@@ -190,8 +193,14 @@ async fn extended_query_protocol_parse_bind_execute() {
         name: "my_view".to_string(),
         sql: "SELECT id, val FROM base".to_string(),
         columns: vec![
-            CatalogColumn { name: "id".to_string(), data_type: "Int64".to_string() },
-            CatalogColumn { name: "val".to_string(), data_type: "Float64".to_string() },
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            CatalogColumn {
+                name: "val".to_string(),
+                data_type: "Float64".to_string(),
+            },
         ],
     });
 
@@ -205,7 +214,11 @@ async fn extended_query_protocol_parse_bind_execute() {
         .expect("prepare failed");
 
     // Verify column count and type OIDs from RowDescription
-    assert_eq!(stmt.columns().len(), 2, "expected 2 columns in RowDescription");
+    assert_eq!(
+        stmt.columns().len(),
+        2,
+        "expected 2 columns in RowDescription"
+    );
     // id → INT8 (OID 20), val → FLOAT8 (OID 701)
     let col_types: Vec<u32> = stmt.columns().iter().map(|c| c.type_().oid()).collect();
     assert_eq!(col_types[0], 20, "id column should be INT8 (OID 20)");

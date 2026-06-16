@@ -5,8 +5,7 @@
 /// Mirrors the OIDs defined in `catalog_stubs` so both sides stay in sync.
 pub fn pg_type_from_name(arrow_type: &str) -> pgwire::api::Type {
     use crate::catalog_stubs::{
-        PG_OID_BOOL, PG_OID_BYTEA, PG_OID_FLOAT8, PG_OID_INT4, PG_OID_INT8,
-        PG_OID_TIMESTAMP,
+        PG_OID_BOOL, PG_OID_BYTEA, PG_OID_FLOAT8, PG_OID_INT4, PG_OID_INT8, PG_OID_TIMESTAMP,
     };
     use pgwire::api::Type;
     let oid = crate::catalog_stubs::arrow_type_to_pg_oid(arrow_type);

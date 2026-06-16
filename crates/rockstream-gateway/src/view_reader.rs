@@ -74,10 +74,7 @@ impl ViewReader for HotOnlyViewReader {
             ));
         }
         let prefix = format!("view_output/{view_name}/");
-        let kvs = self
-            .shard_reader
-            .scan_prefix(prefix.as_bytes())
-            .await?;
+        let kvs = self.shard_reader.scan_prefix(prefix.as_bytes()).await?;
 
         let rows: Vec<Vec<u8>> = kvs.into_iter().map(|(_k, v)| v.to_vec()).collect();
         let rows = match limit {
@@ -112,7 +109,10 @@ mod tests {
         for i in 0u32..5 {
             let key = format!("view_output/my_view/{:08}", i);
             let value = format!("row_{i}\t{i}");
-            shard_db.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+            shard_db
+                .put(key.as_bytes(), value.as_bytes())
+                .await
+                .unwrap();
         }
         shard_db.flush().await.unwrap();
 

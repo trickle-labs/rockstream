@@ -108,7 +108,10 @@ async fn copy_out_streams_view_rows() {
     for i in 0u32..3 {
         let key = format!("view_output/copy_view/{:08}", i);
         let value = format!("row_{i}\t{i}");
-        shard_db.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+        shard_db
+            .put(key.as_bytes(), value.as_bytes())
+            .await
+            .unwrap();
     }
     shard_db.flush().await.unwrap();
 
@@ -124,8 +127,14 @@ async fn copy_out_streams_view_rows() {
         name: "copy_view".to_string(),
         sql: "SELECT name, val FROM source".to_string(),
         columns: vec![
-            CatalogColumn { name: "name".to_string(), data_type: "Utf8".to_string() },
-            CatalogColumn { name: "val".to_string(), data_type: "Int32".to_string() },
+            CatalogColumn {
+                name: "name".to_string(),
+                data_type: "Utf8".to_string(),
+            },
+            CatalogColumn {
+                name: "val".to_string(),
+                data_type: "Int32".to_string(),
+            },
         ],
     });
 
@@ -195,7 +204,9 @@ async fn drain_until_ready(stream: &mut tokio::net::TcpStream) {
         let body_len = len - 4;
         let mut body = vec![0u8; body_len];
         if body_len > 0 {
-            tokio::io::AsyncReadExt::read_exact(stream, &mut body).await.unwrap();
+            tokio::io::AsyncReadExt::read_exact(stream, &mut body)
+                .await
+                .unwrap();
         }
         if msg_type == b'Z' {
             break;
@@ -212,12 +223,14 @@ async fn count_copy_data_messages(stream: &mut tokio::net::TcpStream) -> usize {
         let body_len = len - 4;
         let mut body = vec![0u8; body_len];
         if body_len > 0 {
-            tokio::io::AsyncReadExt::read_exact(stream, &mut body).await.unwrap();
+            tokio::io::AsyncReadExt::read_exact(stream, &mut body)
+                .await
+                .unwrap();
         }
         match msg_type {
-            b'd' => count += 1,       // CopyData
-            b'c' => break,            // CopyDone
-            b'C' | b'Z' => break,     // CommandComplete / ReadyForQuery → done
+            b'd' => count += 1,   // CopyData
+            b'c' => break,        // CopyDone
+            b'C' | b'Z' => break, // CommandComplete / ReadyForQuery → done
             b'E' => panic!("received ErrorResponse during COPY OUT"),
             _ => {} // skip other messages (H = CopyOutResponse, etc.)
         }
@@ -253,7 +266,10 @@ async fn proof_psql_select_limit_10_under_10ms_p99() {
     for i in 0u32..100 {
         let key = format!("view_output/my_view/{:08}", i);
         let value = format!("id_{i}\t{i}");
-        shard_db.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+        shard_db
+            .put(key.as_bytes(), value.as_bytes())
+            .await
+            .unwrap();
     }
     shard_db.flush().await.unwrap();
 
@@ -269,8 +285,14 @@ async fn proof_psql_select_limit_10_under_10ms_p99() {
         name: "my_view".to_string(),
         sql: "SELECT id, val FROM source".to_string(),
         columns: vec![
-            CatalogColumn { name: "id".to_string(), data_type: "Utf8".to_string() },
-            CatalogColumn { name: "val".to_string(), data_type: "Int32".to_string() },
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Utf8".to_string(),
+            },
+            CatalogColumn {
+                name: "val".to_string(),
+                data_type: "Int32".to_string(),
+            },
         ],
     });
 
@@ -307,10 +329,7 @@ async fn proof_psql_select_limit_10_under_10ms_p99() {
     let p99_ms = latencies_ms[p99_idx.min(latencies_ms.len() - 1)];
 
     // 7. Assert p99 < 10 ms.
-    assert!(
-        p99_ms < 10.0,
-        "p99 latency {p99_ms:.2}ms exceeded 10ms SLO"
-    );
+    assert!(p99_ms < 10.0, "p99 latency {p99_ms:.2}ms exceeded 10ms SLO");
 }
 
 // ── S9: proof_inline_view_inlined_into_materialized_view ──────────────────────
@@ -328,7 +347,10 @@ async fn proof_inline_view_inlined_into_materialized_view() {
     for i in 0u32..5 {
         let key = format!("view_output/mv/{:08}", i);
         let value = format!("id_{i}\t{i}");
-        shard_db.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+        shard_db
+            .put(key.as_bytes(), value.as_bytes())
+            .await
+            .unwrap();
     }
     shard_db.flush().await.unwrap();
 
@@ -340,8 +362,7 @@ async fn proof_inline_view_inlined_into_materialized_view() {
 
     let catalog = Arc::new(CatalogStubs::new());
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server =
-        GatewayServer::with_catalog(addr, catalog.clone(), view_reader);
+    let server = GatewayServer::with_catalog(addr, catalog.clone(), view_reader);
     let (local_addr, _handle) = server.serve_background().await.unwrap();
     let port = local_addr.port();
     let client = connect_port(port).await;
@@ -397,7 +418,10 @@ async fn proof_inline_view_inlined_into_materialized_view() {
         }
         Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("RS-1011")),
     };
-    assert!(got_rs1011, "expected RS-1011 for cyclic CREATE VIEW; got: {result:?}");
+    assert!(
+        got_rs1011,
+        "expected RS-1011 for cyclic CREATE VIEW; got: {result:?}"
+    );
 
     // 6. SELECT * FROM mv LIMIT 10 — rows from pre-seeded shard data.
     let rows = client
@@ -422,7 +446,10 @@ async fn proof_inline_view_inlined_into_materialized_view() {
 /// Gated behind the `testcontainers` feature flag for CI environments that
 /// cannot run external containers. Uses only in-process tokio-postgres.
 #[tokio::test]
-#[cfg_attr(not(feature = "testcontainers"), ignore = "requires testcontainers feature")]
+#[cfg_attr(
+    not(feature = "testcontainers"),
+    ignore = "requires testcontainers feature"
+)]
 async fn proof_orm_schema_reflection_testcontainers() {
     _proof_orm_schema_reflection_impl().await;
 }
@@ -440,8 +467,14 @@ async fn _proof_orm_schema_reflection_impl() {
         name: "orders_mv".to_string(),
         sql: "SELECT id, amount FROM orders".to_string(),
         columns: vec![
-            CatalogColumn { name: "id".to_string(), data_type: "Int64".to_string() },
-            CatalogColumn { name: "amount".to_string(), data_type: "Float64".to_string() },
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            CatalogColumn {
+                name: "amount".to_string(),
+                data_type: "Float64".to_string(),
+            },
         ],
     });
 
@@ -505,9 +538,7 @@ async fn _proof_orm_schema_reflection_impl() {
 
     // 3c. pg_catalog.pg_class → orders_mv with non-zero OID
     let rows = client
-        .simple_query(
-            "SELECT oid, relname FROM pg_catalog.pg_class WHERE relname = 'orders_mv'",
-        )
+        .simple_query("SELECT oid, relname FROM pg_catalog.pg_class WHERE relname = 'orders_mv'")
         .await
         .expect("pg_class failed");
     let class_rows: Vec<(String, String)> = rows
@@ -605,12 +636,23 @@ async fn create_table_registers_in_catalog() {
         .expect("CREATE TABLE failed");
 
     // Verify catalog registration
-    let table = catalog.get_table("orders").expect("table should be in catalog");
+    let table = catalog
+        .get_table("orders")
+        .expect("table should be in catalog");
     assert_eq!(table.name, "orders");
     assert_eq!(table.columns.len(), 3);
-    assert!(table.columns.iter().any(|c| c.name == "id" && c.data_type == "Int64"));
-    assert!(table.columns.iter().any(|c| c.name == "amount" && c.data_type == "Float64"));
-    assert!(table.columns.iter().any(|c| c.name == "name" && c.data_type == "Utf8"));
+    assert!(table
+        .columns
+        .iter()
+        .any(|c| c.name == "id" && c.data_type == "Int64"));
+    assert!(table
+        .columns
+        .iter()
+        .any(|c| c.name == "amount" && c.data_type == "Float64"));
+    assert!(table
+        .columns
+        .iter()
+        .any(|c| c.name == "name" && c.data_type == "Utf8"));
 
     // CREATE TABLE IF NOT EXISTS is a no-op (no error)
     client
@@ -619,15 +661,23 @@ async fn create_table_registers_in_catalog() {
         .expect("CREATE TABLE IF NOT EXISTS should not error");
 
     // Duplicate without IF NOT EXISTS returns relation already exists
-    let result = client
-        .simple_query("CREATE TABLE orders (id BIGINT)")
-        .await;
+    let result = client.simple_query("CREATE TABLE orders (id BIGINT)").await;
     let got_42p07 = match &result {
-        Err(e) => e.as_db_error().map(|d| d.code() == &tokio_postgres::error::SqlState::DUPLICATE_TABLE).unwrap_or(false)
-            || e.to_string().contains("42P07") || e.to_string().contains("already exists"),
-        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("already exists")),
+        Err(e) => {
+            e.as_db_error()
+                .map(|d| d.code() == &tokio_postgres::error::SqlState::DUPLICATE_TABLE)
+                .unwrap_or(false)
+                || e.to_string().contains("42P07")
+                || e.to_string().contains("already exists")
+        }
+        Ok(msgs) => msgs
+            .iter()
+            .any(|m| format!("{m:?}").contains("already exists")),
     };
-    assert!(got_42p07, "expected 42P07 duplicate table error; got {result:?}");
+    assert!(
+        got_42p07,
+        "expected 42P07 duplicate table error; got {result:?}"
+    );
 }
 
 // ── S3: insert_accumulates_in_write_buffer ────────────────────────────────────
@@ -701,7 +751,9 @@ async fn commit_flushes_rows_scannable_via_view_prefix() {
         2,
         "expected 2 rows after COMMIT, got {}: {:?}",
         rows.len(),
-        rows.iter().map(|(k, _)| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+        rows.iter()
+            .map(|(k, _)| String::from_utf8_lossy(k))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -715,7 +767,10 @@ fn commit_write_batch_uses_no_range_delete() {
     // Verify BatchOp has only Put, Delete, Merge variants (no RangeDelete).
     // This is a compile-time exhaustiveness check: if a RangeDelete variant
     // were added, this match would fail to compile without a new arm.
-    let op = BatchOp::Put { key: b"k".to_vec(), value: b"v".to_vec() };
+    let op = BatchOp::Put {
+        key: b"k".to_vec(),
+        value: b"v".to_vec(),
+    };
     match op {
         BatchOp::Put { .. } => {}
         BatchOp::Delete { .. } => {}
@@ -792,7 +847,12 @@ async fn insert_returning_returns_written_rows() {
         })
         .collect();
 
-    assert_eq!(data_rows.len(), 1, "expected 1 row from RETURNING, got {}", data_rows.len());
+    assert_eq!(
+        data_rows.len(),
+        1,
+        "expected 1 row from RETURNING, got {}",
+        data_rows.len()
+    );
 }
 
 // ── S7: insert_select_returning_multi_row ────────────────────────────────────
@@ -825,7 +885,8 @@ async fn insert_select_returning_multi_row() {
         .simple_query("INSERT INTO items (id, name) VALUES (1, 'Alpha') RETURNING *")
         .await
         .expect("INSERT 1 RETURNING failed");
-    let count1 = rows1.iter()
+    let count1 = rows1
+        .iter()
         .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
         .count();
     assert_eq!(count1, 1, "expected 1 row from first INSERT RETURNING");
@@ -835,7 +896,8 @@ async fn insert_select_returning_multi_row() {
         .simple_query("INSERT INTO items (id, name) VALUES (2, 'Beta') RETURNING *")
         .await
         .expect("INSERT 2 RETURNING failed");
-    let count2 = rows2.iter()
+    let count2 = rows2
+        .iter()
         .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
         .count();
     assert_eq!(count2, 1, "expected 1 row from second INSERT RETURNING");
@@ -886,7 +948,10 @@ async fn idempotent_replay_is_noop() {
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
         .expect("INSERT failed");
-    client.simple_query("COMMIT").await.expect("COMMIT 1 failed");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT 1 failed");
 
     // Verify row was written
     shard_db.flush().await.unwrap();
@@ -902,7 +967,10 @@ async fn idempotent_replay_is_noop() {
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
         .expect("INSERT replay failed");
-    client.simple_query("COMMIT").await.expect("COMMIT 2 (replay) failed");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT 2 (replay) failed");
 
     // Still exactly 1 row — replay was a no-op
     shard_db.flush().await.unwrap();
@@ -918,9 +986,9 @@ async fn idempotent_replay_is_noop() {
 /// S6 green gate: idempotency-key cleanup uses scan-and-delete, no range-delete.
 #[tokio::test]
 async fn idempotency_key_expiry_cleanup_no_range_delete() {
+    use object_store::memory::InMemory;
     use rockstream_storage::{ShardDb, ShardKeyEncoder};
     use std::sync::Arc;
-    use object_store::memory::InMemory;
 
     let store = Arc::new(InMemory::new());
     let shard_db = ShardDb::builder("s6-cleanup", store.clone())
@@ -958,7 +1026,10 @@ async fn idempotency_key_expiry_cleanup_no_range_delete() {
 
     // Verify old key is gone, new key still present
     let old_epoch = shard_db.get_idempotency_epoch(0, old_hash).await.unwrap();
-    assert!(old_epoch.is_none(), "old key should be deleted after cleanup");
+    assert!(
+        old_epoch.is_none(),
+        "old key should be deleted after cleanup"
+    );
 
     let new_epoch = shard_db.get_idempotency_epoch(0, new_hash).await.unwrap();
     assert!(new_epoch.is_some(), "new key should survive cleanup");
@@ -986,7 +1057,11 @@ async fn proof_psql_insert_commit_reflects_in_view() {
 
     shard_db.flush().await.unwrap();
     let rows = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
-    assert_eq!(rows.len(), 1, "P1: expected 1 row in view_output after COMMIT");
+    assert_eq!(
+        rows.len(),
+        1,
+        "P1: expected 1 row in view_output after COMMIT"
+    );
     let (_, val) = &rows[0];
     let val_str = String::from_utf8_lossy(val);
     assert!(
@@ -1036,7 +1111,10 @@ async fn proof_idempotent_replay_noop_lfs() {
         .simple_query("INSERT INTO orders (id, amount) VALUES (10, 99)")
         .await
         .expect("INSERT 1 failed");
-    client.simple_query("COMMIT").await.expect("COMMIT 1 failed");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT 1 failed");
 
     shard_db.flush().await.unwrap();
     let rows1 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
@@ -1051,7 +1129,10 @@ async fn proof_idempotent_replay_noop_lfs() {
         .simple_query("INSERT INTO orders (id, amount) VALUES (10, 99)")
         .await
         .expect("INSERT replay failed");
-    client.simple_query("COMMIT").await.expect("COMMIT replay failed");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT replay failed");
 
     shard_db.flush().await.unwrap();
     let rows2 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
@@ -1070,9 +1151,9 @@ async fn proof_idempotent_replay_noop_lfs() {
 #[tokio::test]
 #[cfg(feature = "testcontainers")]
 async fn proof_idempotent_replay_noop_minio() {
+    use object_store::aws::AmazonS3Builder;
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::minio::MinIO;
-    use object_store::aws::AmazonS3Builder;
 
     let minio = MinIO::default().start().await.expect("MinIO start failed");
     let host = minio.get_host().await.expect("host");
@@ -1103,8 +1184,14 @@ async fn proof_idempotent_replay_noop_minio() {
     let client = connect_port(local_addr.port()).await;
 
     // First commit
-    client.simple_query("SET rockstream.idempotency_key = 'p3b-minio-key'").await.unwrap();
-    client.simple_query("INSERT INTO orders (id, amount) VALUES (20, 200)").await.unwrap();
+    client
+        .simple_query("SET rockstream.idempotency_key = 'p3b-minio-key'")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (20, 200)")
+        .await
+        .unwrap();
     client.simple_query("COMMIT").await.unwrap();
 
     shard_db.flush().await.unwrap();
@@ -1112,8 +1199,14 @@ async fn proof_idempotent_replay_noop_minio() {
     assert_eq!(rows1.len(), 1, "P3b: expected 1 row after first commit");
 
     // Replay with same key
-    client.simple_query("SET rockstream.idempotency_key = 'p3b-minio-key'").await.unwrap();
-    client.simple_query("INSERT INTO orders (id, amount) VALUES (20, 200)").await.unwrap();
+    client
+        .simple_query("SET rockstream.idempotency_key = 'p3b-minio-key'")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (20, 200)")
+        .await
+        .unwrap();
     client.simple_query("COMMIT").await.unwrap();
 
     shard_db.flush().await.unwrap();

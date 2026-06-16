@@ -37,11 +37,31 @@ impl DmlOp {
     /// Approximate byte size of this operation (used for fill-level tracking).
     pub fn byte_size(&self) -> usize {
         match self {
-            DmlOp::Insert { table, cols, values_tsv, row_key } => {
-                table.len() + cols.iter().map(|c| c.len()).sum::<usize>() + values_tsv.len() + row_key.len() + 64
+            DmlOp::Insert {
+                table,
+                cols,
+                values_tsv,
+                row_key,
+            } => {
+                table.len()
+                    + cols.iter().map(|c| c.len()).sum::<usize>()
+                    + values_tsv.len()
+                    + row_key.len()
+                    + 64
             }
-            DmlOp::Update { table, old_row_key, old_tsv, new_row_key, new_tsv } => {
-                table.len() + old_row_key.len() + old_tsv.len() + new_row_key.len() + new_tsv.len() + 64
+            DmlOp::Update {
+                table,
+                old_row_key,
+                old_tsv,
+                new_row_key,
+                new_tsv,
+            } => {
+                table.len()
+                    + old_row_key.len()
+                    + old_tsv.len()
+                    + new_row_key.len()
+                    + new_tsv.len()
+                    + 64
             }
             DmlOp::Delete { table, row_key } => table.len() + row_key.len() + 32,
         }

@@ -39,7 +39,9 @@ pub fn arrow_type_to_pg_data_type(arrow_type: &str) -> &'static str {
         "Utf8" | "LargeUtf8" => "text",
         "Boolean" => "boolean",
         "Binary" | "LargeBinary" => "bytea",
-        "Timestamp" | "TimestampMicrosecond" | "TimestampNanosecond" => "timestamp without time zone",
+        "Timestamp" | "TimestampMicrosecond" | "TimestampNanosecond" => {
+            "timestamp without time zone"
+        }
         _ => "text",
     }
 }
@@ -249,22 +251,34 @@ impl CatalogStubs {
         }
 
         // pg_catalog queries
-        if ql.contains("pg_catalog.pg_tables") || ql.contains("pg_tables") && ql.contains("pg_catalog") {
+        if ql.contains("pg_catalog.pg_tables")
+            || ql.contains("pg_tables") && ql.contains("pg_catalog")
+        {
             return Some(self.pg_tables());
         }
-        if ql.contains("pg_catalog.pg_views") || (ql.contains("pg_views") && ql.contains("pg_catalog")) {
+        if ql.contains("pg_catalog.pg_views")
+            || (ql.contains("pg_views") && ql.contains("pg_catalog"))
+        {
             return Some(self.pg_views());
         }
-        if ql.contains("pg_catalog.pg_class") || (ql.contains("pg_class") && ql.contains("pg_catalog")) {
+        if ql.contains("pg_catalog.pg_class")
+            || (ql.contains("pg_class") && ql.contains("pg_catalog"))
+        {
             return Some(self.pg_class());
         }
-        if ql.contains("pg_catalog.pg_attribute") || (ql.contains("pg_attribute") && ql.contains("pg_catalog")) {
+        if ql.contains("pg_catalog.pg_attribute")
+            || (ql.contains("pg_attribute") && ql.contains("pg_catalog"))
+        {
             return Some(self.pg_attribute());
         }
-        if ql.contains("pg_catalog.pg_namespace") || (ql.contains("pg_namespace") && ql.contains("pg_catalog")) {
+        if ql.contains("pg_catalog.pg_namespace")
+            || (ql.contains("pg_namespace") && ql.contains("pg_catalog"))
+        {
             return Some(self.pg_namespace());
         }
-        if ql.contains("pg_catalog.pg_type") || (ql.contains("pg_type") && ql.contains("pg_catalog")) {
+        if ql.contains("pg_catalog.pg_type")
+            || (ql.contains("pg_type") && ql.contains("pg_catalog"))
+        {
             return Some(self.pg_type());
         }
 
@@ -394,7 +408,11 @@ impl CatalogStubs {
     // ── pg_catalog.pg_type ───────────────────────────────────────────────────
 
     fn pg_type(&self) -> CatalogResponse {
-        let cols = vec!["oid".to_string(), "typname".to_string(), "typlen".to_string()];
+        let cols = vec![
+            "oid".to_string(),
+            "typname".to_string(),
+            "typlen".to_string(),
+        ];
         let type_rows = vec![
             (PG_OID_INT4, "int4", 4i32),
             (PG_OID_INT8, "int8", 8),

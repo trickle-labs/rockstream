@@ -138,10 +138,7 @@ mod tests {
         rows: &[(&str, &str)],
         store: Arc<InMemory>,
     ) -> Arc<ShardReader> {
-        let shard_db = ShardDb::builder(path, store.clone())
-            .build()
-            .await
-            .unwrap();
+        let shard_db = ShardDb::builder(path, store.clone()).build().await.unwrap();
         for (key_suffix, value) in rows {
             let key = format!("view_output/{view_name}/{key_suffix}");
             shard_db
@@ -176,10 +173,7 @@ mod tests {
         let r2 = make_shard_with_rows(
             "shard2",
             "orders_mv",
-            &[
-                ("00000003", "4\t400.0"),
-                ("00000004", "5\t500.0"),
-            ],
+            &[("00000003", "4\t400.0"), ("00000004", "5\t500.0")],
             store2,
         )
         .await;

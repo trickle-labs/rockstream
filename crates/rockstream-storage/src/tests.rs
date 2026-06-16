@@ -818,10 +818,7 @@ async fn oracle_insert_incremental_equals_batch() {
     }
     db_inc.flush().await.unwrap();
 
-    let rows_inc = db_inc
-        .scan_prefix(b"view_output/t/")
-        .await
-        .unwrap();
+    let rows_inc = db_inc.scan_prefix(b"view_output/t/").await.unwrap();
     db_inc.close().await.unwrap();
 
     // --- Batch path: all rows in one WriteBatch ---
@@ -840,10 +837,7 @@ async fn oracle_insert_incremental_equals_batch() {
     db_bat.write_batch(batch).await.unwrap();
     db_bat.flush().await.unwrap();
 
-    let rows_bat = db_bat
-        .scan_prefix(b"view_output/t/")
-        .await
-        .unwrap();
+    let rows_bat = db_bat.scan_prefix(b"view_output/t/").await.unwrap();
     db_bat.close().await.unwrap();
 
     // Assert both produce the same key-value set.
@@ -860,10 +854,12 @@ async fn oracle_insert_incremental_equals_batch() {
         rows_bat.len()
     );
 
-    let kv_inc: std::collections::BTreeMap<_, _> = rows_inc.iter()
+    let kv_inc: std::collections::BTreeMap<_, _> = rows_inc
+        .iter()
         .map(|(k, v)| (k.as_ref(), v.as_ref()))
         .collect::<std::collections::BTreeMap<&[u8], &[u8]>>();
-    let kv_bat: std::collections::BTreeMap<_, _> = rows_bat.iter()
+    let kv_bat: std::collections::BTreeMap<_, _> = rows_bat
+        .iter()
         .map(|(k, v)| (k.as_ref(), v.as_ref()))
         .collect::<std::collections::BTreeMap<&[u8], &[u8]>>();
 
