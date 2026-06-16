@@ -74,6 +74,10 @@ pub enum OpError {
         value: i64,
         code: ErrorCode,
     },
+
+    /// TopK buffer overflow: too many unique rows in a single partition.
+    #[error("[{code}] TopK buffer overflow: {limit} unique positive-weight rows exceeded in one partition; next_steps: reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add partition columns")]
+    TopKBufferOverflow { limit: usize, code: ErrorCode },
 }
 
 impl OpError {
@@ -157,5 +161,10 @@ impl OpError {
             value,
             code: RS_1017,
         }
+    }
+
+    pub fn topk_buffer_overflow(limit: usize) -> Self {
+        use rockstream_types::error_code::RS_1018;
+        Self::TopKBufferOverflow { limit, code: RS_1018 }
     }
 }

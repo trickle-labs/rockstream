@@ -247,6 +247,12 @@ impl RecoveryDriver {
 
         let started = Instant::now();
 
+        // M4-S1/S3 paired assertion: lease re-election via fence-epoch CAS.
+        // Check tokens before any IO — avoids masking the mismatch with a storage error.
+        if expected_token != current_token {
+            return Err(RecoveryError::LeaseReacquisitionFailed { shard_id });
+        }
+
         // Open the shard reader (pinned to checkpoint snapshot).
         let reader = ShardReader::open(shard_path.into(), object_store)
             .await
@@ -261,13 +267,6 @@ impl RecoveryDriver {
                 elapsed,
                 budget,
             });
-        }
-
-        // M4-S1/S3 paired assertion: lease re-election via fence-epoch CAS.
-        // If the expected token doesn't match the current token, the CAS
-        // fails and recovery cannot proceed without a fresh lease acquisition.
-        if expected_token != current_token {
-            return Err(RecoveryError::LeaseReacquisitionFailed { shard_id });
         }
 
         // Record progress.

@@ -109,6 +109,9 @@ pub const RS_1016: ErrorCode = ErrorCode::new(1016);
 /// MIN/MAX multiset retraction underflow: a value was retracted that has no positive weight.
 /// next_steps: ensure every retraction is matched by a prior insertion; check source ordering.
 pub const RS_1017: ErrorCode = ErrorCode::new(1017);
+/// TopK buffer overflow: more unique rows than TOPK_BUFFER_LIMIT arrived in one partition.
+/// next_steps: reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add partition columns.
+pub const RS_1018: ErrorCode = ErrorCode::new(1018);
 
 // 17xx: Lease management
 /// Shard is already leased by a different worker; acquire rejected (v0.29).
@@ -235,6 +238,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         1015 => "Group-commit queue full; back-pressure applied",
         1016 => "Aggregate running sum overflowed i64",
         1017 => "MIN/MAX multiset retraction underflow: value has no positive weight",
+        1018 => "TopK buffer overflow: too many unique rows in a single partition",
         1512 => "Inner-frontier stall in distributed recursion; per-shard recompute triggered",
         1513 => "Distributed recursion max-iteration cap exceeded without convergence",
         3601 => "Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded",
@@ -320,6 +324,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1015 => "Reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards.",
         1016 => "Reduce value magnitudes or switch to a wider numeric type.",
         1017 => "Ensure every retraction is matched by a prior insertion; check source event ordering and idempotency.",
+        1018 => "Reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add more partition columns.",
         1512 => "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs.",
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
         1701 => "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead.",
@@ -406,6 +411,7 @@ mod tests {
             RS_1013, RS_8001,
             // v0.21
             RS_4003, RS_4004, RS_4005, RS_4006, RS_3005,
+            RS_1018,
         ];
         for code in codes {
             assert_ne!(

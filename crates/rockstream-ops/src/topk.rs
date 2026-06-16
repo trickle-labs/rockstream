@@ -151,8 +151,9 @@ impl TopKOp {
                 .or_insert_with(PartitionState::new);
 
             // Update the buffer entry's net_weight (handles over-retractions correctly).
-            // Buffer admits all new entries up to 2K positive-weight entries.
-            let buffer_limit = self.k * 2;
+            // All positive-weight entries are kept in the buffer — evicting a live row
+            // would cause missing refill candidates if its higher-ranked peers are later
+            // deleted. TOPK_BUFFER_LIMIT is a hard safety cap (not a correctness eviction).
             let positive_count: usize = part.buffer.values().filter(|e| e.net_weight > 0).count();
 
             if part.buffer.contains_key(&row_id) {
@@ -176,37 +177,19 @@ impl TopKOp {
                     },
                 );
             } else {
-                // New positive-weight entry.
-                if positive_count < buffer_limit {
-                    part.buffer.insert(
-                        row_id,
-                        BufferEntry {
-                            rank_value,
-                            row_vals,
-                            net_weight: w,
-                        },
-                    );
-                } else {
-                    // Buffer full: insert only if new entry outranks the worst positive-weight entry.
-                    let new_sort_key = encode_row(&row_vals);
-                    if let Some((worst_id, worst_rv, worst_key)) =
-                        self.buffer_worst_positive(&part.buffer)
-                    {
-                        let new_beats_worst = rank_value > worst_rv
-                            || (rank_value == worst_rv && new_sort_key < worst_key);
-                        if new_beats_worst {
-                            part.buffer.remove(&worst_id);
-                            part.buffer.insert(
-                                row_id,
-                                BufferEntry {
-                                    rank_value,
-                                    row_vals,
-                                    net_weight: w,
-                                },
-                            );
-                        }
-                    }
+                // New positive-weight entry: always buffer (correctness requirement).
+                // Entries above TOPK_BUFFER_LIMIT trigger an error to prevent unbounded growth.
+                if positive_count >= TOPK_BUFFER_LIMIT {
+                    return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
                 }
+                part.buffer.insert(
+                    row_id,
+                    BufferEntry {
+                        rank_value,
+                        row_vals,
+                        net_weight: w,
+                    },
+                );
             }
 
             dirty_partitions.insert(part_key);
@@ -274,23 +257,6 @@ impl TopKOp {
             key.extend_from_slice(&v.to_be_bytes());
         }
         key
-    }
-
-    /// Find the worst positive-weight entry in the buffer by (rank_value desc, encode_row asc).
-    /// Returns (row_id, rank_value, sort_key_bytes) of the worst (last in sort order).
-    fn buffer_worst_positive(
-        &self,
-        buffer: &HashMap<u128, BufferEntry>,
-    ) -> Option<(u128, i64, Vec<u8>)> {
-        buffer
-            .iter()
-            .filter(|(_, e)| e.net_weight > 0)
-            .map(|(&rid, e)| (rid, e.rank_value, encode_row(&e.row_vals)))
-            .min_by(|a, b| {
-                // Worst = smallest in (rank_value desc, bytes asc) order.
-                // Smallest in desc order = lowest rank_value, then largest bytes.
-                a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2))
-            })
     }
 }
 
