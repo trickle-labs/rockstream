@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{stream, Sink, StreamExt};
+use futures::SinkExt;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::portal::Portal;
@@ -20,6 +21,9 @@ use pgwire::api::results::{
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::copy::{
+    CopyData as MsgCopyData, CopyDone as MsgCopyDone, CopyOutResponse as MsgCopyOutResponse,
+};
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
@@ -81,13 +85,7 @@ impl GatewayHandler {
             return Some(Ok(vec![catalog_resp_to_response(catalog_resp)]));
         }
 
-        // COPY <view> TO STDOUT
-        if ql.starts_with("copy ") && ql.contains(" to stdout") {
-            if let Some(view_name) = parse_copy_to_stdout_view(q) {
-                return Some(self.handle_copy_out(&view_name));
-            }
-        }
-
+        // COPY <view> TO STDOUT — handled via streaming in do_query; skip here.
         // CREATE VIEW / CREATE MATERIALIZED VIEW
         if ql.starts_with("create view ")
             || ql.starts_with("create materialized view ")
@@ -172,19 +170,47 @@ impl GatewayHandler {
         Ok(vec![Response::Query(QueryResponse::new(schema, data_stream))])
     }
 
-    fn handle_copy_out<'a>(&'a self, view_name: &str) -> PgWireResult<Vec<Response<'a>>> {
-        use pgwire::api::results::CopyResponse;
-        let col_count = self.catalog.get_view(view_name).map(|v| v.columns.len()).unwrap_or(1);
-        Ok(vec![Response::CopyOut(CopyResponse::new(0, col_count, vec![0i16; col_count]))])
-    }
-
     fn handle_create_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
-        let tag = if ql.contains("materialized view") {
+        let is_materialized = ql.contains("materialized view");
+        let tag = if is_materialized {
             "CREATE MATERIALIZED VIEW"
         } else {
             "CREATE VIEW"
         };
+
+        // Extract view name and query SQL for cycle detection.
+        if let Some(view_name) = parse_create_view_name(q) {
+            let select_sql = parse_create_view_query(q).unwrap_or_default();
+            let deps = extract_sql_refs(&select_sql);
+
+            // Cycle detection: returns RS-1011 if a cycle would be introduced.
+            if let Some((cycle_view, cycle_path)) =
+                self.catalog.detect_cycle_with_new_view(&view_name, &deps)
+            {
+                let msg = format!(
+                    "[RS-1011] Cycle detected in view dependencies: view '{}' forms a cycle via path: {:?}",
+                    cycle_view, cycle_path
+                );
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42P17".to_owned(),
+                    msg,
+                )))]);
+            }
+
+            // Register view in the catalog.
+            use crate::catalog_stubs::CatalogView;
+            self.catalog.add_view_with_deps(
+                CatalogView {
+                    name: view_name.clone(),
+                    sql: select_sql,
+                    columns: vec![],
+                },
+                deps,
+            );
+        }
+
         Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))])
     }
 }
@@ -195,7 +221,7 @@ impl NoopStartupHandler for GatewayHandler {}
 impl SimpleQueryHandler for GatewayHandler {
     async fn do_query<'a, 'b: 'a, C>(
         &'b self,
-        _client: &mut C,
+        client: &mut C,
         query: &'a str,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
@@ -203,6 +229,55 @@ impl SimpleQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // COPY OUT: stream CopyData messages directly through the client sink.
+        let ql = query.trim().to_lowercase();
+        if ql.starts_with("copy ") && ql.contains(" to stdout") {
+            if let Some(view_name) = parse_copy_to_stdout_view(query) {
+                let rows = self
+                    .view_reader
+                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                let row_count = rows.len();
+
+                let col_count = self
+                    .catalog
+                    .get_view(&view_name)
+                    .map(|v| v.columns.len())
+                    .unwrap_or(1);
+
+                // 1. CopyOutResponse
+                let copy_out_resp = MsgCopyOutResponse::new(
+                    0,
+                    col_count as i16,
+                    vec![0i16; col_count],
+                );
+                client
+                    .feed(PgWireBackendMessage::CopyOutResponse(copy_out_resp))
+                    .await?;
+
+                // 2. CopyData — one message per row (tab-separated text + newline)
+                for row in &rows {
+                    let mut data = row.clone();
+                    data.push(b'\n');
+                    let copy_data = MsgCopyData::new(bytes::Bytes::from(data));
+                    client.feed(PgWireBackendMessage::CopyData(copy_data)).await?;
+                }
+
+                // 3. CopyDone
+                client
+                    .feed(PgWireBackendMessage::CopyDone(MsgCopyDone::new()))
+                    .await?;
+                client.flush().await?;
+
+                // 4. Return CommandComplete — pgwire on_query will send it and
+                //    then send ReadyForQuery since state is no longer CopyInProgress.
+                return Ok(vec![Response::Execution(
+                    Tag::new(&format!("COPY {row_count}")).with_rows(row_count),
+                )]);
+            }
+        }
+
         self.dispatch_async(query).await
     }
 }
@@ -483,4 +558,58 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
         }
     }
     vec![]
+}
+
+/// Extract the view name from `CREATE [MATERIALIZED] VIEW <name> AS …`.
+fn parse_create_view_name(q: &str) -> Option<String> {
+    let ql = q.trim().to_lowercase();
+    let after: &str = if ql.starts_with("create or replace materialized view ") {
+        q[36..].trim()
+    } else if ql.starts_with("create materialized view ") {
+        q[25..].trim()
+    } else if ql.starts_with("create or replace view ") {
+        q[23..].trim()
+    } else if ql.starts_with("create view ") {
+        q[12..].trim()
+    } else {
+        return None;
+    };
+    // Take up to " AS " (case-insensitive)
+    let as_pos = after.to_lowercase().find(" as ")?;
+    let raw = after[..as_pos].trim().trim_matches('"');
+    let name = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"');
+    if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// Extract the SELECT SQL from `CREATE … AS <select>`.
+fn parse_create_view_query(q: &str) -> Option<String> {
+    let ql = q.trim().to_lowercase();
+    let as_pos = ql.find(" as ")?;
+    Some(q[as_pos + 4..].trim().to_string())
+}
+
+/// Extract table/view names referenced in FROM and JOIN clauses.
+///
+/// Used for dependency tracking in CREATE VIEW cycle detection.
+fn extract_sql_refs(sql: &str) -> Vec<String> {
+    let tokens_orig: Vec<&str> = sql.split_whitespace().collect();
+    let tokens_lower: Vec<String> = tokens_orig.iter().map(|t| t.to_lowercase()).collect();
+    let mut deps = Vec::new();
+    for i in 0..tokens_lower.len() {
+        if tokens_lower[i] == "from" || tokens_lower[i] == "join" {
+            if let Some(next) = tokens_orig.get(i + 1) {
+                // Skip subquery openers
+                if next.starts_with('(') {
+                    continue;
+                }
+                let name = next.trim_matches(|c| c == '"' || c == ',' || c == ';');
+                let name = name.rsplit('.').next().unwrap_or(name);
+                if !name.is_empty() {
+                    deps.push(name.to_string());
+                }
+            }
+        }
+    }
+    deps.dedup();
+    deps
 }

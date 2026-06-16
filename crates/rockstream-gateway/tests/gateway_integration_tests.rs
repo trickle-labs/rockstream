@@ -82,7 +82,7 @@ async fn server_starts_and_accepts_connection() {
 
 #[tokio::test]
 async fn proof_pg_catalog_schema_reflection_queries() {
-    let mut catalog = CatalogStubs::new();
+    let catalog = CatalogStubs::new();
     catalog.add_view(CatalogView {
         name: "orders_mv".to_string(),
         sql: "SELECT id, amount FROM orders WHERE amount > 0".to_string(),
@@ -185,7 +185,7 @@ async fn proof_pg_catalog_schema_reflection_queries() {
 
 #[tokio::test]
 async fn extended_query_protocol_parse_bind_execute() {
-    let mut catalog = CatalogStubs::new();
+    let catalog = CatalogStubs::new();
     catalog.add_view(CatalogView {
         name: "my_view".to_string(),
         sql: "SELECT id, val FROM base".to_string(),

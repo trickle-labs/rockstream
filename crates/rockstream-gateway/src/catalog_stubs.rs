@@ -3,7 +3,8 @@
 //! Handles ORM and psql reflection queries against standard Postgres system
 //! catalogs. All responses are synthesised from the in-memory view catalog.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 
 /// Postgres type OIDs used in RowDescription fields.
 pub const PG_OID_INT4: i32 = 23;
@@ -70,11 +71,23 @@ pub struct CatalogColumn {
     pub data_type: String,
 }
 
-/// In-memory catalog of views exposed to Postgres clients.
-#[derive(Debug, Clone, Default)]
-pub struct CatalogStubs {
+/// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
+#[derive(Debug, Default)]
+struct CatalogStubsInner {
     /// Keyed by view name.
     views: HashMap<String, CatalogView>,
+    /// Dependency map: view_name → list of view names it depends on (parsed
+    /// from `FROM`/`JOIN` clauses in CREATE VIEW SQL).
+    deps: HashMap<String, Vec<String>>,
+}
+
+/// In-memory catalog of views exposed to Postgres clients.
+///
+/// Thread-safe via interior `RwLock` so that `Arc<CatalogStubs>` can be
+/// mutated at runtime (e.g. by CREATE VIEW commands on the gateway).
+#[derive(Debug, Default)]
+pub struct CatalogStubs {
+    inner: RwLock<CatalogStubsInner>,
 }
 
 impl CatalogStubs {
@@ -82,21 +95,86 @@ impl CatalogStubs {
         Self::default()
     }
 
-    /// Register a view in the catalog.
-    pub fn add_view(&mut self, view: CatalogView) {
-        self.views.insert(view.name.clone(), view);
+    /// Register a view in the catalog without dependency tracking.
+    pub fn add_view(&self, view: CatalogView) {
+        let mut inner = self.inner.write().unwrap();
+        inner.views.insert(view.name.clone(), view);
+    }
+
+    /// Register a view with an explicit dependency list.
+    ///
+    /// Does **not** perform cycle detection — use
+    /// [`detect_cycle_with_new_view`] first if needed.
+    pub fn add_view_with_deps(&self, view: CatalogView, deps: Vec<String>) {
+        let mut inner = self.inner.write().unwrap();
+        inner.deps.insert(view.name.clone(), deps);
+        inner.views.insert(view.name.clone(), view);
     }
 
     /// List all registered views.
-    pub fn list_views(&self) -> Vec<&CatalogView> {
-        let mut v: Vec<&CatalogView> = self.views.values().collect();
-        v.sort_by_key(|v| &v.name);
+    pub fn list_views(&self) -> Vec<CatalogView> {
+        let inner = self.inner.read().unwrap();
+        let mut v: Vec<CatalogView> = inner.views.values().cloned().collect();
+        v.sort_by_key(|v| v.name.clone());
         v
     }
 
-    /// Look up a view by name.
-    pub fn get_view(&self, name: &str) -> Option<&CatalogView> {
-        self.views.get(name)
+    /// Look up a view by name, cloning the entry.
+    pub fn get_view(&self, name: &str) -> Option<CatalogView> {
+        let inner = self.inner.read().unwrap();
+        inner.views.get(name).cloned()
+    }
+
+    /// Check whether adding a new view with the given dependencies would
+    /// introduce a cycle.
+    ///
+    /// Returns `Some((view_name, cycle_path))` if a cycle is detected,
+    /// `None` if the new view is acyclic.
+    pub fn detect_cycle_with_new_view(
+        &self,
+        new_name: &str,
+        new_deps: &[String],
+    ) -> Option<(String, Vec<String>)> {
+        let inner = self.inner.read().unwrap();
+        let mut all_deps = inner.deps.clone();
+        all_deps.insert(new_name.to_string(), new_deps.to_vec());
+
+        // DFS: can we reach `new_name` starting from any of its deps?
+        fn can_reach(
+            target: &str,
+            current: &str,
+            all_deps: &HashMap<String, Vec<String>>,
+            visited: &mut HashSet<String>,
+            path: &mut Vec<String>,
+        ) -> bool {
+            if current == target {
+                return true;
+            }
+            if visited.contains(current) {
+                return false;
+            }
+            visited.insert(current.to_string());
+            path.push(current.to_string());
+            if let Some(dep_list) = all_deps.get(current) {
+                for dep in dep_list {
+                    if can_reach(target, dep, all_deps, visited, path) {
+                        return true;
+                    }
+                }
+            }
+            path.pop();
+            false
+        }
+
+        for dep in new_deps {
+            let mut visited = HashSet::new();
+            let mut path = vec![new_name.to_string()];
+            if can_reach(new_name, dep, &all_deps, &mut visited, &mut path) {
+                path.push(dep.to_string());
+                return Some((new_name.to_string(), path));
+            }
+        }
+        None
     }
 
     /// Dispatch a query string to a catalog handler. Returns `Some(rows)` if
