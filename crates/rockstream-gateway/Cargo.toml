@@ -22,6 +22,8 @@ serde_json.workspace = true
 rockstream-types.workspace = true
 rockstream-storage.workspace = true
 rockstream-sql.workspace = true
+rand.workspace = true
+dashmap.workspace = true
 
 [dev-dependencies]
 tokio-postgres.workspace = true

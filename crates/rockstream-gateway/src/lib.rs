@@ -1,7 +1,7 @@
-//! PostgreSQL wire gateway service for RockStream (v0.23).
+//! PostgreSQL wire gateway service for RockStream (v0.24).
 //!
-//! Serves reads of maintained views to Postgres-compatible clients (`psql`,
-//! SQLAlchemy, JDBC) via the pgwire protocol.
+//! Serves reads of maintained views and accepts direct-write DML (INSERT/UPDATE/DELETE)
+//! from Postgres-compatible clients (`psql`, SQLAlchemy, JDBC) via the pgwire protocol.
 //!
 //! # Modules
 //!
@@ -10,6 +10,7 @@
 //! - `view_reader`    — `ViewReader` trait + `HotOnlyViewReader`
 //! - `multi_shard_reader` — multi-shard scatter reader pinned to a frontier
 //! - `session`        — per-connection session state and isolation levels
+//! - `write_buffer`   — bounded per-connection DML accumulator (`WriteBuffer`)
 //! - `protocol`       — protocol type helpers
 //! - `error`          — `GatewayError`
 
@@ -20,13 +21,9 @@ pub mod protocol;
 pub mod server;
 pub mod session;
 pub mod view_reader;
+pub mod write_buffer;
 
 pub use error::GatewayError;
 pub use server::GatewayServer;
 pub use view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader};
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn gateway_crate_compiles() {}
-}
+pub use write_buffer::{DmlOp, WriteBuffer, WRITE_BUFFER_LIMIT_BYTES};

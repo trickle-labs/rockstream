@@ -4533,9 +4533,11 @@ version = "0.52.10"
 dependencies = [
  "async-trait",
  "bytes",
+ "dashmap",
  "futures",
  "object_store 0.12.5",
  "pgwire",
+ "rand 0.8.6",
  "rockstream-sql",
  "rockstream-storage",
  "rockstream-types",

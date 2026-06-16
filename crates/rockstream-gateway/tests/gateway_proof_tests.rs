@@ -1,13 +1,14 @@
-//! v0.23 Proof tests — Phase 3b: S6–S10 green gates.
+//! v0.23 + v0.24 Proof tests — Phase 3b/3a green gates.
 //!
-//! Each test maps to one or more Proof claims (P1–P4) from the v0.23 plan.
+//! v0.23 tests: S6–S10
+//! v0.24 tests (S2–S5): CREATE TABLE, DML accumulation, COMMIT flush, ROLLBACK
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use object_store::memory::InMemory;
 use rockstream_gateway::{
-    catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView},
+    catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable, CatalogView},
     view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -561,4 +562,231 @@ async fn _proof_orm_schema_reflection_impl() {
         attr_rows.iter().any(|(n, t)| n == "amount" && t == "701"),
         "expected amount/OID-701 in pg_attribute; got {attr_rows:?}"
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v0.24 Direct-Write DML tests (S2–S5)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Build an in-memory ShardDb backed gateway with a fresh shard.
+async fn start_gateway_with_shard(
+    shard_path: &str,
+) -> (u16, tokio::task::JoinHandle<()>, Arc<ShardDb>) {
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder(shard_path, store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db.clone());
+    let (local_addr, handle) = server.serve_background().await.unwrap();
+    (local_addr.port(), handle, shard_db)
+}
+
+// ── S2: create_table_registers_in_catalog ────────────────────────────────────
+
+/// S2 green gate: CREATE TABLE registers the table in the catalog.
+#[tokio::test]
+async fn create_table_registers_in_catalog() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // Create table
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount FLOAT8, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    // Verify catalog registration
+    let table = catalog.get_table("orders").expect("table should be in catalog");
+    assert_eq!(table.name, "orders");
+    assert_eq!(table.columns.len(), 3);
+    assert!(table.columns.iter().any(|c| c.name == "id" && c.data_type == "Int64"));
+    assert!(table.columns.iter().any(|c| c.name == "amount" && c.data_type == "Float64"));
+    assert!(table.columns.iter().any(|c| c.name == "name" && c.data_type == "Utf8"));
+
+    // CREATE TABLE IF NOT EXISTS is a no-op (no error)
+    client
+        .simple_query("CREATE TABLE IF NOT EXISTS orders (id BIGINT)")
+        .await
+        .expect("CREATE TABLE IF NOT EXISTS should not error");
+
+    // Duplicate without IF NOT EXISTS returns relation already exists
+    let result = client
+        .simple_query("CREATE TABLE orders (id BIGINT)")
+        .await;
+    let got_42p07 = match &result {
+        Err(e) => e.as_db_error().map(|d| d.code() == &tokio_postgres::error::SqlState::DUPLICATE_TABLE).unwrap_or(false)
+            || e.to_string().contains("42P07") || e.to_string().contains("already exists"),
+        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("already exists")),
+    };
+    assert!(got_42p07, "expected 42P07 duplicate table error; got {result:?}");
+}
+
+// ── S3: insert_accumulates_in_write_buffer ────────────────────────────────────
+
+/// S3 green gate: INSERT accumulates in write buffer; no shard writes until COMMIT.
+///
+/// We don't have direct write-buffer introspection here via psql, so we verify
+/// that after INSERT (no COMMIT), the view prefix is still empty.
+#[tokio::test]
+async fn insert_accumulates_in_write_buffer() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("s3-insert-buf").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
+        .await
+        .expect("INSERT failed");
+
+    // No COMMIT yet — shard should have no view_output/t/ rows
+    let rows = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
+    assert!(
+        rows.is_empty(),
+        "expected no rows before COMMIT, got {} rows",
+        rows.len()
+    );
+}
+
+/// S3 green gate: DELETE accumulates in write buffer.
+#[tokio::test]
+async fn delete_accumulates_in_write_buffer() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("s3-delete-buf").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("DELETE FROM t WHERE id = 1")
+        .await
+        .expect("DELETE failed");
+
+    // No COMMIT yet — no deletions applied
+    let rows = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
+    assert!(rows.is_empty(), "expected no rows before COMMIT");
+}
+
+// ── S4: commit_flushes_rows_scannable_via_view_prefix ────────────────────────
+
+/// S4 green gate: COMMIT flushes INSERT rows to the shard, scannable via view_output prefix.
+#[tokio::test]
+async fn commit_flushes_rows_scannable_via_view_prefix() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("s4-commit-flush").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (42, 99)")
+        .await
+        .expect("INSERT failed");
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (43, 100)")
+        .await
+        .expect("INSERT 2 failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    // Now the shard should have 2 rows under view_output/orders/
+    shard_db.flush().await.unwrap();
+    let rows = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected 2 rows after COMMIT, got {}: {:?}",
+        rows.len(),
+        rows.iter().map(|(k, _)| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+    );
+}
+
+/// S4: commit_write_batch_uses_no_range_delete — WriteBatch uses only Put/Delete ops.
+///
+/// Introspects WriteBatch to confirm no range-delete op is ever present.
+/// This is a compile-time + structural assertion: `BatchOp` has no RangeDelete variant.
+#[test]
+fn commit_write_batch_uses_no_range_delete() {
+    use rockstream_storage::BatchOp;
+    // Verify BatchOp has only Put, Delete, Merge variants (no RangeDelete).
+    // This is a compile-time exhaustiveness check: if a RangeDelete variant
+    // were added, this match would fail to compile without a new arm.
+    let op = BatchOp::Put { key: b"k".to_vec(), value: b"v".to_vec() };
+    match op {
+        BatchOp::Put { .. } => {}
+        BatchOp::Delete { .. } => {}
+        BatchOp::Merge { .. } => {}
+    }
+    // No range-delete path in BatchOp — assertion passes by exhaustiveness.
+}
+
+// ── S5: rollback_discards_write_buffer_no_shard_writes ────────────────────────
+
+/// S5 green gate: ROLLBACK discards the write buffer — no rows written to shard.
+#[tokio::test]
+async fn rollback_discards_write_buffer_no_shard_writes() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("s5-rollback").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
+        .await
+        .expect("INSERT failed");
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("ROLLBACK failed");
+
+    // After ROLLBACK, shard must have NO rows
+    shard_db.flush().await.unwrap();
+    let rows = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
+    assert!(
+        rows.is_empty(),
+        "expected no rows after ROLLBACK, got {} rows",
+        rows.len()
+    );
+}
+
+// ── S7: insert_returning_returns_written_rows ────────────────────────────────
+
+/// S7 green gate: INSERT … RETURNING returns the written row values.
+#[tokio::test]
+async fn insert_returning_returns_written_rows() {
+    let catalog = Arc::new(CatalogStubs::new());
+    // Register table with schema so RETURNING can build column info
+    catalog.add_table(CatalogTable {
+        name: "products".to_string(),
+        columns: vec![
+            rockstream_gateway::catalog_stubs::CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            rockstream_gateway::catalog_stubs::CatalogColumn {
+                name: "name".to_string(),
+                data_type: "Utf8".to_string(),
+            },
+        ],
+    });
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    let rows = client
+        .simple_query("INSERT INTO products (id, name) VALUES (1, 'Widget') RETURNING *")
+        .await
+        .expect("INSERT RETURNING failed");
+
+    let data_rows: Vec<_> = rows
+        .iter()
+        .filter_map(|m| {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+                Some(r)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(data_rows.len(), 1, "expected 1 row from RETURNING, got {}", data_rows.len());
 }

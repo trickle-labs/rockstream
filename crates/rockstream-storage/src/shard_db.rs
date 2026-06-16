@@ -128,6 +128,11 @@ impl ShardDb {
         self.object_store.clone()
     }
 
+    /// Access the last epoch atomic (for epoch allocation in direct-write commits).
+    pub fn last_epoch(&self) -> &Arc<std::sync::atomic::AtomicU64> {
+        &self.last_epoch
+    }
+
     /// Create a builder for opening a shard database.
     pub fn builder(path: impl Into<String>, object_store: Arc<dyn ObjectStore>) -> ShardDbBuilder {
         ShardDbBuilder::new(path, object_store)

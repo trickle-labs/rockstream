@@ -63,6 +63,13 @@ pub struct CatalogView {
     pub columns: Vec<CatalogColumn>,
 }
 
+/// A table entry registered by `CREATE TABLE` commands.
+#[derive(Debug, Clone)]
+pub struct CatalogTable {
+    pub name: String,
+    pub columns: Vec<CatalogColumn>,
+}
+
 /// A column in a catalog view entry.
 #[derive(Debug, Clone)]
 pub struct CatalogColumn {
@@ -76,6 +83,8 @@ pub struct CatalogColumn {
 struct CatalogStubsInner {
     /// Keyed by view name.
     views: HashMap<String, CatalogView>,
+    /// Keyed by table name (from CREATE TABLE).
+    tables: HashMap<String, CatalogTable>,
     /// Dependency map: view_name → list of view names it depends on (parsed
     /// from `FROM`/`JOIN` clauses in CREATE VIEW SQL).
     deps: HashMap<String, Vec<String>>,
@@ -123,6 +132,34 @@ impl CatalogStubs {
     pub fn get_view(&self, name: &str) -> Option<CatalogView> {
         let inner = self.inner.read().unwrap();
         inner.views.get(name).cloned()
+    }
+
+    /// Register a table in the catalog.
+    ///
+    /// If the table already exists, the call is idempotent only when the caller
+    /// handles `IF NOT EXISTS` logic. Returns `true` if a new table was inserted,
+    /// `false` if a table with the same name already existed.
+    pub fn add_table(&self, table: CatalogTable) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.tables.contains_key(&table.name) {
+            return false;
+        }
+        inner.tables.insert(table.name.clone(), table);
+        true
+    }
+
+    /// Look up a table by name, cloning the entry.
+    pub fn get_table(&self, name: &str) -> Option<CatalogTable> {
+        let inner = self.inner.read().unwrap();
+        inner.tables.get(name).cloned()
+    }
+
+    /// List all registered tables.
+    pub fn list_tables(&self) -> Vec<CatalogTable> {
+        let inner = self.inner.read().unwrap();
+        let mut v: Vec<CatalogTable> = inner.tables.values().cloned().collect();
+        v.sort_by_key(|t| t.name.clone());
+        v
     }
 
     /// Check whether adding a new view with the given dependencies would

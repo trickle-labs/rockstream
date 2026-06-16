@@ -144,6 +144,11 @@ pub const RS_2014: ErrorCode = ErrorCode::new(2014);
 pub const RS_2015: ErrorCode = ErrorCode::new(2015);
 /// Index name conflict.
 pub const RS_2016: ErrorCode = ErrorCode::new(2016);
+/// Shard write buffer full — backpressure (v0.24).
+/// next_steps: "Wait for downstream IVM processing to drain, then retry COMMIT."
+pub const RS_2019: ErrorCode = ErrorCode::new(2019);
+/// RETURNING sub-select shape not supported in this context (v0.24).
+pub const RS_2013: ErrorCode = ErrorCode::new(2013);
 
 // 3xxx: Merge / arrangement
 /// Merge operand malformed (fail-closed: never silently overwrites).
