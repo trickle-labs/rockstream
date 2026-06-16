@@ -319,6 +319,7 @@ impl ShardDb {
     }
 
     /// Look up an idempotency key epoch.
+    /// Value layout: `[epoch:8]` (legacy) or `[epoch:8][timestamp_ms:8]` (v0.24+).
     pub async fn get_idempotency_epoch(
         &self,
         shard_id: u32,
@@ -326,7 +327,7 @@ impl ShardDb {
     ) -> Result<Option<u64>, StorageError> {
         let key = ShardKeyEncoder::idempotency_key(shard_id, key_hash);
         if let Some(bytes) = self.get(&key).await? {
-            if bytes.len() == 8 {
+            if bytes.len() >= 8 {
                 let epoch = u64::from_be_bytes(bytes[..8].try_into().unwrap());
                 return Ok(Some(epoch));
             }
@@ -335,14 +336,56 @@ impl ShardDb {
     }
 
     /// Add an idempotency key insert to a WriteBatch.
+    /// Value layout: `[epoch:8][timestamp_ms:8]` — used by cleanup to expire old keys.
     pub fn put_idempotency_key(
         batch: &mut WriteBatch,
         shard_id: u32,
         key_hash: [u8; 16],
         epoch: u64,
+        timestamp_ms: u64,
     ) {
         let key = ShardKeyEncoder::idempotency_key(shard_id, key_hash);
-        batch.put(&key, &epoch.to_be_bytes());
+        let mut value = [0u8; 16];
+        value[..8].copy_from_slice(&epoch.to_be_bytes());
+        value[8..].copy_from_slice(&timestamp_ms.to_be_bytes());
+        batch.put(&key, &value);
+    }
+
+    /// Scan all idempotency keys for `shard_id` and delete those older than `retention_ms`.
+    ///
+    /// This is scan-and-delete — no range-delete path is used.
+    /// The value layout is `[epoch:8][timestamp_ms:8]`; entries with `timestamp_ms`
+    /// older than `now_ms - retention_ms` are deleted via point-delete in a WriteBatch.
+    pub async fn cleanup_expired_idempotency_keys(
+        &self,
+        shard_id: u32,
+        retention_ms: u64,
+    ) -> Result<usize, StorageError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cutoff_ms = now_ms.saturating_sub(retention_ms);
+
+        // Build the per-shard prefix: OpIndex + "IK" + shard_id
+        let prefix = ShardKeyEncoder::idempotency_prefix(shard_id);
+        let entries = self.scan_prefix(&prefix).await?;
+
+        let mut batch = WriteBatch::new();
+        let mut deleted = 0usize;
+        for (key, value) in &entries {
+            if value.len() >= 16 {
+                let ts_ms = u64::from_be_bytes(value[8..16].try_into().unwrap());
+                if ts_ms < cutoff_ms {
+                    batch.delete(key);
+                    deleted += 1;
+                }
+            }
+        }
+        if deleted > 0 {
+            self.write_batch(batch).await?;
+        }
+        Ok(deleted)
     }
 
     /// Durably commit `epoch` as the new frontier for shard `shard_id`.

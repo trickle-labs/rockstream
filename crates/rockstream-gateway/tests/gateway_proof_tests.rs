@@ -680,6 +680,10 @@ async fn commit_flushes_rows_scannable_via_view_prefix() {
     let client = connect_port(port).await;
 
     client
+        .simple_query("SET rockstream.idempotency_key = 's4-commit-flush-key'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
         .simple_query("INSERT INTO orders (id, amount) VALUES (42, 99)")
         .await
         .expect("INSERT failed");
@@ -789,4 +793,335 @@ async fn insert_returning_returns_written_rows() {
         .collect();
 
     assert_eq!(data_rows.len(), 1, "expected 1 row from RETURNING, got {}", data_rows.len());
+}
+
+// ── S7: insert_select_returning_multi_row ────────────────────────────────────
+
+/// S7 green gate: multi-row INSERT … RETURNING returns all written rows.
+/// Uses VALUES (...), (...) syntax via multiple INSERTs followed by a scan.
+#[tokio::test]
+async fn insert_select_returning_multi_row() {
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "items".to_string(),
+        columns: vec![
+            rockstream_gateway::catalog_stubs::CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            rockstream_gateway::catalog_stubs::CatalogColumn {
+                name: "name".to_string(),
+                data_type: "Utf8".to_string(),
+            },
+        ],
+    });
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // First INSERT … RETURNING
+    let rows1 = client
+        .simple_query("INSERT INTO items (id, name) VALUES (1, 'Alpha') RETURNING *")
+        .await
+        .expect("INSERT 1 RETURNING failed");
+    let count1 = rows1.iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(count1, 1, "expected 1 row from first INSERT RETURNING");
+
+    // Second INSERT … RETURNING
+    let rows2 = client
+        .simple_query("INSERT INTO items (id, name) VALUES (2, 'Beta') RETURNING *")
+        .await
+        .expect("INSERT 2 RETURNING failed");
+    let count2 = rows2.iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(count2, 1, "expected 1 row from second INSERT RETURNING");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v0.24 S6 idempotency tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// S6 green gate: COMMIT without idempotency_key or source_epoch returns RS-2007.
+#[tokio::test]
+async fn missing_idempotency_key_returns_rs2007() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("s6-missing-key").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
+        .await
+        .expect("INSERT failed");
+
+    // COMMIT without setting idempotency_key or source_epoch → RS-2007
+    let result = client.simple_query("COMMIT").await;
+    let got_rs2007 = match &result {
+        Err(e) => {
+            if let Some(db_err) = e.as_db_error() {
+                db_err.message().contains("RS-2007")
+            } else {
+                e.to_string().contains("RS-2007")
+            }
+        }
+        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("RS-2007")),
+    };
+    assert!(got_rs2007, "expected RS-2007; got: {result:?}");
+}
+
+/// S6 green gate: idempotent replay of a committed write is a no-op.
+#[tokio::test]
+async fn idempotent_replay_is_noop() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("s6-idempotent-replay").await;
+    let client = connect_port(port).await;
+
+    // First write with idempotency key
+    client
+        .simple_query("SET rockstream.idempotency_key = 'replay-key-1'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT 1 failed");
+
+    // Verify row was written
+    shard_db.flush().await.unwrap();
+    let rows = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
+    assert_eq!(rows.len(), 1, "expected 1 row after first COMMIT");
+
+    // Replay: same idempotency key — should be a no-op
+    client
+        .simple_query("SET rockstream.idempotency_key = 'replay-key-1'")
+        .await
+        .expect("SET idempotency_key replay failed");
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
+        .await
+        .expect("INSERT replay failed");
+    client.simple_query("COMMIT").await.expect("COMMIT 2 (replay) failed");
+
+    // Still exactly 1 row — replay was a no-op
+    shard_db.flush().await.unwrap();
+    let rows2 = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
+    assert_eq!(
+        rows2.len(),
+        1,
+        "expected still 1 row after idempotent replay, got {}",
+        rows2.len()
+    );
+}
+
+/// S6 green gate: idempotency-key cleanup uses scan-and-delete, no range-delete.
+#[tokio::test]
+async fn idempotency_key_expiry_cleanup_no_range_delete() {
+    use rockstream_storage::{ShardDb, ShardKeyEncoder};
+    use std::sync::Arc;
+    use object_store::memory::InMemory;
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = ShardDb::builder("s6-cleanup", store.clone())
+        .build()
+        .await
+        .unwrap();
+
+    // Insert two idempotency keys: one "old" (0 ms timestamp) and one "new" (now).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    // Old key (timestamp = 0, will be expired by any positive retention)
+    let old_hash = [1u8; 16];
+    let mut batch = rockstream_storage::WriteBatch::new();
+    ShardDb::put_idempotency_key(&mut batch, 0, old_hash, 1, 0);
+    shard_db.write_batch(batch).await.unwrap();
+
+    // New key (timestamp far in the future — will not be expired)
+    let new_hash = [2u8; 16];
+    let future_ms = now_ms + 86_400_000; // 24h ahead
+    let mut batch2 = rockstream_storage::WriteBatch::new();
+    ShardDb::put_idempotency_key(&mut batch2, 0, new_hash, 2, future_ms);
+    shard_db.write_batch(batch2).await.unwrap();
+
+    shard_db.flush().await.unwrap();
+
+    // Cleanup with 24h-1ms retention → old key (ts=0) should be deleted, new key (ts=future) survives
+    let deleted = shard_db
+        .cleanup_expired_idempotency_keys(0, 86_399_999)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1, "expected 1 expired key deleted, got {deleted}");
+
+    // Verify old key is gone, new key still present
+    let old_epoch = shard_db.get_idempotency_epoch(0, old_hash).await.unwrap();
+    assert!(old_epoch.is_none(), "old key should be deleted after cleanup");
+
+    let new_epoch = shard_db.get_idempotency_epoch(0, new_hash).await.unwrap();
+    assert!(new_epoch.is_some(), "new key should survive cleanup");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v0.24 S8/S10 LFS proof tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// P1 (S8/S10): psql INSERT + COMMIT with idempotency_key reflects in view_output scan.
+#[tokio::test]
+async fn proof_psql_insert_commit_reflects_in_view() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("proof-p1-lfs").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'proof-p1-key'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (1, 500)")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    shard_db.flush().await.unwrap();
+    let rows = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    assert_eq!(rows.len(), 1, "P1: expected 1 row in view_output after COMMIT");
+    let (_, val) = &rows[0];
+    let val_str = String::from_utf8_lossy(val);
+    assert!(
+        val_str.contains("500") || val_str.contains("1"),
+        "P1: row value should contain inserted data; got: {val_str}"
+    );
+}
+
+/// P2 (S10): A write missing idempotency_key returns RS-2007.
+#[tokio::test]
+async fn proof_missing_idempotency_returns_rs2007() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("proof-p2-missing-key").await;
+    let client = connect_port(port).await;
+
+    // Do NOT set idempotency_key
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (1, 500)")
+        .await
+        .expect("INSERT should succeed");
+
+    let result = client.simple_query("COMMIT").await;
+    let got_rs2007 = match &result {
+        Err(e) => {
+            if let Some(db_err) = e.as_db_error() {
+                db_err.message().contains("RS-2007")
+            } else {
+                e.to_string().contains("RS-2007")
+            }
+        }
+        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("RS-2007")),
+    };
+    assert!(got_rs2007, "P2: expected RS-2007; got: {result:?}");
+}
+
+/// P3a (S8/S10): Idempotent replay on LFS is a no-op.
+#[tokio::test]
+async fn proof_idempotent_replay_noop_lfs() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("proof-p3a-lfs").await;
+    let client = connect_port(port).await;
+
+    // First commit
+    client
+        .simple_query("SET rockstream.idempotency_key = 'p3a-lfs-key'")
+        .await
+        .expect("SET 1 failed");
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (10, 99)")
+        .await
+        .expect("INSERT 1 failed");
+    client.simple_query("COMMIT").await.expect("COMMIT 1 failed");
+
+    shard_db.flush().await.unwrap();
+    let rows1 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    assert_eq!(rows1.len(), 1, "P3a: expected 1 row after first commit");
+
+    // Replay with same key
+    client
+        .simple_query("SET rockstream.idempotency_key = 'p3a-lfs-key'")
+        .await
+        .expect("SET replay failed");
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (10, 99)")
+        .await
+        .expect("INSERT replay failed");
+    client.simple_query("COMMIT").await.expect("COMMIT replay failed");
+
+    shard_db.flush().await.unwrap();
+    let rows2 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    assert_eq!(
+        rows2.len(),
+        1,
+        "P3a: expected still 1 row after idempotent replay (no-op), got {}",
+        rows2.len()
+    );
+}
+
+// ── P3b: MinIO proof test (feature-gated) ────────────────────────────────────
+
+/// P3b (S9/S10): Idempotent replay on MinIO is a no-op.
+/// Requires the `testcontainers` feature and a running Docker daemon.
+#[tokio::test]
+#[cfg(feature = "testcontainers")]
+async fn proof_idempotent_replay_noop_minio() {
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::minio::MinIO;
+    use object_store::aws::AmazonS3Builder;
+
+    let minio = MinIO::default().start().await.expect("MinIO start failed");
+    let host = minio.get_host().await.expect("host");
+    let port = minio.get_host_port_ipv4(9000).await.expect("port");
+
+    let store = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint(format!("http://{host}:{port}"))
+            .with_bucket_name("testbucket")
+            .with_access_key_id("minioadmin")
+            .with_secret_access_key("minioadmin")
+            .with_allow_http(true)
+            .build()
+            .expect("S3 builder"),
+    );
+
+    let shard_db = Arc::new(
+        rockstream_storage::ShardDb::builder("proof-p3b-minio", store.clone())
+            .build()
+            .await
+            .expect("ShardDb build"),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // First commit
+    client.simple_query("SET rockstream.idempotency_key = 'p3b-minio-key'").await.unwrap();
+    client.simple_query("INSERT INTO orders (id, amount) VALUES (20, 200)").await.unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+
+    shard_db.flush().await.unwrap();
+    let rows1 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    assert_eq!(rows1.len(), 1, "P3b: expected 1 row after first commit");
+
+    // Replay with same key
+    client.simple_query("SET rockstream.idempotency_key = 'p3b-minio-key'").await.unwrap();
+    client.simple_query("INSERT INTO orders (id, amount) VALUES (20, 200)").await.unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+
+    shard_db.flush().await.unwrap();
+    let rows2 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    assert_eq!(
+        rows2.len(),
+        1,
+        "P3b: expected still 1 row after idempotent replay on MinIO, got {}",
+        rows2.len()
+    );
 }

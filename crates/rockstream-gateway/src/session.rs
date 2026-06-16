@@ -34,6 +34,14 @@ pub struct SessionState {
     pub isolation_level: IsolationLevel,
     /// Current transaction isolation level name for `SHOW transaction_isolation`.
     pub search_path: String,
+    /// First 16 bytes of SHA-256 of user-supplied idempotency key string.
+    /// Set via `SET rockstream.idempotency_key = 'str'`.
+    pub idempotency_key: Option<[u8; 16]>,
+    /// Explicit source epoch envelope for this write.
+    /// Set via `SET rockstream.source_epoch = N`.
+    pub source_epoch_envelope: Option<u64>,
+    /// Epoch of the most recently committed write (for read-your-writes in v0.25).
+    pub last_written_epoch: Option<u64>,
 }
 
 impl SessionState {
@@ -42,6 +50,9 @@ impl SessionState {
             pinned_frontier: None,
             isolation_level: IsolationLevel::ReadCommitted,
             search_path: "public".to_string(),
+            idempotency_key: None,
+            source_epoch_envelope: None,
+            last_written_epoch: None,
         }
     }
 

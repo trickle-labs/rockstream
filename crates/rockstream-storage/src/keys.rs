@@ -305,6 +305,16 @@ impl ShardKeyEncoder {
         key
     }
 
+    /// Prefix for scanning all idempotency keys for a given shard.
+    /// Format: `0x02` (OpIndex) + `b"IK"` + `shard_id: u32`
+    pub fn idempotency_prefix(shard_id: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 4);
+        key.push(ShardPrefix::OpIndex.as_byte());
+        key.extend_from_slice(b"IK");
+        key.extend_from_slice(&shard_id.to_be_bytes());
+        key
+    }
+
     // ─── Window arrangement keys (IVM-7) ────────────────────────────────────
 
     /// Encode a Window input arrangement entry key.

@@ -30,6 +30,7 @@ use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
 use crate::catalog_stubs::{arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogStubs, CatalogTable};
+use crate::session::SessionState;
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
 
@@ -60,6 +61,8 @@ pub struct GatewayHandler {
     /// Per-connection write buffers keyed by connection ID.
     /// Bound: WRITE_BUFFER_LIMIT_BYTES per connection (64 MiB).
     write_buffers: Arc<DashMap<String, WriteBuffer>>,
+    /// Per-connection session state (idempotency key, isolation, etc.).
+    sessions: Arc<DashMap<String, SessionState>>,
     /// Optional ShardDb for direct-write DML commits.
     shard_db: Option<Arc<rockstream_storage::ShardDb>>,
 }
@@ -71,6 +74,7 @@ impl GatewayHandler {
             view_reader,
             query_parser: Arc::new(NoopQueryParser),
             write_buffers: Arc::new(DashMap::new()),
+            sessions: Arc::new(DashMap::new()),
             shard_db: None,
         }
     }
@@ -85,6 +89,7 @@ impl GatewayHandler {
             view_reader,
             query_parser: Arc::new(NoopQueryParser),
             write_buffers: Arc::new(DashMap::new()),
+            sessions: Arc::new(DashMap::new()),
             shard_db: Some(shard_db),
         }
     }
@@ -145,14 +150,19 @@ impl GatewayHandler {
         query: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        let q = query.trim();
+        let ql = q.to_lowercase();
+
+        // SET rockstream.* must be intercepted before catalog stubs handle generic SET commands.
+        if ql.starts_with("set rockstream.") || ql.starts_with("set local rockstream.") {
+            return self.handle_set_rockstream(q, &ql, conn_id);
+        }
+
         if let Some(result) = self.dispatch_sync(query) {
             // Promote lifetime — responses from dispatch_sync hold no borrows
             // from `query`, only owned data.
             return result.map(|v| v.into_iter().map(promote_response).collect());
         }
-
-        let q = query.trim();
-        let ql = q.to_lowercase();
 
         // COMMIT — flush write buffer to shard atomically.
         if ql == "commit" || ql == "commit;" {
@@ -322,6 +332,53 @@ impl GatewayHandler {
         Ok(vec![Response::Execution(Tag::new("CREATE TABLE").with_rows(0))])
     }
 
+    /// Handle `SET rockstream.<var> = <value>` — update per-connection session state.
+    fn handle_set_rockstream(
+        &self,
+        q: &str,
+        ql: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        let Some(id) = conn_id else {
+            return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
+        };
+
+        // Parse: SET [LOCAL] rockstream.<var> = <value>
+        // ql is already lowercased
+        let after_set = if ql.starts_with("set local rockstream.") {
+            &ql["set local rockstream.".len()..]
+        } else {
+            &ql["set rockstream.".len()..]
+        };
+        // after_set: "idempotency_key = 'str'" or "source_epoch = 42"
+        let eq_pos = after_set.find('=').unwrap_or(after_set.len());
+        let var_name = after_set[..eq_pos].trim();
+        let val_raw = after_set[eq_pos + 1..].trim().trim_end_matches(';');
+
+        let mut session = self.sessions.entry(id.to_string()).or_insert_with(SessionState::new);
+
+        match var_name {
+            "idempotency_key" => {
+                if val_raw == "default" || val_raw == "null" || val_raw == "''" {
+                    session.idempotency_key = None;
+                } else {
+                    // Strip surrounding single quotes
+                    let key_str = val_raw.trim_matches('\'');
+                    let hash = sha256_16(key_str.as_bytes());
+                    session.idempotency_key = Some(hash);
+                }
+            }
+            "source_epoch" => {
+                if let Ok(n) = val_raw.trim_matches('\'').parse::<u64>() {
+                    session.source_epoch_envelope = Some(n);
+                }
+            }
+            _ => {}
+        }
+        drop(session);
+        Ok(vec![promote_response(Response::Execution(Tag::new("SET")))])
+    }
+
     /// COMMIT handler: flush write buffer to ShardDb atomically.
     async fn handle_commit(&self, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
         let Some(conn_id) = conn_id else {
@@ -338,6 +395,36 @@ impl GatewayHandler {
             entry.clear();
             return Ok(vec![promote_response(Response::TransactionEnd(Tag::new("COMMIT").with_rows(0)))]);
         };
+
+        // ── Idempotency check ─────────────────────────────────────────────────
+        let (idempotency_key, source_epoch_envelope) = {
+            let session = self.sessions.entry(conn_id.to_string()).or_insert_with(SessionState::new);
+            (session.idempotency_key, session.source_epoch_envelope)
+        };
+        if idempotency_key.is_none() && source_epoch_envelope.is_none() {
+            entry.clear();
+            return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "23000".to_owned(),
+                "[RS-2007] write.idempotency_key_required: Every write must carry either SET rockstream.idempotency_key or SET rockstream.source_epoch. Next steps: run SET rockstream.idempotency_key = '<unique-key>' before COMMIT.".to_owned(),
+            ))))]);
+        }
+        if let Some(key_hash) = idempotency_key {
+            // Check for prior commit with this key — idempotent replay → noop
+            match shard_db.get_idempotency_epoch(0, key_hash).await {
+                Ok(Some(_prev_epoch)) => {
+                    // Already committed — discard buffer and return COMMIT noop
+                    entry.clear();
+                    return Ok(vec![promote_response(Response::TransactionEnd(
+                        Tag::new("COMMIT").with_rows(0),
+                    ))]);
+                }
+                Ok(None) => {} // proceed
+                Err(e) => {
+                    return Err(PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))));
+                }
+            }
+        }
 
         let ops = entry.drain();
         let affected = ops.len();
@@ -366,6 +453,14 @@ impl GatewayHandler {
                 }
             }
         }
+        // Persist idempotency key so replays are no-ops
+        if let Some(key_hash) = idempotency_key {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            rockstream_storage::ShardDb::put_idempotency_key(&mut batch, 0, key_hash, epoch, now_ms);
+        }
         // Advance shard frontier
         batch.put(
             &rockstream_storage::ShardKeyEncoder::frontier_key(),
@@ -376,6 +471,11 @@ impl GatewayHandler {
             .write_batch(batch)
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+
+        // Update session's last_written_epoch
+        if let Some(mut session) = self.sessions.get_mut(conn_id) {
+            session.last_written_epoch = Some(epoch);
+        }
 
         Ok(vec![promote_response(Response::TransactionEnd(
             Tag::new("COMMIT").with_rows(affected),
@@ -785,6 +885,16 @@ impl GatewayServer {
 }
 
 // ── Query helpers ─────────────────────────────────────────────────────────────
+
+/// Compute the first 16 bytes of SHA-256 of `data`.
+/// Used as a deterministic 128-bit key hash for idempotency tracking.
+fn sha256_16(data: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(data);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
 
 /// Convert a `CatalogResponse` to a pgwire `Response`.
 fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {

@@ -55,7 +55,7 @@ impl ShardReader {
     ) -> Result<Option<u64>, StorageError> {
         let key = crate::keys::ShardKeyEncoder::idempotency_key(shard_id, key_hash);
         if let Some(bytes) = self.get(&key).await? {
-            if bytes.len() == 8 {
+            if bytes.len() >= 8 {
                 let epoch = u64::from_be_bytes(bytes[..8].try_into().unwrap());
                 return Ok(Some(epoch));
             }
