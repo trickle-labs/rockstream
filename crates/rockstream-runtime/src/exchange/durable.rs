@@ -16,6 +16,37 @@ use rockstream_types::error_code::RS_3010;
 /// Named upper bound for in-memory shuffle frame accumulation (16MB).
 pub const MAX_DURABLE_BUFFER_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
+macro_rules! retry_op {
+    ($store:expr, $op:expr) => {{
+        let mut attempts = 0;
+        let mut delay = std::time::Duration::from_millis(10);
+        loop {
+            match $op.await {
+                Ok(val) => break Ok(val),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("429") || err_str.contains("Too Many Requests") || err_str.contains("throttling") {
+                        attempts += 1;
+                        if attempts >= 5 {
+                            break Err(format!(
+                                "[{}] Failed to complete operation after 5 rate-limited attempts: {:?}",
+                                RS_3010, e
+                            ));
+                        }
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                    } else {
+                        break Err(format!(
+                            "[{}] Object store operation failed: {:?}",
+                            RS_3010, e
+                        ));
+                    }
+                }
+            }
+        }
+    }};
+}
+
 /// Metadata entry representing a single serialized frame in the coalesced shuffle object.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ShuffleIndexEntry {
@@ -106,16 +137,9 @@ impl DurableShuffleWriter {
         // Append footer length as 8-byte big-endian u64
         self.buffer.extend_from_slice(&footer_len.to_be_bytes());
 
-        // Put to object store
-        store
-            .put(path, Bytes::from(self.buffer).into())
-            .await
-            .map_err(|e| {
-                format!(
-                    "[{}] Failed to put coalesced object to object store: {:?}",
-                    RS_3010, e
-                )
-            })?;
+        // Put to object store with retry
+        let payload = Bytes::from(self.buffer);
+        retry_op!(store, store.put(path, payload.clone().into()))?;
 
         Ok(())
     }
@@ -130,10 +154,7 @@ impl DurableShuffleReader {
         store: &dyn ObjectStore,
         path: &Path,
     ) -> Result<ShuffleIndexFooter, String> {
-        let meta = store
-            .head(path)
-            .await
-            .map_err(|e| format!("[{}] Head failed for path {}: {:?}", RS_3010, path, e))?;
+        let meta = retry_op!(store, store.head(path))?;
 
         let size = meta.size as u64;
 
@@ -146,10 +167,7 @@ impl DurableShuffleReader {
 
         // 1. Read last 8 bytes to get the footer length
         let footer_len_range = (size - 8)..size;
-        let footer_len_bytes = store
-            .get_range(path, footer_len_range)
-            .await
-            .map_err(|e| format!("[{}] Failed to read footer length: {:?}", RS_3010, e))?;
+        let footer_len_bytes = retry_op!(store, store.get_range(path, footer_len_range.clone()))?;
 
         if footer_len_bytes.len() != 8 {
             return Err(format!(
@@ -170,10 +188,7 @@ impl DurableShuffleReader {
 
         // 2. Read footer bytes
         let footer_range = (size - 8 - footer_len)..(size - 8);
-        let footer_bytes = store
-            .get_range(path, footer_range)
-            .await
-            .map_err(|e| format!("[{}] Failed to read footer bytes: {:?}", RS_3010, e))?;
+        let footer_bytes = retry_op!(store, store.get_range(path, footer_range.clone()))?;
 
         // 3. Deserialize footer
         let footer: ShuffleIndexFooter = serde_json::from_slice(&footer_bytes)
@@ -190,11 +205,7 @@ impl DurableShuffleReader {
     ) -> Result<Bytes, String> {
         let start = entry.offset;
         let end = entry.offset + entry.length;
-        let bytes = store
-            .get_range(path, start..end)
-            .await
-            .map_err(|e| format!("[{}] Failed to read frame range: {:?}", RS_3010, e))?;
-        Ok(bytes)
+        retry_op!(store, store.get_range(path, start..end))
     }
 }
 

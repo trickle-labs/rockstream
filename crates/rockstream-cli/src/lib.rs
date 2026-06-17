@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub mod metrics_server;
+
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts
 /// written against later versions parse, but they run the same embedded node.
@@ -71,6 +73,8 @@ pub struct StartOptions {
     pub control: Option<String>,
     /// Authentication mode: "off", "oidc", or "mtls".
     pub auth_mode: String,
+    /// Optional metrics server listen address.
+    pub metrics_addr: Option<String>,
 }
 
 /// The result of a successful `rockstream start` no-op run.
@@ -199,6 +203,13 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
 
     rt.block_on(async {
+        let mut metrics_handle = None;
+        if let Some(metrics_addr) = &opts.metrics_addr {
+            let mh = metrics_server::start_metrics_server(metrics_addr).await.unwrap();
+            tracing::info!(metrics_addr = %mh.local_addr, "metrics server started");
+            metrics_handle = Some(mh);
+        }
+
         let mut control_handle = None;
         let mut worker_handle = None;
         let mut control_url = opts.control.clone();
@@ -272,6 +283,9 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         }
         if let Some(ch) = control_handle {
             ch.shutdown();
+        }
+        if let Some(mh) = metrics_handle {
+            mh.shutdown();
         }
     });
 
@@ -372,6 +386,7 @@ mod tests {
             role: "all".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            metrics_addr: None,
         };
         let outcome = run_start(&opts).unwrap();
 
@@ -409,6 +424,7 @@ mod tests {
             role: "all".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            metrics_addr: None,
         };
         run_start(&opts).unwrap();
         assert!(nested.join("audit.jsonl").exists());
@@ -422,6 +438,7 @@ mod tests {
             role: "worker".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            metrics_addr: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -436,6 +453,7 @@ mod tests {
             role: "frontier".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            metrics_addr: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");

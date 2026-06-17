@@ -32,6 +32,13 @@ pub fn register_coord_faults(model: &mut FaultModel) {
                        panicking and without writing partial output to the coordinator.",
         category: FaultCategory::Logic,
     });
+    // SimObjectStore - simulated HTTP 429 Too Many Requests
+    model.register(FaultEntry {
+        id: "object_store.rate_limit",
+        description: "SimObjectStore: injects an HTTP 429 Too Many Requests error to test \
+                       client-side retry and backoff logic.",
+        category: FaultCategory::Io,
+    });
 }
 
 /// Fault-model entries registered by `register_coord_faults`.
@@ -39,6 +46,7 @@ pub const COORD_FAULT_IDS: &[&str] = &[
     "epoch.write_batch_partial_failure",
     "epoch.frontier_write_delay",
     "task.output_channel_closed",
+    "object_store.rate_limit",
 ];
 
 #[cfg(test)]

@@ -29,6 +29,8 @@ protobuf-src = "2.1"
 
 [dev-dependencies]
 rockstream-control = { workspace = true }
+rockstream-cli = { workspace = true }
+rockstream-sim = { workspace = true }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["minio"] }
@@ -36,3 +38,6 @@ reqwest = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+rand = { workspace = true }
+async-trait = { workspace = true }
+

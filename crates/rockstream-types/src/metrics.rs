@@ -59,6 +59,20 @@ struct MetricRegistry {
     rmw_required: HashMap<LawMetricKey, Counter>,
     /// Total manifest writes (global, not per-law).
     manifest_writes: AtomicU64,
+
+    // SRE Observability metrics
+    compaction_bytes_reclaimed: HashMap<u16, Counter>,
+    duplicate_dropped_total: HashMap<u16, Counter>,
+    tombstone_bytes: HashMap<u16, Counter>,
+    monotone_partial_lag_ms: HashMap<u16, Counter>,
+    workload_memory_bytes: HashMap<String, Counter>,
+    state_budget_bytes: AtomicU64,
+    freshness_lag_ms: HashMap<String, Counter>,
+
+    // Flush duration metrics
+    flush_duration_sum_ms: AtomicU64,
+    flush_duration_count: AtomicU64,
+    flush_duration_last_ms: AtomicU64,
 }
 
 impl MetricRegistry {
@@ -69,6 +83,16 @@ impl MetricRegistry {
             rmw_avoided: HashMap::new(),
             rmw_required: HashMap::new(),
             manifest_writes: AtomicU64::new(0),
+            compaction_bytes_reclaimed: HashMap::new(),
+            duplicate_dropped_total: HashMap::new(),
+            tombstone_bytes: HashMap::new(),
+            monotone_partial_lag_ms: HashMap::new(),
+            workload_memory_bytes: HashMap::new(),
+            state_budget_bytes: AtomicU64::new(0),
+            freshness_lag_ms: HashMap::new(),
+            flush_duration_sum_ms: AtomicU64::new(0),
+            flush_duration_count: AtomicU64::new(0),
+            flush_duration_last_ms: AtomicU64::new(0),
         }
     }
 }
@@ -255,7 +279,198 @@ pub fn reset_all() {
         reg.rmw_avoided.clear();
         reg.rmw_required.clear();
         reg.manifest_writes.store(0, Ordering::Relaxed);
+        reg.compaction_bytes_reclaimed.clear();
+        reg.duplicate_dropped_total.clear();
+        reg.tombstone_bytes.clear();
+        reg.monotone_partial_lag_ms.clear();
+        reg.workload_memory_bytes.clear();
+        reg.state_budget_bytes.store(0, Ordering::Relaxed);
+        reg.freshness_lag_ms.clear();
+        reg.flush_duration_sum_ms.store(0, Ordering::Relaxed);
+        reg.flush_duration_count.store(0, Ordering::Relaxed);
+        reg.flush_duration_last_ms.store(0, Ordering::Relaxed);
     });
+}
+
+// ─── SRE Observability Metrics Helpers ────────────────────────────────────────
+
+pub fn inc_compaction_bytes_reclaimed(law_id: u16, bytes: u64) {
+    with_registry(|reg| {
+        let counter = reg.compaction_bytes_reclaimed.entry(law_id).or_insert_with(Counter::new);
+        for _ in 0..bytes {
+            counter.inc();
+        }
+    });
+}
+
+pub fn inc_duplicate_dropped(law_id: u16) {
+    with_registry(|reg| {
+        reg.duplicate_dropped_total.entry(law_id).or_insert_with(Counter::new).inc();
+    });
+}
+
+pub fn set_tombstone_bytes(law_id: u16, bytes: u64) {
+    with_registry(|reg| {
+        let counter = reg.tombstone_bytes.entry(law_id).or_insert_with(Counter::new);
+        counter.value.store(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn set_monotone_partial_lag(law_id: u16, lag_ms: u64) {
+    with_registry(|reg| {
+        let counter = reg.monotone_partial_lag_ms.entry(law_id).or_insert_with(Counter::new);
+        counter.value.store(lag_ms, Ordering::Relaxed);
+    });
+}
+
+pub fn set_workload_memory(workload: &str, bytes: u64) {
+    with_registry(|reg| {
+        let counter = reg.workload_memory_bytes.entry(workload.to_string()).or_insert_with(Counter::new);
+        counter.value.store(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn set_state_budget(bytes: u64) {
+    with_registry(|reg| {
+        reg.state_budget_bytes.store(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn set_freshness_lag(view_name: &str, lag_ms: u64) {
+    with_registry(|reg| {
+        let counter = reg.freshness_lag_ms.entry(view_name.to_string()).or_insert_with(Counter::new);
+        counter.value.store(lag_ms, Ordering::Relaxed);
+    });
+}
+
+pub fn record_flush_duration(duration: std::time::Duration) {
+    with_registry(|reg| {
+        let ms = duration.as_millis() as u64;
+        reg.flush_duration_sum_ms.fetch_add(ms, Ordering::Relaxed);
+        reg.flush_duration_count.fetch_add(1, Ordering::Relaxed);
+        reg.flush_duration_last_ms.store(ms, Ordering::Relaxed);
+    });
+}
+
+pub fn generate_prometheus_metrics() -> String {
+    let mut out = String::new();
+    with_registry(|reg| {
+        // 1. merge_law_applied_total
+        out.push_str("# HELP merge_law_applied_total Counter tracking the number of times a merge law is evaluated on a state merge.\n");
+        out.push_str("# TYPE merge_law_applied_total counter\n");
+        for (k, c) in &reg.applied {
+            out.push_str(&format!(
+                "merge_law_applied_total{{law_id=\"{}\",law_name=\"{}\",law_version=\"{}\"}} {}\n",
+                k.law_id.0, k.law_name, k.law_version, c.get()
+            ));
+        }
+        out.push_str("\n");
+
+        // 2. merge_law_fallback_total
+        out.push_str("# HELP merge_law_fallback_total Counter tracking the number of fallback reads resolved by copying all raw bytes.\n");
+        out.push_str("# TYPE merge_law_fallback_total counter\n");
+        for (k, c) in &reg.fallback {
+            out.push_str(&format!(
+                "merge_law_fallback_total{{law_id=\"{}\",law_name=\"{}\",law_version=\"{}\"}} {}\n",
+                k.law_id.0, k.law_name, k.law_version, c.get()
+            ));
+        }
+        out.push_str("\n");
+
+        // 3. merge_law_compaction_bytes_reclaimed
+        out.push_str("# HELP merge_law_compaction_bytes_reclaimed Counter of bytes reclaimed during SlateDB compaction filters running laws.\n");
+        out.push_str("# TYPE merge_law_compaction_bytes_reclaimed counter\n");
+        for (law_id, c) in &reg.compaction_bytes_reclaimed {
+            out.push_str(&format!(
+                "merge_law_compaction_bytes_reclaimed{{law_id=\"{}\"}} {}\n",
+                law_id, c.get()
+            ));
+        }
+        out.push_str("\n");
+
+        // 4. merge_law_duplicate_dropped_total
+        out.push_str("# HELP merge_law_duplicate_dropped_total Counter of duplicated update/insert operands dropped by idempotent laws.\n");
+        out.push_str("# TYPE merge_law_duplicate_dropped_total counter\n");
+        for (law_id, c) in &reg.duplicate_dropped_total {
+            out.push_str(&format!(
+                "merge_law_duplicate_dropped_total{{law_id=\"{}\"}} {}\n",
+                law_id, c.get()
+            ));
+        }
+        out.push_str("\n");
+
+        // 5. merge_law_tombstone_bytes
+        out.push_str("# HELP merge_law_tombstone_bytes Gauge of active tombstone bytes in the arrangement state.\n");
+        out.push_str("# TYPE merge_law_tombstone_bytes gauge\n");
+        for (law_id, c) in &reg.tombstone_bytes {
+            out.push_str(&format!(
+                "merge_law_tombstone_bytes{{law_id=\"{}\"}} {}\n",
+                law_id, c.get()
+            ));
+        }
+        out.push_str("\n");
+
+        // 6. merge_law_monotone_partial_lag_ms
+        out.push_str("# HELP merge_law_monotone_partial_lag_ms Gauge showing freshness lag of monotone recursive operators.\n");
+        out.push_str("# TYPE merge_law_monotone_partial_lag_ms gauge\n");
+        for (law_id, c) in &reg.monotone_partial_lag_ms {
+            out.push_str(&format!(
+                "merge_law_monotone_partial_lag_ms{{law_id=\"{}\"}} {}\n",
+                law_id, c.get()
+            ));
+        }
+        out.push_str("\n");
+
+        // 7. workload_memory_bytes
+        out.push_str("# HELP workload_memory_bytes Gauge showing live memory consumption of stateful operators grouped by workload.\n");
+        out.push_str("# TYPE workload_memory_bytes gauge\n");
+        for (workload, c) in &reg.workload_memory_bytes {
+            out.push_str(&format!(
+                "workload_memory_bytes{{workload_name=\"{}\"}} {}\n",
+                workload, c.get()
+            ));
+        }
+        out.push_str("\n");
+
+        // 8. state_budget_bytes
+        out.push_str("# HELP state_budget_bytes Gauge tracking total memory allocations against state_budget_gb.\n");
+        out.push_str("# TYPE state_budget_bytes gauge\n");
+        out.push_str(&format!("state_budget_bytes {}\n\n", reg.state_budget_bytes.load(Ordering::Relaxed)));
+
+        // 9. freshness_lag_ms
+        out.push_str("# HELP freshness_lag_ms Gauge showing the lag between input source watermarks and the committed epoch.\n");
+        out.push_str("# TYPE freshness_lag_ms gauge\n");
+        for (view_name, c) in &reg.freshness_lag_ms {
+            out.push_str(&format!(
+                "freshness_lag_ms{{view_name=\"{}\"}} {}\n",
+                view_name, c.get()
+            ));
+        }
+        out.push_str("\n");
+
+        // 10. flush_duration_seconds_sum
+        out.push_str("# HELP flush_duration_seconds_sum Cumulative duration of all flushes.\n");
+        out.push_str("# TYPE flush_duration_seconds_sum counter\n");
+        let sum_sec = reg.flush_duration_sum_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+        out.push_str(&format!("flush_duration_seconds_sum {:.4}\n\n", sum_sec));
+
+        // 11. flush_duration_seconds_count
+        out.push_str("# HELP flush_duration_seconds_count Total count of flushes.\n");
+        out.push_str("# TYPE flush_duration_seconds_count counter\n");
+        out.push_str(&format!("flush_duration_seconds_count {}\n\n", reg.flush_duration_count.load(Ordering::Relaxed)));
+
+        // 12. flush_duration_seconds_last
+        out.push_str("# HELP flush_duration_seconds_last Latency of the last flush operation.\n");
+        out.push_str("# TYPE flush_duration_seconds_last gauge\n");
+        let last_sec = reg.flush_duration_last_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+        out.push_str(&format!("flush_duration_seconds_last {:.4}\n\n", last_sec));
+
+        // 13. slatedb_manifest_write_total
+        out.push_str("# HELP slatedb_manifest_write_total Total manifest writes.\n");
+        out.push_str("# TYPE slatedb_manifest_write_total counter\n");
+        out.push_str(&format!("slatedb_manifest_write_total {}\n", reg.manifest_writes.load(Ordering::Relaxed)));
+    });
+    out
 }
 
 #[cfg(test)]

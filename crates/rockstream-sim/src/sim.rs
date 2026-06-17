@@ -41,10 +41,13 @@ pub struct SimRuntime {
 impl SimRuntime {
     /// Create a new SimRuntime with the given seed.
     pub fn new(seed: u64) -> Self {
+        let clock = SimClock::new();
+        let object_store = SimObjectStoreHandle::new();
+        object_store.set_clock(clock.clone());
         Self {
             seed,
-            clock: SimClock::new(),
-            object_store: SimObjectStoreHandle::new(),
+            clock,
+            object_store,
             network: SimNetworkHandle::new(),
             rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(seed))),
             spawned_tasks: Arc::new(Mutex::new(Vec::new())),

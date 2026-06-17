@@ -38,6 +38,10 @@ enum Command {
         /// Authentication mode.
         #[arg(long, default_value = "off", value_parser = clap::builder::PossibleValuesParser::new(["off", "oidc", "mtls"]))]
         auth: String,
+
+        /// Metrics HTTP server listen address.
+        #[arg(long)]
+        metrics_addr: Option<String>,
     },
 }
 
@@ -57,12 +61,14 @@ fn main() -> ExitCode {
             role,
             control,
             auth,
+            metrics_addr,
         } => {
             let opts = StartOptions {
                 storage,
                 role,
                 control,
                 auth_mode: auth,
+                metrics_addr,
             };
             match run_start(&opts) {
                 Ok(outcome) => {

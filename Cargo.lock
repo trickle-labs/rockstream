@@ -4623,6 +4623,7 @@ name = "rockstream-runtime"
 version = "0.52.10"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "futures",
  "hex",
@@ -4632,9 +4633,12 @@ dependencies = [
  "prost",
  "prost-build",
  "protobuf-src",
+ "rand 0.8.6",
  "reqwest",
+ "rockstream-cli",
  "rockstream-control",
  "rockstream-ops",
+ "rockstream-sim",
  "rockstream-storage",
  "rockstream-types",
  "serde",

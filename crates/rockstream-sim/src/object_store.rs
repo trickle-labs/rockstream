@@ -5,9 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+
+use crate::clock::{Clock, SimClock};
 
 /// Error type for simulated object store operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +43,14 @@ impl SimObjectStoreHandle {
         Self {
             inner: Arc::new(SimObjectStore::new()),
         }
+    }
+
+    pub fn set_clock(&self, clock: SimClock) {
+        self.inner.set_clock(clock);
+    }
+
+    pub fn set_rate_limit(&self, ops_per_sec: Option<f64>) {
+        self.inner.set_rate_limit(ops_per_sec);
     }
 
     pub fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectStoreError> {
@@ -78,22 +89,63 @@ impl Default for SimObjectStoreHandle {
 #[derive(Debug)]
 pub struct SimObjectStore {
     objects: Mutex<BTreeMap<String, Bytes>>,
+    rate_limit: Mutex<Option<f64>>,
+    request_times: Mutex<Vec<Duration>>,
+    clock: Mutex<Option<SimClock>>,
 }
 
 impl SimObjectStore {
     pub fn new() -> Self {
         Self {
             objects: Mutex::new(BTreeMap::new()),
+            rate_limit: Mutex::new(None),
+            request_times: Mutex::new(Vec::new()),
+            clock: Mutex::new(None),
         }
     }
 
+    pub fn set_clock(&self, clock: SimClock) {
+        let mut clk = self.clock.lock();
+        *clk = Some(clock);
+    }
+
+    pub fn set_rate_limit(&self, ops_per_sec: Option<f64>) {
+        let mut limit = self.rate_limit.lock();
+        *limit = ops_per_sec;
+    }
+
+    fn check_rate_limit(&self) -> Result<(), ObjectStoreError> {
+        if crate::buggify!("object_store.rate_limit", 0.05) {
+            return Err(ObjectStoreError::Io("HTTP 429 Too Many Requests".to_string()));
+        }
+        let limit = { *self.rate_limit.lock() };
+        if let Some(r) = limit {
+            let now = if let Some(ref clock) = *self.clock.lock() {
+                clock.elapsed_since_epoch()
+              } else {
+                Duration::from_secs(0)
+            };
+
+            let mut times = self.request_times.lock();
+            times.retain(|&t| now.saturating_sub(t) < Duration::from_secs(1));
+
+            if times.len() as f64 >= r {
+                return Err(ObjectStoreError::Io("HTTP 429 Too Many Requests".to_string()));
+            }
+            times.push(now);
+        }
+        Ok(())
+    }
+
     pub fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectStoreError> {
+        self.check_rate_limit()?;
         let mut objects = self.objects.lock();
         objects.insert(key.to_string(), value);
         Ok(())
     }
 
     pub fn get(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+        self.check_rate_limit()?;
         let objects = self.objects.lock();
         objects
             .get(key)
@@ -102,6 +154,7 @@ impl SimObjectStore {
     }
 
     pub fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+        self.check_rate_limit()?;
         let mut objects = self.objects.lock();
         if objects.remove(key).is_none() {
             return Err(ObjectStoreError::NotFound(key.to_string()));
@@ -110,6 +163,9 @@ impl SimObjectStore {
     }
 
     pub fn list(&self, prefix: &str) -> Vec<String> {
+        if self.check_rate_limit().is_err() {
+            return vec![];
+        }
         let objects = self.objects.lock();
         objects
             .range(prefix.to_string()..)
@@ -119,11 +175,14 @@ impl SimObjectStore {
     }
 
     pub fn exists(&self, key: &str) -> bool {
+        if self.check_rate_limit().is_err() {
+            return false;
+        }
         let objects = self.objects.lock();
         objects.contains_key(key)
     }
 
-    /// Get a full snapshot of the store (for determinism assertions).
+    /// Get a snapshot of all keys and values for determinism checking.
     pub fn snapshot(&self) -> BTreeMap<String, Bytes> {
         self.objects.lock().clone()
     }
@@ -198,5 +257,23 @@ mod tests {
         let snap = store.snapshot();
         let keys: Vec<&String> = snap.keys().collect();
         assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_throttled_object_store() {
+        let clock = SimClock::new();
+        let store = SimObjectStoreHandle::new();
+        store.set_clock(clock);
+        // Rate limit: 2 operations per second
+        store.set_rate_limit(Some(2.0));
+
+        // First operation is fine
+        store.put("key1", Bytes::from("v1")).unwrap();
+        // Second operation is fine
+        store.put("key2", Bytes::from("v2")).unwrap();
+
+        // Third operation in the same second fails with 429
+        let err = store.put("key3", Bytes::from("v3")).unwrap_err();
+        assert!(matches!(err, ObjectStoreError::Io(ref msg) if msg.contains("429")));
     }
 }
