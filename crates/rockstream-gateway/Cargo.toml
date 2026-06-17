@@ -33,3 +33,5 @@ rockstream-control.workspace = true
 tokio-postgres.workspace = true
 tempfile.workspace = true
 object_store = { version = "0.12", features = ["aws"] }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }

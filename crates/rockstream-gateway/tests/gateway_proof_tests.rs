@@ -2006,17 +2006,23 @@ async fn copy_in_auth_enforced_lfs() {
 async fn copy_in_large_batch_no_memory_exhaustion_minio_tc() {
     use rockstream_gateway::copy_state::{COPY_IN_BUFFER_ROWS, MAX_COPY_IN_BATCH_ROWS};
     use std::sync::atomic::Ordering;
-    use testcontainers::clients::Cli;
+    use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::minio::MinIO;
 
-    let docker = Cli::default();
-    let container = docker.run(MinIO::default());
-    let minio_port = container.get_host_port_ipv4(9000);
+    let container = MinIO::default()
+        .start()
+        .await
+        .expect("MinIO container start");
+    let host = container.get_host().await.expect("get MinIO host");
+    let minio_port = container
+        .get_host_port_ipv4(9000)
+        .await
+        .expect("get MinIO port");
 
     let store = Arc::new(
         object_store::aws::AmazonS3Builder::new()
-            .with_endpoint(format!("http://localhost:{minio_port}"))
-            .with_bucket_name("rockstream-test")
+            .with_endpoint(format!("http://{host}:{minio_port}"))
+            .with_bucket_name("testbucket")
             .with_access_key_id("minioadmin")
             .with_secret_access_key("minioadmin")
             .with_allow_http(true)
