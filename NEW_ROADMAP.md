@@ -146,7 +146,9 @@ These names orient readers; they are not calendar commitments.
 | Progress-Tracked | v0.19 | Frontier protocol correct across multi-input operators; bounded shuffle storage; FizzBee M2 frontier-aggregation model green. |
 | Fault-Tolerant ✅ Done | v0.22 | Exactly-once end-to-end; 24h chaos with zero loss/duplicates; recovery SLOs met; all four FizzBee models (M1–M4) green. |
 | Postgres Pillar ✅ Done | v0.26 | Read, write, subscribe, and read-your-writes over the Postgres wire protocol. |
-| Production Ready | v0.30 | Minimal connectors, observability, security, rolling upgrades; surface frozen for 1.0. |
+| Soaks Complete | v0.31 | Ingestion connectors live; failure-detection, shard-reassignment, and freshness-recovery SLOs validated under real cloud pressure. |
+| Private Beta Ready | v0.32 | Secondary indexes enable single-digit-ms point lookups on non-primary keys; open for early-adopter onboarding. |
+| v1.0 Release | v0.43 | All v0.1–v0.42 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged. |
 
 ---
 
@@ -224,14 +226,57 @@ integration with another process).
 | v0.25 | Subscribe and read-your-writes (7.3) ✅ Done | Subscribe endpoint tailing view changes via `WalReader`, gateway-proxied (`mz_timestamp`, `mz_diff`, projected columns; `AS OF NOW WITH SNAPSHOT`, `AS OF EPOCH <n>` within `CHANGE_RETENTION` default 1 h; server-side `WHERE`; column projection); freshness tokens returned on query responses; `wait_for=<token>` read-your-writes with timeout and explicit satisfied/not-satisfied; session-scoped automatic read-your-writes after `COMMIT`. | Read-your-writes demo passes and `wait_for=<token>` resolves within the SLO; a subscribe stream survives a gateway restart with no gaps or duplicates; `SUBSCRIBE orders_mv AS OF NOW WITH SNAPSHOT` delivers current state then live deltas; `WHERE`/projection reduce traffic to matching rows/columns; `AS OF EPOCH` outside retention returns `RS-2005`. | Unit, LFS, TC |
 | v0.26 | Auth, RBAC, and read pushdown (7.4) ✅ Done | OIDC/bearer-token and mTLS auth at the gateway (`--auth=off` for local dev); per-view RBAC (`viewer`/`pipeline_owner`/`admin`) in the control-plane catalog; namespace isolation; cross-shard partial aggregation pushdown (DESIGN.md §12.3.1) so `SELECT agg, key FROM mv GROUP BY key` returns O(distinct groups × shards) rows. **Postgres Pillar** milestone. | An application using a standard Postgres driver creates a view, writes rows, reads them back with read-your-writes, and subscribes to changes end-to-end against the distributed engine; unauthenticated requests are rejected; cross-namespace access is denied; the audit log records `actor` on every control action; `EXPLAIN` names the pushdown effect. | Unit, LFS, TC |
 
-### Phase 8 — Minimal Connectors & Production Hardening
+### Phase 8 — Ingestion & The Crucible Soaks
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.27 | Kafka and Postgres CDC connectors | Kafka source (consumer-group; offsets in the control plane) and Postgres logical-replication source (`pgoutput`); the §13.3 connector contract (`discover_schema`/`start_snapshot`/`poll_delta`/`commit_offset`/`prepare`/`commit`/`abort`/`should_flush`, opaque `OffsetToken`, `watermark`, `credits_available()`); dead-letter queue (`RS-1003` events → DLQ sink; `rockstream_catalog.dead_letter_queue` with replay/dismiss). | An end-to-end Postgres CDC → IVM → Kafka pipeline runs against TestContainers (Postgres + Kafka + MinIO); a Kafka source closes a tumbling window correctly under deliberate clock skew; under downstream saturation, consumption tracks credits with bounded inbox memory; decode errors land in the DLQ and `REPLAY` re-processes them after a fix. | Unit, LFS, MinIO, TC |
-| v0.28 | Object-store sink, schema evolution, observability | Object-store/Parquet sink (idempotent rename); connector schema-version publication with incompatible-drift block (`RS-1002`) before any offset advances; Prometheus metrics (per-operator throughput/latency/state, shuffle bytes, frontier lag, checkpoint duration); OpenTelemetry per-epoch and source-to-sink traces; admin CLI (`pipeline`, `cluster status/scale`, `cluster workers`, `shard`, `checkpoint`, `debug arrangement`). | A schema-incompatible upstream change blocks consumption with `RS-1002` before any offset advances; the Parquet sink writes idempotently under crash-mid-flush (verified on MinIO); metrics and traces are emitted and scrapeable in a TestContainers integration run. | Unit, LFS, MinIO, TC |
-| v0.29 | Security and rolling upgrades | mTLS everywhere (worker↔control, worker↔worker, gateway↔client) with documented rotation; at-rest encryption via object-store features; `CREATE SECRET` with envelope encryption and worker-side resolution; storage-format version gate on shard open (`RS-5001`); N→N+1 rolling upgrade one worker at a time; full `RS-XXXX` doc pages with `next_steps` (CI-enforced); simulation CI gate (safety + liveness). | Unauthenticated/cross-tenant requests are rejected with `actor` audited; a rolling N→N+1 upgrade loses no epochs and the format-version gate fires on an incompatible binary; every registered error code has a published doc page with non-empty `next_steps`. The `formal-verify` job (all four FizzBee models, M1–M4) is part of the release gate alongside the simulation CI gate. | Unit, LFS, MinIO, TC |
-| v0.30 | Production soak and surface freeze | 24-hour end-to-end exactly-once soak (Postgres CDC → IVM → Kafka at 100k rows/s); multi-day availability run on a 32–64-shard cluster; disaster-recovery runbook executed; independent security review; public-surface audit and classification (SQL subset, CLI, system tables, metrics, error codes) with the stable surface frozen and minimal. **Production Ready** milestone → 1.0 gate. | The 24-hour E2E soak shows zero loss and zero duplicates; ≥99.9% availability over the multi-day soak; the DR procedure completes successfully; the security review passes; the stable public surface is frozen, classified, and documented. | Unit, LFS, MinIO, TC |
+| v0.27 | Bulk Historical Load (`COPY` Protocol) | Implement the standard Postgres `COPY` protocol via the pgwire layer; enables migration of massive historical datasets into distributed base tables without external streaming pipelines. | Users can execute multi-gigabyte `COPY FROM` commands into distributed base tables without memory exhaustion. | Unit, LFS, MinIO, TC |
+| v0.28 | First-Party Source Connectors | Native, highly optimized Kafka (consumer-group; offsets in the causal frontier) and AWS S3 source connectors for continuous streaming ingestion; the §13.3 connector contract (`discover_schema`/`start_snapshot`/`poll_delta`/`commit_offset`/`prepare`/`commit`/`abort`/`should_flush`). | Kafka offsets and S3 file pointers are correctly tracked within the causal frontier protocol for exactly-once ingestion; a Kafka source closes a tumbling window correctly under deliberate clock skew. | Unit, LFS, MinIO, TC |
+| v0.29 | Object Store Limit Soak | Maximize sustained pressure to validate shard-level group commits, SST/WAL caches, and coalesced durable fallback paths against cloud provider rate limits; native OpenTelemetry/Prometheus metrics (`/metrics`) utilized for monitoring flush latencies. | The cluster maintains high throughput for 72 hours without HTTP 429 (Too Many Requests) throttling errors from the cloud provider. | Unit, LFS, MinIO, TC |
+| v0.30 | Auto-Tuner Chaos Soak | Subject the cluster to extreme step-function traffic spikes to test the default "self-tuning" adaptive control loops (epoch sizing, source throttling, and parallelism); prove control loops do not overcorrect and enter destabilizing oscillation. | Control loops settle to a stable steady-state within 3 epochs of a 10× traffic spike. | Unit, LFS, MinIO, TC |
+| v0.31 | Recovery SLO Validation | Induce hard network partitions and simulated object-store brownouts under continuous Kafka streaming load; instrument recovery timings end-to-end. **Soaks Complete** milestone. | Failure detection ≤5 s p99, shard reassignment ≤30 s p99, freshness recovery <60 s p99 for 1 TB of state. | Unit, LFS, MinIO, TC |
+
+### Phase 9 — Operational HTAP Ergonomics
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.32 | Secondary Indexes | System-managed materialized IVM views acting transparently as secondary indexes for point queries on non-primary keys; eliminates full shard scans for highly concurrent application reads. **Private Beta Ready** milestone. | Point lookups on indexed non-primary columns execute in single-digit milliseconds. | Unit, LFS, MinIO, TC |
+
+### Phase 10 — The Data Lake Bridge & FinOps
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.33 | Cold-Tier Sinks & Simulator Fixes | Iceberg and Delta sinks exporting periodic columnar Parquet snapshots to object storage; update `SimRuntime` to mock partial object writes; bridges RockStream to the Data Lakehouse for external engines (DuckDB, Trino, Databricks). | External engines can query RockStream-generated Iceberg tables with zero data corruption. | Unit, LFS, MinIO, TC |
+| v0.34 | Deep FinOps Optimizations | Route latency-sensitive metadata (`shard_meta/`) to AWS S3 Express One Zone; tier older compacted SSTs to S3 Standard-IA; validate running the stateless worker pool entirely on Spot/preemptible instances. | TCO benchmarks show >50% reduction in steady-state operational costs compared to v0.31. | Unit, LFS, MinIO, TC |
+
+### Phase 11 — Network Efficiency & Advanced DML
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.35 | Advanced DML & Scatter Pruning | `UPDATE … RETURNING` and `DELETE … RETURNING` (read-modify-write semantics); piggyback min/max bounds and Bloom filters onto the frontier summary to prune unneeded shards during multi-shard point lookups. | Multi-shard point reads safely bypass >90% of shards based on frontier summary Bloom filters. | Unit, LFS, MinIO, TC |
+| v0.36 | Zero-Copy IPC & AZ-Aware Shuffle | Upgrade same-host gRPC loopbacks to Apache Arrow Flight Shared Memory; make the hierarchical exchange subsystem aware of physical availability zones (AZs) to eliminate cross-AZ egress during shuffle. | Zero byte-copying observed in CPU profiles for same-host worker exchanges; cross-AZ traffic drops to near zero during shuffle phases. | Unit, LFS, MinIO, TC |
+
+### Phase 12 — Complex Analytics & Compute Tuning
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.37 | Advanced Streaming Analytics | SQL compiler support for recursive CTEs (`WITH RECURSIVE`) for graph algorithms and fixed-point IVM, lateral joins for nested JSON/arrays, and hopping/session windows. | Transitive closures and sessionization queries incrementally maintain state correctly against the correctness oracle. | Unit, LFS, MinIO, TC |
+| v0.38 | Hot-Path Compute Optimizations | WAL elision for derived intermediate operator shards; link `max_rows_per_quantum` directly to network buffer depth to provide tight backpressure coupling. | Throughput on complex DAGs increases by >30% due to reduced intermediate WAL write amplification. | Unit, LFS, MinIO, TC |
+
+### Phase 13 — Declarative Data Governance
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.39 | Inline Expectations & Lineage Diagnostics | `CREATE EXPECTATION` syntax; specialized "Expectation Operator" injected into the DAG to evaluate rows and zero out Z-set weights for failed records before they reach `ViewSink`; hooks into `EXPLAIN INCREMENTAL ANALYZE`. | Malformed records injected into upstream sources never reach downstream `ViewSink` outputs. | Unit, LFS, MinIO, TC |
+| v0.40 | DLQ Routing & State Degradation | Transactionally forward failed rows to an internal base-table shard (canonical Dead Letter Queue); implement state degradation policies (`warn`, `degrade`, `block`); guarantee exactly-once processing for failed rows. | Failed records are durably queryable in `rockstream_catalog.dead_letter_queue` alongside exactly-once commit boundaries. | Unit, LFS, MinIO, TC |
+
+### Phase 14 — Enterprise Validation & 1.0 Finalization
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.41 | Isolation & Validation Hooks | Validate non-CRDT exact-key writes against per-row versions to prevent blind overwrites; support single-shard `SERIALIZABLE LOCAL` isolation via SlateDB transactions for standard ACID transactional workflows. | Concurrent conflicting writes to the same key on a single shard correctly trigger serialization anomalies/aborts. | Unit, LFS, MinIO, TC |
+| v0.42 | Simulator Maturity & Auto-Tuning Lock | Finalize shift from bounded defaults to fully SLO-driven adaptive control loops; update `SimRuntime` to model Kafka broker-side transaction timeouts (`transaction.timeout.ms`); close final known testing gap for external-system edge cases. | Simulator accurately reproduces and recovers from aborted Kafka transaction edge-cases. | Unit, LFS, MinIO, TC |
+| v0.43 | v1.0 Release Candidate (RC1) | Activate all features from v0.1 through v0.42 simultaneously; run comprehensive chaos, performance, and scaling soak under maximum cluster pressure within a single cloud region. **v1.0 Release** milestone → tag `v1.0.0`. | No P0 or P1 bugs discovered during a 2-week continuous automated chaos cycle. | Unit, LFS, MinIO, TC |
 
 ---
 
@@ -251,7 +296,7 @@ the design is verified before the implementation exists.
 | v0.20 | M4 self-fencing model (D6.1–D6.2) | `formal/m4_self_fencing.fizz` | M4-S1…S4, M4-L1…L2, COV-M4 | M4 model green (justifies writer re-election); paired `assert!`s in `rockstream-runtime` |
 | v0.21 | M3 sink-2PC model (D6.3–D6.4) + M1 duplication variant (D6.5) | `formal/m3_sink_2pc.fizz` (×3 idempotency profiles), `formal/m1_epoch_commit.fizz` (duplication) | M3-S1…S4, M3-L1, COV-M3; M1-S5 under duplication | M3 model green (M3-S3 composed with M1 `cluster_committed`); paired `assert!`s in `rockstream-connectors`, `-runtime` |
 | v0.22 | Continuous verification + findings (D6.6, DC.1–DC.4) | all `.fizz` specs, `formal/findings.md` | all M1–M4 safety + liveness | All four models green at CI-fast and relaxed bounds; path-coupling check live; counterexamples replayed forever as regression seeds |
-| v0.23–v0.30 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M4 | A coordination-protocol change without a model touch fails CI; the v0.30 surface freeze re-runs the relaxed-bounds sweep |
+| v0.23–v0.43 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M4 | A coordination-protocol change without a model touch fails CI; the v0.43 RC1 gate re-runs the relaxed-bounds sweep |
 
 Every row above maps each FizzBee invariant to a paired runtime `assert!` per
 [FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6; CI cross-checks that every
@@ -274,10 +319,18 @@ build thereafter.
 | Phase 5 — Frontier Protocol | v0.18 – v0.19 | M2 frontier aggregation |
 | Phase 6 — Fault Tolerance & Exactly-Once | v0.20 – v0.22 | M3 sink 2PC, M4 self-fencing |
 | Phase 7 — PostgreSQL Wire Gateway | v0.23 – v0.26 | Continuous verification |
-| Phase 8 — Minimal Connectors & Hardening | v0.27 – v0.30 | Continuous verification + relaxed-bounds sweep |
+| Phase 8 — Ingestion & The Crucible Soaks | v0.27 – v0.31 | Continuous verification + relaxed-bounds sweep |
+| Phase 9 — Operational HTAP Ergonomics | v0.32 | Continuous verification |
+| Phase 10 — The Data Lake Bridge & FinOps | v0.33 – v0.34 | Continuous verification |
+| Phase 11 — Network Efficiency & Advanced DML | v0.35 – v0.36 | Continuous verification |
+| Phase 12 — Complex Analytics & Compute Tuning | v0.37 – v0.38 | Continuous verification |
+| Phase 13 — Declarative Data Governance | v0.39 – v0.40 | Continuous verification |
+| Phase 14 — Enterprise Validation & 1.0 Finalization | v0.41 – v0.43 | Continuous verification + relaxed-bounds sweep at RC1 |
 
-Thirty versions at ~6 person-weeks each is the full path from an empty
-repository to a production-ready, two-pillar 1.0. The order is fixed:
+Forty-three versions at ~6 person-weeks each is the full path from an empty
+repository to a production-ready, enterprise-grade 1.0. The order is fixed:
 correctness on one shard is proven before distribution, distribution is made
-fault-tolerant before the Postgres layer depends on it, and only a minimal,
-fully-tested connector set and hardening pass close out 1.0.
+fault-tolerant before the Postgres layer depends on it, ingestion connectors
+and crucible soaks validate real-world pressure before HTAP ergonomics, and
+the data lake bridge, network optimizations, complex analytics, and data
+governance layers close out 1.0 through v0.43.
