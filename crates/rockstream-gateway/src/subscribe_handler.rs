@@ -108,7 +108,10 @@ pub enum SubscribeError {
 impl std::fmt::Display for SubscribeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EpochBeforeRetention { requested, earliest } => write!(
+            Self::EpochBeforeRetention {
+                requested,
+                earliest,
+            } => write!(
                 f,
                 "[RS-2006] history.epoch_before_retention: \
                  requested epoch {requested} is before the earliest retained epoch {earliest}. \
@@ -222,8 +225,11 @@ impl SubscriberHandle {
             ) {
                 continue;
             }
-            let projected =
-                apply_projection(&entry.encoded_row, self.req.projection.as_deref(), &col_names_ref);
+            let projected = apply_projection(
+                &entry.encoded_row,
+                self.req.projection.as_deref(),
+                &col_names_ref,
+            );
             rows.push(SubscribeRow {
                 mz_timestamp: entry.epoch,
                 mz_diff: entry.mz_diff,
@@ -262,7 +268,12 @@ pub fn start_from_epoch(
     }
     // Replay: start at one epoch before start_epoch so that poll() includes start_epoch.
     let replay_from = start_epoch.saturating_sub(1);
-    Ok(SubscriberHandle::new(table_name, replay_from, req.clone(), col_names))
+    Ok(SubscriberHandle::new(
+        table_name,
+        replay_from,
+        req.clone(),
+        col_names,
+    ))
 }
 
 /// Run the full subscribe lifecycle (snapshot + live tail) for a request.
@@ -309,9 +320,7 @@ where
                 }
             }
             // Replay entries from log.
-            let replay = registry
-                .since_epoch(&req.view_name, *e)
-                .unwrap_or_default();
+            let replay = registry.since_epoch(&req.view_name, *e).unwrap_or_default();
             let mut last = e.saturating_sub(1);
             for entry in &replay {
                 if !passes_where(
@@ -322,8 +331,11 @@ where
                     last = entry.epoch;
                     continue;
                 }
-                let projected =
-                    apply_projection(&entry.encoded_row, req.projection.as_deref(), &col_names_ref);
+                let projected = apply_projection(
+                    &entry.encoded_row,
+                    req.projection.as_deref(),
+                    &col_names_ref,
+                );
                 on_row(SubscribeRow {
                     mz_timestamp: entry.epoch,
                     mz_diff: entry.mz_diff,
@@ -359,11 +371,7 @@ where
 /// tab-separated and the column index is resolved by name from `col_names`.
 ///
 /// Returns `true` if the row passes the filter (or if there is no filter).
-pub fn passes_where(
-    encoded_row: &Bytes,
-    where_clause: Option<&str>,
-    col_names: &[&str],
-) -> bool {
+pub fn passes_where(encoded_row: &Bytes, where_clause: Option<&str>, col_names: &[&str]) -> bool {
     let Some(pred) = where_clause else {
         return true;
     };
@@ -528,10 +536,8 @@ mod tests {
     #[test]
     fn subscribe_restart_replays_from_epoch() {
         // Write epochs 1-5.
-        let registry = make_registry_with_entries(
-            "orders_mv",
-            &[(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)],
-        );
+        let registry =
+            make_registry_with_entries("orders_mv", &[(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]);
         let req = parse_subscribe("SUBSCRIBE orders_mv AS OF EPOCH 3").unwrap();
 
         let mut handle = start_from_epoch(&registry, &req, 3, vec![]).unwrap();
@@ -564,7 +570,10 @@ mod tests {
         let req = parse_subscribe("SUBSCRIBE orders_mv AS OF EPOCH 1").unwrap();
         let err = start_from_epoch(&reg, &req, 1, vec![]).unwrap_err();
         match err {
-            SubscribeError::EpochBeforeRetention { requested, earliest } => {
+            SubscribeError::EpochBeforeRetention {
+                requested,
+                earliest,
+            } => {
                 assert_eq!(requested, 1);
                 assert!(earliest > 1, "earliest should be > 1 after eviction");
             }
@@ -593,7 +602,12 @@ mod tests {
         let req = parse_subscribe("SUBSCRIBE t WHERE id > 5").unwrap();
         let mut handle = SubscriberHandle::new("t".to_string(), 0, req, col_names_owned);
         let rows = handle.poll(&registry).unwrap();
-        assert_eq!(rows.len(), 5, "expected 5 rows with id > 5, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            5,
+            "expected 5 rows with id > 5, got {}",
+            rows.len()
+        );
         for row in &rows {
             let id: u64 = std::str::from_utf8(&row.encoded_row)
                 .unwrap()
@@ -631,9 +645,17 @@ mod tests {
         for row in &rows {
             let s = std::str::from_utf8(&row.encoded_row).unwrap();
             let fields: Vec<&str> = s.split('\t').collect();
-            assert_eq!(fields.len(), 2, "expected 2 projected fields, got {:?}", fields);
+            assert_eq!(
+                fields.len(),
+                2,
+                "expected 2 projected fields, got {:?}",
+                fields
+            );
             // Should NOT contain "name" values
-            assert!(!fields[0].starts_with("name"), "first field should be id, not name");
+            assert!(
+                !fields[0].starts_with("name"),
+                "first field should be id, not name"
+            );
         }
     }
 }

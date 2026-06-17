@@ -879,7 +879,10 @@ mod partial_agg_tests {
     #[tokio::test]
     async fn partial_agg_shard_query_returns_compact_batch() {
         let store = Arc::new(InMemory::new());
-        let shard = ShardDb::builder("partial-agg-test", store).build().await.unwrap();
+        let shard = ShardDb::builder("partial-agg-test", store)
+            .build()
+            .await
+            .unwrap();
 
         for i in 0u64..100 {
             let group = i % 5;
@@ -894,7 +897,10 @@ mod partial_agg_tests {
             agg_type: "sum".to_string(),
         };
         let plan_bytes = serde_json::to_vec(&spec).unwrap();
-        let result = shard.partial_query("orders_mv", &plan_bytes, 0).await.unwrap();
+        let result = shard
+            .partial_query("orders_mv", &plan_bytes, 0)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 5, "expected 5 groups, got {}", result.len());
     }
@@ -922,13 +928,18 @@ mod partial_agg_tests {
             agg_type: "sum".to_string(),
         };
         let plan_bytes = serde_json::to_vec(&spec).unwrap();
-        let err = shard.partial_query_with_limit("mv", &plan_bytes, 0, 3).await;
+        let err = shard
+            .partial_query_with_limit("mv", &plan_bytes, 0, 3)
+            .await;
         assert!(
             matches!(err, Err(StorageError::PartialAggResultTooLarge { .. })),
             "expected PartialAggResultTooLarge, got {:?}",
             err
         );
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("RS-2002"), "expected RS-2002 in error, got: {msg}");
+        assert!(
+            msg.contains("RS-2002"),
+            "expected RS-2002 in error, got: {msg}"
+        );
     }
 }

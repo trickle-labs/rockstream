@@ -4500,7 +4500,23 @@ dependencies = [
 name = "rockstream-connectors"
 version = "0.52.10"
 dependencies = [
+ "arrow",
+ "futures",
+ "hex",
+ "hmac 0.12.1",
+ "object_store 0.12.5",
+ "reqwest",
+ "rockstream-ops",
+ "rockstream-plan",
+ "rockstream-sim",
+ "rockstream-storage",
  "rockstream-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "testcontainers",
+ "tokio",
 ]
 
 [[package]]

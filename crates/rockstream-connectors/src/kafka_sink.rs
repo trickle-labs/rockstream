@@ -166,7 +166,7 @@ impl SinkConnector for KafkaSink {
                     return Ok(());
                 }
                 // Not yet delivered: begin a new transaction and commit.
-                let state = SinkState::PreCommitted {
+                let _state = SinkState::PreCommitted {
                     staged_rows: 0,
                     pending_handle: pending_handle.clone(),
                 };
@@ -311,10 +311,12 @@ mod tests {
 
 // ─── Extension trait for test access to pending_handle ───────────────────────
 
+#[cfg(test)]
 trait SinkStatePendingHandle {
     fn pending_handle(&self) -> &[u8];
 }
 
+#[cfg(test)]
 impl SinkStatePendingHandle for SinkState {
     fn pending_handle(&self) -> &[u8] {
         match self {

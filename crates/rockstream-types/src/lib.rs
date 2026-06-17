@@ -4,8 +4,8 @@
 //! timestamps, frontiers, Z-set rows, schema definitions, identity types,
 //! batch types, merge-law descriptors, law implementations, and audit events.
 
-pub mod arrow_batch;
 pub mod acl;
+pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
 pub mod checkpoint;

@@ -195,14 +195,16 @@ mod tests {
 
     #[test]
     fn subscribe_parse_where_projection() {
-        let req = parse_subscribe(
-            "SUBSCRIBE orders_mv AS OF NOW WITH SNAPSHOT WHERE id > 5 (id, value)",
-        )
-        .unwrap();
+        let req =
+            parse_subscribe("SUBSCRIBE orders_mv AS OF NOW WITH SNAPSHOT WHERE id > 5 (id, value)")
+                .unwrap();
         assert_eq!(req.view_name, "orders_mv");
         assert_eq!(req.start, SubscribeStart::NowWithSnapshot);
         assert_eq!(req.where_clause.as_deref(), Some("id > 5"));
-        assert_eq!(req.projection, Some(vec!["id".to_string(), "value".to_string()]));
+        assert_eq!(
+            req.projection,
+            Some(vec!["id".to_string(), "value".to_string()])
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{
-    CopyData, CopyDone, CopyFail, CopyData as MsgCopyData, CopyDone as MsgCopyDone,
+    CopyData, CopyData as MsgCopyData, CopyDone, CopyDone as MsgCopyDone, CopyFail,
     CopyOutResponse as MsgCopyOutResponse,
 };
 use pgwire::messages::response::CommandComplete;
@@ -38,7 +38,9 @@ use crate::auth::{AuthMode, JwtVerifier, Principal};
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogStubs, CatalogTable,
 };
-use crate::copy_state::{CopyState, COPY_IN_BUFFER_ROWS, MAX_COPY_IN_BATCH_ROWS, COPY_IN_FLUSH_BYTES};
+use crate::copy_state::{
+    CopyState, COPY_IN_BUFFER_ROWS, COPY_IN_FLUSH_BYTES, MAX_COPY_IN_BATCH_ROWS,
+};
 use crate::session::{FreshnessToken, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
@@ -248,14 +250,33 @@ impl GatewayHandler {
             if let Some(id) = conn_id {
                 // Extract namespace: SET search_path = <ns> or SET search_path TO <ns>
                 let after_eq = if let Some(pos) = ql.find('=') {
-                    q[pos + 1..].trim().trim_end_matches(';').trim().trim_matches('\'').to_string()
+                    q[pos + 1..]
+                        .trim()
+                        .trim_end_matches(';')
+                        .trim()
+                        .trim_matches('\'')
+                        .to_string()
                 } else if let Some(pos) = ql.find(" to ") {
-                    q[pos + 4..].trim().trim_end_matches(';').trim().trim_matches('\'').to_string()
+                    q[pos + 4..]
+                        .trim()
+                        .trim_end_matches(';')
+                        .trim()
+                        .trim_matches('\'')
+                        .to_string()
                 } else {
                     "public".to_string()
                 };
-                let ns = after_eq.split(',').next().unwrap_or("public").trim().trim_matches('"').to_string();
-                let mut session = self.sessions.entry(id.to_string()).or_insert_with(SessionState::new);
+                let ns = after_eq
+                    .split(',')
+                    .next()
+                    .unwrap_or("public")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
+                let mut session = self
+                    .sessions
+                    .entry(id.to_string())
+                    .or_insert_with(SessionState::new);
                 session.current_namespace = ns.clone();
                 session.search_path = ns;
             }
@@ -369,8 +390,7 @@ impl GatewayHandler {
                     SESSION_WAIT_FOR_TRIGGERED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     match self.wait_for_epoch(token.source_epoch, timeout_ms).await {
                         WaitResult::Satisfied { elapsed_ms } => {
-                            SESSION_WAIT_FOR_SATISFIED_MS
-                                .fetch_add(elapsed_ms, Ordering::Relaxed);
+                            SESSION_WAIT_FOR_SATISFIED_MS.fetch_add(elapsed_ms, Ordering::Relaxed);
                         }
                         WaitResult::TimedOut => {
                             SESSION_WAIT_FOR_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -407,7 +427,10 @@ impl GatewayHandler {
     ) -> PgWireResult<Vec<Response<'static>>> {
         // Get principal and session namespace (v0.26)
         let (principal, session_namespace) = if let Some(id) = conn_id {
-            let session = self.sessions.entry(id.to_string()).or_insert_with(SessionState::new);
+            let session = self
+                .sessions
+                .entry(id.to_string())
+                .or_insert_with(SessionState::new);
             (session.principal.clone(), session.current_namespace.clone())
         } else {
             (Principal::System, "public".to_string())
@@ -416,7 +439,12 @@ impl GatewayHandler {
         // ACL check: Viewer role required for SELECT (RS-2401)
         use rockstream_types::acl::Role;
         if !principal.is_system() {
-            if let Err(e) = self.acl_store.check(principal.identity(), &session_namespace, Some(view_name), Role::Viewer) {
+            if let Err(e) = self.acl_store.check(
+                principal.identity(),
+                &session_namespace,
+                Some(view_name),
+                Role::Viewer,
+            ) {
                 return Ok(vec![promote_response(Response::Error(Box::new(
                     ErrorInfo::new("ERROR".to_owned(), "42501".to_owned(), e.to_string()),
                 )))]);
@@ -428,7 +456,8 @@ impl GatewayHandler {
             let view_ns = &cv.namespace;
             if view_ns != &session_namespace && !principal.is_system() {
                 // Check if principal has Admin in own namespace (can cross-namespace)
-                let is_admin = self.acl_store
+                let is_admin = self
+                    .acl_store
                     .check(principal.identity(), &session_namespace, None, Role::Admin)
                     .is_ok();
                 if !is_admin {
@@ -1009,15 +1038,14 @@ impl GatewayHandler {
         query: &str,
         conn_id: &str,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        let (table, requested_cols) =
-            match crate::copy_state::parse_copy_from_stmt(query) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(vec![promote_response(Response::Error(Box::new(
-                        ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e),
-                    )))]);
-                }
-            };
+        let (table, requested_cols) = match crate::copy_state::parse_copy_from_stmt(query) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e),
+                )))]);
+            }
+        };
 
         // S6: Table must exist in catalog (RS-2500).
         let catalog_table = self.catalog.get_table(&table);
@@ -1088,9 +1116,11 @@ impl GatewayHandler {
             .insert(conn_id.to_string(), CopyState::new(table, columns));
 
         let col_fmt_count = col_count.max(1);
-        Ok(vec![promote_response(Response::CopyIn(
-            CopyResponse::new(0, col_fmt_count, vec![0i16; col_fmt_count]),
-        ))])
+        Ok(vec![promote_response(Response::CopyIn(CopyResponse::new(
+            0,
+            col_fmt_count,
+            vec![0i16; col_fmt_count],
+        )))])
     }
 
     /// Public wrapper for `handle_copy_from_stdin` — for integration tests that
@@ -1108,11 +1138,7 @@ impl GatewayHandler {
     ///
     /// Returns the number of rows written.  If no shard is configured the rows
     /// are silently discarded (test / no-storage mode).
-    async fn flush_copy_batch_rows(
-        &self,
-        table: &str,
-        rows: &[DmlOp],
-    ) -> PgWireResult<usize> {
+    async fn flush_copy_batch_rows(&self, table: &str, rows: &[DmlOp]) -> PgWireResult<usize> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -1144,9 +1170,7 @@ impl GatewayHandler {
         shard_db
             .write_batch(batch)
             .await
-            .map_err(|e| {
-                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-            })?;
+            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
 
         // Audit: log the flush.
         if let Some(log) = &self.audit_log {
@@ -1233,10 +1257,9 @@ impl StartupHandler for GatewayHandler {
                                     }
                                 }
                             } else {
-                                client.metadata_mut().insert(
-                                    "_rs_principal".to_string(),
-                                    format!("jwt:{token}"),
-                                );
+                                client
+                                    .metadata_mut()
+                                    .insert("_rs_principal".to_string(), format!("jwt:{token}"));
                             }
                         }
                     }
@@ -1289,10 +1312,15 @@ impl SimpleQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
-            let mut session = self.sessions.entry(conn_id.clone()).or_insert_with(SessionState::new);
+            let mut session = self
+                .sessions
+                .entry(conn_id.clone())
+                .or_insert_with(SessionState::new);
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
-                    Principal::Jwt { sub: sub.to_string() }
+                    Principal::Jwt {
+                        sub: sub.to_string(),
+                    }
                 } else {
                     Principal::System
                 };
@@ -1427,10 +1455,15 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
-            let mut session = self.sessions.entry(conn_id.clone()).or_insert_with(SessionState::new);
+            let mut session = self
+                .sessions
+                .entry(conn_id.clone())
+                .or_insert_with(SessionState::new);
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
-                    Principal::Jwt { sub: sub.to_string() }
+                    Principal::Jwt {
+                        sub: sub.to_string(),
+                    }
                 } else {
                     Principal::System
                 };
@@ -1449,9 +1482,7 @@ impl ExtendedQueryHandler for GatewayHandler {
                 .unwrap_or(Response::Execution(Tag::new("OK"))));
         }
 
-        let responses = self
-            .dispatch_async_with_conn(query, Some(&conn_id))
-            .await?;
+        let responses = self.dispatch_async_with_conn(query, Some(&conn_id)).await?;
         Ok(responses
             .into_iter()
             .next()
@@ -1501,7 +1532,8 @@ impl CopyHandler for GatewayHandler {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_owned(),
                         "22P05".to_owned(),
-                        "[RS-2501] copy.invalid_encoding: CopyData contains invalid UTF-8".to_owned(),
+                        "[RS-2501] copy.invalid_encoding: CopyData contains invalid UTF-8"
+                            .to_owned(),
                     ))));
                 }
             };
@@ -1541,9 +1573,7 @@ impl CopyHandler for GatewayHandler {
                 }
 
                 let cols: Vec<String> = if state.columns.is_empty() {
-                    (0..fields.len())
-                        .map(|i| format!("col{i}"))
-                        .collect()
+                    (0..fields.len()).map(|i| format!("col{i}")).collect()
                 } else {
                     state.columns.clone()
                 };
@@ -1605,7 +1635,10 @@ impl CopyHandler for GatewayHandler {
                 let prev = state.total_rows_flushed;
                 state.buf_bytes = 0;
                 let n = rows.len() as u64;
-                COPY_IN_BUFFER_ROWS.fetch_sub(n.min(COPY_IN_BUFFER_ROWS.load(Ordering::Relaxed)), Ordering::Relaxed);
+                COPY_IN_BUFFER_ROWS.fetch_sub(
+                    n.min(COPY_IN_BUFFER_ROWS.load(Ordering::Relaxed)),
+                    Ordering::Relaxed,
+                );
                 (rows, prev)
             };
             let flushed = self.flush_copy_batch_rows(&table, &rows_to_flush).await?;
@@ -1701,10 +1734,7 @@ impl CopyHandler for GatewayHandler {
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
             "57014".to_owned(),
-            format!(
-                "COPY FROM STDIN aborted by client: {}",
-                fail.message
-            ),
+            format!("COPY FROM STDIN aborted by client: {}", fail.message),
         )))
     }
 }
@@ -1796,9 +1826,7 @@ impl GatewayServer {
     ) -> Self {
         let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
         handler.auth_mode = AuthMode::Oidc;
-        handler.jwt_verifier = Some(Arc::new(JwtVerifier::with_hs256_key(
-            jwt_secret.to_vec(),
-        )));
+        handler.jwt_verifier = Some(Arc::new(JwtVerifier::with_hs256_key(jwt_secret.to_vec())));
         GatewayServer {
             addr,
             handler: Arc::new(handler),
@@ -2294,9 +2322,9 @@ fn parse_value_list(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod s4_tests {
     use super::*;
+    use crate::auth::Principal;
     use crate::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView};
     use crate::view_reader::{ViewReadStrategy, ViewReader};
-    use crate::auth::Principal;
     use rockstream_types::acl::{AclEntry, Role};
     use std::sync::Arc;
 
@@ -2334,7 +2362,10 @@ mod s4_tests {
         handler.catalog.add_view_in_namespace(CatalogView {
             name: "ns_b_view".to_string(),
             sql: "SELECT 1".to_string(),
-            columns: vec![CatalogColumn { name: "id".to_string(), data_type: "Int32".to_string() }],
+            columns: vec![CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int32".to_string(),
+            }],
             namespace: "ns-b".to_string(),
         });
 
@@ -2349,13 +2380,21 @@ mod s4_tests {
         // Create a session for alice in ns-a
         let conn_id = "test-conn-1";
         {
-            let mut session = handler.sessions.entry(conn_id.to_string()).or_insert_with(SessionState::new);
+            let mut session = handler
+                .sessions
+                .entry(conn_id.to_string())
+                .or_insert_with(SessionState::new);
             session.current_namespace = "ns-a".to_string();
-            session.principal = Principal::Jwt { sub: "alice".to_string() };
+            session.principal = Principal::Jwt {
+                sub: "alice".to_string(),
+            };
         }
 
         // Try to read ns_b_view from ns-a session — should get RS-2402 error
-        let responses = handler.read_view_response("ns_b_view", None, Some(conn_id)).await.unwrap();
+        let responses = handler
+            .read_view_response("ns_b_view", None, Some(conn_id))
+            .await
+            .unwrap();
         let got_error = responses.iter().any(|r| {
             if let Response::Error(e) = r {
                 e.message.contains("RS-2402")
@@ -2376,7 +2415,10 @@ mod s4_tests {
         handler.catalog.add_view_in_namespace(CatalogView {
             name: "ns_b_admin_view".to_string(),
             sql: "SELECT 1".to_string(),
-            columns: vec![CatalogColumn { name: "id".to_string(), data_type: "Int32".to_string() }],
+            columns: vec![CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int32".to_string(),
+            }],
             namespace: "ns-b".to_string(),
         });
 
@@ -2391,15 +2433,26 @@ mod s4_tests {
         // Create a session for carol in ns-a
         let conn_id = "test-conn-2";
         {
-            let mut session = handler.sessions.entry(conn_id.to_string()).or_insert_with(SessionState::new);
+            let mut session = handler
+                .sessions
+                .entry(conn_id.to_string())
+                .or_insert_with(SessionState::new);
             session.current_namespace = "ns-a".to_string();
-            session.principal = Principal::Jwt { sub: "carol".to_string() };
+            session.principal = Principal::Jwt {
+                sub: "carol".to_string(),
+            };
         }
 
         // Try to read ns_b_admin_view from ns-a session — admin should succeed
-        let responses = handler.read_view_response("ns_b_admin_view", None, Some(conn_id)).await.unwrap();
+        let responses = handler
+            .read_view_response("ns_b_admin_view", None, Some(conn_id))
+            .await
+            .unwrap();
         let got_error = responses.iter().any(|r| matches!(r, Response::Error(_)));
-        assert!(!got_error, "admin should be able to access cross-namespace view");
+        assert!(
+            !got_error,
+            "admin should be able to access cross-namespace view"
+        );
     }
 
     // ── S5: audit_carries_principal_actor ────────────────────────────────────

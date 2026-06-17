@@ -37,7 +37,10 @@ pub struct FreshnessToken {
 
 impl FreshnessToken {
     pub fn new(table_name: impl Into<String>, source_epoch: u64) -> Self {
-        Self { table_name: table_name.into(), source_epoch }
+        Self {
+            table_name: table_name.into(),
+            source_epoch,
+        }
     }
 }
 

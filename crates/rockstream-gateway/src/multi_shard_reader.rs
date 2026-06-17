@@ -198,7 +198,11 @@ impl MultiShardReader {
                 for (_k, v) in rows {
                     let row = String::from_utf8_lossy(&v);
                     let cols: Vec<&str> = row.split('\t').collect();
-                    let key = cols.get(shard_spec.group_col).copied().unwrap_or("").to_string();
+                    let key = cols
+                        .get(shard_spec.group_col)
+                        .copied()
+                        .unwrap_or("")
+                        .to_string();
                     let agg_val = cols.get(shard_spec.agg_col).copied().unwrap_or("0");
                     let num: i64 = agg_val.parse().unwrap_or(0);
                     let entry = groups.entry(key).or_insert(0);

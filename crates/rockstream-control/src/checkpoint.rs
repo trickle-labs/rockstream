@@ -200,9 +200,8 @@ impl CheckpointCoordinator {
     {
         let mut guard = self.inner.lock();
 
-        if guard.in_progress.is_some() {
+        if let Some(round) = &guard.in_progress {
             // Already have a round in progress; check for timeout.
-            let round = guard.in_progress.as_ref().unwrap();
             if round.started_at.elapsed() > guard.alignment_timeout {
                 // Drain credits and clear the timed-out round.
                 let held = round.credits_held;

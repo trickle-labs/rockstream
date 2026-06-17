@@ -68,7 +68,11 @@ async fn proof_rbac_denies_cross_namespace_access() {
     });
 
     let view_reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
-    let handler = Arc::new(GatewayHandler::with_shard_db(catalog, view_reader, shard_db));
+    let handler = Arc::new(GatewayHandler::with_shard_db(
+        catalog,
+        view_reader,
+        shard_db,
+    ));
 
     let conn_id = "alice-conn";
     {
@@ -100,7 +104,10 @@ async fn proof_rbac_denies_cross_namespace_access() {
             false
         }
     });
-    assert!(has_rs2402, "expected RS-2402 response for cross-namespace access");
+    assert!(
+        has_rs2402,
+        "expected RS-2402 response for cross-namespace access"
+    );
 }
 
 // ── proof_partial_agg_pushdown_lfs ───────────────────────────────────────────
@@ -169,12 +176,7 @@ async fn proof_end_to_end_postgres_pillar_tc() {
     use tokio_postgres::NoTls;
 
     let store = Arc::new(InMemory::new());
-    let shard_db = Arc::new(
-        ShardDb::builder("tc-shard", store)
-            .build()
-            .await
-            .unwrap(),
-    );
+    let shard_db = Arc::new(ShardDb::builder("tc-shard", store).build().await.unwrap());
     let catalog = Arc::new(CatalogStubs::default());
     let view_reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -195,7 +197,9 @@ async fn proof_end_to_end_postgres_pillar_tc() {
     });
 
     client
-        .simple_query("CREATE MATERIALIZED VIEW orders_mv AS SELECT id, region, val FROM base_table")
+        .simple_query(
+            "CREATE MATERIALIZED VIEW orders_mv AS SELECT id, region, val FROM base_table",
+        )
         .await
         .expect("CREATE MATERIALIZED VIEW should succeed");
 
@@ -209,7 +213,10 @@ async fn proof_end_to_end_postgres_pillar_tc() {
         .unwrap();
     client.simple_query("COMMIT").await.unwrap();
 
-    let rows = client.simple_query("SELECT * FROM orders_mv").await.unwrap();
+    let rows = client
+        .simple_query("SELECT * FROM orders_mv")
+        .await
+        .unwrap();
     assert!(!rows.is_empty(), "SELECT should return response");
 
     let rows = client

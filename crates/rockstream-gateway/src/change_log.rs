@@ -66,15 +66,13 @@ impl ViewChangeLog {
             self.entries.pop_front();
         }
         self.entries.push_back(entry);
-        self.entry_count.store(self.entries.len(), Ordering::Relaxed);
+        self.entry_count
+            .store(self.entries.len(), Ordering::Relaxed);
     }
 
     /// Returns all entries with `epoch >= since` in insertion order.
     pub fn since_epoch(&self, since: u64) -> Vec<&ChangeEntry> {
-        self.entries
-            .iter()
-            .filter(|e| e.epoch >= since)
-            .collect()
+        self.entries.iter().filter(|e| e.epoch >= since).collect()
     }
 
     /// The earliest epoch still retained, or `None` if the log is empty.

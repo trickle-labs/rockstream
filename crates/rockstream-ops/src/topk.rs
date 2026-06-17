@@ -156,40 +156,38 @@ impl TopKOp {
             // deleted. TOPK_BUFFER_LIMIT is a hard safety cap (not a correctness eviction).
             let positive_count: usize = part.buffer.values().filter(|e| e.net_weight > 0).count();
 
-            if part.buffer.contains_key(&row_id) {
-                // Update existing entry.
-                let entry = part.buffer.get_mut(&row_id).unwrap();
-                entry.net_weight += w;
-                entry.rank_value = rank_value;
-                entry.row_vals = row_vals;
-                // Remove entries that cancel to zero.
-                if entry.net_weight == 0 {
-                    part.buffer.remove(&row_id);
+            match part.buffer.entry(row_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry_occ) => {
+                    let entry = entry_occ.get_mut();
+                    entry.net_weight += w;
+                    entry.rank_value = rank_value;
+                    entry.row_vals = row_vals;
+                    // Remove entries that cancel to zero.
+                    if entry.net_weight == 0 {
+                        entry_occ.remove();
+                    }
                 }
-            } else if w < 0 {
-                // Over-retraction: track the debt so future insertions cancel correctly.
-                part.buffer.insert(
-                    row_id,
-                    BufferEntry {
-                        rank_value,
-                        row_vals,
-                        net_weight: w,
-                    },
-                );
-            } else {
-                // New positive-weight entry: always buffer (correctness requirement).
-                // Entries above TOPK_BUFFER_LIMIT trigger an error to prevent unbounded growth.
-                if positive_count >= TOPK_BUFFER_LIMIT {
-                    return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
+                std::collections::hash_map::Entry::Vacant(entry_vac) => {
+                    if w < 0 {
+                        // Over-retraction: track the debt so future insertions cancel correctly.
+                        entry_vac.insert(BufferEntry {
+                            rank_value,
+                            row_vals,
+                            net_weight: w,
+                        });
+                    } else {
+                        // New positive-weight entry: always buffer (correctness requirement).
+                        // Entries above TOPK_BUFFER_LIMIT trigger an error to prevent unbounded growth.
+                        if positive_count >= TOPK_BUFFER_LIMIT {
+                            return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
+                        }
+                        entry_vac.insert(BufferEntry {
+                            rank_value,
+                            row_vals,
+                            net_weight: w,
+                        });
+                    }
                 }
-                part.buffer.insert(
-                    row_id,
-                    BufferEntry {
-                        rank_value,
-                        row_vals,
-                        net_weight: w,
-                    },
-                );
             }
 
             dirty_partitions.insert(part_key);

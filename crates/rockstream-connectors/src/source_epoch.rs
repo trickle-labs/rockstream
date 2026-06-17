@@ -24,7 +24,9 @@ use rockstream_types::timestamp::Epoch;
 ///
 /// Kafka encodes `{partition_id → offset}`; Postgres CDC encodes an LSN;
 /// S3 encodes a manifest pointer. The token is opaque to the registry.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OffsetToken(pub Vec<u8>);
 
 impl OffsetToken {

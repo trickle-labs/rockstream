@@ -136,7 +136,7 @@ async fn copy_out_streams_view_rows() {
                 data_type: "Int32".to_string(),
             },
         ],
-            namespace: "public".to_string(),
+        namespace: "public".to_string(),
     });
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -295,7 +295,7 @@ async fn proof_psql_select_limit_10_under_10ms_p99() {
                 data_type: "Int32".to_string(),
             },
         ],
-            namespace: "public".to_string(),
+        namespace: "public".to_string(),
     });
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -478,7 +478,7 @@ async fn _proof_orm_schema_reflection_impl() {
                 data_type: "Float64".to_string(),
             },
         ],
-            namespace: "public".to_string(),
+        namespace: "public".to_string(),
     });
 
     let (port, _handle) = start_gateway_noop(catalog).await;
@@ -1226,11 +1226,11 @@ async fn proof_idempotent_replay_noop_minio() {
 // v0.25 Phase 3b — S6/S8/S9/S10 proof tests
 // ══════════════════════════════════════════════════════════════════════════════
 
+use rockstream_gateway::change_log::ChangeEntry;
 use rockstream_gateway::subscribe_handler::{
     deliver_snapshot, start_from_epoch, SubscribeRegistry, SubscriberHandle,
 };
 use rockstream_gateway::subscribe_parser::parse_subscribe;
-use rockstream_gateway::change_log::ChangeEntry;
 
 // ── S10-1: oracle_subscribe_incremental_equals_batch ──────────────────────────
 
@@ -1419,8 +1419,15 @@ fn proof_subscribe_no_gaps_restart_tc() {
     }
 
     let rows = handle.poll(&reg).unwrap();
-    assert!(!rows.is_empty(), "should receive entries from epoch 3 onward");
-    assert_eq!(rows.first().unwrap().mz_timestamp, 3, "first row should be epoch 3");
+    assert!(
+        !rows.is_empty(),
+        "should receive entries from epoch 3 onward"
+    );
+    assert_eq!(
+        rows.first().unwrap().mz_timestamp,
+        3,
+        "first row should be epoch 3"
+    );
     let epochs: Vec<u64> = rows.iter().map(|r| r.mz_timestamp).collect();
     for w in epochs.windows(2) {
         assert!(w[1] >= w[0], "epochs must be non-decreasing");
@@ -1445,7 +1452,11 @@ fn subscribe_no_range_delete_in_change_log() {
         });
     }
     // Capacity-3 log after 5 pushes: only entries 3-5 remain (pop_front eviction).
-    assert_eq!(log.entry_count(), 3, "expected 3 entries after pop_front eviction");
+    assert_eq!(
+        log.entry_count(),
+        3,
+        "expected 3 entries after pop_front eviction"
+    );
     let earliest = log.earliest_epoch().unwrap();
     assert!(
         earliest >= 3,
@@ -1473,9 +1484,7 @@ async fn session_wait_for_bounded_by_timeout() {
         .await
         .unwrap();
     client
-        .simple_query(
-            r#"SET rockstream.wait_for = '{"table_name":"t","source_epoch":99999999}'"#,
-        )
+        .simple_query(r#"SET rockstream.wait_for = '{"table_name":"t","source_epoch":99999999}'"#)
         .await
         .unwrap();
 
@@ -1595,7 +1604,10 @@ async fn explain_no_pushdown_for_full_scan() {
     let (port, _handle, _shard_db) = start_gateway_with_shard("explain-no-pushdown").await;
     let client = connect_port(port).await;
 
-    let rows = client.simple_query("EXPLAIN SELECT * FROM mv").await.unwrap();
+    let rows = client
+        .simple_query("EXPLAIN SELECT * FROM mv")
+        .await
+        .unwrap();
 
     let plan_text: String = rows
         .iter()
@@ -1727,14 +1739,13 @@ async fn copy_in_basic_rows_visible_lfs() {
 /// All 50 000 rows appear in the shard afterward.
 #[tokio::test]
 async fn copy_in_large_batch_no_memory_exhaustion_lfs() {
-    use std::sync::atomic::Ordering;
     use rockstream_gateway::copy_state::COPY_IN_BUFFER_ROWS;
+    use std::sync::atomic::Ordering;
 
     // Reset the global gauge to a known baseline.
     COPY_IN_BUFFER_ROWS.store(0, Ordering::Relaxed);
 
-    let (port, _handle, shard_db) =
-        start_gateway_with_shard("v027-s5-large-batch").await;
+    let (port, _handle, shard_db) = start_gateway_with_shard("v027-s5-large-batch").await;
     let client = connect_port(port).await;
 
     client
@@ -1795,9 +1806,9 @@ async fn copy_in_large_batch_no_memory_exhaustion_lfs() {
 
     // Verify a few known keys exist.
     for i in [0usize, 999, 9_999, 25_000, 49_999] {
-        let found = entries.iter().any(|(_, v)| {
-            String::from_utf8_lossy(v).contains(&i.to_string())
-        });
+        let found = entries
+            .iter()
+            .any(|(_, v)| String::from_utf8_lossy(v).contains(&i.to_string()));
         assert!(found, "expected row {i} in shard");
     }
 }
@@ -1807,14 +1818,12 @@ async fn copy_in_large_batch_no_memory_exhaustion_lfs() {
 /// S6 / P3 green gate: COPY into a non-existent table returns RS-2500.
 #[tokio::test]
 async fn copy_in_table_not_found_returns_rs2500() {
-    let (port, _handle, _shard_db) =
-        start_gateway_with_shard("v027-s6-table-not-found").await;
+    let (port, _handle, _shard_db) = start_gateway_with_shard("v027-s6-table-not-found").await;
     let client = connect_port(port).await;
 
     // Do NOT create the table — it must be absent from the catalog.
-    let copy_result: Result<tokio_postgres::CopyInSink<bytes::Bytes>, _> = client
-        .copy_in("COPY ghost_t FROM STDIN")
-        .await;
+    let copy_result: Result<tokio_postgres::CopyInSink<bytes::Bytes>, _> =
+        client.copy_in("COPY ghost_t FROM STDIN").await;
     let err = match copy_result {
         Err(e) => e,
         Ok(_) => panic!("expected error for unknown table, but got CopyInSink"),
@@ -1836,8 +1845,7 @@ async fn copy_in_table_not_found_returns_rs2500() {
 /// S6 / P4 green gate: a TSV row with the wrong field count returns RS-2501.
 #[tokio::test]
 async fn copy_in_column_count_mismatch_returns_rs2501() {
-    let (port, _handle, _shard_db) =
-        start_gateway_with_shard("v027-s6-col-mismatch").await;
+    let (port, _handle, _shard_db) = start_gateway_with_shard("v027-s6-col-mismatch").await;
     let client = connect_port(port).await;
 
     // Create a 3-column table.
@@ -1926,14 +1934,19 @@ async fn copy_in_auth_enforced_lfs() {
     catalog.add_table(rockstream_gateway::catalog_stubs::CatalogTable {
         name: "auth_t".to_string(),
         columns: vec![
-            CatalogColumn { name: "id".to_string(), data_type: "Utf8".to_string() },
-            CatalogColumn { name: "val".to_string(), data_type: "Utf8".to_string() },
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Utf8".to_string(),
+            },
+            CatalogColumn {
+                name: "val".to_string(),
+                data_type: "Utf8".to_string(),
+            },
         ],
     });
 
     // ── RS-2400: JwtVerifier rejects missing/empty token ─────────────────────
-    let verifier =
-        rockstream_gateway::auth::JwtVerifier::with_hs256_key(SECRET.to_vec());
+    let verifier = rockstream_gateway::auth::JwtVerifier::with_hs256_key(SECRET.to_vec());
     let err = verifier.verify("").unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -1958,16 +1971,18 @@ async fn copy_in_auth_enforced_lfs() {
         .copy_from_stdin_response("COPY auth_t FROM STDIN", viewer_conn)
         .expect("copy_from_stdin_response should return Ok (error inside response)");
 
-    let viewer_err = responses.iter().find(|r| {
-        matches!(r, pgwire::api::results::Response::Error(_))
-    });
-    let viewer_err_msg = viewer_err.map(|r| {
-        if let pgwire::api::results::Response::Error(e) = r {
-            e.message.clone()
-        } else {
-            String::new()
-        }
-    }).unwrap_or_default();
+    let viewer_err = responses
+        .iter()
+        .find(|r| matches!(r, pgwire::api::results::Response::Error(_)));
+    let viewer_err_msg = viewer_err
+        .map(|r| {
+            if let pgwire::api::results::Response::Error(e) = r {
+                e.message.clone()
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
     assert!(
         viewer_err_msg.contains("RS-2401") || viewer_err_msg.contains("insufficient_privilege"),
         "expected RS-2401 for viewer; got: {viewer_err_msg:?}"
@@ -1990,9 +2005,9 @@ async fn copy_in_auth_enforced_lfs() {
         .copy_from_stdin_response("COPY auth_t FROM STDIN", owner_conn)
         .expect("owner should get a response");
 
-    let has_copy_in = responses.iter().any(|r| {
-        matches!(r, pgwire::api::results::Response::CopyIn(_))
-    });
+    let has_copy_in = responses
+        .iter()
+        .any(|r| matches!(r, pgwire::api::results::Response::CopyIn(_)));
     assert!(
         has_copy_in,
         "expected CopyInResponse for pipeline_owner; got non-CopyIn response"
@@ -2038,11 +2053,15 @@ async fn copy_in_large_batch_no_memory_exhaustion_minio_tc() {
     );
     let catalog = Arc::new(CatalogStubs::new());
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server = GatewayServer::with_shard_db(addr, catalog, Arc::new(NoopViewReader), shard_db.clone());
+    let server =
+        GatewayServer::with_shard_db(addr, catalog, Arc::new(NoopViewReader), shard_db.clone());
     let (local_addr, _handle) = server.serve_background().await.unwrap();
     let client = connect_port(local_addr.port()).await;
 
-    client.simple_query("CREATE TABLE minio_t (id TEXT, val TEXT)").await.expect("CREATE TABLE");
+    client
+        .simple_query("CREATE TABLE minio_t (id TEXT, val TEXT)")
+        .await
+        .expect("CREATE TABLE");
 
     COPY_IN_BUFFER_ROWS.store(0, Ordering::Relaxed);
 
@@ -2062,10 +2081,15 @@ async fn copy_in_large_batch_no_memory_exhaustion_minio_tc() {
         for i in sent..sent + batch_size {
             data.push_str(&format!("id_{i}\t{i}\n"));
         }
-        futures::SinkExt::send(&mut sink, bytes::Bytes::from(data)).await.expect("send");
+        futures::SinkExt::send(&mut sink, bytes::Bytes::from(data))
+            .await
+            .expect("send");
 
         let gauge = COPY_IN_BUFFER_ROWS.load(Ordering::Relaxed);
-        assert!(gauge <= MAX_COPY_IN_BATCH_ROWS as u64, "gauge {gauge} exceeded bound");
+        assert!(
+            gauge <= MAX_COPY_IN_BATCH_ROWS as u64,
+            "gauge {gauge} exceeded bound"
+        );
 
         sent += batch_size;
     }
@@ -2074,8 +2098,16 @@ async fn copy_in_large_batch_no_memory_exhaustion_minio_tc() {
     assert_eq!(rows, TOTAL as u64, "COPY {TOTAL}");
 
     shard_db.flush().await.unwrap();
-    let entries = shard_db.scan_prefix(b"view_output/minio_t/").await.expect("scan");
-    assert_eq!(entries.len(), TOTAL, "all rows durable in MinIO; got {}", entries.len());
+    let entries = shard_db
+        .scan_prefix(b"view_output/minio_t/")
+        .await
+        .expect("scan");
+    assert_eq!(
+        entries.len(),
+        TOTAL,
+        "all rows durable in MinIO; got {}",
+        entries.len()
+    );
 }
 
 // ── S9 gate: proof_copy_from_lfs ─────────────────────────────────────────────
@@ -2084,8 +2116,7 @@ async fn copy_in_large_batch_no_memory_exhaustion_minio_tc() {
 /// all visible in the shard and CommandComplete reports COPY 1000.
 #[tokio::test]
 async fn proof_copy_from_lfs() {
-    let (port, _handle, shard_db) =
-        start_gateway_with_shard("v027-s9-proof-copy").await;
+    let (port, _handle, shard_db) = start_gateway_with_shard("v027-s9-proof-copy").await;
     let client = connect_port(port).await;
 
     // Register 2-column table in the catalog.
@@ -2129,9 +2160,9 @@ async fn proof_copy_from_lfs() {
 
     // Verify a few spot rows.
     for i in [0usize, 499, 999] {
-        let found = entries.iter().any(|(_, v)| {
-            String::from_utf8_lossy(v).contains(&format!("val_{i}"))
-        });
+        let found = entries
+            .iter()
+            .any(|(_, v)| String::from_utf8_lossy(v).contains(&format!("val_{i}")));
         assert!(found, "expected row val_{i} in shard");
     }
 }

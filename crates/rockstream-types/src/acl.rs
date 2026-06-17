@@ -12,7 +12,7 @@ pub enum Role {
 /// An ACL grant entry persisted under catalog/acl/<namespace>/<principal>.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AclEntry {
-    pub principal: String,         // JWT sub or cert CN
+    pub principal: String, // JWT sub or cert CN
     pub namespace: String,
     pub view_name: Option<String>, // None = namespace-level grant
     pub role: Role,

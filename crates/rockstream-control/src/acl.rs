@@ -26,15 +26,20 @@ pub enum AclError {
         context: String,
     },
     #[error("[RS-2402] auth.namespace_access_denied: principal '{principal}' cannot access namespace '{namespace}'")]
-    NamespaceAccessDenied { principal: String, namespace: String },
+    NamespaceAccessDenied {
+        principal: String,
+        namespace: String,
+    },
 }
 
 /// Cache entry.
+#[allow(dead_code)]
 struct CacheEntry {
     role: Option<Role>,
     inserted_at: Instant,
 }
 
+#[allow(dead_code)]
 impl CacheEntry {
     fn is_expired(&self) -> bool {
         self.inserted_at.elapsed() > ACL_CACHE_TTL
@@ -53,15 +58,23 @@ struct AclKey {
 #[derive(Default)]
 struct AclStoreInner {
     entries: HashMap<AclKey, AclEntry>,
+    #[allow(dead_code)]
     cache: HashMap<AclKey, CacheEntry>,
+    #[allow(dead_code)]
     cache_order: std::collections::VecDeque<AclKey>,
 }
 
+#[allow(dead_code)]
 impl AclStoreInner {
     fn cache_insert(&mut self, key: AclKey, role: Option<Role>) {
         if self.cache.contains_key(&key) {
-            self.cache
-                .insert(key, CacheEntry { role, inserted_at: Instant::now() });
+            self.cache.insert(
+                key,
+                CacheEntry {
+                    role,
+                    inserted_at: Instant::now(),
+                },
+            );
         } else {
             if self.cache.len() >= MAX_ACL_CACHE_ENTRIES {
                 if let Some(oldest) = self.cache_order.pop_front() {
@@ -69,8 +82,13 @@ impl AclStoreInner {
                 }
             }
             self.cache_order.push_back(key.clone());
-            self.cache
-                .insert(key, CacheEntry { role, inserted_at: Instant::now() });
+            self.cache.insert(
+                key,
+                CacheEntry {
+                    role,
+                    inserted_at: Instant::now(),
+                },
+            );
         }
     }
 
@@ -128,7 +146,12 @@ impl AclStore {
 
     /// Look up the effective role for a principal on a view (or namespace-level).
     /// Checks view-level grant first, then namespace-level.
-    fn lookup_role(&self, principal: &str, namespace: &str, view_name: Option<&str>) -> Option<Role> {
+    fn lookup_role(
+        &self,
+        principal: &str,
+        namespace: &str,
+        view_name: Option<&str>,
+    ) -> Option<Role> {
         let inner = self.inner.read().unwrap();
 
         if let Some(vn) = view_name {
@@ -198,7 +221,9 @@ mod tests {
             view_name: None,
             role: Role::Viewer,
         });
-        assert!(store.check("alice", "public", Some("my_view"), Role::Viewer).is_ok());
+        assert!(store
+            .check("alice", "public", Some("my_view"), Role::Viewer)
+            .is_ok());
     }
 
     /// S3 green gate: acl_check_denies_insufficient_role
@@ -214,7 +239,10 @@ mod tests {
         let err = store
             .check("bob", "public", Some("mv"), Role::PipelineOwner)
             .unwrap_err();
-        assert!(err.to_string().contains("RS-2401"), "expected RS-2401, got: {err}");
+        assert!(
+            err.to_string().contains("RS-2401"),
+            "expected RS-2401, got: {err}"
+        );
     }
 
     /// S3 green gate: admin_role_passes_all_checks
@@ -227,9 +255,15 @@ mod tests {
             view_name: None,
             role: Role::Admin,
         });
-        assert!(store.check("carol", "public", Some("v"), Role::Viewer).is_ok());
-        assert!(store.check("carol", "public", Some("v"), Role::PipelineOwner).is_ok());
-        assert!(store.check("carol", "public", Some("v"), Role::Admin).is_ok());
+        assert!(store
+            .check("carol", "public", Some("v"), Role::Viewer)
+            .is_ok());
+        assert!(store
+            .check("carol", "public", Some("v"), Role::PipelineOwner)
+            .is_ok());
+        assert!(store
+            .check("carol", "public", Some("v"), Role::Admin)
+            .is_ok());
     }
 
     /// Invariant: acl_no_range_delete_in_catalog_acl
@@ -263,6 +297,8 @@ mod tests {
     #[test]
     fn system_principal_bypasses_acl() {
         let store = AclStore::new();
-        assert!(store.check("system", "any-ns", Some("any-view"), Role::Admin).is_ok());
+        assert!(store
+            .check("system", "any-ns", Some("any-view"), Role::Admin)
+            .is_ok());
     }
 }

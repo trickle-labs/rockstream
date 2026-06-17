@@ -8,3 +8,23 @@ description = "Source and sink connector implementations for RockStream"
 
 [dependencies]
 rockstream-types = { path = "../rockstream-types" }
+arrow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+object_store = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+rockstream-ops = { path = "../rockstream-ops" }
+rockstream-plan = { path = "../rockstream-plan" }
+rockstream-storage = { path = "../rockstream-storage" }
+rockstream-sim = { path = "../rockstream-sim" }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+object_store = { workspace = true }
+testcontainers = { workspace = true }
+reqwest = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }

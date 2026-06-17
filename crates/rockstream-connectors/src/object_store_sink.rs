@@ -181,10 +181,9 @@ impl SinkConnector for ObjectStoreSink {
                     return Ok(());
                 }
                 // `_pending/` exists but final does not → re-run rename.
-                if !self.pending.contains_key(&epoch) {
-                    // Restore pending from handle if lost.
-                    self.pending.insert(epoch, pending_handle.clone());
-                }
+                self.pending
+                    .entry(epoch)
+                    .or_insert_with(|| pending_handle.clone());
                 // Perform rename.
                 self.pending.remove(&epoch);
                 if self.pending_epochs_count > 0 {

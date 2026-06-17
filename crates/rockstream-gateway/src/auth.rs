@@ -33,8 +33,8 @@ impl AuthMode {
 /// Authenticated principal for a gateway connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Principal {
-    System,               // --auth=off or internal paths
-    Jwt { sub: String },  // OIDC bearer token, verified against JWKS; sub = JWT subject
+    System,                // --auth=off or internal paths
+    Jwt { sub: String },   // OIDC bearer token, verified against JWKS; sub = JWT subject
     CertCn { cn: String }, // mTLS client cert CN
 }
 
@@ -198,7 +198,8 @@ impl JwtVerifier {
         let mut mac = HmacSha256::new_from_slice(&key)
             .map_err(|_| AuthError::Unauthenticated("key error".to_string()))?;
         mac.update(signing_input.as_bytes());
-        mac.verify_slice(&sig).map_err(|_| AuthError::InvalidSignature)?;
+        mac.verify_slice(&sig)
+            .map_err(|_| AuthError::InvalidSignature)?;
 
         // Expiry check
         if let Some(exp) = payload["exp"].as_u64() {
@@ -280,7 +281,10 @@ mod tests {
 
         // Missing token (empty string)
         let err = verifier.verify("").unwrap_err();
-        assert!(err.to_string().contains("RS-2400"), "expected RS-2400, got: {err}");
+        assert!(
+            err.to_string().contains("RS-2400"),
+            "expected RS-2400, got: {err}"
+        );
 
         // Invalid signature (tampered)
         let exp = SystemTime::now()
@@ -291,13 +295,19 @@ mod tests {
         let mut token = create_test_jwt("eve", exp, TEST_SECRET);
         token.push_str("tampered");
         let err = verifier.verify(&token).unwrap_err();
-        assert!(err.to_string().contains("RS-2400"), "expected RS-2400, got: {err}");
+        assert!(
+            err.to_string().contains("RS-2400"),
+            "expected RS-2400, got: {err}"
+        );
 
         // Expired token
         let past_exp: u64 = 1; // far in the past
         let expired = create_test_jwt("bob", past_exp, TEST_SECRET);
         let err = verifier.verify(&expired).unwrap_err();
-        assert!(err.to_string().contains("RS-2400"), "expected RS-2400, got: {err}");
+        assert!(
+            err.to_string().contains("RS-2400"),
+            "expected RS-2400, got: {err}"
+        );
     }
 
     #[test]
