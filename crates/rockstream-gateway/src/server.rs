@@ -89,7 +89,7 @@ pub struct GatewayHandler {
     /// Bound: WRITE_BUFFER_LIMIT_BYTES per connection (64 MiB).
     write_buffers: Arc<DashMap<String, WriteBuffer>>,
     /// Per-connection session state (idempotency key, isolation, etc.).
-    sessions: Arc<DashMap<String, SessionState>>,
+    pub sessions: Arc<DashMap<String, SessionState>>,
     /// Optional ShardDb for direct-write DML commits.
     shard_db: Option<Arc<rockstream_storage::ShardDb>>,
     /// Authentication mode for this gateway instance.
@@ -97,9 +97,10 @@ pub struct GatewayHandler {
     /// Optional JWT verifier (populated when auth_mode == Oidc).
     jwt_verifier: Option<Arc<JwtVerifier>>,
     /// ACL store for RBAC enforcement.
-    acl_store: Arc<rockstream_control::AclStore>,
+    pub acl_store: Arc<rockstream_control::AclStore>,
     /// Namespace catalog.
     namespace_catalog: Arc<rockstream_control::NamespaceCatalog>,
+    audit_log: Option<Arc<rockstream_control::audit::FileAuditLog>>,
 }
 
 impl GatewayHandler {
@@ -115,6 +116,7 @@ impl GatewayHandler {
             jwt_verifier: None,
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
+            audit_log: None,
         }
     }
 
@@ -134,7 +136,13 @@ impl GatewayHandler {
             jwt_verifier: None,
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
+            audit_log: None,
         }
+    }
+
+    pub fn with_audit_log(mut self, log: Arc<rockstream_control::audit::FileAuditLog>) -> Self {
+        self.audit_log = Some(log);
+        self
     }
 
     /// Wait until the shard's frontier epoch reaches `target_epoch` or `timeout_ms` elapses.
@@ -195,18 +203,6 @@ impl GatewayHandler {
             return Some(self.handle_create_table(q));
         }
 
-        // CREATE NAMESPACE <name> (v0.26)
-        if ql.starts_with("create namespace ") {
-            let after = q["create namespace ".len()..].trim().trim_end_matches(';');
-            let ns_name = after.trim().to_lowercase();
-            if !ns_name.is_empty() {
-                self.namespace_catalog.create_namespace(&ns_name);
-            }
-            return Some(Ok(vec![Response::Execution(
-                Tag::new("CREATE NAMESPACE").with_rows(0),
-            )]));
-        }
-
         // Transaction control
         if ql == "begin" || ql == "begin;" || ql.starts_with("begin ") {
             return Some(Ok(vec![Response::TransactionStart(
@@ -226,7 +222,7 @@ impl GatewayHandler {
     }
 
     /// Dispatch with an optional connection ID for write buffer routing.
-    async fn dispatch_async_with_conn(
+    pub async fn dispatch_async_with_conn(
         &self,
         query: &str,
         conn_id: Option<&str>,
@@ -256,6 +252,58 @@ impl GatewayHandler {
                 session.search_path = ns;
             }
             return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
+        }
+
+        // CREATE NAMESPACE <name> (v0.26)
+        if ql.starts_with("create namespace ") {
+            let after = q["create namespace ".len()..].trim().trim_end_matches(';');
+            let ns_name = after.trim().to_lowercase();
+            if !ns_name.is_empty() {
+                self.namespace_catalog.create_namespace(&ns_name);
+                if let Some(log) = &self.audit_log {
+                    let actor = conn_id
+                        .and_then(|id| self.sessions.get(id).map(|s| s.principal.actor()))
+                        .unwrap_or_else(|| "system".to_string());
+                    let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                        actor,
+                        "create_namespace",
+                        &ns_name,
+                    ));
+                }
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("CREATE NAMESPACE").with_rows(0),
+            ))]);
+        }
+
+        // EXPLAIN <query> — return plan annotation with pushdown info.
+        if ql.starts_with("explain ") {
+            let inner_sql = q["explain ".len()..].trim();
+            let pushdown = crate::multi_shard_reader::can_pushdown_partial_agg(inner_sql);
+            let pushdown_note = if pushdown {
+                "partial_pushdown: true  -- O(distinct_groups × shards) rows returned"
+            } else {
+                "partial_pushdown: false"
+            };
+            let plan_text = format!("Plan: SeqScan → {pushdown_note}\nQuery: {inner_sql}");
+            let schema = Arc::new(vec![FieldInfo::new(
+                "QUERY PLAN".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )]);
+            let rows = vec![plan_text];
+            let schema_ref = schema.clone();
+            let data_stream = stream::iter(rows).map(move |line| {
+                let mut encoder = DataRowEncoder::new(schema_ref.clone());
+                encoder.encode_field(&Some(line.as_str()))?;
+                encoder.finish()
+            });
+            return Ok(vec![promote_response(Response::Query(QueryResponse::new(
+                schema,
+                data_stream,
+            )))]);
         }
 
         if let Some(result) = self.dispatch_sync(query) {
@@ -482,6 +530,13 @@ impl GatewayHandler {
                 },
                 deps,
             );
+            if let Some(log) = &self.audit_log {
+                let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                    "system",
+                    "create_view",
+                    &view_name,
+                ));
+            }
         }
 
         Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))])
@@ -722,7 +777,6 @@ impl GatewayHandler {
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
 
-        // Update session's last_written_epoch with a FreshnessToken (S7).
         let table_name = ops
             .iter()
             .last()
@@ -732,6 +786,20 @@ impl GatewayHandler {
                 DmlOp::Delete { table, .. } => table.clone(),
             })
             .unwrap_or_default();
+        if let Some(log) = &self.audit_log {
+            let actor = if let Some(s) = self.sessions.get(conn_id) {
+                s.principal.actor()
+            } else {
+                "system".to_string()
+            };
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                actor,
+                "commit",
+                &table_name,
+            ));
+        }
+
+        // Update session's last_written_epoch with a FreshnessToken (S7).
         if let Some(mut session) = self.sessions.get_mut(conn_id) {
             session.last_written_epoch = Some(FreshnessToken::new(table_name, epoch));
         }
@@ -1832,5 +1900,108 @@ mod s4_tests {
         let responses = handler.read_view_response("ns_b_admin_view", None, Some(conn_id)).await.unwrap();
         let got_error = responses.iter().any(|r| matches!(r, Response::Error(_)));
         assert!(!got_error, "admin should be able to access cross-namespace view");
+    }
+
+    // ── S5: audit_carries_principal_actor ────────────────────────────────────
+
+    /// S5 green gate: COMMIT with a Jwt principal produces an audit event with actor = "jwt:alice".
+    #[tokio::test]
+    async fn audit_carries_principal_actor() {
+        use rockstream_control::audit::FileAuditLog;
+        use tempfile::NamedTempFile;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let log = Arc::new(FileAuditLog::open(tmp.path()).unwrap());
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder("audit-shard", store)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStubs::default());
+        let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
+        let handler = Arc::new(
+            GatewayHandler::with_shard_db(catalog, reader, shard_db).with_audit_log(log.clone()),
+        );
+
+        let conn_id = "audit-conn";
+        {
+            let mut s = handler
+                .sessions
+                .entry(conn_id.to_string())
+                .or_insert_with(crate::session::SessionState::new);
+            s.principal = crate::auth::Principal::Jwt {
+                sub: "alice".to_string(),
+            };
+            s.idempotency_key = Some([1u8; 16]);
+        }
+
+        handler
+            .dispatch_async_with_conn("INSERT INTO t (id, val) VALUES (1, 'x')", Some(conn_id))
+            .await
+            .unwrap();
+        handler
+            .dispatch_async_with_conn("COMMIT", Some(conn_id))
+            .await
+            .unwrap();
+
+        let events = log.read_all().unwrap();
+        assert!(
+            events.iter().any(|e| e.actor == "jwt:alice"),
+            "expected jwt:alice actor in audit log, got: {:?}",
+            events.iter().map(|e| &e.actor).collect::<Vec<_>>()
+        );
+    }
+
+    // ── S5: audit_carries_system_actor_when_auth_off ─────────────────────────
+
+    /// S5 green gate: COMMIT with --auth=off / System principal has actor = "system".
+    #[tokio::test]
+    async fn audit_carries_system_actor_when_auth_off() {
+        use rockstream_control::audit::FileAuditLog;
+        use tempfile::NamedTempFile;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let log = Arc::new(FileAuditLog::open(tmp.path()).unwrap());
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder("audit-shard-sys", store)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStubs::default());
+        let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
+        let handler = Arc::new(
+            GatewayHandler::with_shard_db(catalog, reader, shard_db).with_audit_log(log.clone()),
+        );
+
+        let conn_id = "sys-conn";
+        {
+            let mut s = handler
+                .sessions
+                .entry(conn_id.to_string())
+                .or_insert_with(crate::session::SessionState::new);
+            s.idempotency_key = Some([2u8; 16]);
+        }
+
+        handler
+            .dispatch_async_with_conn("INSERT INTO t (id, val) VALUES (2, 'y')", Some(conn_id))
+            .await
+            .unwrap();
+        handler
+            .dispatch_async_with_conn("COMMIT", Some(conn_id))
+            .await
+            .unwrap();
+
+        let events = log.read_all().unwrap();
+        assert!(
+            events.iter().any(|e| e.actor == "system"),
+            "expected system actor in audit log, got: {:?}",
+            events.iter().map(|e| &e.actor).collect::<Vec<_>>()
+        );
     }
 }

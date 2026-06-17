@@ -17,6 +17,13 @@ pub enum StorageError {
     #[error("unsupported operation: {0}")]
     Unsupported(String),
 
+    /// RS-2002: partial-agg result too large — shard returned >
+    /// MAX_PARTIAL_AGG_RESULT_ROWS groups.
+    /// next_steps: "Reduce GROUP BY cardinality or increase
+    /// MAX_PARTIAL_AGG_RESULT_ROWS."
+    #[error("[RS-2002] view.state_budget_exceeded: partial-agg result exceeded MAX_PARTIAL_AGG_RESULT_ROWS ({limit} groups). Reduce GROUP BY cardinality.")]
+    PartialAggResultTooLarge { limit: usize },
+
     /// RS-5002: arrangement header references a merge law that is not
     /// registered in the catalog. The shard refuses to attach until the law
     /// is either registered or the arrangement is migrated.

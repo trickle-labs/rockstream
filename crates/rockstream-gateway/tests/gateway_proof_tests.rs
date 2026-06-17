@@ -1555,3 +1555,62 @@ async fn session_ryw_opt_out() {
         "opt-out SELECT should complete immediately, took {elapsed_ms}ms"
     );
 }
+
+// ── v0.26 S8: explain_names_pushdown_effect ──────────────────────────────────
+
+/// EXPLAIN SELECT k, COUNT(*) FROM mv GROUP BY k → output contains "partial_pushdown: true".
+#[tokio::test]
+async fn explain_names_pushdown_effect() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("explain-pushdown").await;
+    let client = connect_port(port).await;
+
+    let rows = client
+        .simple_query("EXPLAIN SELECT k, COUNT(*) FROM mv GROUP BY k")
+        .await
+        .unwrap();
+
+    let plan_text: String = rows
+        .iter()
+        .filter_map(|m| {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
+                row.get(0).map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        plan_text.contains("partial_pushdown: true"),
+        "EXPLAIN must contain 'partial_pushdown: true', got: {plan_text}"
+    );
+}
+
+// ── v0.26 S8: explain_no_pushdown_for_full_scan ──────────────────────────────
+
+/// EXPLAIN SELECT * FROM mv → output does NOT contain "partial_pushdown: true".
+#[tokio::test]
+async fn explain_no_pushdown_for_full_scan() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("explain-no-pushdown").await;
+    let client = connect_port(port).await;
+
+    let rows = client.simple_query("EXPLAIN SELECT * FROM mv").await.unwrap();
+
+    let plan_text: String = rows
+        .iter()
+        .filter_map(|m| {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
+                row.get(0).map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !plan_text.contains("partial_pushdown: true"),
+        "EXPLAIN SELECT * must NOT contain 'partial_pushdown: true', got: {plan_text}"
+    );
+}

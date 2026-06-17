@@ -4,7 +4,7 @@
 //! support for write batches, merge operations, and prefix scanning.
 //! Does NOT use range deletion.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,6 +18,15 @@ use slatedb::Db;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ALLOW_LAW_OPERAND_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// Max rows (groups) returned by a single shard's partial_query.
+/// Bound: MAX_PARTIAL_AGG_RESULT_ROWS; fill metric: partial_agg_result_rows gauge.
+pub const MAX_PARTIAL_AGG_RESULT_ROWS: usize = 1_000_000;
+
+/// Fill-level metric: number of rows in the last partial_query call.
+/// Gauge: updated atomically per call to partial_query.
+pub static PARTIAL_AGG_RESULT_ROWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Set whether to allow fallback to raw bytes when a law operand is corrupted.
 pub fn set_allow_law_operand_fallback(allow: bool) {
@@ -79,6 +88,18 @@ pub struct ShardDbBuilder {
     path: String,
     object_store: Arc<dyn ObjectStore>,
     settings: Settings,
+}
+
+/// Specification for a partial aggregation query.
+/// Serialized as JSON in `partial_plan_bytes`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PartialAggSpec {
+    /// Zero-based column index to GROUP BY (TSV column index).
+    pub group_col: usize,
+    /// Zero-based column index to aggregate.
+    pub agg_col: usize,
+    /// Aggregation type: "sum" or "count".
+    pub agg_type: String,
 }
 
 impl ShardDbBuilder {
@@ -238,6 +259,76 @@ impl ShardDb {
             results.push((entry.key, entry.value));
         }
         Ok(results)
+    }
+
+    /// Execute a partial aggregation query against this shard's view output.
+    ///
+    /// # Arguments
+    /// - `view_name`: name of the view (prefix: `view_output/<view_name>/`)
+    /// - `partial_plan_bytes`: JSON-encoded `PartialAggSpec`
+    /// - `frontier`: unused in this impl (pinned reads not yet supported here); pass 0
+    ///
+    /// # Bounds
+    /// Result groups ≤ MAX_PARTIAL_AGG_RESULT_ROWS.
+    /// Fill metric: PARTIAL_AGG_RESULT_ROWS updated per call.
+    ///
+    /// # Returns
+    /// TSV rows: each row is `<group_key>\t<agg_value>` as bytes.
+    pub async fn partial_query(
+        &self,
+        view_name: &str,
+        partial_plan_bytes: &[u8],
+        frontier: u64,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        self.partial_query_with_limit(
+            view_name,
+            partial_plan_bytes,
+            frontier,
+            MAX_PARTIAL_AGG_RESULT_ROWS,
+        )
+        .await
+    }
+
+    /// Like `partial_query` but with a configurable row limit (for testing).
+    pub async fn partial_query_with_limit(
+        &self,
+        view_name: &str,
+        partial_plan_bytes: &[u8],
+        _frontier: u64,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        let spec: PartialAggSpec = serde_json::from_slice(partial_plan_bytes)
+            .map_err(|e| StorageError::KeyEncoding(format!("invalid PartialAggSpec: {e}")))?;
+
+        let prefix = format!("view_output/{view_name}/");
+        let rows = self.scan_prefix(prefix.as_bytes()).await?;
+
+        let mut groups: HashMap<String, i64> = HashMap::new();
+        for (_k, v) in &rows {
+            let row_str = String::from_utf8_lossy(v);
+            let cols: Vec<&str> = row_str.split('\t').collect();
+            let key = cols.get(spec.group_col).copied().unwrap_or("").to_string();
+            let agg_val = cols.get(spec.agg_col).copied().unwrap_or("0");
+            let num: i64 = agg_val.parse().unwrap_or(0);
+            let entry = groups.entry(key).or_insert(0);
+            match spec.agg_type.as_str() {
+                "sum" => *entry += num,
+                "count" => *entry += 1,
+                _ => *entry += num,
+            }
+        }
+
+        let result_count = groups.len();
+        PARTIAL_AGG_RESULT_ROWS.store(result_count, Ordering::Relaxed);
+
+        if result_count > limit {
+            return Err(StorageError::PartialAggResultTooLarge { limit });
+        }
+
+        Ok(groups
+            .into_iter()
+            .map(|(k, v)| format!("{k}\t{v}").into_bytes())
+            .collect())
     }
 
     /// Scan key-value pairs with the given prefix, up to a byte budget.
@@ -774,5 +865,70 @@ mod frontier_reporter_tests {
             h2.shard_checkpoint_id,
             h1.shard_checkpoint_id
         );
+    }
+}
+
+#[cfg(test)]
+mod partial_agg_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    // ── S6: partial_agg_shard_query_returns_compact_batch ─────────────────────
+
+    /// Write 100 rows across 5 groups, partial_query GROUP BY key, SUM(val) → 5 rows.
+    #[tokio::test]
+    async fn partial_agg_shard_query_returns_compact_batch() {
+        let store = Arc::new(InMemory::new());
+        let shard = ShardDb::builder("partial-agg-test", store).build().await.unwrap();
+
+        for i in 0u64..100 {
+            let group = i % 5;
+            let key = format!("view_output/orders_mv/{:016x}", i);
+            let val = format!("{group}\t{}", group * 10);
+            shard.put(key.as_bytes(), val.as_bytes()).await.unwrap();
+        }
+
+        let spec = PartialAggSpec {
+            group_col: 0,
+            agg_col: 1,
+            agg_type: "sum".to_string(),
+        };
+        let plan_bytes = serde_json::to_vec(&spec).unwrap();
+        let result = shard.partial_query("orders_mv", &plan_bytes, 0).await.unwrap();
+
+        assert_eq!(result.len(), 5, "expected 5 groups, got {}", result.len());
+    }
+
+    // ── S6: partial_agg_shard_query_too_large_returns_rs2002 ─────────────────
+
+    /// With limit=3, 10 distinct groups → RS-2002 returned.
+    #[tokio::test]
+    async fn partial_agg_shard_query_too_large_returns_rs2002() {
+        let store = Arc::new(InMemory::new());
+        let shard = ShardDb::builder("partial-agg-too-large", store)
+            .build()
+            .await
+            .unwrap();
+
+        for i in 0u64..10 {
+            let key = format!("view_output/mv/{:016x}", i);
+            let val = format!("{i}\t{}", i * 5);
+            shard.put(key.as_bytes(), val.as_bytes()).await.unwrap();
+        }
+
+        let spec = PartialAggSpec {
+            group_col: 0,
+            agg_col: 1,
+            agg_type: "sum".to_string(),
+        };
+        let plan_bytes = serde_json::to_vec(&spec).unwrap();
+        let err = shard.partial_query_with_limit("mv", &plan_bytes, 0, 3).await;
+        assert!(
+            matches!(err, Err(StorageError::PartialAggResultTooLarge { .. })),
+            "expected PartialAggResultTooLarge, got {:?}",
+            err
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("RS-2002"), "expected RS-2002 in error, got: {msg}");
     }
 }

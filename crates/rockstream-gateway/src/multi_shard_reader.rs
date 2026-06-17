@@ -17,9 +17,46 @@ use std::sync::{
     Arc,
 };
 
-use rockstream_storage::ShardReader;
+use rockstream_storage::{PartialAggSpec, ShardReader};
 
 use crate::error::GatewayError;
+
+/// Returns true if the SQL query can be pushed down as a partial aggregation.
+/// Detects: SELECT <cols> FROM <view> GROUP BY <cols> where aggregates are SUM/COUNT/AVG.
+pub fn can_pushdown_partial_agg(sql: &str) -> bool {
+    let ql = sql.to_lowercase();
+    if !ql.contains("group by") {
+        return false;
+    }
+    if !ql.contains("select") || !ql.contains("from") {
+        return false;
+    }
+    if ql.contains("select *") || ql.contains("select\n*") {
+        return false;
+    }
+    ql.contains("sum(") || ql.contains("count(") || ql.contains("count(*)") || ql.contains("avg(")
+}
+
+/// Extract a PartialAggSpec from a GROUP BY SQL query.
+/// Returns None if the query is not parseable.
+fn extract_partial_agg_spec(sql: &str) -> Option<PartialAggSpec> {
+    if !can_pushdown_partial_agg(sql) {
+        return None;
+    }
+    let ql = sql.to_lowercase();
+    let agg_type = if ql.contains("sum(") {
+        "sum"
+    } else if ql.contains("count(") || ql.contains("count(*)") {
+        "count"
+    } else {
+        "sum"
+    };
+    Some(PartialAggSpec {
+        group_col: 0,
+        agg_col: 1,
+        agg_type: agg_type.to_string(),
+    })
+}
 
 /// Scatter-reads a view across multiple shards, all pinned to the same
 /// `pinned_frontier` epoch.
@@ -123,6 +160,86 @@ impl MultiShardReader {
 
         Ok(rows)
     }
+
+    /// Scatter a partial aggregation query to all shards, then merge (re-aggregate) the results.
+    ///
+    /// Bounds: MAX_PARTIAL_AGG_RESULT_ROWS per shard (enforced by shard);
+    /// MAX_IN_FLIGHT_ROWS on merged total.
+    pub async fn scatter_read_partial_agg(
+        &self,
+        view_name: &str,
+        partial_plan_bytes: &[u8],
+        sql: &str,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        use std::collections::HashMap;
+
+        let planner_spec = extract_partial_agg_spec(sql).ok_or_else(|| {
+            GatewayError::NotSupported("query is not eligible for partial aggregation".to_string())
+        })?;
+        let spec: PartialAggSpec = serde_json::from_slice(partial_plan_bytes)
+            .map_err(|e| GatewayError::NotSupported(format!("invalid PartialAggSpec: {e}")))?;
+        let agg_type = if spec.agg_type.is_empty() {
+            planner_spec.agg_type
+        } else {
+            spec.agg_type.clone()
+        };
+
+        let prefix = format!("view_output/{view_name}/");
+        let prefix_bytes = prefix.into_bytes();
+
+        let mut handles = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            let shard = shard.clone();
+            let pfx = prefix_bytes.clone();
+            let shard_spec = spec.clone();
+            handles.push(tokio::spawn(async move {
+                let rows = shard.scan_prefix(&pfx).await?;
+                let mut groups: HashMap<String, i64> = HashMap::new();
+                for (_k, v) in rows {
+                    let row = String::from_utf8_lossy(&v);
+                    let cols: Vec<&str> = row.split('\t').collect();
+                    let key = cols.get(shard_spec.group_col).copied().unwrap_or("").to_string();
+                    let agg_val = cols.get(shard_spec.agg_col).copied().unwrap_or("0");
+                    let num: i64 = agg_val.parse().unwrap_or(0);
+                    let entry = groups.entry(key).or_insert(0);
+                    match shard_spec.agg_type.as_str() {
+                        "sum" => *entry += num,
+                        "count" => *entry += 1,
+                        _ => *entry += num,
+                    }
+                }
+                Ok::<HashMap<String, i64>, rockstream_storage::StorageError>(groups)
+            }));
+        }
+
+        let mut merged: HashMap<String, i64> = HashMap::new();
+        for handle in handles {
+            let partial_groups = handle
+                .await
+                .map_err(|e| GatewayError::NotSupported(format!("join error: {e}")))?
+                .map_err(GatewayError::Storage)?;
+
+            for (key, val) in partial_groups {
+                let entry = merged.entry(key).or_insert(0);
+                match agg_type.as_str() {
+                    "sum" | "count" => *entry += val,
+                    _ => *entry += val,
+                }
+            }
+        }
+
+        let total = merged.len();
+        if total > self.max_in_flight_rows {
+            return Err(GatewayError::ResultSetTooLarge);
+        }
+
+        self.rows_in_flight.store(total, Ordering::Relaxed);
+
+        Ok(merged
+            .into_iter()
+            .map(|(k, v)| format!("{k}\t{v}").into_bytes())
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +328,114 @@ mod tests {
             matches!(err, Err(GatewayError::ResultSetTooLarge)),
             "expected ResultSetTooLarge"
         );
+    }
+
+    // ── S7: partial_agg_gateway_planner_detects_pushdown_query ───────────────
+
+    #[test]
+    fn partial_agg_gateway_planner_detects_pushdown_query() {
+        assert!(
+            can_pushdown_partial_agg("SELECT k, SUM(v) FROM mv GROUP BY k"),
+            "GROUP BY + SUM should be detected as pushdown"
+        );
+        assert!(
+            can_pushdown_partial_agg("SELECT region, COUNT(*) FROM orders_mv GROUP BY region"),
+            "GROUP BY + COUNT(*) should be detected as pushdown"
+        );
+    }
+
+    // ── S7: partial_agg_gateway_planner_rejects_non_pushdown ─────────────────
+
+    #[test]
+    fn partial_agg_gateway_planner_rejects_non_pushdown() {
+        assert!(
+            !can_pushdown_partial_agg("SELECT * FROM mv WHERE id > 5"),
+            "full scan SELECT * should not be pushdown"
+        );
+        assert!(
+            !can_pushdown_partial_agg("SELECT id, val FROM mv"),
+            "no GROUP BY should not be pushdown"
+        );
+    }
+
+    // ── S7: oracle_partial_agg_pushdown_equals_full_scan ─────────────────────
+
+    /// Oracle: pushdown result must equal a re-aggregation of the full scan.
+    #[tokio::test]
+    async fn oracle_partial_agg_pushdown_equals_full_scan() {
+        let mut shards_reader = vec![];
+        for i in 0..3usize {
+            let store = Arc::new(InMemory::new());
+            let shard = Arc::new(
+                ShardDb::builder(format!("oracle-shard-{i}"), store.clone())
+                    .build()
+                    .await
+                    .unwrap(),
+            );
+            for j in 0u64..10 {
+                let group = j % 5;
+                let key = format!("view_output/mv/{:016x}", j);
+                let val = format!("{group}\t{}", (i as u64 + 1) * 10 + j);
+                shard.put(key.as_bytes(), val.as_bytes()).await.unwrap();
+            }
+            shard.flush().await.unwrap();
+            shards_reader.push(Arc::new(
+                ShardReader::open(format!("oracle-shard-{i}"), store)
+                    .await
+                    .unwrap(),
+            ));
+        }
+
+        let msr = MultiShardReader::new(
+            shards_reader,
+            0,
+            MultiShardReader::DEFAULT_MAX_IN_FLIGHT_ROWS,
+        );
+
+        let spec = PartialAggSpec {
+            group_col: 0,
+            agg_col: 1,
+            agg_type: "sum".to_string(),
+        };
+        let plan_bytes = serde_json::to_vec(&spec).unwrap();
+
+        let pushdown_rows = msr
+            .scatter_read_partial_agg("mv", &plan_bytes, "SELECT k, SUM(v) FROM mv GROUP BY k")
+            .await
+            .unwrap();
+
+        let full_rows = msr.scatter_read("mv", None).await.unwrap();
+        let mut expected: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for row in &full_rows {
+            let s = String::from_utf8_lossy(row);
+            let cols: Vec<&str> = s.split('\t').collect();
+            let key = cols.get(0).copied().unwrap_or("").to_string();
+            let val: i64 = cols.get(1).copied().unwrap_or("0").parse().unwrap_or(0);
+            *expected.entry(key).or_insert(0) += val;
+        }
+
+        let mut pushdown_map: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        for row in &pushdown_rows {
+            let s = String::from_utf8_lossy(row);
+            let cols: Vec<&str> = s.split('\t').collect();
+            let key = cols.get(0).copied().unwrap_or("").to_string();
+            let val: i64 = cols.get(1).copied().unwrap_or("0").parse().unwrap_or(0);
+            pushdown_map.insert(key, val);
+        }
+
+        assert_eq!(
+            pushdown_rows.len(),
+            expected.len(),
+            "pushdown group count should equal full-scan group count"
+        );
+        for (k, v) in &expected {
+            assert_eq!(
+                pushdown_map.get(k).copied().unwrap_or(0),
+                *v,
+                "group {k}: pushdown={}, full_scan={v}",
+                pushdown_map.get(k).copied().unwrap_or(0)
+            );
+        }
     }
 }
