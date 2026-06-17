@@ -400,8 +400,8 @@ attempting them would compromise the rest of the design:
   sequence number, which is an explicit non-goal (see below). `READ COMMITTED`
   and `REPEATABLE READ` are fully supported by the existing vector-frontier
   model (§12.6) and cover the vast majority of analytical and streaming
-  workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is a candidate
-  extension (v0.51). Optimistic exact-key guarded writes for non-CRDT columns
+  workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is scheduled
+  for v0.41 (Phase 14). Optimistic exact-key guarded writes for non-CRDT columns
   and blind commutative writes for CRDT columns are planned pre-1.0 (§13.5.1).
   A *global* cross-shard `SERIALIZABLE` coordinator (one covering every shard)
   is an explicit non-goal. See
@@ -417,8 +417,8 @@ attempting them would compromise the rest of the design:
   an idempotent join-semilattice column could become a region-spanning surface
   later, but no version through 1.0 promises that path.
 - **Arbitrary user-defined merge functions before the built-in CRDT catalog
-  ships.** `CREATE MERGE LAW` is gated on the v0.51 built-in catalog and shared
-  property-test suite (§6.11; [ideas/crdts.md](ideas/crdts.md)).
+  ships.** `CREATE MERGE LAW` is gated on a post-1.0 release of the built-in
+  catalog and shared property-test suite (§6.11; [ideas/crdts.md](ideas/crdts.md)).
 - **Per-query cost accounting ($/query) in the hot path.** Cost visibility in
   `EXPLAIN ESTIMATE` is a design goal; per-query billing middleware and
   chargeback to tenants is an application-layer concern out of scope.
@@ -1514,8 +1514,8 @@ in [ideas/crdts.md](ideas/crdts.md); the design-level commitments are:
 
 7. **User-visible CRDT column types** (`COUNTER`, `MAX_REGISTER`,
    `MIN_REGISTER`, `LWW`, `G_SET`, `OR_SET`, plus `APPROX_*` sketches)
-   land in v0.43–v0.45 once the internal law contract is proven.
-   `CREATE MERGE LAW` for user-defined laws is gated until v0.51 and
+   are post-1.0 once the internal law contract is proven.
+   `CREATE MERGE LAW` for user-defined laws is deferred post-1.0 and
    the built-in catalog property suite must accept it before it can be
    used in a `PlanNode`. Non-idempotent laws written through the
    direct-write gateway require either exact-once source offsets or an
@@ -2721,7 +2721,7 @@ streaming workloads.
 | `READ COMMITTED` | Each statement pins to the latest published vector frontier at statement start. |
 | `REPEATABLE READ` | `BEGIN` pins the session to a specific vector frontier; all statements in the transaction see that snapshot. |
 | `SERIALIZABLE` | **Not supported** for cross-shard transactions (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
-| `SERIALIZABLE LOCAL` | Candidate v0.51: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
+| `SERIALIZABLE LOCAL` | v0.41: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
 
 **Optimistic write semantics** (§13.5.1): direct-write transactions may use
 optimistic exact-key guards (`RS-2008` on conflict) and blind CRDT writes
@@ -2956,9 +2956,9 @@ The gateway planner selects `TwoTier` when all of the following hold:
 For all other queries (point lookups, range scans by partition key, subscribe),
 the gateway always uses `HotOnly` regardless of whether a cold tier exists.
 
-In Phase 8 (v0.40), only `HotOnly` is implemented. The `ViewReadStrategy`
+In Phase 7 (v0.26 ✅ done), only `HotOnly` is implemented. The `ViewReadStrategy`
 enum and the `ViewReader` trait are defined in full so that the cold-tier
-implementation (Phase 12 / v0.53) slot-fits without touching the gateway
+implementation (Phase 10 / v0.33) slot-fits without touching the gateway
 planner.
 
 #### 12.7.4 Competitive Position
@@ -2979,10 +2979,9 @@ becomes competitive for ad-hoc analytics over its own data as well.
 
 #### 12.7.5 Implementation Scope
 
-The cold tier is a future extension. Phase 9 obligation: define `ViewReader` /
-`ViewReadStrategy` with cold-tier slots and implement `HotOnly`. The cold-tier
-`TwoTier` path and the cold-snapshot checkpoint writer are deferred to a later
-roadmap version. See IMPLEMENTATION_PLAN.md §Phase 9.
+The `HotOnly` gateway path shipped in Phase 7 (v0.26, ✅ done). The cold-tier
+`TwoTier` path and the cold-snapshot checkpoint writer ship at v0.33 (Phase 10
+of NEW_ROADMAP.md — Cold-Tier Sinks & Simulator Fixes).
 
 ---
 
@@ -3104,8 +3103,8 @@ the response contains the written row as if it were a `SELECT` result.
 
 `INSERT ... RETURNING` does **not** extend to `UPDATE ... RETURNING` or
 `DELETE ... RETURNING` in v0.43. Those variants require the gateway to read
-old state before the write, which adds read-modify-write latency. They are
-deferred post-1.0.
+old state before the write, which adds read-modify-write latency. They ship
+at v0.35 (Phase 11 — Advanced DML & Scatter Pruning).
 
 **Ships**: v0.43 (extends the direct-write surface).
 
@@ -3469,10 +3468,10 @@ transaction into one of five shapes:
 
 | Shape | Description | Pre-1.0? |
 |---|---|---:|
-| `ShardLocalSerializable` | Planner proves all reads/writes touch one shard; delegates to SlateDB transaction. | v0.51 |
+| `ShardLocalSerializable` | Planner proves all reads/writes touch one shard; delegates to SlateDB transaction. | v0.41 |
 | `BlindCommutative` | All writes are registered CRDT operands with `read_dependent = false`. | v0.43+ |
-| `OptimisticExactKey` | Non-CRDT exact-key writes validated against per-row versions. | v0.51 |
-| `MixedCrdtAndOptimisticExactKey` | CRDT writes skip validation; non-CRDT exact-key writes validate. | v0.55 experimental |
+| `OptimisticExactKey` | Non-CRDT exact-key writes validated against per-row versions. | v0.41 |
+| `MixedCrdtAndOptimisticExactKey` | CRDT writes skip validation; non-CRDT exact-key writes validate. | post-1.0 |
 | `Unsupported` | Predicate reads, range reads, cross-shard uniqueness, foreign keys, or any shape requiring general serializability. Returns `RS-2009`. | No |
 
 **Row-version metadata.** Each direct-write base-table row carries a
@@ -4799,16 +4798,15 @@ The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
 adaptive per-operator parallelism**.
 
-**GA vs. Data Lake GA scope.** The table above describes the system at
-full design scope (v0.55+). At Production Beta / v1.0 (v0.52), the cold-tier
-Iceberg sink, Iceberg REST Catalog server, and DuckDB/Spark/Trino discovery-
-by-name are **not yet shipped** — they are Phase 12 deliverables (v0.53–v0.55).
-The v1.0 positioning therefore rests on: object-storage-native IVM, full SQL,
+**GA vs. Data Lake GA scope.** At v1.0 (v0.43 RC1), the cold-tier
+Iceberg/Delta sink (v0.33) and DuckDB/Spark/Trino table discovery via
+registered external catalogs ship before the RC1 gate. The Iceberg REST
+Catalog server (§13.7) and the DuckLake catalog server (§13.8) remain
+post-1.0. The v1.0 positioning rests on: object-storage-native IVM, full SQL,
 adaptive parallelism, Postgres wire access, direct DML writes, secondary
-indexes, and the connector ecosystem. The "first-class Iceberg table" story
-(§12.7, §13.6, §13.7) is a differentiator at Data Lake GA, not at Production
-Beta. Marketing materials and competitive positioning prior to v0.53 must not
-claim cold-tier or external-catalog features as shipping capabilities.
+indexes, and the connector and cold-tier ecosystem. Marketing materials must
+not claim the Iceberg REST Catalog or DuckLake server as shipping capabilities
+until they are released.
 
 ### 15.1 Explicitly Deferred: Data Quality / Expectations
 
@@ -4827,8 +4825,8 @@ a dedicated assertion language, DLQ routing, per-row vs. batch-level
 semantics, and integration with alerting — each of which is a meaningful
 scope addition.
 
-**Planned phase.** Data quality is targeted as a **post-1.0 extension**
-(tentatively v0.55+), designed as a plugin/extension layer:
+**Planned phase.** Data quality is scheduled for **v0.39–v0.40** (Phase 13 —
+Declarative Data Governance), designed as a plugin/extension layer:
 
 - `CREATE EXPECTATION <name> ON <view> AS <predicate>` DDL.
 - Failing rows routed to a configurable DLQ sink with the expectation name
@@ -5114,8 +5112,8 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    several seconds after a PUT. Consequence: the CALM epoch manifest
    verifiability property (§8.4) is not tested against LIST staleness.
    Mitigation: add `list_staleness_epochs` fault parameter to
-   `SimObjectStore` by v0.38.
-   Status: **[UNMITIGATED — v0.38 deferred to v0.39]** — informational only;
+   `SimObjectStore` by v0.42 (Simulator Maturity).
+   Status: **[UNMITIGATED — scheduled for v0.42 Simulator Maturity]** — informational only;
    CALM property depends on direct manifest reads, not LIST.
 
 4. **Network packet fragmentation** — TCP segmentation of large shuffle

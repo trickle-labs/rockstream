@@ -10,11 +10,10 @@ production-grade system built around **two core pillars** and nothing else:
    write base-table rows, and subscribe to change streams over the standard
    Postgres protocol.
 
-Everything else in [DESIGN.md](DESIGN.md) and the original
-[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) is **explicitly deferred** (see
-[Out of Scope](#out-of-scope-for-this-plan)). This document replaces breadth
-with depth: a smaller surface, implemented in strict dependency order, with a
-named test gate at every step.
+The two pillars are built first, then extended across Phases 9–14 to v1.0.
+Capabilities that remain out of scope are listed in
+[Out of Scope](#out-of-scope-for-this-plan). Every phase is implemented in
+strict dependency order with a named test gate at every step.
 
 > **Read alongside**:
 > - [DESIGN.md](DESIGN.md) — system architecture.
@@ -49,30 +48,33 @@ named test gate at every step.
 
 ## Out of Scope for This Plan
 
-The following are intentionally **not** part of this plan. They are deferred,
-not rejected; each can be added later behind the same abstractions without a
-rewrite. Removing them is what makes the core deliverable achievable and
-well-tested.
+The following are intentionally **not** part of this plan. They remain deferred
+beyond v1.0; each slots behind an abstraction already built without a rewrite.
 
 - User-visible CRDT column types (`COUNTER`, `LWW`, `OR_SET`, `MV_REGISTER`)
   and the general `CREATE MERGE LAW` facility. *(The internal Z-set weight
   algebra is kept; user-facing CRDTs are not.)*
-- Cold-tier Iceberg/Delta sinks, the native Iceberg REST catalog server, and
-  the DuckLake catalog server.
-- Secondary indexes and shard-column-statistics scatter pruning.
-- Optimistic / `SERIALIZABLE LOCAL` transactions and the transaction-shape
-  classifier.
-- A broad connector matrix and external connector/plugin APIs.
-- Advanced auto-tuning and SLO-driven adaptive control loops beyond simple,
-  bounded epoch-sizing and parallelism defaults.
-- Recursion (`WITH RECURSIVE`), lateral / set-returning functions, and advanced
-  windowing beyond the essential set.
+- The native Iceberg REST catalog server (§13.7) and the DuckLake catalog
+  server (§13.8). *(Cold-tier Iceberg/Delta sinks ship at v0.33 — Phase 10.)*
+- External connector/plugin APIs. *(Native Kafka and AWS S3 source connectors
+  ship at v0.27–v0.28 — Phase 8.)*
 - Multi-region operation and active-active writes.
 - Historical (`AS OF`) full-collection scans beyond the checkpoint-bounded
   point/range reads needed for correctness.
 
-A focused 1.0 ships the two pillars, correct and operable. The deferred work is
-sequenced post-1.0.
+The following were previously deferred and are **now scheduled** in Phases 8–14
+(v0.27–v0.43):
+- `COPY` bulk load and first-party Kafka/S3 connectors (v0.27–v0.28).
+- Secondary indexes (v0.32) and scatter-pruning Bloom filters (v0.35).
+- `SERIALIZABLE LOCAL` transactions and optimistic exact-key writes (v0.41).
+- SLO-driven adaptive control loops and simulator maturity (v0.30, v0.42).
+- `WITH RECURSIVE`, lateral joins, hopping/session windows (v0.37).
+- Cold-tier Iceberg/Delta sinks and FinOps storage tiering (v0.33–v0.34).
+- `UPDATE … RETURNING` / `DELETE … RETURNING` (v0.35).
+- Declarative data quality expectations and DLQ routing (v0.39–v0.40).
+
+A v1.0 ships all of the above plus the two foundational pillars, correct and
+operable. The items in the first list remain deferred beyond v1.0.
 
 ---
 
@@ -116,7 +118,13 @@ must satisfy the relevant rungs before it exits.
 | 5 | IVM | Frontier protocol & progress tracking | Multi-rate joins correct; bounded shuffle storage |
 | 6 | IVM | Fault tolerance & exactly-once | 24h chaos: zero loss, zero duplicates |
 | 7 | Postgres | PostgreSQL wire gateway: read, DML, subscribe | `psql` + ORM round-trip; read-your-writes |
-| 8 | Both | Minimal connectors + production hardening | 24h E2E exactly-once; security review |
+| 8 | Both | Ingestion connectors & crucible soaks | 72h object-store soak; recovery SLOs under real load |
+| 9 | Both | Operational HTAP ergonomics | Secondary indexes; single-digit-ms point lookups |
+| 10 | Both | Data lake bridge & FinOps | External engines query Iceberg snapshots; >50% TCO reduction |
+| 11 | Both | Network efficiency & advanced DML | Zero-copy IPC; >90% shard pruning on Bloom filters |
+| 12 | IVM | Complex analytics & compute tuning | Recursive CTEs correct against oracle; +30% DAG throughput |
+| 13 | Both | Declarative data governance | Malformed records never reach ViewSink; DLQ durable |
+| 14 | Both | Enterprise validation & v1.0 finalization | 2-week chaos; zero P0/P1; `v1.0.0` tagged |
 
 Distribution (Phases 4–6) deliberately precedes the Postgres layer (Phase 7):
 the gateway must serve a correct, fault-tolerant, distributed engine, not a
@@ -337,8 +345,8 @@ by >2× requires a tracked mitigation before advancing.
 **Goal**: Complete the operator set needed for the analytical 1.0 subset, then
 prove the single-shard engine is production-correct *before* distribution.
 
-**Essential operators only** (advanced windowing, recursion, and lateral
-functions are deferred — see [Out of Scope](#out-of-scope-for-this-plan)):
+**Essential operators only** (hopping/session windows, recursion, and lateral
+functions land in Phase 12 — see [Phase 12](#phase-12--complex-analytics--compute-tuning)):
 
 ### IVM-7 — Window functions (partition-recompute strategy)
 
@@ -353,7 +361,7 @@ functions are deferred — see [Out of Scope](#out-of-scope-for-this-plan)):
 
 - TUMBLE windows keyed by `window_id`, with event-time TTL on arrangement
   entries and a frontier-aware compaction filter that removes state only after
-  event-time expiry. *(HOP/SESSION deferred.)*
+  event-time expiry. *(HOP/SESSION windows land in Phase 12, v0.37.)*
 
 ### IVM-9 — Top-K
 
@@ -703,6 +711,157 @@ and prove production readiness. Breadth is intentionally avoided.
 
 ---
 
+## Phase 9 — Operational HTAP Ergonomics
+
+**Goal**: Enable single-digit-millisecond point lookups on non-primary keys,
+unlocking early-adopter OLTP workloads without full shard scans.
+
+**Deliverables**
+
+- **Secondary indexes** (DESIGN.md §13.9): system-managed materialized IVM
+  views acting transparently as secondary indexes; the planner rewrites a
+  `WHERE non_pk_col = ?` predicate to route through the index view.
+- Index DDL: `CREATE INDEX ON t (col)` / `DROP INDEX`.
+- `EXPLAIN` shows index usage.
+
+**Exit criteria**: point lookups on indexed non-primary columns execute in
+single-digit milliseconds at p99. *(Private Beta milestone.)*
+
+---
+
+## Phase 10 — The Data Lake Bridge & FinOps
+
+**Goal**: Connect RockStream to the columnar data lake ecosystem and cut
+steady-state cloud costs.
+
+**Deliverables**
+
+- **Cold-tier Iceberg/Delta sinks** (DESIGN.md §13.6): `CREATE SINK` writing
+  periodic columnar Parquet snapshots to object storage in Iceberg v2 and Delta
+  formats; checkpoint-to-manifest lifecycle; external-catalog API calls
+  (`filesystem`, `glue`, `rest`, `hive`, `ducklake`).
+- **`SimRuntime` partial-write mocks**: add `partial_write_probability` to
+  `SimObjectStore` fault model to close the cold-tier exactly-once gap
+  (DESIGN.md §17 gap 1).
+- **FinOps storage tiering**: route `shard_meta/` to AWS S3 Express One Zone;
+  tier older compacted SSTs to S3 Standard-IA; validate stateless worker pool
+  on Spot/preemptible instances.
+
+**Exit criteria**:
+- External engines (DuckDB, Trino, Databricks) can query RockStream-generated
+  Iceberg tables with zero data corruption.
+- TCO benchmarks show >50% reduction in steady-state operational costs compared
+  to Phase 8.
+- `SimRuntime` partial-write coverage closes the cold-tier exactly-once gap.
+
+---
+
+## Phase 11 — Network Efficiency & Advanced DML
+
+**Goal**: Eliminate cross-network serialization overhead and extend the DML
+surface to full read-modify-write semantics.
+
+**Deliverables**
+
+- **`UPDATE … RETURNING` / `DELETE … RETURNING`** (DESIGN.md §12.8.2):
+  read-modify-write gateway path; the gateway reads current shard state, applies
+  the mutation, and returns modified rows in a single round-trip.
+- **Bloom filter scatter pruning** (DESIGN.md §8.7, §12.3.1): piggyback
+  min/max bounds and Bloom filters on `WorkerFrontierSummary`; gateway planner
+  prunes shards that cannot contain matching keys before dispatching.
+- **Zero-copy IPC** (DESIGN.md §7.5): upgrade same-host gRPC loopbacks to
+  Apache Arrow Flight Shared Memory; eliminate memory-copy overhead for
+  collocated workers.
+- **AZ-aware shuffle**: make the hierarchical exchange subsystem availability-
+  zone-aware to confine high-bandwidth shuffle traffic within the same AZ.
+
+**Exit criteria**:
+- Multi-shard point reads bypass >90% of shards via Bloom filter pruning.
+- CPU profiles show zero byte-copying for same-host worker exchanges.
+- Cross-AZ traffic drops to near zero during shuffle phases.
+
+---
+
+## Phase 12 — Complex Analytics & Compute Tuning
+
+**Goal**: Unlock enterprise graph and session analytics; reduce intermediate
+WAL write amplification.
+
+**Deliverables**
+
+- **`WITH RECURSIVE`** (DESIGN.md §6): recursive CTEs for graph algorithms and
+  fixed-point IVM; cycle detection returns `RS-1012`.
+- **Lateral joins**: `LATERAL` subqueries for nested JSON/array expansion.
+- **Hopping and session windows** (DESIGN.md §6.9): HOP and SESSION window
+  operators with frontier-aware state GC.
+- **WAL elision** for derived intermediate operator shards whose state is fully
+  recoverable from upstream arrangement state.
+- **Backpressure coupling**: link `max_rows_per_quantum` directly to network
+  buffer depth so CPU stays saturated when downstream shuffle queues are empty.
+
+**Exit criteria**:
+- Transitive closures and sessionization queries incrementally maintain state
+  correctly against the correctness oracle.
+- Throughput on complex DAGs increases by >30% due to reduced WAL write
+  amplification.
+
+---
+
+## Phase 13 — Declarative Data Governance
+
+**Goal**: Protect the persistent LSM state from malformed records with an
+inline expectation layer and durable dead-letter routing.
+
+**Deliverables**
+
+- **`CREATE EXPECTATION`** (DESIGN.md §15.1): new DDL injecting an
+  "Expectation Operator" into the operator DAG before `ViewSink`; rows failing
+  the predicate have their Z-set weight zeroed and are never written to view
+  state.
+- **DLQ routing**: failed rows forwarded transactionally to an internal
+  base-table shard (the canonical Dead Letter Queue); surfaced via
+  `rockstream_catalog.dead_letter_queue` with `REPLAY` / `DISMISS` commands.
+- **State degradation policies**: `warn`, `degrade`, `block` modes controlling
+  upstream consumption when the error threshold is crossed.
+- **`EXPLAIN INCREMENTAL ANALYZE`** integration for expectation evaluation.
+
+**Exit criteria**:
+- Malformed records injected into upstream sources never reach downstream
+  `ViewSink` outputs.
+- Failed records are durably queryable in `rockstream_catalog.dead_letter_queue`
+  alongside exactly-once commit boundaries.
+
+---
+
+## Phase 14 — Enterprise Validation & v1.0 Finalization
+
+**Goal**: Prove the full integrated system survives maximum cloud pressure;
+tag v1.0.0.
+
+**Deliverables**
+
+- **`SERIALIZABLE LOCAL` isolation** (DESIGN.md §1.1, §12.6): validate
+  non-CRDT exact-key writes against per-row versions to prevent blind
+  overwrites; single-shard `SERIALIZABLE LOCAL` isolation via SlateDB
+  transactions.
+- **Simulator maturity & auto-tuning lock**: finalize SLO-driven adaptive
+  control loops; model Kafka broker-side transaction timeouts
+  (`transaction.timeout.ms`) in `SimRuntime`, closing the final simulation gap
+  (DESIGN.md §17 gap 2).
+- **v1.0 RC1 chaos soak**: activate all features from Phase 0 through 13
+  simultaneously; run a 2-week comprehensive chaos, performance, and scaling
+  soak under maximum cluster pressure within a single cloud region.
+
+**Exit criteria**:
+- Concurrent conflicting writes to the same key on a single shard correctly
+  trigger serialization anomalies/aborts.
+- Simulator accurately reproduces and recovers from aborted Kafka transaction
+  edge-cases.
+- No P0 or P1 bugs discovered during the 2-week continuous automated chaos
+  cycle. Tag release `v1.0.0`.
+
+---
+
 ## Cross-Cutting Concerns
 
 ### Performance targets
@@ -742,22 +901,31 @@ and prove production readiness. Breadth is intentionally avoided.
 
 ---
 
-## Why This Plan Is Narrower Than `IMPLEMENTATION_PLAN.md`
+## How This Plan Relates to `IMPLEMENTATION_PLAN.md`
 
 The original plan carries 14 phases through v1.0 and beyond, including
 user-facing CRDTs, cold-tier Iceberg/Delta sinks, an Iceberg REST catalog
 server, secondary indexes, optimistic transactions, scatter-pruning statistics,
-and a broad connector matrix. This plan keeps only what the two core pillars
-require and sequences it so that:
+and a broad connector matrix. The two foundational pillars remain the same:
+an IVM engine proven correct then made distributed, topped by a Postgres
+wire layer. Phases 9–14 incorporate what was previously deferred.
+
+The build order is fixed:
 
 1. The IVM engine is **proven correct on one shard** (Phase 3) before it is
    distributed.
 2. The engine is **distributed, progress-tracked, and fault-tolerant**
    (Phases 4–6) before the Postgres layer depends on it.
 3. The **Postgres wire layer** (Phase 7) is built once against a stable engine.
-4. **Production hardening and a minimal connector set** (Phase 8) close it out.
+4. **Ingestion, soaks, and crucible validation** (Phase 8) prove the system
+   under real cloud pressure.
+5. **HTAP ergonomics, data lake bridge, FinOps, network efficiency, and
+   complex analytics** (Phases 9–12) extend the surface.
+6. **Data governance and enterprise validation** (Phases 13–14) close out v1.0.
 
-The deferred capabilities are not lost: every one of them slots behind an
-abstraction this plan already builds (`ViewReader`/`ViewReadStrategy`, the
-connector contract, the merge/Z-set algebra, the gateway), so they can be added
-post-1.0 without reworking the core.
+The remaining deferred capabilities (user-facing CRDTs, native Iceberg REST
+catalog, DuckLake catalog server, external connector plugin APIs, multi-region
+active-active writes, historical full-collection scans) still slot behind
+abstractions this plan builds (`ViewReader`/`ViewReadStrategy`, the connector
+contract, the merge/Z-set algebra, the gateway), so they can be added post-v1.0
+without reworking the core.
