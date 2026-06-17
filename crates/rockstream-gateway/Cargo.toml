@@ -25,6 +25,9 @@ rockstream-sql.workspace = true
 rand.workspace = true
 dashmap.workspace = true
 sha2.workspace = true
+hmac.workspace = true
+base64 = "0.22"
+rockstream-control.workspace = true
 
 [dev-dependencies]
 tokio-postgres.workspace = true

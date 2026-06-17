@@ -4532,12 +4532,15 @@ name = "rockstream-gateway"
 version = "0.52.10"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "dashmap",
  "futures",
+ "hmac 0.12.1",
  "object_store 0.12.5",
  "pgwire",
  "rand 0.8.6",
+ "rockstream-control",
  "rockstream-sql",
  "rockstream-storage",
  "rockstream-types",

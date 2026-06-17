@@ -63,6 +63,8 @@ pub struct CatalogView {
     pub name: String,
     pub sql: String,
     pub columns: Vec<CatalogColumn>,
+    /// Namespace this view belongs to (v0.26). Default: "public".
+    pub namespace: String,
 }
 
 /// A table entry registered by `CREATE TABLE` commands.
@@ -119,6 +121,12 @@ impl CatalogStubs {
     pub fn add_view_with_deps(&self, view: CatalogView, deps: Vec<String>) {
         let mut inner = self.inner.write().unwrap();
         inner.deps.insert(view.name.clone(), deps);
+        inner.views.insert(view.name.clone(), view);
+    }
+
+    /// Register a view that already has its namespace set.
+    pub fn add_view_in_namespace(&self, view: CatalogView) {
+        let mut inner = self.inner.write().unwrap();
         inner.views.insert(view.name.clone(), view);
     }
 

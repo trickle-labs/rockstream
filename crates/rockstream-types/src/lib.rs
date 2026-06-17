@@ -5,6 +5,7 @@
 //! batch types, merge-law descriptors, law implementations, and audit events.
 
 pub mod arrow_batch;
+pub mod acl;
 pub mod audit;
 pub mod batch;
 pub mod checkpoint;

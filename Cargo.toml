@@ -41,6 +41,7 @@ testcontainers-modules = { version = "0.11", features = ["minio"] }
 parking_lot = "0.12"
 hex = "0.4"
 hmac = "0.12"
+base64 = "0.22"
 proptest = "1"
 rand = { version = "0.8", features = ["small_rng"] }
 dashmap = "6"

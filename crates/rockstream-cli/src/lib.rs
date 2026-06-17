@@ -69,6 +69,8 @@ pub struct StartOptions {
     pub role: String,
     /// Control service URL.
     pub control: Option<String>,
+    /// Authentication mode: "off", "oidc", or "mtls".
+    pub auth_mode: String,
 }
 
 /// The result of a successful `rockstream start` no-op run.
@@ -369,6 +371,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "all".to_string(),
             control: None,
+            auth_mode: "off".to_string(),
         };
         let outcome = run_start(&opts).unwrap();
 
@@ -405,6 +408,7 @@ mod tests {
             storage: nested.clone(),
             role: "all".to_string(),
             control: None,
+            auth_mode: "off".to_string(),
         };
         run_start(&opts).unwrap();
         assert!(nested.join("audit.jsonl").exists());
@@ -417,6 +421,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "worker".to_string(),
             control: None,
+            auth_mode: "off".to_string(),
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -430,6 +435,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "frontier".to_string(),
             control: None,
+            auth_mode: "off".to_string(),
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");

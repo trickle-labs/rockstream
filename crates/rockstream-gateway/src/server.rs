@@ -12,7 +12,10 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::SinkExt;
 use futures::{stream, Sink, StreamExt};
-use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::auth::{
+    finish_authentication, save_startup_parameters_to_metadata, DefaultServerParameterProvider,
+    StartupHandler,
+};
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
@@ -29,6 +32,7 @@ use pgwire::messages::copy::{
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
+use crate::auth::{AuthMode, JwtVerifier, Principal};
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogStubs, CatalogTable,
 };
@@ -88,6 +92,14 @@ pub struct GatewayHandler {
     sessions: Arc<DashMap<String, SessionState>>,
     /// Optional ShardDb for direct-write DML commits.
     shard_db: Option<Arc<rockstream_storage::ShardDb>>,
+    /// Authentication mode for this gateway instance.
+    auth_mode: AuthMode,
+    /// Optional JWT verifier (populated when auth_mode == Oidc).
+    jwt_verifier: Option<Arc<JwtVerifier>>,
+    /// ACL store for RBAC enforcement.
+    acl_store: Arc<rockstream_control::AclStore>,
+    /// Namespace catalog.
+    namespace_catalog: Arc<rockstream_control::NamespaceCatalog>,
 }
 
 impl GatewayHandler {
@@ -99,6 +111,10 @@ impl GatewayHandler {
             write_buffers: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             shard_db: None,
+            auth_mode: AuthMode::Off,
+            jwt_verifier: None,
+            acl_store: Arc::new(rockstream_control::AclStore::new()),
+            namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
         }
     }
 
@@ -114,6 +130,10 @@ impl GatewayHandler {
             write_buffers: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             shard_db: Some(shard_db),
+            auth_mode: AuthMode::Off,
+            jwt_verifier: None,
+            acl_store: Arc::new(rockstream_control::AclStore::new()),
+            namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
         }
     }
 
@@ -175,6 +195,18 @@ impl GatewayHandler {
             return Some(self.handle_create_table(q));
         }
 
+        // CREATE NAMESPACE <name> (v0.26)
+        if ql.starts_with("create namespace ") {
+            let after = q["create namespace ".len()..].trim().trim_end_matches(';');
+            let ns_name = after.trim().to_lowercase();
+            if !ns_name.is_empty() {
+                self.namespace_catalog.create_namespace(&ns_name);
+            }
+            return Some(Ok(vec![Response::Execution(
+                Tag::new("CREATE NAMESPACE").with_rows(0),
+            )]));
+        }
+
         // Transaction control
         if ql == "begin" || ql == "begin;" || ql.starts_with("begin ") {
             return Some(Ok(vec![Response::TransactionStart(
@@ -205,6 +237,25 @@ impl GatewayHandler {
         // SET rockstream.* must be intercepted before catalog stubs handle generic SET commands.
         if ql.starts_with("set rockstream.") || ql.starts_with("set local rockstream.") {
             return self.handle_set_rockstream(q, &ql, conn_id);
+        }
+
+        // SET search_path = <namespace> (v0.26 namespace isolation)
+        if ql.starts_with("set search_path") || ql.starts_with("set local search_path") {
+            if let Some(id) = conn_id {
+                // Extract namespace: SET search_path = <ns> or SET search_path TO <ns>
+                let after_eq = if let Some(pos) = ql.find('=') {
+                    q[pos + 1..].trim().trim_end_matches(';').trim().trim_matches('\'').to_string()
+                } else if let Some(pos) = ql.find(" to ") {
+                    q[pos + 4..].trim().trim_end_matches(';').trim().trim_matches('\'').to_string()
+                } else {
+                    "public".to_string()
+                };
+                let ns = after_eq.split(',').next().unwrap_or("public").trim().trim_matches('"').to_string();
+                let mut session = self.sessions.entry(id.to_string()).or_insert_with(SessionState::new);
+                session.current_namespace = ns.clone();
+                session.search_path = ns;
+            }
+            return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
         }
 
         if let Some(result) = self.dispatch_sync(query) {
@@ -282,7 +333,7 @@ impl GatewayHandler {
             if let Some(view_name) = extract_view_name_from_select(q) {
                 if !view_name.starts_with("pg_") && !view_name.starts_with("information_schema") {
                     let limit = extract_limit(q);
-                    return self.read_view_response(&view_name, limit).await;
+                    return self.read_view_response(&view_name, limit, conn_id).await;
                 }
             }
         }
@@ -291,11 +342,54 @@ impl GatewayHandler {
     }
 
     /// Read rows from a view and build a pgwire `Response::Query`.
+    /// Enforces ACL (RS-2401) and namespace isolation (RS-2402) when conn_id is provided.
     async fn read_view_response(
         &self,
         view_name: &str,
         limit: Option<usize>,
+        conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        // Get principal and session namespace (v0.26)
+        let (principal, session_namespace) = if let Some(id) = conn_id {
+            let session = self.sessions.entry(id.to_string()).or_insert_with(SessionState::new);
+            (session.principal.clone(), session.current_namespace.clone())
+        } else {
+            (Principal::System, "public".to_string())
+        };
+
+        // ACL check: Viewer role required for SELECT (RS-2401)
+        use rockstream_types::acl::Role;
+        if !principal.is_system() {
+            if let Err(e) = self.acl_store.check(principal.identity(), &session_namespace, Some(view_name), Role::Viewer) {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "42501".to_owned(), e.to_string()),
+                )))]);
+            }
+        }
+
+        // Namespace isolation check (RS-2402)
+        if let Some(cv) = self.catalog.get_view(view_name) {
+            let view_ns = &cv.namespace;
+            if view_ns != &session_namespace && !principal.is_system() {
+                // Check if principal has Admin in own namespace (can cross-namespace)
+                let is_admin = self.acl_store
+                    .check(principal.identity(), &session_namespace, None, Role::Admin)
+                    .is_ok();
+                if !is_admin {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "42501".to_owned(),
+                            format!(
+                                "[RS-2402] auth.namespace_access_denied: principal '{}' cannot access namespace '{}' from session namespace '{}'",
+                                principal.identity(), view_ns, session_namespace
+                            ),
+                        ),
+                    )))]);
+                }
+            }
+        }
+
         let schema_fields: Vec<FieldInfo> = if let Some(cv) = self.catalog.get_view(view_name) {
             cv.columns
                 .iter()
@@ -384,6 +478,7 @@ impl GatewayHandler {
                     name: view_name.clone(),
                     sql: select_sql,
                     columns: vec![],
+                    namespace: "public".to_string(),
                 },
                 deps,
             );
@@ -828,7 +923,104 @@ impl GatewayHandler {
     }
 }
 
-impl NoopStartupHandler for GatewayHandler {}
+#[async_trait]
+impl StartupHandler for GatewayHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::PgWireFrontendMessage,
+    ) -> pgwire::error::PgWireResult<()>
+    where
+        C: pgwire::api::ClientInfo
+            + futures::Sink<pgwire::messages::PgWireBackendMessage>
+            + Unpin
+            + Send,
+        C::Error: std::fmt::Debug,
+        pgwire::error::PgWireError:
+            From<<C as futures::Sink<pgwire::messages::PgWireBackendMessage>>::Error>,
+    {
+        if let pgwire::messages::PgWireFrontendMessage::Startup(ref startup) = message {
+            save_startup_parameters_to_metadata(client, startup);
+
+            match &self.auth_mode {
+                AuthMode::Off => {
+                    client
+                        .metadata_mut()
+                        .insert("_rs_principal".to_string(), "system".to_string());
+                }
+                AuthMode::Oidc => {
+                    let auth_param = startup
+                        .parameters
+                        .iter()
+                        .find(|(k, _)| k.to_lowercase() == "authorization")
+                        .map(|(_, v)| v.clone());
+
+                    match auth_param {
+                        None => {
+                            return Err(pgwire::error::PgWireError::UserError(Box::new(
+                                pgwire::error::ErrorInfo::new(
+                                    "FATAL".to_string(),
+                                    "28000".to_string(),
+                                    "[RS-2400] auth.unauthenticated: Request missing credentials; provide Authorization: Bearer <token> in startup parameters. next_steps: Provide valid credentials (Bearer token or mTLS certificate)".to_string(),
+                                ),
+                            )));
+                        }
+                        Some(auth_val) => {
+                            let token = auth_val.strip_prefix("Bearer ").unwrap_or("").trim();
+                            if token.is_empty() {
+                                return Err(pgwire::error::PgWireError::UserError(Box::new(
+                                    pgwire::error::ErrorInfo::new(
+                                        "FATAL".to_string(),
+                                        "28000".to_string(),
+                                        "[RS-2400] auth.unauthenticated: Bearer token missing or empty. next_steps: Provide valid credentials (Bearer token or mTLS certificate)".to_string(),
+                                    ),
+                                )));
+                            }
+                            if let Some(verifier) = &self.jwt_verifier {
+                                match verifier.verify(token) {
+                                    Ok(claims) => {
+                                        client.metadata_mut().insert(
+                                            "_rs_principal".to_string(),
+                                            format!("jwt:{}", claims.sub),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        return Err(pgwire::error::PgWireError::UserError(
+                                            Box::new(pgwire::error::ErrorInfo::new(
+                                                "FATAL".to_string(),
+                                                "28000".to_string(),
+                                                format!("{e}. next_steps: Provide valid credentials (Bearer token or mTLS certificate)"),
+                                            )),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                client.metadata_mut().insert(
+                                    "_rs_principal".to_string(),
+                                    format!("jwt:{token}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                AuthMode::Mtls => {
+                    let cn = startup
+                        .parameters
+                        .iter()
+                        .find(|(k, _)| k.to_lowercase() == "cn")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    client
+                        .metadata_mut()
+                        .insert("_rs_principal".to_string(), format!("cert:{cn}"));
+                }
+            }
+
+            finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
+        }
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl SimpleQueryHandler for GatewayHandler {
@@ -1529,4 +1721,116 @@ fn parse_value_list(s: &str) -> Vec<String> {
         values.push(last);
     }
     values
+}
+
+#[cfg(test)]
+mod s4_tests {
+    use super::*;
+    use crate::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView};
+    use crate::view_reader::{ViewReadStrategy, ViewReader};
+    use crate::auth::Principal;
+    use rockstream_types::acl::{AclEntry, Role};
+    use std::sync::Arc;
+
+    struct NoopViewReader;
+
+    #[async_trait]
+    impl ViewReader for NoopViewReader {
+        async fn read_view(
+            &self,
+            _view_name: &str,
+            _limit: Option<usize>,
+            _strategy: ViewReadStrategy,
+        ) -> Result<Vec<Vec<u8>>, crate::error::GatewayError> {
+            Ok(vec![])
+        }
+
+        fn published_frontier(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    fn make_handler() -> Arc<GatewayHandler> {
+        let catalog = Arc::new(CatalogStubs::new());
+        let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
+        Arc::new(GatewayHandler::new(catalog, reader))
+    }
+
+    /// S4 green gate: namespace_isolation_blocks_cross_access
+    /// A non-admin principal in ns-a cannot access a view in ns-b.
+    #[tokio::test]
+    async fn namespace_isolation_blocks_cross_access() {
+        let handler = make_handler();
+
+        // Register view in ns-b
+        handler.catalog.add_view_in_namespace(CatalogView {
+            name: "ns_b_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![CatalogColumn { name: "id".to_string(), data_type: "Int32".to_string() }],
+            namespace: "ns-b".to_string(),
+        });
+
+        // Grant alice Viewer on ns-a only
+        handler.acl_store.grant(AclEntry {
+            principal: "alice".to_string(),
+            namespace: "ns-a".to_string(),
+            view_name: None,
+            role: Role::Viewer,
+        });
+
+        // Create a session for alice in ns-a
+        let conn_id = "test-conn-1";
+        {
+            let mut session = handler.sessions.entry(conn_id.to_string()).or_insert_with(SessionState::new);
+            session.current_namespace = "ns-a".to_string();
+            session.principal = Principal::Jwt { sub: "alice".to_string() };
+        }
+
+        // Try to read ns_b_view from ns-a session — should get RS-2402 error
+        let responses = handler.read_view_response("ns_b_view", None, Some(conn_id)).await.unwrap();
+        let got_error = responses.iter().any(|r| {
+            if let Response::Error(e) = r {
+                e.message.contains("RS-2402")
+            } else {
+                false
+            }
+        });
+        assert!(got_error, "expected RS-2402 namespace isolation error");
+    }
+
+    /// S4 green gate: admin_can_access_cross_namespace
+    /// A principal with Admin role can access views in other namespaces.
+    #[tokio::test]
+    async fn admin_can_access_cross_namespace() {
+        let handler = make_handler();
+
+        // Register view in ns-b
+        handler.catalog.add_view_in_namespace(CatalogView {
+            name: "ns_b_admin_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![CatalogColumn { name: "id".to_string(), data_type: "Int32".to_string() }],
+            namespace: "ns-b".to_string(),
+        });
+
+        // Grant carol Admin on ns-a (allows cross-namespace)
+        handler.acl_store.grant(AclEntry {
+            principal: "carol".to_string(),
+            namespace: "ns-a".to_string(),
+            view_name: None,
+            role: Role::Admin,
+        });
+
+        // Create a session for carol in ns-a
+        let conn_id = "test-conn-2";
+        {
+            let mut session = handler.sessions.entry(conn_id.to_string()).or_insert_with(SessionState::new);
+            session.current_namespace = "ns-a".to_string();
+            session.principal = Principal::Jwt { sub: "carol".to_string() };
+        }
+
+        // Try to read ns_b_admin_view from ns-a session — admin should succeed
+        let responses = handler.read_view_response("ns_b_admin_view", None, Some(conn_id)).await.unwrap();
+        let got_error = responses.iter().any(|r| matches!(r, Response::Error(_)));
+        assert!(!got_error, "admin should be able to access cross-namespace view");
+    }
 }

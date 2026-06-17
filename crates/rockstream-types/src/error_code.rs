@@ -156,6 +156,14 @@ pub const RS_2012: ErrorCode = ErrorCode::new(2012);
 /// next_steps: "Reconnect with AS OF NOW WITH SNAPSHOT or increase CHANGE_LOG_MAX_ENTRIES."
 pub const RS_2020: ErrorCode = ErrorCode::new(2020);
 
+// 24xx: Auth (v0.26)
+/// Unauthenticated: request missing or carrying invalid credentials.
+pub const RS_2400: ErrorCode = ErrorCode::new(2400);
+/// Permission denied: authenticated principal lacks required RBAC role.
+pub const RS_2401: ErrorCode = ErrorCode::new(2401);
+/// Namespace access denied: cross-namespace access attempt by non-admin principal.
+pub const RS_2402: ErrorCode = ErrorCode::new(2402);
+
 // 3xxx: Merge / arrangement
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
@@ -227,6 +235,16 @@ pub struct ErrorCodeMeta {
     pub doc_url: &'static str,
 }
 
+/// Returns a short slug for a known error code (e.g. "auth.unauthenticated").
+pub fn slug(code: ErrorCode) -> &'static str {
+    match code.0 {
+        2400 => "auth.unauthenticated",
+        2401 => "auth.permission_denied",
+        2402 => "auth.namespace_access_denied",
+        _ => "unknown",
+    }
+}
+
 /// Returns a human-readable description for a known error code.
 pub fn description(code: ErrorCode) -> &'static str {
     match code.0 {
@@ -295,6 +313,9 @@ pub fn description(code: ErrorCode) -> &'static str {
         2019 => "Shard write buffer full; backpressure applied",
         2012 => "Session wait-for deadline exceeded; query proceeded at current frontier",
         2020 => "Subscribe consumer fell behind the change-log retention window",
+        2400 => "Unauthenticated: request missing or carrying invalid credentials",
+        2401 => "Permission denied: authenticated principal lacks required RBAC role",
+        2402 => "Namespace access denied: cross-namespace access attempt by non-admin principal",
         _ => "Unknown error",
     }
 }
@@ -381,6 +402,9 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         5019 => "Immediately free unused view resources or scale cluster capacity to prevent pipeline stalls.",
         6001 => "Apply view replacement or run manual migration to match the new upstream schema.",
         8001 => "Scale out frontier aggregators (add more nodes with --role=frontier) or reduce shard count below the configured limit.",
+        2400 => "Provide valid credentials (Bearer token or mTLS certificate)",
+        2401 => "Request elevated RBAC role from an admin or contact the namespace owner",
+        2402 => "Switch to the correct namespace with SET search_path or request cross-namespace admin role",
         _ => "See documentation for this error code.",
     }
 }
@@ -424,6 +448,7 @@ mod tests {
             RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017, RS_1012,
             RS_1013, RS_8001, // v0.21
             RS_4003, RS_4004, RS_4005, RS_4006, RS_3005, RS_1018,
+            RS_2400, RS_2401, RS_2402, // v0.26 auth
         ];
         for code in codes {
             assert_ne!(
@@ -441,5 +466,21 @@ mod tests {
                 "Code {code} has empty next steps"
             );
         }
+    }
+
+    /// S1 green gate: auth_error_codes_registered
+    #[test]
+    fn auth_error_codes_registered() {
+        assert_eq!(RS_2400.value(), 2400);
+        assert_eq!(RS_2401.value(), 2401);
+        assert_eq!(RS_2402.value(), 2402);
+
+        assert_ne!(description(RS_2400), "Unknown error");
+        assert_ne!(description(RS_2401), "Unknown error");
+        assert_ne!(description(RS_2402), "Unknown error");
+
+        assert_eq!(slug(RS_2400), "auth.unauthenticated");
+        assert_eq!(slug(RS_2401), "auth.permission_denied");
+        assert_eq!(slug(RS_2402), "auth.namespace_access_denied");
     }
 }

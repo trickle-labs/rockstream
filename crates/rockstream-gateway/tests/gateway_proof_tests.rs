@@ -136,6 +136,7 @@ async fn copy_out_streams_view_rows() {
                 data_type: "Int32".to_string(),
             },
         ],
+            namespace: "public".to_string(),
     });
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -294,6 +295,7 @@ async fn proof_psql_select_limit_10_under_10ms_p99() {
                 data_type: "Int32".to_string(),
             },
         ],
+            namespace: "public".to_string(),
     });
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -476,6 +478,7 @@ async fn _proof_orm_schema_reflection_impl() {
                 data_type: "Float64".to_string(),
             },
         ],
+            namespace: "public".to_string(),
     });
 
     let (port, _handle) = start_gateway_noop(catalog).await;

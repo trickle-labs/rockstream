@@ -93,6 +93,7 @@ async fn proof_pg_catalog_schema_reflection_queries() {
                 data_type: "Float64".to_string(),
             },
         ],
+            namespace: "public".to_string(),
     });
 
     let (addr, _handle) = start_gateway(catalog).await;
@@ -202,6 +203,7 @@ async fn extended_query_protocol_parse_bind_execute() {
                 data_type: "Float64".to_string(),
             },
         ],
+            namespace: "public".to_string(),
     });
 
     let (addr, _handle) = start_gateway(catalog).await;

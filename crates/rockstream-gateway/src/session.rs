@@ -69,6 +69,10 @@ pub struct SessionState {
     pub session_wait_for_timeout_ms: u64,
     /// Whether automatic session-scoped RYW is enabled. Default: `true`.
     pub session_wait_for_enabled: bool,
+    /// The namespace this session is currently operating in (v0.26).
+    pub current_namespace: String,
+    /// Authenticated principal for this session (v0.26).
+    pub principal: crate::auth::Principal,
 }
 
 impl Default for SessionState {
@@ -89,6 +93,8 @@ impl SessionState {
             wait_for_token: None,
             session_wait_for_timeout_ms: 5_000,
             session_wait_for_enabled: true,
+            current_namespace: "public".to_string(),
+            principal: crate::auth::Principal::System,
         }
     }
 
