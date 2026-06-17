@@ -16,19 +16,21 @@ use pgwire::api::auth::{
     finish_authentication, save_startup_parameters_to_metadata, DefaultServerParameterProvider,
     StartupHandler,
 };
-use pgwire::api::copy::NoopCopyHandler;
+use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
-    QueryResponse, Response, Tag,
+    CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
+    FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{
-    CopyData as MsgCopyData, CopyDone as MsgCopyDone, CopyOutResponse as MsgCopyOutResponse,
+    CopyData, CopyDone, CopyFail, CopyData as MsgCopyData, CopyDone as MsgCopyDone,
+    CopyOutResponse as MsgCopyOutResponse,
 };
+use pgwire::messages::response::CommandComplete;
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
@@ -36,6 +38,7 @@ use crate::auth::{AuthMode, JwtVerifier, Principal};
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogStubs, CatalogTable,
 };
+use crate::copy_state::{CopyState, COPY_IN_BUFFER_ROWS, MAX_COPY_IN_BATCH_ROWS, COPY_IN_FLUSH_BYTES};
 use crate::session::{FreshnessToken, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
@@ -88,6 +91,9 @@ pub struct GatewayHandler {
     /// Per-connection write buffers keyed by connection ID.
     /// Bound: WRITE_BUFFER_LIMIT_BYTES per connection (64 MiB).
     write_buffers: Arc<DashMap<String, WriteBuffer>>,
+    /// Per-connection COPY IN state keyed by connection ID.
+    /// Bound: MAX_COPY_IN_BATCH_ROWS rows or COPY_IN_FLUSH_BYTES bytes.
+    copy_states: Arc<DashMap<String, CopyState>>,
     /// Per-connection session state (idempotency key, isolation, etc.).
     pub sessions: Arc<DashMap<String, SessionState>>,
     /// Optional ShardDb for direct-write DML commits.
@@ -110,6 +116,7 @@ impl GatewayHandler {
             view_reader,
             query_parser: Arc::new(NoopQueryParser),
             write_buffers: Arc::new(DashMap::new()),
+            copy_states: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             shard_db: None,
             auth_mode: AuthMode::Off,
@@ -130,6 +137,7 @@ impl GatewayHandler {
             view_reader,
             query_parser: Arc::new(NoopQueryParser),
             write_buffers: Arc::new(DashMap::new()),
+            copy_states: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             shard_db: Some(shard_db),
             auth_mode: AuthMode::Off,
@@ -989,6 +997,112 @@ impl GatewayHandler {
             Tag::new("DELETE 1").with_rows(1),
         ))])
     }
+
+    // ── COPY IN helpers ──────────────────────────────────────────────────────
+
+    /// Detect `COPY <table> FROM STDIN`, register CopyState, return CopyInResponse.
+    ///
+    /// If the table is not in the catalog the gateway accepts in passthrough mode
+    /// (positional column naming).  Auth enforcement is added in S7.
+    fn handle_copy_from_stdin(
+        &self,
+        query: &str,
+        conn_id: &str,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        let (table, requested_cols) =
+            match crate::copy_state::parse_copy_from_stmt(query) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), e),
+                    )))]);
+                }
+            };
+
+        // Resolve columns: use declared list, or infer from catalog, or passthrough.
+        let columns = if !requested_cols.is_empty() {
+            requested_cols
+        } else if let Some(ct) = self.catalog.get_table(&table) {
+            ct.columns.iter().map(|c| c.name.clone()).collect()
+        } else {
+            vec![] // passthrough — column names not available
+        };
+
+        let col_count = columns.len();
+
+        // Audit: log control-plane action.
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "copy_in_start",
+                &table,
+            ));
+        }
+
+        self.copy_states
+            .insert(conn_id.to_string(), CopyState::new(table, columns));
+
+        let col_fmt_count = col_count.max(1);
+        Ok(vec![promote_response(Response::CopyIn(
+            CopyResponse::new(0, col_fmt_count, vec![0i16; col_fmt_count]),
+        ))])
+    }
+
+    /// Flush `rows` to the shard as a single `WriteBatch`.
+    ///
+    /// Returns the number of rows written.  If no shard is configured the rows
+    /// are silently discarded (test / no-storage mode).
+    async fn flush_copy_batch_rows(
+        &self,
+        table: &str,
+        rows: &[DmlOp],
+    ) -> PgWireResult<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let Some(shard_db) = &self.shard_db else {
+            return Ok(rows.len()); // no storage — pretend success
+        };
+
+        let epoch = shard_db.last_epoch().fetch_add(1, Ordering::SeqCst) + 1;
+        let mut batch = rockstream_storage::WriteBatch::new();
+        for op in rows {
+            if let DmlOp::Insert {
+                table: op_table,
+                row_key,
+                values_tsv,
+                ..
+            } = op
+            {
+                let key = format!("view_output/{op_table}/{row_key}");
+                batch.put(key.as_bytes(), values_tsv.as_bytes());
+            }
+        }
+        // Advance shard frontier.
+        batch.put(
+            &rockstream_storage::ShardKeyEncoder::frontier_key(),
+            &epoch.to_be_bytes(),
+        );
+
+        shard_db
+            .write_batch(batch)
+            .await
+            .map_err(|e| {
+                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+            })?;
+
+        // Audit: log the flush.
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "copy_in_flush",
+                table,
+            ));
+        }
+
+        Ok(rows.len())
+    }
 }
 
 #[async_trait]
@@ -1117,8 +1231,13 @@ impl SimpleQueryHandler for GatewayHandler {
             }
         };
 
-        // COPY OUT: stream CopyData messages directly through the client sink.
+        // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
         let ql = query.trim().to_lowercase();
+        if ql.starts_with("copy ") && ql.contains(" from stdin") {
+            return self.handle_copy_from_stdin(query, &conn_id);
+        }
+
+        // COPY OUT: stream CopyData messages directly through the client sink.
         if ql.starts_with("copy ") && ql.contains(" to stdout") {
             if let Some(view_name) = parse_copy_to_stdout_view(query) {
                 let rows = self
@@ -1212,7 +1331,7 @@ impl ExtendedQueryHandler for GatewayHandler {
 
     async fn do_query<'a, 'b: 'a, C>(
         &'b self,
-        _client: &mut C,
+        client: &mut C,
         portal: &'a Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response<'a>>
@@ -1223,13 +1342,290 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // Ensure a stable connection ID is stored for COPY IN routing.
+        let conn_id = {
+            let existing = client.metadata().get("_rs_conn_id").cloned();
+            if let Some(id) = existing {
+                id
+            } else {
+                use rand::Rng;
+                let id = format!("{:032x}", rand::thread_rng().gen::<u128>());
+                client
+                    .metadata_mut()
+                    .insert("_rs_conn_id".to_string(), id.clone());
+                id
+            }
+        };
+
+        let query = portal.statement.statement.as_str();
+        let ql = query.trim().to_lowercase();
+
+        // COPY IN via extended query protocol (e.g. tokio_postgres.copy_in()).
+        if ql.starts_with("copy ") && ql.contains(" from stdin") {
+            let responses = self.handle_copy_from_stdin(query, &conn_id)?;
+            return Ok(responses
+                .into_iter()
+                .next()
+                .unwrap_or(Response::Execution(Tag::new("OK"))));
+        }
+
         let responses = self
-            .dispatch_async(portal.statement.statement.as_str())
+            .dispatch_async_with_conn(query, Some(&conn_id))
             .await?;
         Ok(responses
             .into_iter()
             .next()
             .unwrap_or(Response::Execution(Tag::new("OK"))))
+    }
+}
+
+// ── CopyHandler implementation ────────────────────────────────────────────────
+
+#[async_trait]
+impl CopyHandler for GatewayHandler {
+    /// Receive a `CopyData` message, parse TSV rows, and buffer them.
+    ///
+    /// Handles partial lines that span `CopyData` message boundaries via
+    /// `CopyState::partial_line`.  Validates column count against the declared
+    /// schema (RS-2501).  Auto-flush when bounds are exceeded (S5).
+    async fn on_copy_data<C>(&self, client: &mut C, copy_data: CopyData) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let conn_id = client
+            .metadata()
+            .get("_rs_conn_id")
+            .cloned()
+            .unwrap_or_default();
+
+        // Parse all complete lines from this chunk.
+        // We take what we need from the state, then release the guard before
+        // any await point.
+        let (table, columns, rows_to_add, new_partial, needs_flush) = {
+            let mut state = match self.copy_states.get_mut(&conn_id) {
+                Some(s) => s,
+                None => {
+                    return Err(PgWireError::ApiError(Box::new(
+                        crate::error::GatewayError::NotSupported(
+                            "CopyData received without active COPY IN session".to_string(),
+                        ),
+                    )));
+                }
+            };
+
+            let chunk = match std::str::from_utf8(&copy_data.data) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22P05".to_owned(),
+                        "[RS-2501] copy.invalid_encoding: CopyData contains invalid UTF-8".to_owned(),
+                    ))));
+                }
+            };
+
+            state.partial_line.push_str(chunk);
+
+            // Process all complete lines.
+            let mut new_ops: Vec<DmlOp> = Vec::new();
+            let mut col_mismatch: Option<(usize, usize)> = None;
+
+            loop {
+                let nl = state.partial_line.find('\n');
+                if nl.is_none() {
+                    break;
+                }
+                let nl_pos = nl.unwrap();
+                let raw_line = state.partial_line[..nl_pos].to_string();
+                state.partial_line.drain(..=nl_pos);
+
+                // Strip carriage return for Windows-style line endings.
+                let line = raw_line.trim_end_matches('\r');
+
+                // Skip the COPY sentinel `\.`.
+                if line == "\\." {
+                    continue;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+
+                let fields: Vec<&str> = line.split('\t').collect();
+
+                // Column count validation (RS-2501).
+                if !state.columns.is_empty() && fields.len() != state.columns.len() {
+                    col_mismatch = Some((state.columns.len(), fields.len()));
+                    break;
+                }
+
+                let cols: Vec<String> = if state.columns.is_empty() {
+                    (0..fields.len())
+                        .map(|i| format!("col{i}"))
+                        .collect()
+                } else {
+                    state.columns.clone()
+                };
+
+                let row_key = cols
+                    .iter()
+                    .zip(fields.iter())
+                    .map(|(c, v)| format!("{c}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let values_tsv = fields.join("\t");
+                let op_bytes = values_tsv.len() + row_key.len() + state.table.len() + 64;
+
+                let op = DmlOp::Insert {
+                    table: state.table.clone(),
+                    cols,
+                    values_tsv,
+                    row_key,
+                };
+                state.buf_bytes += op_bytes;
+                new_ops.push(op);
+                COPY_IN_BUFFER_ROWS.fetch_add(1, Ordering::Relaxed);
+            }
+
+            if let Some((expected, got)) = col_mismatch {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P04".to_owned(),
+                    format!(
+                        "[RS-2501] copy.column_count_mismatch: expected {expected} fields \
+                         but got {got}. next_steps: Check that the TSV row matches the \
+                         column count declared in COPY or the catalog."
+                    ),
+                ))));
+            }
+
+            for op in &new_ops {
+                state.buf_rows.push(op.clone());
+            }
+
+            let needs_flush = state.buf_rows.len() >= MAX_COPY_IN_BATCH_ROWS
+                || state.buf_bytes >= COPY_IN_FLUSH_BYTES;
+
+            let partial = state.partial_line.clone();
+            let table = state.table.clone();
+            let columns = state.columns.clone();
+            (table, columns, new_ops, partial, needs_flush)
+            // RefMut drops here — safe before await
+        };
+
+        // Auto-flush when a bound is exceeded (S5).
+        if needs_flush {
+            let (rows_to_flush, _prev_total) = {
+                let mut state = match self.copy_states.get_mut(&conn_id) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                let rows = std::mem::take(&mut state.buf_rows);
+                let prev = state.total_rows_flushed;
+                state.buf_bytes = 0;
+                let n = rows.len() as u64;
+                COPY_IN_BUFFER_ROWS.fetch_sub(n.min(COPY_IN_BUFFER_ROWS.load(Ordering::Relaxed)), Ordering::Relaxed);
+                (rows, prev)
+            };
+            let flushed = self.flush_copy_batch_rows(&table, &rows_to_flush).await?;
+            if let Some(mut state) = self.copy_states.get_mut(&conn_id) {
+                state.total_rows_flushed += flushed;
+            }
+        }
+
+        let _ = (columns, rows_to_add, new_partial); // suppress unused warnings
+        Ok(())
+    }
+
+    /// `CopyDone` — flush remaining buffer and send `CommandComplete`.
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let conn_id = client
+            .metadata()
+            .get("_rs_conn_id")
+            .cloned()
+            .unwrap_or_default();
+
+        // Extract remaining rows + total before any await.
+        let (table, rows, prev_total) = match self.copy_states.get_mut(&conn_id) {
+            Some(mut state) => {
+                let rows = std::mem::take(&mut state.buf_rows);
+                let n = rows.len() as u64;
+                COPY_IN_BUFFER_ROWS.fetch_sub(
+                    n.min(COPY_IN_BUFFER_ROWS.load(Ordering::Relaxed)),
+                    Ordering::Relaxed,
+                );
+                state.buf_bytes = 0;
+                let total = state.total_rows_flushed;
+                let table = state.table.clone();
+                (table, rows, total)
+            }
+            None => return Ok(()), // no state — nothing to do
+        };
+
+        let flushed = self.flush_copy_batch_rows(&table, &rows).await?;
+        let total = prev_total + flushed;
+
+        // Remove COPY state.
+        self.copy_states.remove(&conn_id);
+
+        // Emit audit event.
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "copy_in_done",
+                &table,
+            ));
+        }
+
+        // Send CommandComplete: `COPY N`
+        client
+            .feed(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                format!("COPY {total}"),
+            )))
+            .await?;
+        client.flush().await?;
+
+        Ok(())
+    }
+
+    /// `CopyFail` — clean up state and surface the failure.
+    async fn on_copy_fail<C>(&self, client: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let conn_id = client
+            .metadata()
+            .get("_rs_conn_id")
+            .cloned()
+            .unwrap_or_default();
+
+        if let Some(mut state) = self.copy_states.get_mut(&conn_id) {
+            let n = state.buf_rows.len() as u64;
+            COPY_IN_BUFFER_ROWS.fetch_sub(
+                n.min(COPY_IN_BUFFER_ROWS.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
+            state.buf_rows.clear();
+            state.buf_bytes = 0;
+        }
+        self.copy_states.remove(&conn_id);
+
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "57014".to_owned(),
+            format!(
+                "COPY FROM STDIN aborted by client: {}",
+                fail.message
+            ),
+        )))
     }
 }
 
@@ -1243,7 +1639,7 @@ impl PgWireServerHandlers for GatewayHandlerFactory {
     type StartupHandler = GatewayHandler;
     type SimpleQueryHandler = GatewayHandler;
     type ExtendedQueryHandler = GatewayHandler;
-    type CopyHandler = NoopCopyHandler;
+    type CopyHandler = GatewayHandler;
     type ErrorHandler = NoopErrorHandler;
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
@@ -1256,7 +1652,7 @@ impl PgWireServerHandlers for GatewayHandlerFactory {
         self.handler.clone()
     }
     fn copy_handler(&self) -> Arc<Self::CopyHandler> {
-        Arc::new(NoopCopyHandler)
+        self.handler.clone()
     }
     fn error_handler(&self) -> Arc<Self::ErrorHandler> {
         Arc::new(NoopErrorHandler)

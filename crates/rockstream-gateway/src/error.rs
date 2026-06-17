@@ -27,6 +27,16 @@ pub enum GatewayError {
     #[error("[RS-2007] write.idempotency_key_required: SET rockstream.idempotency_key = '<key>' or SET rockstream.source_epoch = N before COMMIT.")]
     IdempotencyKeyRequired,
 
+    /// [RS-2500] copy.table_not_found — COPY target table does not exist in the catalog.
+    /// next_steps: "Register the table with CREATE TABLE before using COPY FROM STDIN."
+    #[error("[RS-2500] copy.table_not_found: COPY target table '{table}' does not exist in the catalog. next_steps: Register the table with CREATE TABLE before using COPY FROM STDIN.")]
+    CopyTableNotFound { table: String },
+
+    /// [RS-2501] copy.column_count_mismatch — Row field count does not match the declared column count.
+    /// next_steps: "Check that the TSV row matches the column count declared in COPY or the catalog."
+    #[error("[RS-2501] copy.column_count_mismatch: expected {expected} fields but got {got}. next_steps: Check that the TSV row matches the column count declared in COPY or the catalog.")]
+    CopyColumnCountMismatch { expected: usize, got: usize },
+
     #[error("Not supported: {0}")]
     NotSupported(String),
 
@@ -46,5 +56,43 @@ pub enum GatewayError {
 impl From<pgwire::error::PgWireError> for GatewayError {
     fn from(e: pgwire::error::PgWireError) -> Self {
         GatewayError::PgWire(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S1 green gate: each new variant's Display contains the expected RS code.
+    #[test]
+    fn copy_error_codes_display() {
+        let e = GatewayError::CopyTableNotFound {
+            table: "ghost_t".to_string(),
+        };
+        assert!(
+            e.to_string().contains("RS-2500"),
+            "expected RS-2500 in: {}",
+            e
+        );
+        assert!(
+            e.to_string().contains("ghost_t"),
+            "expected table name in: {}",
+            e
+        );
+
+        let e = GatewayError::CopyColumnCountMismatch {
+            expected: 3,
+            got: 2,
+        };
+        assert!(
+            e.to_string().contains("RS-2501"),
+            "expected RS-2501 in: {}",
+            e
+        );
+        assert!(
+            e.to_string().contains('3') && e.to_string().contains('2'),
+            "expected counts in: {}",
+            e
+        );
     }
 }

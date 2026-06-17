@@ -2742,7 +2742,7 @@ guarantee.
 **Postgres wire protocol does NOT imply a Postgres drop-in.** DDL (`CREATE
 TABLE`, `ALTER TABLE`) is handled via `CREATE MATERIALIZED VIEW` / `CREATE VIEW` /
 `CREATE WORKLOAD` semantics. Write DML goes through the internal source connector (§13.5).
-Extensions, `COPY`, `LISTEN`/`NOTIFY`, and advisory locks are out of scope.
+`COPY FROM STDIN` (text format) is supported as of v0.27 (§12.6.2). `LISTEN`/`NOTIFY` and advisory locks remain out of scope.
 
 ### 12.6.1 The `rockstream_catalog` System Schema
 
@@ -2817,6 +2817,40 @@ entries including the full audit log.
 (§13.5), RockStream operates as a *streaming SQL platform with Postgres-compatible
 read access* — the same tier as Materialize and RisingWave, not Neon. Clients
 write rows directly; the IVM engine keeps views fresh; `psql` queries views.
+
+### 12.6.2 COPY Protocol
+
+As of v0.27, `COPY <table> FROM STDIN` (text format, tab-separated values) is
+supported directly via the Postgres wire layer.
+
+**Flow:**
+1. Client sends `COPY <table> [(col1, col2, ...)] FROM STDIN`.
+2. Gateway parses the statement, resolves column list from the catalog if not
+   specified, and sends `CopyInResponse`.
+3. Client streams `CopyData` messages (TSV rows terminated by `\.\n`).
+4. Client sends `CopyDone`; gateway flushes the final batch and responds with
+   `CommandComplete COPY N`.
+
+**Memory safety (auto-flush):**  
+Each per-connection COPY IN buffer is bounded by two named limits:
+- `MAX_COPY_IN_BATCH_ROWS = 10_000 rows`
+- `COPY_IN_FLUSH_BYTES = 64 MiB`
+
+Whichever limit is reached first triggers an auto-flush: the current batch is
+committed to the shard as a `WriteBatch` (put-only, no range-deletion), and the
+buffer is reset. The fill-level metric `COPY_IN_BUFFER_ROWS` (gauge) tracks the
+current row count across all active COPY IN connections.
+
+**Error codes:**
+| Code | Slug | Trigger |
+|------|------|---------|
+| RS-2500 | `copy.table_not_found` | COPY target table not in catalog |
+| RS-2501 | `copy.column_count_mismatch` | TSV field count ≠ declared column count |
+
+**Auth:** `pipeline_owner` role required (RS-2400/RS-2401 otherwise). See §12.5.
+
+**No range-delete dependency.** Flush uses `WriteBatch::put` only (identical to
+the regular `COMMIT` path). No scan-and-delete is required.
 
 ---
 

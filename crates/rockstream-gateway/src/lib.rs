@@ -17,6 +17,7 @@
 pub mod auth;
 pub mod catalog_stubs;
 pub mod change_log;
+pub mod copy_state;
 pub mod error;
 pub mod multi_shard_reader;
 pub mod protocol;

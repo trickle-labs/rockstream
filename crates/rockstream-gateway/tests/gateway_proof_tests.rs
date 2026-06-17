@@ -1614,3 +1614,104 @@ async fn explain_no_pushdown_for_full_scan() {
         "EXPLAIN SELECT * must NOT contain 'partial_pushdown: true', got: {plan_text}"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// v0.27 COPY Protocol tests (Phase 3a: S1–S4)
+// ════════════════════════════════════════════════════════════════════════════
+
+use rockstream_gateway::copy_state::MAX_COPY_IN_BATCH_ROWS;
+
+// ── S3 gate: copy_from_stdin_returns_copy_in_response ────────────────────────
+
+/// S3 green gate: `COPY t FROM STDIN` causes the gateway to enter COPY IN mode
+/// (tokio_postgres successfully obtains a `CopyInSink` without error).
+#[tokio::test]
+async fn copy_from_stdin_returns_copy_in_response() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("v027-s3-copy-in-response").await;
+    let client = connect_port(port).await;
+
+    // Register table so the gateway can resolve columns.
+    client
+        .simple_query("CREATE TABLE t (id TEXT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    // `copy_in` will send the COPY statement and expect CopyInResponse back.
+    // If we get a CopyInSink without error, the gateway entered COPY IN mode.
+    let sink: tokio_postgres::CopyInSink<bytes::Bytes> = client
+        .copy_in("COPY t FROM STDIN")
+        .await
+        .expect("copy_in should enter COPY IN mode without error");
+    tokio::pin!(sink);
+
+    // Close the sink immediately (zero rows) — gateway should send COPY 0.
+    let rows_written = sink.finish().await.expect("finish should succeed");
+    assert_eq!(rows_written, 0, "expected COPY 0 for empty stream");
+}
+
+// ── S4 gate: copy_in_basic_rows_visible_lfs ──────────────────────────────────
+
+/// S4 green gate (P1): three rows sent via COPY FROM STDIN are visible in the
+/// shard after CopyDone.
+///
+/// Asserts:
+/// - CopyInResponse received (entering COPY IN mode)
+/// - CopyDone sent successfully
+/// - CommandComplete tag == `COPY 3`
+/// - Shard contains 3 keys under `view_output/t/…`
+#[tokio::test]
+async fn copy_in_basic_rows_visible_lfs() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v027-s4-copy-in-basic").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id TEXT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    // Obtain a COPY IN sink — this confirms CopyInResponse was sent.
+    let sink: tokio_postgres::CopyInSink<bytes::Bytes> = client
+        .copy_in("COPY t FROM STDIN")
+        .await
+        .expect("copy_in should enter COPY IN mode");
+    tokio::pin!(sink);
+
+    // Send 3 TSV rows via the Sink trait.
+    for i in 1u32..=3 {
+        let row = format!("row{i}\tval{i}\n");
+        futures::SinkExt::send(&mut sink, bytes::Bytes::from(row))
+            .await
+            .expect("send row failed");
+    }
+
+    // CopyDone — gateway flushes and sends CommandComplete.
+    let rows_written = sink.finish().await.expect("CopyDone should succeed");
+    assert_eq!(rows_written, 3, "CommandComplete should report COPY 3");
+
+    // Verify rows are durable in the shard.
+    shard_db.flush().await.unwrap();
+    let entries = shard_db
+        .scan_prefix(b"view_output/t/")
+        .await
+        .expect("scan_prefix failed");
+    assert_eq!(
+        entries.len(),
+        3,
+        "shard should contain 3 rows under view_output/t/, got {}",
+        entries.len()
+    );
+
+    // Spot-check that values contain the expected TSV data.
+    let vals: Vec<String> = entries
+        .iter()
+        .map(|(_, v)| String::from_utf8_lossy(v).to_string())
+        .collect();
+    assert!(
+        vals.iter().any(|v| v.contains("val1")),
+        "expected val1 in shard; got: {vals:?}"
+    );
+    assert!(
+        vals.iter().any(|v| v.contains("val3")),
+        "expected val3 in shard; got: {vals:?}"
+    );
+}
