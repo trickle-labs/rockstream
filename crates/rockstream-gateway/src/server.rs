@@ -1002,8 +1002,8 @@ impl GatewayHandler {
 
     /// Detect `COPY <table> FROM STDIN`, register CopyState, return CopyInResponse.
     ///
-    /// If the table is not in the catalog the gateway accepts in passthrough mode
-    /// (positional column naming).  Auth enforcement is added in S7.
+    /// Returns RS-2500 if the table is not in the catalog (S6).
+    /// Enforces PipelineOwner role (RS-2400/RS-2401) when auth is enabled (S7).
     fn handle_copy_from_stdin(
         &self,
         query: &str,
@@ -1019,13 +1019,58 @@ impl GatewayHandler {
                 }
             };
 
-        // Resolve columns: use declared list, or infer from catalog, or passthrough.
+        // S6: Table must exist in catalog (RS-2500).
+        let catalog_table = self.catalog.get_table(&table);
+        if catalog_table.is_none() {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42P01".to_owned(),
+                    format!(
+                        "[RS-2500] copy.table_not_found: table '{}' does not exist. \
+                         next_steps: Create the table with CREATE TABLE before issuing COPY.",
+                        table
+                    ),
+                ),
+            )))]);
+        }
+
+        // S7: Auth enforcement — PipelineOwner role required.
+        let principal = if let Some(session) = self.sessions.get(conn_id) {
+            session.principal.clone()
+        } else {
+            Principal::System
+        };
+
+        use rockstream_types::acl::Role;
+        if !principal.is_system() {
+            let session_namespace = self
+                .sessions
+                .get(conn_id)
+                .map(|s| s.current_namespace.clone())
+                .unwrap_or_else(|| "public".to_string());
+            if let Err(e) = self.acl_store.check(
+                principal.identity(),
+                &session_namespace,
+                Some(&table),
+                Role::PipelineOwner,
+            ) {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_owned(), "42501".to_owned(), e.to_string()),
+                )))]);
+            }
+        }
+
+        // Resolve columns: use declared list, or infer from catalog.
         let columns = if !requested_cols.is_empty() {
             requested_cols
-        } else if let Some(ct) = self.catalog.get_table(&table) {
-            ct.columns.iter().map(|c| c.name.clone()).collect()
         } else {
-            vec![] // passthrough — column names not available
+            catalog_table
+                .unwrap()
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
         };
 
         let col_count = columns.len();
@@ -1046,6 +1091,17 @@ impl GatewayHandler {
         Ok(vec![promote_response(Response::CopyIn(
             CopyResponse::new(0, col_fmt_count, vec![0i16; col_fmt_count]),
         ))])
+    }
+
+    /// Public wrapper for `handle_copy_from_stdin` — for integration tests that
+    /// need to exercise auth/error paths without going through the full pgwire stack.
+    #[doc(hidden)]
+    pub fn copy_from_stdin_response(
+        &self,
+        query: &str,
+        conn_id: &str,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        self.handle_copy_from_stdin(query, conn_id)
     }
 
     /// Flush `rows` to the shard as a single `WriteBatch`.
@@ -1231,6 +1287,18 @@ impl SimpleQueryHandler for GatewayHandler {
             }
         };
 
+        // Sync principal from startup metadata into the session (once per connection).
+        if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let mut session = self.sessions.entry(conn_id.clone()).or_insert_with(SessionState::new);
+            if session.principal == Principal::System && raw_principal != "system" {
+                session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
+                    Principal::Jwt { sub: sub.to_string() }
+                } else {
+                    Principal::System
+                };
+            }
+        }
+
         // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
         let ql = query.trim().to_lowercase();
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
@@ -1356,6 +1424,18 @@ impl ExtendedQueryHandler for GatewayHandler {
                 id
             }
         };
+
+        // Sync principal from startup metadata into the session (once per connection).
+        if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
+            let mut session = self.sessions.entry(conn_id.clone()).or_insert_with(SessionState::new);
+            if session.principal == Principal::System && raw_principal != "system" {
+                session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
+                    Principal::Jwt { sub: sub.to_string() }
+                } else {
+                    Principal::System
+                };
+            }
+        }
 
         let query = portal.statement.statement.as_str();
         let ql = query.trim().to_lowercase();
@@ -1704,6 +1784,30 @@ impl GatewayServer {
                 shard_db,
             )),
         }
+    }
+
+    /// Create a gateway with OIDC auth enabled (for auth integration tests).
+    pub fn with_shard_db_and_auth(
+        addr: std::net::SocketAddr,
+        catalog: Arc<CatalogStubs>,
+        view_reader: Arc<dyn ViewReader>,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+        jwt_secret: &[u8],
+    ) -> Self {
+        let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
+        handler.auth_mode = AuthMode::Oidc;
+        handler.jwt_verifier = Some(Arc::new(JwtVerifier::with_hs256_key(
+            jwt_secret.to_vec(),
+        )));
+        GatewayServer {
+            addr,
+            handler: Arc::new(handler),
+        }
+    }
+
+    /// Return a reference to the handler (for seeding ACL and sessions in tests).
+    pub fn handler(&self) -> &Arc<GatewayHandler> {
+        &self.handler
     }
 
     /// Return a reference to the handler's catalog stubs (for seeding in tests).

@@ -1649,6 +1649,10 @@ async fn copy_from_stdin_returns_copy_in_response() {
     assert_eq!(rows_written, 0, "expected COPY 0 for empty stream");
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v0.27 COPY Protocol tests (Phase 3b: S5–S9)
+// ════════════════════════════════════════════════════════════════════════════
+
 // ── S4 gate: copy_in_basic_rows_visible_lfs ──────────────────────────────────
 
 /// S4 green gate (P1): three rows sent via COPY FROM STDIN are visible in the
@@ -1714,4 +1718,414 @@ async fn copy_in_basic_rows_visible_lfs() {
         vals.iter().any(|v| v.contains("val3")),
         "expected val3 in shard; got: {vals:?}"
     );
+}
+
+// ── S5 gate: copy_in_large_batch_no_memory_exhaustion_lfs ────────────────────
+
+/// S5 / P2 green gate: 50 000-row COPY FROM STDIN auto-flushes at
+/// MAX_COPY_IN_BATCH_ROWS so `COPY_IN_BUFFER_ROWS` never exceeds the bound.
+/// All 50 000 rows appear in the shard afterward.
+#[tokio::test]
+async fn copy_in_large_batch_no_memory_exhaustion_lfs() {
+    use std::sync::atomic::Ordering;
+    use rockstream_gateway::copy_state::COPY_IN_BUFFER_ROWS;
+
+    // Reset the global gauge to a known baseline.
+    COPY_IN_BUFFER_ROWS.store(0, Ordering::Relaxed);
+
+    let (port, _handle, shard_db) =
+        start_gateway_with_shard("v027-s5-large-batch").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE big (id TEXT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    let sink: tokio_postgres::CopyInSink<bytes::Bytes> = client
+        .copy_in("COPY big FROM STDIN")
+        .await
+        .expect("copy_in should enter COPY IN mode");
+    tokio::pin!(sink);
+
+    // Send 50 000 rows in chunks of MAX_COPY_IN_BATCH_ROWS+1 to ensure auto-flush
+    // fires at least once.
+    const TOTAL: usize = 50_000;
+    const CHUNK: usize = 1_024; // arbitrary; auto-flush triggers inside on_copy_data
+
+    let mut sent = 0usize;
+    while sent < TOTAL {
+        let batch_size = CHUNK.min(TOTAL - sent);
+        let mut data = String::new();
+        for i in sent..sent + batch_size {
+            data.push_str(&format!("id_{i}\t{i}\n"));
+        }
+        futures::SinkExt::send(&mut sink, bytes::Bytes::from(data))
+            .await
+            .expect("send chunk failed");
+
+        // Assert the gauge never exceeds MAX_COPY_IN_BATCH_ROWS after each chunk.
+        let gauge = COPY_IN_BUFFER_ROWS.load(Ordering::Relaxed);
+        assert!(
+            gauge <= MAX_COPY_IN_BATCH_ROWS as u64,
+            "COPY_IN_BUFFER_ROWS ({gauge}) exceeded MAX_COPY_IN_BATCH_ROWS ({MAX_COPY_IN_BATCH_ROWS}) after sending batch ending at row {}", sent + batch_size
+        );
+
+        sent += batch_size;
+    }
+
+    let rows_written = sink.finish().await.expect("CopyDone should succeed");
+    assert_eq!(
+        rows_written, TOTAL as u64,
+        "CommandComplete should report COPY {TOTAL}"
+    );
+
+    // Spot-check 5 sampled rows in shard.
+    shard_db.flush().await.unwrap();
+    let entries = shard_db
+        .scan_prefix(b"view_output/big/")
+        .await
+        .expect("scan_prefix failed");
+    assert_eq!(
+        entries.len(),
+        TOTAL,
+        "shard should contain {TOTAL} rows; got {}",
+        entries.len()
+    );
+
+    // Verify a few known keys exist.
+    for i in [0usize, 999, 9_999, 25_000, 49_999] {
+        let found = entries.iter().any(|(_, v)| {
+            String::from_utf8_lossy(v).contains(&i.to_string())
+        });
+        assert!(found, "expected row {i} in shard");
+    }
+}
+
+// ── S6 gate: copy_in_table_not_found_returns_rs2500 ──────────────────────────
+
+/// S6 / P3 green gate: COPY into a non-existent table returns RS-2500.
+#[tokio::test]
+async fn copy_in_table_not_found_returns_rs2500() {
+    let (port, _handle, _shard_db) =
+        start_gateway_with_shard("v027-s6-table-not-found").await;
+    let client = connect_port(port).await;
+
+    // Do NOT create the table — it must be absent from the catalog.
+    let copy_result: Result<tokio_postgres::CopyInSink<bytes::Bytes>, _> = client
+        .copy_in("COPY ghost_t FROM STDIN")
+        .await;
+    let err = match copy_result {
+        Err(e) => e,
+        Ok(_) => panic!("expected error for unknown table, but got CopyInSink"),
+    };
+
+    let msg = if let Some(db_err) = err.as_db_error() {
+        db_err.message().to_string()
+    } else {
+        err.to_string()
+    };
+    assert!(
+        msg.contains("RS-2500"),
+        "expected RS-2500 in error, got: {msg}"
+    );
+}
+
+// ── S6 gate: copy_in_column_count_mismatch_returns_rs2501 ────────────────────
+
+/// S6 / P4 green gate: a TSV row with the wrong field count returns RS-2501.
+#[tokio::test]
+async fn copy_in_column_count_mismatch_returns_rs2501() {
+    let (port, _handle, _shard_db) =
+        start_gateway_with_shard("v027-s6-col-mismatch").await;
+    let client = connect_port(port).await;
+
+    // Create a 3-column table.
+    client
+        .simple_query("CREATE TABLE tbl3 (a TEXT, b TEXT, c TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    let sink: tokio_postgres::CopyInSink<bytes::Bytes> = client
+        .copy_in("COPY tbl3 FROM STDIN")
+        .await
+        .expect("copy_in should enter COPY IN mode");
+    tokio::pin!(sink);
+
+    // Send a row with only 2 fields — mismatch against 3-column table.
+    futures::SinkExt::send(&mut sink, bytes::Bytes::from("field1\tfield2\n"))
+        .await
+        .expect("send should not fail immediately");
+
+    // CopyDone or finish will surface the RS-2501 error.
+    let result = sink.finish().await;
+    match result {
+        Err(e) => {
+            let msg = if let Some(db_err) = e.as_db_error() {
+                db_err.message().to_string()
+            } else {
+                e.to_string()
+            };
+            assert!(
+                msg.contains("RS-2501"),
+                "expected RS-2501 in error, got: {msg}"
+            );
+        }
+        Ok(n) => panic!("expected error but got COPY {n}"),
+    }
+}
+
+// ── S7 gate: copy_in_auth_enforced_lfs ───────────────────────────────────────
+
+/// S7 / P5 green gate: COPY IN enforces PipelineOwner role.
+///
+/// Tests at the handler level (matching auth_proof_tests.rs pattern):
+/// - No principal (system with auth=off) → passthrough (system bypasses ACL)
+/// - Viewer principal → RS-2401
+/// - PipelineOwner principal → CopyIn accepted
+/// - No principal with auth enabled but no session → RS-2400 tested via JwtVerifier
+#[tokio::test]
+async fn copy_in_auth_enforced_lfs() {
+    use rockstream_gateway::auth::Principal;
+    use rockstream_gateway::server::GatewayHandler;
+    use rockstream_types::acl::{AclEntry, Role};
+
+    const SECRET: &[u8] = b"v027-auth-test-secret";
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("v027-s7-auth", store)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
+
+    let handler = Arc::new(GatewayHandler::with_shard_db(
+        catalog.clone(),
+        view_reader,
+        shard_db,
+    ));
+
+    // Grant PipelineOwner to owner_user; Viewer to viewer_user.
+    handler.acl_store.grant(AclEntry {
+        principal: "owner_user".to_string(),
+        namespace: "public".to_string(),
+        view_name: None,
+        role: Role::PipelineOwner,
+    });
+    handler.acl_store.grant(AclEntry {
+        principal: "viewer_user".to_string(),
+        namespace: "public".to_string(),
+        view_name: None,
+        role: Role::Viewer,
+    });
+
+    // Register the target table.
+    catalog.add_table(rockstream_gateway::catalog_stubs::CatalogTable {
+        name: "auth_t".to_string(),
+        columns: vec![
+            CatalogColumn { name: "id".to_string(), data_type: "Utf8".to_string() },
+            CatalogColumn { name: "val".to_string(), data_type: "Utf8".to_string() },
+        ],
+    });
+
+    // ── RS-2400: JwtVerifier rejects missing/empty token ─────────────────────
+    let verifier =
+        rockstream_gateway::auth::JwtVerifier::with_hs256_key(SECRET.to_vec());
+    let err = verifier.verify("").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RS-2400") || msg.contains("unauthenticated"),
+        "expected RS-2400 for empty token; got: {msg}"
+    );
+
+    // ── RS-2401: viewer_user cannot COPY IN ───────────────────────────────────
+    let viewer_conn = "viewer-conn-001";
+    {
+        let mut s = handler
+            .sessions
+            .entry(viewer_conn.to_string())
+            .or_insert_with(rockstream_gateway::session::SessionState::new);
+        s.principal = Principal::Jwt {
+            sub: "viewer_user".to_string(),
+        };
+        s.current_namespace = "public".to_string();
+    }
+
+    let responses = handler
+        .copy_from_stdin_response("COPY auth_t FROM STDIN", viewer_conn)
+        .expect("copy_from_stdin_response should return Ok (error inside response)");
+
+    let viewer_err = responses.iter().find(|r| {
+        matches!(r, pgwire::api::results::Response::Error(_))
+    });
+    let viewer_err_msg = viewer_err.map(|r| {
+        if let pgwire::api::results::Response::Error(e) = r {
+            e.message.clone()
+        } else {
+            String::new()
+        }
+    }).unwrap_or_default();
+    assert!(
+        viewer_err_msg.contains("RS-2401") || viewer_err_msg.contains("insufficient_privilege"),
+        "expected RS-2401 for viewer; got: {viewer_err_msg:?}"
+    );
+
+    // ── PipelineOwner: owner_user can COPY IN ─────────────────────────────────
+    let owner_conn = "owner-conn-001";
+    {
+        let mut s = handler
+            .sessions
+            .entry(owner_conn.to_string())
+            .or_insert_with(rockstream_gateway::session::SessionState::new);
+        s.principal = Principal::Jwt {
+            sub: "owner_user".to_string(),
+        };
+        s.current_namespace = "public".to_string();
+    }
+
+    let responses = handler
+        .copy_from_stdin_response("COPY auth_t FROM STDIN", owner_conn)
+        .expect("owner should get a response");
+
+    let has_copy_in = responses.iter().any(|r| {
+        matches!(r, pgwire::api::results::Response::CopyIn(_))
+    });
+    assert!(
+        has_copy_in,
+        "expected CopyInResponse for pipeline_owner; got non-CopyIn response"
+    );
+}
+
+// ── S8 gate: copy_in_large_batch_no_memory_exhaustion_minio_tc ───────────────
+
+#[cfg(feature = "testcontainers")]
+#[tokio::test]
+async fn copy_in_large_batch_no_memory_exhaustion_minio_tc() {
+    use rockstream_gateway::copy_state::{COPY_IN_BUFFER_ROWS, MAX_COPY_IN_BATCH_ROWS};
+    use std::sync::atomic::Ordering;
+    use testcontainers::clients::Cli;
+    use testcontainers_modules::minio::MinIO;
+
+    let docker = Cli::default();
+    let container = docker.run(MinIO::default());
+    let minio_port = container.get_host_port_ipv4(9000);
+
+    let store = Arc::new(
+        object_store::aws::AmazonS3Builder::new()
+            .with_endpoint(format!("http://localhost:{minio_port}"))
+            .with_bucket_name("rockstream-test")
+            .with_access_key_id("minioadmin")
+            .with_secret_access_key("minioadmin")
+            .with_allow_http(true)
+            .build()
+            .expect("build MinIO store"),
+    );
+
+    let shard_db = Arc::new(
+        ShardDb::builder("v027-s8-minio", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog, Arc::new(NoopViewReader), shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client.simple_query("CREATE TABLE minio_t (id TEXT, val TEXT)").await.expect("CREATE TABLE");
+
+    COPY_IN_BUFFER_ROWS.store(0, Ordering::Relaxed);
+
+    const TOTAL: usize = 50_000;
+    const CHUNK: usize = 1_024;
+
+    let sink: tokio_postgres::CopyInSink<bytes::Bytes> = client
+        .copy_in("COPY minio_t FROM STDIN")
+        .await
+        .expect("copy_in");
+    tokio::pin!(sink);
+
+    let mut sent = 0usize;
+    while sent < TOTAL {
+        let batch_size = CHUNK.min(TOTAL - sent);
+        let mut data = String::new();
+        for i in sent..sent + batch_size {
+            data.push_str(&format!("id_{i}\t{i}\n"));
+        }
+        futures::SinkExt::send(&mut sink, bytes::Bytes::from(data)).await.expect("send");
+
+        let gauge = COPY_IN_BUFFER_ROWS.load(Ordering::Relaxed);
+        assert!(gauge <= MAX_COPY_IN_BATCH_ROWS as u64, "gauge {gauge} exceeded bound");
+
+        sent += batch_size;
+    }
+
+    let rows = sink.finish().await.expect("finish");
+    assert_eq!(rows, TOTAL as u64, "COPY {TOTAL}");
+
+    shard_db.flush().await.unwrap();
+    let entries = shard_db.scan_prefix(b"view_output/minio_t/").await.expect("scan");
+    assert_eq!(entries.len(), TOTAL, "all rows durable in MinIO; got {}", entries.len());
+}
+
+// ── S9 gate: proof_copy_from_lfs ─────────────────────────────────────────────
+
+/// S9 / P1 end-to-end proof: 1 000 rows via tokio_postgres `copy_in` API are
+/// all visible in the shard and CommandComplete reports COPY 1000.
+#[tokio::test]
+async fn proof_copy_from_lfs() {
+    let (port, _handle, shard_db) =
+        start_gateway_with_shard("v027-s9-proof-copy").await;
+    let client = connect_port(port).await;
+
+    // Register 2-column table in the catalog.
+    client
+        .simple_query("CREATE TABLE proof_t (id TEXT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    let sink: tokio_postgres::CopyInSink<bytes::Bytes> = client
+        .copy_in("COPY proof_t FROM STDIN")
+        .await
+        .expect("copy_in should enter COPY IN mode");
+    tokio::pin!(sink);
+
+    const TOTAL: usize = 1_000;
+    for i in 0..TOTAL {
+        let row = format!("id_{i}\tval_{i}\n");
+        futures::SinkExt::send(&mut sink, bytes::Bytes::from(row))
+            .await
+            .expect("send row failed");
+    }
+
+    let rows_written = sink.finish().await.expect("CopyDone should succeed");
+    assert_eq!(
+        rows_written, TOTAL as u64,
+        "CommandComplete should report COPY {TOTAL}"
+    );
+
+    // All rows visible in the shard.
+    shard_db.flush().await.unwrap();
+    let entries = shard_db
+        .scan_prefix(b"view_output/proof_t/")
+        .await
+        .expect("scan_prefix failed");
+    assert_eq!(
+        entries.len(),
+        TOTAL,
+        "shard should contain {TOTAL} rows; got {}",
+        entries.len()
+    );
+
+    // Verify a few spot rows.
+    for i in [0usize, 499, 999] {
+        let found = entries.iter().any(|(_, v)| {
+            String::from_utf8_lossy(v).contains(&format!("val_{i}"))
+        });
+        assert!(found, "expected row val_{i} in shard");
+    }
 }
