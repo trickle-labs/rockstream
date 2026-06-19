@@ -13,7 +13,9 @@
 //! parameterized on the `Runtime` trait so that tests can deterministically
 //! reproduce failures.
 
+pub mod auto_tuner;
 pub mod brownout;
+pub mod spike;
 pub mod buggify;
 pub mod chaos;
 pub mod clock;
@@ -33,6 +35,11 @@ pub mod tokio_rt;
 pub mod two_pc;
 pub mod wire_version;
 
+pub use auto_tuner::{
+    AutoTuner, EPOCH_CEILING_MS, EPOCH_FLOOR_MS, LAG_TRIGGER_EPOCHS, MAX_THROTTLE_BYTES,
+    MIN_THROTTLE_BYTES, PARALLELISM_P95_SCALE_DOWN_MS, PARALLELISM_P95_SCALE_UP_MS,
+    SLO_TARGET, WRITE_RATE_QUOTA,
+};
 pub use brownout::{BrownoutStatus, ObjectStoreBrownoutGuard, LOCAL_BUFFER_MAX_EPOCHS};
 pub use buggify::buggify_enabled;
 pub use chaos::{
@@ -57,6 +64,7 @@ pub use soak::{
 };
 pub use tokio_rt::TokioRuntime;
 pub use two_pc::{TwoPcPhase, TwoPcSinkState};
+pub use spike::{OscillationDetector, SpikeResult, SpikeScenario};
 pub use wire_version::{
     negotiate_version, NegotiationResult, ProtocolVersion, SupportedVersionRange,
 };

@@ -4673,6 +4673,7 @@ dependencies = [
  "rockstream-runtime",
  "rockstream-storage",
  "rockstream-types",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "testcontainers",

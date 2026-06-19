@@ -35,4 +35,5 @@ rockstream-storage = { workspace = true }
 rockstream-ops = { workspace = true }
 rockstream-connectors = { workspace = true }
 reqwest = { workspace = true }
+serde_json = { workspace = true }
 
