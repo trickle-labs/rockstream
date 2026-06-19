@@ -331,6 +331,7 @@ fn proof_seed_corpus_covers_all_registered_laws() {
         "HyperLogLog/v1",
         "BloomUnion/v1",
         "AutoTuner/v1",
+        "RecoverySLO/v1",
     ];
 
     assert!(

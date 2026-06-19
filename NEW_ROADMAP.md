@@ -146,7 +146,7 @@ These names orient readers; they are not calendar commitments.
 | Progress-Tracked | v0.19 | Frontier protocol correct across multi-input operators; bounded shuffle storage; FizzBee M2 frontier-aggregation model green. |
 | Fault-Tolerant ✅ Done | v0.22 | Exactly-once end-to-end; 24h chaos with zero loss/duplicates; recovery SLOs met; all four FizzBee models (M1–M4) green. |
 | Postgres Pillar ✅ Done | v0.26 | Read, write, subscribe, and read-your-writes over the Postgres wire protocol. |
-| Soaks Complete | v0.31 | Ingestion connectors live; failure-detection, shard-reassignment, and freshness-recovery SLOs validated under real cloud pressure. |
+| Soaks Complete ✅ Done | v0.31 | Ingestion connectors live; failure-detection, shard-reassignment, and freshness-recovery SLOs validated under real cloud pressure. |
 | Private Beta Ready | v0.32 | Secondary indexes enable single-digit-ms point lookups on non-primary keys; open for early-adopter onboarding. |
 | v1.0 Release | v0.43 | All v0.1–v0.42 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged. |
 
@@ -234,7 +234,7 @@ integration with another process).
 | v0.28 | First-Party Source Connectors ✅ Done | Native, highly optimized Kafka (consumer-group; offsets in the causal frontier) and AWS S3 source connectors for continuous streaming ingestion; the §13.3 connector contract (`discover_schema`/`start_snapshot`/`poll_delta`/`commit_offset`/`prepare`/`commit`/`abort`/`should_flush`). | Kafka offsets and S3 file pointers are correctly tracked within the causal frontier protocol for exactly-once ingestion; a Kafka source closes a tumbling window correctly under deliberate clock skew. | Unit, LFS, MinIO, TC |
 | v0.29 | Object Store Limit Soak ✅ Done | Maximize sustained pressure to validate shard-level group commits, SST/WAL caches, and coalesced durable fallback paths against cloud provider rate limits; native OpenTelemetry/Prometheus metrics (`/metrics`) utilized for monitoring flush latencies. | The cluster maintains high throughput for 72 hours without HTTP 429 (Too Many Requests) throttling errors from the cloud provider. | Unit, LFS, MinIO, TC |
 | v0.30 | Auto-Tuner Chaos Soak ✅ Done | Subject the cluster to extreme step-function traffic spikes to test the default "self-tuning" adaptive control loops (epoch sizing, source throttling, and parallelism); prove control loops do not overcorrect and enter destabilizing oscillation. | Control loops settle to a stable steady-state within 3 epochs of a 10× traffic spike. | Unit, LFS, MinIO, TC |
-| v0.31 | Recovery SLO Validation | Induce hard network partitions and simulated object-store brownouts under continuous Kafka streaming load; instrument recovery timings end-to-end. **Soaks Complete** milestone. | Failure detection ≤5 s p99, shard reassignment ≤30 s p99, freshness recovery <60 s p99 for 1 TB of state. | Unit, LFS, MinIO, TC |
+| v0.31 | Recovery SLO Validation ✅ Done | Induce hard network partitions and simulated object-store brownouts under continuous Kafka streaming load; instrument recovery timings end-to-end. **Soaks Complete** milestone. | Failure detection ≤5 s p99, shard reassignment ≤30 s p99, freshness recovery <60 s p99 for 1 TB of state. | Unit, LFS, MinIO, TC |
 
 ### Phase 9 — Operational HTAP Ergonomics
 

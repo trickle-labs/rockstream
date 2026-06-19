@@ -1,26 +1,25 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::ops::Range;
-use std::time::Duration;
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use reqwest;
-use tokio;
 use rand;
-use async_trait::async_trait;
+use reqwest;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio;
 
-use object_store::{
-    ObjectStore, Result, GetResult, PutResult, PutPayload, ObjectMeta,
-    GetOptions, PutOptions, MultipartUpload, PutMultipartOptions, ListResult, GetRange
-};
 use object_store::path::Path;
+use object_store::{
+    GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+};
 
-
-use rockstream_runtime::exchange::durable::{DurableShuffleWriter, DurableShuffleReader};
-use rockstream_sim::SimRuntime;
-use rockstream_sim::Runtime;
+use rockstream_runtime::exchange::durable::{DurableShuffleReader, DurableShuffleWriter};
 use rockstream_sim::object_store::ObjectStoreError;
+use rockstream_sim::Runtime;
+use rockstream_sim::SimRuntime;
 
 // ─── Throttled Store Wrapper for testing ───
 
@@ -89,7 +88,12 @@ impl<T> std::fmt::Display for ThrottledStoreWrapper<T> {
 
 #[async_trait]
 impl<T: ObjectStore> ObjectStore for ThrottledStoreWrapper<T> {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> Result<PutResult> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
         self.maybe_fail()?;
         self.inner.put_opts(location, payload, opts).await
     }
@@ -123,7 +127,11 @@ impl<T: ObjectStore> ObjectStore for ThrottledStoreWrapper<T> {
         self.inner.copy_if_not_exists(from, to).await
     }
 
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> {
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>> {
         self.maybe_fail()?;
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -144,7 +152,10 @@ impl SimObjectStoreWrapper {
     fn convert_err(e: ObjectStoreError) -> object_store::Error {
         object_store::Error::Generic {
             store: "SimObjectStoreWrapper",
-            source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )),
         }
     }
 }
@@ -158,9 +169,16 @@ impl std::fmt::Display for SimObjectStoreWrapper {
 #[async_trait]
 #[allow(unused_variables)]
 impl ObjectStore for SimObjectStoreWrapper {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> Result<PutResult> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
         let bytes = payload.clone().into();
-        self.inner.put(location.as_ref(), bytes).map_err(Self::convert_err)?;
+        self.inner
+            .put(location.as_ref(), bytes)
+            .map_err(Self::convert_err)?;
         Ok(PutResult {
             e_tag: None,
             version: None,
@@ -168,15 +186,18 @@ impl ObjectStore for SimObjectStoreWrapper {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        let bytes = self.inner.get(location.as_ref()).map_err(Self::convert_err)?;
+        let bytes = self
+            .inner
+            .get(location.as_ref())
+            .map_err(Self::convert_err)?;
         let (range, data) = match options.range {
             Some(r) => {
-                let resolved = r.as_range(bytes.len() as u64).map_err(|e| {
-                    object_store::Error::Generic {
-                        store: "SimObjectStoreWrapper",
-                        source: Box::new(e),
-                    }
-                })?;
+                let resolved =
+                    r.as_range(bytes.len() as u64)
+                        .map_err(|e| object_store::Error::Generic {
+                            store: "SimObjectStoreWrapper",
+                            source: Box::new(e),
+                        })?;
                 let start = resolved.start as usize;
                 let end = resolved.end as usize;
                 (resolved, bytes.slice(start..end))
@@ -185,7 +206,7 @@ impl ObjectStore for SimObjectStoreWrapper {
         };
         Ok(GetResult {
             payload: object_store::GetResultPayload::Stream(
-                futures::stream::once(futures::future::ready(Ok(data))).boxed()
+                futures::stream::once(futures::future::ready(Ok(data))).boxed(),
             ),
             meta: ObjectMeta {
                 location: location.clone(),
@@ -200,46 +221,67 @@ impl ObjectStore for SimObjectStoreWrapper {
     }
 
     async fn delete(&self, location: &Path) -> Result<()> {
-        self.inner.delete(location.as_ref()).map_err(Self::convert_err)?;
+        self.inner
+            .delete(location.as_ref())
+            .map_err(Self::convert_err)?;
         Ok(())
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let prefix_str = prefix.map(|p| p.as_ref()).unwrap_or("");
         let keys = self.inner.list(prefix_str);
-        let metas: Vec<Result<ObjectMeta>> = keys.into_iter().map(|k| {
-            Ok(ObjectMeta {
-                location: Path::from(k),
-                last_modified: std::time::SystemTime::now().into(),
-                size: 0,
-                e_tag: None,
-                version: None,
+        let metas: Vec<Result<ObjectMeta>> = keys
+            .into_iter()
+            .map(|k| {
+                Ok(ObjectMeta {
+                    location: Path::from(k),
+                    last_modified: std::time::SystemTime::now().into(),
+                    size: 0,
+                    e_tag: None,
+                    version: None,
+                })
             })
-        }).collect();
+            .collect();
         futures::stream::iter(metas).boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         Err(object_store::Error::NotSupported {
-            source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "list_with_delimiter not supported")),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "list_with_delimiter not supported",
+            )),
         })
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
         Err(object_store::Error::NotSupported {
-            source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "copy not supported")),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "copy not supported",
+            )),
         })
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
         Err(object_store::Error::NotSupported {
-            source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "copy_if_not_exists not supported")),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "copy_if_not_exists not supported",
+            )),
         })
     }
 
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> {
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>> {
         Err(object_store::Error::NotSupported {
-            source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "put_multipart_opts not supported")),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "put_multipart_opts not supported",
+            )),
         })
     }
 }
@@ -295,13 +337,17 @@ async fn test_coalesced_durable_fallback_retry() {
     // Reset fail counter
     store.fail_counter.store(0, Ordering::Relaxed);
 
-    let footer = DurableShuffleReader::read_footer(&store, &path).await.unwrap();
+    let footer = DurableShuffleReader::read_footer(&store, &path)
+        .await
+        .unwrap();
     assert_eq!(footer.entries.len(), 1);
 
     // Reset fail counter
     store.fail_counter.store(0, Ordering::Relaxed);
 
-    let frame = DurableShuffleReader::read_frame(&store, &path, &footer.entries[0]).await.unwrap();
+    let frame = DurableShuffleReader::read_frame(&store, &path, &footer.entries[0])
+        .await
+        .unwrap();
     assert_eq!(frame, payload);
 }
 
@@ -329,10 +375,14 @@ async fn test_object_store_limit_soak_sim() {
 
         writer.finish(&wrapper, &path).await.unwrap();
 
-        let footer = DurableShuffleReader::read_footer(&wrapper, &path).await.unwrap();
+        let footer = DurableShuffleReader::read_footer(&wrapper, &path)
+            .await
+            .unwrap();
         assert_eq!(footer.entries.len(), 1);
 
-        let frame = DurableShuffleReader::read_frame(&wrapper, &path, &footer.entries[0]).await.unwrap();
+        let frame = DurableShuffleReader::read_frame(&wrapper, &path, &footer.entries[0])
+            .await
+            .unwrap();
         assert_eq!(frame, payload);
     }
 
@@ -388,7 +438,18 @@ fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     }
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let dpm: [u32; 12] = [
-        31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month = 0u32;
     for &d in &dpm {
@@ -486,9 +547,13 @@ async fn test_minio_rate_limit_soak_tc() {
 
     writer.finish(&store, &path).await.unwrap();
 
-    let footer = DurableShuffleReader::read_footer(&store, &path).await.unwrap();
+    let footer = DurableShuffleReader::read_footer(&store, &path)
+        .await
+        .unwrap();
     assert_eq!(footer.entries.len(), 1);
 
-    let frame = DurableShuffleReader::read_frame(&store, &path, &footer.entries[0]).await.unwrap();
+    let frame = DurableShuffleReader::read_frame(&store, &path, &footer.entries[0])
+        .await
+        .unwrap();
     assert_eq!(frame, payload);
 }

@@ -11,10 +11,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use rockstream_sim::{
-    AutoTuner, OscillationDetector, SimObjectStoreHandle, SpikeScenario,
-};
 use rockstream_sim::buggify::{buggify_disable, buggify_init};
+use rockstream_sim::{AutoTuner, OscillationDetector, SimObjectStoreHandle, SpikeScenario};
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::AutotunerConfig;
 
@@ -96,7 +94,10 @@ fn proof_auto_tuner_audit_survives_crash_replay() {
 
         // Persist audit events to SimObjectStore.
         let events = &tuner.audit_sink;
-        assert!(!events.is_empty(), "audit sink must have events after spike");
+        assert!(
+            !events.is_empty(),
+            "audit sink must have events after spike"
+        );
         let serialized = serialize_events(events);
         store.put("audit/auto_tuner.jsonl", serialized).unwrap();
         events.len()
@@ -338,9 +339,9 @@ async fn proof_auto_tuner_stability_minio_tc() {
     let scenario = SpikeScenario::ten_x_spike(5, 10);
     let result = scenario.run();
 
-    let settled = result.epochs_to_settle.expect(
-        "auto-tuner must settle within the spike window"
-    );
+    let settled = result
+        .epochs_to_settle
+        .expect("auto-tuner must settle within the spike window");
     assert!(
         settled <= 3,
         "all loops must settle within 3 epochs of the 10× spike; settled at {settled}"
@@ -375,7 +376,10 @@ async fn proof_auto_tuner_stability_minio_tc() {
 
     // Read back and verify durability.
     let get_result = store.get(&path).await.expect("MinIO get must succeed");
-    let raw = get_result.bytes().await.expect("MinIO body must be readable");
+    let raw = get_result
+        .bytes()
+        .await
+        .expect("MinIO body must be readable");
     let recovered = deserialize_events(&raw);
     assert_eq!(
         recovered.len(),

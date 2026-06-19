@@ -296,7 +296,10 @@ pub fn reset_all() {
 
 pub fn inc_compaction_bytes_reclaimed(law_id: u16, bytes: u64) {
     with_registry(|reg| {
-        let counter = reg.compaction_bytes_reclaimed.entry(law_id).or_insert_with(Counter::new);
+        let counter = reg
+            .compaction_bytes_reclaimed
+            .entry(law_id)
+            .or_insert_with(Counter::new);
         for _ in 0..bytes {
             counter.inc();
         }
@@ -305,27 +308,39 @@ pub fn inc_compaction_bytes_reclaimed(law_id: u16, bytes: u64) {
 
 pub fn inc_duplicate_dropped(law_id: u16) {
     with_registry(|reg| {
-        reg.duplicate_dropped_total.entry(law_id).or_insert_with(Counter::new).inc();
+        reg.duplicate_dropped_total
+            .entry(law_id)
+            .or_insert_with(Counter::new)
+            .inc();
     });
 }
 
 pub fn set_tombstone_bytes(law_id: u16, bytes: u64) {
     with_registry(|reg| {
-        let counter = reg.tombstone_bytes.entry(law_id).or_insert_with(Counter::new);
+        let counter = reg
+            .tombstone_bytes
+            .entry(law_id)
+            .or_insert_with(Counter::new);
         counter.value.store(bytes, Ordering::Relaxed);
     });
 }
 
 pub fn set_monotone_partial_lag(law_id: u16, lag_ms: u64) {
     with_registry(|reg| {
-        let counter = reg.monotone_partial_lag_ms.entry(law_id).or_insert_with(Counter::new);
+        let counter = reg
+            .monotone_partial_lag_ms
+            .entry(law_id)
+            .or_insert_with(Counter::new);
         counter.value.store(lag_ms, Ordering::Relaxed);
     });
 }
 
 pub fn set_workload_memory(workload: &str, bytes: u64) {
     with_registry(|reg| {
-        let counter = reg.workload_memory_bytes.entry(workload.to_string()).or_insert_with(Counter::new);
+        let counter = reg
+            .workload_memory_bytes
+            .entry(workload.to_string())
+            .or_insert_with(Counter::new);
         counter.value.store(bytes, Ordering::Relaxed);
     });
 }
@@ -338,7 +353,10 @@ pub fn set_state_budget(bytes: u64) {
 
 pub fn set_freshness_lag(view_name: &str, lag_ms: u64) {
     with_registry(|reg| {
-        let counter = reg.freshness_lag_ms.entry(view_name.to_string()).or_insert_with(Counter::new);
+        let counter = reg
+            .freshness_lag_ms
+            .entry(view_name.to_string())
+            .or_insert_with(Counter::new);
         counter.value.store(lag_ms, Ordering::Relaxed);
     });
 }
@@ -361,7 +379,10 @@ pub fn generate_prometheus_metrics() -> String {
         for (k, c) in &reg.applied {
             out.push_str(&format!(
                 "merge_law_applied_total{{law_id=\"{}\",law_name=\"{}\",law_version=\"{}\"}} {}\n",
-                k.law_id.0, k.law_name, k.law_version, c.get()
+                k.law_id.0,
+                k.law_name,
+                k.law_version,
+                c.get()
             ));
         }
         out.push_str("\n");
@@ -372,7 +393,10 @@ pub fn generate_prometheus_metrics() -> String {
         for (k, c) in &reg.fallback {
             out.push_str(&format!(
                 "merge_law_fallback_total{{law_id=\"{}\",law_name=\"{}\",law_version=\"{}\"}} {}\n",
-                k.law_id.0, k.law_name, k.law_version, c.get()
+                k.law_id.0,
+                k.law_name,
+                k.law_version,
+                c.get()
             ));
         }
         out.push_str("\n");
@@ -383,7 +407,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (law_id, c) in &reg.compaction_bytes_reclaimed {
             out.push_str(&format!(
                 "merge_law_compaction_bytes_reclaimed{{law_id=\"{}\"}} {}\n",
-                law_id, c.get()
+                law_id,
+                c.get()
             ));
         }
         out.push_str("\n");
@@ -394,7 +419,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (law_id, c) in &reg.duplicate_dropped_total {
             out.push_str(&format!(
                 "merge_law_duplicate_dropped_total{{law_id=\"{}\"}} {}\n",
-                law_id, c.get()
+                law_id,
+                c.get()
             ));
         }
         out.push_str("\n");
@@ -405,7 +431,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (law_id, c) in &reg.tombstone_bytes {
             out.push_str(&format!(
                 "merge_law_tombstone_bytes{{law_id=\"{}\"}} {}\n",
-                law_id, c.get()
+                law_id,
+                c.get()
             ));
         }
         out.push_str("\n");
@@ -416,7 +443,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (law_id, c) in &reg.monotone_partial_lag_ms {
             out.push_str(&format!(
                 "merge_law_monotone_partial_lag_ms{{law_id=\"{}\"}} {}\n",
-                law_id, c.get()
+                law_id,
+                c.get()
             ));
         }
         out.push_str("\n");
@@ -427,7 +455,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (workload, c) in &reg.workload_memory_bytes {
             out.push_str(&format!(
                 "workload_memory_bytes{{workload_name=\"{}\"}} {}\n",
-                workload, c.get()
+                workload,
+                c.get()
             ));
         }
         out.push_str("\n");
@@ -435,7 +464,10 @@ pub fn generate_prometheus_metrics() -> String {
         // 8. state_budget_bytes
         out.push_str("# HELP state_budget_bytes Gauge tracking total memory allocations against state_budget_gb.\n");
         out.push_str("# TYPE state_budget_bytes gauge\n");
-        out.push_str(&format!("state_budget_bytes {}\n\n", reg.state_budget_bytes.load(Ordering::Relaxed)));
+        out.push_str(&format!(
+            "state_budget_bytes {}\n\n",
+            reg.state_budget_bytes.load(Ordering::Relaxed)
+        ));
 
         // 9. freshness_lag_ms
         out.push_str("# HELP freshness_lag_ms Gauge showing the lag between input source watermarks and the committed epoch.\n");
@@ -443,7 +475,8 @@ pub fn generate_prometheus_metrics() -> String {
         for (view_name, c) in &reg.freshness_lag_ms {
             out.push_str(&format!(
                 "freshness_lag_ms{{view_name=\"{}\"}} {}\n",
-                view_name, c.get()
+                view_name,
+                c.get()
             ));
         }
         out.push_str("\n");
@@ -457,7 +490,10 @@ pub fn generate_prometheus_metrics() -> String {
         // 11. flush_duration_seconds_count
         out.push_str("# HELP flush_duration_seconds_count Total count of flushes.\n");
         out.push_str("# TYPE flush_duration_seconds_count counter\n");
-        out.push_str(&format!("flush_duration_seconds_count {}\n\n", reg.flush_duration_count.load(Ordering::Relaxed)));
+        out.push_str(&format!(
+            "flush_duration_seconds_count {}\n\n",
+            reg.flush_duration_count.load(Ordering::Relaxed)
+        ));
 
         // 12. flush_duration_seconds_last
         out.push_str("# HELP flush_duration_seconds_last Latency of the last flush operation.\n");
@@ -468,7 +504,10 @@ pub fn generate_prometheus_metrics() -> String {
         // 13. slatedb_manifest_write_total
         out.push_str("# HELP slatedb_manifest_write_total Total manifest writes.\n");
         out.push_str("# TYPE slatedb_manifest_write_total counter\n");
-        out.push_str(&format!("slatedb_manifest_write_total {}\n", reg.manifest_writes.load(Ordering::Relaxed)));
+        out.push_str(&format!(
+            "slatedb_manifest_write_total {}\n",
+            reg.manifest_writes.load(Ordering::Relaxed)
+        ));
     });
     out
 }

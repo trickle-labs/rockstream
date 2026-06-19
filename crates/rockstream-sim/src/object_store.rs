@@ -116,13 +116,15 @@ impl SimObjectStore {
 
     fn check_rate_limit(&self) -> Result<(), ObjectStoreError> {
         if crate::buggify!("object_store.rate_limit", 0.05) {
-            return Err(ObjectStoreError::Io("HTTP 429 Too Many Requests".to_string()));
+            return Err(ObjectStoreError::Io(
+                "HTTP 429 Too Many Requests".to_string(),
+            ));
         }
         let limit = { *self.rate_limit.lock() };
         if let Some(r) = limit {
             let now = if let Some(ref clock) = *self.clock.lock() {
                 clock.elapsed_since_epoch()
-              } else {
+            } else {
                 Duration::from_secs(0)
             };
 
@@ -130,7 +132,9 @@ impl SimObjectStore {
             times.retain(|&t| now.saturating_sub(t) < Duration::from_secs(1));
 
             if times.len() as f64 >= r {
-                return Err(ObjectStoreError::Io("HTTP 429 Too Many Requests".to_string()));
+                return Err(ObjectStoreError::Io(
+                    "HTTP 429 Too Many Requests".to_string(),
+                ));
             }
             times.push(now);
         }

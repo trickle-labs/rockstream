@@ -205,7 +205,9 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     rt.block_on(async {
         let mut metrics_handle = None;
         if let Some(metrics_addr) = &opts.metrics_addr {
-            let mh = metrics_server::start_metrics_server(metrics_addr).await.unwrap();
+            let mh = metrics_server::start_metrics_server(metrics_addr)
+                .await
+                .unwrap();
             tracing::info!(metrics_addr = %mh.local_addr, "metrics server started");
             metrics_handle = Some(mh);
         }

@@ -84,10 +84,10 @@ impl AutoTuner {
             write_rate_ops_per_ms > WRITE_RATE_QUOTA || slo_compliance_ratio < SLO_TARGET;
 
         let (new_min, new_max) = if should_widen {
-            let new_min = (self.current_min_epoch_ms + self.current_min_epoch_ms / 2)
-                .min(EPOCH_CEILING_MS);
-            let new_max = (self.current_max_epoch_ms + self.current_max_epoch_ms / 2)
-                .min(EPOCH_CEILING_MS);
+            let new_min =
+                (self.current_min_epoch_ms + self.current_min_epoch_ms / 2).min(EPOCH_CEILING_MS);
+            let new_max =
+                (self.current_max_epoch_ms + self.current_max_epoch_ms / 2).min(EPOCH_CEILING_MS);
             (new_min, new_max)
         } else {
             let new_min = ((self.current_min_epoch_ms * 2) / 3).max(EPOCH_FLOOR_MS);
@@ -95,8 +95,7 @@ impl AutoTuner {
             (new_min, new_max)
         };
 
-        let changed =
-            new_min != self.current_min_epoch_ms || new_max != self.current_max_epoch_ms;
+        let changed = new_min != self.current_min_epoch_ms || new_max != self.current_max_epoch_ms;
         self.current_min_epoch_ms = new_min;
         self.current_max_epoch_ms = new_max;
 
@@ -282,9 +281,9 @@ mod tests {
 
         // No oscillation in the full trace.
         let trace = [p0, p1, p2, p3, p4, p5, p6];
-        let oscillating = trace.windows(3).any(|w| {
-            (w[1] > w[0] && w[2] < w[1]) || (w[1] < w[0] && w[2] > w[1])
-        });
+        let oscillating = trace
+            .windows(3)
+            .any(|w| (w[1] > w[0] && w[2] < w[1]) || (w[1] < w[0] && w[2] > w[1]));
         assert!(!oscillating, "no oscillation in parallelism trace");
     }
 
@@ -301,7 +300,10 @@ mod tests {
         for _ in 0..100 {
             let new_throttle =
                 tuner.adjust_source_throttle(lag_ms, freshness_target_ms, current_throttle);
-            assert!(new_throttle > 0, "deadlock prevention: throttle must never be 0");
+            assert!(
+                new_throttle > 0,
+                "deadlock prevention: throttle must never be 0"
+            );
             assert!(new_throttle >= MIN_THROTTLE_BYTES);
             if new_throttle < current_throttle {
                 reductions += 1;

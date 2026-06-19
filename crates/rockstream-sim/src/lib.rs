@@ -15,7 +15,6 @@
 
 pub mod auto_tuner;
 pub mod brownout;
-pub mod spike;
 pub mod buggify;
 pub mod chaos;
 pub mod clock;
@@ -27,18 +26,20 @@ pub mod liveness;
 pub mod network;
 pub mod object_store;
 pub mod paired_assert;
+pub mod recovery_soak;
 pub mod runtime;
 pub mod shard_map;
 pub mod sim;
 pub mod soak;
+pub mod spike;
 pub mod tokio_rt;
 pub mod two_pc;
 pub mod wire_version;
 
 pub use auto_tuner::{
     AutoTuner, EPOCH_CEILING_MS, EPOCH_FLOOR_MS, LAG_TRIGGER_EPOCHS, MAX_THROTTLE_BYTES,
-    MIN_THROTTLE_BYTES, PARALLELISM_P95_SCALE_DOWN_MS, PARALLELISM_P95_SCALE_UP_MS,
-    SLO_TARGET, WRITE_RATE_QUOTA,
+    MIN_THROTTLE_BYTES, PARALLELISM_P95_SCALE_DOWN_MS, PARALLELISM_P95_SCALE_UP_MS, SLO_TARGET,
+    WRITE_RATE_QUOTA,
 };
 pub use brownout::{BrownoutStatus, ObjectStoreBrownoutGuard, LOCAL_BUFFER_MAX_EPOCHS};
 pub use buggify::buggify_enabled;
@@ -56,15 +57,19 @@ pub use liveness::{DegradedState, LivenessChecker, LivenessStatus};
 pub use network::{SimNetwork, SimNetworkHandle};
 pub use object_store::{SimObjectStore, SimObjectStoreHandle};
 pub use paired_assert::paired_assert;
+pub use recovery_soak::{
+    run_brownout_recovery_scenario, run_partition_recovery_scenario, KafkaLagTimings,
+    KafkaRecoverySoakResult, RecoverySoakConfig,
+};
 pub use runtime::{Runtime, Spawner};
 pub use shard_map::{ShardOwnership, ShardRange, SimShardMap};
 pub use sim::SimRuntime;
 pub use soak::{
     build_initial_corpus, LawSeed, RegressionSeed, SeedCorpus, SeedOutcome, SoakRunner,
 };
+pub use spike::{OscillationDetector, SpikeResult, SpikeScenario};
 pub use tokio_rt::TokioRuntime;
 pub use two_pc::{TwoPcPhase, TwoPcSinkState};
-pub use spike::{OscillationDetector, SpikeResult, SpikeScenario};
 pub use wire_version::{
     negotiate_version, NegotiationResult, ProtocolVersion, SupportedVersionRange,
 };

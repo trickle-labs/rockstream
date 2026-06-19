@@ -82,7 +82,11 @@ impl SpikeScenario {
             // of epoch duration).
             let effective_write_rate = self.baseline_write_rate * spike_mult;
             // SLO degrades when write rate meets or exceeds quota.
-            let slo_ratio = if effective_write_rate >= WRITE_RATE_QUOTA { 0.50 } else { 0.99 };
+            let slo_ratio = if effective_write_rate >= WRITE_RATE_QUOTA {
+                0.50
+            } else {
+                0.99
+            };
 
             let epoch_ms_p95 = ((PARALLELISM_P95_SCALE_UP_MS as f64 * spike_mult)
                 / tuner.current_parallelism as f64) as u64;
@@ -110,16 +114,10 @@ impl SpikeScenario {
                 let spike_epoch = epoch - self.baseline_epochs;
                 if spike_epoch > 0 {
                     let i = parallelism_trace.len() - 1;
-                    let settled = within_5_pct(
-                        parallelism_trace[i] as f64,
-                        parallelism_trace[i - 1] as f64,
-                    ) && within_5_pct(
-                        epoch_ms_trace[i] as f64,
-                        epoch_ms_trace[i - 1] as f64,
-                    ) && within_5_pct(
-                        throttle_trace[i] as f64,
-                        throttle_trace[i - 1] as f64,
-                    );
+                    let settled =
+                        within_5_pct(parallelism_trace[i] as f64, parallelism_trace[i - 1] as f64)
+                            && within_5_pct(epoch_ms_trace[i] as f64, epoch_ms_trace[i - 1] as f64)
+                            && within_5_pct(throttle_trace[i] as f64, throttle_trace[i - 1] as f64);
                     if settled {
                         epochs_to_settle = Some(spike_epoch);
                     }
@@ -240,13 +238,14 @@ mod tests {
         let batch_min = EPOCH_CEILING_MS;
         let batch_max = EPOCH_CEILING_MS;
         let fires = 10usize / config.hysteresis_scale_up_windows; // floor(10/3) = 3
-        let batch_par = config.default_parallelism + fires;       // 4 + 3 = 7
+        let batch_par = config.default_parallelism + fires; // 4 + 3 = 7
 
         assert_eq!(incr_max, batch_max, "max_epoch_ms must reach ceiling");
         assert_eq!(incr_min, batch_min, "min_epoch_ms must reach ceiling");
         assert_eq!(
             incr_par, batch_par,
-            "parallelism must match batch oracle ({} fires in 10 iters)", fires
+            "parallelism must match batch oracle ({} fires in 10 iters)",
+            fires
         );
         assert_eq!(
             (incr_min, incr_max, incr_par),
