@@ -385,7 +385,7 @@ pub fn generate_prometheus_metrics() -> String {
                 c.get()
             ));
         }
-        out.push_str("\n");
+        out.push('\n');
 
         // 2. merge_law_fallback_total
         out.push_str("# HELP merge_law_fallback_total Counter tracking the number of fallback reads resolved by copying all raw bytes.\n");
@@ -399,7 +399,7 @@ pub fn generate_prometheus_metrics() -> String {
                 c.get()
             ));
         }
-        out.push_str("\n");
+        out.push('\n');
 
         // 3. merge_law_compaction_bytes_reclaimed
         out.push_str("# HELP merge_law_compaction_bytes_reclaimed Counter of bytes reclaimed during SlateDB compaction filters running laws.\n");
@@ -411,7 +411,7 @@ pub fn generate_prometheus_metrics() -> String {
                 c.get()
             ));
         }
-        out.push_str("\n");
+        out.push('\n');
 
         // 4. merge_law_duplicate_dropped_total
         out.push_str("# HELP merge_law_duplicate_dropped_total Counter of duplicated update/insert operands dropped by idempotent laws.\n");
@@ -423,7 +423,7 @@ pub fn generate_prometheus_metrics() -> String {
                 c.get()
             ));
         }
-        out.push_str("\n");
+        out.push('\n');
 
         // 5. merge_law_tombstone_bytes
         out.push_str("# HELP merge_law_tombstone_bytes Gauge of active tombstone bytes in the arrangement state.\n");
@@ -435,7 +435,7 @@ pub fn generate_prometheus_metrics() -> String {
                 c.get()
             ));
         }
-        out.push_str("\n");
+        out.push('\n');
 
         // 6. merge_law_monotone_partial_lag_ms
         out.push_str("# HELP merge_law_monotone_partial_lag_ms Gauge showing freshness lag of monotone recursive operators.\n");
@@ -447,7 +447,7 @@ pub fn generate_prometheus_metrics() -> String {
                 c.get()
             ));
         }
-        out.push_str("\n");
+        out.push('\n');
 
         // 7. workload_memory_bytes
         out.push_str("# HELP workload_memory_bytes Gauge showing live memory consumption of stateful operators grouped by workload.\n");
@@ -459,7 +459,7 @@ pub fn generate_prometheus_metrics() -> String {
                 c.get()
             ));
         }
-        out.push_str("\n");
+        out.push('\n');
 
         // 8. state_budget_bytes
         out.push_str("# HELP state_budget_bytes Gauge tracking total memory allocations against state_budget_gb.\n");
@@ -479,7 +479,7 @@ pub fn generate_prometheus_metrics() -> String {
                 c.get()
             ));
         }
-        out.push_str("\n");
+        out.push('\n');
 
         // 10. flush_duration_seconds_sum
         out.push_str("# HELP flush_duration_seconds_sum Cumulative duration of all flushes.\n");

@@ -522,6 +522,8 @@ pub enum CatalogType {
     Schema = 0x14,
     /// Connector configuration.
     Connector = 0x15,
+    /// Secondary index definition (v0.32).
+    Index = 0x16,
 }
 
 impl CatalogKeyEncoder {

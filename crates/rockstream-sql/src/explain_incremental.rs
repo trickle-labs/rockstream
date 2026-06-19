@@ -162,6 +162,20 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<String>) {
             ));
         }
 
+        // v0.32: IndexArrange
+        PlanNode::IndexArrange {
+            input,
+            index_cols,
+            pk_cols,
+            ..
+        } => {
+            render_node(input, depth + 1, lines);
+            lines.push(format!(
+                "{indent}✓ IndexArrange[index_cols={index_cols:?}, pk_cols={pk_cols:?}]  \
+                 bound=max_arrangement_rows  fill=index_arrange_row_count"
+            ));
+        }
+
         other => {
             lines.push(format!("{indent}  {other:?}"));
         }

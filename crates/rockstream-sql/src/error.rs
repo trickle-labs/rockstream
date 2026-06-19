@@ -4,7 +4,7 @@
 //! with actionable next_steps text.
 
 use rockstream_types::error_code::{
-    ErrorCode, RS_0001, RS_0003, RS_1002, RS_1011, RS_1012, RS_1013, RS_1016,
+    ErrorCode, RS_0001, RS_0003, RS_1002, RS_1011, RS_1012, RS_1013, RS_1016, RS_2016,
 };
 use thiserror::Error;
 
@@ -63,6 +63,20 @@ pub enum SqlError {
     /// JSON serialization error (catalog encoding).
     #[error("[RS-0001] Catalog serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// Index name conflict: same index name already exists for a different table.
+    ///
+    /// RS-2016: use a different index name or drop the existing index first.
+    #[error("[RS-2016] Index name conflict: index '{index_name}' already exists for table '{existing_table}' (not '{requested_table}')")]
+    IndexNameConflict {
+        index_name: String,
+        existing_table: String,
+        requested_table: String,
+    },
+
+    /// DDL parse error: unrecognized or malformed DDL statement.
+    #[error("[RS-1012] DDL parse error: {message}")]
+    DdlParseError { message: String },
 }
 
 impl SqlError {
@@ -77,6 +91,8 @@ impl SqlError {
             Self::Storage(_) => RS_0003,
             Self::DataFusion(_) => RS_1012,
             Self::Serde(_) => RS_0001,
+            Self::IndexNameConflict { .. } => RS_2016,
+            Self::DdlParseError { .. } => RS_1012,
         }
     }
 }

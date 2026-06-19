@@ -69,6 +69,8 @@ fn collect_refs(plan: &PlanNode, out: &mut Vec<String>) {
         // v0.4 additions
         PlanNode::ViewSink { child, .. } => collect_refs(child, out),
         PlanNode::Exchange { child, .. } => collect_refs(child, out),
+        // v0.32: IndexArrange
+        PlanNode::IndexArrange { input, .. } => collect_refs(input, out),
     }
 }
 

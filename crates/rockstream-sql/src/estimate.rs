@@ -171,6 +171,26 @@ fn estimate_node(
             });
         }
 
+        // v0.32: IndexArrange (S9) — arrangement state: cardinality * 24 bytes
+        // (index_key:8 + pk:8 + row_ptr:8). Throughput: 1M rows/s (same as ViewSink).
+        PlanNode::IndexArrange {
+            input,
+            index_cols,
+            pk_cols,
+            ..
+        } => {
+            estimate_node(input, cardinality_hint, batch_rows, out);
+            let state_per_row = 24u64; // index_key(8) + pk(8) + row_ptr(8)
+            out.push(EstimateRow {
+                operator_kind: format!(
+                    "IndexArrange[idx={index_cols:?},pk={pk_cols:?}] estimated_index_state_bytes={}",
+                    cardinality_hint * state_per_row
+                ),
+                predicted_state_bytes: cardinality_hint * state_per_row,
+                epoch_ms: epoch_ms(batch_rows, 1_000_000.0),
+            });
+        }
+
         // All other nodes — pass through without an estimate row.
         _ => {}
     }

@@ -290,6 +290,26 @@ pub enum PlanNode {
         /// The input plan to re-partition.
         child: Box<PlanNode>,
     },
+
+    /// Index arrangement operator (v0.32).
+    ///
+    /// Maintains a `(index_key_bytes ++ pk_bytes) → row_bytes` arrangement
+    /// stored under `view_output/__idx_<index_name>/`. Used to implement
+    /// secondary indexes without range deletion.
+    ///
+    /// Bound: bounded by `max_arrangement_rows` config. Fill metric:
+    /// `index_arrange_row_count` gauge. Backpressure: source credit-starved
+    /// if fill exceeds bound.
+    IndexArrange {
+        /// Input plan producing the rows to index.
+        input: Box<PlanNode>,
+        /// Column indices forming the index key.
+        index_cols: Vec<usize>,
+        /// Column indices forming the primary key.
+        pk_cols: Vec<usize>,
+        /// Optional filter predicate (for partial indexes).
+        filter_pred: Option<Expr>,
+    },
 }
 
 /// How an Exchange operator partitions data across shards (v0.4).
@@ -741,5 +761,41 @@ mod tests {
             "extremum_requires_rmw"
         );
         assert_eq!(NotMergeSafeReason::ClampNotALaw.as_str(), "clamp_not_a_law");
+    }
+
+    // ── v0.32: IndexArrange ───────────────────────────────────────────────────
+
+    #[test]
+    fn index_arrange_roundtrips_serde() {
+        let node = PlanNode::IndexArrange {
+            input: Box::new(PlanNode::Source {
+                name: "t".to_string(),
+            }),
+            index_cols: vec![1],
+            pk_cols: vec![0],
+            filter_pred: None,
+        };
+        let bytes = serde_json::to_vec(&node).unwrap();
+        let decoded: PlanNode = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, node);
+    }
+
+    #[test]
+    fn index_arrange_with_filter_pred_roundtrips_serde() {
+        let node = PlanNode::IndexArrange {
+            input: Box::new(PlanNode::Source {
+                name: "orders".to_string(),
+            }),
+            index_cols: vec![2, 3],
+            pk_cols: vec![0],
+            filter_pred: Some(Expr::BinaryOp {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column(2)),
+                right: Box::new(Expr::Literal(100i64.to_be_bytes().to_vec())),
+            }),
+        };
+        let bytes = serde_json::to_vec(&node).unwrap();
+        let decoded: PlanNode = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, node);
     }
 }

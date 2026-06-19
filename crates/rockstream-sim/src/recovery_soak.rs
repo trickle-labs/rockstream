@@ -272,12 +272,12 @@ pub fn run_brownout_recovery_scenario(
             rows_per_shard
         };
 
-        for shard in 0..config.num_shards {
-            if shard_last_epoch[shard] != u64::MAX && shard_last_epoch[shard] >= epoch {
+        for entry in shard_last_epoch.iter_mut().take(config.num_shards) {
+            if *entry != u64::MAX && *entry >= epoch {
                 duplicate_events += 1;
             }
             rows_written += rows_this_epoch;
-            shard_last_epoch[shard] = epoch;
+            *entry = epoch;
             epochs_committed += 1;
         }
     }

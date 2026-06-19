@@ -21,6 +21,7 @@ pub mod error;
 pub mod expr;
 pub mod filter;
 pub mod group_commit;
+pub mod index_arrange;
 pub mod join;
 pub mod map;
 pub mod minmax;

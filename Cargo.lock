@@ -4616,6 +4616,7 @@ version = "0.52.10"
 dependencies = [
  "rockstream-types",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

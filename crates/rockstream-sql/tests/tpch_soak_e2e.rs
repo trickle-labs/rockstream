@@ -350,6 +350,7 @@ fn get_column_count(plan: &PlanNode) -> usize {
         }),
         PlanNode::ViewRef { .. } => panic!("ViewRef not supported"),
         PlanNode::Lateral { .. } => panic!("Lateral not supported"),
+        PlanNode::IndexArrange { input, .. } => get_column_count(input),
     }
 }
 

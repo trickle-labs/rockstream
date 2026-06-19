@@ -197,9 +197,7 @@ impl AutoTuner {
             let reduced = current_max_poll_bytes / 2;
             reduced.max(MIN_THROTTLE_BYTES)
         } else {
-            current_max_poll_bytes
-                .min(MAX_THROTTLE_BYTES)
-                .max(MIN_THROTTLE_BYTES)
+            current_max_poll_bytes.clamp(MIN_THROTTLE_BYTES, MAX_THROTTLE_BYTES)
         };
 
         debug_assert!(new_throttle > 0, "throttle must never be 0");

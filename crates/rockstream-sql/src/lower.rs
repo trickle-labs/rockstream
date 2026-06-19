@@ -1113,6 +1113,22 @@ fn resolve_views_and_snapshots(
                 snapshot_sources,
             )),
         },
+        // v0.32: IndexArrange — pass through, resolving input sources.
+        PlanNode::IndexArrange {
+            input,
+            index_cols,
+            pk_cols,
+            filter_pred,
+        } => PlanNode::IndexArrange {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            index_cols,
+            pk_cols,
+            filter_pred,
+        },
     }
 }
 

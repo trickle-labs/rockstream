@@ -80,6 +80,7 @@ fn collect_dependencies(plan: &PlanNode, registered: &HashSet<String>, out: &mut
         PlanNode::Lateral { input, .. } => collect_dependencies(input, registered, out),
         PlanNode::ViewSink { child, .. } => collect_dependencies(child, registered, out),
         PlanNode::Exchange { child, .. } => collect_dependencies(child, registered, out),
+        PlanNode::IndexArrange { input, .. } => collect_dependencies(input, registered, out),
     }
 }
 
@@ -111,6 +112,34 @@ pub struct ViewEntry {
     pub schema_version: u32,
     /// Output columns in order.
     pub columns: Vec<ColumnDef>,
+}
+
+// ─── Index entry ─────────────────────────────────────────────────────────────
+
+/// The build state of a secondary index (v0.32).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexState {
+    /// Index is being backfilled from existing data.
+    Building,
+    /// Index is fully built and ready for queries.
+    Ready,
+}
+
+/// A complete secondary index definition stored in the catalog (v0.32).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexEntry {
+    /// Index name (unique within the namespace).
+    pub name: String,
+    /// The base table this index covers.
+    pub table: String,
+    /// Column names forming the index key.
+    pub index_cols: Vec<String>,
+    /// Column names forming the primary key of the base table.
+    pub pk_cols: Vec<String>,
+    /// SQL text of optional filter predicate (partial index).
+    pub where_pred: Option<String>,
+    /// Current build state.
+    pub state: IndexState,
 }
 
 // ─── Schema-change classification ────────────────────────────────────────────
@@ -152,6 +181,22 @@ fn view_object_id(name: &str) -> u128 {
 
 fn view_key(name: &str) -> Vec<u8> {
     CatalogKeyEncoder::encode(CatalogType::View, DEFAULT_NAMESPACE, view_object_id(name))
+}
+
+/// Compute the object_id (stable FNV-1a hash of index name) for catalog key construction (v0.32).
+fn index_object_id(name: &str) -> u128 {
+    // FNV-1a 128-bit hash (separate from view_object_id even though algorithm is identical,
+    // ensuring Index and View namespaces are independent).
+    let mut hash: u128 = 0x6c62272e07bb0142_62b821756295c58d_u128;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u128;
+        hash = hash.wrapping_mul(0x0000_0000_0001_0000_0000_0000_0000_013B_u128);
+    }
+    hash
+}
+
+fn index_key(name: &str) -> Vec<u8> {
+    CatalogKeyEncoder::encode(CatalogType::Index, DEFAULT_NAMESPACE, index_object_id(name))
 }
 
 // ─── SchemaCatalog ───────────────────────────────────────────────────────────
@@ -318,15 +363,83 @@ impl SchemaCatalog {
     /// Return all view names stored in the catalog (for listing).
     ///
     /// Scans the full `CatalogType::View` prefix in the default namespace.
+    /// Names starting with `__idx_` (internal index views) are excluded.
     pub async fn list_view_names(&self) -> Result<Vec<String>, SqlError> {
         let prefix = CatalogKeyEncoder::namespace_prefix(CatalogType::View, DEFAULT_NAMESPACE);
         let entries = self.db.scan_prefix(&prefix).await?;
         let mut names = Vec::new();
         for (_key, value) in entries {
             let entry: ViewEntry = serde_json::from_slice(&value)?;
+            if !entry.name.starts_with("__idx_") {
+                names.push(entry.name);
+            }
+        }
+        Ok(names)
+    }
+
+    // ── v0.32 Index catalog methods ──────────────────────────────────────────
+
+    /// Register a secondary index entry in the catalog (v0.32).
+    ///
+    /// Returns `RS-2016` if an index with the same name already exists for a
+    /// **different** table. If it exists for the same table, the entry is
+    /// updated (idempotent re-register).
+    pub async fn register_index(&self, entry: &IndexEntry) -> Result<(), SqlError> {
+        let key = index_key(&entry.name);
+        if let Some(existing_bytes) = self.db.get(&key).await? {
+            let existing: IndexEntry = serde_json::from_slice(&existing_bytes)?;
+            if existing.table != entry.table {
+                return Err(SqlError::IndexNameConflict {
+                    index_name: entry.name.clone(),
+                    existing_table: existing.table.clone(),
+                    requested_table: entry.table.clone(),
+                });
+            }
+        }
+        let value = serde_json::to_vec(entry)?;
+        let mut batch = WriteBatch::new();
+        batch.put(&key, &value);
+        self.db.write_batch(batch).await?;
+        Ok(())
+    }
+
+    /// Load an index entry by name. Returns `None` if not found.
+    pub async fn load_index(&self, name: &str) -> Result<Option<IndexEntry>, SqlError> {
+        let key = index_key(name);
+        match self.db.get(&key).await? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Return all index names stored in the catalog.
+    pub async fn list_index_names(&self) -> Result<Vec<String>, SqlError> {
+        let prefix = CatalogKeyEncoder::namespace_prefix(CatalogType::Index, DEFAULT_NAMESPACE);
+        let entries = self.db.scan_prefix(&prefix).await?;
+        let mut names = Vec::new();
+        for (_key, value) in entries {
+            let entry: IndexEntry = serde_json::from_slice(&value)?;
             names.push(entry.name);
         }
         Ok(names)
+    }
+
+    /// Remove an index entry by name (for DROP INDEX).
+    pub async fn remove_index(&self, name: &str) -> Result<(), SqlError> {
+        let key = index_key(name);
+        let mut batch = WriteBatch::new();
+        batch.delete(&key);
+        self.db.write_batch(batch).await?;
+        Ok(())
+    }
+
+    /// Remove a view entry by name (for DROP INDEX internal view cleanup).
+    pub async fn remove_view(&self, name: &str) -> Result<(), SqlError> {
+        let key = view_key(name);
+        let mut batch = WriteBatch::new();
+        batch.delete(&key);
+        self.db.write_batch(batch).await?;
+        Ok(())
     }
 }
 
@@ -397,6 +510,50 @@ mod tests {
     fn view_object_id_is_stable() {
         assert_eq!(view_object_id("orders"), view_object_id("orders"));
         assert_ne!(view_object_id("orders"), view_object_id("items"));
+    }
+
+    #[test]
+    fn index_entry_roundtrips_serde() {
+        let entry = IndexEntry {
+            name: "idx_customer".to_string(),
+            table: "orders".to_string(),
+            index_cols: vec!["customer_id".to_string()],
+            pk_cols: vec!["order_id".to_string()],
+            where_pred: None,
+            state: IndexState::Ready,
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let decoded: IndexEntry = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn index_state_building_roundtrips_serde() {
+        let entry = IndexEntry {
+            name: "idx_partial".to_string(),
+            table: "events".to_string(),
+            index_cols: vec!["event_type".to_string()],
+            pk_cols: vec!["event_id".to_string()],
+            where_pred: Some("event_type = 'click'".to_string()),
+            state: IndexState::Building,
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let decoded: IndexEntry = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.state, IndexState::Building);
+    }
+
+    #[test]
+    fn index_object_id_is_stable() {
+        assert_eq!(index_object_id("idx_foo"), index_object_id("idx_foo"));
+        assert_ne!(index_object_id("idx_foo"), index_object_id("idx_bar"));
+        // The two functions are separate (independent function bodies), even though
+        // the algorithm is the same — keys are differentiated by CatalogType byte.
+        assert_ne!(
+            index_key("orders"),
+            view_key("orders"),
+            "index_key and view_key must differ (different CatalogType byte)"
+        );
     }
 
     #[test]

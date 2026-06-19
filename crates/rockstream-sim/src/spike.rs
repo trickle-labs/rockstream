@@ -3,7 +3,7 @@
 use rockstream_types::config::AutotunerConfig;
 
 use crate::auto_tuner::{
-    AutoTuner, EPOCH_CEILING_MS, PARALLELISM_P95_SCALE_UP_MS, WRITE_RATE_QUOTA,
+    AutoTuner, PARALLELISM_P95_SCALE_UP_MS, WRITE_RATE_QUOTA,
 };
 
 const EPOCH_CAP: usize = 10_000;
@@ -194,6 +194,7 @@ fn reversals_in_window(w: &[f64]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auto_tuner::EPOCH_CEILING_MS;
 
     #[test]
     fn proof_auto_tuner_combined_settles_within_3_epochs() {
