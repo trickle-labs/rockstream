@@ -135,6 +135,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "antichain"
+version = "0.3.1"
+source = "git+https://github.com/trickle-labs/antichain?tag=v0.3.1#641187be7c1ef3075532b5ea132953ee000e8745"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4730,6 +4738,7 @@ dependencies = [
 name = "rockstream-types"
 version = "0.52.10"
 dependencies = [
+ "antichain",
  "arrow",
  "serde",
  "serde_json",

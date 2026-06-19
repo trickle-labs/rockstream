@@ -20,7 +20,7 @@ use rockstream_runtime::exchange::persistence::{
     gc_exchange_storage, persist_inbox, persist_outbox,
 };
 use rockstream_storage::shard_db::ShardDb;
-use rockstream_types::frontier::{FreshnessToken, Lattice, SourceProgress};
+use rockstream_types::frontier::{FreshnessToken, ProgressMerge, SourceProgress};
 use rockstream_types::ids::{OperatorId, SourceId};
 
 const MINIO_USER: &str = "minioadmin";
