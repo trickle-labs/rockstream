@@ -4493,13 +4493,17 @@ name = "rockstream-cli"
 version = "0.52.10"
 dependencies = [
  "clap",
+ "object_store 0.12.5",
  "rockstream-control",
+ "rockstream-gateway",
  "rockstream-runtime",
+ "rockstream-storage",
  "rockstream-types",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "tracing-subscriber",
 ]

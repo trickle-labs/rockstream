@@ -1,11 +1,12 @@
 //! The `rockstream` CLI library.
 //!
-//! One binary serves every node role; each role is a flag on the same
-//! `rockstream` binary. At v0.1 the binary runs an **embedded no-op node**:
-//! `rockstream start --storage <dir>` brings up the node, runs a no-op
-//! pipeline to completion, writes an audit log and a support bundle, and exits
-//! cleanly. Real operators, durability, and the distributed roles are added in
-//! later versions.
+//! One binary serves every node role via the `--role` flag:
+//!
+//! - **`gateway`** / **`all`** — starts the PostgreSQL wire gateway on
+//!   `--listen` and blocks until SIGTERM / Ctrl-C.  Use `psql -h <host>
+//!   -p 5432 -U rockstream` to connect.
+//! - **`control`**, **`worker`**, **`frontier`** — run the respective
+//!   distributed role (requires `--control=<url>` for worker/frontier).
 //!
 //! All user/operator-visible failures carry an `RS-XXXX` error code with
 //! actionable `next_steps` text (see [`CliError`]).
@@ -75,6 +76,11 @@ pub struct StartOptions {
     pub auth_mode: String,
     /// Optional metrics server listen address.
     pub metrics_addr: Option<String>,
+    /// PostgreSQL wire gateway listen address.
+    ///
+    /// For the `gateway` role this defaults to `127.0.0.1:5432`.  When
+    /// `None` the gateway is not started (no-op / test mode).
+    pub listen_addr: Option<String>,
 }
 
 /// The result of a successful `rockstream start` no-op run.
@@ -135,19 +141,120 @@ fn validate_role(role: &str) -> Result<(), CliError> {
     }
 }
 
-/// Run `rockstream start` as an embedded no-op node.
+/// Start the PostgreSQL wire gateway and return the bound local address and a
+/// task handle that keeps the server alive.
 ///
-/// Creates the storage directory, writes an audit log recording the node and
-/// no-op pipeline lifecycle, writes a support bundle, and returns the paths of
-/// the artifacts written.
+/// The caller must be inside a tokio runtime (`#[tokio::test]` or
+/// `rt.block_on`). The gateway serves until the handle is dropped or aborted.
+///
+/// The gateway storage is initialised under `<opts.storage>/gateway-shard/`
+/// using a `LocalFileSystem`-backed `ShardDb`. An initial `flush()` creates
+/// the manifest so reads succeed immediately even on a fresh node.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] (RS-0003) if the storage cannot be initialised or
+/// the listen port is already in use, or RS-0002 for an unparseable address.
+pub async fn start_gateway(
+    opts: &StartOptions,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
+    let gateway_shard_dir = opts.storage.join("gateway-shard");
+    std::fs::create_dir_all(&gateway_shard_dir).map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("cannot create gateway-shard dir: {e}"),
+            "Check storage directory permissions.",
+        )
+    })?;
+
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(&gateway_shard_dir).map_err(
+            |e| {
+                CliError::new(
+                    RS_0003,
+                    format!("gateway storage init failed: {e}"),
+                    "Check that the storage path exists and is writable.",
+                )
+            },
+        )?,
+    );
+
+    let shard_db = rockstream_storage::ShardDb::builder("gateway", store.clone())
+        .build()
+        .await
+        .map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("gateway ShardDb failed to open: {e}"),
+                "Check that the storage directory is accessible.",
+            )
+        })?;
+    let shard_db = Arc::new(shard_db);
+
+    // Flush to create the initial manifest so ShardReader can open on a fresh node.
+    shard_db.flush().await.map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("gateway shard initial flush failed: {e}"),
+            "",
+        )
+    })?;
+
+    let reader = rockstream_storage::ShardReader::open("gateway", store)
+        .await
+        .map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("gateway ShardReader failed to open: {e}"),
+                "",
+            )
+        })?;
+
+    let view_reader: Arc<dyn rockstream_gateway::ViewReader> =
+        Arc::new(rockstream_gateway::HotOnlyViewReader {
+            shard_reader: Arc::new(reader),
+            frontier_epoch: None,
+        });
+
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+
+    let listen = opts.listen_addr.as_deref().unwrap_or("127.0.0.1:5432");
+    let addr: std::net::SocketAddr = listen.parse().map_err(|e| {
+        CliError::new(
+            RS_0002,
+            format!("invalid listen address `{listen}`: {e}"),
+            "Pass a valid socket address such as 127.0.0.1:5432.",
+        )
+    })?;
+
+    let server =
+        rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db);
+
+    server.serve_background().await.map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("failed to bind gateway on {listen}: {e}"),
+            "Check that the port is not already in use.",
+        )
+    })
+}
+
+/// Run `rockstream start`.
+///
+/// For the `gateway` and `all` roles with a configured listen address this
+/// starts the live PostgreSQL wire server and blocks until SIGTERM / Ctrl-C.
+/// For all other roles (and for gateway/all without a listen address) it runs
+/// the embedded no-op node, writes an audit log and support bundle, and exits.
 pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let started_ms = now_ms();
     validate_role(&opts.role)?;
 
-    if (opts.role == "worker" || opts.role == "gateway") && opts.control.is_none() {
+    // Worker requires a control URL to register with the control plane.
+    // Gateway can run in standalone mode without a control URL.
+    if opts.role == "worker" && opts.control.is_none() {
         return Err(CliError::new(
             rockstream_types::error_code::RS_0002,
-            format!("role `{}` requires --control=<url>", opts.role),
+            "role `worker` requires --control=<url>",
             "Provide the control plane URL via the --control argument.",
         ));
     }
@@ -196,13 +303,30 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         "noop-pipeline",
     ));
 
+    // Determine whether to serve a live gateway for this run.
+    // A listen address must be explicitly provided; absence means no-op/test mode.
+    let serve_gateway = opts.listen_addr.is_some()
+        && (opts.role == "gateway" || opts.role == "all");
+
+    // Pre-validate the listen address before starting the runtime.
+    if serve_gateway {
+        let listen = opts.listen_addr.as_deref().unwrap_or("127.0.0.1:5432");
+        listen.parse::<std::net::SocketAddr>().map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("invalid --listen address `{listen}`: {e}"),
+                "Pass a valid socket address such as 127.0.0.1:5432.",
+            )
+        })?;
+    }
+
     // Start services in a tokio runtime
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
 
-    rt.block_on(async {
+    let serve_result: Result<(), CliError> = rt.block_on(async {
         let mut metrics_handle = None;
         if let Some(metrics_addr) = &opts.metrics_addr {
             let mh = metrics_server::start_metrics_server(metrics_addr)
@@ -273,12 +397,54 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             );
         }
 
-        // Allow live interactions to complete
-        let sleep_ms = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(50);
-        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        if serve_gateway {
+            // ── Live gateway serve mode ────────────────────────────────────
+            // Build the gateway and wait for an OS shutdown signal.
+            match start_gateway(opts).await {
+                Ok((local_addr, gw_handle)) => {
+                    let _ = audit_log.append(
+                        &AuditEvent::now(SYSTEM_ACTOR, "gateway.started", &local_addr.to_string())
+                            .with_detail(format!("role={}", opts.role)),
+                    );
+                    tracing::info!(
+                        addr = %local_addr,
+                        "PostgreSQL wire gateway ready — connect with: psql -h {} -p {} -U rockstream",
+                        local_addr.ip(),
+                        local_addr.port(),
+                    );
+
+                    // Block until Ctrl-C or SIGTERM.
+                    let _ = tokio::signal::ctrl_c().await;
+                    tracing::info!("shutdown signal received — stopping gateway");
+                    gw_handle.abort();
+
+                    let _ = audit_log.append(
+                        &AuditEvent::now(SYSTEM_ACTOR, "gateway.stopped", &local_addr.to_string()),
+                    );
+                }
+                Err(e) => {
+                    // Clean up already-started services before surfacing the error.
+                    if let Some(wh) = worker_handle.take() {
+                        wh.abort();
+                    }
+                    if let Some(ch) = control_handle.take() {
+                        ch.shutdown();
+                    }
+                    if let Some(mh) = metrics_handle.take() {
+                        mh.shutdown();
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            // ── No-op / test mode ─────────────────────────────────────────
+            // Allow live interactions to complete, then exit cleanly.
+            let sleep_ms = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(50);
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        }
 
         if let Some(wh) = worker_handle {
             wh.abort();
@@ -289,7 +455,11 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         if let Some(mh) = metrics_handle {
             mh.shutdown();
         }
+
+        Ok(())
     });
+
+    serve_result?;
 
     let _ = audit_log.append(&AuditEvent::now(
         SYSTEM_ACTOR,
@@ -389,6 +559,7 @@ mod tests {
             control: None,
             auth_mode: "off".to_string(),
             metrics_addr: None,
+            listen_addr: None,
         };
         let outcome = run_start(&opts).unwrap();
 
@@ -427,13 +598,14 @@ mod tests {
             control: None,
             auth_mode: "off".to_string(),
             metrics_addr: None,
+            listen_addr: None,
         };
         run_start(&opts).unwrap();
         assert!(nested.join("audit.jsonl").exists());
     }
 
     #[test]
-    fn worker_or_gateway_role_without_control_fails_with_rs_0002() {
+    fn worker_role_without_control_fails_with_rs_0002() {
         let dir = tempfile::tempdir().unwrap();
         let opts = StartOptions {
             storage: dir.path().to_path_buf(),
@@ -441,9 +613,28 @@ mod tests {
             control: None,
             auth_mode: "off".to_string(),
             metrics_addr: None,
+            listen_addr: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
+    }
+
+    /// gateway role without --control succeeds in standalone mode.
+    #[test]
+    fn gateway_role_without_control_runs_standalone() {
+        let dir = tempfile::tempdir().unwrap();
+        // listen_addr: None → no-op mode (no blocking gateway serve)
+        let opts = StartOptions {
+            storage: dir.path().to_path_buf(),
+            role: "gateway".to_string(),
+            control: None,
+            auth_mode: "off".to_string(),
+            metrics_addr: None,
+            listen_addr: None,
+        };
+        // Should succeed: gateway + no listen_addr → no-op path
+        let outcome = run_start(&opts).unwrap();
+        assert!(outcome.events_written >= 3);
     }
 
     /// Slice 6: `--role=frontier` without `--control` must fail with RS-0002.
@@ -456,6 +647,7 @@ mod tests {
             control: None,
             auth_mode: "off".to_string(),
             metrics_addr: None,
+            listen_addr: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");

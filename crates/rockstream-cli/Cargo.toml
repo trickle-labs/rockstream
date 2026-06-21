@@ -18,6 +18,9 @@ path = "src/lib.rs"
 rockstream-types = { workspace = true }
 rockstream-control = { workspace = true }
 rockstream-runtime = { workspace = true }
+rockstream-gateway = { workspace = true }
+rockstream-storage = { workspace = true }
+object_store = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -27,3 +30,5 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }

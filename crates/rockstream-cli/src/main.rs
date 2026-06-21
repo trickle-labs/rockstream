@@ -19,9 +19,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start a RockStream node. At v0.1 this runs an embedded no-op node:
-    /// it brings the node up, runs a no-op pipeline to completion, writes an
-    /// audit log and a support bundle under the storage directory, and exits.
+    /// Start a RockStream node.
+    ///
+    /// For the `gateway` or `all` role the node starts a long-running PostgreSQL
+    /// wire server on `--listen` and blocks until SIGTERM / Ctrl-C. Other roles
+    /// run the embedded no-op node (audit log + support bundle), then exit.
     Start {
         /// Local storage directory for node state and artifacts.
         #[arg(long)]
@@ -31,7 +33,7 @@ enum Command {
         #[arg(long, default_value = "all")]
         role: String,
 
-        /// Control service URL (required for worker and gateway roles).
+        /// Control service URL (required for the worker and frontier roles).
         #[arg(long)]
         control: Option<String>,
 
@@ -42,6 +44,11 @@ enum Command {
         /// Metrics HTTP server listen address.
         #[arg(long)]
         metrics_addr: Option<String>,
+
+        /// PostgreSQL wire gateway listen address.
+        /// Activates the live gateway server for the `gateway` and `all` roles.
+        #[arg(long, default_value = "127.0.0.1:5432")]
+        listen: String,
     },
 }
 
@@ -62,6 +69,7 @@ fn main() -> ExitCode {
             control,
             auth,
             metrics_addr,
+            listen,
         } => {
             let opts = StartOptions {
                 storage,
@@ -69,6 +77,7 @@ fn main() -> ExitCode {
                 control,
                 auth_mode: auth,
                 metrics_addr,
+                listen_addr: Some(listen),
             };
             match run_start(&opts) {
                 Ok(outcome) => {
@@ -76,7 +85,7 @@ fn main() -> ExitCode {
                         audit = %outcome.audit_path.display(),
                         bundle = %outcome.bundle_path.display(),
                         events = outcome.events_written,
-                        "rockstream: embedded no-op node ran to completion"
+                        "rockstream: node stopped cleanly"
                     );
                     ExitCode::SUCCESS
                 }
