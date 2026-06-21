@@ -148,7 +148,8 @@ These names orient readers; they are not calendar commitments.
 | Postgres Pillar ✅ Done | v0.26 | Read, write, subscribe, and read-your-writes over the Postgres wire protocol. |
 | Soaks Complete ✅ Done | v0.31 | Ingestion connectors live; failure-detection, shard-reassignment, and freshness-recovery SLOs validated under real cloud pressure. |
 | Private Beta Ready ✅ Done | v0.32 | Secondary indexes enable single-digit-ms point lookups on non-primary keys; open for early-adopter onboarding. |
-| v1.0 Release | v0.43 | All v0.1–v0.42 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged. |
+| Nexmark Certified | v0.36 | All 23 Nexmark queries (q0–q22) correct and meeting throughput/latency SLOs, verified end-to-end over the Postgres wire protocol with SlateDB LFS and MinIO. |
+| v1.0 Release | v0.47 | All v0.1–v0.46 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged. |
 
 ---
 
@@ -242,41 +243,50 @@ integration with another process).
 |---|---|---|---|---|
 | v0.32 | Secondary Indexes ✅ Done | System-managed materialized IVM views acting transparently as secondary indexes for point queries on non-primary keys; eliminates full shard scans for highly concurrent application reads. **Private Beta Ready** milestone. | Point lookups on indexed non-primary columns execute in single-digit milliseconds. | Unit, LFS, MinIO, TC |
 
-### Phase 10 — The Data Lake Bridge & FinOps
+### Phase 10 — Nexmark Test & Benchmark Suite
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.33 | Cold-Tier Sinks & Simulator Fixes | Iceberg and Delta sinks exporting periodic columnar Parquet snapshots to object storage; update `SimRuntime` to mock partial object writes; bridges RockStream to the Data Lakehouse for external engines (DuckDB, Trino, Databricks). | External engines can query RockStream-generated Iceberg tables with zero data corruption. | Unit, LFS, MinIO, TC |
-| v0.34 | Deep FinOps Optimizations | Route latency-sensitive metadata (`shard_meta/`) to AWS S3 Express One Zone; tier older compacted SSTs to S3 Standard-IA; validate running the stateless worker pool entirely on Spot/preemptible instances. | TCO benchmarks show >50% reduction in steady-state operational costs compared to v0.31. | Unit, LFS, MinIO, TC |
+| v0.33 | Nexmark Schemas & Deterministic Event Generator | Define `person`, `auction`, `bid` SQL DDL; implement `NexmarkGenerator` in `rockstream-sim` (seeded, configurable event rates, correct NEXMark distribution: ~46 bids : 3 auctions : 1 person per event); wire the generator through the Postgres wire protocol — events are fed as batched `INSERT` statements via pgwire and base tables are created with standard `CREATE TABLE` DDL. Test scaffold in `rockstream-sql/tests/nexmark/` covers schema creation, ingestion, and basic round-trip reads, all operating end-to-end over the full pgwire + SlateDB stack (LFS and MinIO). | Same seed produces an identical event stream across two runs; generator distribution is within 1% of target ratios; all three tables accept `INSERT` via pgwire and return correct row counts via `SELECT`; schema round-trips through the catalog; verified on LFS and MinIO via TestContainers. | Unit, LFS, MinIO, TC |
+| v0.34 | Nexmark q0–q9: Projections, Filters, Joins & Basic Aggregates | End-to-end implementation of the first ten Nexmark queries as `CREATE VIEW` statements maintained by the IVM engine, all exercising the full stack exclusively via the Postgres wire protocol: q0 (pass-through `SELECT *`), q1 (currency conversion — multiply price), q2 (selection filter — `MOD(auction, 123) = 0`), q3 (local item suggestion — inner join Auction × Person filtered by state and category), q4 (average price per category — windowed join + `AVG`), q5 (hot items — sliding-window bid `COUNT` + top-N), q6 (average selling price by seller — last-10-auctions window), q7 (highest bid — tumbling-window `MAX`), q8 (new-user monitoring — join Person × Auction within event-time window), q9 (winning bids — join Bid at closing price). Views created via `CREATE VIEW`; events fed via `INSERT`; results consumed via `SELECT` and `SUBSCRIBE` — no in-process shortcuts. | Each of q0–q9 produces results **bit-identical** to the DataFusion batch oracle over static Nexmark snapshots; incremental results match batch results after every event batch under randomised generator seeds; `SUBSCRIBE` delivers correct deltas as events arrive; all queries verified end-to-end over pgwire on LFS and MinIO. | Unit, LFS, MinIO, TC |
+| v0.35 | Nexmark q10–q22: Sessions, Dedup, TOP-N & Complex Analytics | End-to-end implementation of the remaining thirteen Nexmark queries, all via the full pgwire + SlateDB stack: q10 (log to object-store — tumbling-window Parquet partition sink), q11 (user session windows — `SESSION` gap-based windowing on bids), q12 (processing-time tumbling windows — wall-clock tumble), q13 (bounded side-input join — stream enriched from a static lookup table), q14 (`CASE WHEN` + `CAST` complex projection), q15 (bidding statistics — multiple `COUNT(DISTINCT …)` with price-tier filters), q16 (channel statistics — multi-key `COUNT(DISTINCT …)`), q17 (auction statistics — unbounded `GROUP BY` date), q18 (find last bid — deduplication via `LAST_VALUE` / retract-and-replace), q19 (auction TOP-10 prices — `TOP-N` descending), q20 (expand bid with auction — filter + equi-join), q21 (add channel ID — `CASE WHEN` + `REGEXP_EXTRACT`), q22 (URL directories — `SPLIT_INDEX`). `CREATE VIEW` → IVM → `SELECT` / `SUBSCRIBE` over pgwire; data written via `INSERT`; verified on LFS and MinIO. | q10–q22 results are **bit-identical** to the DataFusion batch oracle on static Nexmark snapshots; q18 deduplication and q19 TOP-N maintain correctness under retraction storms; session windows (q11) open and close correctly on configurable inactivity gaps; q10 object-store sink produces zero-corruption Parquet files readable by DuckDB; all 13 queries pass on LFS and MinIO via pgwire. | Unit, LFS, MinIO, TC |
+| v0.36 | Nexmark Benchmark Harness & Performance Gate | Benchmark harness in `rockstream-ops/benches/nexmark.rs` (criterion) driving all 23 queries (q0–q22) end-to-end over a live Rockstream cluster via the Postgres wire protocol; events injected via `COPY` or batched `INSERT`s; latency measured from `INSERT` commit to `SUBSCRIBE` delivery (p50/p99/p999). Throughput targets: q0–q2 ≥1 M events/sec at 4 shards; q3–q9 ≥500 k events/sec; q10–q22 ≥100 k events/sec; p99 latency ≤100 ms for stateless queries (q0–q2) at 1 M events/sec. CI performance gate: >15% throughput regression on any query fails the build. Grafana dashboard updated with Nexmark throughput, latency, and per-query panels. **Nexmark Certified** milestone. | All 23 queries process 10 M events without correctness regression; throughput scales linearly from 1→4→8 shards; p99 latency ≤100 ms for q0–q2 under 1 M events/sec load; CI performance gate green; benchmarks run end-to-end over pgwire against LFS and MinIO via TestContainers. | Unit, LFS, MinIO, TC |
 
-### Phase 11 — Network Efficiency & Advanced DML
-
-| Version | Focus | Scope | Proof | Backends |
-|---|---|---|---|---|
-| v0.35 | Advanced DML & Scatter Pruning | `UPDATE … RETURNING` and `DELETE … RETURNING` (read-modify-write semantics); piggyback min/max bounds and Bloom filters onto the frontier summary to prune unneeded shards during multi-shard point lookups. | Multi-shard point reads safely bypass >90% of shards based on frontier summary Bloom filters. | Unit, LFS, MinIO, TC |
-| v0.36 | Zero-Copy IPC & AZ-Aware Shuffle | Upgrade same-host gRPC loopbacks to Apache Arrow Flight Shared Memory; make the hierarchical exchange subsystem aware of physical availability zones (AZs) to eliminate cross-AZ egress during shuffle. | Zero byte-copying observed in CPU profiles for same-host worker exchanges; cross-AZ traffic drops to near zero during shuffle phases. | Unit, LFS, MinIO, TC |
-
-### Phase 12 — Complex Analytics & Compute Tuning
+### Phase 11 — The Data Lake Bridge & FinOps
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.37 | Advanced Streaming Analytics | SQL compiler support for recursive CTEs (`WITH RECURSIVE`) for graph algorithms and fixed-point IVM, lateral joins for nested JSON/arrays, and hopping/session windows. | Transitive closures and sessionization queries incrementally maintain state correctly against the correctness oracle. | Unit, LFS, MinIO, TC |
-| v0.38 | Hot-Path Compute Optimizations | WAL elision for derived intermediate operator shards; link `max_rows_per_quantum` directly to network buffer depth to provide tight backpressure coupling. | Throughput on complex DAGs increases by >30% due to reduced intermediate WAL write amplification. | Unit, LFS, MinIO, TC |
+| v0.37 | Cold-Tier Sinks & Simulator Fixes | Iceberg and Delta sinks exporting periodic columnar Parquet snapshots to object storage; update `SimRuntime` to mock partial object writes; bridges RockStream to the Data Lakehouse for external engines (DuckDB, Trino, Databricks). | External engines can query RockStream-generated Iceberg tables with zero data corruption. | Unit, LFS, MinIO, TC |
+| v0.38 | Deep FinOps Optimizations | Route latency-sensitive metadata (`shard_meta/`) to AWS S3 Express One Zone; tier older compacted SSTs to S3 Standard-IA; validate running the stateless worker pool entirely on Spot/preemptible instances. | TCO benchmarks show >50% reduction in steady-state operational costs compared to v0.31. | Unit, LFS, MinIO, TC |
 
-### Phase 13 — Declarative Data Governance
-
-| Version | Focus | Scope | Proof | Backends |
-|---|---|---|---|---|
-| v0.39 | Inline Expectations & Lineage Diagnostics | `CREATE EXPECTATION` syntax; specialized "Expectation Operator" injected into the DAG to evaluate rows and zero out Z-set weights for failed records before they reach `ViewSink`; hooks into `EXPLAIN INCREMENTAL ANALYZE`. | Malformed records injected into upstream sources never reach downstream `ViewSink` outputs. | Unit, LFS, MinIO, TC |
-| v0.40 | DLQ Routing & State Degradation | Transactionally forward failed rows to an internal base-table shard (canonical Dead Letter Queue); implement state degradation policies (`warn`, `degrade`, `block`); guarantee exactly-once processing for failed rows. | Failed records are durably queryable in `rockstream_catalog.dead_letter_queue` alongside exactly-once commit boundaries. | Unit, LFS, MinIO, TC |
-
-### Phase 14 — Enterprise Validation & 1.0 Finalization
+### Phase 12 — Network Efficiency & Advanced DML
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.41 | Isolation & Validation Hooks | Validate non-CRDT exact-key writes against per-row versions to prevent blind overwrites; support single-shard `SERIALIZABLE LOCAL` isolation via SlateDB transactions for standard ACID transactional workflows. | Concurrent conflicting writes to the same key on a single shard correctly trigger serialization anomalies/aborts. | Unit, LFS, MinIO, TC |
-| v0.42 | Simulator Maturity & Auto-Tuning Lock | Finalize shift from bounded defaults to fully SLO-driven adaptive control loops; update `SimRuntime` to model Kafka broker-side transaction timeouts (`transaction.timeout.ms`); close final known testing gap for external-system edge cases. | Simulator accurately reproduces and recovers from aborted Kafka transaction edge-cases. | Unit, LFS, MinIO, TC |
-| v0.43 | v1.0 Release Candidate (RC1) | Activate all features from v0.1 through v0.42 simultaneously; run comprehensive chaos, performance, and scaling soak under maximum cluster pressure within a single cloud region. **v1.0 Release** milestone → tag `v1.0.0`. | No P0 or P1 bugs discovered during a 2-week continuous automated chaos cycle. | Unit, LFS, MinIO, TC |
+| v0.39 | Advanced DML & Scatter Pruning | `UPDATE … RETURNING` and `DELETE … RETURNING` (read-modify-write semantics); piggyback min/max bounds and Bloom filters onto the frontier summary to prune unneeded shards during multi-shard point lookups. | Multi-shard point reads safely bypass >90% of shards based on frontier summary Bloom filters. | Unit, LFS, MinIO, TC |
+| v0.40 | Zero-Copy IPC & AZ-Aware Shuffle | Upgrade same-host gRPC loopbacks to Apache Arrow Flight Shared Memory; make the hierarchical exchange subsystem aware of physical availability zones (AZs) to eliminate cross-AZ egress during shuffle. | Zero byte-copying observed in CPU profiles for same-host worker exchanges; cross-AZ traffic drops to near zero during shuffle phases. | Unit, LFS, MinIO, TC |
+
+### Phase 13 — Complex Analytics & Compute Tuning
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.41 | Advanced Streaming Analytics | SQL compiler support for recursive CTEs (`WITH RECURSIVE`) for graph algorithms and fixed-point IVM, lateral joins for nested JSON/arrays, and hopping/session windows. | Transitive closures and sessionization queries incrementally maintain state correctly against the correctness oracle. | Unit, LFS, MinIO, TC |
+| v0.42 | Hot-Path Compute Optimizations | WAL elision for derived intermediate operator shards; link `max_rows_per_quantum` directly to network buffer depth to provide tight backpressure coupling. | Throughput on complex DAGs increases by >30% due to reduced intermediate WAL write amplification. | Unit, LFS, MinIO, TC |
+
+### Phase 14 — Declarative Data Governance
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.43 | Inline Expectations & Lineage Diagnostics | `CREATE EXPECTATION` syntax; specialized "Expectation Operator" injected into the DAG to evaluate rows and zero out Z-set weights for failed records before they reach `ViewSink`; hooks into `EXPLAIN INCREMENTAL ANALYZE`. | Malformed records injected into upstream sources never reach downstream `ViewSink` outputs. | Unit, LFS, MinIO, TC |
+| v0.44 | DLQ Routing & State Degradation | Transactionally forward failed rows to an internal base-table shard (canonical Dead Letter Queue); implement state degradation policies (`warn`, `degrade`, `block`); guarantee exactly-once processing for failed rows. | Failed records are durably queryable in `rockstream_catalog.dead_letter_queue` alongside exactly-once commit boundaries. | Unit, LFS, MinIO, TC |
+
+### Phase 15 — Enterprise Validation & 1.0 Finalization
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.45 | Isolation & Validation Hooks | Validate non-CRDT exact-key writes against per-row versions to prevent blind overwrites; support single-shard `SERIALIZABLE LOCAL` isolation via SlateDB transactions for standard ACID transactional workflows. | Concurrent conflicting writes to the same key on a single shard correctly trigger serialization anomalies/aborts. | Unit, LFS, MinIO, TC |
+| v0.46 | Simulator Maturity & Auto-Tuning Lock | Finalize shift from bounded defaults to fully SLO-driven adaptive control loops; update `SimRuntime` to model Kafka broker-side transaction timeouts (`transaction.timeout.ms`); close final known testing gap for external-system edge cases. | Simulator accurately reproduces and recovers from aborted Kafka transaction edge-cases. | Unit, LFS, MinIO, TC |
+| v0.47 | v1.0 Release Candidate (RC1) | Activate all features from v0.1 through v0.46 simultaneously; run comprehensive chaos, performance, and scaling soak under maximum cluster pressure within a single cloud region. **v1.0 Release** milestone → tag `v1.0.0`. | No P0 or P1 bugs discovered during a 2-week continuous automated chaos cycle. | Unit, LFS, MinIO, TC |
 
 ---
 
@@ -296,7 +306,7 @@ the design is verified before the implementation exists.
 | v0.20 | M4 self-fencing model (D6.1–D6.2) | `formal/m4_self_fencing.fizz` | M4-S1…S4, M4-L1…L2, COV-M4 | M4 model green (justifies writer re-election); paired `assert!`s in `rockstream-runtime` |
 | v0.21 | M3 sink-2PC model (D6.3–D6.4) + M1 duplication variant (D6.5) | `formal/m3_sink_2pc.fizz` (×3 idempotency profiles), `formal/m1_epoch_commit.fizz` (duplication) | M3-S1…S4, M3-L1, COV-M3; M1-S5 under duplication | M3 model green (M3-S3 composed with M1 `cluster_committed`); paired `assert!`s in `rockstream-connectors`, `-runtime` |
 | v0.22 | Continuous verification + findings (D6.6, DC.1–DC.4) | all `.fizz` specs, `formal/findings.md` | all M1–M4 safety + liveness | All four models green at CI-fast and relaxed bounds; path-coupling check live; counterexamples replayed forever as regression seeds |
-| v0.23–v0.43 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M4 | A coordination-protocol change without a model touch fails CI; the v0.43 RC1 gate re-runs the relaxed-bounds sweep |
+| v0.23–v0.47 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M4 | A coordination-protocol change without a model touch fails CI; the v0.47 RC1 gate re-runs the relaxed-bounds sweep |
 
 Every row above maps each FizzBee invariant to a paired runtime `assert!` per
 [FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6; CI cross-checks that every
@@ -321,16 +331,18 @@ build thereafter.
 | Phase 7 — PostgreSQL Wire Gateway | v0.23 – v0.26 | Continuous verification |
 | Phase 8 — Ingestion & The Crucible Soaks | v0.27 – v0.31 | Continuous verification + relaxed-bounds sweep |
 | Phase 9 — Operational HTAP Ergonomics | v0.32 | Continuous verification |
-| Phase 10 — The Data Lake Bridge & FinOps | v0.33 – v0.34 | Continuous verification |
-| Phase 11 — Network Efficiency & Advanced DML | v0.35 – v0.36 | Continuous verification |
-| Phase 12 — Complex Analytics & Compute Tuning | v0.37 – v0.38 | Continuous verification |
-| Phase 13 — Declarative Data Governance | v0.39 – v0.40 | Continuous verification |
-| Phase 14 — Enterprise Validation & 1.0 Finalization | v0.41 – v0.43 | Continuous verification + relaxed-bounds sweep at RC1 |
+| Phase 10 — Nexmark Test & Benchmark Suite | v0.33 – v0.36 | Continuous verification |
+| Phase 11 — The Data Lake Bridge & FinOps | v0.37 – v0.38 | Continuous verification |
+| Phase 12 — Network Efficiency & Advanced DML | v0.39 – v0.40 | Continuous verification |
+| Phase 13 — Complex Analytics & Compute Tuning | v0.41 – v0.42 | Continuous verification |
+| Phase 14 — Declarative Data Governance | v0.43 – v0.44 | Continuous verification |
+| Phase 15 — Enterprise Validation & 1.0 Finalization | v0.45 – v0.47 | Continuous verification + relaxed-bounds sweep at RC1 |
 
-Forty-three versions at ~6 person-weeks each is the full path from an empty
+Forty-seven versions at ~6 person-weeks each is the full path from an empty
 repository to a production-ready, enterprise-grade 1.0. The order is fixed:
 correctness on one shard is proven before distribution, distribution is made
 fault-tolerant before the Postgres layer depends on it, ingestion connectors
-and crucible soaks validate real-world pressure before HTAP ergonomics, and
-the data lake bridge, network optimizations, complex analytics, and data
-governance layers close out 1.0 through v0.43.
+and crucible soaks validate real-world pressure before HTAP ergonomics, the
+Nexmark suite certifies end-to-end correctness and throughput on the full stack,
+and the data lake bridge, network optimizations, complex analytics, and data
+governance layers close out 1.0 through v0.47.
