@@ -413,8 +413,24 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                         local_addr.port(),
                     );
 
-                    // Block until Ctrl-C or SIGTERM.
-                    let _ = tokio::signal::ctrl_c().await;
+                    // Block until Ctrl-C (SIGINT) or SIGTERM.
+                    #[cfg(unix)]
+                    {
+                        use tokio::signal::unix::{signal, SignalKind};
+                        let mut sigterm =
+                            signal(SignalKind::terminate()).unwrap_or_else(|_| {
+                                // Fallback: if SIGTERM handler fails, just wait for Ctrl-C.
+                                panic!("failed to install SIGTERM handler")
+                            });
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {}
+                            _ = sigterm.recv() => {}
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
                     tracing::info!("shutdown signal received — stopping gateway");
                     gw_handle.abort();
 

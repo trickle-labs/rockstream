@@ -499,11 +499,30 @@ impl GatewayHandler {
             )]
         };
 
-        let raw_rows = self
-            .view_reader
-            .read_view(view_name, limit, ViewReadStrategy::HotOnly)
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        // Prefer reading directly from ShardDb when available.  ShardDb reads
+        // from its in-memory memtable (WAL + SSTs), which reflects the latest
+        // committed writes immediately after the post-COMMIT flush.  The
+        // ShardReader (DbReader) polls for a new manifest every 1 s and would
+        // return stale results until the next poll fires.
+        let raw_rows: Vec<Vec<u8>> = if let Some(shard_db) = &self.shard_db {
+            let prefix = format!("view_output/{view_name}/");
+            let kvs = shard_db
+                .scan_prefix(prefix.as_bytes())
+                .await
+                .map_err(|e| {
+                    PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+                })?;
+            let mut rows: Vec<Vec<u8>> = kvs.into_iter().map(|(_, v)| v.to_vec()).collect();
+            if let Some(n) = limit {
+                rows.truncate(n);
+            }
+            rows
+        } else {
+            self.view_reader
+                .read_view(view_name, limit, ViewReadStrategy::HotOnly)
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+        };
 
         let schema = Arc::new(schema_fields);
         let schema_ref = schema.clone();
@@ -558,11 +577,26 @@ impl GatewayHandler {
 
             // Register view in the catalog.
             use crate::catalog_stubs::CatalogView;
+
+            // Pre-populate column names by static analysis of the SELECT list.
+            // This allows `SELECT * FROM view` to return correct column headers
+            // even before the first DML commit triggers a full materialization.
+            // Types default to Utf8 and are refined to the true Arrow types once
+            // the view is first materialized via `update_view_columns`.
+            let initial_columns: Vec<crate::catalog_stubs::CatalogColumn> =
+                infer_select_columns(&select_sql)
+                    .into_iter()
+                    .map(|name| crate::catalog_stubs::CatalogColumn {
+                        name,
+                        data_type: "Utf8".to_string(),
+                    })
+                    .collect();
+
             self.catalog.add_view_with_deps(
                 CatalogView {
                     name: view_name.clone(),
                     sql: select_sql,
-                    columns: vec![],
+                    columns: initial_columns,
                     namespace: "public".to_string(),
                 },
                 deps,
@@ -833,6 +867,13 @@ impl GatewayHandler {
                 &changed_tables,
             )
             .await;
+            // Flush the WAL so that materialised view output is immediately
+            // visible to the ShardReader (DbReader reads from SSTs, not the
+            // in-memory WAL buffer; without a flush the SELECT after COMMIT
+            // would see stale state until the background 100 ms flush fires).
+            if let Err(e) = shard_db.flush().await {
+                tracing::warn!("post-commit shard flush failed (non-fatal): {e}");
+            }
         }
 
         let table_name = ops
@@ -2035,6 +2076,127 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
 }
 
 /// Extract the view name from `CREATE [MATERIALIZED] VIEW <name> AS …`.
+/// Find the byte offset of " as" followed by whitespace or end-of-string
+/// within `s` (which must already be lowercased). Returns the index of the
+/// space that precedes "as".
+///
+/// This handles both `AS ` (space) and `AS\n` / `AS\t` / `AS\r` so that
+/// multi-line SQL like `CREATE VIEW foo AS\n  SELECT …` parses correctly.
+fn find_as_separator(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i + 2 < len {
+        if bytes[i] == b' ' && bytes[i + 1] == b'a' && bytes[i + 2] == b's' {
+            let next_ok = i + 3 >= len || (bytes[i + 3] as char).is_ascii_whitespace();
+            if next_ok {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract output column names from a SELECT SQL string by static analysis.
+///
+/// Handles simple column references (`url`) and aliased expressions
+/// (`COUNT(*) AS hits`, `SUM(amount) AS spend`).  Returns an empty vec for
+/// `SELECT *` or SQL that cannot be statically decomposed.
+fn infer_select_columns(sql: &str) -> Vec<String> {
+    let trimmed = sql.trim();
+    let lower = trimmed.to_lowercase();
+    // Must start with SELECT
+    let after_select = if let Some(s) = lower.strip_prefix("select ").or_else(|| {
+        lower.strip_prefix("select\n").or_else(|| lower.strip_prefix("select\t"))
+    }) {
+        &trimmed[trimmed.len() - s.len()..]
+    } else {
+        return vec![];
+    };
+
+    // Find the FROM keyword at nesting depth 0
+    let from_pos = {
+        let bytes = after_select.as_bytes();
+        let lower_after = after_select.to_lowercase();
+        let mut depth: usize = 0;
+        let mut found = after_select.len();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' if depth > 0 => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && lower_after[i..].starts_with(" from ") {
+                found = i;
+                break;
+            }
+            i += 1;
+        }
+        found
+    };
+
+    let select_list = &after_select[..from_pos];
+
+    // Split the column list by commas at depth 0
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut depth: usize = 0;
+    for ch in select_list.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' if depth > 0 => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                let p = current.trim().to_string();
+                if !p.is_empty() {
+                    parts.push(p);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let last = current.trim().to_string();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+
+    // For each part: extract alias (after AS) or the last identifier token
+    parts
+        .iter()
+        .filter_map(|p| {
+            if p == "*" {
+                return None; // SELECT * — can't statically name it
+            }
+            let pl = p.to_lowercase();
+            if let Some(as_pos) = find_as_separator(&pl) {
+                // Has an AS alias
+                let alias = p[as_pos + 3..].trim().to_lowercase();
+                if alias.is_empty() {
+                    None
+                } else {
+                    Some(alias)
+                }
+            } else {
+                // No alias: take the last whitespace-delimited token
+                let last = p.split_whitespace().last().unwrap_or("").to_lowercase();
+                if last.is_empty() {
+                    None
+                } else {
+                    Some(last)
+                }
+            }
+        })
+        .collect()
+}
+
 fn parse_create_view_name(q: &str) -> Option<String> {
     let ql = q.trim().to_lowercase();
     let after: &str = if ql.starts_with("create or replace materialized view ") {
@@ -2048,8 +2210,8 @@ fn parse_create_view_name(q: &str) -> Option<String> {
     } else {
         return None;
     };
-    // Take up to " AS " (case-insensitive)
-    let as_pos = after.to_lowercase().find(" as ")?;
+    // Take up to " AS" followed by any whitespace (handles AS\n, AS\t, AS )
+    let as_pos = find_as_separator(&after.to_lowercase())?;
     let raw = after[..as_pos].trim().trim_matches('"');
     let name = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"');
     if name.is_empty() {
@@ -2060,10 +2222,29 @@ fn parse_create_view_name(q: &str) -> Option<String> {
 }
 
 /// Extract the SELECT SQL from `CREATE … AS <select>`.
+///
+/// Correctly handles `AS` followed by any whitespace, including newlines
+/// produced by multi-line SQL input (e.g. `CREATE VIEW foo AS\n  SELECT …`).
 fn parse_create_view_query(q: &str) -> Option<String> {
     let ql = q.trim().to_lowercase();
-    let as_pos = ql.find(" as ")?;
-    Some(q[as_pos + 4..].trim().to_string())
+    // Determine the byte offset at which the view name begins.
+    let name_start: usize = if ql.starts_with("create or replace materialized view ") {
+        36
+    } else if ql.starts_with("create materialized view ") {
+        25
+    } else if ql.starts_with("create or replace view ") {
+        23
+    } else if ql.starts_with("create view ") {
+        12
+    } else {
+        return None;
+    };
+    // Find " as" + whitespace in the portion of ql that starts at the view name.
+    // This avoids matching an AS alias inside the SELECT body (e.g. COUNT(*) AS hits).
+    let after_lower = &ql[name_start..];
+    let as_pos_in_after = find_as_separator(after_lower)?;
+    // Skip the leading space (1) + "as" (2) = 3 bytes, then trim surrounding whitespace.
+    Some(q[name_start + as_pos_in_after + 3..].trim().to_string())
 }
 
 /// Extract table/view names referenced in FROM and JOIN clauses.
@@ -2157,11 +2338,22 @@ fn pg_type_to_arrow(pg_type: &str) -> &'static str {
 /// input slice. This ensures retries of the same INSERT produce the same key
 /// (idempotent within the write buffer).
 fn build_row_key(cols: &[String], vals: &[String]) -> String {
-    cols.iter()
-        .zip(vals.iter())
-        .map(|(c, v)| format!("{c}={v}"))
-        .collect::<Vec<_>>()
-        .join("|")
+    if cols.is_empty() {
+        // No explicit column list: use positional indices so each row gets a
+        // unique key even when column names are unknown (e.g. INSERT INTO t
+        // VALUES (...) without a column list).
+        vals.iter()
+            .enumerate()
+            .map(|(i, v)| format!("col{i}={v}"))
+            .collect::<Vec<_>>()
+            .join("|")
+    } else {
+        cols.iter()
+            .zip(vals.iter())
+            .map(|(c, v)| format!("{c}={v}"))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
 }
 
 /// Parse `INSERT INTO <table> [(cols)] VALUES (v1, v2, ...)`.
