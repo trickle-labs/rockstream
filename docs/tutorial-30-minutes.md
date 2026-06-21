@@ -1,31 +1,37 @@
-# RockStream in 30 Minutes: From Theory to a Running Engine
+# RockStream in 30 Minutes: From Theory to a Live SQL Engine
 
 Welcome. The next half hour takes you from *never having heard of incremental
-view maintenance* to *running the RockStream engine on your own machine and
-watching its correctness proofs execute in front of you*.
+view maintenance* to *running the RockStream engine on your own machine, talking
+to it with `psql`, building a DAG of materialized views, and watching its
+correctness proofs execute in front of you*.
 
-This is a hands-on tutorial, and every command in it really runs. That matters,
-because RockStream is a young project in the middle of an honest, evidence-driven
-build-out. Rather than show you a glossy demo of features that don't exist yet,
-this guide does two things:
+This is a hands-on tutorial, and **every command in it really runs.** That
+matters, because RockStream is a young project in the middle of an honest,
+evidence-driven build-out. Rather than show you a glossy demo of features that
+don't exist yet, this guide does two things:
 
 1. **Explains the ideas** that make RockStream different — incremental view
    maintenance, Z-sets, frontiers, merge laws, and bottomless cloud state.
-2. **Lets you reproduce reality.** You will build the workspace, boot a node,
-   read the audit trail and support bundle it writes, and then watch the actual
-   IVM engine, SQL compiler, and Postgres wire gateway prove themselves through
-   the project's test harness.
+2. **Lets you reproduce reality.** You will build the workspace, boot a node that
+   speaks the PostgreSQL wire protocol, connect a real `psql` client, assemble a
+   dependency graph of views, watch the engine reject a cycle, and then run the
+   project's own proofs that show the incremental engine producing
+   *bit-identical* results to a batch re-computation.
 
-> **Where the project is right now.** RockStream is built version by version,
-> and each version is "done" only when its proof is done (see
-> [NEW_ROADMAP.md](../NEW_ROADMAP.md)). The incremental engine, the SQL
-> frontend, multi-shard execution, fault tolerance, and the PostgreSQL wire
-> gateway are all implemented and proven by tests. The single `rockstream`
-> binary today boots a real node — control plane, worker registration, shard
-> leasing and fencing, and a SlateDB store — and runs an embedded *no-op*
-> pipeline end to end. The SQL-over-Postgres serving path is wired and verified
-> in the test harness rather than exposed as a long-running server command. This
-> tutorial is precise about which is which, so nothing here will surprise you.
+> **Where the project is right now — read this once.** RockStream is built
+> version by version, and each version is "done" only when its proof is done
+> (see [NEW_ROADMAP.md](../NEW_ROADMAP.md)). The single `rockstream` binary boots
+> a real node — control plane, worker registration, shard leasing and fencing, a
+> SlateDB store — and now also **starts a long-running PostgreSQL wire server you
+> connect to directly with `psql`.** Over that connection you can run DDL
+> (`CREATE VIEW`, `CREATE MATERIALIZED VIEW`), build and validate a view
+> dependency DAG (cycles are rejected), issue transactional DML, `SUBSCRIBE`,
+> and set session variables. What is *not* wired yet is the last hop: streaming a
+> live worker's maintained-view output back into the gateway's serving shard, so
+> today a `SELECT` over a freshly-created view returns **zero rows**. The place
+> where data genuinely flows through a view DAG and is proven correct against a
+> batch oracle is the test harness — and you will run it in Part 6. This tutorial
+> is precise about which is which, so nothing here will surprise you.
 
 ---
 
@@ -85,7 +91,7 @@ The payoff is a hard guarantee: RockStream's incremental output is always
 *bit-identical* to what a full batch re-computation would produce. No drift, no
 approximation. This guarantee is not a slogan — it is asserted as a property test
 for **every** operator against a DataFusion batch reference, which you will run
-yourself in Part 5.
+yourself in Part 6.
 
 ### Coordination without locks: frontiers
 
@@ -99,7 +105,8 @@ input catches up.
 That gives **diamond consistency**: if a query fans out into two paths and merges
 again at a join, the join always sees a perfectly aligned snapshot — never an
 event from epoch 42 against state from epoch 41 — and it does so with no global
-lock.
+lock. This is exactly what makes a *DAG* of views safe to maintain: every node
+downstream sees a consistent cut of its inputs.
 
 ### Bottomless state: SlateDB on object storage
 
@@ -133,29 +140,15 @@ the engine records that a deletion of the current extremum needs a read to find
 the replacement. Keeping this explicit is what lets the compiler reason about
 cost and safety instead of guessing.
 
-```
-        Incoming change (a Z-set delta)
-                     │
-                     ▼
-         ┌───────────────────────┐
-         │   SQL frontend        │  parse · bind · optimize (DataFusion)
-         │   (rockstream-sql)    │
-         └───────────┬───────────┘
-                     ▼
-         ┌───────────────────────┐
-         │   PlanNode IR         │  logical/physical plan
-         │   (rockstream-plan)   │
-         └───────────┬───────────┘
-                     ▼
-         ┌───────────────────────┐
-         │   Differentiation     │  DiffCtx inserts arrangements
-         │   (rockstream-diff)   │
-         └───────────┬───────────┘
-                     ▼
-         ┌───────────────────────┐
-         │   Operator graph      │  executes deltas, commits to SlateDB
-         │   (rockstream-ops)    │
-         └───────────────────────┘
+Here is the path a single change takes, from SQL text to durable view output:
+
+```mermaid
+flowchart TD
+    A["Incoming change<br/>(a Z-set delta)"] --> B["SQL frontend<br/>parse · bind · optimize (DataFusion)<br/><i>rockstream-sql</i>"]
+    B --> C["PlanNode IR<br/>logical / physical plan<br/><i>rockstream-plan</i>"]
+    C --> D["Differentiation<br/>DiffCtx inserts arrangements<br/><i>rockstream-diff</i>"]
+    D --> E["Operator graph<br/>executes deltas, commits to SlateDB<br/><i>rockstream-ops</i>"]
+    E --> F["PostgreSQL wire gateway<br/>serves view reads to psql<br/><i>rockstream-gateway</i>"]
 ```
 
 With the ideas in place, let's run something.
@@ -188,167 +181,299 @@ The crates you just compiled map directly onto the architecture from Part 1:
 | `rockstream-sim` / `rockstream-oracle` | Deterministic simulator and the `incremental == batch` oracle |
 | `rockstream-cli` | The single `rockstream` binary |
 
-Confirm the binary built and inspect its surface:
+Confirm the binary built and inspect the `start` command:
 
 ```bash
-cargo run --bin rockstream -- --help
+cargo run --bin rockstream -- start --help
 ```
 
 ```text
-The single `rockstream` binary: one CLI for every node role
+Start a RockStream node.
 
-Usage: rockstream <COMMAND>
+For the `gateway` or `all` role the node starts a long-running PostgreSQL wire
+server on `--listen` and blocks until SIGTERM / Ctrl-C. Other roles run the
+embedded no-op node (audit log + support bundle), then exit.
 
-Commands:
-  start  Start a RockStream node. At v0.1 this runs an embedded no-op node: it
-         brings the node up, runs a no-op pipeline to completion, writes an audit
-         log and a support bundle under the storage directory, and exits
-  help   Print this message or the help of the given subcommand(s)
+Usage: rockstream start [OPTIONS] --storage <STORAGE>
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+      --storage <STORAGE>      Local storage directory for node state and artifacts
+      --role <ROLE>            Node role [default: all]
+      --control <CONTROL>      Control service URL (required for the worker and frontier roles)
+      --auth <AUTH>            Authentication mode [default: off] [possible values: off, oidc, mtls]
+      --metrics-addr <ADDR>    Metrics HTTP server listen address
+      --listen <LISTEN>        PostgreSQL wire gateway listen address [default: 127.0.0.1:5432]
+  -h, --help                   Print help
 ```
 
 One binary, every role as a flag — that is a deliberate design rule: `main`
-stays runnable at every version of the roadmap. Today that binary boots a node
-and runs an embedded no-op pipeline. Let's watch it do exactly that.
+stays runnable at every version of the roadmap. Let's boot it and connect.
 
 ---
 
-## Part 3 — Boot a Node and Read What It Leaves Behind
+## Part 3 — Boot a Node and Connect with `psql`
 
-Pick a clean storage directory and start a node in the combined `all` profile,
-which runs the control plane, a worker, and the storage engine inside one
-process:
+Pick a clean storage directory and start a node in the default combined `all`
+profile, which runs the control plane, a worker, the SlateDB store, **and** the
+PostgreSQL wire gateway inside one process.
+
+> **Pick a free port.** The gateway defaults to `127.0.0.1:5432`, the standard
+> PostgreSQL port. If you already run Postgres locally, that port is taken and
+> the gateway will fail to bind with a clear error:
+> `RS-0003 failed to bind gateway on 127.0.0.1:5432: Address already in use`.
+> Throughout this tutorial we use `5544` to avoid the clash.
 
 ```bash
-cargo run --bin rockstream -- start --storage ./rockstream-data
+cargo run --bin rockstream -- start --storage ./rockstream-data --listen 127.0.0.1:5544
 ```
 
-You will see real lifecycle logs. The interesting lines (abridged) are:
+You will see real lifecycle logs, ending with the gateway announcing itself:
 
 ```text
-INFO rockstream_control::service: control service listening addr=127.0.0.1:63179
+INFO rockstream_control::service: control service listening addr=127.0.0.1:58817
 INFO rockstream_control::service: control: worker registered worker_id=worker-1 headroom=1.00
 INFO rockstream_runtime::client: Worker client registered successfully as WorkerId(1)
 INFO rockstream_control::service: control: shard lease granted worker_id=worker-1 shard_id=shard-1 token=1
 INFO rockstream_runtime::client: Received ShardAssigned lease for ShardId(1)
-INFO slatedb::db::builder: opening SlateDB database [path=db, ...]
-INFO rockstream: rockstream: embedded no-op node ran to completion
-       audit=./rockstream-data/audit.jsonl bundle=./rockstream-data/support-bundle-….json events=7
+INFO rockstream_cli: PostgreSQL wire gateway ready — connect with: psql -h 127.0.0.1 -p 5544 -U rockstream
 ```
 
-That short burst exercised a surprising amount of the real system:
+That short burst exercised a surprising amount of the real system: the **control
+plane** came up and started listening; a **worker** registered and reported its
+capacity headroom; a **shard lease** was granted with a fencing token (the same
+machinery that, in a real cluster, guarantees only one writer can ever commit to
+a shard — no split-brain); **SlateDB** opened a real store; and the
+**PostgreSQL gateway** bound the port and is now blocking, ready for clients.
 
-1. **The control plane** came up and started listening (here on an ephemeral
-   port). It owns the topology catalog and hands out shards.
-2. **A worker** registered itself with the control plane and reported its
-   capacity headroom.
-3. **A shard lease** was granted with a fencing token. This is the same leasing
-   and fencing machinery that, in a real cluster, guarantees only one writer can
-   ever commit to a shard — no split-brain.
-4. **SlateDB** opened a real store under `./rockstream-data`.
-5. The **embedded no-op pipeline** ran to completion, and the node shut down
-   cleanly, writing an audit log and a support bundle.
-
-### The audit trail
-
-Every control-plane action writes an audit event — a hard rule across the whole
-project. Look at what the run recorded:
+Leave that process running. In a **second terminal**, connect with a genuine
+PostgreSQL client:
 
 ```bash
-cat ./rockstream-data/audit.jsonl
+psql -h 127.0.0.1 -p 5544 -U rockstream
 ```
 
-```json
-{"timestamp_ms":…, "actor":"system",  "action":"server.started",     "resource":"rockstream",     "detail":"role=all"}
-{"timestamp_ms":…, "actor":"system",  "action":"pipeline.created",    "resource":"noop-pipeline",  "detail":"embedded no-op pipeline"}
-{"timestamp_ms":…, "actor":"system",  "action":"pipeline.started",    "resource":"noop-pipeline"}
-{"timestamp_ms":…, "actor":"control", "action":"worker.registered",   "resource":"worker-1",       "detail":"address=127.0.0.1:0, headroom=1.00"}
-{"timestamp_ms":…, "actor":"control", "action":"shard.lease_granted", "resource":"shard-1",        "detail":"worker=worker-1, token=lease-1"}
-{"timestamp_ms":…, "actor":"system",  "action":"pipeline.stopped",    "resource":"noop-pipeline"}
-{"timestamp_ms":…, "actor":"system",  "action":"server.stopped",      "resource":"rockstream"}
+Ask the server who it is:
+
+```sql
+SHOW server_version;
 ```
-
-Notice that every event names an `actor` (`system` or `control`) and a
-`resource`. When real DDL and DML flow through the gateway, the same trail will
-record *who* created a view or wrote a row.
-
-### The support bundle
-
-The node also wrote a self-contained diagnostic snapshot:
-
-```bash
-cat ./rockstream-data/support-bundle-*.json
-```
-
-```json
-{
-  "generated_at_ms": …,
-  "system_info": { "version": "0.52.10", "os": "macos", "arch": "aarch64", "role": "all" },
-  "metrics":     { "uptime_ms": 160, "audit_events_emitted": 7 },
-  "audit_events": [ … the full audit log … ]
-}
-```
-
-This is the artifact you would attach to a bug report: version, platform, a
-metrics snapshot, and the complete audit history in one file.
-
-And the storage directory itself now contains a real SlateDB layout:
-
-```bash
-ls ./rockstream-data
-# audit.jsonl   shards/   support-bundle-….json
-```
-
----
-
-## Part 4 — Splitting the Roles
-
-The same binary runs each role separately, which is how a real cluster is shaped.
-Booting a control node and a worker that registers with it looks like this:
-
-```bash
-# Terminal 1 — control plane on a fixed port
-rockstream start --role=control --storage ./rs-control
-
-# Terminal 2 — a worker that joins it
-rockstream start --role=worker --control=127.0.0.1:8000 --storage ./rs-worker
-```
-
-A `worker` or `gateway` role requires `--control=<url>`; omit it and you get a
-clear, actionable error:
 
 ```text
-RS-0002 role `worker` requires --control=<url>
-  next steps: Provide the control plane URL via the --control argument.
+ server_version
+----------------
+ 14.0
+(1 row)
 ```
 
-Every operator-visible failure in RockStream carries an `RS-XXXX` code with a
-`next steps` line — CI fails the build on any error path that doesn't. The full
-registry lives in
-[crates/rockstream-types/src/error_code.rs](../crates/rockstream-types/src/error_code.rs),
-and the CLI surface is documented in [docs/cli.md](cli.md).
+You are talking to RockStream over the real PostgreSQL wire protocol. Any
+Postgres driver — `psql`, `psycopg`, JDBC, SQLAlchemy — speaks this same
+protocol, so the same connection works from your application code.
 
-If you want the project's own end-to-end check that boots a control node and a
-worker, verifies their audit logs, and runs the local-filesystem and MinIO
-storage suites, run:
+> **A note on the dialect.** The gateway implements the *commands RockStream
+> needs* rather than the entire surface of PostgreSQL. `SHOW server_version`,
+> catalog reflection, `CREATE [MATERIALIZED] VIEW`, `CREATE TABLE`, transactional
+> DML, `SUBSCRIBE`, `EXPLAIN`, and `SET rockstream.*` are handled explicitly.
+> Statements outside that set (for example `SELECT version()`) currently return a
+> generic `OK` rather than an error — handy to know so you aren't surprised.
 
-```bash
-make e2e
+---
+
+## Part 4 — Build a DAG of Materialized Views
+
+This is the heart of RockStream: you describe the answers you want as **views**,
+and the engine maintains them. Views can depend on other views, forming a
+**directed acyclic graph (DAG)** — raw events at the roots, refined and
+aggregated results at the leaves. Let's build one for a tiny clickstream +
+orders analytics workload.
+
+Still connected with `psql`, declare two base tables:
+
+```sql
+CREATE TABLE clicks (user_id INT, url TEXT, ts BIGINT);
+CREATE TABLE orders (order_id INT, user_id INT, amount INT, ts BIGINT);
+```
+
+```text
+CREATE TABLE 0
+CREATE TABLE 0
+```
+
+Now layer views on top. The first branch turns raw clicks into a per-URL hit
+count, then ranks the busiest pages:
+
+```sql
+CREATE VIEW page_hits AS
+  SELECT url, COUNT(*) AS hits
+  FROM clicks
+  GROUP BY url;
+
+CREATE MATERIALIZED VIEW top_pages AS
+  SELECT url, hits
+  FROM page_hits
+  ORDER BY hits DESC
+  LIMIT 10;
+```
+
+The second branch turns raw orders into per-user spend, then isolates the big
+spenders:
+
+```sql
+CREATE VIEW user_spend AS
+  SELECT user_id, SUM(amount) AS spend
+  FROM orders
+  GROUP BY user_id;
+
+CREATE MATERIALIZED VIEW big_spenders AS
+  SELECT user_id, spend
+  FROM user_spend
+  WHERE spend > 1000;
+```
+
+Each statement returns its command tag (the gateway prints `CREATE VIEW 0` /
+`CREATE MATERIALIZED VIEW 0` — the trailing `0` is a row count) as the engine
+registers the definition and records its dependencies. What you have built is
+this DAG:
+
+```mermaid
+flowchart LR
+    clicks[("clicks<br/><i>base table</i>")] --> page_hits["page_hits<br/>GROUP BY url, COUNT(*)"]
+    page_hits --> top_pages[["top_pages<br/>ORDER BY hits DESC<br/><i>materialized</i>"]]
+    orders[("orders<br/><i>base table</i>")] --> user_spend["user_spend<br/>GROUP BY user_id, SUM(amount)"]
+    user_spend --> big_spenders[["big_spenders<br/>WHERE spend &gt; 1000<br/><i>materialized</i>"]]
+```
+
+The difference between a plain `VIEW` and a `MATERIALIZED VIEW` here is intent:
+both are compiled into the incremental operator graph, but a materialized view is
+one whose output RockStream keeps durably in SlateDB so it can be read back and
+subscribed to. In a fully-wired pipeline, a single `INSERT INTO clicks` would
+ripple through `page_hits` into `top_pages` as a small delta — never a re-scan.
+
+### The engine guards the graph: cycle detection
+
+A view DAG must stay *acyclic* — a view that (transitively) depends on itself can
+never be maintained. RockStream enforces this at definition time. Try to tie a
+knot:
+
+```sql
+CREATE VIEW loop_a AS SELECT * FROM loop_b;
+CREATE VIEW loop_b AS SELECT * FROM loop_a;
+```
+
+The first succeeds (`loop_b` doesn't exist yet, so there's no cycle *yet*). The
+second is rejected the moment it would close the loop:
+
+```text
+CREATE VIEW 0
+ERROR:  [RS-1011] Cycle detected in view dependencies: view 'loop_b' forms a
+cycle via path: ["loop_b", "loop_a", "loop_a"]
+```
+
+Notice the error carries an `RS-XXXX` code *and* the exact path that forms the
+cycle. Every operator-visible failure in RockStream is structured this way — a
+hard rule the CI enforces.
+
+### Reading a view (and an honest caveat)
+
+You can read from any view you've created:
+
+```sql
+SELECT * FROM top_pages LIMIT 10;
+```
+
+```text
+--
+(0 rows)
+```
+
+Zero rows — and that is *correct* for where the project is today. The standalone
+gateway serves reads from its own fresh SlateDB shard, and the last hop that
+streams a live worker's maintained-view output into that serving shard is not
+wired yet. So the DAG is real, validated, and durable as a *definition*, but the
+maintained *rows* don't yet flow back to this `psql` session. Part 6 is where you
+watch real data flow through a view DAG end to end and prove it bit-identical to
+batch — that path runs today, in the test harness.
+
+### Inspect the plan
+
+Ask the engine how it would execute a read, including whether it can push a
+partial aggregate down to the shards:
+
+```sql
+EXPLAIN SELECT url, hits FROM page_hits;
+```
+
+```text
+               QUERY PLAN
+-----------------------------------------
+ Plan: SeqScan → partial_pushdown: false
+ Query: SELECT url, hits FROM page_hits
+(1 row)
+```
+
+### Subscribe to a view
+
+Beyond point reads, the gateway speaks a streaming `SUBSCRIBE` command — the
+basis for live dashboards that receive deltas as the view changes:
+
+```sql
+SUBSCRIBE top_pages;
+```
+
+```text
+OK
 ```
 
 ---
 
-## Part 5 — Watch the IVM Engine Prove Itself
+## Part 5 — Transactional Writes
 
-Here is the honest, powerful part. The incremental engine — filters, joins,
-aggregates, windows, recursion, the whole DBSP machinery from Part 1 — is
-implemented and continuously verified. The way you *watch it work today* is by
-running the proofs. These are not toy unit tests; they are property tests that
-generate thousands of random insert/update/delete sequences and assert that the
-incremental result equals a full batch re-computation, every time.
+RockStream accepts direct-write DML (`INSERT`/`UPDATE`/`DELETE`) over the same
+connection. Writes accumulate in a per-connection **write buffer** and are
+flushed atomically on `COMMIT`. To make commits safely retryable, RockStream
+requires an **idempotency key** per committing transaction — re-sending the same
+key never double-applies the writes.
+
+```sql
+SET rockstream.idempotency_key = 'demo-txn-001';
+
+BEGIN;
+INSERT INTO clicks VALUES (1, '/home', 100);
+INSERT INTO clicks VALUES (2, '/home', 101);
+INSERT INTO clicks VALUES (3, '/pricing', 102);
+COMMIT;
+```
+
+```text
+SET
+BEGIN 0
+INSERT 0 1 1
+INSERT 0 1 1
+INSERT 0 1 1
+COMMIT 3
+```
+
+The `COMMIT 3` confirms three buffered writes were flushed to the shard
+atomically. (If you forget the idempotency key, the commit is refused with
+`RS-2007` — that is the engine protecting you from accidental double-writes.)
+
+> **Reproducibility note.** In this build, the per-statement `INSERT` command tag
+> is slightly verbose, and a strict client such as `psql` 18 may print a benign
+> `could not interpret result from server: INSERT 0 1 1` notice for each row. The
+> write still succeeds; the `COMMIT` tag is the authoritative count.
+
+When you are done exploring, return to the first terminal and press **Ctrl-C**.
+The node shuts the gateway down cleanly and writes its audit log and support
+bundle — which we read next.
+
+---
+
+## Part 6 — Watch Data Actually Flow Through a View DAG
+
+Part 4 built a DAG and validated it; this part is where rows genuinely flow
+through one and the result is *proven* correct. The way you watch it today is by
+running the project's proofs. These are not toy unit tests — they are property
+tests that generate thousands of random insert/update/delete sequences and assert
+that the incremental result equals a full batch re-computation, **every time.**
 
 ### The oracle: `incremental == batch`
 
@@ -368,23 +493,33 @@ feeds the operator a random stream of deltas and checks its output against the
 DataFusion batch reference. When this passes, the bilinear join expansion and the
 merge-law arithmetic from Part 1 are not just plausible — they are demonstrated.
 
-### A real view: join + group-by, maintained incrementally
+### A real DAG that flows data: join → group-by, maintained incrementally
 
-The SQL frontend compiles a query into the operator graph and maintains it. The
-end-to-end test in
+The SQL frontend compiles a query into the operator graph and maintains it as
+data streams in. The end-to-end test in
 [crates/rockstream-sql/tests/sql_engine_e2e.rs](../crates/rockstream-sql/tests/sql_engine_e2e.rs)
-takes this view:
+maintains exactly the kind of view DAG you built in Part 4 — a join feeding an
+aggregate:
 
 ```sql
 CREATE VIEW revenue AS
 SELECT o.region, SUM(l.amount)
 FROM orders o
-JOIN lineitem l ON o.order_id = l.order_id
+JOIN lineitem l ON o.id = l.order_id
 GROUP BY o.region;
 ```
 
-…deploys it, streams changes into `orders` and `lineitem`, and asserts the
-maintained `revenue` view matches the batch answer after every epoch. Run it:
+```mermaid
+flowchart LR
+    orders[("orders")] --> join["JoinOp<br/>o.id = l.order_id"]
+    lineitem[("lineitem")] --> join
+    join --> agg["AggregateOp<br/>GROUP BY region, SUM(amount)"]
+    agg --> revenue[["revenue<br/><i>maintained view</i>"]]
+```
+
+The test deploys this view, streams changes into `orders` and `lineitem`, and
+asserts that the maintained `revenue` view matches the batch answer after every
+epoch. Run it:
 
 ```bash
 cargo test -p rockstream-sql --test sql_engine_e2e
@@ -397,8 +532,9 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 The second test maintains a `ROW_NUMBER() OVER (PARTITION BY k ORDER BY v)`
-window incrementally — the same window functions a campaign leaderboard or a
-"top product per region" dashboard would need.
+window incrementally — the same window function a campaign leaderboard or a
+"top product per region" dashboard would need, and the same shape as the
+`top_pages` view you wrote.
 
 ### Operator durability and the full SQL surface
 
@@ -425,68 +561,136 @@ batch.
 
 ---
 
-## Part 6 — The PostgreSQL Wire Gateway
+## Part 7 — Read What the Node Left Behind
 
-RockStream speaks the Postgres wire protocol so you can eventually point `psql`,
-a BI tool, or any Postgres driver at it. The gateway (`rockstream-gateway`) is
-implemented and proven against a **real** Postgres client (`tokio-postgres`) in
-its integration suite. Run it:
+Back in the first terminal, after you pressed Ctrl-C, the node wrote an
+auditable trail and a self-contained diagnostic snapshot. Every control-plane
+action writes an audit event — a hard rule across the whole project.
 
 ```bash
-cargo test -p rockstream-gateway --test gateway_integration_tests
+cat ./rockstream-data/audit.jsonl
 ```
+
+For the combined run you just performed, the trail captures the full lifecycle —
+including the gateway coming up and going down:
 
 ```text
-test server_starts_and_accepts_connection ... ok
-test extended_query_protocol_parse_bind_execute ... ok
-test proof_pg_catalog_schema_reflection_queries ... ok
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+server.started        -> rockstream      (role=all)
+pipeline.created      -> noop-pipeline
+pipeline.started      -> noop-pipeline
+worker.registered     -> worker-1        (address=127.0.0.1:0, headroom=1.00)
+shard.lease_granted   -> shard-1         (worker=worker-1, token=lease-1)
+gateway.started       -> 127.0.0.1:5544  (role=all)
+gateway.stopped       -> 127.0.0.1:5544
+pipeline.stopped      -> noop-pipeline
+server.stopped        -> rockstream
 ```
 
-Those three tests stand up a `GatewayServer` on a real socket, connect with a
-genuine Postgres client, and exercise:
+Every event names an `actor` (`system` or `control`) and a `resource`. The node
+also wrote a support bundle — the artifact you would attach to a bug report:
 
-- **Connection + simple query** — `SELECT 1` round-trips over the wire.
-- **The extended query protocol** — parse / bind / execute, the path every
-  driver and ORM actually uses.
-- **Catalog reflection** — `pg_catalog.pg_tables`, `pg_views`, `pg_class`, so
-  tools that introspect schemas (SQLAlchemy, JDBC) see your views as tables.
+```bash
+cat ./rockstream-data/support-bundle-*.json
+```
 
-The deeper proof suite in
-[crates/rockstream-gateway/tests/gateway_proof_tests.rs](../crates/rockstream-gateway/tests/gateway_proof_tests.rs)
-goes further, demonstrating the behaviors that make the gateway usable from real
-applications:
+```json
+{
+  "generated_at_ms": …,
+  "system_info": { "version": "0.52.10", "os": "macos", "arch": "aarch64", "role": "all" },
+  "metrics":     { "uptime_ms": …, "audit_events_emitted": 9 },
+  "audit_events": [ … the full audit log … ]
+}
+```
 
-- `proof_psql_select_limit_10_under_10ms_p99` — point reads stay fast.
-- `create_table_registers_in_catalog` and `insert_accumulates_in_write_buffer` —
-  `CREATE TABLE` and buffered `INSERT`/`UPDATE`/`DELETE` DML.
-- `copy_out_streams_view_rows` — the Postgres `COPY` path for bulk export.
-- `proof_serializable_returns_rs2003` — isolation levels return precise
-  `RS-XXXX` codes when a mode is unsupported.
+And the storage directory now contains a real SlateDB layout plus the gateway's
+own serving shard:
 
-Authentication, RBAC, and read-your-writes are covered alongside in
-[auth_proof_tests.rs](../crates/rockstream-gateway/tests/auth_proof_tests.rs).
-
-> **What this means for you.** The query examples above describe exactly what the
-> engine maintains and serves; they are exercised by the suites you just ran, not
-> typed into a live psql session. Wiring the gateway, the catalog, and a live
-> view reader together behind a single long-running `rockstream serve` command is
-> the productization step that turns these proven parts into a server you connect
-> to directly. Until then, the test harness is the faithful, reproducible way to
-> see the Postgres layer behave.
+```bash
+ls ./rockstream-data
+# audit.jsonl   gateway-shard/   shards/   support-bundle-….json
+```
 
 ---
 
-## Part 7 — Where This Is Going
+## Part 8 — Splitting the Roles and Proving the Gateway
+
+The same binary runs each role separately, which is how a real cluster is shaped.
+A pure gateway node, a control node, and a worker that joins it look like this:
+
+```bash
+# A standalone PostgreSQL gateway (no control/worker in-process)
+rockstream start --role=gateway --storage ./rs-gw --listen 127.0.0.1:5544
+
+# A control plane on a fixed port…
+rockstream start --role=control --storage ./rs-control
+
+# …and a worker that joins it
+rockstream start --role=worker --control=127.0.0.1:8000 --storage ./rs-worker
+```
+
+A `worker` or `frontier` role requires `--control=<url>`; omit it and you get a
+clear, actionable error:
+
+```text
+RS-0002 role `worker` requires --control=<url>
+  next steps: Provide the control plane URL via the --control argument.
+```
+
+The full `RS-XXXX` registry lives in
+[crates/rockstream-types/src/error_code.rs](../crates/rockstream-types/src/error_code.rs),
+and the CLI surface is documented in [docs/cli.md](cli.md).
+
+### The gateway, proven against a real client
+
+Everything you did over `psql` in Parts 3–5 is also pinned by automated suites
+that stand up the gateway on a real socket and drive it with a genuine
+`tokio-postgres` client. The serve-mode suite mirrors this tutorial step for
+step:
+
+```bash
+cargo test -p rockstream-cli --test gateway_serve_tests
+```
+
+```text
+test gateway_starts_and_accepts_connection ... ok
+test gateway_show_server_version_returns_a_row ... ok
+test gateway_information_schema_tables_is_queryable ... ok
+test gateway_pg_catalog_pg_class_is_queryable ... ok
+test gateway_create_view_and_select_succeeds ... ok
+test gateway_cyclic_view_returns_rs_1011 ... ok
+test gateway_dml_in_transaction_accumulates_without_error ... ok
+test gateway_subscribe_returns_without_error ... ok
+test gateway_invalid_listen_address_returns_rs_0002 ... ok
+test gateway_port_in_use_returns_rs_0003 ... ok
+test gateway_handles_concurrent_clients ... ok
+test gateway_set_rockstream_session_variables ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The deeper protocol and behavior proofs live alongside in the gateway crate
+itself —
+[gateway_proof_tests.rs](../crates/rockstream-gateway/tests/gateway_proof_tests.rs)
+(extended query protocol, catalog reflection, `COPY`, buffered DML) and
+[auth_proof_tests.rs](../crates/rockstream-gateway/tests/auth_proof_tests.rs)
+(authentication, RBAC, read-your-writes):
+
+```bash
+cargo test -p rockstream-gateway
+```
+
+---
+
+## Part 9 — Where This Is Going
 
 You have now seen the real RockStream: a node that boots, leases and fences
-shards, and writes an auditable trail; an incremental engine whose correctness is
-proven against a batch oracle; and a Postgres gateway verified against a real
-client. The roadmap's design is **one binary, one config, three tiers**, and the
-same artifacts you built scale along it:
+shards, writes an auditable trail, **and serves the PostgreSQL wire protocol you
+connected to with `psql`**; an incremental engine whose correctness is proven
+against a batch oracle; and a view DAG the engine validates and maintains. The
+roadmap's design is **one binary, one config, three tiers**, and the same
+artifacts you built scale along it:
 
-1. **Evaluation (laptop).** A single process with local storage — exactly what
-   you ran in Part 3.
+1. **Evaluation (laptop).** A single process with local storage and a gateway on
+   `127.0.0.1` — exactly what you ran in Part 3.
 2. **Single-host production.** The same process, but `--storage` points at an
    object store (`s3://…` or MinIO). If the host dies, a new one boots against
    the same bucket and recovers, because all durable state lives there.
@@ -494,12 +698,14 @@ same artifacts you built scale along it:
    `--role=gateway` on separate nodes, sharing object storage, exchanging data
    over gRPC shuffles, and coordinating through the frontier protocol.
 
-The build sequence that gets there — single-shard correctness, multi-shard
-execution, the frontier protocol, exactly-once fault tolerance, the Postgres
-pillar, ingestion connectors, and secondary indexes — is laid out, version by
-version with its proof obligations, in [NEW_ROADMAP.md](../NEW_ROADMAP.md). Every
-"Done" version has a sign-off file under [sign-offs/](../sign-offs/) listing the
-exact tests that back its claims.
+The one remaining hop you saw in Part 4 — streaming a live worker's
+maintained-view output into the gateway's serving shard, so a `SELECT` over your
+DAG returns live rows directly in `psql` — is the next productization step. The
+parts are all proven (Part 6); connecting them end to end behind the running
+server is what turns "zero rows today" into "live rows tomorrow." The full build
+sequence, version by version with its proof obligations, is laid out in
+[NEW_ROADMAP.md](../NEW_ROADMAP.md). Every "Done" version has a sign-off file
+under [sign-offs/](../sign-offs/) listing the exact tests that back its claims.
 
 ### Keep exploring
 
@@ -515,12 +721,15 @@ exact tests that back its claims.
 1. Learned how incremental view maintenance, Z-sets, frontiers, and merge laws
    let RockStream keep answers fresh by processing only change.
 2. Built the workspace and inspected the single `rockstream` binary.
-3. Booted a node, watched the control plane, worker registration, shard leasing,
-   and SlateDB come up, and read the audit log and support bundle it produced.
-4. Saw the roles split the way a real cluster is shaped.
-5. Ran the oracle and SQL proofs that demonstrate `incremental == batch` for
-   real operators and a real `JOIN … GROUP BY` view.
-6. Verified the PostgreSQL wire gateway against a genuine Postgres client.
+3. Booted a node and **connected to it with a real `psql` client** over the
+   PostgreSQL wire protocol.
+4. Assembled a **DAG of materialized views**, watched the engine reject a cycle
+   with `RS-1011`, ran transactional DML, subscribed, and inspected a plan.
+5. Read the audit log and support bundle the node produced, including the
+   gateway's own lifecycle events.
+6. Ran the oracle and SQL proofs that demonstrate `incremental == batch` for real
+   operators and a real `JOIN … GROUP BY` view DAG.
+7. Verified the gateway against a genuine PostgreSQL client.
 
 Welcome to RockStream. The scoreboard is already ticking — now you know what
-makes it tick.
+makes it tick, and you've talked to it yourself.
