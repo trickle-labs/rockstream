@@ -158,6 +158,20 @@ impl CatalogStubs {
         true
     }
 
+    /// Update the column list for an existing view (called after materialisation).
+    pub fn update_view_columns(&self, view_name: &str, columns: Vec<CatalogColumn>) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(v) = inner.views.get_mut(view_name) {
+            v.columns = columns;
+        }
+    }
+
+    /// Return the dependency list for a specific view.
+    pub fn get_view_deps(&self, view_name: &str) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        inner.deps.get(view_name).cloned().unwrap_or_default()
+    }
+
     /// Look up a table by name, cloning the entry.
     pub fn get_table(&self, name: &str) -> Option<CatalogTable> {
         let inner = self.inner.read().unwrap();

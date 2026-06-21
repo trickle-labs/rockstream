@@ -18,6 +18,7 @@
 
 pub mod auth;
 pub mod catalog_stubs;
+pub mod view_materializer;
 pub mod change_log;
 pub mod copy_state;
 pub mod error;

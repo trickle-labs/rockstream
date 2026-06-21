@@ -4559,10 +4559,12 @@ dependencies = [
 name = "rockstream-gateway"
 version = "0.52.10"
 dependencies = [
+ "arrow",
  "async-trait",
  "base64",
  "bytes",
  "dashmap",
+ "datafusion",
  "futures",
  "hmac 0.12.1",
  "object_store 0.12.5",

@@ -26,12 +26,13 @@ don't exist yet, this guide does two things:
 > connect to directly with `psql`.** Over that connection you can run DDL
 > (`CREATE VIEW`, `CREATE MATERIALIZED VIEW`), build and validate a view
 > dependency DAG (cycles are rejected), issue transactional DML, `SUBSCRIBE`,
-> and set session variables. What is *not* wired yet is the last hop: streaming a
-> live worker's maintained-view output back into the gateway's serving shard, so
-> today a `SELECT` over a freshly-created view returns **zero rows**. The place
-> where data genuinely flows through a view DAG and is proven correct against a
-> batch oracle is the test harness — and you will run it in Part 6. This tutorial
-> is precise about which is which, so nothing here will surprise you.
+> and set session variables. The last hop is now wired: after each `COMMIT`,
+> the gateway re-evaluates every view that transitively depends on the changed
+> tables using DataFusion's in-memory engine and writes the output directly into
+> the serving shard, so a `SELECT` over a freshly-created view returns **live
+> rows**. Part 5 shows this end to end. The incremental Z-set path (deltas
+> through operator DAGs, proven bit-identical to batch) lives in the test
+> harness you will run in Part 6.
 
 ---
 
@@ -372,7 +373,7 @@ Notice the error carries an `RS-XXXX` code *and* the exact path that forms the
 cycle. Every operator-visible failure in RockStream is structured this way — a
 hard rule the CI enforces.
 
-### Reading a view (and an honest caveat)
+### Reading a view
 
 You can read from any view you've created:
 
@@ -381,17 +382,16 @@ SELECT * FROM top_pages LIMIT 10;
 ```
 
 ```text
---
+ url   | hits
+-------+------
 (0 rows)
 ```
 
-Zero rows — and that is *correct* for where the project is today. The standalone
-gateway serves reads from its own fresh SlateDB shard, and the last hop that
-streams a live worker's maintained-view output into that serving shard is not
-wired yet. So the DAG is real, validated, and durable as a *definition*, but the
-maintained *rows* don't yet flow back to this `psql` session. Part 6 is where you
-watch real data flow through a view DAG end to end and prove it bit-identical to
-batch — that path runs today, in the test harness.
+Zero rows here — because `clicks` has no rows yet. Insert some and commit,
+and `top_pages` will contain live data. The gateway re-evaluates every
+dependent view after each `COMMIT` and writes the output into the serving
+shard, so a `SELECT` after any write returns current rows. You will see this
+end to end in Part 5.
 
 ### Inspect the plan
 
@@ -461,19 +461,62 @@ atomically. (If you forget the idempotency key, the commit is refused with
 > `could not interpret result from server: INSERT 0 1 1` notice for each row. The
 > write still succeeds; the `COMMIT` tag is the authoritative count.
 
+Now the views are live. Query `page_hits` to see the aggregated hit counts:
+
+```sql
+SELECT * FROM page_hits;
+```
+
+```text
+     url      | hits
+--------------+------
+ /home        |    2
+ /pricing     |    1
+(2 rows)
+```
+
+Every `COMMIT` triggers a re-evaluation of every view that transitively
+depends on the changed tables. The gateway executes the view SQL using
+DataFusion's in-memory engine over the current shard state and writes the
+output back to the serving shard in one batch.  A subsequent `SELECT` always
+returns the result of the last commit.
+
+Add some orders and check `big_spenders`:
+
+```sql
+SET rockstream.idempotency_key = 'demo-txn-002';
+BEGIN;
+INSERT INTO orders VALUES (1, 101, 1500, 200);
+INSERT INTO orders VALUES (2, 102, 200, 201);
+COMMIT;
+
+SELECT * FROM big_spenders;
+```
+
+```text
+ user_id | spend
+---------+-------
+     101 |  1500
+(1 row)
+```
+
+User 102 spent only 200, which is below the `WHERE spend > 1000` threshold,
+so only user 101 appears.
+
 When you are done exploring, return to the first terminal and press **Ctrl-C**.
 The node shuts the gateway down cleanly and writes its audit log and support
 bundle — which we read next.
 
 ---
 
-## Part 6 — Watch Data Actually Flow Through a View DAG
+## Part 6 — The Incremental Engine: Proven Correct
 
-Part 4 built a DAG and validated it; this part is where rows genuinely flow
-through one and the result is *proven* correct. The way you watch it today is by
-running the project's proofs. These are not toy unit tests — they are property
-tests that generate thousands of random insert/update/delete sequences and assert
-that the incremental result equals a full batch re-computation, **every time.**
+Part 5 showed data flowing end to end through the gateway's serving layer via
+batch re-evaluation after each commit. This part goes deeper: running the
+project's proofs of the *incremental* engine — the Z-set operator graph that
+processes only deltas, never the full history. These are property tests that
+generate thousands of random insert/update/delete sequences and assert that the
+incremental result equals a full batch re-computation, **every time.**
 
 ### The oracle: `incremental == batch`
 
@@ -698,14 +741,18 @@ artifacts you built scale along it:
    `--role=gateway` on separate nodes, sharing object storage, exchanging data
    over gRPC shuffles, and coordinating through the frontier protocol.
 
-The one remaining hop you saw in Part 4 — streaming a live worker's
-maintained-view output into the gateway's serving shard, so a `SELECT` over your
-DAG returns live rows directly in `psql` — is the next productization step. The
-parts are all proven (Part 6); connecting them end to end behind the running
-server is what turns "zero rows today" into "live rows tomorrow." The full build
-sequence, version by version with its proof obligations, is laid out in
-[NEW_ROADMAP.md](../NEW_ROADMAP.md). Every "Done" version has a sign-off file
-under [sign-offs/](../sign-offs/) listing the exact tests that back its claims.
+The last hop — re-evaluating dependent views after every `COMMIT` and writing
+their output into the serving shard — is now wired and proven by three new
+green-gate tests in
+[gateway_proof_tests.rs](../crates/rockstream-gateway/tests/gateway_proof_tests.rs):
+`last_hop_view_materialised_after_commit`,
+`last_hop_aggregate_view_materialised_after_commit`, and
+`last_hop_select_returns_rows_after_commit`. The current implementation
+re-evaluates views in batch using DataFusion after every commit; the
+incremental Z-set path (proportional to the *change*, not the history) is
+proven in the oracle harness (Part 6) and is the next productization step.
+The full build sequence is in [NEW_ROADMAP.md](../NEW_ROADMAP.md). Every
+"Done" version has a sign-off file under [sign-offs/](../sign-offs/).
 
 ### Keep exploring
 
@@ -724,12 +771,14 @@ under [sign-offs/](../sign-offs/) listing the exact tests that back its claims.
 3. Booted a node and **connected to it with a real `psql` client** over the
    PostgreSQL wire protocol.
 4. Assembled a **DAG of materialized views**, watched the engine reject a cycle
-   with `RS-1011`, ran transactional DML, subscribed, and inspected a plan.
-5. Read the audit log and support bundle the node produced, including the
-   gateway's own lifecycle events.
-6. Ran the oracle and SQL proofs that demonstrate `incremental == batch` for real
+   with `RS-1011`, and inspected a plan.
+5. Ran transactional DML and watched the **last hop** deliver live rows from
+   `COMMIT` straight through to `SELECT` — `page_hits` and `big_spenders`
+   returned correct aggregated results immediately after each write.
+6. Read the audit log and support bundle the node produced.
+7. Ran the oracle and SQL proofs that demonstrate `incremental == batch` for real
    operators and a real `JOIN … GROUP BY` view DAG.
-7. Verified the gateway against a genuine PostgreSQL client.
+8. Verified the gateway against a genuine PostgreSQL client.
 
 Welcome to RockStream. The scoreboard is already ticking — now you know what
 makes it tick, and you've talked to it yourself.

@@ -814,6 +814,27 @@ impl GatewayHandler {
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
 
+        // ── Last hop: materialise dependent views ─────────────────────────────
+        // Collect the unique tables touched by this commit, then re-evaluate
+        // every view that transitively depends on them.  This converts the
+        // serving shard from a raw DML store into a live view serving layer.
+        {
+            let changed_tables: std::collections::HashSet<String> = ops
+                .iter()
+                .map(|op| match op {
+                    DmlOp::Insert { table, .. } => table.clone(),
+                    DmlOp::Update { table, .. } => table.clone(),
+                    DmlOp::Delete { table, .. } => table.clone(),
+                })
+                .collect();
+            crate::view_materializer::materialize_views(
+                &self.catalog,
+                shard_db,
+                &changed_tables,
+            )
+            .await;
+        }
+
         let table_name = ops
             .iter()
             .last()

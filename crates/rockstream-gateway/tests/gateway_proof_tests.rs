@@ -2166,3 +2166,286 @@ async fn proof_copy_from_lfs() {
         assert!(found, "expected row val_{i} in shard");
     }
 }
+
+// ── Last-hop: view materialisation after DML commit ──────────────────────────
+
+/// Last-hop green gate: INSERT INTO base_table + COMMIT causes dependent views
+/// to be materialised into the serving shard immediately, so that a subsequent
+/// SELECT over a view returns real rows instead of zero rows.
+///
+/// This is the "last hop" described in the 30-minute tutorial — the bridge that
+/// connects the DML write path to the live view serving layer.
+#[tokio::test]
+async fn last_hop_view_materialised_after_commit() {
+    // Use an in-memory store so we can open a fresh ShardReader after flushing.
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("last-hop-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+
+    // Use NoopViewReader for startup; we'll verify via ShardDb scan directly.
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // DDL: table + filter view
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW big_orders AS \
+             SELECT id, amount FROM orders WHERE amount > 50",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW");
+
+    // DML: two rows, one above the filter threshold, one below
+    client
+        .simple_query("SET rockstream.idempotency_key = 'last-hop-001'")
+        .await
+        .expect("SET idempotency_key");
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (1, 100)")
+        .await
+        .expect("INSERT row 1");
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (2, 10)")
+        .await
+        .expect("INSERT row 2");
+    client.simple_query("COMMIT").await.expect("COMMIT");
+
+    // Flush so data is durably in the object store (needed for ShardReader).
+    shard_db.flush().await.unwrap();
+
+    // Verify: base table has 2 rows
+    let base_rows = shard_db
+        .scan_prefix(b"view_output/orders/")
+        .await
+        .unwrap();
+    assert_eq!(base_rows.len(), 2, "orders should have 2 rows");
+
+    // Verify: the materialiser wrote big_orders — only the row with amount=100
+    let view_rows = shard_db
+        .scan_prefix(b"view_output/big_orders/")
+        .await
+        .unwrap();
+    assert_eq!(
+        view_rows.len(),
+        1,
+        "big_orders should have exactly 1 row (amount=100 passes WHERE amount > 50); \
+         got {}: {:?}",
+        view_rows.len(),
+        view_rows
+            .iter()
+            .map(|(_, v)| String::from_utf8_lossy(v).to_string())
+            .collect::<Vec<_>>()
+    );
+    let row_str = String::from_utf8_lossy(&view_rows[0].1);
+    assert!(
+        row_str.contains("100"),
+        "big_orders row should contain amount=100; got: {row_str}"
+    );
+    assert!(
+        !row_str.contains('\t') || !row_str.ends_with("10"),
+        "big_orders must not contain the low-amount row"
+    );
+}
+
+/// Last-hop with a GROUP BY aggregate view: COUNT(*) and SUM() produce
+/// correct values in the serving shard after COMMIT.
+#[tokio::test]
+async fn last_hop_aggregate_view_materialised_after_commit() {
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("last-hop-agg-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query("CREATE TABLE clicks (user_id BIGINT, url TEXT, ts BIGINT)")
+        .await
+        .expect("CREATE TABLE clicks");
+    client
+        .simple_query(
+            "CREATE VIEW page_hits AS \
+             SELECT url, COUNT(*) AS hits FROM clicks GROUP BY url",
+        )
+        .await
+        .expect("CREATE VIEW page_hits");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'last-hop-agg-001'")
+        .await
+        .expect("SET");
+    // 3 clicks: /home × 2, /pricing × 1
+    client
+        .simple_query("INSERT INTO clicks (user_id, url, ts) VALUES (1, '/home', 100)")
+        .await
+        .expect("INSERT 1");
+    client
+        .simple_query("INSERT INTO clicks (user_id, url, ts) VALUES (2, '/home', 101)")
+        .await
+        .expect("INSERT 2");
+    client
+        .simple_query("INSERT INTO clicks (user_id, url, ts) VALUES (3, '/pricing', 102)")
+        .await
+        .expect("INSERT 3");
+    client.simple_query("COMMIT").await.expect("COMMIT");
+
+    shard_db.flush().await.unwrap();
+
+    // page_hits should have 2 rows (one per URL)
+    let view_rows = shard_db
+        .scan_prefix(b"view_output/page_hits/")
+        .await
+        .unwrap();
+    assert_eq!(
+        view_rows.len(),
+        2,
+        "page_hits should have 2 rows (one per URL); got {}",
+        view_rows.len()
+    );
+
+    // Parse hits from TSV rows: `url\thits`
+    let mut hit_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (_, v) in &view_rows {
+        let s = String::from_utf8_lossy(v);
+        let parts: Vec<&str> = s.split('\t').collect();
+        if parts.len() >= 2 {
+            let url = parts[0].to_string();
+            let hits: i64 = parts[1].parse().unwrap_or(0);
+            hit_map.insert(url, hits);
+        }
+    }
+    assert_eq!(
+        hit_map.get("/home").copied(),
+        Some(2),
+        "expected /home hits=2; got: {hit_map:?}"
+    );
+    assert_eq!(
+        hit_map.get("/pricing").copied(),
+        Some(1),
+        "expected /pricing hits=1; got: {hit_map:?}"
+    );
+}
+
+/// Last-hop SELECT: after INSERT+COMMIT, a SELECT over the view returns rows
+/// via the ShardReader-backed HotOnlyViewReader.
+///
+/// This is the full end-to-end path: DML → materialiser → ShardReader → SELECT.
+#[tokio::test]
+async fn last_hop_select_returns_rows_after_commit() {
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("last-hop-select-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+
+    // Start gateway with a NoopViewReader initially — we'll swap the
+    // catalog to verify rows in the shard; the SELECT path uses HotOnlyViewReader
+    // opened after the flush so it sees the materialised output.
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server =
+        GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW high_value AS \
+             SELECT id, amount FROM orders WHERE amount > 100",
+        )
+        .await
+        .expect("CREATE VIEW high_value");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'last-hop-select-001'")
+        .await
+        .expect("SET");
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (10, 200)")
+        .await
+        .expect("INSERT 200");
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (11, 50)")
+        .await
+        .expect("INSERT 50");
+    client.simple_query("COMMIT").await.expect("COMMIT");
+
+    // Flush so the materialiser's output is visible to a ShardReader.
+    shard_db.flush().await.unwrap();
+
+    // Open a fresh ShardReader AFTER the flush so it reads the latest SSTables.
+    let reader = ShardReader::open("last-hop-select-shard", store.clone())
+        .await
+        .unwrap();
+    let hot_reader = Arc::new(HotOnlyViewReader {
+        shard_reader: Arc::new(reader),
+        frontier_epoch: None,
+    });
+
+    // Use a second gateway instance backed by the same shard but with the live reader.
+    let addr2: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server2 =
+        GatewayServer::with_catalog(addr2, catalog.clone(), hot_reader);
+    let (local_addr2, _handle2) = server2.serve_background().await.unwrap();
+    let client2 = connect_port(local_addr2.port()).await;
+
+    // SELECT from high_value — should return 1 row (amount=200 > 100)
+    let rows = client2
+        .simple_query("SELECT * FROM high_value")
+        .await
+        .expect("SELECT high_value");
+
+    let data_rows: Vec<_> = rows
+        .iter()
+        .filter_map(|m| {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+                Some(r)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        data_rows.len(),
+        1,
+        "SELECT high_value should return 1 row (amount=200); got {}: {:?}",
+        data_rows.len(),
+        data_rows
+            .iter()
+            .map(|r| format!("({:?},{:?})", r.get(0), r.get(1)))
+            .collect::<Vec<_>>()
+    );
+    // Verify the amount column
+    let amount_val = data_rows[0].get(1).unwrap_or("");
+    assert_eq!(
+        amount_val, "200",
+        "expected amount=200 in high_value row; got {amount_val}"
+    );
+}
