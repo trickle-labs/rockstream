@@ -2449,3 +2449,247 @@ async fn last_hop_select_returns_rows_after_commit() {
         "expected amount=200 in high_value row; got {amount_val}"
     );
 }
+
+// ── Tutorial DAG: 3-level view chain (aggregate → join → filter) ─────────────
+
+/// Validates the 3-level DAG shown in the 30-minute tutorial:
+///
+///   campaigns ──────────────────────────────────┐
+///                                               ▼
+///   conversions → campaign_totals → campaign_report → high_performers
+///
+/// Proves that:
+/// 1. An aggregate view over a base table materialises correctly.
+/// 2. A join view (base table ⋈ aggregate view) materialises correctly.
+/// 3. A filter materialized view on the join view materialises correctly.
+/// 4. Inserting more data that crosses the threshold updates high_performers.
+#[tokio::test]
+async fn tutorial_dag_three_level_chain_materialises_correctly() {
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("tutorial-dag-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server =
+        GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // ── DDL: two base tables ─────────────────────────────────────────────────
+    client
+        .simple_query(
+            "CREATE TABLE campaigns \
+             (campaign_id BIGINT, name TEXT, channel TEXT, budget BIGINT)",
+        )
+        .await
+        .expect("CREATE TABLE campaigns");
+
+    client
+        .simple_query(
+            "CREATE TABLE conversions \
+             (conv_id BIGINT, campaign_id BIGINT, revenue BIGINT, ts BIGINT)",
+        )
+        .await
+        .expect("CREATE TABLE conversions");
+
+    // ── DDL: 3-level view chain ──────────────────────────────────────────────
+    // Level 1: aggregate conversions per campaign
+    client
+        .simple_query(
+            "CREATE VIEW campaign_totals AS \
+             SELECT campaign_id, COUNT(*) AS conv_count, SUM(revenue) AS total_revenue \
+             FROM conversions GROUP BY campaign_id",
+        )
+        .await
+        .expect("CREATE VIEW campaign_totals");
+
+    // Level 2: join aggregate view with base table
+    client
+        .simple_query(
+            "CREATE VIEW campaign_report AS \
+             SELECT c.name, c.channel, t.conv_count, t.total_revenue \
+             FROM campaigns c JOIN campaign_totals t ON c.campaign_id = t.campaign_id",
+        )
+        .await
+        .expect("CREATE VIEW campaign_report");
+
+    // Level 3: filter materialized view on join view
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW high_performers AS \
+             SELECT name, channel, total_revenue \
+             FROM campaign_report WHERE total_revenue > 500",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW high_performers");
+
+    // ── Transaction 1: seed campaigns ────────────────────────────────────────
+    client
+        .simple_query("SET rockstream.idempotency_key = 'tutorial-dag-txn-001'")
+        .await
+        .expect("SET idempotency_key 1");
+    client
+        .simple_query("INSERT INTO campaigns (campaign_id, name, channel, budget) VALUES (1, 'Summer Sale', 'email', 5000)")
+        .await
+        .expect("INSERT campaign 1");
+    client
+        .simple_query("INSERT INTO campaigns (campaign_id, name, channel, budget) VALUES (2, 'Brand Awareness', 'social', 3000)")
+        .await
+        .expect("INSERT campaign 2");
+    client
+        .simple_query("INSERT INTO campaigns (campaign_id, name, channel, budget) VALUES (3, 'Retargeting', 'display', 2000)")
+        .await
+        .expect("INSERT campaign 3");
+    client.simple_query("COMMIT").await.expect("COMMIT 1");
+
+    // After seeding campaigns: campaign_report and high_performers should be
+    // empty because no conversions exist yet (JOIN produces no rows).
+    shard_db.flush().await.unwrap();
+    let hp_rows = shard_db
+        .scan_prefix(b"view_output/high_performers/")
+        .await
+        .unwrap();
+    assert_eq!(
+        hp_rows.len(),
+        0,
+        "high_performers should be empty before any conversions; got {}",
+        hp_rows.len()
+    );
+
+    // ── Transaction 2: first batch of conversions ─────────────────────────────
+    // campaign 1 (Summer Sale): 2 conversions totalling 550 → above threshold
+    // campaign 2 (Brand Awareness): 1 conversion of 150 → below threshold
+    // campaign 3 (Retargeting): 1 conversion of 600 → above threshold
+    client
+        .simple_query("SET rockstream.idempotency_key = 'tutorial-dag-txn-002'")
+        .await
+        .expect("SET idempotency_key 2");
+    client
+        .simple_query("INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (101, 1, 300, 1000)")
+        .await
+        .expect("INSERT conv 101");
+    client
+        .simple_query("INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (102, 1, 250, 1001)")
+        .await
+        .expect("INSERT conv 102");
+    client
+        .simple_query("INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (103, 2, 150, 1002)")
+        .await
+        .expect("INSERT conv 103");
+    client
+        .simple_query("INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (104, 3, 600, 1003)")
+        .await
+        .expect("INSERT conv 104");
+    client.simple_query("COMMIT").await.expect("COMMIT 2");
+
+    shard_db.flush().await.unwrap();
+
+    // campaign_totals: 3 rows (one per campaign)
+    let ct_rows = shard_db
+        .scan_prefix(b"view_output/campaign_totals/")
+        .await
+        .unwrap();
+    assert_eq!(
+        ct_rows.len(),
+        3,
+        "campaign_totals should have 3 rows; got {}",
+        ct_rows.len()
+    );
+
+    // campaign_report: 3 rows (inner join matched all 3 campaigns)
+    let cr_rows = shard_db
+        .scan_prefix(b"view_output/campaign_report/")
+        .await
+        .unwrap();
+    assert_eq!(
+        cr_rows.len(),
+        3,
+        "campaign_report should have 3 rows; got {}",
+        cr_rows.len()
+    );
+
+    // high_performers: 2 rows (Summer Sale=550 and Retargeting=600 exceed 500;
+    //                          Brand Awareness=150 does not)
+    let hp_rows = shard_db
+        .scan_prefix(b"view_output/high_performers/")
+        .await
+        .unwrap();
+    assert_eq!(
+        hp_rows.len(),
+        2,
+        "high_performers should have 2 rows (total_revenue > 500); got {}: {:?}",
+        hp_rows.len(),
+        hp_rows
+            .iter()
+            .map(|(_, v)| String::from_utf8_lossy(v).to_string())
+            .collect::<Vec<_>>()
+    );
+
+    // Verify the high_performers rows contain the expected names
+    let hp_names: Vec<String> = hp_rows
+        .iter()
+        .map(|(_, v)| {
+            let s = String::from_utf8_lossy(v);
+            s.split('\t').next().unwrap_or("").to_string()
+        })
+        .collect();
+    assert!(
+        hp_names.contains(&"Summer Sale".to_string()),
+        "high_performers must contain 'Summer Sale'; got: {hp_names:?}"
+    );
+    assert!(
+        hp_names.contains(&"Retargeting".to_string()),
+        "high_performers must contain 'Retargeting'; got: {hp_names:?}"
+    );
+    assert!(
+        !hp_names.contains(&"Brand Awareness".to_string()),
+        "high_performers must NOT contain 'Brand Awareness' (revenue 150 < 500); got: {hp_names:?}"
+    );
+
+    // ── Transaction 3: Brand Awareness crosses the threshold ──────────────────
+    // One more conversion worth 400 pushes campaign 2 from 150 to 550 (> 500).
+    client
+        .simple_query("SET rockstream.idempotency_key = 'tutorial-dag-txn-003'")
+        .await
+        .expect("SET idempotency_key 3");
+    client
+        .simple_query("INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (105, 2, 400, 1004)")
+        .await
+        .expect("INSERT conv 105");
+    client.simple_query("COMMIT").await.expect("COMMIT 3");
+
+    shard_db.flush().await.unwrap();
+
+    // high_performers: now 3 rows — Brand Awareness (150+400=550) joined the club
+    let hp_rows = shard_db
+        .scan_prefix(b"view_output/high_performers/")
+        .await
+        .unwrap();
+    assert_eq!(
+        hp_rows.len(),
+        3,
+        "after threshold crossing, high_performers should have 3 rows; got {}: {:?}",
+        hp_rows.len(),
+        hp_rows
+            .iter()
+            .map(|(_, v)| String::from_utf8_lossy(v).to_string())
+            .collect::<Vec<_>>()
+    );
+
+    let hp_names_final: Vec<String> = hp_rows
+        .iter()
+        .map(|(_, v)| {
+            let s = String::from_utf8_lossy(v);
+            s.split('\t').next().unwrap_or("").to_string()
+        })
+        .collect();
+    assert!(
+        hp_names_final.contains(&"Brand Awareness".to_string()),
+        "Brand Awareness should now be in high_performers (revenue 550 > 500); got: {hp_names_final:?}"
+    );
+}

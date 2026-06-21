@@ -996,7 +996,7 @@ impl GatewayHandler {
         }
 
         Ok(vec![promote_response(Response::Execution(
-            Tag::new("INSERT 0 1").with_rows(1),
+            Tag::new("INSERT").with_oid(0u32).with_rows(1),
         ))])
     }
 

@@ -284,14 +284,29 @@ protocol, so the same connection works from your application code.
 This is the heart of RockStream: you describe the answers you want as **views**,
 and the engine maintains them. Views can depend on other views, forming a
 **directed acyclic graph (DAG)** — raw events at the roots, refined and
-aggregated results at the leaves. Let's build one for a tiny clickstream +
-orders analytics workload.
+aggregated results at the leaves.
+
+Let's build a real campaign-analytics workload: two base tables, an aggregate
+view, a join view on top of that aggregate, and finally a filter materialized
+view on top of the join — a **three-level chain** where every commit ripples data
+all the way from raw events to a served result.
 
 Still connected with `psql`, declare two base tables:
 
 ```sql
-CREATE TABLE clicks (user_id INT, url TEXT, ts BIGINT);
-CREATE TABLE orders (order_id INT, user_id INT, amount INT, ts BIGINT);
+CREATE TABLE campaigns (
+  campaign_id BIGINT,
+  name        TEXT,
+  channel     TEXT,
+  budget      BIGINT
+);
+
+CREATE TABLE conversions (
+  conv_id     BIGINT,
+  campaign_id BIGINT,
+  revenue     BIGINT,
+  ts          BIGINT
+);
 ```
 
 ```text
@@ -299,55 +314,84 @@ CREATE TABLE 0
 CREATE TABLE 0
 ```
 
-Now layer views on top. The first branch turns raw clicks into a per-URL hit
-count, then ranks the busiest pages:
+Now layer three views on top, each building on the one before it.
+
+**Level 1 — aggregate raw events per campaign:**
 
 ```sql
-CREATE VIEW page_hits AS
-  SELECT url, COUNT(*) AS hits
-  FROM clicks
-  GROUP BY url;
-
-CREATE MATERIALIZED VIEW top_pages AS
-  SELECT url, hits
-  FROM page_hits
-  ORDER BY hits DESC
-  LIMIT 10;
+CREATE VIEW campaign_totals AS
+  SELECT campaign_id,
+         COUNT(*)      AS conv_count,
+         SUM(revenue)  AS total_revenue
+  FROM conversions
+  GROUP BY campaign_id;
 ```
 
-The second branch turns raw orders into per-user spend, then isolates the big
-spenders:
+`campaign_totals` answers the question *"how many conversions and how much revenue
+did each campaign generate?"* entirely from the `conversions` table.
+
+**Level 2 — join the aggregate back to the campaign catalog:**
 
 ```sql
-CREATE VIEW user_spend AS
-  SELECT user_id, SUM(amount) AS spend
-  FROM orders
-  GROUP BY user_id;
-
-CREATE MATERIALIZED VIEW big_spenders AS
-  SELECT user_id, spend
-  FROM user_spend
-  WHERE spend > 1000;
+CREATE VIEW campaign_report AS
+  SELECT c.name, c.channel, t.conv_count, t.total_revenue
+  FROM campaigns c
+  JOIN campaign_totals t ON c.campaign_id = t.campaign_id;
 ```
 
-Each statement returns its command tag (the gateway prints `CREATE VIEW 0` /
-`CREATE MATERIALIZED VIEW 0` — the trailing `0` is a row count) as the engine
-registers the definition and records its dependencies. What you have built is
-this DAG:
+`campaign_report` **joins a base table with a derived view**. It reads the
+human-readable name and channel from `campaigns` and staples the running totals
+from `campaign_totals` onto each row. Notice that `campaign_totals` is itself a
+view — the engine resolves the dependency chain and processes them in the correct
+topological order.
+
+**Level 3 — filter to only the high performers:**
+
+```sql
+CREATE MATERIALIZED VIEW high_performers AS
+  SELECT name, channel, total_revenue
+  FROM campaign_report
+  WHERE total_revenue > 500;
+```
+
+Each statement returns its command tag as the engine registers the definition and
+records its dependencies:
+
+```text
+CREATE VIEW 0
+CREATE VIEW 0
+CREATE MATERIALIZED VIEW 0
+```
+
+What you have built is this DAG — data flows left to right; a commit to any node
+ripples downstream automatically:
 
 ```mermaid
 flowchart LR
-    clicks[("clicks<br/><i>base table</i>")] --> page_hits["page_hits<br/>GROUP BY url, COUNT(*)"]
-    page_hits --> top_pages[["top_pages<br/>ORDER BY hits DESC<br/><i>materialized</i>"]]
-    orders[("orders<br/><i>base table</i>")] --> user_spend["user_spend<br/>GROUP BY user_id, SUM(amount)"]
-    user_spend --> big_spenders[["big_spenders<br/>WHERE spend &gt; 1000<br/><i>materialized</i>"]]
+    campaigns[("campaigns\nbase table")]
+    conversions[("conversions\nbase table")]
+
+    conversions --> campaign_totals["campaign_totals\nGROUP BY campaign_id\nCOUNT · SUM(revenue)"]
+    campaigns --> campaign_report
+    campaign_totals --> campaign_report["campaign_report\nJOIN campaigns ⋈ campaign_totals\nname · channel · conv_count · total_revenue"]
+    campaign_report --> high_performers[["high_performers\nWHERE total_revenue > 500\nmaterialized"]]
 ```
 
-The difference between a plain `VIEW` and a `MATERIALIZED VIEW` here is intent:
-both are compiled into the incremental operator graph, but a materialized view is
-one whose output RockStream keeps durably in SlateDB so it can be read back and
-subscribed to. In a fully-wired pipeline, a single `INSERT INTO clicks` would
-ripple through `page_hits` into `top_pages` as a small delta — never a re-scan.
+The difference between a plain `VIEW` and a `MATERIALIZED VIEW` is intent: both
+are compiled into the operator graph, but a materialized view's output is kept
+durably in SlateDB and can be subscribed to. In the fully-wired incremental path,
+a single `INSERT INTO conversions` produces a **Z-set delta** that propagates
+through `campaign_totals` → `campaign_report` → `high_performers` by applying
+only the differential change at each hop — no re-scan of history.
+
+### How a commit triggers the full chain
+
+After every `COMMIT`, the gateway identifies which base tables were written and
+**topologically sorts** all transitively dependent views. It then re-evaluates
+them in order using DataFusion's in-memory engine and writes each output back to
+the serving shard. A view-of-a-view works because the materializer processes
+`campaign_totals` first, caches its output schema, and feeds that output as the
+input to `campaign_report` — all within a single pass.
 
 ### The engine guards the graph: cycle detection
 
@@ -373,24 +417,20 @@ Notice the error carries an `RS-XXXX` code *and* the exact path that forms the
 cycle. Every operator-visible failure in RockStream is structured this way — a
 hard rule the CI enforces.
 
-### Reading a view
-
-You can read from any view you've created:
+### Reading a view before any data arrives
 
 ```sql
-SELECT * FROM top_pages LIMIT 10;
+SELECT * FROM high_performers;
 ```
 
 ```text
- url   | hits
--------+------
+ name | channel | total_revenue
+------+---------+---------------
 (0 rows)
 ```
 
-Zero rows here — because `clicks` has no rows yet. Insert some and commit,
-and `top_pages` will contain live data. The gateway re-evaluates every
-dependent view after each `COMMIT` and writes the output into the serving
-shard, so a `SELECT` after any write returns current rows. You will see this
+Zero rows — no conversions yet, so the join produces nothing. Insert some data
+and `high_performers` will contain live results immediately. You will see this
 end to end in Part 5.
 
 ### Inspect the plan
@@ -399,14 +439,14 @@ Ask the engine how it would execute a read, including whether it can push a
 partial aggregate down to the shards:
 
 ```sql
-EXPLAIN SELECT url, hits FROM page_hits;
+EXPLAIN SELECT name, channel, total_revenue FROM campaign_report;
 ```
 
 ```text
                QUERY PLAN
 -----------------------------------------
  Plan: SeqScan → partial_pushdown: false
- Query: SELECT url, hits FROM page_hits
+ Query: SELECT name, channel, total_revenue FROM campaign_report
 (1 row)
 ```
 
@@ -416,7 +456,7 @@ Beyond point reads, the gateway speaks a streaming `SUBSCRIBE` command — the
 basis for live dashboards that receive deltas as the view changes:
 
 ```sql
-SUBSCRIBE top_pages;
+SUBSCRIBE high_performers;
 ```
 
 ```text
@@ -425,7 +465,7 @@ OK
 
 ---
 
-## Part 5 — Transactional Writes
+## Part 5 — Transactional Writes: Data Flowing Through the DAG
 
 RockStream accepts direct-write DML (`INSERT`/`UPDATE`/`DELETE`) over the same
 connection. Writes accumulate in a per-connection **write buffer** and are
@@ -433,75 +473,179 @@ flushed atomically on `COMMIT`. To make commits safely retryable, RockStream
 requires an **idempotency key** per committing transaction — re-sending the same
 key never double-applies the writes.
 
+We'll drive three transactions through the DAG to see exactly what happens at
+each level.
+
+### Transaction 1 — seed the campaign catalog
+
 ```sql
 SET rockstream.idempotency_key = 'demo-txn-001';
 
-BEGIN;
-INSERT INTO clicks VALUES (1, '/home', 100);
-INSERT INTO clicks VALUES (2, '/home', 101);
-INSERT INTO clicks VALUES (3, '/pricing', 102);
+INSERT INTO campaigns (campaign_id, name, channel, budget)
+  VALUES (1, 'Summer Sale',     'email',   5000),
+         (2, 'Brand Awareness', 'social',  3000),
+         (3, 'Retargeting',     'display', 2000);
 COMMIT;
 ```
 
 ```text
 SET
-BEGIN 0
-INSERT 0 1 1
-INSERT 0 1 1
-INSERT 0 1 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
 COMMIT 3
 ```
 
-The `COMMIT 3` confirms three buffered writes were flushed to the shard
-atomically. (If you forget the idempotency key, the commit is refused with
-`RS-2007` — that is the engine protecting you from accidental double-writes.)
+The `COMMIT 3` confirms three buffered writes were flushed atomically. (If you
+forget the idempotency key, the commit is refused with `RS-2007` — that is the
+engine protecting you from accidental double-writes.)
 
-> **Reproducibility note.** In this build, the per-statement `INSERT` command tag
-> is slightly verbose, and a strict client such as `psql` 18 may print a benign
-> `could not interpret result from server: INSERT 0 1 1` notice for each row. The
-> write still succeeds; the `COMMIT` tag is the authoritative count.
-
-Now the views are live. Query `page_hits` to see the aggregated hit counts:
+After this commit the gateway re-evaluates `campaign_totals` and `campaign_report`
+— but `conversions` is still empty, so the join produces nothing:
 
 ```sql
-SELECT * FROM page_hits;
+SELECT * FROM campaign_report;
 ```
 
 ```text
-     url      | hits
---------------+------
- /home        |    2
- /pricing     |    1
-(2 rows)
+ name | channel | conv_count | total_revenue
+------+---------+------------+---------------
+(0 rows)
 ```
 
-Every `COMMIT` triggers a re-evaluation of every view that transitively
-depends on the changed tables. The gateway executes the view SQL using
-DataFusion's in-memory engine over the current shard state and writes the
-output back to the serving shard in one batch.  A subsequent `SELECT` always
-returns the result of the last commit.
+No rows yet — campaign names live in `campaigns`, but there are no conversions to
+join against. `high_performers` is similarly empty.
 
-Add some orders and check `big_spenders`:
+### Transaction 2 — first wave of conversions
 
 ```sql
 SET rockstream.idempotency_key = 'demo-txn-002';
-BEGIN;
-INSERT INTO orders VALUES (1, 101, 1500, 200);
-INSERT INTO orders VALUES (2, 102, 200, 201);
-COMMIT;
 
-SELECT * FROM big_spenders;
+-- Summer Sale:     two conversions, 300 + 250 = 550  (above threshold)
+-- Brand Awareness: one conversion, 150              (below threshold)
+-- Retargeting:     one conversion, 600              (above threshold)
+INSERT INTO conversions (conv_id, campaign_id, revenue, ts)
+  VALUES (101, 1, 300, 1000),
+         (102, 1, 250, 1001),
+         (103, 2, 150, 1002),
+         (104, 3, 600, 1003);
+COMMIT;
 ```
 
 ```text
- user_id | spend
----------+-------
-     101 |  1500
-(1 row)
+COMMIT 4
 ```
 
-User 102 spent only 200, which is below the `WHERE spend > 1000` threshold,
-so only user 101 appears.
+Now inspect each level of the DAG:
+
+```sql
+SELECT * FROM campaign_totals ORDER BY campaign_id;
+```
+
+```text
+ campaign_id | conv_count | total_revenue
+-------------+------------+---------------
+           1 |          2 |           550
+           2 |          1 |           150
+           3 |          1 |           600
+(3 rows)
+```
+
+The aggregate view has fresh numbers for every campaign. Now the join view:
+
+```sql
+SELECT * FROM campaign_report ORDER BY name;
+```
+
+```text
+      name       | channel | conv_count | total_revenue
+-----------------+---------+------------+---------------
+ Brand Awareness | social  |          1 |           150
+ Retargeting     | display |          1 |           600
+ Summer Sale     | email   |          2 |           550
+(3 rows)
+```
+
+`campaign_report` joined the human-readable names from `campaigns` onto the
+running totals computed by `campaign_totals`. And the materialized filter:
+
+```sql
+SELECT * FROM high_performers ORDER BY total_revenue DESC;
+```
+
+```text
+     name     | channel | total_revenue
+--------------+---------+---------------
+ Retargeting  | display |           600
+ Summer Sale  | email   |           550
+(2 rows)
+```
+
+Two campaigns cleared the `total_revenue > 500` threshold.
+`Brand Awareness` (150) did not, so it is absent from `high_performers`.
+
+Every `COMMIT` triggers re-evaluation of every view that transitively depends on
+the changed tables. The gateway executes the view SQL using DataFusion's
+in-memory engine over the current shard state and writes the output back in one
+batch. A subsequent `SELECT` always returns the result of the last commit.
+
+### Transaction 3 — a threshold crossing in real time
+
+One more conversion arrives for `Brand Awareness`: 400 in revenue. Combined with
+the 150 already recorded, its total crosses 500.
+
+```sql
+SET rockstream.idempotency_key = 'demo-txn-003';
+
+INSERT INTO conversions (conv_id, campaign_id, revenue, ts)
+  VALUES (105, 2, 400, 1004);
+COMMIT;
+```
+
+```text
+COMMIT 1
+```
+
+Query `campaign_totals` to confirm the aggregate updated:
+
+```sql
+SELECT * FROM campaign_totals ORDER BY campaign_id;
+```
+
+```text
+ campaign_id | conv_count | total_revenue
+-------------+------------+---------------
+           1 |          2 |           550
+           2 |          2 |           550
+           3 |          1 |           600
+(3 rows)
+```
+
+Campaign 2 now has `conv_count=2` and `total_revenue=550`. And the payoff —
+`high_performers` now lists all three campaigns:
+
+```sql
+SELECT * FROM high_performers ORDER BY total_revenue DESC;
+```
+
+```text
+     name        | channel | total_revenue
+-----------------+---------+---------------
+ Retargeting     | display |           600
+ Brand Awareness | social  |           550
+ Summer Sale     | email   |           550
+(3 rows)
+```
+
+`Brand Awareness` joined the club — a single INSERT into `conversions` rippled
+through the full 3-level chain (`campaign_totals` → `campaign_report` →
+`high_performers`) and updated the served result without any re-scan of history.
+
+This entire scenario — three transactions, three campaigns, threshold crossing —
+is validated by the green-gate test
+`tutorial_dag_three_level_chain_materialises_correctly` in
+[gateway_proof_tests.rs](../crates/rockstream-gateway/tests/gateway_proof_tests.rs).
+Every assertion you just observed interactively is also a machine-checked proof.
 
 When you are done exploring, return to the first terminal and press **Ctrl-C**.
 The node shuts the gateway down cleanly and writes its audit log and support
@@ -542,7 +686,8 @@ The SQL frontend compiles a query into the operator graph and maintains it as
 data streams in. The end-to-end test in
 [crates/rockstream-sql/tests/sql_engine_e2e.rs](../crates/rockstream-sql/tests/sql_engine_e2e.rs)
 maintains exactly the kind of view DAG you built in Part 4 — a join feeding an
-aggregate:
+aggregate. The query is structurally identical to `campaign_report` stacked on
+`campaign_totals`, but in the operator-level test it uses a TPC-H-style schema:
 
 ```sql
 CREATE VIEW revenue AS
@@ -742,15 +887,18 @@ artifacts you built scale along it:
    over gRPC shuffles, and coordinating through the frontier protocol.
 
 The last hop — re-evaluating dependent views after every `COMMIT` and writing
-their output into the serving shard — is now wired and proven by three new
-green-gate tests in
+their output into the serving shard — is now wired and proven by four green-gate
+tests in
 [gateway_proof_tests.rs](../crates/rockstream-gateway/tests/gateway_proof_tests.rs):
 `last_hop_view_materialised_after_commit`,
-`last_hop_aggregate_view_materialised_after_commit`, and
-`last_hop_select_returns_rows_after_commit`. The current implementation
-re-evaluates views in batch using DataFusion after every commit; the
-incremental Z-set path (proportional to the *change*, not the history) is
-proven in the oracle harness (Part 6) and is the next productization step.
+`last_hop_aggregate_view_materialised_after_commit`,
+`last_hop_select_returns_rows_after_commit`, and
+`tutorial_dag_three_level_chain_materialises_correctly` — the last one exercises
+the exact campaign analytics DAG from Parts 4 and 5, including the threshold
+crossing in transaction 3. The current implementation re-evaluates views in batch
+using DataFusion after every commit; the incremental Z-set path (proportional to
+the *change*, not the history) is proven in the oracle harness (Part 6) and is
+the next productization step.
 The full build sequence is in [NEW_ROADMAP.md](../NEW_ROADMAP.md). Every
 "Done" version has a sign-off file under [sign-offs/](../sign-offs/).
 
@@ -770,11 +918,14 @@ The full build sequence is in [NEW_ROADMAP.md](../NEW_ROADMAP.md). Every
 2. Built the workspace and inspected the single `rockstream` binary.
 3. Booted a node and **connected to it with a real `psql` client** over the
    PostgreSQL wire protocol.
-4. Assembled a **DAG of materialized views**, watched the engine reject a cycle
-   with `RS-1011`, and inspected a plan.
-5. Ran transactional DML and watched the **last hop** deliver live rows from
-   `COMMIT` straight through to `SELECT` — `page_hits` and `big_spenders`
-   returned correct aggregated results immediately after each write.
+4. Assembled a **three-level DAG of materialized views** — an aggregate view,
+   a join view, and a filter materialized view — watched the engine reject a
+   cycle with `RS-1011`, and inspected a plan.
+5. Ran three transactional DML batches and watched the **last hop** propagate
+   each commit through the full 3-level chain: `campaign_totals` →
+   `campaign_report` → `high_performers`. Observed a threshold crossing in real
+   time as a single `INSERT` moved `Brand Awareness` from absent to present in
+   the materialized result.
 6. Read the audit log and support bundle the node produced.
 7. Ran the oracle and SQL proofs that demonstrate `incremental == batch` for real
    operators and a real `JOIN … GROUP BY` view DAG.
