@@ -202,8 +202,14 @@ mod proptest_oracle {
         // Expected: (pk=1, v=10, id=1)
         let mut expected = BTreeMap::new();
         expected.insert((1i64, 10i64, 1i64), 1i64);
-        assert_eq!(incr_live, expected, "K=1 must select the highest value v=10");
-        assert_eq!(incr_live, batch_live, "incremental must match batch reference");
+        assert_eq!(
+            incr_live, expected,
+            "K=1 must select the highest value v=10"
+        );
+        assert_eq!(
+            incr_live, batch_live,
+            "incremental must match batch reference"
+        );
     }
 
     /// Deleting the current top-1 element must promote the next-best row.
@@ -226,7 +232,10 @@ mod proptest_oracle {
         let after_e1 = positive_entries(&incr_output);
         let mut exp_e1 = BTreeMap::new();
         exp_e1.insert((1i64, 10i64, 1i64), 1i64);
-        assert_eq!(after_e1, exp_e1, "after epoch 1: top-1 must be (pk=1,v=10,id=1)");
+        assert_eq!(
+            after_e1, exp_e1,
+            "after epoch 1: top-1 must be (pk=1,v=10,id=1)"
+        );
 
         // epoch 2: retract (v=10, id=1, pk=1) — top-1 must fall back to v=8
         let epoch2: Vec<(i64, i64, i64, i64)> = vec![(10, 1, 1, -1)];
@@ -240,8 +249,14 @@ mod proptest_oracle {
 
         let mut exp_e2 = BTreeMap::new();
         exp_e2.insert((1i64, 8i64, 2i64), 1i64); // (pk=1, v=8, id=2)
-        assert_eq!(after_e2, exp_e2, "after retraction of top element: v=8 must become top-1");
-        assert_eq!(after_e2, batch_e2, "incremental must equal batch after retraction");
+        assert_eq!(
+            after_e2, exp_e2,
+            "after retraction of top element: v=8 must become top-1"
+        );
+        assert_eq!(
+            after_e2, batch_e2,
+            "incremental must equal batch after retraction"
+        );
     }
 
     /// K=1 applied to two partitions must independently select the top row per partition.
@@ -253,7 +268,8 @@ mod proptest_oracle {
         let mut input_state: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
         let mut incr_output: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
 
-        let epoch: Vec<(i64, i64, i64, i64)> = vec![(10, 1, 1, 1), (5, 2, 1, 1), (3, 3, 2, 1), (7, 4, 2, 1)];
+        let epoch: Vec<(i64, i64, i64, i64)> =
+            vec![(10, 1, 1, 1), (5, 2, 1, 1), (3, 3, 2, 1), (7, 4, 2, 1)];
         let b = make_batch(&epoch);
         accumulate_state(&mut input_state, &b);
         let out = op.process_epoch(b, 1).unwrap();
@@ -265,8 +281,14 @@ mod proptest_oracle {
         let mut expected = BTreeMap::new();
         expected.insert((1i64, 10i64, 1i64), 1i64);
         expected.insert((2i64, 7i64, 4i64), 1i64);
-        assert_eq!(incr_live, expected, "K=1 per partition: wrong winners selected");
-        assert_eq!(incr_live, batch_live, "incremental must match batch reference");
+        assert_eq!(
+            incr_live, expected,
+            "K=1 per partition: wrong winners selected"
+        );
+        assert_eq!(
+            incr_live, batch_live,
+            "incremental must match batch reference"
+        );
     }
 
     /// K=2 must return the two highest-value rows and not the third.
@@ -277,7 +299,8 @@ mod proptest_oracle {
         let mut input_state: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
         let mut incr_output: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
 
-        let epoch: Vec<(i64, i64, i64, i64)> = vec![(3, 4, 1, 1), (10, 1, 1, 1), (8, 2, 1, 1), (5, 3, 1, 1)];
+        let epoch: Vec<(i64, i64, i64, i64)> =
+            vec![(3, 4, 1, 1), (10, 1, 1, 1), (8, 2, 1, 1), (5, 3, 1, 1)];
         let b = make_batch(&epoch);
         accumulate_state(&mut input_state, &b);
         let out = op.process_epoch(b, 1).unwrap();
@@ -289,8 +312,14 @@ mod proptest_oracle {
         let mut expected = BTreeMap::new();
         expected.insert((1i64, 10i64, 1i64), 1i64);
         expected.insert((1i64, 8i64, 2i64), 1i64);
-        assert_eq!(incr_live, expected, "K=2 must return only the two highest-value rows");
-        assert_eq!(incr_live, batch_live, "incremental must match batch reference");
+        assert_eq!(
+            incr_live, expected,
+            "K=2 must return only the two highest-value rows"
+        );
+        assert_eq!(
+            incr_live, batch_live,
+            "incremental must match batch reference"
+        );
     }
 
     /// Inserting a new row with a higher value than the current top-K must displace
@@ -321,8 +350,14 @@ mod proptest_oracle {
         let mut expected = BTreeMap::new();
         expected.insert((1i64, 9i64, 3i64), 1i64);
         expected.insert((1i64, 5i64, 1i64), 1i64);
-        assert_eq!(incr_live, expected, "new insert v=9 must displace old bottom v=3 from top-2");
-        assert_eq!(incr_live, batch_live, "incremental must match batch reference");
+        assert_eq!(
+            incr_live, expected,
+            "new insert v=9 must displace old bottom v=3 from top-2"
+        );
+        assert_eq!(
+            incr_live, batch_live,
+            "incremental must match batch reference"
+        );
     }
 
     proptest! {

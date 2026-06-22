@@ -241,9 +241,9 @@ impl ExecNode {
                 if group_by.len() > 1 {
                     let mut lookup = key_lookup.lock().unwrap();
                     for i in 0..in_val.num_rows() {
-                        lookup.entry(keys[i]).or_insert_with(|| {
-                            key_vecs.iter().map(|kv| kv[i]).collect()
-                        });
+                        lookup
+                            .entry(keys[i])
+                            .or_insert_with(|| key_vecs.iter().map(|kv| kv[i]).collect());
                     }
                 }
 
@@ -982,14 +982,30 @@ async fn test_tpch_lineitem_orders_join_count() {
     let sql = "SELECT l_orderkey, o_custkey FROM lineitem JOIN orders ON l_orderkey = o_orderkey";
 
     let frontend = SqlFrontend::new();
-    frontend.register_table("lineitem", tpch_gen::lineitem_schema()).unwrap();
-    frontend.register_table("orders", tpch_gen::orders_schema()).unwrap();
-    frontend.register_table("region", tpch_gen::region_schema()).unwrap();
-    frontend.register_table("nation", tpch_gen::nation_schema()).unwrap();
-    frontend.register_table("supplier", tpch_gen::supplier_schema()).unwrap();
-    frontend.register_table("part", tpch_gen::part_schema()).unwrap();
-    frontend.register_table("partsupp", tpch_gen::partsupp_schema()).unwrap();
-    frontend.register_table("customer", tpch_gen::customer_schema()).unwrap();
+    frontend
+        .register_table("lineitem", tpch_gen::lineitem_schema())
+        .unwrap();
+    frontend
+        .register_table("orders", tpch_gen::orders_schema())
+        .unwrap();
+    frontend
+        .register_table("region", tpch_gen::region_schema())
+        .unwrap();
+    frontend
+        .register_table("nation", tpch_gen::nation_schema())
+        .unwrap();
+    frontend
+        .register_table("supplier", tpch_gen::supplier_schema())
+        .unwrap();
+    frontend
+        .register_table("part", tpch_gen::part_schema())
+        .unwrap();
+    frontend
+        .register_table("partsupp", tpch_gen::partsupp_schema())
+        .unwrap();
+    frontend
+        .register_table("customer", tpch_gen::customer_schema())
+        .unwrap();
 
     let plan_node = frontend
         .sql_to_plan_node(sql)
@@ -1087,12 +1103,19 @@ async fn test_retraction_heavy_workload() {
     let out_0 = exec_tree.evaluate(&current_dataset);
     accumulate_zset_output(&out_0, &mut inc_acc);
     let batch_0 = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
-    assert_eq!(inc_acc, batch_0, "Epoch 0: heavy retraction — initial snapshot mismatch");
+    assert_eq!(
+        inc_acc, batch_0,
+        "Epoch 0: heavy retraction — initial snapshot mismatch"
+    );
 
     // Each group must have a positive count.
     assert!(!inc_acc.is_empty(), "Epoch 0: no aggregate groups produced");
     for (row, &w) in &inc_acc {
-        assert!(w > 0, "Epoch 0: negative or zero aggregate weight for row {:?}", row);
+        assert!(
+            w > 0,
+            "Epoch 0: negative or zero aggregate weight for row {:?}",
+            row
+        );
     }
 
     // ── Epochs 1-5: 50% churn (30k lineitem retractions + 30k insertions) ─
@@ -1110,7 +1133,10 @@ async fn test_retraction_heavy_workload() {
             retraction_count, 30_000,
             "Epoch {epoch}: expected exactly 30k lineitem retractions, got {retraction_count}"
         );
-        assert_eq!(insertion_count, 30_000, "Epoch {epoch}: expected 30k lineitem insertions, got {insertion_count}");
+        assert_eq!(
+            insertion_count, 30_000,
+            "Epoch {epoch}: expected 30k lineitem insertions, got {insertion_count}"
+        );
 
         let out = exec_tree.evaluate(&delta);
         accumulate_zset_output(&out, &mut inc_acc);
@@ -1130,7 +1156,11 @@ async fn test_retraction_heavy_workload() {
 
         // All surviving groups must have positive weight.
         for (row, &w) in &inc_acc {
-            assert!(w > 0, "Epoch {epoch}: negative aggregate weight for row {:?}", row);
+            assert!(
+                w > 0,
+                "Epoch {epoch}: negative aggregate weight for row {:?}",
+                row
+            );
         }
     }
 }
@@ -1186,7 +1216,10 @@ async fn test_cross_operator_filter_join_aggregate() {
     accumulate_zset_output(&out_0, &mut inc_acc);
 
     let batch_0 = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
-    assert_eq!(inc_acc, batch_0, "Epoch 0: Filter→Join→Agg incremental != batch");
+    assert_eq!(
+        inc_acc, batch_0,
+        "Epoch 0: Filter→Join→Agg incremental != batch"
+    );
 
     // The query groups by o_shippriority ∈ {1,2,3}; all 3 groups should appear
     // since lineitem has ~46% of rows with l_quantity < 24 evenly distributed.
@@ -1360,7 +1393,8 @@ async fn test_outer_join_retraction_heavy_workload() {
 /// Run with: `cargo test -p rockstream-sql --features sf10_tests test_tpch_sf10_aggregate_correctness -- --nocapture`
 #[cfg(feature = "sf10_tests")]
 #[tokio::test]
-async fn test_tpch_sf10_aggregate_correctness() {    let sf10_queries: &[&str] = &[
+async fn test_tpch_sf10_aggregate_correctness() {
+    let sf10_queries: &[&str] = &[
         // Q1: SUM by returnflag — exercises large single-key aggregation
         "SELECT l_returnflag, SUM(l_extendedprice) FROM lineitem GROUP BY l_returnflag",
         // Q4: COUNT by shippriority — join + aggregate on 150k orders × 600k lineitem
@@ -1392,7 +1426,10 @@ async fn test_tpch_sf10_aggregate_correctness() {    let sf10_queries: &[&str] =
 
     // Verify scale: lineitem must have exactly 600,000 rows.
     let lineitem_count = initial_dataset.get("lineitem").unwrap().num_rows();
-    assert_eq!(lineitem_count, 600_000, "SF=0.1 lineitem should have 600,000 rows, got {lineitem_count}");
+    assert_eq!(
+        lineitem_count, 600_000,
+        "SF=0.1 lineitem should have 600,000 rows, got {lineitem_count}"
+    );
 
     for (qi, sql) in sf10_queries.iter().enumerate() {
         let q_label = format!("SF10-Q{}", qi + 1);
@@ -1416,7 +1453,10 @@ async fn test_tpch_sf10_aggregate_correctness() {    let sf10_queries: &[&str] =
 
         let batch_0 = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
         assert_eq!(inc_acc, batch_0, "{q_label} Epoch 0: incremental != batch");
-        println!("{q_label} Epoch 0 ok ({} groups, inc={inc_time_0:?})", inc_acc.len());
+        println!(
+            "{q_label} Epoch 0 ok ({} groups, inc={inc_time_0:?})",
+            inc_acc.len()
+        );
 
         // Epochs 1–3: 1% churn
         for epoch in 1u64..=3 {

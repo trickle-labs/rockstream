@@ -82,6 +82,22 @@ pub struct CatalogColumn {
     pub data_type: String,
 }
 
+/// State of a secondary index as tracked by the gateway catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogIndexState {
+    Building,
+    Ready,
+}
+
+/// A secondary index entry registered via `CREATE INDEX` through the pgwire layer.
+#[derive(Debug, Clone)]
+pub struct CatalogIndexEntry {
+    pub name: String,
+    pub table: String,
+    pub index_cols: Vec<String>,
+    pub state: CatalogIndexState,
+}
+
 /// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
 #[derive(Debug, Default)]
 struct CatalogStubsInner {
@@ -92,6 +108,8 @@ struct CatalogStubsInner {
     /// Dependency map: view_name → list of view names it depends on (parsed
     /// from `FROM`/`JOIN` clauses in CREATE VIEW SQL).
     deps: HashMap<String, Vec<String>>,
+    /// Keyed by index name (from CREATE INDEX). v0.32.
+    indexes: HashMap<String, CatalogIndexEntry>,
 }
 
 /// In-memory catalog of views exposed to Postgres clients.
@@ -236,6 +254,52 @@ impl CatalogStubs {
             }
         }
         None
+    }
+
+    // ── Index catalog (v0.32 pgwire DDL wiring) ───────────────────────────────
+
+    /// Register a new index in Building state. Returns `false` if an index
+    /// with the same name and a different table already exists (RS-2016).
+    pub fn add_index(&self, entry: CatalogIndexEntry) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(existing) = inner.indexes.get(&entry.name) {
+            if existing.table != entry.table {
+                return false;
+            }
+        }
+        inner.indexes.insert(entry.name.clone(), entry);
+        true
+    }
+
+    /// Look up an index by name.
+    pub fn get_index(&self, name: &str) -> Option<CatalogIndexEntry> {
+        let inner = self.inner.read().unwrap();
+        inner.indexes.get(name).cloned()
+    }
+
+    /// Remove an index entry (DROP INDEX).
+    pub fn remove_index(&self, name: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.indexes.remove(name);
+    }
+
+    /// Transition an existing index back to Building state (REBUILD INDEX).
+    /// Returns `false` if the index does not exist.
+    pub fn rebuild_index(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(entry) = inner.indexes.get_mut(name) {
+            entry.state = CatalogIndexState::Building;
+            return true;
+        }
+        false
+    }
+
+    /// List all registered index names.
+    pub fn list_index_names(&self) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        let mut names: Vec<String> = inner.indexes.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Dispatch a query string to a catalog handler. Returns `Some(rows)` if

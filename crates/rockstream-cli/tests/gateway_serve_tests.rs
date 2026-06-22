@@ -80,7 +80,10 @@ async fn gateway_show_server_version_returns_a_row() {
             false
         }
     });
-    assert!(found, "SHOW server_version did not return a row; got: {rows:?}");
+    assert!(
+        found,
+        "SHOW server_version did not return a row; got: {rows:?}"
+    );
 }
 
 // ── G3: pg_catalog schema reflection ─────────────────────────────────────────
@@ -107,7 +110,10 @@ async fn gateway_information_schema_tables_is_queryable() {
     let completed = rows
         .iter()
         .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)));
-    assert!(completed, "expected CommandComplete from information_schema.tables");
+    assert!(
+        completed,
+        "expected CommandComplete from information_schema.tables"
+    );
 }
 
 /// G3b: pg_catalog.pg_class is queryable.
@@ -127,7 +133,10 @@ async fn gateway_pg_catalog_pg_class_is_queryable() {
     let completed = rows
         .iter()
         .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)));
-    assert!(completed, "expected CommandComplete from pg_catalog.pg_class");
+    assert!(
+        completed,
+        "expected CommandComplete from pg_catalog.pg_class"
+    );
 }
 
 // ── G4: CREATE VIEW + SELECT ──────────────────────────────────────────────────
@@ -202,7 +211,10 @@ async fn gateway_cyclic_view_returns_rs_1011() {
         }
         Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("RS-1011")),
     };
-    assert!(got_rs1011, "expected RS-1011 for cyclic view; got: {result:?}");
+    assert!(
+        got_rs1011,
+        "expected RS-1011 for cyclic view; got: {result:?}"
+    );
 }
 
 // ── G6: DML accumulation ──────────────────────────────────────────────────────
@@ -271,7 +283,10 @@ async fn gateway_subscribe_returns_without_error() {
     let completed = rows
         .iter()
         .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)));
-    assert!(completed, "SUBSCRIBE did not return CommandComplete; got: {rows:?}");
+    assert!(
+        completed,
+        "SUBSCRIBE did not return CommandComplete; got: {rows:?}"
+    );
 }
 
 // ── G8: error cases ───────────────────────────────────────────────────────────
@@ -301,9 +316,7 @@ async fn gateway_invalid_listen_address_returns_rs_0002() {
 #[tokio::test]
 async fn gateway_port_in_use_returns_rs_0003() {
     // Occupy a port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let occupied_port = listener.local_addr().unwrap().port();
 
     let dir = tempfile::tempdir().unwrap();

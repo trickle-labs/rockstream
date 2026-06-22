@@ -2,9 +2,7 @@
 
 use rockstream_types::config::AutotunerConfig;
 
-use crate::auto_tuner::{
-    AutoTuner, PARALLELISM_P95_SCALE_UP_MS, WRITE_RATE_QUOTA,
-};
+use crate::auto_tuner::{AutoTuner, PARALLELISM_P95_SCALE_UP_MS, WRITE_RATE_QUOTA};
 
 const EPOCH_CAP: usize = 10_000;
 

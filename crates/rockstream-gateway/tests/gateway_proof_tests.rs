@@ -2,13 +2,14 @@
 //!
 //! v0.23 tests: S6–S10
 //! v0.24 tests (S2–S5): CREATE TABLE, DML accumulation, COMMIT flush, ROLLBACK
+//! v0.32 index DDL wire tests: CREATE INDEX, DROP INDEX, REBUILD INDEX through pgwire
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use object_store::memory::InMemory;
 use rockstream_gateway::{
-    catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable, CatalogView},
+    catalog_stubs::{CatalogColumn, CatalogIndexState, CatalogStubs, CatalogTable, CatalogView},
     view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -716,7 +717,10 @@ async fn insert_accumulates_in_write_buffer() {
         .expect("INSERT failed");
 
     // No COMMIT yet — SELECT must return 0 rows (write buffer not flushed to shard)
-    let msgs = client.simple_query("SELECT * FROM t").await.expect("SELECT t failed");
+    let msgs = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT t failed");
     let data_rows = data_rows_from(&msgs);
     assert_eq!(
         data_rows.len(),
@@ -742,7 +746,10 @@ async fn delete_accumulates_in_write_buffer() {
         .expect("DELETE failed");
 
     // No COMMIT yet — SELECT must return 0 rows
-    let msgs = client.simple_query("SELECT * FROM t").await.expect("SELECT t failed");
+    let msgs = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT t failed");
     let data_rows = data_rows_from(&msgs);
     assert_eq!(data_rows.len(), 0, "expected no rows before COMMIT");
 }
@@ -836,7 +843,10 @@ async fn rollback_discards_write_buffer_no_shard_writes() {
 
     // After ROLLBACK, SELECT must return 0 rows
     shard_db.flush().await.unwrap();
-    let msgs = client.simple_query("SELECT * FROM t").await.expect("SELECT t failed");
+    let msgs = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT t failed");
     let data_rows = data_rows_from(&msgs);
     assert_eq!(
         data_rows.len(),
@@ -1000,7 +1010,10 @@ async fn idempotent_replay_is_noop() {
 
     // After first COMMIT: exactly 1 row with the inserted data
     shard_db.flush().await.unwrap();
-    let msgs1 = client.simple_query("SELECT * FROM t").await.expect("SELECT t after first commit");
+    let msgs1 = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT t after first commit");
     let rows1 = data_rows_from(&msgs1);
     assert_eq!(rows1.len(), 1, "expected 1 row after first COMMIT");
     assert_eq!(rows1[0].get("id").unwrap_or(""), "1");
@@ -1022,7 +1035,10 @@ async fn idempotent_replay_is_noop() {
 
     // Still exactly 1 row with the same data — replay was a no-op
     shard_db.flush().await.unwrap();
-    let msgs2 = client.simple_query("SELECT * FROM t").await.expect("SELECT t after replay");
+    let msgs2 = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT t after replay");
     let rows2 = data_rows_from(&msgs2);
     assert_eq!(
         rows2.len(),
@@ -1799,9 +1815,18 @@ async fn copy_in_basic_rows_visible_lfs() {
         .iter()
         .map(|(_, v)| String::from_utf8_lossy(v).to_string())
         .collect();
-    assert!(values.iter().any(|v| v.contains("val1")), "expected val1 in shard");
-    assert!(values.iter().any(|v| v.contains("val2")), "expected val2 in shard");
-    assert!(values.iter().any(|v| v.contains("val3")), "expected val3 in shard");
+    assert!(
+        values.iter().any(|v| v.contains("val1")),
+        "expected val1 in shard"
+    );
+    assert!(
+        values.iter().any(|v| v.contains("val2")),
+        "expected val2 in shard"
+    );
+    assert!(
+        values.iter().any(|v| v.contains("val3")),
+        "expected val3 in shard"
+    );
 }
 
 // ── S5 gate: copy_in_large_batch_no_memory_exhaustion_lfs ────────────────────
@@ -2411,8 +2436,7 @@ async fn last_hop_select_returns_rows_after_commit() {
     // opened after the flush so it sees the materialised output.
     let view_reader = Arc::new(NoopViewReader);
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server =
-        GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
     let (local_addr, _handle) = server.serve_background().await.unwrap();
     let client = connect_port(local_addr.port()).await;
 
@@ -2456,8 +2480,7 @@ async fn last_hop_select_returns_rows_after_commit() {
 
     // Use a second gateway instance backed by the same shard but with the live reader.
     let addr2: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server2 =
-        GatewayServer::with_catalog(addr2, catalog.clone(), hot_reader);
+    let server2 = GatewayServer::with_catalog(addr2, catalog.clone(), hot_reader);
     let (local_addr2, _handle2) = server2.serve_background().await.unwrap();
     let client2 = connect_port(local_addr2.port()).await;
 
@@ -2521,8 +2544,7 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
     let catalog = Arc::new(CatalogStubs::new());
     let view_reader = Arc::new(NoopViewReader);
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server =
-        GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
     let (local_addr, _handle) = server.serve_background().await.unwrap();
     let client = connect_port(local_addr.port()).await;
 
@@ -2641,7 +2663,12 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
         .await
         .expect("SELECT campaign_totals");
     let ct_rows = data_rows_from(&ct_msgs);
-    assert_eq!(ct_rows.len(), 3, "campaign_totals should have 3 rows; got {}", ct_rows.len());
+    assert_eq!(
+        ct_rows.len(),
+        3,
+        "campaign_totals should have 3 rows; got {}",
+        ct_rows.len()
+    );
     assert_eq!(ct_rows[0].get("campaign_id").unwrap_or(""), "1");
     assert_eq!(ct_rows[0].get("conv_count").unwrap_or(""), "2");
     assert_eq!(ct_rows[0].get("total_revenue").unwrap_or(""), "550");
@@ -2658,7 +2685,12 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
         .await
         .expect("SELECT campaign_report");
     let cr_rows = data_rows_from(&cr_msgs);
-    assert_eq!(cr_rows.len(), 3, "campaign_report should have 3 rows; got {}", cr_rows.len());
+    assert_eq!(
+        cr_rows.len(),
+        3,
+        "campaign_report should have 3 rows; got {}",
+        cr_rows.len()
+    );
     // ORDER BY name: Brand Awareness < Retargeting < Summer Sale
     assert_eq!(cr_rows[0].get("name").unwrap_or(""), "Brand Awareness");
     assert_eq!(cr_rows[0].get("channel").unwrap_or(""), "social");
@@ -2730,4 +2762,231 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
     assert_eq!(hp_rows3[2].get("name").unwrap_or(""), "Summer Sale");
     assert_eq!(hp_rows3[2].get("channel").unwrap_or(""), "email");
     assert_eq!(hp_rows3[2].get("total_revenue").unwrap_or(""), "550");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v0.32 — Index DDL via pgwire (CREATE INDEX, DROP INDEX, REBUILD INDEX)
+// These tests verify that the gateway correctly routes index DDL statements
+// through the wire protocol and that error codes RS-2016 / RS-2014 surface
+// correctly to pgwire clients.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// CREATE INDEX … ON … via pgwire registers the index in Building state.
+#[tokio::test]
+async fn create_index_ddl_registers_in_catalog_via_wire() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    let result = client
+        .simple_query("CREATE INDEX idx_orders_email ON orders (email)")
+        .await
+        .expect("CREATE INDEX failed");
+
+    assert!(
+        result
+            .iter()
+            .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_))),
+        "expected CommandComplete for CREATE INDEX; got {result:?}"
+    );
+
+    let entry = catalog
+        .get_index("idx_orders_email")
+        .expect("index not in catalog after CREATE INDEX");
+    assert_eq!(entry.table, "orders");
+    assert_eq!(entry.index_cols, vec!["email".to_string()]);
+    assert_eq!(entry.state, CatalogIndexState::Building);
+}
+
+/// DROP INDEX removes the index from the catalog; a second DROP returns an error.
+#[tokio::test]
+async fn drop_index_ddl_removes_from_catalog_via_wire() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    client
+        .simple_query("CREATE INDEX idx_drop_test ON products (sku)")
+        .await
+        .expect("CREATE INDEX failed");
+
+    assert!(
+        catalog.get_index("idx_drop_test").is_some(),
+        "index must exist before DROP"
+    );
+
+    client
+        .simple_query("DROP INDEX idx_drop_test")
+        .await
+        .expect("DROP INDEX failed");
+
+    assert!(
+        catalog.get_index("idx_drop_test").is_none(),
+        "index must be gone after DROP INDEX"
+    );
+
+    // Second DROP on nonexistent index returns an error (42704).
+    let result = client.simple_query("DROP INDEX idx_drop_test").await;
+    let got_err = match &result {
+        Err(e) => e
+            .as_db_error()
+            .map(|d| d.message().contains("does not exist"))
+            .unwrap_or(false),
+        Ok(msgs) => msgs
+            .iter()
+            .any(|m| format!("{m:?}").contains("does not exist")),
+    };
+    assert!(got_err, "expected 42704 for missing index; got {result:?}");
+}
+
+/// REBUILD INDEX transitions state back to Building; nonexistent index returns error.
+#[tokio::test]
+async fn rebuild_index_ddl_transitions_state_via_wire() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    client
+        .simple_query("CREATE INDEX idx_rebuild_test ON events (user_id)")
+        .await
+        .expect("CREATE INDEX failed");
+
+    // Initially Building; REBUILD returns CommandComplete.
+    let result = client
+        .simple_query("REBUILD INDEX idx_rebuild_test")
+        .await
+        .expect("REBUILD INDEX failed");
+
+    assert!(
+        result
+            .iter()
+            .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_))),
+        "expected CommandComplete for REBUILD INDEX"
+    );
+
+    // State must still be Building after REBUILD.
+    let entry = catalog.get_index("idx_rebuild_test").unwrap();
+    assert_eq!(
+        entry.state,
+        CatalogIndexState::Building,
+        "index must be Building after REBUILD INDEX"
+    );
+
+    // REBUILD on nonexistent index returns error.
+    let result = client.simple_query("REBUILD INDEX idx_nonexistent").await;
+    let got_err = match &result {
+        Err(e) => e
+            .as_db_error()
+            .map(|d| d.message().contains("does not exist"))
+            .unwrap_or(false),
+        Ok(msgs) => msgs
+            .iter()
+            .any(|m| format!("{m:?}").contains("does not exist")),
+    };
+    assert!(
+        got_err,
+        "expected 42704 for nonexistent index; got {result:?}"
+    );
+}
+
+/// CREATE INDEX with a name already used for a different table returns RS-2016.
+#[tokio::test]
+async fn create_index_name_conflict_returns_rs2016_via_wire() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    // Register index on table_a.
+    client
+        .simple_query("CREATE INDEX idx_conflict ON table_a (col1)")
+        .await
+        .expect("first CREATE INDEX failed");
+
+    // Attempt same index name on a different table → RS-2016.
+    let result = client
+        .simple_query("CREATE INDEX idx_conflict ON table_b (col2)")
+        .await;
+
+    let got_rs2016 = match &result {
+        Err(e) => {
+            if let Some(db) = e.as_db_error() {
+                db.message().contains("RS-2016")
+            } else {
+                e.to_string().contains("RS-2016")
+            }
+        }
+        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("RS-2016")),
+    };
+    assert!(
+        got_rs2016,
+        "expected RS-2016 for index name conflict; got {result:?}"
+    );
+
+    // Same name on same table is idempotent (no error).
+    client
+        .simple_query("CREATE INDEX idx_conflict ON table_a (col1)")
+        .await
+        .expect("idempotent CREATE INDEX on same table should succeed");
+}
+
+/// EXPLAIN shows RS-2014 hint for a BUILDING index covering the queried table.
+#[tokio::test]
+async fn explain_shows_rs2014_hint_for_building_index_via_wire() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    // Register an index on orders in Building state.
+    client
+        .simple_query("CREATE INDEX idx_orders_status ON orders (status)")
+        .await
+        .expect("CREATE INDEX failed");
+
+    // EXPLAIN a query over orders — should surface RS-2014.
+    let msgs = client
+        .simple_query("EXPLAIN SELECT * FROM orders WHERE status = 'shipped'")
+        .await
+        .expect("EXPLAIN failed");
+
+    let plan_output: String = msgs
+        .iter()
+        .filter_map(|m| {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+                r.get(0).map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        plan_output.contains("RS-2014"),
+        "EXPLAIN output must contain RS-2014 hint for building index; got:\n{plan_output}"
+    );
 }

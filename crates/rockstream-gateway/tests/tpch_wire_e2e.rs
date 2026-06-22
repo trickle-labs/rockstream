@@ -157,10 +157,7 @@ fn run_q1_incremental(op: &AggregateOp, lineitem: &ArrowZSet) -> Vec<(i64, i64)>
 ///
 /// The output delta contains (k, sum_v, count_v, avg_v) rows with weights
 /// +1 (insert) or -1 (retract). We only track (k → sum_v) for Q1.
-fn apply_agg_delta(
-    state: &mut BTreeMap<i64, i64>,
-    output: &ArrowZSet,
-) {
+fn apply_agg_delta(state: &mut BTreeMap<i64, i64>, output: &ArrowZSet) {
     if output.is_empty() {
         return;
     }
@@ -284,16 +281,8 @@ async fn read_q1_via_wire(port: u16) -> Vec<(i64, i64)> {
     let mut result: Vec<(i64, i64)> = rows
         .iter()
         .map(|r| {
-            let k: i64 = r
-                .get("l_returnflag")
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-            let s: i64 = r
-                .get("sum_extprice")
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
+            let k: i64 = r.get("l_returnflag").unwrap_or("0").parse().unwrap_or(0);
+            let s: i64 = r.get("sum_extprice").unwrap_or("0").parse().unwrap_or(0);
             (k, s)
         })
         .collect();
@@ -341,8 +330,7 @@ async fn tpch_q1_lfs_epoch0_and_delta() {
 
     // Assert incremental == batch at epoch 0 with exact values.
     assert_eq!(
-        inc_epoch0,
-        batch_epoch0,
+        inc_epoch0, batch_epoch0,
         "Q1 epoch 0: incremental != batch\ninc={inc_epoch0:?}\nbatch={batch_epoch0:?}"
     );
 
@@ -372,13 +360,12 @@ async fn tpch_q1_lfs_epoch0_and_delta() {
     write_q1_to_shard(&shard_db, &inc_epoch0).await;
 
     // Start gateway and read via wire protocol.
-    let (port, _handle) = start_gateway_for_view("tpch-q1-lfs", store.clone(), tpch_q1_columns())
-        .await;
+    let (port, _handle) =
+        start_gateway_for_view("tpch-q1-lfs", store.clone(), tpch_q1_columns()).await;
     let wire_epoch0 = read_q1_via_wire(port).await;
 
     assert_eq!(
-        wire_epoch0,
-        inc_epoch0,
+        wire_epoch0, inc_epoch0,
         "Q1 epoch 0: wire result != incremental\nwire={wire_epoch0:?}\nincremental={inc_epoch0:?}"
     );
 
@@ -429,7 +416,8 @@ async fn tpch_q1_lfs_epoch0_and_delta() {
             )
             .unwrap();
             let kv_delta = ArrowZSet::new(data, lineitem_delta_1.weights.clone());
-            op.process_delta(kv_delta).expect("AggregateOp delta failed")
+            op.process_delta(kv_delta)
+                .expect("AggregateOp delta failed")
         }
     };
     let inc_time_1 = t_inc_1.elapsed();
@@ -478,10 +466,7 @@ async fn tpch_q1_lfs_epoch0_and_delta() {
         }
         acc.retain(|_, w| *w > 0);
         // acc now maps row → net_weight for positive rows only.
-        let positive_rows: Vec<Vec<i64>> = acc
-            .into_iter()
-            .map(|(r, _)| r)
-            .collect();
+        let positive_rows: Vec<Vec<i64>> = acc.into_iter().map(|(r, _)| r).collect();
         // Rebuild as ArrowZSet
         if positive_rows.is_empty() {
             ArrowZSet::empty(lineitem_0.schema())
@@ -524,8 +509,7 @@ async fn tpch_q1_lfs_epoch0_and_delta() {
     let wire_epoch1 = read_q1_via_wire(port2).await;
 
     assert_eq!(
-        wire_epoch1,
-        inc_epoch1,
+        wire_epoch1, inc_epoch1,
         "Q1 epoch 1: wire result != incremental\nwire={wire_epoch1:?}\nincremental={inc_epoch1:?}"
     );
 
@@ -776,8 +760,7 @@ async fn tpch_q11_lfs_join_aggregate() {
     wire_result.sort_by_key(|(k, _)| *k);
 
     assert_eq!(
-        wire_result,
-        inc_result,
+        wire_result, inc_result,
         "Q11 wire != incremental\nwire={wire_result:?}\ninc={inc_result:?}"
     );
 
@@ -843,8 +826,7 @@ async fn tpch_q1_minio_wire_protocol() {
     // Cross-validate with DataFusion batch.
     let batch_result = run_q1_batch(lineitem).await;
     assert_eq!(
-        inc_result,
-        batch_result,
+        inc_result, batch_result,
         "Q1 minio: incremental != batch\ninc={inc_result:?}\nbatch={batch_result:?}"
     );
     assert!(!inc_result.is_empty(), "Q1 minio: result must be non-empty");
@@ -880,19 +862,21 @@ async fn tpch_q1_minio_wire_protocol() {
     // Read via wire protocol and verify.
     let wire_result = read_q1_via_wire(port).await;
     assert_eq!(
-        wire_result,
-        inc_result,
+        wire_result, inc_result,
         "Q1 minio: wire != incremental\nwire={wire_result:?}\ninc={inc_result:?}"
     );
 
-    println!("Q1 MinIO: {} groups verified via wire protocol", wire_result.len());
+    println!(
+        "Q1 MinIO: {} groups verified via wire protocol",
+        wire_result.len()
+    );
 }
 
 // ─── MinIO bucket creation helper ────────────────────────────────────────────
 
 async fn create_minio_bucket(port: u16, bucket: &str) {
-    use sha2::{Digest, Sha256};
     use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
 
     fn sha256_hex(data: &[u8]) -> String {
         format!("{:x}", Sha256::digest(data))
@@ -911,19 +895,36 @@ async fn create_minio_bucket(port: u16, bucket: &str) {
         let s = (sod % 60) as u32;
         let mut year = 1970u32;
         loop {
-            let leap = year.is_multiple_of(4)
-                && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+            let leap =
+                year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
             let dy = if leap { 366 } else { 365 };
-            if days < dy { break; }
+            if days < dy {
+                break;
+            }
             days -= dy;
             year += 1;
         }
         let leap =
             year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let dpm: [u32; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let dpm: [u32; 12] = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
         let mut month = 0u32;
         for &d in &dpm {
-            if days < d { break; }
+            if days < d {
+                break;
+            }
             days -= d;
             month += 1;
         }

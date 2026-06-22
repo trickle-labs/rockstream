@@ -171,9 +171,9 @@ fn bench_delta_propagation_rates(c: &mut Criterion) {
 
     // Change rates: (label, delta_size as fraction of DATASET_SIZE).
     let rates: &[(&str, usize)] = &[
-        ("0.1pct", DATASET_SIZE / 1000),  // 100 rows
-        ("1pct",   DATASET_SIZE / 100),   // 1 000 rows
-        ("10pct",  DATASET_SIZE / 10),    // 10 000 rows
+        ("0.1pct", DATASET_SIZE / 1000), // 100 rows
+        ("1pct", DATASET_SIZE / 100),    // 1 000 rows
+        ("10pct", DATASET_SIZE / 10),    // 10 000 rows
     ];
 
     for &(label, delta_size) in rates {
@@ -223,20 +223,16 @@ fn bench_filter_delta_rates(c: &mut Criterion) {
 
     let rates: &[(&str, usize)] = &[
         ("0.1pct", DATASET_SIZE / 1000),
-        ("1pct",   DATASET_SIZE / 100),
-        ("10pct",  DATASET_SIZE / 10),
+        ("1pct", DATASET_SIZE / 100),
+        ("10pct", DATASET_SIZE / 10),
     ];
 
     for &(label, delta_size) in rates {
         let delta = make_update_delta(DATASET_SIZE, delta_size);
         group.throughput(Throughput::Elements(delta.num_rows() as u64));
-        group.bench_with_input(
-            BenchmarkId::new("filter_update", label),
-            &delta,
-            |b, d| {
-                b.iter(|| op.process_delta(d.clone()).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("filter_update", label), &delta, |b, d| {
+            b.iter(|| op.process_delta(d.clone()).unwrap());
+        });
     }
 
     group.finish();

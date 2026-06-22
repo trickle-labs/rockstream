@@ -86,8 +86,12 @@ fn apply_agg_output(state: &mut BTreeMap<i64, i64>, output: &ArrowZSet) {
         let k = k_col.value(i);
         let s = s_col.value(i);
         match output.weights[i] {
-            w if w > 0 => { state.insert(k, s); }
-            w if w < 0 => { state.remove(&k); }
+            w if w > 0 => {
+                state.insert(k, s);
+            }
+            w if w < 0 => {
+                state.remove(&k);
+            }
             _ => {}
         }
     }
@@ -197,7 +201,10 @@ fn run_agg_delta_test(pop_n: usize, n_groups: i64, delta_n: usize, label: &str) 
 
     // Effective amplification measured on the ACCUMULATED state delta:
     // how many group states actually changed relative to input rows.
-    let mut state_before = state0.iter().cloned().collect::<std::collections::BTreeMap<i64,i64>>();
+    let mut state_before = state0
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeMap<i64, i64>>();
     apply_agg_output(&mut state_before, &out1);
     let state_after: Vec<(i64, i64)> = {
         let mut v: Vec<_> = state_before.iter().map(|(&k, &s)| (k, s)).collect();
@@ -210,7 +217,7 @@ fn run_agg_delta_test(pop_n: usize, n_groups: i64, delta_n: usize, label: &str) 
         .count()
         + state_after.len().saturating_sub(state0.len()) // new groups
         + state0.len().saturating_sub(state_after.len()); // deleted groups
-    // State-level amplification: groups_changed / input_delta_rows_after_dedup
+                                                          // State-level amplification: groups_changed / input_delta_rows_after_dedup
     let amplification = groups_changed as f64 / delta_n as f64;
     assert!(
         amplification <= 1.0,
@@ -310,12 +317,9 @@ fn ivm_join_delta_amplification_1_pct() {
     let join_op = JoinOp::with_schema(OperatorId(0), vec![0], vec![0], 2, 2);
 
     // Bootstrap: load full left + right.
-    let left_initial: Vec<(i64, i64, i64)> = (0..POP as i64)
-        .map(|i| (i % N_KEYS, i, 1))
-        .collect();
-    let right_initial: Vec<(i64, i64, i64)> = (0..POP as i64)
-        .map(|i| (i % N_KEYS, i * 100, 1))
-        .collect();
+    let left_initial: Vec<(i64, i64, i64)> = (0..POP as i64).map(|i| (i % N_KEYS, i, 1)).collect();
+    let right_initial: Vec<(i64, i64, i64)> =
+        (0..POP as i64).map(|i| (i % N_KEYS, i * 100, 1)).collect();
 
     let t0 = Instant::now();
     let out_bootstrap = join_op
@@ -691,8 +695,7 @@ fn ivm_join_then_aggregate_delta_1_pct() {
         let right_sum_for_k: i64 = (0..RIGHT_PER_KEY as i64).map(|i| (k + 1) * 10 + i).sum();
         // Epoch 0 sum − 1 left row removed (was value k*1000) × right_sum
         // The removed left row contributed right_sum_for_k to the group sum.
-        let expected_s =
-            (RIGHT_PER_KEY as i64 * (k * 1000)) as i64; // original left v contribution
+        let expected_s = (RIGHT_PER_KEY as i64 * (k * 1000)) as i64; // original left v contribution
         let expected_new_s = {
             // sum was: RIGHT_PER_KEY * LEFT_PER_KEY * avg_right_v
             let old_right_sum: i64 = right_sum_for_k * LEFT_PER_KEY as i64;

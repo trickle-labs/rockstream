@@ -173,9 +173,18 @@ mod tests {
     fn oracle_noop_duplicate_inserts_positive_weight() {
         // Insert the same row 3 times: net weight = 3 (still one unique row).
         let deltas = vec![
-            ZSetDelta { row: TestRow { id: 5, value: 55 }, weight: 1 },
-            ZSetDelta { row: TestRow { id: 5, value: 55 }, weight: 1 },
-            ZSetDelta { row: TestRow { id: 5, value: 55 }, weight: 1 },
+            ZSetDelta {
+                row: TestRow { id: 5, value: 55 },
+                weight: 1,
+            },
+            ZSetDelta {
+                row: TestRow { id: 5, value: 55 },
+                weight: 1,
+            },
+            ZSetDelta {
+                row: TestRow { id: 5, value: 55 },
+                weight: 1,
+            },
         ];
         // The noop oracle keeps rows with positive net weight.
         // Row (5, 55) has weight 3 > 0 → should appear once in the batch result.
@@ -188,13 +197,25 @@ mod tests {
     fn oracle_noop_cross_epoch_insert_then_retract() {
         // First epoch: insert two rows.
         let epoch1 = vec![
-            ZSetDelta { row: TestRow { id: 10, value: 100 }, weight: 1 },
-            ZSetDelta { row: TestRow { id: 20, value: 200 }, weight: 1 },
+            ZSetDelta {
+                row: TestRow { id: 10, value: 100 },
+                weight: 1,
+            },
+            ZSetDelta {
+                row: TestRow { id: 20, value: 200 },
+                weight: 1,
+            },
         ];
         // Second epoch: retract both.
         let epoch2 = vec![
-            ZSetDelta { row: TestRow { id: 10, value: 100 }, weight: -1 },
-            ZSetDelta { row: TestRow { id: 20, value: 200 }, weight: -1 },
+            ZSetDelta {
+                row: TestRow { id: 10, value: 100 },
+                weight: -1,
+            },
+            ZSetDelta {
+                row: TestRow { id: 20, value: 200 },
+                weight: -1,
+            },
         ];
         // Flatten both epochs into one delta sequence and assert empty result.
         let mut deltas = epoch1;
@@ -210,14 +231,20 @@ mod tests {
         // Insert 200 distinct rows.
         for i in 0..200i64 {
             deltas.push(ZSetDelta {
-                row: TestRow { id: i * 3, value: i * 47 % 10000 },
+                row: TestRow {
+                    id: i * 3,
+                    value: i * 47 % 10000,
+                },
                 weight: 1,
             });
         }
         // Retract every other one.
         for i in (0..200i64).step_by(2) {
             deltas.push(ZSetDelta {
-                row: TestRow { id: i * 3, value: i * 47 % 10000 },
+                row: TestRow {
+                    id: i * 3,
+                    value: i * 47 % 10000,
+                },
                 weight: -1,
             });
         }

@@ -168,15 +168,13 @@ pub async fn start_gateway(
     })?;
 
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(
-        object_store::local::LocalFileSystem::new_with_prefix(&gateway_shard_dir).map_err(
-            |e| {
-                CliError::new(
-                    RS_0003,
-                    format!("gateway storage init failed: {e}"),
-                    "Check that the storage path exists and is writable.",
-                )
-            },
-        )?,
+        object_store::local::LocalFileSystem::new_with_prefix(&gateway_shard_dir).map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("gateway storage init failed: {e}"),
+                "Check that the storage path exists and is writable.",
+            )
+        })?,
     );
 
     let shard_db = rockstream_storage::ShardDb::builder("gateway", store.clone())
@@ -305,8 +303,8 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
 
     // Determine whether to serve a live gateway for this run.
     // A listen address must be explicitly provided; absence means no-op/test mode.
-    let serve_gateway = opts.listen_addr.is_some()
-        && (opts.role == "gateway" || opts.role == "all");
+    let serve_gateway =
+        opts.listen_addr.is_some() && (opts.role == "gateway" || opts.role == "all");
 
     // Pre-validate the listen address before starting the runtime.
     if serve_gateway {

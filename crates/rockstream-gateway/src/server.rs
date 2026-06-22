@@ -213,6 +213,17 @@ impl GatewayHandler {
             return Some(self.handle_create_table(q));
         }
 
+        // CREATE INDEX / DROP INDEX / REBUILD INDEX — v0.32 pgwire DDL wiring
+        if ql.starts_with("create index ") {
+            return Some(self.handle_create_index(q));
+        }
+        if ql.starts_with("drop index ") {
+            return Some(self.handle_drop_index(q));
+        }
+        if ql.starts_with("rebuild index ") {
+            return Some(self.handle_rebuild_index(q));
+        }
+
         // Transaction control
         if ql == "begin" || ql == "begin;" || ql.starts_with("begin ") {
             return Some(Ok(vec![Response::TransactionStart(
@@ -305,7 +316,7 @@ impl GatewayHandler {
             ))]);
         }
 
-        // EXPLAIN <query> — return plan annotation with pushdown info.
+        // EXPLAIN <query> — return plan annotation with pushdown info and index state.
         if ql.starts_with("explain ") {
             let inner_sql = q["explain ".len()..].trim();
             let pushdown = crate::multi_shard_reader::can_pushdown_partial_agg(inner_sql);
@@ -314,7 +325,44 @@ impl GatewayHandler {
             } else {
                 "partial_pushdown: false"
             };
-            let plan_text = format!("Plan: SeqScan → {pushdown_note}\nQuery: {inner_sql}");
+
+            // Surface index state in EXPLAIN (RS-2014 / RS-2015 hints). Scan the
+            // gateway's index catalog for any index covering a table that appears
+            // in the query, and annotate the plan text accordingly.
+            let index_note = {
+                use crate::catalog_stubs::CatalogIndexState;
+                let inner_upper = inner_sql.to_uppercase();
+                let mut note = String::new();
+                for idx_name in self.catalog.list_index_names() {
+                    if let Some(entry) = self.catalog.get_index(&idx_name) {
+                        let table_upper = entry.table.to_uppercase();
+                        if inner_upper.contains(&table_upper) {
+                            match entry.state {
+                                CatalogIndexState::Building => {
+                                    note = format!(
+                                        "\n[RS-2014] index '{}' on table '{}' is BUILDING — \
+                                         falling back to shard scan. \
+                                         Wait for READY state before relying on index scan.",
+                                        entry.name, entry.table
+                                    );
+                                }
+                                CatalogIndexState::Ready => {
+                                    let cols = entry.index_cols.join(", ");
+                                    note = format!(
+                                        "\nindex_scan: index='{}' table='{}' cols=[{}] state=READY",
+                                        entry.name, entry.table, cols
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                note
+            };
+
+            let plan_text =
+                format!("Plan: SeqScan → {pushdown_note}{index_note}\nQuery: {inner_sql}");
             let schema = Arc::new(vec![FieldInfo::new(
                 "QUERY PLAN".to_string(),
                 None,
@@ -410,7 +458,9 @@ impl GatewayHandler {
                 if !view_name.starts_with("pg_") && !view_name.starts_with("information_schema") {
                     let limit = extract_limit(q);
                     let order_by = extract_order_by(q);
-                    return self.read_view_response(&view_name, limit, order_by, conn_id).await;
+                    return self
+                        .read_view_response(&view_name, limit, order_by, conn_id)
+                        .await;
                 }
             }
         }
@@ -522,12 +572,9 @@ impl GatewayHandler {
         // return stale results until the next poll fires.
         let raw_rows: Vec<Vec<u8>> = if let Some(shard_db) = &self.shard_db {
             let prefix = format!("view_output/{view_name}/");
-            let kvs = shard_db
-                .scan_prefix(prefix.as_bytes())
-                .await
-                .map_err(|e| {
-                    PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-                })?;
+            let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
+                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+            })?;
             let mut rows: Vec<Vec<u8>> = kvs.into_iter().map(|(_, v)| v.to_vec()).collect();
             // Apply ORDER BY if specified
             if !order_by.is_empty() {
@@ -549,13 +596,9 @@ impl GatewayHandler {
                         };
                         let av = a_fields.get(idx).copied().unwrap_or("");
                         let bv = b_fields.get(idx).copied().unwrap_or("");
-                        let ord = if let (Ok(an), Ok(bn)) =
-                            (av.parse::<i64>(), bv.parse::<i64>())
-                        {
+                        let ord = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
                             an.cmp(&bn)
-                        } else if let (Ok(af), Ok(bf)) =
-                            (av.parse::<f64>(), bv.parse::<f64>())
-                        {
+                        } else if let (Ok(af), Ok(bf)) = (av.parse::<f64>(), bv.parse::<f64>()) {
                             af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
                         } else {
                             av.cmp(bv)
@@ -718,6 +761,144 @@ impl GatewayHandler {
 
         Ok(vec![Response::Execution(
             Tag::new("CREATE TABLE").with_rows(0),
+        )])
+    }
+
+    /// Handle `CREATE INDEX <name> ON <table> (<col>, ...) [WHERE <pred>]` — v0.32.
+    ///
+    /// Registers the index in `Building` state in the gateway catalog stubs.
+    /// Returns RS-2016 if an index with the same name exists for a different table.
+    fn handle_create_index<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        use crate::catalog_stubs::{CatalogIndexEntry, CatalogIndexState};
+
+        // Parse: CREATE INDEX <name> ON <table> (<cols>)
+        let after_keyword = q["CREATE INDEX".len()..].trim();
+        let upper_after = after_keyword.to_uppercase();
+
+        let on_pos = match upper_after.find(" ON ") {
+            Some(p) => p,
+            None => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    "CREATE INDEX requires ON clause".to_owned(),
+                )))]);
+            }
+        };
+
+        let index_name = after_keyword[..on_pos].trim().to_lowercase();
+        let after_on = after_keyword[on_pos + 4..].trim();
+
+        let paren_open = match after_on.find('(') {
+            Some(p) => p,
+            None => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    "CREATE INDEX requires column list in parentheses".to_owned(),
+                )))]);
+            }
+        };
+        let table = after_on[..paren_open].trim().to_lowercase();
+        let paren_close = after_on.rfind(')').unwrap_or(after_on.len());
+        let cols_str = &after_on[paren_open + 1..paren_close];
+        let index_cols: Vec<String> = cols_str
+            .split(',')
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        if index_cols.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "CREATE INDEX requires at least one column".to_owned(),
+            )))]);
+        }
+
+        let entry = CatalogIndexEntry {
+            name: index_name.clone(),
+            table: table.clone(),
+            index_cols,
+            state: CatalogIndexState::Building,
+        };
+
+        if !self.catalog.add_index(entry) {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42710".to_owned(),
+                format!(
+                    "[RS-2016] Index name conflict: index '{index_name}' already exists for a \
+                     different table. Choose a unique index name or drop the existing index first."
+                ),
+            )))]);
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("CREATE INDEX").with_rows(0),
+        )])
+    }
+
+    /// Handle `DROP INDEX <name>` — v0.32.
+    fn handle_drop_index<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let rest = q["DROP INDEX".len()..].trim();
+        let name = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "DROP INDEX requires an index name".to_owned(),
+            )))]);
+        }
+
+        if self.catalog.get_index(&name).is_none() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42704".to_owned(),
+                format!("index \"{name}\" does not exist"),
+            )))]);
+        }
+
+        self.catalog.remove_index(&name);
+        Ok(vec![Response::Execution(
+            Tag::new("DROP INDEX").with_rows(0),
+        )])
+    }
+
+    /// Handle `REBUILD INDEX <name>` — v0.32. Transitions index back to Building.
+    fn handle_rebuild_index<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let rest = q["REBUILD INDEX".len()..].trim();
+        let name = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "REBUILD INDEX requires an index name".to_owned(),
+            )))]);
+        }
+
+        if !self.catalog.rebuild_index(&name) {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42704".to_owned(),
+                format!("index \"{name}\" does not exist"),
+            )))]);
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("REBUILD INDEX").with_rows(0),
         )])
     }
 
@@ -916,12 +1097,8 @@ impl GatewayHandler {
                     DmlOp::Delete { table, .. } => table.clone(),
                 })
                 .collect();
-            crate::view_materializer::materialize_views(
-                &self.catalog,
-                shard_db,
-                &changed_tables,
-            )
-            .await;
+            crate::view_materializer::materialize_views(&self.catalog, shard_db, &changed_tables)
+                .await;
             // Flush the WAL so that materialised view output is immediately
             // visible to the ShardReader (DbReader reads from SSTs, not the
             // in-memory WAL buffer; without a flush the SELECT after COMMIT
@@ -2104,9 +2281,7 @@ fn extract_order_by(q: &str) -> Vec<(String, bool)> {
     // Everything after ORDER BY, up to LIMIT or end
     let after = q[ob_pos + 10..].trim();
     let after_lower = after.to_lowercase();
-    let end = after_lower
-        .find(" limit ")
-        .unwrap_or(after.len());
+    let end = after_lower.find(" limit ").unwrap_or(after.len());
     let order_part = after[..end].trim().trim_end_matches(';');
 
     order_part
@@ -2118,7 +2293,10 @@ fn extract_order_by(q: &str) -> Vec<(String, bool)> {
             }
             let tokens: Vec<&str> = part.split_whitespace().collect();
             let col = tokens.first()?.to_lowercase();
-            let desc = tokens.last().map(|t| t.to_lowercase() == "desc").unwrap_or(false);
+            let desc = tokens
+                .last()
+                .map(|t| t.to_lowercase() == "desc")
+                .unwrap_or(false);
             Some((col, desc))
         })
         .collect()
@@ -2194,7 +2372,9 @@ fn infer_select_columns(sql: &str) -> Vec<String> {
     let lower = trimmed.to_lowercase();
     // Must start with SELECT
     let after_select = if let Some(s) = lower.strip_prefix("select ").or_else(|| {
-        lower.strip_prefix("select\n").or_else(|| lower.strip_prefix("select\t"))
+        lower
+            .strip_prefix("select\n")
+            .or_else(|| lower.strip_prefix("select\t"))
     }) {
         &trimmed[trimmed.len() - s.len()..]
     } else {

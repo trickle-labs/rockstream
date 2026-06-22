@@ -555,9 +555,9 @@ impl ExecNode {
                 if group_by.len() > 1 {
                     let mut lookup = key_lookup.lock().unwrap();
                     for i in 0..in_val.num_rows() {
-                        lookup.entry(keys[i]).or_insert_with(|| {
-                            key_vecs.iter().map(|kv| kv[i]).collect()
-                        });
+                        lookup
+                            .entry(keys[i])
+                            .or_insert_with(|| key_vecs.iter().map(|kv| kv[i]).collect());
                     }
                 }
 
@@ -665,9 +665,9 @@ impl ExecNode {
                         let mut orig_key_cols: Vec<Vec<i64>> = vec![Vec::new(); group_by.len()];
                         for i in 0..raw_out.num_rows() {
                             let k = k_arr.value(i);
-                            let orig = lookup
-                                .get(&k)
-                                .unwrap_or_else(|| panic!("multi-key reverse lookup missing for combined_key={k}"));
+                            let orig = lookup.get(&k).unwrap_or_else(|| {
+                                panic!("multi-key reverse lookup missing for combined_key={k}")
+                            });
                             for (c, &v) in orig.iter().enumerate() {
                                 orig_key_cols[c].push(v);
                             }
@@ -1032,7 +1032,11 @@ pub async fn run_fuzz_case_for_query(query: &str, seed: u64) {
     accumulate_output(&out_2, &mut inc_acc);
 
     let df_2 = make_df_ctx_and_run(&dataset_after_2, &query).await;
-    assert_eq!(inc_acc, df_2, "Fuzz Epoch 2 (cross-epoch retraction) mismatch for query: {}", query);
+    assert_eq!(
+        inc_acc, df_2,
+        "Fuzz Epoch 2 (cross-epoch retraction) mismatch for query: {}",
+        query
+    );
 }
 
 // ─── Soak / Unit Tests ───────────────────────────────────────────────────────

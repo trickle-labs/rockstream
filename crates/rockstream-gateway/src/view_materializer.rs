@@ -20,9 +20,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
-};
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
@@ -106,10 +104,8 @@ async fn try_materialize_views(
             let tsv_rows: Vec<Vec<u8>> = kvs.into_iter().map(|(_, v)| v.to_vec()).collect();
 
             // Build in-memory RecordBatch
-            let batch =
-                tsv_to_record_batch(schema.clone(), &tsv_rows).unwrap_or_else(|_| {
-                    RecordBatch::new_empty(schema.clone())
-                });
+            let batch = tsv_to_record_batch(schema.clone(), &tsv_rows)
+                .unwrap_or_else(|_| RecordBatch::new_empty(schema.clone()));
             let mem_table = MemTable::try_new(schema, vec![vec![batch]])
                 .map_err(|e| format!("MemTable({src_name}): {e}"))?;
             ctx.register_table(src_name.as_str(), Arc::new(mem_table))
@@ -307,7 +303,11 @@ fn source_schema(
         }
     }
     // Fallback: single Utf8 column — ensures DataFusion won't panic on empty schema
-    Arc::new(Schema::new(vec![Field::new("_value", DataType::Utf8, true)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "_value",
+        DataType::Utf8,
+        true,
+    )]))
 }
 
 /// Map a catalog data-type name (Arrow name) to an Arrow `DataType`.
@@ -324,8 +324,12 @@ pub fn catalog_name_to_arrow_dt(name: &str) -> DataType {
 /// Map an Arrow `DataType` back to the catalog name used in `CatalogColumn`.
 fn arrow_dt_to_catalog_name(dt: &DataType) -> &'static str {
     match dt {
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt8
-        | DataType::UInt16 | DataType::UInt32 => "Int32",
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => "Int32",
         DataType::Int64 | DataType::UInt64 => "Int64",
         DataType::Float32 | DataType::Float64 => "Float64",
         DataType::Boolean => "Boolean",
@@ -532,12 +536,7 @@ mod tests {
 
     async fn make_shard() -> Arc<ShardDb> {
         let store = Arc::new(InMemory::new());
-        Arc::new(
-            ShardDb::builder("test", store)
-                .build()
-                .await
-                .unwrap(),
-        )
+        Arc::new(ShardDb::builder("test", store).build().await.unwrap())
     }
 
     #[test]
@@ -572,8 +571,14 @@ mod tests {
         catalog.add_table(CatalogTable {
             name: "orders".to_string(),
             columns: vec![
-                CatalogColumn { name: "id".to_string(), data_type: "Int64".to_string() },
-                CatalogColumn { name: "amount".to_string(), data_type: "Int64".to_string() },
+                CatalogColumn {
+                    name: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                CatalogColumn {
+                    name: "amount".to_string(),
+                    data_type: "Int64".to_string(),
+                },
             ],
         });
 
@@ -618,9 +623,18 @@ mod tests {
         catalog.add_table(CatalogTable {
             name: "clicks".to_string(),
             columns: vec![
-                CatalogColumn { name: "user_id".to_string(), data_type: "Int64".to_string() },
-                CatalogColumn { name: "url".to_string(), data_type: "Utf8".to_string() },
-                CatalogColumn { name: "ts".to_string(), data_type: "Int64".to_string() },
+                CatalogColumn {
+                    name: "user_id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                CatalogColumn {
+                    name: "url".to_string(),
+                    data_type: "Utf8".to_string(),
+                },
+                CatalogColumn {
+                    name: "ts".to_string(),
+                    data_type: "Int64".to_string(),
+                },
             ],
         });
 
@@ -646,10 +660,7 @@ mod tests {
         materialize_views(&catalog, &shard, &changed).await;
 
         // page_hits should have 2 rows (one per URL)
-        let kvs = shard
-            .scan_prefix(b"view_output/page_hits/")
-            .await
-            .unwrap();
+        let kvs = shard.scan_prefix(b"view_output/page_hits/").await.unwrap();
         assert_eq!(kvs.len(), 2, "expected 2 rows in page_hits (one per URL)");
 
         // Check that hits are correct: /home → 2, /pricing → 1

@@ -574,7 +574,9 @@ pub fn generate_tpch_heavy_deltas(
     let mut deltas = HashMap::new();
 
     // Static dimension tables — no changes.
-    for name in &["region", "nation", "supplier", "part", "partsupp", "customer"] {
+    for name in &[
+        "region", "nation", "supplier", "part", "partsupp", "customer",
+    ] {
         let schema = match *name {
             "region" => region_schema(),
             "nation" => nation_schema(),
@@ -604,7 +606,13 @@ pub fn generate_tpch_heavy_deltas(
     }
     let o_ins = make_zset(
         orders_schema(),
-        vec![o_orderkey, o_custkey, o_orderdate, o_totalprice, o_shippriority],
+        vec![
+            o_orderkey,
+            o_custkey,
+            o_orderdate,
+            o_totalprice,
+            o_shippriority,
+        ],
         1,
     );
     deltas.insert("orders".to_string(), concat_zsets(&o_ret, &o_ins));
@@ -641,10 +649,17 @@ pub fn generate_tpch_heavy_deltas(
     let l_ins = make_zset(
         lineitem_schema(),
         vec![
-            l_orderkey_v, l_partkey_v, l_suppkey_v,
-            l_extprice_v, l_discount_v, l_quantity_v,
-            l_returnflag_v, l_linestatus_v,
-            l_shipdate_v, l_commitdate_v, l_receiptdate_v,
+            l_orderkey_v,
+            l_partkey_v,
+            l_suppkey_v,
+            l_extprice_v,
+            l_discount_v,
+            l_quantity_v,
+            l_returnflag_v,
+            l_linestatus_v,
+            l_shipdate_v,
+            l_commitdate_v,
+            l_receiptdate_v,
         ],
         1,
     );
@@ -670,7 +685,10 @@ pub fn generate_tpch_dataset_scaled(seed: u64, scale: u64) -> HashMap<String, Ar
 
     // 1. region: 5 rows (static)
     let r_regionkey: Vec<i64> = (1..=5).collect();
-    tables.insert("region".to_string(), make_zset(region_schema(), vec![r_regionkey], 1));
+    tables.insert(
+        "region".to_string(),
+        make_zset(region_schema(), vec![r_regionkey], 1),
+    );
 
     // 2. nation: 25 rows (static)
     let mut n_nationkey = Vec::new();
@@ -679,7 +697,10 @@ pub fn generate_tpch_dataset_scaled(seed: u64, scale: u64) -> HashMap<String, Ar
         n_nationkey.push(i);
         n_regionkey.push(rng.next_range(1, 5));
     }
-    tables.insert("nation".to_string(), make_zset(nation_schema(), vec![n_nationkey, n_regionkey], 1));
+    tables.insert(
+        "nation".to_string(),
+        make_zset(nation_schema(), vec![n_nationkey, n_regionkey], 1),
+    );
 
     // 3. supplier: 100 * scale rows
     let mut s_suppkey = Vec::new();
@@ -690,7 +711,14 @@ pub fn generate_tpch_dataset_scaled(seed: u64, scale: u64) -> HashMap<String, Ar
         s_nationkey.push(rng.next_range(1, 25));
         s_acctbal.push(rng.next_range(-1000, 10000));
     }
-    tables.insert("supplier".to_string(), make_zset(supplier_schema(), vec![s_suppkey, s_nationkey, s_acctbal], 1));
+    tables.insert(
+        "supplier".to_string(),
+        make_zset(
+            supplier_schema(),
+            vec![s_suppkey, s_nationkey, s_acctbal],
+            1,
+        ),
+    );
 
     // 4. part: 2,000 * scale rows
     let mut p_partkey = Vec::new();
@@ -707,7 +735,21 @@ pub fn generate_tpch_dataset_scaled(seed: u64, scale: u64) -> HashMap<String, Ar
         p_type.push(rng.next_range(1, 15));
         p_container.push(rng.next_range(1, 10));
     }
-    tables.insert("part".to_string(), make_zset(part_schema(), vec![p_partkey, p_size, p_retailprice, p_brand, p_type, p_container], 1));
+    tables.insert(
+        "part".to_string(),
+        make_zset(
+            part_schema(),
+            vec![
+                p_partkey,
+                p_size,
+                p_retailprice,
+                p_brand,
+                p_type,
+                p_container,
+            ],
+            1,
+        ),
+    );
 
     // 5. partsupp: 8,000 * scale rows
     let mut ps_partkey = Vec::new();
@@ -726,7 +768,14 @@ pub fn generate_tpch_dataset_scaled(seed: u64, scale: u64) -> HashMap<String, Ar
         ps_availqty.push(rng.next_range(1, 9999));
         ps_supplycost.push(rng.next_range(1, 1000));
     }
-    tables.insert("partsupp".to_string(), make_zset(partsupp_schema(), vec![ps_partkey, ps_suppkey, ps_availqty, ps_supplycost], 1));
+    tables.insert(
+        "partsupp".to_string(),
+        make_zset(
+            partsupp_schema(),
+            vec![ps_partkey, ps_suppkey, ps_availqty, ps_supplycost],
+            1,
+        ),
+    );
 
     // 6. customer: 1,500 * scale rows
     let mut c_custkey = Vec::new();
@@ -739,7 +788,14 @@ pub fn generate_tpch_dataset_scaled(seed: u64, scale: u64) -> HashMap<String, Ar
         c_acctbal.push(rng.next_range(-1000, 10000));
         c_mktsegment.push(rng.next_range(1, 5));
     }
-    tables.insert("customer".to_string(), make_zset(customer_schema(), vec![c_custkey, c_nationkey, c_acctbal, c_mktsegment], 1));
+    tables.insert(
+        "customer".to_string(),
+        make_zset(
+            customer_schema(),
+            vec![c_custkey, c_nationkey, c_acctbal, c_mktsegment],
+            1,
+        ),
+    );
 
     // 7. orders: 15,000 * scale rows (sequential keys so every lineitem joins)
     let mut o_orderkey = Vec::new();
@@ -754,7 +810,20 @@ pub fn generate_tpch_dataset_scaled(seed: u64, scale: u64) -> HashMap<String, Ar
         o_totalprice.push(rng.next_range(900, 500000));
         o_shippriority.push(rng.next_range(1, 3));
     }
-    tables.insert("orders".to_string(), make_zset(orders_schema(), vec![o_orderkey, o_custkey, o_orderdate, o_totalprice, o_shippriority], 1));
+    tables.insert(
+        "orders".to_string(),
+        make_zset(
+            orders_schema(),
+            vec![
+                o_orderkey,
+                o_custkey,
+                o_orderdate,
+                o_totalprice,
+                o_shippriority,
+            ],
+            1,
+        ),
+    );
 
     // 8. lineitem: 60,000 * scale rows
     //    First 15,000*scale rows: l_orderkey = i (guaranteed 1:1 join coverage)
@@ -796,10 +865,26 @@ pub fn generate_tpch_dataset_scaled(seed: u64, scale: u64) -> HashMap<String, Ar
         l_commitdate.push(rng.next_range(1, 2500));
         l_receiptdate.push(rng.next_range(1, 2500));
     }
-    tables.insert("lineitem".to_string(), make_zset(lineitem_schema(), vec![
-        l_orderkey, l_partkey, l_suppkey, l_extendedprice, l_discount, l_quantity,
-        l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate,
-    ], 1));
+    tables.insert(
+        "lineitem".to_string(),
+        make_zset(
+            lineitem_schema(),
+            vec![
+                l_orderkey,
+                l_partkey,
+                l_suppkey,
+                l_extendedprice,
+                l_discount,
+                l_quantity,
+                l_returnflag,
+                l_linestatus,
+                l_shipdate,
+                l_commitdate,
+                l_receiptdate,
+            ],
+            1,
+        ),
+    );
 
     tables
 }
@@ -822,15 +907,22 @@ pub fn generate_tpch_deltas_scaled(
     let s_suppkey = vec![rng.next_range(100 * s + 1, 200 * s)];
     let s_nationkey = vec![rng.next_range(1, 25)];
     let s_acctbal = vec![rng.next_range(-1000, 10000)];
-    let s_ins = make_zset(supplier_schema(), vec![s_suppkey, s_nationkey, s_acctbal], 1);
+    let s_ins = make_zset(
+        supplier_schema(),
+        vec![s_suppkey, s_nationkey, s_acctbal],
+        1,
+    );
     deltas.insert("supplier".to_string(), concat_zsets(&s_ret, &s_ins));
 
     // part: 1% of 2000*scale = 20*scale rows
     let p_count = (20 * s) as usize;
     let p_ret = select_retractions(current_dataset, "part", p_count, &mut rng);
-    let mut p_partkey = Vec::new(); let mut p_size = Vec::new();
-    let mut p_retailprice = Vec::new(); let mut p_brand = Vec::new();
-    let mut p_type = Vec::new(); let mut p_container = Vec::new();
+    let mut p_partkey = Vec::new();
+    let mut p_size = Vec::new();
+    let mut p_retailprice = Vec::new();
+    let mut p_brand = Vec::new();
+    let mut p_type = Vec::new();
+    let mut p_container = Vec::new();
     for i in 1..=(p_count as i64) {
         p_partkey.push(2000 * s + i);
         p_size.push(rng.next_range(1, 50));
@@ -839,42 +931,68 @@ pub fn generate_tpch_deltas_scaled(
         p_type.push(rng.next_range(1, 15));
         p_container.push(rng.next_range(1, 10));
     }
-    let p_ins = make_zset(part_schema(), vec![p_partkey, p_size, p_retailprice, p_brand, p_type, p_container], 1);
+    let p_ins = make_zset(
+        part_schema(),
+        vec![
+            p_partkey,
+            p_size,
+            p_retailprice,
+            p_brand,
+            p_type,
+            p_container,
+        ],
+        1,
+    );
     deltas.insert("part".to_string(), concat_zsets(&p_ret, &p_ins));
 
     // partsupp: 1% of 8000*scale = 80*scale rows
     let ps_count = (80 * s) as usize;
     let ps_ret = select_retractions(current_dataset, "partsupp", ps_count, &mut rng);
-    let mut ps_partkey = Vec::new(); let mut ps_suppkey = Vec::new();
-    let mut ps_availqty = Vec::new(); let mut ps_supplycost = Vec::new();
+    let mut ps_partkey = Vec::new();
+    let mut ps_suppkey = Vec::new();
+    let mut ps_availqty = Vec::new();
+    let mut ps_supplycost = Vec::new();
     for _ in 0..ps_count {
         ps_partkey.push(rng.next_range(1, 2000 * s));
         ps_suppkey.push(rng.next_range(1, 100 * s));
         ps_availqty.push(rng.next_range(1, 9999));
         ps_supplycost.push(rng.next_range(1, 1000));
     }
-    let ps_ins = make_zset(partsupp_schema(), vec![ps_partkey, ps_suppkey, ps_availqty, ps_supplycost], 1);
+    let ps_ins = make_zset(
+        partsupp_schema(),
+        vec![ps_partkey, ps_suppkey, ps_availqty, ps_supplycost],
+        1,
+    );
     deltas.insert("partsupp".to_string(), concat_zsets(&ps_ret, &ps_ins));
 
     // customer: 1% of 1500*scale = 15*scale rows
     let c_count = (15 * s) as usize;
     let c_ret = select_retractions(current_dataset, "customer", c_count, &mut rng);
-    let mut c_custkey = Vec::new(); let mut c_nationkey = Vec::new();
-    let mut c_acctbal = Vec::new(); let mut c_mktsegment = Vec::new();
+    let mut c_custkey = Vec::new();
+    let mut c_nationkey = Vec::new();
+    let mut c_acctbal = Vec::new();
+    let mut c_mktsegment = Vec::new();
     for i in 1..=(c_count as i64) {
         c_custkey.push(1500 * s + i);
         c_nationkey.push(rng.next_range(1, 25));
         c_acctbal.push(rng.next_range(-1000, 10000));
         c_mktsegment.push(rng.next_range(1, 5));
     }
-    let c_ins = make_zset(customer_schema(), vec![c_custkey, c_nationkey, c_acctbal, c_mktsegment], 1);
+    let c_ins = make_zset(
+        customer_schema(),
+        vec![c_custkey, c_nationkey, c_acctbal, c_mktsegment],
+        1,
+    );
     deltas.insert("customer".to_string(), concat_zsets(&c_ret, &c_ins));
 
     // orders: 1% of 15000*scale = 150*scale rows
     let o_count = (150 * s) as usize;
     let o_ret = select_retractions(current_dataset, "orders", o_count, &mut rng);
-    let mut o_orderkey = Vec::new(); let mut o_custkey = Vec::new();
-    let mut o_orderdate = Vec::new(); let mut o_totalprice = Vec::new(); let mut o_shippriority = Vec::new();
+    let mut o_orderkey = Vec::new();
+    let mut o_custkey = Vec::new();
+    let mut o_orderdate = Vec::new();
+    let mut o_totalprice = Vec::new();
+    let mut o_shippriority = Vec::new();
     for i in 1..=(o_count as i64) {
         o_orderkey.push(15000 * s + i);
         o_custkey.push(rng.next_range(1, 1500 * s));
@@ -882,16 +1000,33 @@ pub fn generate_tpch_deltas_scaled(
         o_totalprice.push(rng.next_range(900, 500000));
         o_shippriority.push(rng.next_range(1, 3));
     }
-    let o_ins = make_zset(orders_schema(), vec![o_orderkey, o_custkey, o_orderdate, o_totalprice, o_shippriority], 1);
+    let o_ins = make_zset(
+        orders_schema(),
+        vec![
+            o_orderkey,
+            o_custkey,
+            o_orderdate,
+            o_totalprice,
+            o_shippriority,
+        ],
+        1,
+    );
     deltas.insert("orders".to_string(), concat_zsets(&o_ret, &o_ins));
 
     // lineitem: 1% of 60000*scale = 600*scale rows
     let l_count = (600 * s) as usize;
     let l_ret = select_retractions(current_dataset, "lineitem", l_count, &mut rng);
-    let mut l_orderkey = Vec::new(); let mut l_partkey = Vec::new(); let mut l_suppkey = Vec::new();
-    let mut l_extendedprice = Vec::new(); let mut l_discount = Vec::new(); let mut l_quantity = Vec::new();
-    let mut l_returnflag = Vec::new(); let mut l_linestatus = Vec::new();
-    let mut l_shipdate = Vec::new(); let mut l_commitdate = Vec::new(); let mut l_receiptdate = Vec::new();
+    let mut l_orderkey = Vec::new();
+    let mut l_partkey = Vec::new();
+    let mut l_suppkey = Vec::new();
+    let mut l_extendedprice = Vec::new();
+    let mut l_discount = Vec::new();
+    let mut l_quantity = Vec::new();
+    let mut l_returnflag = Vec::new();
+    let mut l_linestatus = Vec::new();
+    let mut l_shipdate = Vec::new();
+    let mut l_commitdate = Vec::new();
+    let mut l_receiptdate = Vec::new();
     for _ in 0..l_count {
         l_orderkey.push(rng.next_range(1, 15000 * s));
         l_partkey.push(rng.next_range(1, 2000 * s));
@@ -905,10 +1040,23 @@ pub fn generate_tpch_deltas_scaled(
         l_commitdate.push(rng.next_range(1, 2500));
         l_receiptdate.push(rng.next_range(1, 2500));
     }
-    let l_ins = make_zset(lineitem_schema(), vec![
-        l_orderkey, l_partkey, l_suppkey, l_extendedprice, l_discount, l_quantity,
-        l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate,
-    ], 1);
+    let l_ins = make_zset(
+        lineitem_schema(),
+        vec![
+            l_orderkey,
+            l_partkey,
+            l_suppkey,
+            l_extendedprice,
+            l_discount,
+            l_quantity,
+            l_returnflag,
+            l_linestatus,
+            l_shipdate,
+            l_commitdate,
+            l_receiptdate,
+        ],
+        1,
+    );
     deltas.insert("lineitem".to_string(), concat_zsets(&l_ret, &l_ins));
 
     deltas
@@ -1075,10 +1223,7 @@ mod tests {
     }
 
     /// Apply AggregateOp output Z-set deltas to an in-memory state map.
-    fn apply_agg_output_deltas(
-        state: &mut BTreeMap<i64, (i64, i64)>,
-        output: &ArrowZSet,
-    ) {
+    fn apply_agg_output_deltas(state: &mut BTreeMap<i64, (i64, i64)>, output: &ArrowZSet) {
         if output.is_empty() {
             return;
         }
@@ -1177,7 +1322,8 @@ mod tests {
         let batch_after = batch_agg_reference(&kv_after);
 
         assert_eq!(
-            incr_state, batch_after,
+            incr_state,
+            batch_after,
             "TPC-H Q1 aggregate after 1% delta: incremental != batch\n\
              incremental ({} groups): {incr_state:?}\n\
              batch       ({} groups): {batch_after:?}",
@@ -1226,7 +1372,8 @@ mod tests {
             let batch = batch_agg_reference(&project_lineitem_kv(&updated));
 
             assert_eq!(
-                incr_state, batch,
+                incr_state,
+                batch,
                 "TPC-H Q1 epoch {epoch}: incremental != batch\n\
                  incremental ({} groups): {incr_state:?}\n\
                  batch       ({} groups): {batch:?}",
@@ -1242,14 +1389,11 @@ mod tests {
                 m.insert("lineitem".to_string(), current_lineitem.clone());
                 // Carry over the other tables unchanged.
                 for table in &[
-                    "region", "nation", "supplier", "part", "partsupp",
-                    "customer", "orders",
+                    "region", "nation", "supplier", "part", "partsupp", "customer", "orders",
                 ] {
                     m.insert(
                         table.to_string(),
-                        generate_tpch_dataset(base_seed)
-                            .remove(*table)
-                            .unwrap(),
+                        generate_tpch_dataset(base_seed).remove(*table).unwrap(),
                     );
                 }
                 m
@@ -1389,8 +1533,7 @@ mod tests {
         let expected_initial = batch_q6_sum(&lineitem);
         let incr_initial_sum: i64 = incr_state.values().map(|(sum, _)| *sum).sum();
         assert_eq!(
-            incr_initial_sum,
-            expected_initial,
+            incr_initial_sum, expected_initial,
             "Q6 initial load: incremental SUM != batch SUM\n\
              incremental sum: {incr_initial_sum}\n\
              batch sum:       {expected_initial}"
@@ -1410,8 +1553,7 @@ mod tests {
         let incr_after_sum: i64 = incr_state.values().map(|(sum, _)| *sum).sum();
 
         assert_eq!(
-            incr_after_sum,
-            expected_after,
+            incr_after_sum, expected_after,
             "Q6 after 1% delta: incremental SUM != batch SUM\n\
              incremental sum: {incr_after_sum}\n\
              batch sum:       {expected_after}"
@@ -1457,7 +1599,8 @@ mod tests {
             let batch = batch_agg_reference(&project_lineitem_kv(&updated));
 
             assert_eq!(
-                incr_state, batch,
+                incr_state,
+                batch,
                 "TPC-H Q1 10-epoch test, epoch {epoch}: incremental != batch\n\
                  incremental ({} groups): {incr_state:?}\n\
                  batch       ({} groups): {batch:?}",
@@ -1470,8 +1613,7 @@ mod tests {
                 let mut m = std::collections::HashMap::new();
                 m.insert("lineitem".to_string(), current_lineitem.clone());
                 for table in &[
-                    "region", "nation", "supplier", "part", "partsupp",
-                    "customer", "orders",
+                    "region", "nation", "supplier", "part", "partsupp", "customer", "orders",
                 ] {
                     m.insert(
                         table.to_string(),

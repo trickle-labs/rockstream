@@ -310,11 +310,7 @@ mod tests {
         // Insert then delete the same row → group disappears entirely.
         assert_oracle_aggregate(&[vec![(1, 10, 1)], vec![(1, 10, -1)]]);
         let result = incremental_output(&[vec![(1, 10, 1)], vec![(1, 10, -1)]]);
-        assert_eq!(
-            result,
-            vec![],
-            "insert-then-delete must leave no groups"
-        );
+        assert_eq!(result, vec![], "insert-then-delete must leave no groups");
     }
 
     #[test]
@@ -389,16 +385,8 @@ mod tests {
     fn oracle_aggregate_group_deletion_and_resurrection() {
         // k=1 v=10 inserted, then deleted, then re-inserted with v=20.
         // Final: k=1 sum=20, count=1, avg=20.
-        assert_oracle_aggregate(&[
-            vec![(1, 10, 1)],
-            vec![(1, 10, -1)],
-            vec![(1, 20, 1)],
-        ]);
-        let result = incremental_output(&[
-            vec![(1, 10, 1)],
-            vec![(1, 10, -1)],
-            vec![(1, 20, 1)],
-        ]);
+        assert_oracle_aggregate(&[vec![(1, 10, 1)], vec![(1, 10, -1)], vec![(1, 20, 1)]]);
+        let result = incremental_output(&[vec![(1, 10, 1)], vec![(1, 10, -1)], vec![(1, 20, 1)]]);
         assert_eq!(
             result,
             vec![(1, 20, 1, 20)],
@@ -410,14 +398,8 @@ mod tests {
     fn oracle_aggregate_multi_group_partial_deletion() {
         // k=1: 3 copies of v=5 → insert 3, delete 1 → 2 copies left.
         // Final: k=1 sum=10, count=2, avg=5.
-        assert_oracle_aggregate(&[
-            vec![(1, 5, 1), (1, 5, 1), (1, 5, 1)],
-            vec![(1, 5, -1)],
-        ]);
-        let result = incremental_output(&[
-            vec![(1, 5, 1), (1, 5, 1), (1, 5, 1)],
-            vec![(1, 5, -1)],
-        ]);
+        assert_oracle_aggregate(&[vec![(1, 5, 1), (1, 5, 1), (1, 5, 1)], vec![(1, 5, -1)]]);
+        let result = incremental_output(&[vec![(1, 5, 1), (1, 5, 1), (1, 5, 1)], vec![(1, 5, -1)]]);
         assert_eq!(
             result,
             vec![(1, 10, 2, 5)],

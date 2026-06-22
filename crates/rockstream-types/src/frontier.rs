@@ -147,10 +147,6 @@ impl ProgressMerge for FreshnessToken {
     }
 }
 
-
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
