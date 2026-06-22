@@ -18,6 +18,10 @@ rtk cargo test ... 2>&1 | grep -E "^test .* (ok|FAILED|ignored)|^test result:|^F
 
 Show full output **only for FAILED tests**. Passing test noise balloons the cache and gets re-read on every subsequent turn, multiplying token costs 10–30×.
 
+## Writing tests
+
+All tests must test and verify the exact, and ideally, full output instead of counts and other simplifications. This is important so that the tests can cover more ground.
+
 ## RTK Wrapper
 
 Always use rtk wrapper for all commands. Examples:

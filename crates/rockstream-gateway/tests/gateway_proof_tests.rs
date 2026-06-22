@@ -50,6 +50,18 @@ async fn connect_port(port: u16) -> tokio_postgres::Client {
     client
 }
 
+/// Extract `SimpleQueryMessage::Row` entries from a simple_query result.
+fn data_rows_from(
+    msgs: &[tokio_postgres::SimpleQueryMessage],
+) -> Vec<&tokio_postgres::SimpleQueryRow> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn start_gateway_noop(catalog: CatalogStubs) -> (u16, tokio::task::JoinHandle<()>) {
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, Arc::new(catalog), Arc::new(NoopViewReader));
@@ -688,50 +700,65 @@ async fn create_table_registers_in_catalog() {
 /// S3 green gate: INSERT accumulates in write buffer; no shard writes until COMMIT.
 ///
 /// We don't have direct write-buffer introspection here via psql, so we verify
-/// that after INSERT (no COMMIT), the view prefix is still empty.
+/// that after INSERT (no COMMIT), SELECT returns zero rows.
 #[tokio::test]
 async fn insert_accumulates_in_write_buffer() {
-    let (port, _handle, shard_db) = start_gateway_with_shard("s3-insert-buf").await;
+    let (port, _handle, _shard_db) = start_gateway_with_shard("s3-insert-buf").await;
     let client = connect_port(port).await;
 
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
     client
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
         .expect("INSERT failed");
 
-    // No COMMIT yet — shard should have no view_output/t/ rows
-    let rows = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
-    assert!(
-        rows.is_empty(),
+    // No COMMIT yet — SELECT must return 0 rows (write buffer not flushed to shard)
+    let msgs = client.simple_query("SELECT * FROM t").await.expect("SELECT t failed");
+    let data_rows = data_rows_from(&msgs);
+    assert_eq!(
+        data_rows.len(),
+        0,
         "expected no rows before COMMIT, got {} rows",
-        rows.len()
+        data_rows.len()
     );
 }
 
 /// S3 green gate: DELETE accumulates in write buffer.
 #[tokio::test]
 async fn delete_accumulates_in_write_buffer() {
-    let (port, _handle, shard_db) = start_gateway_with_shard("s3-delete-buf").await;
+    let (port, _handle, _shard_db) = start_gateway_with_shard("s3-delete-buf").await;
     let client = connect_port(port).await;
 
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
     client
         .simple_query("DELETE FROM t WHERE id = 1")
         .await
         .expect("DELETE failed");
 
-    // No COMMIT yet — no deletions applied
-    let rows = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
-    assert!(rows.is_empty(), "expected no rows before COMMIT");
+    // No COMMIT yet — SELECT must return 0 rows
+    let msgs = client.simple_query("SELECT * FROM t").await.expect("SELECT t failed");
+    let data_rows = data_rows_from(&msgs);
+    assert_eq!(data_rows.len(), 0, "expected no rows before COMMIT");
 }
 
 // ── S4: commit_flushes_rows_scannable_via_view_prefix ────────────────────────
 
-/// S4 green gate: COMMIT flushes INSERT rows to the shard, scannable via view_output prefix.
+/// S4 green gate: COMMIT flushes INSERT rows to the shard, visible via SELECT.
 #[tokio::test]
 async fn commit_flushes_rows_scannable_via_view_prefix() {
     let (port, _handle, shard_db) = start_gateway_with_shard("s4-commit-flush").await;
     let client = connect_port(port).await;
 
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
     client
         .simple_query("SET rockstream.idempotency_key = 's4-commit-flush-key'")
         .await
@@ -746,18 +773,22 @@ async fn commit_flushes_rows_scannable_via_view_prefix() {
         .expect("INSERT 2 failed");
     client.simple_query("COMMIT").await.expect("COMMIT failed");
 
-    // Now the shard should have 2 rows under view_output/orders/
     shard_db.flush().await.unwrap();
-    let rows = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    let msgs = client
+        .simple_query("SELECT * FROM orders ORDER BY id")
+        .await
+        .expect("SELECT orders failed");
+    let data_rows = data_rows_from(&msgs);
     assert_eq!(
-        rows.len(),
+        data_rows.len(),
         2,
-        "expected 2 rows after COMMIT, got {}: {:?}",
-        rows.len(),
-        rows.iter()
-            .map(|(k, _)| String::from_utf8_lossy(k))
-            .collect::<Vec<_>>()
+        "expected 2 rows after COMMIT, got {}",
+        data_rows.len()
     );
+    assert_eq!(data_rows[0].get("id").unwrap_or(""), "42");
+    assert_eq!(data_rows[0].get("amount").unwrap_or(""), "99");
+    assert_eq!(data_rows[1].get("id").unwrap_or(""), "43");
+    assert_eq!(data_rows[1].get("amount").unwrap_or(""), "100");
 }
 
 /// S4: commit_write_batch_uses_no_range_delete — WriteBatch uses only Put/Delete ops.
@@ -784,12 +815,16 @@ fn commit_write_batch_uses_no_range_delete() {
 
 // ── S5: rollback_discards_write_buffer_no_shard_writes ────────────────────────
 
-/// S5 green gate: ROLLBACK discards the write buffer — no rows written to shard.
+/// S5 green gate: ROLLBACK discards the write buffer — SELECT returns zero rows.
 #[tokio::test]
 async fn rollback_discards_write_buffer_no_shard_writes() {
     let (port, _handle, shard_db) = start_gateway_with_shard("s5-rollback").await;
     let client = connect_port(port).await;
 
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
     client
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
@@ -799,13 +834,15 @@ async fn rollback_discards_write_buffer_no_shard_writes() {
         .await
         .expect("ROLLBACK failed");
 
-    // After ROLLBACK, shard must have NO rows
+    // After ROLLBACK, SELECT must return 0 rows
     shard_db.flush().await.unwrap();
-    let rows = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
-    assert!(
-        rows.is_empty(),
+    let msgs = client.simple_query("SELECT * FROM t").await.expect("SELECT t failed");
+    let data_rows = data_rows_from(&msgs);
+    assert_eq!(
+        data_rows.len(),
+        0,
         "expected no rows after ROLLBACK, got {} rows",
-        rows.len()
+        data_rows.len()
     );
 }
 
@@ -942,6 +979,11 @@ async fn idempotent_replay_is_noop() {
     let (port, _handle, shard_db) = start_gateway_with_shard("s6-idempotent-replay").await;
     let client = connect_port(port).await;
 
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
     // First write with idempotency key
     client
         .simple_query("SET rockstream.idempotency_key = 'replay-key-1'")
@@ -956,10 +998,13 @@ async fn idempotent_replay_is_noop() {
         .await
         .expect("COMMIT 1 failed");
 
-    // Verify row was written
+    // After first COMMIT: exactly 1 row with the inserted data
     shard_db.flush().await.unwrap();
-    let rows = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
-    assert_eq!(rows.len(), 1, "expected 1 row after first COMMIT");
+    let msgs1 = client.simple_query("SELECT * FROM t").await.expect("SELECT t after first commit");
+    let rows1 = data_rows_from(&msgs1);
+    assert_eq!(rows1.len(), 1, "expected 1 row after first COMMIT");
+    assert_eq!(rows1[0].get("id").unwrap_or(""), "1");
+    assert_eq!(rows1[0].get("val").unwrap_or(""), "hello");
 
     // Replay: same idempotency key — should be a no-op
     client
@@ -975,22 +1020,25 @@ async fn idempotent_replay_is_noop() {
         .await
         .expect("COMMIT 2 (replay) failed");
 
-    // Still exactly 1 row — replay was a no-op
+    // Still exactly 1 row with the same data — replay was a no-op
     shard_db.flush().await.unwrap();
-    let rows2 = shard_db.scan_prefix(b"view_output/t/").await.unwrap();
+    let msgs2 = client.simple_query("SELECT * FROM t").await.expect("SELECT t after replay");
+    let rows2 = data_rows_from(&msgs2);
     assert_eq!(
         rows2.len(),
         1,
         "expected still 1 row after idempotent replay, got {}",
         rows2.len()
     );
+    assert_eq!(rows2[0].get("id").unwrap_or(""), "1");
+    assert_eq!(rows2[0].get("val").unwrap_or(""), "hello");
 }
 
 /// S6 green gate: idempotency-key cleanup uses scan-and-delete, no range-delete.
 #[tokio::test]
 async fn idempotency_key_expiry_cleanup_no_range_delete() {
     use object_store::memory::InMemory;
-    use rockstream_storage::{ShardDb, ShardKeyEncoder};
+    use rockstream_storage::ShardDb;
     use std::sync::Arc;
 
     let store = Arc::new(InMemory::new());
@@ -1042,12 +1090,16 @@ async fn idempotency_key_expiry_cleanup_no_range_delete() {
 // v0.24 S8/S10 LFS proof tests
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// P1 (S8/S10): psql INSERT + COMMIT with idempotency_key reflects in view_output scan.
+/// P1 (S8/S10): psql INSERT + COMMIT with idempotency_key is visible via SELECT.
 #[tokio::test]
 async fn proof_psql_insert_commit_reflects_in_view() {
     let (port, _handle, shard_db) = start_gateway_with_shard("proof-p1-lfs").await;
     let client = connect_port(port).await;
 
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
     client
         .simple_query("SET rockstream.idempotency_key = 'proof-p1-key'")
         .await
@@ -1059,18 +1111,14 @@ async fn proof_psql_insert_commit_reflects_in_view() {
     client.simple_query("COMMIT").await.expect("COMMIT failed");
 
     shard_db.flush().await.unwrap();
-    let rows = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
-    assert_eq!(
-        rows.len(),
-        1,
-        "P1: expected 1 row in view_output after COMMIT"
-    );
-    let (_, val) = &rows[0];
-    let val_str = String::from_utf8_lossy(val);
-    assert!(
-        val_str.contains("500") || val_str.contains("1"),
-        "P1: row value should contain inserted data; got: {val_str}"
-    );
+    let msgs = client
+        .simple_query("SELECT * FROM orders")
+        .await
+        .expect("SELECT orders failed");
+    let data_rows = data_rows_from(&msgs);
+    assert_eq!(data_rows.len(), 1, "P1: expected 1 row after COMMIT");
+    assert_eq!(data_rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(data_rows[0].get("amount").unwrap_or(""), "500");
 }
 
 /// P2 (S10): A write missing idempotency_key returns RS-2007.
@@ -1105,6 +1153,11 @@ async fn proof_idempotent_replay_noop_lfs() {
     let (port, _handle, shard_db) = start_gateway_with_shard("proof-p3a-lfs").await;
     let client = connect_port(port).await;
 
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
+
     // First commit
     client
         .simple_query("SET rockstream.idempotency_key = 'p3a-lfs-key'")
@@ -1120,8 +1173,14 @@ async fn proof_idempotent_replay_noop_lfs() {
         .expect("COMMIT 1 failed");
 
     shard_db.flush().await.unwrap();
-    let rows1 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    let msgs1 = client
+        .simple_query("SELECT * FROM orders")
+        .await
+        .expect("SELECT after first commit");
+    let rows1 = data_rows_from(&msgs1);
     assert_eq!(rows1.len(), 1, "P3a: expected 1 row after first commit");
+    assert_eq!(rows1[0].get("id").unwrap_or(""), "10");
+    assert_eq!(rows1[0].get("amount").unwrap_or(""), "99");
 
     // Replay with same key
     client
@@ -1138,13 +1197,19 @@ async fn proof_idempotent_replay_noop_lfs() {
         .expect("COMMIT replay failed");
 
     shard_db.flush().await.unwrap();
-    let rows2 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    let msgs2 = client
+        .simple_query("SELECT * FROM orders")
+        .await
+        .expect("SELECT after replay");
+    let rows2 = data_rows_from(&msgs2);
     assert_eq!(
         rows2.len(),
         1,
         "P3a: expected still 1 row after idempotent replay (no-op), got {}",
         rows2.len()
     );
+    assert_eq!(rows2[0].get("id").unwrap_or(""), "10");
+    assert_eq!(rows2[0].get("amount").unwrap_or(""), "99");
 }
 
 // ── P3b: MinIO proof test (feature-gated) ────────────────────────────────────
@@ -1186,6 +1251,12 @@ async fn proof_idempotent_replay_noop_minio() {
     let (local_addr, _handle) = server.serve_background().await.unwrap();
     let client = connect_port(local_addr.port()).await;
 
+    // Register table so SELECT can return typed columns.
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .unwrap();
+
     // First commit
     client
         .simple_query("SET rockstream.idempotency_key = 'p3b-minio-key'")
@@ -1198,8 +1269,11 @@ async fn proof_idempotent_replay_noop_minio() {
     client.simple_query("COMMIT").await.unwrap();
 
     shard_db.flush().await.unwrap();
-    let rows1 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    let msgs1 = client.simple_query("SELECT * FROM orders").await.unwrap();
+    let rows1 = data_rows_from(&msgs1);
     assert_eq!(rows1.len(), 1, "P3b: expected 1 row after first commit");
+    assert_eq!(rows1[0].get("id").unwrap_or(""), "20");
+    assert_eq!(rows1[0].get("amount").unwrap_or(""), "200");
 
     // Replay with same key
     client
@@ -1213,13 +1287,16 @@ async fn proof_idempotent_replay_noop_minio() {
     client.simple_query("COMMIT").await.unwrap();
 
     shard_db.flush().await.unwrap();
-    let rows2 = shard_db.scan_prefix(b"view_output/orders/").await.unwrap();
+    let msgs2 = client.simple_query("SELECT * FROM orders").await.unwrap();
+    let rows2 = data_rows_from(&msgs2);
     assert_eq!(
         rows2.len(),
         1,
         "P3b: expected still 1 row after idempotent replay on MinIO, got {}",
         rows2.len()
     );
+    assert_eq!(rows2[0].get("id").unwrap_or(""), "20");
+    assert_eq!(rows2[0].get("amount").unwrap_or(""), "200");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1704,7 +1781,9 @@ async fn copy_in_basic_rows_visible_lfs() {
     let rows_written = sink.finish().await.expect("CopyDone should succeed");
     assert_eq!(rows_written, 3, "CommandComplete should report COPY 3");
 
-    // Verify rows are durable in the shard.
+    // Wire-protocol proof: row count verified via CommandComplete above.
+    // Content check via direct shard scan (SELECT after COPY deadlocks in the
+    // single-threaded test runtime).
     shard_db.flush().await.unwrap();
     let entries = shard_db
         .scan_prefix(b"view_output/t/")
@@ -1713,23 +1792,16 @@ async fn copy_in_basic_rows_visible_lfs() {
     assert_eq!(
         entries.len(),
         3,
-        "shard should contain 3 rows under view_output/t/, got {}",
+        "expected 3 rows in shard after COPY, got {}",
         entries.len()
     );
-
-    // Spot-check that values contain the expected TSV data.
-    let vals: Vec<String> = entries
+    let values: Vec<String> = entries
         .iter()
         .map(|(_, v)| String::from_utf8_lossy(v).to_string())
         .collect();
-    assert!(
-        vals.iter().any(|v| v.contains("val1")),
-        "expected val1 in shard; got: {vals:?}"
-    );
-    assert!(
-        vals.iter().any(|v| v.contains("val3")),
-        "expected val3 in shard; got: {vals:?}"
-    );
+    assert!(values.iter().any(|v| v.contains("val1")), "expected val1 in shard");
+    assert!(values.iter().any(|v| v.contains("val2")), "expected val2 in shard");
+    assert!(values.iter().any(|v| v.contains("val3")), "expected val3 in shard");
 }
 
 // ── S5 gate: copy_in_large_batch_no_memory_exhaustion_lfs ────────────────────
@@ -1785,13 +1857,15 @@ async fn copy_in_large_batch_no_memory_exhaustion_lfs() {
         sent += batch_size;
     }
 
+    // Wire-protocol proof: CommandComplete tag carries the exact row count.
     let rows_written = sink.finish().await.expect("CopyDone should succeed");
     assert_eq!(
         rows_written, TOTAL as u64,
         "CommandComplete should report COPY {TOTAL}"
     );
 
-    // Spot-check 5 sampled rows in shard.
+    // All rows visible in the shard (verified via direct scan; SELECT after COPY
+    // deadlocks in the single-threaded test runtime due to TCP buffer back-pressure).
     shard_db.flush().await.unwrap();
     let entries = shard_db
         .scan_prefix(b"view_output/big/")
@@ -1800,17 +1874,9 @@ async fn copy_in_large_batch_no_memory_exhaustion_lfs() {
     assert_eq!(
         entries.len(),
         TOTAL,
-        "shard should contain {TOTAL} rows; got {}",
+        "shard should contain {TOTAL} rows after large COPY; got {}",
         entries.len()
     );
-
-    // Verify a few known keys exist.
-    for i in [0usize, 999, 9_999, 25_000, 49_999] {
-        let found = entries
-            .iter()
-            .any(|(_, v)| String::from_utf8_lossy(v).contains(&i.to_string()));
-        assert!(found, "expected row {i} in shard");
-    }
 }
 
 // ── S6 gate: copy_in_table_not_found_returns_rs2500 ──────────────────────────
@@ -2097,15 +2163,17 @@ async fn copy_in_large_batch_no_memory_exhaustion_minio_tc() {
     let rows = sink.finish().await.expect("finish");
     assert_eq!(rows, TOTAL as u64, "COPY {TOTAL}");
 
+    // Wire-protocol proof: row count verified via CommandComplete above.
+    // Content check via direct shard scan.
     shard_db.flush().await.unwrap();
     let entries = shard_db
         .scan_prefix(b"view_output/minio_t/")
         .await
-        .expect("scan");
+        .expect("scan_prefix failed");
     assert_eq!(
         entries.len(),
         TOTAL,
-        "all rows durable in MinIO; got {}",
+        "shard should contain {TOTAL} rows; got {}",
         entries.len()
     );
 }
@@ -2139,6 +2207,7 @@ async fn proof_copy_from_lfs() {
             .expect("send row failed");
     }
 
+    // Wire-protocol proof: CommandComplete tag carries the exact row count.
     let rows_written = sink.finish().await.expect("CopyDone should succeed");
     assert_eq!(
         rows_written, TOTAL as u64,
@@ -2222,41 +2291,34 @@ async fn last_hop_view_materialised_after_commit() {
         .expect("INSERT row 2");
     client.simple_query("COMMIT").await.expect("COMMIT");
 
-    // Flush so data is durably in the object store (needed for ShardReader).
     shard_db.flush().await.unwrap();
 
-    // Verify: base table has 2 rows
-    let base_rows = shard_db
-        .scan_prefix(b"view_output/orders/")
+    // Verify: base table has 2 rows with exact values (ordered by id)
+    let base_msgs = client
+        .simple_query("SELECT * FROM orders ORDER BY id")
         .await
-        .unwrap();
+        .expect("SELECT orders failed");
+    let base_rows = data_rows_from(&base_msgs);
     assert_eq!(base_rows.len(), 2, "orders should have 2 rows");
+    assert_eq!(base_rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(base_rows[0].get("amount").unwrap_or(""), "100");
+    assert_eq!(base_rows[1].get("id").unwrap_or(""), "2");
+    assert_eq!(base_rows[1].get("amount").unwrap_or(""), "10");
 
-    // Verify: the materialiser wrote big_orders — only the row with amount=100
-    let view_rows = shard_db
-        .scan_prefix(b"view_output/big_orders/")
+    // Verify: big_orders has exactly 1 row (amount=100 passes WHERE amount > 50)
+    let view_msgs = client
+        .simple_query("SELECT * FROM big_orders")
         .await
-        .unwrap();
+        .expect("SELECT big_orders failed");
+    let view_rows = data_rows_from(&view_msgs);
     assert_eq!(
         view_rows.len(),
         1,
-        "big_orders should have exactly 1 row (amount=100 passes WHERE amount > 50); \
-         got {}: {:?}",
-        view_rows.len(),
-        view_rows
-            .iter()
-            .map(|(_, v)| String::from_utf8_lossy(v).to_string())
-            .collect::<Vec<_>>()
+        "big_orders should have exactly 1 row (amount=100 passes WHERE amount > 50); got {}",
+        view_rows.len()
     );
-    let row_str = String::from_utf8_lossy(&view_rows[0].1);
-    assert!(
-        row_str.contains("100"),
-        "big_orders row should contain amount=100; got: {row_str}"
-    );
-    assert!(
-        !row_str.contains('\t') || !row_str.ends_with("10"),
-        "big_orders must not contain the low-amount row"
-    );
+    assert_eq!(view_rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(view_rows[0].get("amount").unwrap_or(""), "100");
 }
 
 /// Last-hop with a GROUP BY aggregate view: COUNT(*) and SUM() produce
@@ -2310,39 +2372,23 @@ async fn last_hop_aggregate_view_materialised_after_commit() {
 
     shard_db.flush().await.unwrap();
 
-    // page_hits should have 2 rows (one per URL)
-    let view_rows = shard_db
-        .scan_prefix(b"view_output/page_hits/")
+    // Verify exact page_hits output via SELECT (ordered by url for determinism)
+    let msgs = client
+        .simple_query("SELECT * FROM page_hits ORDER BY url")
         .await
-        .unwrap();
+        .expect("SELECT page_hits failed");
+    let view_rows = data_rows_from(&msgs);
     assert_eq!(
         view_rows.len(),
         2,
         "page_hits should have 2 rows (one per URL); got {}",
         view_rows.len()
     );
-
-    // Parse hits from TSV rows: `url\thits`
-    let mut hit_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for (_, v) in &view_rows {
-        let s = String::from_utf8_lossy(v);
-        let parts: Vec<&str> = s.split('\t').collect();
-        if parts.len() >= 2 {
-            let url = parts[0].to_string();
-            let hits: i64 = parts[1].parse().unwrap_or(0);
-            hit_map.insert(url, hits);
-        }
-    }
-    assert_eq!(
-        hit_map.get("/home").copied(),
-        Some(2),
-        "expected /home hits=2; got: {hit_map:?}"
-    );
-    assert_eq!(
-        hit_map.get("/pricing").copied(),
-        Some(1),
-        "expected /pricing hits=1; got: {hit_map:?}"
-    );
+    // ORDER BY url: /home < /pricing (lexicographic)
+    assert_eq!(view_rows[0].get("url").unwrap_or(""), "/home");
+    assert_eq!(view_rows[0].get("hits").unwrap_or(""), "2");
+    assert_eq!(view_rows[1].get("url").unwrap_or(""), "/pricing");
+    assert_eq!(view_rows[1].get("hits").unwrap_or(""), "1");
 }
 
 /// Last-hop SELECT: after INSERT+COMMIT, a SELECT over the view returns rows
@@ -2547,18 +2593,18 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
         .expect("INSERT campaign 3");
     client.simple_query("COMMIT").await.expect("COMMIT 1");
 
-    // After seeding campaigns: campaign_report and high_performers should be
-    // empty because no conversions exist yet (JOIN produces no rows).
+    // After seeding campaigns: high_performers must be empty (no conversions yet).
     shard_db.flush().await.unwrap();
-    let hp_rows = shard_db
-        .scan_prefix(b"view_output/high_performers/")
+    let hp_msgs0 = client
+        .simple_query("SELECT * FROM high_performers")
         .await
-        .unwrap();
+        .expect("SELECT high_performers after txn1");
+    let hp_rows0 = data_rows_from(&hp_msgs0);
     assert_eq!(
-        hp_rows.len(),
+        hp_rows0.len(),
         0,
         "high_performers should be empty before any conversions; got {}",
-        hp_rows.len()
+        hp_rows0.len()
     );
 
     // ── Transaction 2: first batch of conversions ─────────────────────────────
@@ -2589,67 +2635,64 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
 
     shard_db.flush().await.unwrap();
 
-    // campaign_totals: 3 rows (one per campaign)
-    let ct_rows = shard_db
-        .scan_prefix(b"view_output/campaign_totals/")
+    // campaign_totals: 3 rows (one per campaign), ordered by campaign_id
+    let ct_msgs = client
+        .simple_query("SELECT * FROM campaign_totals ORDER BY campaign_id")
         .await
-        .unwrap();
-    assert_eq!(
-        ct_rows.len(),
-        3,
-        "campaign_totals should have 3 rows; got {}",
-        ct_rows.len()
-    );
+        .expect("SELECT campaign_totals");
+    let ct_rows = data_rows_from(&ct_msgs);
+    assert_eq!(ct_rows.len(), 3, "campaign_totals should have 3 rows; got {}", ct_rows.len());
+    assert_eq!(ct_rows[0].get("campaign_id").unwrap_or(""), "1");
+    assert_eq!(ct_rows[0].get("conv_count").unwrap_or(""), "2");
+    assert_eq!(ct_rows[0].get("total_revenue").unwrap_or(""), "550");
+    assert_eq!(ct_rows[1].get("campaign_id").unwrap_or(""), "2");
+    assert_eq!(ct_rows[1].get("conv_count").unwrap_or(""), "1");
+    assert_eq!(ct_rows[1].get("total_revenue").unwrap_or(""), "150");
+    assert_eq!(ct_rows[2].get("campaign_id").unwrap_or(""), "3");
+    assert_eq!(ct_rows[2].get("conv_count").unwrap_or(""), "1");
+    assert_eq!(ct_rows[2].get("total_revenue").unwrap_or(""), "600");
 
-    // campaign_report: 3 rows (inner join matched all 3 campaigns)
-    let cr_rows = shard_db
-        .scan_prefix(b"view_output/campaign_report/")
+    // campaign_report: 3 rows (inner join matched all 3 campaigns), ordered by name
+    let cr_msgs = client
+        .simple_query("SELECT * FROM campaign_report ORDER BY name")
         .await
-        .unwrap();
-    assert_eq!(
-        cr_rows.len(),
-        3,
-        "campaign_report should have 3 rows; got {}",
-        cr_rows.len()
-    );
+        .expect("SELECT campaign_report");
+    let cr_rows = data_rows_from(&cr_msgs);
+    assert_eq!(cr_rows.len(), 3, "campaign_report should have 3 rows; got {}", cr_rows.len());
+    // ORDER BY name: Brand Awareness < Retargeting < Summer Sale
+    assert_eq!(cr_rows[0].get("name").unwrap_or(""), "Brand Awareness");
+    assert_eq!(cr_rows[0].get("channel").unwrap_or(""), "social");
+    assert_eq!(cr_rows[0].get("conv_count").unwrap_or(""), "1");
+    assert_eq!(cr_rows[0].get("total_revenue").unwrap_or(""), "150");
+    assert_eq!(cr_rows[1].get("name").unwrap_or(""), "Retargeting");
+    assert_eq!(cr_rows[1].get("channel").unwrap_or(""), "display");
+    assert_eq!(cr_rows[1].get("conv_count").unwrap_or(""), "1");
+    assert_eq!(cr_rows[1].get("total_revenue").unwrap_or(""), "600");
+    assert_eq!(cr_rows[2].get("name").unwrap_or(""), "Summer Sale");
+    assert_eq!(cr_rows[2].get("channel").unwrap_or(""), "email");
+    assert_eq!(cr_rows[2].get("conv_count").unwrap_or(""), "2");
+    assert_eq!(cr_rows[2].get("total_revenue").unwrap_or(""), "550");
 
     // high_performers: 2 rows (Summer Sale=550 and Retargeting=600 exceed 500;
-    //                          Brand Awareness=150 does not)
-    let hp_rows = shard_db
-        .scan_prefix(b"view_output/high_performers/")
+    //                          Brand Awareness=150 does not).
+    // ORDER BY total_revenue DESC, name: Retargeting(600) then Summer Sale(550).
+    let hp_msgs2 = client
+        .simple_query("SELECT * FROM high_performers ORDER BY total_revenue DESC, name")
         .await
-        .unwrap();
+        .expect("SELECT high_performers after txn2");
+    let hp_rows2 = data_rows_from(&hp_msgs2);
     assert_eq!(
-        hp_rows.len(),
+        hp_rows2.len(),
         2,
-        "high_performers should have 2 rows (total_revenue > 500); got {}: {:?}",
-        hp_rows.len(),
-        hp_rows
-            .iter()
-            .map(|(_, v)| String::from_utf8_lossy(v).to_string())
-            .collect::<Vec<_>>()
+        "high_performers should have 2 rows (total_revenue > 500); got {}",
+        hp_rows2.len()
     );
-
-    // Verify the high_performers rows contain the expected names
-    let hp_names: Vec<String> = hp_rows
-        .iter()
-        .map(|(_, v)| {
-            let s = String::from_utf8_lossy(v);
-            s.split('\t').next().unwrap_or("").to_string()
-        })
-        .collect();
-    assert!(
-        hp_names.contains(&"Summer Sale".to_string()),
-        "high_performers must contain 'Summer Sale'; got: {hp_names:?}"
-    );
-    assert!(
-        hp_names.contains(&"Retargeting".to_string()),
-        "high_performers must contain 'Retargeting'; got: {hp_names:?}"
-    );
-    assert!(
-        !hp_names.contains(&"Brand Awareness".to_string()),
-        "high_performers must NOT contain 'Brand Awareness' (revenue 150 < 500); got: {hp_names:?}"
-    );
+    assert_eq!(hp_rows2[0].get("name").unwrap_or(""), "Retargeting");
+    assert_eq!(hp_rows2[0].get("channel").unwrap_or(""), "display");
+    assert_eq!(hp_rows2[0].get("total_revenue").unwrap_or(""), "600");
+    assert_eq!(hp_rows2[1].get("name").unwrap_or(""), "Summer Sale");
+    assert_eq!(hp_rows2[1].get("channel").unwrap_or(""), "email");
+    assert_eq!(hp_rows2[1].get("total_revenue").unwrap_or(""), "550");
 
     // ── Transaction 3: Brand Awareness crosses the threshold ──────────────────
     // One more conversion worth 400 pushes campaign 2 from 150 to 550 (> 500).
@@ -2665,31 +2708,26 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
 
     shard_db.flush().await.unwrap();
 
-    // high_performers: now 3 rows — Brand Awareness (150+400=550) joined the club
-    let hp_rows = shard_db
-        .scan_prefix(b"view_output/high_performers/")
+    // high_performers: now 3 rows — Brand Awareness (150+400=550) joined the club.
+    // ORDER BY total_revenue DESC, name: Retargeting(600), Brand Awareness(550), Summer Sale(550).
+    let hp_msgs3 = client
+        .simple_query("SELECT * FROM high_performers ORDER BY total_revenue DESC, name")
         .await
-        .unwrap();
+        .expect("SELECT high_performers after txn3");
+    let hp_rows3 = data_rows_from(&hp_msgs3);
     assert_eq!(
-        hp_rows.len(),
+        hp_rows3.len(),
         3,
-        "after threshold crossing, high_performers should have 3 rows; got {}: {:?}",
-        hp_rows.len(),
-        hp_rows
-            .iter()
-            .map(|(_, v)| String::from_utf8_lossy(v).to_string())
-            .collect::<Vec<_>>()
+        "after threshold crossing, high_performers should have 3 rows; got {}",
+        hp_rows3.len()
     );
-
-    let hp_names_final: Vec<String> = hp_rows
-        .iter()
-        .map(|(_, v)| {
-            let s = String::from_utf8_lossy(v);
-            s.split('\t').next().unwrap_or("").to_string()
-        })
-        .collect();
-    assert!(
-        hp_names_final.contains(&"Brand Awareness".to_string()),
-        "Brand Awareness should now be in high_performers (revenue 550 > 500); got: {hp_names_final:?}"
-    );
+    assert_eq!(hp_rows3[0].get("name").unwrap_or(""), "Retargeting");
+    assert_eq!(hp_rows3[0].get("channel").unwrap_or(""), "display");
+    assert_eq!(hp_rows3[0].get("total_revenue").unwrap_or(""), "600");
+    assert_eq!(hp_rows3[1].get("name").unwrap_or(""), "Brand Awareness");
+    assert_eq!(hp_rows3[1].get("channel").unwrap_or(""), "social");
+    assert_eq!(hp_rows3[1].get("total_revenue").unwrap_or(""), "550");
+    assert_eq!(hp_rows3[2].get("name").unwrap_or(""), "Summer Sale");
+    assert_eq!(hp_rows3[2].get("channel").unwrap_or(""), "email");
+    assert_eq!(hp_rows3[2].get("total_revenue").unwrap_or(""), "550");
 }

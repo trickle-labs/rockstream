@@ -409,7 +409,8 @@ impl GatewayHandler {
             if let Some(view_name) = extract_view_name_from_select(q) {
                 if !view_name.starts_with("pg_") && !view_name.starts_with("information_schema") {
                     let limit = extract_limit(q);
-                    return self.read_view_response(&view_name, limit, conn_id).await;
+                    let order_by = extract_order_by(q);
+                    return self.read_view_response(&view_name, limit, order_by, conn_id).await;
                 }
             }
         }
@@ -423,6 +424,7 @@ impl GatewayHandler {
         &self,
         view_name: &str,
         limit: Option<usize>,
+        order_by: Vec<(String, bool)>,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
         // Get principal and session namespace (v0.26)
@@ -489,6 +491,20 @@ impl GatewayHandler {
                     )
                 })
                 .collect()
+        } else if let Some(ct) = self.catalog.get_table(view_name) {
+            ct.columns
+                .iter()
+                .map(|c| {
+                    let oid = arrow_type_to_pg_oid(&c.data_type);
+                    FieldInfo::new(
+                        c.name.clone(),
+                        None,
+                        None,
+                        pg_type_from_oid(oid),
+                        FieldFormat::Text,
+                    )
+                })
+                .collect()
         } else {
             vec![FieldInfo::new(
                 "result".to_string(),
@@ -513,6 +529,45 @@ impl GatewayHandler {
                     PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
                 })?;
             let mut rows: Vec<Vec<u8>> = kvs.into_iter().map(|(_, v)| v.to_vec()).collect();
+            // Apply ORDER BY if specified
+            if !order_by.is_empty() {
+                // Build column-name → index map from schema_fields
+                let col_idx: std::collections::HashMap<String, usize> = schema_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (f.name().to_lowercase(), i))
+                    .collect();
+                rows.sort_by(|a, b| {
+                    let a_fields: Vec<&str> =
+                        std::str::from_utf8(a).unwrap_or("").split('\t').collect();
+                    let b_fields: Vec<&str> =
+                        std::str::from_utf8(b).unwrap_or("").split('\t').collect();
+                    for (col, desc) in &order_by {
+                        let idx = match col_idx.get(col.as_str()) {
+                            Some(&i) => i,
+                            None => continue,
+                        };
+                        let av = a_fields.get(idx).copied().unwrap_or("");
+                        let bv = b_fields.get(idx).copied().unwrap_or("");
+                        let ord = if let (Ok(an), Ok(bn)) =
+                            (av.parse::<i64>(), bv.parse::<i64>())
+                        {
+                            an.cmp(&bn)
+                        } else if let (Ok(af), Ok(bf)) =
+                            (av.parse::<f64>(), bv.parse::<f64>())
+                        {
+                            af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+                        } else {
+                            av.cmp(bv)
+                        };
+                        let ord = if *desc { ord.reverse() } else { ord };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
             if let Some(n) = limit {
                 rows.truncate(n);
             }
@@ -2038,6 +2093,37 @@ fn extract_limit(q: &str) -> Option<usize> {
     rest[..end].parse().ok()
 }
 
+/// Extract ORDER BY columns from a query string.
+/// Returns a list of `(column_name, descending)` pairs.
+fn extract_order_by(q: &str) -> Vec<(String, bool)> {
+    let ql = q.to_lowercase();
+    let ob_pos = match ql.find(" order by ") {
+        Some(p) => p,
+        None => return vec![],
+    };
+    // Everything after ORDER BY, up to LIMIT or end
+    let after = q[ob_pos + 10..].trim();
+    let after_lower = after.to_lowercase();
+    let end = after_lower
+        .find(" limit ")
+        .unwrap_or(after.len());
+    let order_part = after[..end].trim().trim_end_matches(';');
+
+    order_part
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let tokens: Vec<&str> = part.split_whitespace().collect();
+            let col = tokens.first()?.to_lowercase();
+            let desc = tokens.last().map(|t| t.to_lowercase() == "desc").unwrap_or(false);
+            Some((col, desc))
+        })
+        .collect()
+}
+
 /// Extract the view name from `COPY <view> TO STDOUT`.
 fn parse_copy_to_stdout_view(q: &str) -> Option<String> {
     let ql = q.to_lowercase();
@@ -2185,12 +2271,15 @@ fn infer_select_columns(sql: &str) -> Vec<String> {
                     Some(alias)
                 }
             } else {
-                // No alias: take the last whitespace-delimited token
+                // No alias: take the last whitespace-delimited token, then
+                // strip any table qualifier (e.g. `c.name` → `name`)
                 let last = p.split_whitespace().last().unwrap_or("").to_lowercase();
                 if last.is_empty() {
                     None
                 } else {
-                    Some(last)
+                    // Strip table.column → column
+                    let col = last.rsplit('.').next().unwrap_or(&last).to_string();
+                    Some(col)
                 }
             }
         })
@@ -2605,7 +2694,7 @@ mod s4_tests {
 
         // Try to read ns_b_view from ns-a session — should get RS-2402 error
         let responses = handler
-            .read_view_response("ns_b_view", None, Some(conn_id))
+            .read_view_response("ns_b_view", None, vec![], Some(conn_id))
             .await
             .unwrap();
         let got_error = responses.iter().any(|r| {
@@ -2658,7 +2747,7 @@ mod s4_tests {
 
         // Try to read ns_b_admin_view from ns-a session — admin should succeed
         let responses = handler
-            .read_view_response("ns_b_admin_view", None, Some(conn_id))
+            .read_view_response("ns_b_admin_view", None, vec![], Some(conn_id))
             .await
             .unwrap();
         let got_error = responses.iter().any(|r| matches!(r, Response::Error(_)));
