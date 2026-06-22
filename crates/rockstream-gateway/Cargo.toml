@@ -37,3 +37,10 @@ tempfile.workspace = true
 object_store = { version = "0.12", features = ["aws"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+rockstream-oracle = { workspace = true }
+rockstream-ops = { workspace = true }
+datafusion = { workspace = true }
+reqwest = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }

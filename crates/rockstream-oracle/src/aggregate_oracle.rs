@@ -269,59 +269,160 @@ pub async fn run_datafusion_aggregate(
 mod tests {
     use super::*;
 
-    // ── Deterministic oracle tests ─────────────────────────────────────────
+    // ── Deterministic oracle tests — with exact expected values ──────────
 
     #[test]
     fn oracle_aggregate_empty_input() {
         assert_oracle_aggregate(&[]);
+        // Empty input → no groups.
+        let result = incremental_output(&[]);
+        assert_eq!(result, vec![], "empty input must produce empty output");
     }
 
     #[test]
     fn oracle_aggregate_single_insert() {
         // One row: k=1, v=10.
+        // Expected: [(k=1, sum=10, count=1, avg=10)]
         assert_oracle_aggregate(&[vec![(1, 10, 1)]]);
+        let result = incremental_output(&[vec![(1, 10, 1)]]);
+        assert_eq!(
+            result,
+            vec![(1, 10, 1, 10)],
+            "single insert k=1 v=10: expected (k=1, sum=10, count=1, avg=10)"
+        );
     }
 
     #[test]
     fn oracle_aggregate_two_groups() {
+        // k=1: v=10 + v=5 → sum=15, count=2, avg=7 (truncating integer div)
+        // k=2: v=20        → sum=20, count=1, avg=20
         assert_oracle_aggregate(&[vec![(1, 10, 1), (2, 20, 1), (1, 5, 1)]]);
+        let result = incremental_output(&[vec![(1, 10, 1), (2, 20, 1), (1, 5, 1)]]);
+        assert_eq!(
+            result,
+            vec![(1, 15, 2, 7), (2, 20, 1, 20)],
+            "two_groups: expected [(1,15,2,7),(2,20,1,20)]"
+        );
     }
 
     #[test]
     fn oracle_aggregate_insert_then_delete() {
-        // Insert then delete the same row.
+        // Insert then delete the same row → group disappears entirely.
         assert_oracle_aggregate(&[vec![(1, 10, 1)], vec![(1, 10, -1)]]);
+        let result = incremental_output(&[vec![(1, 10, 1)], vec![(1, 10, -1)]]);
+        assert_eq!(
+            result,
+            vec![],
+            "insert-then-delete must leave no groups"
+        );
     }
 
     #[test]
     fn oracle_aggregate_group_churn() {
-        // Group k=1 appears, grows, then disappears.
+        // Group k=1: insert v=5, insert v=7, delete v=5, delete v=7 → disappears.
         assert_oracle_aggregate(&[
             vec![(1, 5, 1), (1, 7, 1)],
             vec![(1, 5, -1)],
             vec![(1, 7, -1)],
         ]);
+        let result = incremental_output(&[
+            vec![(1, 5, 1), (1, 7, 1)],
+            vec![(1, 5, -1)],
+            vec![(1, 7, -1)],
+        ]);
+        assert_eq!(result, vec![], "group churn must leave no groups");
     }
 
     #[test]
     fn oracle_aggregate_update_via_delete_insert() {
         // "Update" v=5 to v=9 for k=1.
+        // Final state: k=1 sum=9, count=1, avg=9.
         assert_oracle_aggregate(&[vec![(1, 5, 1)], vec![(1, 5, -1), (1, 9, 1)]]);
+        let result = incremental_output(&[vec![(1, 5, 1)], vec![(1, 5, -1), (1, 9, 1)]]);
+        assert_eq!(
+            result,
+            vec![(1, 9, 1, 9)],
+            "update (delete+insert): expected k=1 sum=9 count=1 avg=9"
+        );
     }
 
     #[test]
     fn oracle_aggregate_negative_values() {
+        // k=1: v=-3, v=-5 → sum=-8, count=2, avg=-4
+        // k=2: v=4         → sum=4,  count=1, avg=4
         assert_oracle_aggregate(&[vec![(1, -3, 1), (1, -5, 1), (2, 4, 1)]]);
+        let result = incremental_output(&[vec![(1, -3, 1), (1, -5, 1), (2, 4, 1)]]);
+        assert_eq!(
+            result,
+            vec![(1, -8, 2, -4), (2, 4, 1, 4)],
+            "negative values: expected [(1,-8,2,-4),(2,4,1,4)]"
+        );
     }
 
     #[test]
     fn oracle_aggregate_multiple_epochs() {
+        // epoch 0: k=1 v=10         → k=1 sum=10 count=1
+        // epoch 1: k=1 v=20, k=2 v=5 → k=1 sum=30 count=2, k=2 sum=5 count=1
+        // epoch 2: k=2 v=5 deleted   → k=2 disappears
+        // epoch 3: k=1 v=10 deleted  → k=1 sum=20 count=1
+        // Final: [(k=1, sum=20, count=1, avg=20)]
         assert_oracle_aggregate(&[
             vec![(1, 10, 1)],
             vec![(1, 20, 1), (2, 5, 1)],
             vec![(2, 5, -1)],
             vec![(1, 10, -1)],
         ]);
+        let result = incremental_output(&[
+            vec![(1, 10, 1)],
+            vec![(1, 20, 1), (2, 5, 1)],
+            vec![(2, 5, -1)],
+            vec![(1, 10, -1)],
+        ]);
+        assert_eq!(
+            result,
+            vec![(1, 20, 1, 20)],
+            "multiple_epochs: expected [(1,20,1,20)]"
+        );
+    }
+
+    #[test]
+    fn oracle_aggregate_group_deletion_and_resurrection() {
+        // k=1 v=10 inserted, then deleted, then re-inserted with v=20.
+        // Final: k=1 sum=20, count=1, avg=20.
+        assert_oracle_aggregate(&[
+            vec![(1, 10, 1)],
+            vec![(1, 10, -1)],
+            vec![(1, 20, 1)],
+        ]);
+        let result = incremental_output(&[
+            vec![(1, 10, 1)],
+            vec![(1, 10, -1)],
+            vec![(1, 20, 1)],
+        ]);
+        assert_eq!(
+            result,
+            vec![(1, 20, 1, 20)],
+            "group deletion+resurrection: expected k=1 sum=20"
+        );
+    }
+
+    #[test]
+    fn oracle_aggregate_multi_group_partial_deletion() {
+        // k=1: 3 copies of v=5 → insert 3, delete 1 → 2 copies left.
+        // Final: k=1 sum=10, count=2, avg=5.
+        assert_oracle_aggregate(&[
+            vec![(1, 5, 1), (1, 5, 1), (1, 5, 1)],
+            vec![(1, 5, -1)],
+        ]);
+        let result = incremental_output(&[
+            vec![(1, 5, 1), (1, 5, 1), (1, 5, 1)],
+            vec![(1, 5, -1)],
+        ]);
+        assert_eq!(
+            result,
+            vec![(1, 10, 2, 5)],
+            "partial deletion: expected k=1 sum=10 count=2 avg=5"
+        );
     }
 
     // ── DataFusion validation test ─────────────────────────────────────────

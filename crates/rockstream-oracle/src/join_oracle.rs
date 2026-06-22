@@ -379,25 +379,43 @@ mod tests {
     #[test]
     fn oracle_join_empty_input() {
         assert_oracle_join(&[]);
+        // Both sides empty → no output.
+        let result = incremental_join_output(&[]);
+        assert_eq!(result, vec![], "empty input must produce empty join output");
     }
 
     #[test]
     fn oracle_join_no_match() {
         // Left key=1, right key=2 — no join partner.
         assert_oracle_join(&[(vec![(1, 10, 1)], vec![(2, 20, 1)])]);
+        let result = incremental_join_output(&[(vec![(1, 10, 1)], vec![(2, 20, 1)])]);
+        assert_eq!(result, vec![], "non-matching keys must produce empty join output");
     }
 
     #[test]
     fn oracle_join_single_match() {
+        // l(k=5, lv=50) ⋈ r(k=5, rv=500) → (5, 50, 500)
         assert_oracle_join(&[(vec![(5, 50, 1)], vec![(5, 500, 1)])]);
+        let result = incremental_join_output(&[(vec![(5, 50, 1)], vec![(5, 500, 1)])]);
+        assert_eq!(
+            result,
+            vec![(5, 50, 500)],
+            "single match: expected [(k=5, lv=50, rv=500)]"
+        );
     }
 
     #[test]
     fn oracle_join_insert_then_delete_right() {
+        // Insert pair then delete right — tuple disappears.
         assert_oracle_join(&[
             (vec![(3, 30, 1)], vec![(3, 300, 1)]),
             (vec![], vec![(3, 300, -1)]),
         ]);
+        let result = incremental_join_output(&[
+            (vec![(3, 30, 1)], vec![(3, 300, 1)]),
+            (vec![], vec![(3, 300, -1)]),
+        ]);
+        assert_eq!(result, vec![], "delete right side must remove join tuple");
     }
 
     #[test]
@@ -406,21 +424,62 @@ mod tests {
             (vec![(3, 30, 1)], vec![(3, 300, 1)]),
             (vec![(3, 30, -1)], vec![]),
         ]);
+        let result = incremental_join_output(&[
+            (vec![(3, 30, 1)], vec![(3, 300, 1)]),
+            (vec![(3, 30, -1)], vec![]),
+        ]);
+        assert_eq!(result, vec![], "delete left side must remove join tuple");
     }
 
     #[test]
     fn oracle_join_multiple_matching_right_rows() {
-        // l: (k=1, v=10); r: (k=1, w=100), (k=1, w=200).
+        // l: (k=1, lv=10); r: (k=1, rv=100), (k=1, rv=200).
+        // Expected: [(1, 10, 100), (1, 10, 200)]
         assert_oracle_join(&[(vec![(1, 10, 1)], vec![(1, 100, 1), (1, 200, 1)])]);
+        let result = incremental_join_output(&[(vec![(1, 10, 1)], vec![(1, 100, 1), (1, 200, 1)])]);
+        assert_eq!(
+            result,
+            vec![(1, 10, 100), (1, 10, 200)],
+            "multiple right matches: expected [(1,10,100),(1,10,200)]"
+        );
+    }
+
+    #[test]
+    fn oracle_join_multiple_matching_left_rows() {
+        // l: (k=2, lv=10), (k=2, lv=20); r: (k=2, rv=300).
+        // Expected: [(2, 10, 300), (2, 20, 300)]
+        assert_oracle_join(&[(vec![(2, 10, 1), (2, 20, 1)], vec![(2, 300, 1)])]);
+        let result = incremental_join_output(&[(vec![(2, 10, 1), (2, 20, 1)], vec![(2, 300, 1)])]);
+        let mut got = result.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(2, 10, 300), (2, 20, 300)],
+            "multiple left matches: expected [(2,10,300),(2,20,300)]"
+        );
     }
 
     #[test]
     fn oracle_join_multiple_epochs() {
+        // epoch 0: l(1,10) ⋈ r(1,100) → (1,10,100)
+        // epoch 1: l(2,20) ⋈ r(2,200) → (2,20,200)
+        // epoch 2: delete l(1,10)      → (1,10,100) removed
+        // Final: [(2,20,200)]
         assert_oracle_join(&[
             (vec![(1, 10, 1)], vec![(1, 100, 1)]),
             (vec![(2, 20, 1)], vec![(2, 200, 1)]),
             (vec![(1, 10, -1)], vec![]),
         ]);
+        let result = incremental_join_output(&[
+            (vec![(1, 10, 1)], vec![(1, 100, 1)]),
+            (vec![(2, 20, 1)], vec![(2, 200, 1)]),
+            (vec![(1, 10, -1)], vec![]),
+        ]);
+        assert_eq!(
+            result,
+            vec![(2, 20, 200)],
+            "multiple_epochs: expected only (2,20,200) after deleting (1,10)"
+        );
     }
 
     #[test]
@@ -433,6 +492,15 @@ mod tests {
             (vec![], vec![(7, 701, 1)]),
             (vec![(7, 71, -1)], vec![(7, 700, -1), (7, 701, -1)]),
         ]);
+        // After all operations: no tuples survive (all inserted rows removed).
+        let result = incremental_join_output(&[
+            (vec![(7, 70, 1)], vec![(7, 700, 1)]),
+            (vec![(7, 70, -1)], vec![]),
+            (vec![(7, 71, 1)], vec![]),
+            (vec![], vec![(7, 701, 1)]),
+            (vec![(7, 71, -1)], vec![(7, 700, -1), (7, 701, -1)]),
+        ]);
+        assert_eq!(result, vec![], "key churn must leave empty output");
     }
 
     #[test]
@@ -444,6 +512,23 @@ mod tests {
         ra.insert((1, 200), 1);
         let result = batch_reference_join(&la, &ra);
         assert_eq!(result, vec![(1, 10, 100), (1, 10, 200)]);
+    }
+
+    #[test]
+    fn oracle_join_cross_product_exact() {
+        // l: (k=3, v=1), (k=3, v=2); r: (k=3, v=10), (k=3, v=20).
+        // Cross product: (3,1,10), (3,1,20), (3,2,10), (3,2,20) — 4 tuples.
+        let result = incremental_join_output(&[(
+            vec![(3, 1, 1), (3, 2, 1)],
+            vec![(3, 10, 1), (3, 20, 1)],
+        )]);
+        let mut got = result.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(3, 1, 10), (3, 1, 20), (3, 2, 10), (3, 2, 20)],
+            "cross product: expected 4 tuples"
+        );
     }
 
     // ── Proptest randomized oracle (≥100k scenarios) ──────────────────────
