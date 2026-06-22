@@ -261,7 +261,7 @@ fn rebuild_zset(schema: SchemaRef, active_rows: &[Vec<i64>]) -> ArrowZSet {
 
 pub fn generate_random_query(seed: u64) -> String {
     let mut rng = FuzzRng::new(seed);
-    let q_type = rng.next_range(0, 11);
+    let q_type = rng.next_range(0, 13);
     match q_type {
         0 => {
             // Filter + Project
@@ -345,13 +345,34 @@ pub fn generate_random_query(seed: u64) -> String {
                 "SELECT t2.group_id, SUM(t1.val) FROM t1 JOIN t2 ON t1.id = t2.id GROUP BY t2.group_id"
             )
         }
-        _ => {
+        11 => {
             // Semi-join / IN-subquery: the planner lowers this to a LeftSemi join.
             // Exercises the OuterJoinOp::Semi path, which currently receives no
             // coverage from query types 0-10. Output contains only t1.id values
             // that exist in the t2 subset, so the result must be ⊆ t1.id.
             let k = rng.next_range(1, 5);
             format!("SELECT id FROM t1 WHERE id IN (SELECT id FROM t2 WHERE group_id = {k})")
+        }
+        12 => {
+            // Anti-join / NOT IN: the planner lowers this to OuterJoinOp::Anti.
+            // Exercises the NOT IN / NOT EXISTS path that had zero fuzzer coverage.
+            // Output is t1.id values that do NOT appear in the t2 subset.
+            let k = rng.next_range(1, 5);
+            format!("SELECT id FROM t1 WHERE id NOT IN (SELECT id FROM t2 WHERE group_id = {k})")
+        }
+        _ => {
+            // Multi-key GROUP BY: exercises group_by with 2 key columns.
+            // Detects the bug where only group_by[0] is hashed, silently dropping
+            // the second key column and collapsing distinct groups.
+            let agg_fn = match rng.next_range(0, 1) {
+                0 => "SUM(t1.val)",
+                _ => "COUNT(t1.id)",
+            };
+            format!(
+                "SELECT t1.category, t2.group_id, {agg_fn} FROM t1 \
+                 JOIN t2 ON t1.id = t2.id \
+                 GROUP BY t1.category, t2.group_id"
+            )
         }
     }
 }
@@ -386,6 +407,9 @@ pub enum ExecNode {
         group_by: Vec<Expr>,
         func: AggregateFunc,
         agg_input: Expr,
+        /// Persistent reverse map: combined FNV hash key → original multi-column key values.
+        /// Required to reconstruct the full GROUP BY output when group_by.len() > 1.
+        key_lookup: std::sync::Mutex<std::collections::HashMap<i64, Vec<i64>>>,
     },
     Union {
         left: Box<ExecNode>,
@@ -434,6 +458,7 @@ impl ExecNode {
                 group_by,
                 func,
                 agg_input,
+                key_lookup,
             } => {
                 let in_val = input.evaluate(inputs, epoch_id);
                 if in_val.is_empty() {
@@ -446,11 +471,44 @@ impl ExecNode {
                     return ArrowZSet::empty(schema);
                 }
 
-                let keys = if group_by.is_empty() {
-                    vec![0; in_val.num_rows()]
+                // Evaluate all group_by key columns.
+                let key_vecs: Vec<Vec<i64>> = if group_by.is_empty() {
+                    vec![]
                 } else {
-                    rockstream_ops::expr::eval_i64(&group_by[0], &in_val.data).unwrap()
+                    group_by
+                        .iter()
+                        .map(|expr| rockstream_ops::expr::eval_i64(expr, &in_val.data).unwrap())
+                        .collect()
                 };
+
+                // Combine multiple keys into a single hash key for AggregateOp.
+                // Single-key GROUP BY passes the raw value unchanged (no collision risk).
+                let keys: Vec<i64> = if group_by.is_empty() {
+                    vec![0; in_val.num_rows()]
+                } else if group_by.len() == 1 {
+                    key_vecs[0].clone()
+                } else {
+                    (0..in_val.num_rows())
+                        .map(|i| {
+                            let mut h: u64 = 2166136261u64; // FNV-1a offset basis
+                            for kv in &key_vecs {
+                                h = h.wrapping_mul(16777619).wrapping_add(kv[i] as u64);
+                            }
+                            h as i64
+                        })
+                        .collect()
+                };
+
+                // Maintain persistent reverse mapping so we can reconstruct the full
+                // multi-column key in the output (combined_key → original key columns).
+                if group_by.len() > 1 {
+                    let mut lookup = key_lookup.lock().unwrap();
+                    for i in 0..in_val.num_rows() {
+                        lookup.entry(keys[i]).or_insert_with(|| {
+                            key_vecs.iter().map(|kv| kv[i]).collect()
+                        });
+                    }
+                }
 
                 let vals = match func {
                     AggregateFunc::Count => {
@@ -480,11 +538,17 @@ impl ExecNode {
                 if raw_out.is_empty() {
                     let logical_schema = if group_by.is_empty() {
                         Arc::new(Schema::new(vec![Field::new("agg", DataType::Int64, false)]))
-                    } else {
+                    } else if group_by.len() == 1 {
                         Arc::new(Schema::new(vec![
                             Field::new("k", DataType::Int64, false),
                             Field::new("agg", DataType::Int64, false),
                         ]))
+                    } else {
+                        let fields: Vec<Field> = (0..group_by.len())
+                            .map(|j| Field::new(format!("k{j}"), DataType::Int64, false))
+                            .chain(std::iter::once(Field::new("agg", DataType::Int64, false)))
+                            .collect();
+                        Arc::new(Schema::new(fields))
                     };
                     ArrowZSet::empty(logical_schema)
                 } else {
@@ -529,7 +593,7 @@ impl ExecNode {
                         )
                         .unwrap();
                         ArrowZSet::new(data, raw_out.weights)
-                    } else {
+                    } else if group_by.len() == 1 {
                         let logical_schema = Arc::new(Schema::new(vec![
                             Field::new("k", DataType::Int64, false),
                             Field::new("agg", DataType::Int64, false),
@@ -542,6 +606,32 @@ impl ExecNode {
                             ],
                         )
                         .unwrap();
+                        ArrowZSet::new(data, raw_out.weights)
+                    } else {
+                        // Multi-key GROUP BY: reconstruct original key columns from
+                        // the persistent reverse lookup (combined_key → [k0, k1, ...]).
+                        let lookup = key_lookup.lock().unwrap();
+                        let mut orig_key_cols: Vec<Vec<i64>> = vec![Vec::new(); group_by.len()];
+                        for i in 0..raw_out.num_rows() {
+                            let k = k_arr.value(i);
+                            let orig = lookup
+                                .get(&k)
+                                .unwrap_or_else(|| panic!("multi-key reverse lookup missing for combined_key={k}"));
+                            for (c, &v) in orig.iter().enumerate() {
+                                orig_key_cols[c].push(v);
+                            }
+                        }
+                        let fields: Vec<Field> = (0..group_by.len())
+                            .map(|j| Field::new(format!("k{j}"), DataType::Int64, false))
+                            .chain(std::iter::once(Field::new("agg", DataType::Int64, false)))
+                            .collect();
+                        let logical_schema = Arc::new(Schema::new(fields));
+                        let mut arrow_cols: Vec<ArrayRef> = orig_key_cols
+                            .into_iter()
+                            .map(|v| Arc::new(Int64Array::from(v)) as ArrayRef)
+                            .collect();
+                        arrow_cols.push(Arc::new(Int64Array::from(agg_vals)) as ArrayRef);
+                        let data = RecordBatch::try_new(logical_schema, arrow_cols).unwrap();
                         ArrowZSet::new(data, raw_out.weights)
                     }
                 }
@@ -697,6 +787,7 @@ pub fn build_exec_node(plan: &PlanNode, next_id: &mut u64) -> ExecNode {
                 group_by: group_by.clone(),
                 func,
                 agg_input,
+                key_lookup: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
         PlanNode::Union { left, right } => {
@@ -896,11 +987,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fuzz_simple_cases() {
-        // Seeds 0-119 cover all 12 query types (0-11) with ≥10 expected samples
-        // each. Type 11 is the new Semi-join / IN-subquery path. Each seed also
-        // exercises 3 epochs (initial, delta, cross-epoch retraction), so 120
-        // seeds give 360 epoch-level oracle checks.
-        for seed in 0..120 {
+        // Seeds 0-139 cover all 14 query types (0-13) with ≥10 expected samples
+        // each. Type 11 = Semi-join, 12 = Anti-join (NOT IN), 13 = multi-key
+        // GROUP BY. Each seed exercises 3 epochs (initial, delta, cross-epoch
+        // retraction), so 140 seeds give 420 epoch-level oracle checks.
+        for seed in 0..140 {
             run_fuzz_case(seed).await;
         }
     }

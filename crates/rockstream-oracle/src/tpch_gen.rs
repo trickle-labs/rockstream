@@ -653,6 +653,267 @@ pub fn generate_tpch_heavy_deltas(
     deltas
 }
 
+// ─── Scaled Dataset Generator (SF 0.01 × scale) ──────────────────────────────
+
+/// Generate a TPC-H-style dataset at `scale` × SF 0.01.
+///
+/// | scale | lineitem | orders | customer | tables |
+/// |-------|----------|--------|----------|--------|
+/// |     1 |   60,000 | 15,000 |    1,500 | SF 0.01 (default) |
+/// |    10 |  600,000 |150,000 |   15,000 | SF 0.1  |
+///
+/// Key relationships scale proportionally so all joins remain valid.
+pub fn generate_tpch_dataset_scaled(seed: u64, scale: u64) -> HashMap<String, ArrowZSet> {
+    let s = scale as i64;
+    let mut rng = SimpleRng::new(seed);
+    let mut tables = HashMap::new();
+
+    // 1. region: 5 rows (static)
+    let r_regionkey: Vec<i64> = (1..=5).collect();
+    tables.insert("region".to_string(), make_zset(region_schema(), vec![r_regionkey], 1));
+
+    // 2. nation: 25 rows (static)
+    let mut n_nationkey = Vec::new();
+    let mut n_regionkey = Vec::new();
+    for i in 1..=25i64 {
+        n_nationkey.push(i);
+        n_regionkey.push(rng.next_range(1, 5));
+    }
+    tables.insert("nation".to_string(), make_zset(nation_schema(), vec![n_nationkey, n_regionkey], 1));
+
+    // 3. supplier: 100 * scale rows
+    let mut s_suppkey = Vec::new();
+    let mut s_nationkey = Vec::new();
+    let mut s_acctbal = Vec::new();
+    for i in 1..=(100 * s) {
+        s_suppkey.push(i);
+        s_nationkey.push(rng.next_range(1, 25));
+        s_acctbal.push(rng.next_range(-1000, 10000));
+    }
+    tables.insert("supplier".to_string(), make_zset(supplier_schema(), vec![s_suppkey, s_nationkey, s_acctbal], 1));
+
+    // 4. part: 2,000 * scale rows
+    let mut p_partkey = Vec::new();
+    let mut p_size = Vec::new();
+    let mut p_retailprice = Vec::new();
+    let mut p_brand = Vec::new();
+    let mut p_type = Vec::new();
+    let mut p_container = Vec::new();
+    for i in 1..=(2000 * s) {
+        p_partkey.push(i);
+        p_size.push(rng.next_range(1, 50));
+        p_retailprice.push(rng.next_range(900, 200000));
+        p_brand.push(rng.next_range(1, 5));
+        p_type.push(rng.next_range(1, 15));
+        p_container.push(rng.next_range(1, 10));
+    }
+    tables.insert("part".to_string(), make_zset(part_schema(), vec![p_partkey, p_size, p_retailprice, p_brand, p_type, p_container], 1));
+
+    // 5. partsupp: 8,000 * scale rows
+    let mut ps_partkey = Vec::new();
+    let mut ps_suppkey = Vec::new();
+    let mut ps_availqty = Vec::new();
+    let mut ps_supplycost = Vec::new();
+    for i in 1..=(2000 * s) {
+        ps_partkey.push(i);
+        ps_suppkey.push(rng.next_range(1, 100 * s));
+        ps_availqty.push(rng.next_range(1, 9999));
+        ps_supplycost.push(rng.next_range(1, 1000));
+    }
+    for _ in (2000 * s)..(8000 * s) {
+        ps_partkey.push(rng.next_range(1, 2000 * s));
+        ps_suppkey.push(rng.next_range(1, 100 * s));
+        ps_availqty.push(rng.next_range(1, 9999));
+        ps_supplycost.push(rng.next_range(1, 1000));
+    }
+    tables.insert("partsupp".to_string(), make_zset(partsupp_schema(), vec![ps_partkey, ps_suppkey, ps_availqty, ps_supplycost], 1));
+
+    // 6. customer: 1,500 * scale rows
+    let mut c_custkey = Vec::new();
+    let mut c_nationkey = Vec::new();
+    let mut c_acctbal = Vec::new();
+    let mut c_mktsegment = Vec::new();
+    for i in 1..=(1500 * s) {
+        c_custkey.push(i);
+        c_nationkey.push(rng.next_range(1, 25));
+        c_acctbal.push(rng.next_range(-1000, 10000));
+        c_mktsegment.push(rng.next_range(1, 5));
+    }
+    tables.insert("customer".to_string(), make_zset(customer_schema(), vec![c_custkey, c_nationkey, c_acctbal, c_mktsegment], 1));
+
+    // 7. orders: 15,000 * scale rows (sequential keys so every lineitem joins)
+    let mut o_orderkey = Vec::new();
+    let mut o_custkey = Vec::new();
+    let mut o_orderdate = Vec::new();
+    let mut o_totalprice = Vec::new();
+    let mut o_shippriority = Vec::new();
+    for i in 1..=(15000 * s) {
+        o_orderkey.push(i);
+        o_custkey.push(rng.next_range(1, 1500 * s));
+        o_orderdate.push(rng.next_range(1, 2500));
+        o_totalprice.push(rng.next_range(900, 500000));
+        o_shippriority.push(rng.next_range(1, 3));
+    }
+    tables.insert("orders".to_string(), make_zset(orders_schema(), vec![o_orderkey, o_custkey, o_orderdate, o_totalprice, o_shippriority], 1));
+
+    // 8. lineitem: 60,000 * scale rows
+    //    First 15,000*scale rows: l_orderkey = i (guaranteed 1:1 join coverage)
+    //    Remaining 45,000*scale rows: l_orderkey ∈ [1, 15,000*scale] (random)
+    let mut l_orderkey = Vec::new();
+    let mut l_partkey = Vec::new();
+    let mut l_suppkey = Vec::new();
+    let mut l_extendedprice = Vec::new();
+    let mut l_discount = Vec::new();
+    let mut l_quantity = Vec::new();
+    let mut l_returnflag = Vec::new();
+    let mut l_linestatus = Vec::new();
+    let mut l_shipdate = Vec::new();
+    let mut l_commitdate = Vec::new();
+    let mut l_receiptdate = Vec::new();
+    for i in 1..=(15000 * s) {
+        l_orderkey.push(i);
+        l_partkey.push(rng.next_range(1, 2000 * s));
+        l_suppkey.push(rng.next_range(1, 100 * s));
+        l_extendedprice.push(rng.next_range(900, 100000));
+        l_discount.push(rng.next_range(0, 10));
+        l_quantity.push(rng.next_range(1, 50));
+        l_returnflag.push(rng.next_range(0, 1));
+        l_linestatus.push(rng.next_range(0, 1));
+        l_shipdate.push(rng.next_range(1, 2500));
+        l_commitdate.push(rng.next_range(1, 2500));
+        l_receiptdate.push(rng.next_range(1, 2500));
+    }
+    for _ in (15000 * s)..(60000 * s) {
+        l_orderkey.push(rng.next_range(1, 15000 * s));
+        l_partkey.push(rng.next_range(1, 2000 * s));
+        l_suppkey.push(rng.next_range(1, 100 * s));
+        l_extendedprice.push(rng.next_range(900, 100000));
+        l_discount.push(rng.next_range(0, 10));
+        l_quantity.push(rng.next_range(1, 50));
+        l_returnflag.push(rng.next_range(0, 1));
+        l_linestatus.push(rng.next_range(0, 1));
+        l_shipdate.push(rng.next_range(1, 2500));
+        l_commitdate.push(rng.next_range(1, 2500));
+        l_receiptdate.push(rng.next_range(1, 2500));
+    }
+    tables.insert("lineitem".to_string(), make_zset(lineitem_schema(), vec![
+        l_orderkey, l_partkey, l_suppkey, l_extendedprice, l_discount, l_quantity,
+        l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate,
+    ], 1));
+
+    tables
+}
+
+/// Generate 1% churn deltas for a scaled TPC-H dataset.
+pub fn generate_tpch_deltas_scaled(
+    current_dataset: &HashMap<String, ArrowZSet>,
+    seed: u64,
+    scale: u64,
+) -> HashMap<String, ArrowZSet> {
+    let s = scale as i64;
+    let mut rng = SimpleRng::new(seed);
+    let mut deltas = HashMap::new();
+
+    deltas.insert("region".to_string(), ArrowZSet::empty(region_schema()));
+    deltas.insert("nation".to_string(), ArrowZSet::empty(nation_schema()));
+
+    // supplier: 1% of 100*scale = scale retractions + insertions
+    let s_ret = select_retractions(current_dataset, "supplier", scale as usize, &mut rng);
+    let s_suppkey = vec![rng.next_range(100 * s + 1, 200 * s)];
+    let s_nationkey = vec![rng.next_range(1, 25)];
+    let s_acctbal = vec![rng.next_range(-1000, 10000)];
+    let s_ins = make_zset(supplier_schema(), vec![s_suppkey, s_nationkey, s_acctbal], 1);
+    deltas.insert("supplier".to_string(), concat_zsets(&s_ret, &s_ins));
+
+    // part: 1% of 2000*scale = 20*scale rows
+    let p_count = (20 * s) as usize;
+    let p_ret = select_retractions(current_dataset, "part", p_count, &mut rng);
+    let mut p_partkey = Vec::new(); let mut p_size = Vec::new();
+    let mut p_retailprice = Vec::new(); let mut p_brand = Vec::new();
+    let mut p_type = Vec::new(); let mut p_container = Vec::new();
+    for i in 1..=(p_count as i64) {
+        p_partkey.push(2000 * s + i);
+        p_size.push(rng.next_range(1, 50));
+        p_retailprice.push(rng.next_range(900, 200000));
+        p_brand.push(rng.next_range(1, 5));
+        p_type.push(rng.next_range(1, 15));
+        p_container.push(rng.next_range(1, 10));
+    }
+    let p_ins = make_zset(part_schema(), vec![p_partkey, p_size, p_retailprice, p_brand, p_type, p_container], 1);
+    deltas.insert("part".to_string(), concat_zsets(&p_ret, &p_ins));
+
+    // partsupp: 1% of 8000*scale = 80*scale rows
+    let ps_count = (80 * s) as usize;
+    let ps_ret = select_retractions(current_dataset, "partsupp", ps_count, &mut rng);
+    let mut ps_partkey = Vec::new(); let mut ps_suppkey = Vec::new();
+    let mut ps_availqty = Vec::new(); let mut ps_supplycost = Vec::new();
+    for _ in 0..ps_count {
+        ps_partkey.push(rng.next_range(1, 2000 * s));
+        ps_suppkey.push(rng.next_range(1, 100 * s));
+        ps_availqty.push(rng.next_range(1, 9999));
+        ps_supplycost.push(rng.next_range(1, 1000));
+    }
+    let ps_ins = make_zset(partsupp_schema(), vec![ps_partkey, ps_suppkey, ps_availqty, ps_supplycost], 1);
+    deltas.insert("partsupp".to_string(), concat_zsets(&ps_ret, &ps_ins));
+
+    // customer: 1% of 1500*scale = 15*scale rows
+    let c_count = (15 * s) as usize;
+    let c_ret = select_retractions(current_dataset, "customer", c_count, &mut rng);
+    let mut c_custkey = Vec::new(); let mut c_nationkey = Vec::new();
+    let mut c_acctbal = Vec::new(); let mut c_mktsegment = Vec::new();
+    for i in 1..=(c_count as i64) {
+        c_custkey.push(1500 * s + i);
+        c_nationkey.push(rng.next_range(1, 25));
+        c_acctbal.push(rng.next_range(-1000, 10000));
+        c_mktsegment.push(rng.next_range(1, 5));
+    }
+    let c_ins = make_zset(customer_schema(), vec![c_custkey, c_nationkey, c_acctbal, c_mktsegment], 1);
+    deltas.insert("customer".to_string(), concat_zsets(&c_ret, &c_ins));
+
+    // orders: 1% of 15000*scale = 150*scale rows
+    let o_count = (150 * s) as usize;
+    let o_ret = select_retractions(current_dataset, "orders", o_count, &mut rng);
+    let mut o_orderkey = Vec::new(); let mut o_custkey = Vec::new();
+    let mut o_orderdate = Vec::new(); let mut o_totalprice = Vec::new(); let mut o_shippriority = Vec::new();
+    for i in 1..=(o_count as i64) {
+        o_orderkey.push(15000 * s + i);
+        o_custkey.push(rng.next_range(1, 1500 * s));
+        o_orderdate.push(rng.next_range(1, 2500));
+        o_totalprice.push(rng.next_range(900, 500000));
+        o_shippriority.push(rng.next_range(1, 3));
+    }
+    let o_ins = make_zset(orders_schema(), vec![o_orderkey, o_custkey, o_orderdate, o_totalprice, o_shippriority], 1);
+    deltas.insert("orders".to_string(), concat_zsets(&o_ret, &o_ins));
+
+    // lineitem: 1% of 60000*scale = 600*scale rows
+    let l_count = (600 * s) as usize;
+    let l_ret = select_retractions(current_dataset, "lineitem", l_count, &mut rng);
+    let mut l_orderkey = Vec::new(); let mut l_partkey = Vec::new(); let mut l_suppkey = Vec::new();
+    let mut l_extendedprice = Vec::new(); let mut l_discount = Vec::new(); let mut l_quantity = Vec::new();
+    let mut l_returnflag = Vec::new(); let mut l_linestatus = Vec::new();
+    let mut l_shipdate = Vec::new(); let mut l_commitdate = Vec::new(); let mut l_receiptdate = Vec::new();
+    for _ in 0..l_count {
+        l_orderkey.push(rng.next_range(1, 15000 * s));
+        l_partkey.push(rng.next_range(1, 2000 * s));
+        l_suppkey.push(rng.next_range(1, 100 * s));
+        l_extendedprice.push(rng.next_range(900, 100000));
+        l_discount.push(rng.next_range(0, 10));
+        l_quantity.push(rng.next_range(1, 50));
+        l_returnflag.push(rng.next_range(0, 1));
+        l_linestatus.push(rng.next_range(0, 1));
+        l_shipdate.push(rng.next_range(1, 2500));
+        l_commitdate.push(rng.next_range(1, 2500));
+        l_receiptdate.push(rng.next_range(1, 2500));
+    }
+    let l_ins = make_zset(lineitem_schema(), vec![
+        l_orderkey, l_partkey, l_suppkey, l_extendedprice, l_discount, l_quantity,
+        l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate,
+    ], 1);
+    deltas.insert("lineitem".to_string(), concat_zsets(&l_ret, &l_ins));
+
+    deltas
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

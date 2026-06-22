@@ -132,6 +132,8 @@ enum ExecNode {
         group_by: Vec<Expr>,
         func: AggregateFunc,
         agg_input: Expr,
+        /// Persistent reverse map: combined FNV hash key → original multi-column key values.
+        key_lookup: std::sync::Mutex<std::collections::HashMap<i64, Vec<i64>>>,
     },
     Union {
         left: Box<ExecNode>,
@@ -172,6 +174,7 @@ impl ExecNode {
                 group_by,
                 func,
                 agg_input,
+                key_lookup,
             } => {
                 let in_val = input.evaluate(inputs);
                 if in_val.is_empty() {
@@ -184,12 +187,44 @@ impl ExecNode {
                     return ArrowZSet::empty(schema);
                 }
 
-                // 1. Evaluate key:
-                let keys = if group_by.is_empty() {
-                    vec![0; in_val.num_rows()]
+                // Evaluate all group_by key columns.
+                let key_vecs: Vec<Vec<i64>> = if group_by.is_empty() {
+                    vec![]
                 } else {
-                    rockstream_ops::expr::eval_i64(&group_by[0], &in_val.data).unwrap()
+                    group_by
+                        .iter()
+                        .map(|expr| rockstream_ops::expr::eval_i64(expr, &in_val.data).unwrap())
+                        .collect()
                 };
+
+                // Combine multiple keys into a single hash for AggregateOp.
+                // Single-key GROUP BY passes the raw value unchanged.
+                let keys: Vec<i64> = if group_by.is_empty() {
+                    vec![0; in_val.num_rows()]
+                } else if group_by.len() == 1 {
+                    key_vecs[0].clone()
+                } else {
+                    (0..in_val.num_rows())
+                        .map(|i| {
+                            let mut h: u64 = 2166136261u64; // FNV-1a offset basis
+                            for kv in &key_vecs {
+                                h = h.wrapping_mul(16777619).wrapping_add(kv[i] as u64);
+                            }
+                            h as i64
+                        })
+                        .collect()
+                };
+
+                // Maintain persistent reverse mapping so we can reconstruct the full
+                // multi-column key in the output.
+                if group_by.len() > 1 {
+                    let mut lookup = key_lookup.lock().unwrap();
+                    for i in 0..in_val.num_rows() {
+                        lookup.entry(keys[i]).or_insert_with(|| {
+                            key_vecs.iter().map(|kv| kv[i]).collect()
+                        });
+                    }
+                }
 
                 // 2. Evaluate value to aggregate:
                 let vals = match func {
@@ -219,16 +254,21 @@ impl ExecNode {
                 // Run actual physical operator
                 let raw_out = op.process_delta(kv_zset).unwrap();
 
-                // Project physical output (k, sum, count, avg) to logical output (group_key, agg_val).
-                // Logical columns: if group_by is empty, just aggregate val; else (group_key, agg_val).
+                // Project physical output (k, sum, count, avg) to logical output.
                 let out_cols = if raw_out.is_empty() {
                     let logical_schema = if group_by.is_empty() {
                         Arc::new(Schema::new(vec![Field::new("agg", DataType::Int64, false)]))
-                    } else {
+                    } else if group_by.len() == 1 {
                         Arc::new(Schema::new(vec![
                             Field::new("k", DataType::Int64, false),
                             Field::new("agg", DataType::Int64, false),
                         ]))
+                    } else {
+                        let fields: Vec<Field> = (0..group_by.len())
+                            .map(|j| Field::new(format!("k{j}"), DataType::Int64, false))
+                            .chain(std::iter::once(Field::new("agg", DataType::Int64, false)))
+                            .collect();
+                        Arc::new(Schema::new(fields))
                     };
                     return ArrowZSet::empty(logical_schema);
                 } else {
@@ -279,7 +319,7 @@ impl ExecNode {
                         )
                         .unwrap();
                         ArrowZSet::new(data, raw_out.weights)
-                    } else {
+                    } else if group_by.len() == 1 {
                         let logical_schema = Arc::new(Schema::new(vec![
                             Field::new("k", DataType::Int64, false),
                             Field::new("agg", DataType::Int64, false),
@@ -292,6 +332,32 @@ impl ExecNode {
                             ],
                         )
                         .unwrap();
+                        ArrowZSet::new(data, raw_out.weights)
+                    } else {
+                        // Multi-key GROUP BY: reconstruct original key columns from
+                        // the persistent reverse lookup (combined_key → [k0, k1, ...]).
+                        let lookup = key_lookup.lock().unwrap();
+                        let mut orig_key_cols: Vec<Vec<i64>> = vec![Vec::new(); group_by.len()];
+                        for i in 0..raw_out.num_rows() {
+                            let k = k_arr.value(i);
+                            let orig = lookup.get(&k).unwrap_or_else(|| {
+                                panic!("multi-key reverse lookup missing for combined_key={k}")
+                            });
+                            for (c, &v) in orig.iter().enumerate() {
+                                orig_key_cols[c].push(v);
+                            }
+                        }
+                        let fields: Vec<Field> = (0..group_by.len())
+                            .map(|j| Field::new(format!("k{j}"), DataType::Int64, false))
+                            .chain(std::iter::once(Field::new("agg", DataType::Int64, false)))
+                            .collect();
+                        let logical_schema = Arc::new(Schema::new(fields));
+                        let mut arrow_cols: Vec<ArrayRef> = orig_key_cols
+                            .into_iter()
+                            .map(|v| Arc::new(Int64Array::from(v)) as ArrayRef)
+                            .collect();
+                        arrow_cols.push(Arc::new(Int64Array::from(agg_vals)) as ArrayRef);
+                        let data = RecordBatch::try_new(logical_schema, arrow_cols).unwrap();
                         ArrowZSet::new(data, raw_out.weights)
                     }
                 };
@@ -459,6 +525,7 @@ fn build_exec_node(plan: &PlanNode, next_id: &mut u64) -> ExecNode {
                 group_by: group_by.clone(),
                 func,
                 agg_input,
+                key_lookup: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
         PlanNode::Union { left, right } => {
@@ -598,6 +665,10 @@ fn tpch_queries() -> Vec<&'static str> {
         "SELECT s_suppkey, COUNT(l_orderkey) FROM supplier JOIN lineitem ON s_suppkey = l_suppkey GROUP BY s_suppkey",
         // Q22
         "SELECT c_nationkey, COUNT(c_custkey) FROM customer WHERE c_acctbal > 5000 GROUP BY c_nationkey",
+        // Q23: multi-key GROUP BY — exercises the two-key aggregate path on a
+        // large table. returnflag ∈ {0,1} × linestatus ∈ {0,1} gives 4 groups.
+        // A single-key bug silently merges groups, producing wrong SUM values.
+        "SELECT l_returnflag, l_linestatus, SUM(l_extendedprice) FROM lineitem GROUP BY l_returnflag, l_linestatus",
     ]
 }
 
@@ -1248,6 +1319,114 @@ async fn test_outer_join_retraction_heavy_workload() {
                 w > 0,
                 "Epoch {epoch}: negative aggregate weight for row {:?}",
                 row
+            );
+        }
+    }
+}
+
+/// SF=0.1 aggregate correctness — opt-in via `TPCH_SF10=1` environment variable.
+///
+/// Exercises the same incremental vs. batch equivalence checks as the main
+/// TPC-H suite but on a 10× larger dataset (600,000 lineitems, 150,000 orders).
+/// Running at SF=0.1 catches performance regressions that are invisible at
+/// SF=0.01: join operator hash-table sizes, aggregate bucket collisions, and
+/// delta processing overhead all scale differently with 10× more data.
+///
+/// Query set: Q1 (SUM by returnflag), Q4 (COUNT by shippriority),
+/// Q10 (SUM by custkey), and Q23 (two-key GROUP BY on returnflag × linestatus).
+/// Three epochs with 1% churn each.
+///
+/// Run with: `TPCH_SF10=1 cargo test test_tpch_sf10_aggregate_correctness -- --nocapture`
+#[tokio::test]
+async fn test_tpch_sf10_aggregate_correctness() {
+    if std::env::var("TPCH_SF10").is_err() {
+        println!("Skipping SF=0.1 test (set TPCH_SF10=1 to enable)");
+        return;
+    }
+
+    let sf10_queries: &[&str] = &[
+        // Q1: SUM by returnflag — exercises large single-key aggregation
+        "SELECT l_returnflag, SUM(l_extendedprice) FROM lineitem GROUP BY l_returnflag",
+        // Q4: COUNT by shippriority — join + aggregate on 150k orders × 600k lineitem
+        "SELECT o_shippriority, COUNT(o_orderkey) FROM orders JOIN lineitem ON o_orderkey = l_orderkey GROUP BY o_shippriority",
+        // Q10: SUM by custkey — three-way join (customer, orders, lineitem) at scale
+        "SELECT c_custkey, SUM(l_extendedprice) FROM customer JOIN orders ON c_custkey = o_custkey JOIN lineitem ON o_orderkey = l_orderkey GROUP BY c_custkey",
+        // Q23-SF10: two-key GROUP BY — ensures multi-key agg is correct at 10× scale
+        "SELECT l_returnflag, l_linestatus, SUM(l_extendedprice) FROM lineitem GROUP BY l_returnflag, l_linestatus",
+    ];
+
+    let frontend = SqlFrontend::new();
+    for (name, schema) in [
+        ("region", tpch_gen::region_schema()),
+        ("nation", tpch_gen::nation_schema()),
+        ("supplier", tpch_gen::supplier_schema()),
+        ("part", tpch_gen::part_schema()),
+        ("partsupp", tpch_gen::partsupp_schema()),
+        ("customer", tpch_gen::customer_schema()),
+        ("orders", tpch_gen::orders_schema()),
+        ("lineitem", tpch_gen::lineitem_schema()),
+    ] {
+        frontend.register_table(name, schema).unwrap();
+    }
+
+    println!("Generating SF=0.1 dataset (600k lineitems)…");
+    let t0 = std::time::Instant::now();
+    let initial_dataset = tpch_gen::generate_tpch_dataset_scaled(42, 10);
+    println!("Dataset generated in {:?}", t0.elapsed());
+
+    // Verify scale: lineitem must have exactly 600,000 rows.
+    let lineitem_count = initial_dataset.get("lineitem").unwrap().num_rows();
+    assert_eq!(lineitem_count, 600_000, "SF=0.1 lineitem should have 600,000 rows, got {lineitem_count}");
+
+    for (qi, sql) in sf10_queries.iter().enumerate() {
+        let q_label = format!("SF10-Q{}", qi + 1);
+
+        let plan_node = frontend
+            .sql_to_plan_node(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{q_label}: failed to compile: {e:?}"));
+
+        let mut next_id = 0u64;
+        let exec_tree = build_exec_node(&plan_node, &mut next_id);
+
+        let mut current_dataset = initial_dataset.clone();
+        let mut inc_acc: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+
+        // Epoch 0: initial snapshot
+        let t_inc = std::time::Instant::now();
+        let out_0 = exec_tree.evaluate(&current_dataset);
+        let inc_time_0 = t_inc.elapsed();
+        accumulate_zset_output(&out_0, &mut inc_acc);
+
+        let batch_0 = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+        assert_eq!(inc_acc, batch_0, "{q_label} Epoch 0: incremental != batch");
+        println!("{q_label} Epoch 0 ok ({} groups, inc={inc_time_0:?})", inc_acc.len());
+
+        // Epochs 1–3: 1% churn
+        for epoch in 1u64..=3 {
+            let delta = tpch_gen::generate_tpch_deltas_scaled(&current_dataset, 42 + epoch * 7, 10);
+
+            let t_inc = std::time::Instant::now();
+            let out = exec_tree.evaluate(&delta);
+            let inc_time = t_inc.elapsed();
+            accumulate_zset_output(&out, &mut inc_acc);
+
+            for (name, d) in &delta {
+                let prev = current_dataset.get(name).unwrap();
+                current_dataset.insert(name.clone(), apply_delta_physically(prev, d));
+            }
+
+            let t_batch = std::time::Instant::now();
+            let batch = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+            let batch_time = t_batch.elapsed();
+
+            assert_eq!(
+                inc_acc, batch,
+                "{q_label} Epoch {epoch}: incremental != batch"
+            );
+            println!(
+                "{q_label} Epoch {epoch} ok (inc={inc_time:?}, batch={batch_time:?}, speedup={:.1}x)",
+                batch_time.as_secs_f64() / inc_time.as_secs_f64().max(0.001)
             );
         }
     }
