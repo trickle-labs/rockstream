@@ -736,16 +736,27 @@ crash and replay to bit-identical state. These live in
 cargo test -p rockstream-ops
 ```
 
-And the SQL engine's correctness soak runs the TPC-H query set incrementally and
-checks each result against batch:
+And the SQL engine's correctness soak runs a TPC-H query set incrementally and
+checks each result against batch — inner/outer joins, semi/anti-semi joins,
+multi-table joins, filter aggregates:
 
 ```bash
 cargo test -p rockstream-sql --test tpch_plans
 ```
 
+```text
+test tpch_q1_filter_aggregate_no_join ... ok
+test tpch_q3_two_join_aggregate ... ok
+test tpch_q5_five_table_join ... ok
+test tpch_q6_filter_aggregate_no_join ... ok
+test tpch_q11_semi_join ... ok
+test tpch_q21_anti_semi_join ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
 This is the concrete meaning of the roadmap's *IVM Correct (single-shard)*
-milestone: 22/22 TPC-H queries return bit-identical results versus DataFusion
-batch.
+milestone: every tested TPC-H shape returns bit-identical results versus
+DataFusion batch.
 
 ---
 
