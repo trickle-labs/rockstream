@@ -548,7 +548,204 @@ pub fn generate_tpch_deltas(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use rockstream_ops::aggregate::AggregateOp;
+    use rockstream_ops::op::Operator;
+    use rockstream_ops::zset::ArrowZSet;
+    use rockstream_types::ids::OperatorId;
+
     use super::*;
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    /// Project lineitem Z-set to (k = l_returnflag, v = l_extendedprice).
+    ///
+    /// Column indices (0-based) for lineitem_schema():
+    ///   0  l_orderkey
+    ///   1  l_partkey
+    ///   2  l_suppkey
+    ///   3  l_extendedprice
+    ///   4  l_discount
+    ///   5  l_quantity
+    ///   6  l_returnflag
+    ///   7  l_linestatus
+    ///   8  l_shipdate
+    ///   9  l_commitdate
+    ///  10  l_receiptdate
+    fn project_lineitem_kv(lineitem: &ArrowZSet) -> ArrowZSet {
+        if lineitem.is_empty() {
+            let kv_schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            let empty = RecordBatch::new_empty(kv_schema);
+            return ArrowZSet::new(empty, vec![]);
+        }
+        let returnflag = lineitem
+            .data
+            .column(6)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        let extprice = lineitem
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        let kv_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            kv_schema,
+            vec![
+                Arc::new(Int64Array::from(returnflag)) as _,
+                Arc::new(Int64Array::from(extprice)) as _,
+            ],
+        )
+        .unwrap();
+        ArrowZSet::new(data, lineitem.weights.clone())
+    }
+
+    /// Apply a Z-set delta to a base dataset (physical append + retract).
+    ///
+    /// Returns the new physical dataset as a positive-weight-only Z-set,
+    /// i.e. `accumulated_state` after applying `delta`.
+    fn apply_delta_to_dataset(base: &ArrowZSet, delta: &ArrowZSet) -> ArrowZSet {
+        // Build a weight map: row → net weight.
+        let mut row_weights: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+
+        let add_rows = |zset: &ArrowZSet, map: &mut BTreeMap<Vec<i64>, i64>| {
+            if zset.is_empty() {
+                return;
+            }
+            let ncols = zset.data.num_columns();
+            for i in 0..zset.num_rows() {
+                let row: Vec<i64> = (0..ncols)
+                    .map(|c| {
+                        zset.data
+                            .column(c)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(i)
+                    })
+                    .collect();
+                *map.entry(row).or_insert(0) += zset.weights[i];
+            }
+        };
+
+        add_rows(base, &mut row_weights);
+        add_rows(delta, &mut row_weights);
+
+        // Collect rows with positive net weight.
+        let live_rows: Vec<Vec<i64>> = row_weights
+            .into_iter()
+            .filter(|(_, w)| *w > 0)
+            .map(|(r, _)| r)
+            .collect();
+
+        if live_rows.is_empty() {
+            return ArrowZSet::new(RecordBatch::new_empty(base.data.schema()), vec![]);
+        }
+
+        let ncols = base.data.num_columns();
+        let mut cols: Vec<Vec<i64>> = vec![Vec::new(); ncols];
+        for row in &live_rows {
+            for (c, &v) in row.iter().enumerate() {
+                cols[c].push(v);
+            }
+        }
+        let arrow_cols: Vec<_> = cols
+            .into_iter()
+            .map(|c| Arc::new(Int64Array::from(c)) as _)
+            .collect();
+        let data = RecordBatch::try_new(base.data.schema(), arrow_cols).unwrap();
+        let n = data.num_rows();
+        ArrowZSet::new(data, vec![1; n])
+    }
+
+    /// Batch reference: compute GROUP BY k → (sum_v, count) from a physical
+    /// (positive-weight-only) kv Z-set.
+    fn batch_agg_reference(kv: &ArrowZSet) -> BTreeMap<i64, (i64, i64)> {
+        let mut result: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+        if kv.is_empty() {
+            return result;
+        }
+        let k_col = kv
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = kv
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..kv.num_rows() {
+            let w = kv.weights[i];
+            if w <= 0 {
+                continue;
+            }
+            let entry = result.entry(k_col.value(i)).or_insert((0, 0));
+            entry.0 += v_col.value(i) * w;
+            entry.1 += w;
+        }
+        result
+    }
+
+    /// Apply AggregateOp output Z-set deltas to an in-memory state map.
+    fn apply_agg_output_deltas(
+        state: &mut BTreeMap<i64, (i64, i64)>,
+        output: &ArrowZSet,
+    ) {
+        if output.is_empty() {
+            return;
+        }
+        let k_col = output
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let s_col = output
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let c_col = output
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..output.num_rows() {
+            let k = k_col.value(i);
+            let s = s_col.value(i);
+            let c = c_col.value(i);
+            let w = output.weights[i];
+            if w > 0 {
+                state.insert(k, (s, c));
+            } else {
+                state.remove(&k);
+            }
+        }
+    }
+
+    // ─── Tests ───────────────────────────────────────────────────────────────
 
     #[test]
     fn test_generator_counts() {
@@ -561,5 +758,134 @@ mod tests {
         assert_eq!(dataset.get("customer").unwrap().num_rows(), 1500);
         assert_eq!(dataset.get("orders").unwrap().num_rows(), 15000);
         assert_eq!(dataset.get("lineitem").unwrap().num_rows(), 60000);
+    }
+
+    /// TPC-H Q1-style incremental oracle (SF 0.01).
+    ///
+    /// Query: `SELECT l_returnflag, SUM(l_extendedprice), COUNT(*) FROM lineitem GROUP BY l_returnflag`
+    ///
+    /// Oracle property: after applying 1% deltas, the incremental aggregate
+    /// output accumulated via `AggregateOp` must equal the batch reference
+    /// computed from the physically updated dataset.
+    ///
+    /// This test verifies:
+    /// 1. Initial load (60 000 rows) is correctly aggregated incrementally.
+    /// 2. A 1% delta (600 retractions + 600 insertions) updates the aggregate correctly.
+    /// 3. Final incremental state == batch-from-scratch on the updated dataset.
+    #[test]
+    fn tpch_q1_style_incremental_oracle() {
+        let seed = 42u64;
+        let dataset = generate_tpch_dataset(seed);
+        let lineitem = dataset.get("lineitem").unwrap().clone();
+
+        // ── Phase 1: initial incremental load ──────────────────────────────
+        let op = AggregateOp::new(OperatorId(99));
+        let kv_initial = project_lineitem_kv(&lineitem);
+        let out_initial = op.process_delta(kv_initial).expect("initial pass");
+
+        let mut incr_state: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+        apply_agg_output_deltas(&mut incr_state, &out_initial);
+
+        // Verify initial state against batch reference.
+        let batch_initial = batch_agg_reference(&project_lineitem_kv(&lineitem));
+        assert_eq!(
+            incr_state, batch_initial,
+            "Initial TPC-H Q1 aggregate: incremental != batch\n\
+             incremental: {incr_state:?}\n\
+             batch:       {batch_initial:?}"
+        );
+
+        // ── Phase 2: apply 1% delta (600 retractions + 600 insertions) ─────
+        let deltas = generate_tpch_deltas(&dataset, seed + 1);
+        let lineitem_delta = deltas.get("lineitem").unwrap();
+
+        let kv_delta = project_lineitem_kv(lineitem_delta);
+        let out_delta = op.process_delta(kv_delta).expect("delta pass");
+        apply_agg_output_deltas(&mut incr_state, &out_delta);
+
+        // ── Phase 3: batch reference on the updated dataset ─────────────────
+        let lineitem_after = apply_delta_to_dataset(&lineitem, lineitem_delta);
+        let kv_after = project_lineitem_kv(&lineitem_after);
+        let batch_after = batch_agg_reference(&kv_after);
+
+        assert_eq!(
+            incr_state, batch_after,
+            "TPC-H Q1 aggregate after 1% delta: incremental != batch\n\
+             incremental ({} groups): {incr_state:?}\n\
+             batch       ({} groups): {batch_after:?}",
+            incr_state.len(),
+            batch_after.len()
+        );
+    }
+
+    /// TPC-H Q1-style with three consecutive delta epochs (SF 0.01).
+    ///
+    /// Extends the single-delta test by applying 3 successive 1% deltas
+    /// and verifying the oracle property holds after every epoch.
+    ///
+    /// This specifically stresses cross-epoch retraction: rows inserted in
+    /// epoch N become candidates for retraction in epoch N+1.
+    #[test]
+    fn tpch_q1_style_three_epoch_oracle() {
+        let base_seed = 100u64;
+        let dataset0 = generate_tpch_dataset(base_seed);
+        let lineitem0 = dataset0.get("lineitem").unwrap().clone();
+
+        let op = AggregateOp::new(OperatorId(100));
+        let mut incr_state: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+
+        // Initial load.
+        let out0 = op
+            .process_delta(project_lineitem_kv(&lineitem0))
+            .expect("epoch 0");
+        apply_agg_output_deltas(&mut incr_state, &out0);
+
+        let mut current_lineitem = lineitem0;
+        let mut current_dataset = dataset0;
+
+        for epoch in 1u64..=3 {
+            let deltas = generate_tpch_deltas(&current_dataset, base_seed + epoch * 7);
+            let lineitem_delta = deltas.get("lineitem").unwrap();
+
+            // Incremental update.
+            let out = op
+                .process_delta(project_lineitem_kv(lineitem_delta))
+                .expect("epoch delta");
+            apply_agg_output_deltas(&mut incr_state, &out);
+
+            // Batch reference on the physically updated dataset.
+            let updated = apply_delta_to_dataset(&current_lineitem, lineitem_delta);
+            let batch = batch_agg_reference(&project_lineitem_kv(&updated));
+
+            assert_eq!(
+                incr_state, batch,
+                "TPC-H Q1 epoch {epoch}: incremental != batch\n\
+                 incremental ({} groups): {incr_state:?}\n\
+                 batch       ({} groups): {batch:?}",
+                incr_state.len(),
+                batch.len()
+            );
+
+            // Advance dataset.
+            current_lineitem = updated;
+            // Rebuild a minimal dataset map for the next delta call.
+            current_dataset = {
+                let mut m = std::collections::HashMap::new();
+                m.insert("lineitem".to_string(), current_lineitem.clone());
+                // Carry over the other tables unchanged.
+                for table in &[
+                    "region", "nation", "supplier", "part", "partsupp",
+                    "customer", "orders",
+                ] {
+                    m.insert(
+                        table.to_string(),
+                        generate_tpch_dataset(base_seed)
+                            .remove(*table)
+                            .unwrap(),
+                    );
+                }
+                m
+            };
+        }
     }
 }

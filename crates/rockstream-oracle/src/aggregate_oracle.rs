@@ -471,21 +471,21 @@ mod tests {
             /// Oracle property test: incremental == batch for ≥100k random
             /// delta sequences over the aggregate query.
             ///
-            /// This is the v0.5 Proof 1 evidence:
-            /// `SELECT k, SUM(v), COUNT(*), AVG(v) FROM t GROUP BY k`
-            /// passes the oracle check across 100k random insert/delete
-            /// sequences with group churn.
+            /// Key space expanded to k ∈ [0..20], v ∈ [-200..200], up to
+            /// 10 epochs, up to 20 rows each — wider than the original
+            /// [0..5]/[-50..50] to exercise more group-key diversity and
+            /// deeper churn.
             #[test]
             #[allow(clippy::items_after_test_module)]
             fn oracle_aggregate_100k(
                 epochs in prop::collection::vec(
                     prop::collection::vec(
-                        // (k ∈ 0..5, v ∈ -50..50, weight ∈ {+1, -1})
-                        (0i64..5i64, -50i64..50i64, prop::bool::ANY)
+                        // (k ∈ 0..20, v ∈ -200..200, weight ∈ {+1, -1})
+                        (0i64..20i64, -200i64..200i64, prop::bool::ANY)
                             .prop_map(|(k, v, insert)| (k, v, if insert { 1i64 } else { -1i64 })),
-                        0..10usize,
+                        0..20usize,
                     ),
-                    1..6usize,
+                    1..10usize,
                 )
             ) {
                 // Filter epochs to only include valid deltas (no over-delete).
@@ -515,6 +515,45 @@ mod tests {
                     }
                 }
                 assert_oracle_aggregate(&valid_epochs);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config::with_cases(20_000))]
+
+            /// High-churn retraction proptest: groups are inserted and then
+            /// fully retracted in alternating epochs, exercising the
+            /// "group dies and is resurrected" code path.
+            ///
+            /// Every odd epoch inserts rows; every even epoch retracts all of them.
+            /// At each even epoch the aggregate must be empty; at each odd epoch
+            /// it must match the fresh batch reference.
+            #[test]
+            fn oracle_aggregate_high_churn(
+                inserts in prop::collection::vec(
+                    prop::collection::vec(
+                        (0i64..10i64, 1i64..100i64)
+                            .prop_map(|(k, v)| (k, v)),
+                        1..15usize,
+                    ),
+                    1..8usize,
+                )
+            ) {
+                // Build alternating insert / full-retract epoch pairs.
+                let mut epochs: Vec<Vec<(i64, i64, i64)>> = Vec::new();
+                for batch in &inserts {
+                    // Insert epoch.
+                    let ins: Vec<(i64, i64, i64)> = batch.iter().map(|&(k,v)| (k, v, 1)).collect();
+                    // Retract epoch: delete everything just inserted.
+                    let ret: Vec<(i64, i64, i64)> = batch.iter().map(|&(k,v)| (k, v, -1)).collect();
+                    if !ins.is_empty() {
+                        epochs.push(ins);
+                        epochs.push(ret);
+                    }
+                }
+                if !epochs.is_empty() {
+                    assert_oracle_aggregate(&epochs);
+                }
             }
         }
     }
