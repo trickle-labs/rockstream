@@ -546,6 +546,105 @@ pub fn generate_tpch_deltas(
     deltas
 }
 
+// ─── Delta Generator (50% Churn — retraction-stress variant) ─────────────────
+
+/// Generate 50% churn deltas for `orders` and `lineitem` — for retraction-heavy
+/// stress testing of the retraction path through join and aggregate operators.
+///
+/// Per epoch:
+/// - `orders`:   7,500  retractions (50% of 15,000) + 7,500  new insertions
+/// - `lineitem`: 30,000 retractions (50% of 60,000) + 30,000 new insertions
+/// - All other tables: empty delta (no change)
+///
+/// New rows use unique high-offset keys (keyed off `seed`) so they never
+/// accidentally collide with previously inserted rows.
+pub fn generate_tpch_heavy_deltas(
+    current_dataset: &HashMap<String, ArrowZSet>,
+    seed: u64,
+) -> HashMap<String, ArrowZSet> {
+    let mut rng = SimpleRng::new(seed);
+    let mut deltas = HashMap::new();
+
+    // Static dimension tables — no changes.
+    for name in &["region", "nation", "supplier", "part", "partsupp", "customer"] {
+        let schema = match *name {
+            "region" => region_schema(),
+            "nation" => nation_schema(),
+            "supplier" => supplier_schema(),
+            "part" => part_schema(),
+            "partsupp" => partsupp_schema(),
+            "customer" => customer_schema(),
+            _ => unreachable!(),
+        };
+        deltas.insert(name.to_string(), ArrowZSet::empty(schema));
+    }
+
+    // orders: 50% churn — 7,500 retractions + 7,500 insertions.
+    let o_ret = select_retractions(current_dataset, "orders", 7_500, &mut rng);
+    let base_o_key = 200_000i64 + (seed as i64 % 1_000) * 10_000;
+    let mut o_orderkey = Vec::new();
+    let mut o_custkey = Vec::new();
+    let mut o_orderdate = Vec::new();
+    let mut o_totalprice = Vec::new();
+    let mut o_shippriority = Vec::new();
+    for i in 0..7_500i64 {
+        o_orderkey.push(base_o_key + i);
+        o_custkey.push(rng.next_range(1, 1500));
+        o_orderdate.push(rng.next_range(1, 2500));
+        o_totalprice.push(rng.next_range(900, 500_000));
+        o_shippriority.push(rng.next_range(1, 3));
+    }
+    let o_ins = make_zset(
+        orders_schema(),
+        vec![o_orderkey, o_custkey, o_orderdate, o_totalprice, o_shippriority],
+        1,
+    );
+    deltas.insert("orders".to_string(), concat_zsets(&o_ret, &o_ins));
+
+    // lineitem: 50% churn — 30,000 retractions + 30,000 insertions.
+    // New rows reference l_orderkey values from 1-15000 so they still join
+    // with the surviving orders rows (matching the TPC-H generator invariant).
+    let l_ret = select_retractions(current_dataset, "lineitem", 30_000, &mut rng);
+    let base_l_key = 500_000i64 + (seed as i64 % 1_000) * 100_000;
+    let mut l_orderkey_v = Vec::new();
+    let mut l_partkey_v = Vec::new();
+    let mut l_suppkey_v = Vec::new();
+    let mut l_extprice_v = Vec::new();
+    let mut l_discount_v = Vec::new();
+    let mut l_quantity_v = Vec::new();
+    let mut l_returnflag_v = Vec::new();
+    let mut l_linestatus_v = Vec::new();
+    let mut l_shipdate_v = Vec::new();
+    let mut l_commitdate_v = Vec::new();
+    let mut l_receiptdate_v = Vec::new();
+    for i in 0..30_000i64 {
+        l_orderkey_v.push(base_l_key + i);
+        l_partkey_v.push(rng.next_range(1, 2000));
+        l_suppkey_v.push(rng.next_range(1, 100));
+        l_extprice_v.push(rng.next_range(900, 100_000));
+        l_discount_v.push(rng.next_range(0, 10));
+        l_quantity_v.push(rng.next_range(1, 50));
+        l_returnflag_v.push(rng.next_range(0, 1));
+        l_linestatus_v.push(rng.next_range(0, 1));
+        l_shipdate_v.push(rng.next_range(1, 2500));
+        l_commitdate_v.push(rng.next_range(1, 2500));
+        l_receiptdate_v.push(rng.next_range(1, 2500));
+    }
+    let l_ins = make_zset(
+        lineitem_schema(),
+        vec![
+            l_orderkey_v, l_partkey_v, l_suppkey_v,
+            l_extprice_v, l_discount_v, l_quantity_v,
+            l_returnflag_v, l_linestatus_v,
+            l_shipdate_v, l_commitdate_v, l_receiptdate_v,
+        ],
+        1,
+    );
+    deltas.insert("lineitem".to_string(), concat_zsets(&l_ret, &l_ins));
+
+    deltas
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

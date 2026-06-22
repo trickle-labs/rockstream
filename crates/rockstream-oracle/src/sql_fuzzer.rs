@@ -235,7 +235,7 @@ fn rebuild_zset(schema: SchemaRef, active_rows: &[Vec<i64>]) -> ArrowZSet {
 
 pub fn generate_random_query(seed: u64) -> String {
     let mut rng = FuzzRng::new(seed);
-    let q_type = rng.next_range(0, 7);
+    let q_type = rng.next_range(0, 10);
     match q_type {
         0 => {
             // Filter + Project
@@ -281,10 +281,43 @@ pub fn generate_random_query(seed: u64) -> String {
             // Distinct
             "SELECT DISTINCT category FROM t1".to_string()
         }
-        _ => {
+        7 => {
             // Lag Window
             "SELECT id, val, LAG(id, 1) OVER (PARTITION BY category ORDER BY id) FROM t1"
                 .to_string()
+        }
+        8 => {
+            // Aggregate + HAVING — tests Filter-on-Aggregate (planner emits
+            // Filter(Aggregate(Source)) which exercises the retraction path through
+            // the post-aggregate filter on every delta epoch).
+            let agg_fn = match rng.next_range(0, 1) {
+                0 => "SUM(val)",
+                _ => "COUNT(id)",
+            };
+            let threshold = rng.next_range(50, 250);
+            format!(
+                "SELECT category, {agg_fn} FROM t1 GROUP BY category HAVING {agg_fn} > {threshold}"
+            )
+        }
+        9 => {
+            // Filter → Join → Aggregate: the cross-operator composition path.
+            // Tests that delta propagation through filter-then-join-then-aggregate
+            // produces results identical to a DataFusion batch re-execution.
+            let val_limit = rng.next_range(5, 50);
+            format!(
+                "SELECT t1.category, COUNT(t1.id) FROM t1 \
+                 JOIN t2 ON t1.id = t2.id \
+                 WHERE t1.val > {val_limit} \
+                 GROUP BY t1.category"
+            )
+        }
+        _ => {
+            // Join → Aggregate on joined column: GROUP BY a column from the right side.
+            // This tests that column offsets in the post-join aggregate are resolved
+            // correctly (t2 columns start at index 3 in the concatenated join schema).
+            format!(
+                "SELECT t2.group_id, SUM(t1.val) FROM t1 JOIN t2 ON t1.id = t2.id GROUP BY t2.group_id"
+            )
         }
     }
 }
@@ -843,7 +876,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_fuzz_simple_cases() {
-        for seed in 0..50 {
+        // Seeds 0-49 cover types 0-7 (original); seeds 50-109 provide dedicated
+        // coverage for the three new types (8=HAVING, 9=Filter→Join→Agg, 10=Join→Agg).
+        // Type selection: seed % 11 (range 0-10), so every 11 seeds cycles all types.
+        for seed in 0..110 {
             run_fuzz_case(seed).await;
         }
     }

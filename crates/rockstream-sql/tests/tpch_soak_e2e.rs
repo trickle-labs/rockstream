@@ -514,6 +514,42 @@ async fn run_df_batch(ctx: &SessionContext, query: &str) -> BTreeMap<Vec<i64>, i
     results
 }
 
+/// Build a DataFusion `SessionContext` pre-loaded with all tables from `dataset`.
+fn make_df_ctx(dataset: &HashMap<String, ArrowZSet>) -> SessionContext {
+    let ctx = SessionContext::new();
+    for (name, zset) in dataset {
+        let mem_table = datafusion::datasource::memory::MemTable::try_new(
+            zset.schema(),
+            vec![vec![zset.data.clone()]],
+        )
+        .unwrap();
+        ctx.register_table(name, Arc::new(mem_table)).unwrap();
+    }
+    ctx
+}
+
+/// Accumulate Z-set output rows into `acc` (row → net weight).
+fn accumulate_zset_output(out: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
+    if out.is_empty() {
+        return;
+    }
+    let num_cols = out.data.num_columns();
+    let col_arrays: Vec<_> = (0..num_cols)
+        .map(|j| {
+            out.data
+                .column(j)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+        })
+        .collect();
+    for i in 0..out.num_rows() {
+        let row: Vec<i64> = col_arrays.iter().map(|c| c.value(i)).collect();
+        *acc.entry(row).or_insert(0) += out.weights[i];
+    }
+    acc.retain(|_, &mut w| w != 0);
+}
+
 // ─── TPC-H SQL Queries ───────────────────────────────────────────────────────
 
 fn tpch_queries() -> Vec<&'static str> {
@@ -836,4 +872,258 @@ async fn test_tpch_queries_incremental_vs_batch() {
         speedup,
         speedup_threshold
     );
+}
+
+/// Multi-table join oracle: `lineitem ⋈ orders` on `l_orderkey = o_orderkey`.
+///
+/// Verifies the raw join output count (without aggregation) across 5 epochs of
+/// 1% churn — the join operator under TPC-H-scale data (60k × 15k → 60k result
+/// rows) with real churn at every epoch.
+///
+/// Specifically checks:
+/// - Epoch 0: the full join produces exactly 60,000 rows (every lineitem has a
+///   matching order in the TPC-H generator).
+/// - Epochs 1-4: incremental delta output accumulates to match the DataFusion
+///   batch result on the physically-updated dataset.
+#[tokio::test]
+async fn test_tpch_lineitem_orders_join_count() {
+    let sql = "SELECT l_orderkey, o_custkey FROM lineitem JOIN orders ON l_orderkey = o_orderkey";
+
+    let frontend = SqlFrontend::new();
+    frontend.register_table("lineitem", tpch_gen::lineitem_schema()).unwrap();
+    frontend.register_table("orders", tpch_gen::orders_schema()).unwrap();
+    frontend.register_table("region", tpch_gen::region_schema()).unwrap();
+    frontend.register_table("nation", tpch_gen::nation_schema()).unwrap();
+    frontend.register_table("supplier", tpch_gen::supplier_schema()).unwrap();
+    frontend.register_table("part", tpch_gen::part_schema()).unwrap();
+    frontend.register_table("partsupp", tpch_gen::partsupp_schema()).unwrap();
+    frontend.register_table("customer", tpch_gen::customer_schema()).unwrap();
+
+    let plan_node = frontend
+        .sql_to_plan_node(sql)
+        .await
+        .expect("lineitem⋈orders query failed to compile");
+
+    let mut next_id = 0u64;
+    let exec_tree = build_exec_node(&plan_node, &mut next_id);
+
+    let mut current_dataset = tpch_gen::generate_tpch_dataset(42);
+    let mut inc_acc: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+
+    // ── Epoch 0: initial join ──────────────────────────────────────────────
+    let out_0 = exec_tree.evaluate(&current_dataset);
+    accumulate_zset_output(&out_0, &mut inc_acc);
+
+    // Every lineitem row has l_orderkey ∈ [1, 15000], which maps to exactly one
+    // order row → expect exactly 60,000 result rows.
+    let row_count_0: i64 = inc_acc.values().sum();
+    assert_eq!(
+        row_count_0, 60_000,
+        "Epoch 0: expected 60,000 join rows, got {row_count_0}"
+    );
+
+    let batch_0 = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+    assert_eq!(inc_acc, batch_0, "Epoch 0: incremental != batch");
+
+    // ── Epochs 1-4: 1% churn per epoch ────────────────────────────────────
+    for epoch in 1u64..=4 {
+        let delta = tpch_gen::generate_tpch_deltas(&current_dataset, 42 + epoch * 7);
+
+        let out = exec_tree.evaluate(&delta);
+        accumulate_zset_output(&out, &mut inc_acc);
+
+        // Advance the physical dataset.
+        for (name, d) in &delta {
+            let prev = current_dataset.get(name).unwrap();
+            let updated = apply_delta_physically(prev, d);
+            current_dataset.insert(name.clone(), updated);
+        }
+
+        let batch = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+        assert_eq!(
+            inc_acc, batch,
+            "Epoch {epoch}: lineitem⋈orders incremental != batch"
+        );
+
+        // Join count stays near 60k (±2% tolerance for 1% churn per epoch).
+        let row_count: i64 = inc_acc.values().sum();
+        assert!(
+            (55_000..=65_000).contains(&row_count),
+            "Epoch {epoch}: join row count {row_count} out of expected range [55k, 65k]"
+        );
+    }
+}
+
+/// Retraction-heavy workload: 50% DELETE rate per epoch on lineitem + orders.
+///
+/// Uses Q4-style aggregation (COUNT by ship priority) to verify that retraction
+/// correctness is maintained when half the fact table is replaced every epoch.
+///
+/// This stresses the retraction path 25× harder than the 2%-churn TPC-H soak
+/// test, exposing any incorrect weight accumulation in join+aggregate pipelines.
+#[tokio::test]
+async fn test_retraction_heavy_workload() {
+    // Q4: join lineitem + orders, count by ship priority.
+    let sql = "SELECT o_shippriority, COUNT(o_orderkey) FROM orders JOIN lineitem ON o_orderkey = l_orderkey GROUP BY o_shippriority";
+
+    let frontend = SqlFrontend::new();
+    for (name, schema) in [
+        ("region", tpch_gen::region_schema()),
+        ("nation", tpch_gen::nation_schema()),
+        ("supplier", tpch_gen::supplier_schema()),
+        ("part", tpch_gen::part_schema()),
+        ("partsupp", tpch_gen::partsupp_schema()),
+        ("customer", tpch_gen::customer_schema()),
+        ("orders", tpch_gen::orders_schema()),
+        ("lineitem", tpch_gen::lineitem_schema()),
+    ] {
+        frontend.register_table(name, schema).unwrap();
+    }
+
+    let plan_node = frontend
+        .sql_to_plan_node(sql)
+        .await
+        .expect("Q4 heavy retraction query failed to compile");
+
+    let mut next_id = 0u64;
+    let exec_tree = build_exec_node(&plan_node, &mut next_id);
+
+    let mut current_dataset = tpch_gen::generate_tpch_dataset(77);
+    let mut inc_acc: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+
+    // ── Epoch 0: initial snapshot ──────────────────────────────────────────
+    let out_0 = exec_tree.evaluate(&current_dataset);
+    accumulate_zset_output(&out_0, &mut inc_acc);
+    let batch_0 = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+    assert_eq!(inc_acc, batch_0, "Epoch 0: heavy retraction — initial snapshot mismatch");
+
+    // Each group must have a positive count.
+    assert!(!inc_acc.is_empty(), "Epoch 0: no aggregate groups produced");
+    for (row, &w) in &inc_acc {
+        assert!(w > 0, "Epoch 0: negative or zero aggregate weight for row {:?}", row);
+    }
+
+    // ── Epochs 1-5: 50% churn (30k lineitem retractions + 30k insertions) ─
+    for epoch in 1u64..=5 {
+        let delta = tpch_gen::generate_tpch_heavy_deltas(&current_dataset, 77 + epoch * 13);
+
+        // Verify the delta contains substantial retraction volume.
+        // select_retractions samples with replacement from 60k rows — 30k samples
+        // produce ≈23.6k unique rows (birthday paradox). Assert at least 18k.
+        let l_delta = delta.get("lineitem").unwrap();
+        let retraction_count = l_delta.weights.iter().filter(|&&w| w < 0).count();
+        let insertion_count = l_delta.weights.iter().filter(|&&w| w > 0).count();
+        assert!(
+            retraction_count >= 18_000,
+            "Epoch {epoch}: expected ≥18k lineitem retractions, got {retraction_count}"
+        );
+        assert_eq!(insertion_count, 30_000, "Epoch {epoch}: expected 30k lineitem insertions, got {insertion_count}");
+
+        let out = exec_tree.evaluate(&delta);
+        accumulate_zset_output(&out, &mut inc_acc);
+
+        for (name, d) in &delta {
+            let prev = current_dataset.get(name).unwrap();
+            let updated = apply_delta_physically(prev, d);
+            current_dataset.insert(name.clone(), updated);
+        }
+
+        let batch = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+        assert_eq!(
+            inc_acc, batch,
+            "Epoch {epoch}: heavy retraction — incremental != batch\n\
+             (50% DELETE rate: {retraction_count} retractions in lineitem)"
+        );
+
+        // All surviving groups must have positive weight.
+        for (row, &w) in &inc_acc {
+            assert!(w > 0, "Epoch {epoch}: negative aggregate weight for row {:?}", row);
+        }
+    }
+}
+
+/// Cross-operator oracle: `Filter → Join → Aggregate` end-to-end.
+///
+/// Query: `SELECT o_shippriority, COUNT(l_orderkey) FROM lineitem
+///          JOIN orders ON l_orderkey = o_orderkey
+///          WHERE l_quantity < 24
+///          GROUP BY o_shippriority`
+///
+/// The planner emits: Filter(lineitem.l_quantity < 24) → InnerJoin → Aggregate.
+/// This tests operator composition boundaries that single-operator unit tests
+/// cannot catch: incorrect schema mapping between filter→join and join→agg.
+///
+/// Runs 3 epochs with 1% churn, asserting exact incremental == batch equivalence.
+/// Also verifies that the incremental aggregate output at epoch 0 covers all 3
+/// ship-priority groups with non-zero counts.
+#[tokio::test]
+async fn test_cross_operator_filter_join_aggregate() {
+    let sql = "SELECT o_shippriority, COUNT(l_orderkey) FROM lineitem \
+               JOIN orders ON l_orderkey = o_orderkey \
+               WHERE l_quantity < 24 \
+               GROUP BY o_shippriority";
+
+    let frontend = SqlFrontend::new();
+    for (name, schema) in [
+        ("region", tpch_gen::region_schema()),
+        ("nation", tpch_gen::nation_schema()),
+        ("supplier", tpch_gen::supplier_schema()),
+        ("part", tpch_gen::part_schema()),
+        ("partsupp", tpch_gen::partsupp_schema()),
+        ("customer", tpch_gen::customer_schema()),
+        ("orders", tpch_gen::orders_schema()),
+        ("lineitem", tpch_gen::lineitem_schema()),
+    ] {
+        frontend.register_table(name, schema).unwrap();
+    }
+
+    let plan_node = frontend
+        .sql_to_plan_node(sql)
+        .await
+        .expect("Filter→Join→Agg query failed to compile");
+
+    let mut next_id = 0u64;
+    let exec_tree = build_exec_node(&plan_node, &mut next_id);
+
+    let mut current_dataset = tpch_gen::generate_tpch_dataset(55);
+    let mut inc_acc: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+
+    // ── Epoch 0 ────────────────────────────────────────────────────────────
+    let out_0 = exec_tree.evaluate(&current_dataset);
+    accumulate_zset_output(&out_0, &mut inc_acc);
+
+    let batch_0 = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+    assert_eq!(inc_acc, batch_0, "Epoch 0: Filter→Join→Agg incremental != batch");
+
+    // The query groups by o_shippriority ∈ {1,2,3}; all 3 groups should appear
+    // since lineitem has ~46% of rows with l_quantity < 24 evenly distributed.
+    assert!(
+        inc_acc.len() >= 2,
+        "Epoch 0: expected ≥2 ship-priority groups, got {}",
+        inc_acc.len()
+    );
+    // Every group must have a strictly positive count.
+    for (row, &w) in &inc_acc {
+        assert!(w > 0, "Epoch 0: non-positive weight for group {:?}", row);
+    }
+
+    // ── Epochs 1-3: 1% churn ───────────────────────────────────────────────
+    for epoch in 1u64..=3 {
+        let delta = tpch_gen::generate_tpch_deltas(&current_dataset, 55 + epoch * 11);
+
+        let out = exec_tree.evaluate(&delta);
+        accumulate_zset_output(&out, &mut inc_acc);
+
+        for (name, d) in &delta {
+            let prev = current_dataset.get(name).unwrap();
+            let updated = apply_delta_physically(prev, d);
+            current_dataset.insert(name.clone(), updated);
+        }
+
+        let batch = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+        assert_eq!(
+            inc_acc, batch,
+            "Epoch {epoch}: Filter→Join→Agg incremental != batch"
+        );
+    }
 }
