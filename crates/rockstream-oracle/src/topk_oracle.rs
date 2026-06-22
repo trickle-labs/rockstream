@@ -180,9 +180,154 @@ mod proptest_oracle {
         )
     }
 
+    // ─── Deterministic tests with exact expected output ───────────────────────
+
+    /// K=1 must select the single highest-value row across 3 inserted rows.
+    #[test]
+    fn topk_k1_exact_selects_highest_value() {
+        // Insert (v=5,id=3,pk=1), (v=10,id=1,pk=1), (v=7,id=2,pk=1) — top-1 must be v=10.
+        let op = TopKOp::new(schema_vpk(), 1, 0, vec![2]);
+        let mut input_state: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+        let mut incr_output: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+
+        let epoch = vec![(5i64, 3, 1, 1), (10, 1, 1, 1), (7, 2, 1, 1)];
+        let b = make_batch(&epoch);
+        accumulate_state(&mut input_state, &b);
+        let out = op.process_epoch(b, 1).unwrap();
+        accumulate_output(&mut incr_output, &out);
+
+        let incr_live = positive_entries(&incr_output);
+        let batch_live = batch_topk(&input_state, 1);
+
+        // Expected: (pk=1, v=10, id=1)
+        let mut expected = BTreeMap::new();
+        expected.insert((1i64, 10i64, 1i64), 1i64);
+        assert_eq!(incr_live, expected, "K=1 must select the highest value v=10");
+        assert_eq!(incr_live, batch_live, "incremental must match batch reference");
+    }
+
+    /// Deleting the current top-1 element must promote the next-best row.
+    ///
+    /// This exercises the retraction-and-replacement path, which is the
+    /// most important correctness property of TopK in an IVM context.
+    #[test]
+    fn topk_k1_deleted_row_is_replaced_by_next() {
+        let op = TopKOp::new(schema_vpk(), 1, 0, vec![2]);
+        let mut input_state: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+        let mut incr_output: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+
+        // epoch 1: insert three rows — top-1 = (pk=1, v=10, id=1)
+        let epoch1: Vec<(i64, i64, i64, i64)> = vec![(10, 1, 1, 1), (8, 2, 1, 1), (5, 3, 1, 1)];
+        let b1 = make_batch(&epoch1);
+        accumulate_state(&mut input_state, &b1);
+        let out1 = op.process_epoch(b1, 1).unwrap();
+        accumulate_output(&mut incr_output, &out1);
+
+        let after_e1 = positive_entries(&incr_output);
+        let mut exp_e1 = BTreeMap::new();
+        exp_e1.insert((1i64, 10i64, 1i64), 1i64);
+        assert_eq!(after_e1, exp_e1, "after epoch 1: top-1 must be (pk=1,v=10,id=1)");
+
+        // epoch 2: retract (v=10, id=1, pk=1) — top-1 must fall back to v=8
+        let epoch2: Vec<(i64, i64, i64, i64)> = vec![(10, 1, 1, -1)];
+        let b2 = make_batch(&epoch2);
+        accumulate_state(&mut input_state, &b2);
+        let out2 = op.process_epoch(b2, 2).unwrap();
+        accumulate_output(&mut incr_output, &out2);
+
+        let after_e2 = positive_entries(&incr_output);
+        let batch_e2 = batch_topk(&input_state, 1);
+
+        let mut exp_e2 = BTreeMap::new();
+        exp_e2.insert((1i64, 8i64, 2i64), 1i64); // (pk=1, v=8, id=2)
+        assert_eq!(after_e2, exp_e2, "after retraction of top element: v=8 must become top-1");
+        assert_eq!(after_e2, batch_e2, "incremental must equal batch after retraction");
+    }
+
+    /// K=1 applied to two partitions must independently select the top row per partition.
+    #[test]
+    fn topk_two_partitions_k1_exact() {
+        // pk=1: (v=10,id=1), (v=5,id=2) → top-1 = (pk=1, v=10, id=1)
+        // pk=2: (v=3,id=3),  (v=7,id=4) → top-1 = (pk=2, v=7,  id=4)
+        let op = TopKOp::new(schema_vpk(), 1, 0, vec![2]);
+        let mut input_state: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+        let mut incr_output: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+
+        let epoch: Vec<(i64, i64, i64, i64)> = vec![(10, 1, 1, 1), (5, 2, 1, 1), (3, 3, 2, 1), (7, 4, 2, 1)];
+        let b = make_batch(&epoch);
+        accumulate_state(&mut input_state, &b);
+        let out = op.process_epoch(b, 1).unwrap();
+        accumulate_output(&mut incr_output, &out);
+
+        let incr_live = positive_entries(&incr_output);
+        let batch_live = batch_topk(&input_state, 1);
+
+        let mut expected = BTreeMap::new();
+        expected.insert((1i64, 10i64, 1i64), 1i64);
+        expected.insert((2i64, 7i64, 4i64), 1i64);
+        assert_eq!(incr_live, expected, "K=1 per partition: wrong winners selected");
+        assert_eq!(incr_live, batch_live, "incremental must match batch reference");
+    }
+
+    /// K=2 must return the two highest-value rows and not the third.
+    #[test]
+    fn topk_k2_exact_excludes_third_row() {
+        // 4 rows in pk=1: v ∈ {10, 8, 5, 3}; K=2 must return v=10 and v=8 only.
+        let op = TopKOp::new(schema_vpk(), 2, 0, vec![2]);
+        let mut input_state: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+        let mut incr_output: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+
+        let epoch: Vec<(i64, i64, i64, i64)> = vec![(3, 4, 1, 1), (10, 1, 1, 1), (8, 2, 1, 1), (5, 3, 1, 1)];
+        let b = make_batch(&epoch);
+        accumulate_state(&mut input_state, &b);
+        let out = op.process_epoch(b, 1).unwrap();
+        accumulate_output(&mut incr_output, &out);
+
+        let incr_live = positive_entries(&incr_output);
+        let batch_live = batch_topk(&input_state, 2);
+
+        let mut expected = BTreeMap::new();
+        expected.insert((1i64, 10i64, 1i64), 1i64);
+        expected.insert((1i64, 8i64, 2i64), 1i64);
+        assert_eq!(incr_live, expected, "K=2 must return only the two highest-value rows");
+        assert_eq!(incr_live, batch_live, "incremental must match batch reference");
+    }
+
+    /// Inserting a new row with a higher value than the current top-K must displace
+    /// the previous bottom element and include the newcomer.
+    #[test]
+    fn topk_k2_new_insert_displaces_bottom() {
+        let op = TopKOp::new(schema_vpk(), 2, 0, vec![2]);
+        let mut input_state: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+        let mut incr_output: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+
+        // epoch 1: v=5 and v=3 → top-2 = {v=5, v=3}
+        let epoch1: Vec<(i64, i64, i64, i64)> = vec![(5, 1, 1, 1), (3, 2, 1, 1)];
+        let b1 = make_batch(&epoch1);
+        accumulate_state(&mut input_state, &b1);
+        let out1 = op.process_epoch(b1, 1).unwrap();
+        accumulate_output(&mut incr_output, &out1);
+
+        // epoch 2: insert v=9 → top-2 = {v=9, v=5}, v=3 is displaced
+        let epoch2: Vec<(i64, i64, i64, i64)> = vec![(9, 3, 1, 1)];
+        let b2 = make_batch(&epoch2);
+        accumulate_state(&mut input_state, &b2);
+        let out2 = op.process_epoch(b2, 2).unwrap();
+        accumulate_output(&mut incr_output, &out2);
+
+        let incr_live = positive_entries(&incr_output);
+        let batch_live = batch_topk(&input_state, 2);
+
+        let mut expected = BTreeMap::new();
+        expected.insert((1i64, 9i64, 3i64), 1i64);
+        expected.insert((1i64, 5i64, 1i64), 1i64);
+        assert_eq!(incr_live, expected, "new insert v=9 must displace old bottom v=3 from top-2");
+        assert_eq!(incr_live, batch_live, "incremental must match batch reference");
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 1000,
+            cases: 20_000,
             ..ProptestConfig::default()
         })]
 

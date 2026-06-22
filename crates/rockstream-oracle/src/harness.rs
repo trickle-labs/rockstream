@@ -287,5 +287,30 @@ mod tests {
                 assert_oracle_noop(&flat);
             }
         }
+
+        /// Non-unit weight proptest: verifies that the oracle correctly handles
+        /// rows with weights greater than 1 (e.g. batch-load duplicates).
+        ///
+        /// A row with weight 2 or 3 is still "present" (weight > 0) and must
+        /// appear once in the batch result.  A row partially retracted from
+        /// weight 3 to weight 1 must still appear; only when it reaches ≤ 0
+        /// is it absent.  This exercises accumulation correctness beyond ±1.
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config::with_cases(5_000))]
+            #[test]
+            fn oracle_noop_non_unit_weights(
+                deltas in prop::collection::vec(
+                    (0i64..100i64, -500i64..500i64,
+                     prop_oneof![Just(1i64), Just(2i64), Just(3i64), Just(-1i64), Just(-2i64)])
+                        .prop_map(|(id, value, weight)| ZSetDelta {
+                            row: TestRow { id, value },
+                            weight,
+                        }),
+                    0..50,
+                )
+            ) {
+                assert_oracle_noop(&deltas);
+            }
+        }
     }
 }

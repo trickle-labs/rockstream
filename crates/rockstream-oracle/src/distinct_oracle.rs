@@ -180,7 +180,7 @@ mod proptest_oracle {
     // ─── Strategies ──────────────────────────────────────────────────────────
 
     fn arb_delta_row() -> impl Strategy<Value = DeltaRow> {
-        (1i64..=5, 1i64..=5, prop_oneof![Just(1i64), Just(-1i64)]).prop_map(|(k, v, w)| (k, v, w))
+        (1i64..=20, 1i64..=20, prop_oneof![Just(1i64), Just(-1i64)]).prop_map(|(k, v, w)| (k, v, w))
     }
 
     fn arb_epoch(max_rows: usize) -> impl Strategy<Value = Vec<DeltaRow>> {

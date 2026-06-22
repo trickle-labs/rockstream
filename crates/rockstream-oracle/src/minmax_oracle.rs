@@ -375,11 +375,11 @@ mod tests {
             fn oracle_min_100k(
                 raw_epochs in prop::collection::vec(
                     prop::collection::vec(
-                        (0i64..5i64, -50i64..50i64, prop::bool::ANY)
+                        (0i64..15i64, -200i64..200i64, prop::bool::ANY)
                             .prop_map(|(k, v, insert)| (k, v, if insert { 1i64 } else { -1i64 })),
-                        0..10usize,
+                        0..15usize,
                     ),
-                    1..6usize,
+                    1..8usize,
                 )
             ) {
                 // Filter out invalid retractions (no over-delete).
@@ -414,11 +414,11 @@ mod tests {
             fn oracle_max_100k(
                 raw_epochs in prop::collection::vec(
                     prop::collection::vec(
-                        (0i64..5i64, -50i64..50i64, prop::bool::ANY)
+                        (0i64..15i64, -200i64..200i64, prop::bool::ANY)
                             .prop_map(|(k, v, insert)| (k, v, if insert { 1i64 } else { -1i64 })),
-                        0..10usize,
+                        0..15usize,
                     ),
-                    1..6usize,
+                    1..8usize,
                 )
             ) {
                 let mut kv_state: std::collections::HashMap<(i64, i64), i64> =

@@ -888,4 +888,230 @@ mod tests {
             };
         }
     }
+
+    /// Project lineitem to (k=l_returnflag, v=l_extendedprice) only for rows
+    /// matching the Q6 filter: `l_discount BETWEEN 5 AND 7 AND l_quantity < 25`.
+    ///
+    /// This allows counting filtered lineitems via `AggregateOp` SUM(1) = COUNT(*).
+    /// Lineitem column indices: 0=l_orderkey, 3=l_extendedprice, 4=l_discount, 5=l_quantity.
+    fn project_lineitem_q6(lineitem: &ArrowZSet) -> ArrowZSet {
+        if lineitem.is_empty() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            return ArrowZSet::new(RecordBatch::new_empty(schema), vec![]);
+        }
+        let discount_col = lineitem
+            .data
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let quantity_col = lineitem
+            .data
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ep_col = lineitem
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let mut k_vals = Vec::new();
+        let mut v_vals = Vec::new();
+        let mut weights = Vec::new();
+        for i in 0..lineitem.num_rows() {
+            let discount = discount_col.value(i);
+            let quantity = quantity_col.value(i);
+            // Q6 filter: discount in [5, 7] and quantity < 25
+            if discount >= 5 && discount <= 7 && quantity < 25 {
+                k_vals.push(0i64); // single group (no GROUP BY in Q6)
+                v_vals.push(ep_col.value(i));
+                weights.push(lineitem.weights[i]);
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        if k_vals.is_empty() {
+            return ArrowZSet::new(RecordBatch::new_empty(schema), vec![]);
+        }
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(k_vals)) as _,
+                Arc::new(Int64Array::from(v_vals)) as _,
+            ],
+        )
+        .unwrap();
+        ArrowZSet::new(data, weights)
+    }
+
+    /// Compute the Q6 batch reference: SUM(l_extendedprice) for rows matching
+    /// `l_discount BETWEEN 5 AND 7 AND l_quantity < 25` from a physical lineitem Z-set.
+    fn batch_q6_sum(lineitem: &ArrowZSet) -> i64 {
+        if lineitem.is_empty() {
+            return 0;
+        }
+        let ep_col = lineitem
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let discount_col = lineitem
+            .data
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let quantity_col = lineitem
+            .data
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut total = 0i64;
+        for i in 0..lineitem.num_rows() {
+            let w = lineitem.weights[i];
+            if w <= 0 {
+                continue;
+            }
+            let discount = discount_col.value(i);
+            let quantity = quantity_col.value(i);
+            if discount >= 5 && discount <= 7 && quantity < 25 {
+                total += ep_col.value(i);
+            }
+        }
+        total
+    }
+
+    /// TPC-H Q6-style incremental oracle: SUM(l_extendedprice) for filtered lineitems.
+    ///
+    /// Query (simplified Q6):
+    /// `SELECT SUM(l_extendedprice) FROM lineitem
+    ///   WHERE l_discount BETWEEN 5 AND 7 AND l_quantity < 25`
+    ///
+    /// Oracle property: after initial load + 1% delta, the incremental aggregate
+    /// output from `AggregateOp` must equal the batch SUM on the updated dataset.
+    ///
+    /// This tests incremental maintenance of a filter-aggregate combination:
+    /// rows that enter or leave the filter predicate must update the aggregate
+    /// correctly via retraction + insertion.
+    #[test]
+    fn tpch_q6_style_incremental_oracle() {
+        let seed = 200u64;
+        let dataset = generate_tpch_dataset(seed);
+        let lineitem = dataset.get("lineitem").unwrap().clone();
+
+        let op = AggregateOp::new(OperatorId(200));
+        let mut incr_state: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+
+        // Phase 1: initial load — project + filter, then aggregate.
+        let kv_initial = project_lineitem_q6(&lineitem);
+        let out_initial = op.process_delta(kv_initial).expect("Q6 initial pass");
+        apply_agg_output_deltas(&mut incr_state, &out_initial);
+
+        // Verify initial state vs batch.
+        let expected_initial = batch_q6_sum(&lineitem);
+        let incr_initial_sum: i64 = incr_state.values().map(|(sum, _)| *sum).sum();
+        assert_eq!(
+            incr_initial_sum,
+            expected_initial,
+            "Q6 initial load: incremental SUM != batch SUM\n\
+             incremental sum: {incr_initial_sum}\n\
+             batch sum:       {expected_initial}"
+        );
+
+        // Phase 2: 1% delta.
+        let deltas = generate_tpch_deltas(&dataset, seed + 1);
+        let lineitem_delta = deltas.get("lineitem").unwrap();
+
+        let kv_delta = project_lineitem_q6(lineitem_delta);
+        let out_delta = op.process_delta(kv_delta).expect("Q6 delta pass");
+        apply_agg_output_deltas(&mut incr_state, &out_delta);
+
+        // Phase 3: batch reference on updated dataset.
+        let lineitem_after = apply_delta_to_dataset(&lineitem, lineitem_delta);
+        let expected_after = batch_q6_sum(&lineitem_after);
+        let incr_after_sum: i64 = incr_state.values().map(|(sum, _)| *sum).sum();
+
+        assert_eq!(
+            incr_after_sum,
+            expected_after,
+            "Q6 after 1% delta: incremental SUM != batch SUM\n\
+             incremental sum: {incr_after_sum}\n\
+             batch sum:       {expected_after}"
+        );
+    }
+
+    /// TPC-H Q1-style oracle with 10 consecutive delta epochs (SF 0.01).
+    ///
+    /// Extends the 3-epoch test to prove the oracle property holds across 10
+    /// successive 1% churn epochs — total 10% of the dataset replaced.
+    ///
+    /// Cross-epoch retraction: rows inserted in epoch N are candidates for
+    /// deletion in any subsequent epoch, validating the long-running IVM
+    /// accumulation correctness.
+    #[test]
+    fn tpch_q1_style_ten_epoch_oracle() {
+        let base_seed = 500u64;
+        let dataset0 = generate_tpch_dataset(base_seed);
+        let lineitem0 = dataset0.get("lineitem").unwrap().clone();
+
+        let op = AggregateOp::new(OperatorId(500));
+        let mut incr_state: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+
+        // Initial load.
+        let out0 = op
+            .process_delta(project_lineitem_kv(&lineitem0))
+            .expect("epoch 0");
+        apply_agg_output_deltas(&mut incr_state, &out0);
+
+        let mut current_lineitem = lineitem0;
+        let mut current_dataset = dataset0;
+
+        for epoch in 1u64..=10 {
+            let deltas = generate_tpch_deltas(&current_dataset, base_seed + epoch * 13);
+            let lineitem_delta = deltas.get("lineitem").unwrap();
+
+            let out = op
+                .process_delta(project_lineitem_kv(lineitem_delta))
+                .expect("epoch delta");
+            apply_agg_output_deltas(&mut incr_state, &out);
+
+            let updated = apply_delta_to_dataset(&current_lineitem, lineitem_delta);
+            let batch = batch_agg_reference(&project_lineitem_kv(&updated));
+
+            assert_eq!(
+                incr_state, batch,
+                "TPC-H Q1 10-epoch test, epoch {epoch}: incremental != batch\n\
+                 incremental ({} groups): {incr_state:?}\n\
+                 batch       ({} groups): {batch:?}",
+                incr_state.len(),
+                batch.len()
+            );
+
+            current_lineitem = updated;
+            current_dataset = {
+                let mut m = std::collections::HashMap::new();
+                m.insert("lineitem".to_string(), current_lineitem.clone());
+                for table in &[
+                    "region", "nation", "supplier", "part", "partsupp",
+                    "customer", "orders",
+                ] {
+                    m.insert(
+                        table.to_string(),
+                        generate_tpch_dataset(base_seed).remove(*table).unwrap(),
+                    );
+                }
+                m
+            };
+        }
+    }
 }
