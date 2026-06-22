@@ -215,6 +215,27 @@ impl ExecNode {
                         .collect()
                 };
 
+                // Debug-mode hash collision guard: assert no two distinct key-column
+                // tuples produce the same FNV-1a combined hash within this batch.
+                #[cfg(debug_assertions)]
+                if group_by.len() > 1 {
+                    let mut seen: std::collections::HashMap<i64, Vec<i64>> =
+                        std::collections::HashMap::new();
+                    for i in 0..in_val.num_rows() {
+                        let k = keys[i];
+                        let tuple: Vec<i64> = key_vecs.iter().map(|kv| kv[i]).collect();
+                        if let Some(existing) = seen.get(&k) {
+                            assert_eq!(
+                                existing, &tuple,
+                                "FNV-1a hash collision: tuple {:?} and {:?} both map to hash {}",
+                                existing, tuple, k
+                            );
+                        } else {
+                            seen.insert(k, tuple);
+                        }
+                    }
+                }
+
                 // Maintain persistent reverse mapping so we can reconstruct the full
                 // multi-column key in the output.
                 if group_by.len() > 1 {
@@ -1324,7 +1345,7 @@ async fn test_outer_join_retraction_heavy_workload() {
     }
 }
 
-/// SF=0.1 aggregate correctness — opt-in via `TPCH_SF10=1` environment variable.
+/// SF=0.1 aggregate correctness — opt-in via `--features sf10_tests`.
 ///
 /// Exercises the same incremental vs. batch equivalence checks as the main
 /// TPC-H suite but on a 10× larger dataset (600,000 lineitems, 150,000 orders).
@@ -1336,15 +1357,10 @@ async fn test_outer_join_retraction_heavy_workload() {
 /// Q10 (SUM by custkey), and Q23 (two-key GROUP BY on returnflag × linestatus).
 /// Three epochs with 1% churn each.
 ///
-/// Run with: `TPCH_SF10=1 cargo test test_tpch_sf10_aggregate_correctness -- --nocapture`
+/// Run with: `cargo test -p rockstream-sql --features sf10_tests test_tpch_sf10_aggregate_correctness -- --nocapture`
+#[cfg(feature = "sf10_tests")]
 #[tokio::test]
-async fn test_tpch_sf10_aggregate_correctness() {
-    if std::env::var("TPCH_SF10").is_err() {
-        println!("Skipping SF=0.1 test (set TPCH_SF10=1 to enable)");
-        return;
-    }
-
-    let sf10_queries: &[&str] = &[
+async fn test_tpch_sf10_aggregate_correctness() {    let sf10_queries: &[&str] = &[
         // Q1: SUM by returnflag — exercises large single-key aggregation
         "SELECT l_returnflag, SUM(l_extendedprice) FROM lineitem GROUP BY l_returnflag",
         // Q4: COUNT by shippriority — join + aggregate on 150k orders × 600k lineitem

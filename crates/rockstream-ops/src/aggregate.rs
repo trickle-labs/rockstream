@@ -280,19 +280,46 @@ impl Operator for AggregateOp {
 
         let n = delta.num_rows();
 
-        // Output vecs — pre-allocate for 2 output rows per input row (retract + insert).
-        let mut out_k: Vec<i64> = Vec::with_capacity(n * 2);
-        let mut out_sum: Vec<i64> = Vec::with_capacity(n * 2);
-        let mut out_count: Vec<i64> = Vec::with_capacity(n * 2);
-        let mut out_avg: Vec<i64> = Vec::with_capacity(n * 2);
-        let mut out_weights: Vec<i64> = Vec::with_capacity(n * 2);
-
-        let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
-
+        // Consolidate input: sum weights for identical (k, v) pairs before
+        // processing.  Without this, the DBSP bilinear join rule can emit
+        // multiple rows for the same (key, value) with weights that net to
+        // zero or a single unit — e.g. (-1, -1, +1) for a concurrent
+        // retraction from both sides — and processing them individually
+        // causes the group count to transiently hit 0, which deletes the
+        // group entry and corrupts the running sum for that epoch.
+        //
+        // Preserving insertion order for equal net weight ensures deterministic
+        // output ordering across platforms.
+        let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
+            std::collections::HashMap::new();
+        let mut order: Vec<(i64, i64)> = Vec::new();
         for row in 0..n {
             let k = k_col.value(row);
             let v = v_col.value(row);
             let w = delta.weights[row];
+            let entry = consolidated.entry((k, v)).or_insert_with(|| {
+                order.push((k, v));
+                0
+            });
+            *entry += w;
+        }
+
+        // Output vecs — pre-allocate for 2 output rows per consolidated input row.
+        let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_avg: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
+
+        let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
+
+        for (k, v) in &order {
+            let k = *k;
+            let v = *v;
+            let w = consolidated[&(k, v)];
+            if w == 0 {
+                continue;
+            }
 
             let (old_state, new_state) = state.apply_delta(k, v, w)?;
 

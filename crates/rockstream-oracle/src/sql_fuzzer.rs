@@ -119,13 +119,19 @@ pub fn generate_synthetic_deltas(
     let mut rng = FuzzRng::new(seed);
     let mut deltas = HashMap::new();
 
-    // t1 deltas: 2 retractions, 2 insertions
+    // t1 deltas: 2 retractions (without replacement), 2 insertions.
+    // Partial Fisher-Yates shuffle — produces exactly 2 unique row indices,
+    // matching the approach used in tpch_gen.rs and avoiding the birthday-
+    // paradox duplicates that with-replacement sampling causes.
     let t1 = current_dataset.get("t1").unwrap();
-    let mut t1_ret_idx = Vec::new();
-    for _ in 0..2 {
-        t1_ret_idx.push(rng.next_range(0, (t1.num_rows() - 1) as i64) as usize);
+    let t1_num_rows = t1.num_rows();
+    let mut t1_all_idx: Vec<usize> = (0..t1_num_rows).collect();
+    for i in 0..2 {
+        let j = i + rng.next_range(0, (t1_num_rows - 1 - i) as i64) as usize;
+        t1_all_idx.swap(i, j);
     }
-    let mut t1_ret = t1.select_rows(&t1_ret_idx).unwrap();
+    let t1_ret_idx = &t1_all_idx[..2];
+    let mut t1_ret = t1.select_rows(t1_ret_idx).unwrap();
     t1_ret.weights = vec![-1; t1_ret.weights.len()];
 
     let t1_id = vec![rng.next_range(101, 200), rng.next_range(101, 200)];
@@ -134,13 +140,14 @@ pub fn generate_synthetic_deltas(
     let t1_ins = make_zset(t1_schema(), vec![t1_id, t1_val, t1_cat], 1);
     deltas.insert("t1".to_string(), concat_zsets(&t1_ret, &t1_ins));
 
-    // t2 deltas: 1 retraction, 1 insertion
+    // t2 deltas: 1 retraction (without replacement), 1 insertion.
     let t2 = current_dataset.get("t2").unwrap();
-    let mut t2_ret_idx = Vec::new();
-    for _ in 0..1 {
-        t2_ret_idx.push(rng.next_range(0, (t2.num_rows() - 1) as i64) as usize);
-    }
-    let mut t2_ret = t2.select_rows(&t2_ret_idx).unwrap();
+    let t2_num_rows = t2.num_rows();
+    let mut t2_all_idx: Vec<usize> = (0..t2_num_rows).collect();
+    let j = rng.next_range(0, (t2_num_rows - 1) as i64) as usize;
+    t2_all_idx.swap(0, j);
+    let t2_ret_idx = &t2_all_idx[..1];
+    let mut t2_ret = t2.select_rows(t2_ret_idx).unwrap();
     t2_ret.weights = vec![-1; t2_ret.weights.len()];
 
     let t2_id = vec![rng.next_range(101, 200)];
@@ -261,7 +268,7 @@ fn rebuild_zset(schema: SchemaRef, active_rows: &[Vec<i64>]) -> ArrowZSet {
 
 pub fn generate_random_query(seed: u64) -> String {
     let mut rng = FuzzRng::new(seed);
-    let q_type = rng.next_range(0, 13);
+    let q_type = rng.next_range(0, 14);
     match q_type {
         0 => {
             // Filter + Project
@@ -360,7 +367,7 @@ pub fn generate_random_query(seed: u64) -> String {
             let k = rng.next_range(1, 5);
             format!("SELECT id FROM t1 WHERE id NOT IN (SELECT id FROM t2 WHERE group_id = {k})")
         }
-        _ => {
+        13 => {
             // Multi-key GROUP BY: exercises group_by with 2 key columns.
             // Detects the bug where only group_by[0] is hashed, silently dropping
             // the second key column and collapsing distinct groups.
@@ -372,6 +379,26 @@ pub fn generate_random_query(seed: u64) -> String {
                 "SELECT t1.category, t2.group_id, {agg_fn} FROM t1 \
                  JOIN t2 ON t1.id = t2.id \
                  GROUP BY t1.category, t2.group_id"
+            )
+        }
+        _ => {
+            // HAVING + scalar subquery: GROUP BY with a HAVING threshold that is
+            // computed from a scalar subquery over t2.  This exercises the planner
+            // path where a HAVING predicate references an aggregate from a different
+            // relation — the "nested aggregation" planner path.  If the planner does
+            // not yet support scalar subqueries in HAVING, sql_to_plan_node returns
+            // Err and run_fuzz_case silently skips the case (correct behaviour).
+            let agg_fn = match rng.next_range(0, 1) {
+                0 => "COUNT(id)",
+                _ => "SUM(val)",
+            };
+            let sub_agg = match rng.next_range(0, 1) {
+                0 => "CAST(AVG(val) AS BIGINT)",
+                _ => "COUNT(id)",
+            };
+            format!(
+                "SELECT category, {agg_fn} FROM t1 GROUP BY category \
+                 HAVING {agg_fn} > (SELECT {sub_agg} FROM t2)"
             )
         }
     }
@@ -498,6 +525,30 @@ impl ExecNode {
                         })
                         .collect()
                 };
+
+                // Debug-mode hash collision guard: assert no two distinct key-column
+                // tuples produce the same FNV-1a combined hash within this batch.
+                // The ~2^-32 per-pair collision probability is negligible for the small
+                // synthetic datasets used in tests, so a collision here always indicates
+                // either a bug in the hash function or an unexpectedly large key space.
+                #[cfg(debug_assertions)]
+                if group_by.len() > 1 {
+                    let mut seen: std::collections::HashMap<i64, Vec<i64>> =
+                        std::collections::HashMap::new();
+                    for i in 0..in_val.num_rows() {
+                        let k = keys[i];
+                        let tuple: Vec<i64> = key_vecs.iter().map(|kv| kv[i]).collect();
+                        if let Some(existing) = seen.get(&k) {
+                            assert_eq!(
+                                existing, &tuple,
+                                "FNV-1a hash collision: tuple {:?} and {:?} both map to hash {}",
+                                existing, tuple, k
+                            );
+                        } else {
+                            seen.insert(k, tuple);
+                        }
+                    }
+                }
 
                 // Maintain persistent reverse mapping so we can reconstruct the full
                 // multi-column key in the output (combined_key → original key columns).
@@ -919,6 +970,12 @@ async fn make_df_ctx_and_run(
 
 pub async fn run_fuzz_case(seed: u64) {
     let query = generate_random_query(seed);
+    run_fuzz_case_for_query(&query, seed).await;
+}
+
+/// Run the full 3-epoch fuzz oracle for an arbitrary SQL query string.
+/// Used by both `run_fuzz_case` and the dedicated scalar-subquery test.
+pub async fn run_fuzz_case_for_query(query: &str, seed: u64) {
     let frontend = SqlFrontend::new();
     frontend.register_table("t1", t1_schema()).unwrap();
     frontend.register_table("t2", t2_schema()).unwrap();
@@ -987,13 +1044,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_fuzz_simple_cases() {
-        // Seeds 0-139 cover all 14 query types (0-13) with ≥10 expected samples
+        // Seeds 0-299 cover all 15 query types (0-14) with ≥20 expected samples
         // each. Type 11 = Semi-join, 12 = Anti-join (NOT IN), 13 = multi-key
-        // GROUP BY. Each seed exercises 3 epochs (initial, delta, cross-epoch
-        // retraction), so 140 seeds give 420 epoch-level oracle checks.
-        for seed in 0..140 {
+        // GROUP BY, 14 = HAVING + scalar subquery (skipped if planner does not
+        // support it yet).  Each seed exercises 3 epochs (initial, delta,
+        // cross-epoch retraction), so 300 seeds give 900 epoch-level oracle
+        // checks.
+        //
+        // Seed 1116 is a regression test for the AggregateOp consolidation bug:
+        // concurrent retraction from both join sides (t1.id=49 AND t2.id=49)
+        // caused the DBSP bilinear triple (−1, −1, +1) to hit count=0 transiently,
+        // corrupting the per-group sum.
+        for seed in 0..300 {
             run_fuzz_case(seed).await;
         }
+        run_fuzz_case(1116).await;
     }
 
     /// Fuzzer soak test running up to a specified duration or iteration count.
@@ -1014,5 +1079,56 @@ mod tests {
             seed += 1;
         }
         println!("Completed fuzzer soak test: {} iterations", seed - 1000);
+    }
+
+    /// Dedicated coverage test for HAVING + scalar subquery (query type 14).
+    ///
+    /// Tests four concrete forms of `GROUP BY … HAVING agg > (SELECT … FROM t2)`:
+    ///
+    /// - `COUNT(id) > (SELECT CAST(AVG(val) AS BIGINT) FROM t2)` — most common path
+    /// - `SUM(val)  > (SELECT COUNT(id) FROM t2)` — second form
+    ///
+    /// Each variant is run through the full 3-epoch fuzz harness (initial snapshot,
+    /// mixed delta, cross-epoch retraction).  If the planner does not yet support
+    /// scalar subqueries in HAVING the compilation step returns `Err` and
+    /// `run_fuzz_case` silently skips the case — the test still passes but prints a
+    /// notice so we know coverage is absent.  When the planner does support it, the
+    /// equivalence oracle catches any mismatch immediately.
+    #[tokio::test]
+    async fn test_having_scalar_subquery_planner_coverage() {
+        let queries: &[&str] = &[
+            "SELECT category, COUNT(id) FROM t1 GROUP BY category \
+             HAVING COUNT(id) > (SELECT CAST(AVG(val) AS BIGINT) FROM t2)",
+            "SELECT category, SUM(val) FROM t1 GROUP BY category \
+             HAVING SUM(val) > (SELECT COUNT(id) FROM t2)",
+            "SELECT category, COUNT(id) FROM t1 GROUP BY category \
+             HAVING COUNT(id) > (SELECT COUNT(id) FROM t2)",
+        ];
+
+        let frontend = SqlFrontend::new();
+        frontend.register_table("t1", t1_schema()).unwrap();
+        frontend.register_table("t2", t2_schema()).unwrap();
+
+        let mut any_supported = false;
+        for query in queries {
+            match frontend.sql_to_plan_node(query).await {
+                Ok(_) => {
+                    any_supported = true;
+                    // Planner supports it — run full 3-epoch equivalence check.
+                    run_fuzz_case_for_query(query, 42).await;
+                }
+                Err(_) => {
+                    println!(
+                        "HAVING scalar subquery not yet supported by planner (skipped): {query}"
+                    );
+                }
+            }
+        }
+        if !any_supported {
+            println!(
+                "NOTE: all HAVING-scalar-subquery variants were skipped; \
+                 planner does not support scalar subqueries in HAVING yet."
+            );
+        }
     }
 }
