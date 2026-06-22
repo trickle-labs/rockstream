@@ -1008,14 +1008,15 @@ async fn test_retraction_heavy_workload() {
         let delta = tpch_gen::generate_tpch_heavy_deltas(&current_dataset, 77 + epoch * 13);
 
         // Verify the delta contains substantial retraction volume.
-        // select_retractions samples with replacement from 60k rows — 30k samples
-        // produce ≈23.6k unique rows (birthday paradox). Assert at least 18k.
+        // select_retractions now samples without replacement from 60k rows, so
+        // 30k requested retractions yield exactly 30k unique rows — no birthday
+        // paradox. Assert exactly 30k retractions.
         let l_delta = delta.get("lineitem").unwrap();
         let retraction_count = l_delta.weights.iter().filter(|&&w| w < 0).count();
         let insertion_count = l_delta.weights.iter().filter(|&&w| w > 0).count();
-        assert!(
-            retraction_count >= 18_000,
-            "Epoch {epoch}: expected ≥18k lineitem retractions, got {retraction_count}"
+        assert_eq!(
+            retraction_count, 30_000,
+            "Epoch {epoch}: expected exactly 30k lineitem retractions, got {retraction_count}"
         );
         assert_eq!(insertion_count, 30_000, "Epoch {epoch}: expected 30k lineitem insertions, got {insertion_count}");
 
@@ -1125,5 +1126,129 @@ async fn test_cross_operator_filter_join_aggregate() {
             inc_acc, batch,
             "Epoch {epoch}: Filter→Join→Agg incremental != batch"
         );
+    }
+}
+
+/// Outer-join retraction under heavy churn: LEFT JOIN variant.
+///
+/// The null-padding side of an outer join has a more complex retraction path
+/// than an inner join: when a right-side match disappears, the engine must
+/// retract the matched row AND emit a null-padded replacement for the orphaned
+/// left row. When a new right match appears, the null-padded row must be
+/// retracted and a real matched row emitted.
+///
+/// Uses Q13-style `customer LEFT JOIN orders GROUP BY c_custkey`. Orders churns
+/// at 50% per epoch (7,500 retractions + 7,500 insertions from 15,000 rows),
+/// which repeatedly toggles the matched/unmatched state for many customer keys.
+///
+/// Specifically verifies:
+/// - Every customer appears in the output at every epoch (LEFT JOIN preserves
+///   all left rows, unmatched customers get COUNT = 0).
+/// - Incremental accumulator matches DataFusion batch at every epoch.
+/// - All output row weights are strictly positive (no negative weight leaks).
+#[tokio::test]
+async fn test_outer_join_retraction_heavy_workload() {
+    // Q13-style: aggregate order counts per customer, preserving customers with
+    // no orders (the null-padding path).
+    let sql = "SELECT c_custkey, COUNT(o_orderkey) FROM customer \
+               LEFT JOIN orders ON c_custkey = o_custkey \
+               GROUP BY c_custkey";
+
+    let frontend = SqlFrontend::new();
+    for (name, schema) in [
+        ("region", tpch_gen::region_schema()),
+        ("nation", tpch_gen::nation_schema()),
+        ("supplier", tpch_gen::supplier_schema()),
+        ("part", tpch_gen::part_schema()),
+        ("partsupp", tpch_gen::partsupp_schema()),
+        ("customer", tpch_gen::customer_schema()),
+        ("orders", tpch_gen::orders_schema()),
+        ("lineitem", tpch_gen::lineitem_schema()),
+    ] {
+        frontend.register_table(name, schema).unwrap();
+    }
+
+    let plan_node = frontend
+        .sql_to_plan_node(sql)
+        .await
+        .expect("LEFT JOIN heavy retraction query failed to compile");
+
+    let mut next_id = 0u64;
+    let exec_tree = build_exec_node(&plan_node, &mut next_id);
+
+    let mut current_dataset = tpch_gen::generate_tpch_dataset(88);
+    let mut inc_acc: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+
+    // ── Epoch 0: initial snapshot ──────────────────────────────────────────
+    let out_0 = exec_tree.evaluate(&current_dataset);
+    accumulate_zset_output(&out_0, &mut inc_acc);
+
+    let batch_0 = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+    assert_eq!(
+        inc_acc, batch_0,
+        "Epoch 0: LEFT JOIN heavy retraction — initial snapshot mismatch"
+    );
+
+    // LEFT JOIN preserves all customers; every row weight must be positive.
+    let initial_customer_count = inc_acc.len();
+    assert!(
+        initial_customer_count > 0,
+        "Epoch 0: no customer rows produced"
+    );
+    for (row, &w) in &inc_acc {
+        assert!(w > 0, "Epoch 0: non-positive row weight for {:?}", row);
+    }
+
+    // ── Epochs 1-5: 50% orders churn ──────────────────────────────────────
+    // generate_tpch_heavy_deltas retracts 7,500 orders (50% of 15,000)
+    // and inserts 7,500 new ones — maximally stressing the null-padding path.
+    for epoch in 1u64..=5 {
+        let delta = tpch_gen::generate_tpch_heavy_deltas(&current_dataset, 88 + epoch * 17);
+
+        // Verify the orders delta has the expected heavy-churn volume.
+        let o_delta = delta.get("orders").unwrap();
+        let o_ret = o_delta.weights.iter().filter(|&&w| w < 0).count();
+        let o_ins = o_delta.weights.iter().filter(|&&w| w > 0).count();
+        assert_eq!(
+            o_ret, 7_500,
+            "Epoch {epoch}: expected exactly 7,500 order retractions, got {o_ret}"
+        );
+        assert_eq!(
+            o_ins, 7_500,
+            "Epoch {epoch}: expected 7,500 order insertions, got {o_ins}"
+        );
+
+        let out = exec_tree.evaluate(&delta);
+        accumulate_zset_output(&out, &mut inc_acc);
+
+        for (name, d) in &delta {
+            let prev = current_dataset.get(name).unwrap();
+            let updated = apply_delta_physically(prev, d);
+            current_dataset.insert(name.clone(), updated);
+        }
+
+        let batch = run_df_batch(&make_df_ctx(&current_dataset), sql).await;
+        assert_eq!(
+            inc_acc, batch,
+            "Epoch {epoch}: LEFT JOIN heavy retraction — incremental != batch\n\
+             (50% orders churn; null-padding retraction path must toggle correctly)"
+        );
+
+        // All customers must still appear in every epoch (LEFT JOIN invariant).
+        assert_eq!(
+            inc_acc.len(),
+            initial_customer_count,
+            "Epoch {epoch}: customer count changed from {initial_customer_count} to {}",
+            inc_acc.len()
+        );
+
+        // All surviving rows must have positive weight.
+        for (row, &w) in &inc_acc {
+            assert!(
+                w > 0,
+                "Epoch {epoch}: negative aggregate weight for row {:?}",
+                row
+            );
+        }
     }
 }

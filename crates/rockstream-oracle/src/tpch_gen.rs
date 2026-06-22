@@ -369,11 +369,19 @@ fn select_retractions(
 ) -> ArrowZSet {
     let current = current_dataset.get(table_name).unwrap();
     let num_rows = current.num_rows();
-    let mut indices = Vec::new();
-    for _ in 0..count {
-        indices.push(rng.next_range(0, (num_rows - 1) as i64) as usize);
+    let take = count.min(num_rows);
+    // Partial Fisher-Yates shuffle — produces exactly `take` unique row indices.
+    // Sampling with replacement would yield only ~63% unique rows when
+    // count ≈ num_rows (birthday paradox): e.g., 30k samples from 60k rows
+    // gives ~23.6k unique. Without-replacement delivers exactly `take` distinct
+    // retractions, making heavy-churn tests fully deterministic and exact.
+    let mut all_indices: Vec<usize> = (0..num_rows).collect();
+    for i in 0..take {
+        let j = i + rng.next_range(0, (num_rows - 1 - i) as i64) as usize;
+        all_indices.swap(i, j);
     }
-    let mut ret = current.select_rows(&indices).unwrap();
+    let indices = &all_indices[..take];
+    let mut ret = current.select_rows(indices).unwrap();
     ret.weights = vec![-1; ret.weights.len()];
     ret
 }

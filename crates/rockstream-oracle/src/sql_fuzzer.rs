@@ -172,6 +172,32 @@ fn concat_zsets(a: &ArrowZSet, b: &ArrowZSet) -> ArrowZSet {
     ArrowZSet::new(data, weights)
 }
 
+/// Build a delta that retracts all positive-weight rows from `delta`.
+///
+/// Used for the third-epoch test: after epoch 1 inserts new rows, epoch 2
+/// retracts those same rows to verify the accumulator correctly undoes inserts
+/// it made one epoch ago — the hardest case for cross-epoch state management.
+fn negate_insertions(delta: &HashMap<String, ArrowZSet>) -> HashMap<String, ArrowZSet> {
+    let mut result = HashMap::new();
+    for (name, d) in delta {
+        let insert_indices: Vec<usize> = d
+            .weights
+            .iter()
+            .enumerate()
+            .filter(|(_, &w)| w > 0)
+            .map(|(i, _)| i)
+            .collect();
+        if insert_indices.is_empty() {
+            result.insert(name.clone(), ArrowZSet::empty(d.schema()));
+        } else {
+            let mut ret = d.select_rows(&insert_indices).unwrap();
+            ret.weights = vec![-1; ret.weights.len()];
+            result.insert(name.clone(), ret);
+        }
+    }
+    result
+}
+
 pub fn apply_delta_physically(current: &ArrowZSet, delta: &ArrowZSet) -> ArrowZSet {
     if delta.is_empty() {
         return current.clone();
@@ -235,7 +261,7 @@ fn rebuild_zset(schema: SchemaRef, active_rows: &[Vec<i64>]) -> ArrowZSet {
 
 pub fn generate_random_query(seed: u64) -> String {
     let mut rng = FuzzRng::new(seed);
-    let q_type = rng.next_range(0, 10);
+    let q_type = rng.next_range(0, 11);
     match q_type {
         0 => {
             // Filter + Project
@@ -311,13 +337,21 @@ pub fn generate_random_query(seed: u64) -> String {
                  GROUP BY t1.category"
             )
         }
-        _ => {
+        10 => {
             // Join → Aggregate on joined column: GROUP BY a column from the right side.
             // This tests that column offsets in the post-join aggregate are resolved
             // correctly (t2 columns start at index 3 in the concatenated join schema).
             format!(
                 "SELECT t2.group_id, SUM(t1.val) FROM t1 JOIN t2 ON t1.id = t2.id GROUP BY t2.group_id"
             )
+        }
+        _ => {
+            // Semi-join / IN-subquery: the planner lowers this to a LeftSemi join.
+            // Exercises the OuterJoinOp::Semi path, which currently receives no
+            // coverage from query types 0-10. Output contains only t1.id values
+            // that exist in the t2 subset, so the result must be ⊆ t1.id.
+            let k = rng.next_range(1, 5);
+            format!("SELECT id FROM t1 WHERE id IN (SELECT id FROM t2 WHERE group_id = {k})")
         }
     }
 }
@@ -753,6 +787,45 @@ async fn run_df_batch(ctx: &SessionContext, query: &str) -> BTreeMap<Vec<i64>, i
 
 // ─── Core Fuzz Assertion ─────────────────────────────────────────────────────
 
+/// Accumulate Z-set output rows into `acc` (row → net weight), pruning zeros.
+fn accumulate_output(out: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
+    if out.is_empty() {
+        return;
+    }
+    let num_cols = out.data.num_columns();
+    let col_arrays: Vec<_> = (0..num_cols)
+        .map(|j| {
+            out.data
+                .column(j)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+        })
+        .collect();
+    for i in 0..out.num_rows() {
+        let row: Vec<i64> = col_arrays.iter().map(|c| c.value(i)).collect();
+        *acc.entry(row).or_insert(0) += out.weights[i];
+    }
+    acc.retain(|_, &mut w| w != 0);
+}
+
+/// Build a DataFusion `SessionContext` loaded with all tables from `dataset`.
+async fn make_df_ctx_and_run(
+    dataset: &HashMap<String, ArrowZSet>,
+    query: &str,
+) -> BTreeMap<Vec<i64>, i64> {
+    let ctx = SessionContext::new();
+    for (name, zset) in dataset {
+        let mem_table = datafusion::datasource::memory::MemTable::try_new(
+            zset.schema(),
+            vec![vec![zset.data.clone()]],
+        )
+        .unwrap();
+        ctx.register_table(name, Arc::new(mem_table)).unwrap();
+    }
+    run_df_batch(&ctx, query).await
+}
+
 pub async fn run_fuzz_case(seed: u64) {
     let query = generate_random_query(seed);
     let frontend = SqlFrontend::new();
@@ -770,101 +843,48 @@ pub async fn run_fuzz_case(seed: u64) {
     let mut next_id = 0;
     let exec_tree = build_exec_node(&plan_node, &mut next_id);
 
-    // Initial datasets
+    // ── Epoch 0: initial snapshot ──────────────────────────────────────────
     let initial_dataset = generate_synthetic_dataset(seed);
+    let mut inc_acc: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+
+    let out_0 = exec_tree.evaluate(&initial_dataset, 1);
+    accumulate_output(&out_0, &mut inc_acc);
+
+    let df_0 = make_df_ctx_and_run(&initial_dataset, &query).await;
+    assert_eq!(inc_acc, df_0, "Fuzz Epoch 0 mismatch for query: {}", query);
+
+    // ── Epoch 1: apply mixed delta (retractions + insertions) ─────────────
     let delta = generate_synthetic_deltas(&initial_dataset, seed + 1);
 
-    let mut dataset_after = initial_dataset.clone();
+    let mut dataset_after_1 = initial_dataset.clone();
     for (name, d) in &delta {
-        let current = dataset_after.get(name).unwrap();
-        let new_zset = apply_delta_physically(current, d);
-        dataset_after.insert(name.clone(), new_zset);
+        let current = dataset_after_1.get(name).unwrap();
+        dataset_after_1.insert(name.clone(), apply_delta_physically(current, d));
     }
 
-    // Evaluate Epoch 0
-    let mut inc_acc: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
-    let out_0 = exec_tree.evaluate(&initial_dataset, 1);
-    if !out_0.is_empty() {
-        let num_cols = out_0.data.num_columns();
-        let mut col_arrays = Vec::new();
-        for j in 0..num_cols {
-            col_arrays.push(
-                out_0
-                    .data
-                    .column(j)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap(),
-            );
-        }
-        for i in 0..out_0.num_rows() {
-            let mut row = Vec::new();
-            for col_array in &col_arrays {
-                row.push(col_array.value(i));
-            }
-            *inc_acc.entry(row).or_insert(0) += out_0.weights[i];
-        }
-    }
-    inc_acc.retain(|_, &mut w| w != 0);
-
-    // Compare with DataFusion Epoch 0
-    let ctx = SessionContext::new();
-    for (name, zset) in &initial_dataset {
-        let mem_table = datafusion::datasource::memory::MemTable::try_new(
-            zset.schema(),
-            vec![vec![zset.data.clone()]],
-        )
-        .unwrap();
-        ctx.register_table(name, Arc::new(mem_table)).unwrap();
-    }
-    let df_results_0 = run_df_batch(&ctx, &query).await;
-    assert_eq!(
-        inc_acc, df_results_0,
-        "Fuzz Epoch 0 mismatch for query: {}",
-        query
-    );
-
-    // Evaluate Epoch 1 (Delta)
     let out_1 = exec_tree.evaluate(&delta, 2);
-    if !out_1.is_empty() {
-        let num_cols = out_1.data.num_columns();
-        let mut col_arrays = Vec::new();
-        for j in 0..num_cols {
-            col_arrays.push(
-                out_1
-                    .data
-                    .column(j)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap(),
-            );
-        }
-        for i in 0..out_1.num_rows() {
-            let mut row = Vec::new();
-            for col_array in &col_arrays {
-                row.push(col_array.value(i));
-            }
-            *inc_acc.entry(row).or_insert(0) += out_1.weights[i];
-        }
-    }
-    inc_acc.retain(|_, &mut w| w != 0);
+    accumulate_output(&out_1, &mut inc_acc);
 
-    // Compare with DataFusion Epoch 1
-    let new_ctx = SessionContext::new();
-    for (name, zset) in &dataset_after {
-        let mem_table = datafusion::datasource::memory::MemTable::try_new(
-            zset.schema(),
-            vec![vec![zset.data.clone()]],
-        )
-        .unwrap();
-        new_ctx.register_table(name, Arc::new(mem_table)).unwrap();
+    let df_1 = make_df_ctx_and_run(&dataset_after_1, &query).await;
+    assert_eq!(inc_acc, df_1, "Fuzz Epoch 1 mismatch for query: {}", query);
+
+    // ── Epoch 2: retract the rows that were inserted in epoch 1 ───────────
+    // This is the hardest case for the accumulator: it must correctly "undo"
+    // state changes from two epochs ago, where the to-be-retracted rows were
+    // not present in the original epoch-0 dataset.
+    let delta_2 = negate_insertions(&delta);
+
+    let mut dataset_after_2 = dataset_after_1.clone();
+    for (name, d2) in &delta_2 {
+        let current = dataset_after_2.get(name).unwrap();
+        dataset_after_2.insert(name.clone(), apply_delta_physically(current, d2));
     }
-    let df_results_1 = run_df_batch(&new_ctx, &query).await;
-    assert_eq!(
-        inc_acc, df_results_1,
-        "Fuzz Epoch 1 mismatch for query: {}",
-        query
-    );
+
+    let out_2 = exec_tree.evaluate(&delta_2, 3);
+    accumulate_output(&out_2, &mut inc_acc);
+
+    let df_2 = make_df_ctx_and_run(&dataset_after_2, &query).await;
+    assert_eq!(inc_acc, df_2, "Fuzz Epoch 2 (cross-epoch retraction) mismatch for query: {}", query);
 }
 
 // ─── Soak / Unit Tests ───────────────────────────────────────────────────────
@@ -876,10 +896,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fuzz_simple_cases() {
-        // Seeds 0-49 cover types 0-7 (original); seeds 50-109 provide dedicated
-        // coverage for the three new types (8=HAVING, 9=Filter→Join→Agg, 10=Join→Agg).
-        // Type selection: seed % 11 (range 0-10), so every 11 seeds cycles all types.
-        for seed in 0..110 {
+        // Seeds 0-119 cover all 12 query types (0-11) with ≥10 expected samples
+        // each. Type 11 is the new Semi-join / IN-subquery path. Each seed also
+        // exercises 3 epochs (initial, delta, cross-epoch retraction), so 120
+        // seeds give 360 epoch-level oracle checks.
+        for seed in 0..120 {
             run_fuzz_case(seed).await;
         }
     }
