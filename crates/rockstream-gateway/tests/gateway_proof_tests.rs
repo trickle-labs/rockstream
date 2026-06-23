@@ -2990,3 +2990,206 @@ async fn explain_shows_rs2014_hint_for_building_index_via_wire() {
         "EXPLAIN output must contain RS-2014 hint for building index; got:\n{plan_output}"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v0.32 gap-fill: index scan SELECT, state sync (MARK INDEX READY), proof test
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// MARK INDEX <name> READY op_id=<n> transitions catalog state to Ready and
+/// records the backing OperatorId so the gateway can route point lookups.
+#[tokio::test]
+async fn mark_index_ready_updates_catalog_state_via_wire() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    client
+        .simple_query("CREATE INDEX idx_events_uid ON events (user_id)")
+        .await
+        .expect("CREATE INDEX failed");
+
+    let before = catalog.get_index("idx_events_uid").unwrap();
+    assert_eq!(before.state, CatalogIndexState::Building);
+    assert_eq!(before.op_id, None);
+
+    client
+        .simple_query("MARK INDEX idx_events_uid READY op_id=42")
+        .await
+        .expect("MARK INDEX READY failed");
+
+    let after = catalog.get_index("idx_events_uid").unwrap();
+    assert_eq!(after.state, CatalogIndexState::Ready);
+    assert_eq!(after.op_id, Some(42));
+}
+
+/// MARK INDEX READY on a nonexistent index returns error 42704.
+#[tokio::test]
+async fn mark_index_ready_nonexistent_returns_error() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    let result = client
+        .simple_query("MARK INDEX idx_ghost READY op_id=1")
+        .await;
+    let got_err = match &result {
+        Err(e) => e
+            .as_db_error()
+            .map(|d| d.message().contains("does not exist"))
+            .unwrap_or(false),
+        Ok(msgs) => msgs
+            .iter()
+            .any(|m| format!("{m:?}").contains("does not exist")),
+    };
+    assert!(
+        got_err,
+        "expected 42704 for nonexistent index; got {result:?}"
+    );
+}
+
+/// P1 (wire) — SELECT WHERE on a READY index uses the index arrangement and
+/// returns only matching rows within the latency target.
+///
+/// Proof claim: a point-lookup SELECT through pgwire on a READY secondary index
+/// returns the correct subset of rows and completes in < 10 ms p99.
+#[tokio::test]
+async fn proof_index_scan_point_lookup_via_wire() {
+    use rockstream_ops::index_arrange::{BackfillRow, IndexArrangeOp, MAX_INDEX_ARRANGE_ROWS};
+    use rockstream_types::ids::OperatorId;
+
+    const INDEX_OP_ID: u64 = 99;
+
+    // Build an in-memory ShardDb and populate it via IndexArrangeOp.
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let shard_db = Arc::new(
+        rockstream_storage::ShardDb::builder("idx-scan-proof", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+
+    // index_cols=[0] (account_id), pk_cols=[1] (order_id)
+    let op = IndexArrangeOp::new(
+        shard_db.clone(),
+        OperatorId(INDEX_OP_ID),
+        vec![0],
+        vec![1],
+        MAX_INDEX_ARRANGE_ROWS,
+    );
+
+    // Insert 5 rows: account_id ∈ {111, 222}
+    // Rows with account_id=111: order_id 1 and 3
+    // Rows with account_id=222: order_id 2, 4, 5
+    let rows = vec![
+        BackfillRow {
+            index_val: 111,
+            pk_val: 1,
+        },
+        BackfillRow {
+            index_val: 222,
+            pk_val: 2,
+        },
+        BackfillRow {
+            index_val: 111,
+            pk_val: 3,
+        },
+        BackfillRow {
+            index_val: 222,
+            pk_val: 4,
+        },
+        BackfillRow {
+            index_val: 222,
+            pk_val: 5,
+        },
+    ];
+    op.run_backfill_rows(&rows, "idx_by_account", shard_db.clone(), 0)
+        .await
+        .expect("backfill failed");
+
+    // Start gateway with the same ShardDb.
+    let catalog = Arc::new(CatalogStubs::new());
+    // Register the "orders" table with known column names.
+    catalog.add_table(rockstream_gateway::catalog_stubs::CatalogTable {
+        name: "orders".to_string(),
+        columns: vec![
+            rockstream_gateway::catalog_stubs::CatalogColumn {
+                name: "account_id".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            rockstream_gateway::catalog_stubs::CatalogColumn {
+                name: "order_id".to_string(),
+                data_type: "Int64".to_string(),
+            },
+        ],
+    });
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // Register index via wire and transition to Ready with the correct op_id.
+    client
+        .simple_query("CREATE INDEX idx_by_account ON orders (account_id)")
+        .await
+        .expect("CREATE INDEX failed");
+    client
+        .simple_query(&format!(
+            "MARK INDEX idx_by_account READY op_id={INDEX_OP_ID}"
+        ))
+        .await
+        .expect("MARK INDEX READY failed");
+
+    // Verify catalog state.
+    let entry = catalog.get_index("idx_by_account").unwrap();
+    assert_eq!(entry.state, CatalogIndexState::Ready);
+    assert_eq!(entry.op_id, Some(INDEX_OP_ID));
+
+    // Issue point-lookup SELECT via wire and measure latency.
+    let t0 = std::time::Instant::now();
+    let msgs = client
+        .simple_query("SELECT * FROM orders WHERE account_id = 111")
+        .await
+        .expect("SELECT failed");
+    let elapsed_ms = t0.elapsed().as_millis();
+
+    // Extract data rows.
+    let data_rows = data_rows_from(&msgs);
+
+    assert_eq!(
+        data_rows.len(),
+        2,
+        "expected 2 rows for account_id=111; got {}",
+        data_rows.len()
+    );
+
+    // Both rows must have account_id=111.
+    for row in &data_rows {
+        let acct = row.get("account_id").unwrap_or("");
+        assert_eq!(acct, "111", "returned row has wrong account_id: {acct}");
+    }
+
+    // Order ids must be 1 and 3 (in any order).
+    let mut order_ids: Vec<i64> = data_rows
+        .iter()
+        .filter_map(|r| r.get("order_id").and_then(|v| v.parse().ok()))
+        .collect();
+    order_ids.sort();
+    assert_eq!(order_ids, vec![1i64, 3], "wrong order_ids: {order_ids:?}");
+
+    // P1 latency gate: < 10 ms for an in-memory shard.
+    assert!(
+        elapsed_ms < 10,
+        "index point-lookup took {elapsed_ms}ms — must be < 10ms"
+    );
+}

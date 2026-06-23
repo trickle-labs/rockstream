@@ -96,6 +96,10 @@ pub struct CatalogIndexEntry {
     pub table: String,
     pub index_cols: Vec<String>,
     pub state: CatalogIndexState,
+    /// OperatorId (as u64) of the `IndexArrangeOp` backing this index.
+    /// Set via `mark_index_ready` once backfill completes. `None` means the
+    /// index is still Building and cannot serve point lookups through the gateway.
+    pub op_id: Option<u64>,
 }
 
 /// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
@@ -289,6 +293,18 @@ impl CatalogStubs {
         let mut inner = self.inner.write().unwrap();
         if let Some(entry) = inner.indexes.get_mut(name) {
             entry.state = CatalogIndexState::Building;
+            return true;
+        }
+        false
+    }
+
+    /// Transition an existing index to Ready state and record its `op_id`.
+    /// Returns `false` if the index does not exist.
+    pub fn mark_index_ready(&self, name: &str, op_id: u64) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(entry) = inner.indexes.get_mut(name) {
+            entry.state = CatalogIndexState::Ready;
+            entry.op_id = Some(op_id);
             return true;
         }
         false

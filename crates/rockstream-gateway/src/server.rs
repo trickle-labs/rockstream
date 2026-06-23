@@ -213,7 +213,7 @@ impl GatewayHandler {
             return Some(self.handle_create_table(q));
         }
 
-        // CREATE INDEX / DROP INDEX / REBUILD INDEX — v0.32 pgwire DDL wiring
+        // CREATE INDEX / DROP INDEX / REBUILD INDEX / MARK INDEX READY — v0.32 pgwire DDL wiring
         if ql.starts_with("create index ") {
             return Some(self.handle_create_index(q));
         }
@@ -222,6 +222,9 @@ impl GatewayHandler {
         }
         if ql.starts_with("rebuild index ") {
             return Some(self.handle_rebuild_index(q));
+        }
+        if ql.starts_with("mark index ") {
+            return Some(self.handle_mark_index_ready(q));
         }
 
         // Transaction control
@@ -456,6 +459,10 @@ impl GatewayHandler {
 
             if let Some(view_name) = extract_view_name_from_select(q) {
                 if !view_name.starts_with("pg_") && !view_name.starts_with("information_schema") {
+                    // Try index-accelerated point lookup before falling back to full scan.
+                    if let Some(responses) = self.maybe_index_point_lookup(q, &view_name).await? {
+                        return Ok(responses);
+                    }
                     let limit = extract_limit(q);
                     let order_by = extract_order_by(q);
                     return self
@@ -466,6 +473,130 @@ impl GatewayHandler {
         }
 
         Ok(vec![promote_response(Response::Execution(Tag::new("OK")))])
+    }
+
+    /// Try to serve a SELECT via an index arrangement point lookup.
+    ///
+    /// Returns `Some(responses)` when:
+    ///   - the query has a single `WHERE <col> = <int>` predicate,
+    ///   - a READY index covers `col` on `view_name`, and
+    ///   - `shard_db` is available with the arrangement's `op_id`.
+    ///
+    /// Returns `None` to fall through to the normal full-scan path.
+    async fn maybe_index_point_lookup(
+        &self,
+        q: &str,
+        view_name: &str,
+    ) -> PgWireResult<Option<Vec<Response<'static>>>> {
+        let shard_db = match &self.shard_db {
+            Some(db) => db.clone(),
+            None => return Ok(None),
+        };
+
+        let (pred_col, pred_val) = match extract_where_equality(q) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Find a READY index on the view/table that covers the predicate column.
+        let matching_idx = self
+            .catalog
+            .list_index_names()
+            .into_iter()
+            .find_map(|idx_name| {
+                let entry = self.catalog.get_index(&idx_name)?;
+                if entry.table != view_name {
+                    return None;
+                }
+                if entry.state != crate::catalog_stubs::CatalogIndexState::Ready {
+                    return None;
+                }
+                let op_id = entry.op_id?;
+                if entry.index_cols.first()?.as_str() == pred_col {
+                    Some(op_id)
+                } else {
+                    None
+                }
+            });
+
+        let op_id = match matching_idx {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Build the binary prefix: [0x03][op_id 8 BE][pred_val 8 BE]
+        let mut prefix = Vec::with_capacity(17);
+        prefix.push(0x03u8); // ShardPrefix::ViewOutput
+        prefix.extend_from_slice(&op_id.to_be_bytes());
+        prefix.extend_from_slice(&pred_val.to_be_bytes());
+
+        let entries = shard_db
+            .scan_prefix(&prefix)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+
+        // Determine column names from the catalog (fall back to positional names).
+        let col_names: Vec<String> = if let Some(cv) = self.catalog.get_view(view_name) {
+            cv.columns.iter().map(|c| c.name.clone()).collect()
+        } else if let Some(ct) = self.catalog.get_table(view_name) {
+            ct.columns.iter().map(|c| c.name.clone()).collect()
+        } else {
+            vec![]
+        };
+
+        // Decode each arrangement value: all columns encoded as i64 BE (8 bytes each).
+        let raw_rows: Vec<Vec<u8>> = entries
+            .into_iter()
+            .filter_map(|(_, val)| {
+                if val.len() % 8 != 0 {
+                    return None;
+                }
+                let n_cols = val.len() / 8;
+                let fields: Vec<String> = (0..n_cols)
+                    .map(|i| {
+                        let bytes: [u8; 8] = val[i * 8..(i + 1) * 8].try_into().ok()?;
+                        Some(i64::from_be_bytes(bytes).to_string())
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(fields.join("\t").into_bytes())
+            })
+            .collect();
+
+        let n_cols = if raw_rows.is_empty() {
+            col_names.len().max(1)
+        } else {
+            raw_rows[0].iter().filter(|&&b| b == b'\t').count() + 1
+        };
+
+        let schema_fields: Vec<FieldInfo> = (0..n_cols)
+            .map(|i| {
+                let name = col_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("col_{i}"));
+                FieldInfo::new(name, None, None, Type::INT8, FieldFormat::Text)
+            })
+            .collect();
+
+        let schema = Arc::new(schema_fields);
+        let schema_ref = schema.clone();
+        let data_stream = stream::iter(raw_rows).map(move |raw: Vec<u8>| {
+            let mut encoder = DataRowEncoder::new(schema_ref.clone());
+            let row_str = String::from_utf8_lossy(&raw).into_owned();
+            let col_count = schema_ref.len();
+            let fields: Vec<&str> = row_str.split('\t').collect();
+            for i in 0..col_count {
+                encoder
+                    .encode_field(&fields.get(i).copied())
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            }
+            encoder.finish()
+        });
+
+        Ok(Some(vec![Response::Query(QueryResponse::new(
+            schema,
+            data_stream,
+        ))]))
     }
 
     /// Read rows from a view and build a pgwire `Response::Query`.
@@ -821,6 +952,7 @@ impl GatewayHandler {
             table: table.clone(),
             index_cols,
             state: CatalogIndexState::Building,
+            op_id: None,
         };
 
         if !self.catalog.add_index(entry) {
@@ -899,6 +1031,61 @@ impl GatewayHandler {
 
         Ok(vec![Response::Execution(
             Tag::new("REBUILD INDEX").with_rows(0),
+        )])
+    }
+
+    /// Handle `MARK INDEX <name> READY op_id=<n>` — transition index to Ready and bind its op_id.
+    ///
+    /// Called by the IVM engine (or admin) after backfill completes so the gateway
+    /// can route equality-predicate SELECTs through the index arrangement.
+    fn handle_mark_index_ready<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        // Parse: MARK INDEX <name> READY [op_id=<n>]
+        let rest = q["MARK INDEX".len()..].trim();
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() < 2 || parts[1].to_lowercase() != "ready" {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "MARK INDEX requires: MARK INDEX <name> READY [op_id=<n>]".to_owned(),
+            )))]);
+        }
+        let name = parts[0].trim_end_matches(';').to_lowercase();
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "MARK INDEX requires an index name".to_owned(),
+            )))]);
+        }
+
+        // Parse optional op_id=<n>
+        let op_id: Option<u64> = parts.iter().find_map(|p| {
+            let pl = p.to_lowercase();
+            pl.strip_prefix("op_id=")
+                .and_then(|v| v.trim_end_matches(';').parse().ok())
+        });
+
+        let op_id_val = match op_id {
+            Some(v) => v,
+            None => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    "MARK INDEX READY requires op_id=<n>".to_owned(),
+                )))]);
+            }
+        };
+
+        if !self.catalog.mark_index_ready(&name, op_id_val) {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42704".to_owned(),
+                format!("index \"{name}\" does not exist"),
+            )))]);
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("MARK INDEX").with_rows(0),
         )])
     }
 
@@ -2300,6 +2487,38 @@ fn extract_order_by(q: &str) -> Vec<(String, bool)> {
             Some((col, desc))
         })
         .collect()
+}
+
+/// Extract a simple equality predicate `WHERE <col> = <int_literal>` from a query.
+///
+/// Returns `(column_name, value)` when the query contains exactly one equality
+/// on an integer literal. Only used for index-scan routing — complex predicates
+/// fall through to the normal full-scan path.
+fn extract_where_equality(q: &str) -> Option<(String, i64)> {
+    let ql = q.to_lowercase();
+    let where_pos = ql.find(" where ")?;
+    // Take everything after WHERE, stop at ORDER / LIMIT / semicolon.
+    let after = q[where_pos + 7..].trim();
+    let after_lower = after.to_lowercase();
+    let end = ["order by ", "limit ", ";"]
+        .iter()
+        .filter_map(|kw| after_lower.find(kw))
+        .min()
+        .unwrap_or(after.len());
+    let pred = after[..end].trim();
+
+    // Only handle the simple `col = literal` form (no AND / OR / NOT).
+    if pred.contains(" and ") || pred.contains(" or ") || pred.to_lowercase().starts_with("not ") {
+        return None;
+    }
+    let eq_pos = pred.find('=')?;
+    let col = pred[..eq_pos].trim().to_lowercase();
+    let val_str = pred[eq_pos + 1..].trim().trim_end_matches(';');
+    let val: i64 = val_str.parse().ok()?;
+    if col.is_empty() {
+        return None;
+    }
+    Some((col, val))
 }
 
 /// Extract the view name from `COPY <view> TO STDOUT`.
