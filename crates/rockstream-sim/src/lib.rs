@@ -24,6 +24,7 @@ pub mod fault_model;
 pub mod law_faults;
 pub mod liveness;
 pub mod network;
+pub mod nexmark;
 pub mod object_store;
 pub mod paired_assert;
 pub mod recovery_soak;
@@ -35,6 +36,8 @@ pub mod spike;
 pub mod tokio_rt;
 pub mod two_pc;
 pub mod wire_version;
+
+pub use nexmark::{Auction, Bid, NexmarkEvent, NexmarkGenerator, Person};
 
 pub use auto_tuner::{
     AutoTuner, EPOCH_CEILING_MS, EPOCH_FLOOR_MS, LAG_TRIGGER_EPOCHS, MAX_THROTTLE_BYTES,

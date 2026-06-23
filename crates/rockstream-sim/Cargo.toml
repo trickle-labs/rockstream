@@ -9,6 +9,7 @@ description = "Deterministic simulation harness for RockStream (SimRuntime, bugg
 [features]
 default = []
 simulation = []
+docker_tests = []
 
 [dependencies]
 rockstream-types = { workspace = true }

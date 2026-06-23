@@ -618,8 +618,8 @@ fn test_source_coordination_sim() {
             // Set up a KafkaSource and populate it with deterministic data based on seed
             let mut base_source = KafkaSource::new(ConnectorId(seed), schema.clone(), &[0, 1]);
             for i in 0..10 {
-                base_source.add_record(0, (i * 100) as i64, vec![i]);
-                base_source.add_record(1, (i * 100 + 50) as i64, vec![100 + i]);
+                base_source.add_record(0, i * 100, vec![i]);
+                base_source.add_record(1, i * 100 + 50, vec![100 + i]);
             }
 
             let mut source = ChaosSource {

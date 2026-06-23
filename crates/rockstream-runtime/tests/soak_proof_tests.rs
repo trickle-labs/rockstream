@@ -2,17 +2,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use rand;
-use reqwest;
-use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio;
 
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
 
@@ -56,8 +52,7 @@ impl<T> ThrottledStoreWrapper<T> {
             if count < max {
                 return Err(object_store::Error::Generic {
                     store: "ThrottledStoreWrapper",
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    source: Box::new(std::io::Error::other(
                         "HTTP 429 Too Many Requests (throttling)",
                     )),
                 });
@@ -69,8 +64,7 @@ impl<T> ThrottledStoreWrapper<T> {
             if rng.gen_bool(prob) {
                 return Err(object_store::Error::Generic {
                     store: "ThrottledStoreWrapper",
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    source: Box::new(std::io::Error::other(
                         "HTTP 429 Too Many Requests (throttling)",
                     )),
                 });
@@ -152,10 +146,7 @@ impl SimObjectStoreWrapper {
     fn convert_err(e: ObjectStoreError) -> object_store::Error {
         object_store::Error::Generic {
             store: "SimObjectStoreWrapper",
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            )),
+            source: Box::new(std::io::Error::other(e.to_string())),
         }
     }
 }
@@ -247,28 +238,19 @@ impl ObjectStore for SimObjectStoreWrapper {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         Err(object_store::Error::NotSupported {
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "list_with_delimiter not supported",
-            )),
+            source: Box::new(std::io::Error::other("list_with_delimiter not supported")),
         })
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
         Err(object_store::Error::NotSupported {
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "copy not supported",
-            )),
+            source: Box::new(std::io::Error::other("copy not supported")),
         })
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
         Err(object_store::Error::NotSupported {
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "copy_if_not_exists not supported",
-            )),
+            source: Box::new(std::io::Error::other("copy_if_not_exists not supported")),
         })
     }
 
@@ -278,10 +260,7 @@ impl ObjectStore for SimObjectStoreWrapper {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         Err(object_store::Error::NotSupported {
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "put_multipart_opts not supported",
-            )),
+            source: Box::new(std::io::Error::other("put_multipart_opts not supported")),
         })
     }
 }

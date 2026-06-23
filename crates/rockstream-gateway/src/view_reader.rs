@@ -92,7 +92,6 @@ impl ViewReader for HotOnlyViewReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use object_store::memory::InMemory;
     use rockstream_storage::ShardDb;
     use std::sync::Arc;

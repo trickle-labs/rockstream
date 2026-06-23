@@ -448,7 +448,7 @@ pub fn apply_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
+    use crate::subscribe_parser::parse_subscribe;
 
     fn make_snapshot(n: usize) -> Vec<(Bytes, Bytes)> {
         (1..=n)

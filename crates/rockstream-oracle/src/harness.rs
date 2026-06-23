@@ -260,13 +260,13 @@ mod tests {
         use super::super::assert_oracle_noop;
         use crate::zset::{TestRow, ZSetDelta};
 
-        /// Baseline proptest: single-epoch sequences with a wider key space
-        /// (id ∈ [0..500], value ∈ [-1000..1000]).
-        ///
-        /// Validates that `incremental == batch` across:
-        /// - pure inserts, pure deletes, interleaved patterns
-        /// - duplicate rows (weight accumulation > 1)
-        /// - "over-delete" resulting in negative net weight
+        // Baseline proptest: single-epoch sequences with a wider key space
+        // (id ∈ [0..500], value ∈ [-1000..1000]).
+        //
+        // Validates that `incremental == batch` across:
+        // - pure inserts, pure deletes, interleaved patterns
+        // - duplicate rows (weight accumulation > 1)
+        // - "over-delete" resulting in negative net weight
         proptest! {
             #![proptest_config(proptest::test_runner::Config::with_cases(10_000))]
             #[test]
@@ -284,13 +284,13 @@ mod tests {
             }
         }
 
-        /// Multi-epoch proptest: runs up to 8 delta epochs in sequence and
-        /// asserts that the Z-set accumulated across all epochs equals the
-        /// DataFusion batch result.
-        ///
-        /// This is distinct from the single-epoch test: rows inserted in epoch N
-        /// and retracted in epoch N+1 must cancel correctly.  Exercises the
-        /// cross-epoch retraction path — the key correctness invariant for IVM.
+        // Multi-epoch proptest: runs up to 8 delta epochs in sequence and
+        // asserts that the Z-set accumulated across all epochs equals the
+        // DataFusion batch result.
+        //
+        // This is distinct from the single-epoch test: rows inserted in epoch N
+        // and retracted in epoch N+1 must cancel correctly.  Exercises the
+        // cross-epoch retraction path — the key correctness invariant for IVM.
         proptest! {
             #![proptest_config(proptest::test_runner::Config::with_cases(5_000))]
             #[test]
@@ -315,13 +315,13 @@ mod tests {
             }
         }
 
-        /// Non-unit weight proptest: verifies that the oracle correctly handles
-        /// rows with weights greater than 1 (e.g. batch-load duplicates).
-        ///
-        /// A row with weight 2 or 3 is still "present" (weight > 0) and must
-        /// appear once in the batch result.  A row partially retracted from
-        /// weight 3 to weight 1 must still appear; only when it reaches ≤ 0
-        /// is it absent.  This exercises accumulation correctness beyond ±1.
+        // Non-unit weight proptest: verifies that the oracle correctly handles
+        // rows with weights greater than 1 (e.g. batch-load duplicates).
+        //
+        // A row with weight 2 or 3 is still "present" (weight > 0) and must
+        // appear once in the batch result.  A row partially retracted from
+        // weight 3 to weight 1 must still appear; only when it reaches ≤ 0
+        // is it absent.  This exercises accumulation correctness beyond ±1.
         proptest! {
             #![proptest_config(proptest::test_runner::Config::with_cases(5_000))]
             #[test]

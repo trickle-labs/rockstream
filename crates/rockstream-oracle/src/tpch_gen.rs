@@ -1440,7 +1440,7 @@ mod tests {
             let discount = discount_col.value(i);
             let quantity = quantity_col.value(i);
             // Q6 filter: discount in [5, 7] and quantity < 25
-            if discount >= 5 && discount <= 7 && quantity < 25 {
+            if (5..=7).contains(&discount) && quantity < 25 {
                 k_vals.push(0i64); // single group (no GROUP BY in Q6)
                 v_vals.push(ep_col.value(i));
                 weights.push(lineitem.weights[i]);
@@ -1496,7 +1496,7 @@ mod tests {
             }
             let discount = discount_col.value(i);
             let quantity = quantity_col.value(i);
-            if discount >= 5 && discount <= 7 && quantity < 25 {
+            if (5..=7).contains(&discount) && quantity < 25 {
                 total += ep_col.value(i);
             }
         }

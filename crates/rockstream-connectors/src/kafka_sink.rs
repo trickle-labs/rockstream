@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn crash_during_commit_already_delivered_recovery() {
         let mut sink = make_sink();
-        let state = sink.pre_commit(3, 5).unwrap();
+        let _state = sink.pre_commit(3, 5).unwrap();
         // Simulate: commit partially succeeded (delivered but not finalized).
         sink.delivered_epochs.insert(3);
         // Recovery: CheckBeforeCommit — already delivered → no-op.
@@ -307,21 +307,19 @@ mod tests {
         assert_eq!(sink.kafka_sink_staged_epochs_count(), 0);
         assert!(!sink.check_epoch_delivered(10));
     }
-}
 
-// ─── Extension trait for test access to pending_handle ───────────────────────
+    // ─── Extension trait for test access to pending_handle ───────────────────────
 
-#[cfg(test)]
-trait SinkStatePendingHandle {
-    fn pending_handle(&self) -> &[u8];
-}
+    trait SinkStatePendingHandle {
+        fn pending_handle(&self) -> &[u8];
+    }
 
-#[cfg(test)]
-impl SinkStatePendingHandle for SinkState {
-    fn pending_handle(&self) -> &[u8] {
-        match self {
-            SinkState::PreCommitted { pending_handle, .. } => pending_handle,
-            _ => &[],
+    impl SinkStatePendingHandle for SinkState {
+        fn pending_handle(&self) -> &[u8] {
+            match self {
+                SinkState::PreCommitted { pending_handle, .. } => pending_handle,
+                _ => &[],
+            }
         }
     }
 }

@@ -319,9 +319,9 @@ async fn create_minio_bucket_raw(port: u16, bucket: &str) {
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
     let canonical_request =
         format!("PUT\n/{bucket}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let req_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
     let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{date_stamp}/us-east-1/s3/aws4_request\n{}",
-        format!("{:x}", Sha256::digest(canonical_request.as_bytes()))
+        "AWS4-HMAC-SHA256\n{amz_date}\n{date_stamp}/us-east-1/s3/aws4_request\n{req_hash}"
     );
 
     let hmac_fn = |key: &[u8], data: &[u8]| -> Vec<u8> {
@@ -409,7 +409,7 @@ fn epoch_hms(secs: u64) -> (u32, u32, u32) {
 }
 
 fn is_leap(y: u32) -> bool {
-    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+    y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400))
 }
 
 fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {

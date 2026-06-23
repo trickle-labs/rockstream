@@ -2051,7 +2051,7 @@ async fn copy_in_auth_enforced_lfs() {
         let mut s = handler
             .sessions
             .entry(viewer_conn.to_string())
-            .or_insert_with(rockstream_gateway::session::SessionState::new);
+            .or_default();
         s.principal = Principal::Jwt {
             sub: "viewer_user".to_string(),
         };
@@ -2085,7 +2085,7 @@ async fn copy_in_auth_enforced_lfs() {
         let mut s = handler
             .sessions
             .entry(owner_conn.to_string())
-            .or_insert_with(rockstream_gateway::session::SessionState::new);
+            .or_default();
         s.principal = Principal::Jwt {
             sub: "owner_user".to_string(),
         };

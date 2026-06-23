@@ -348,9 +348,7 @@ pub fn generate_random_query(seed: u64) -> String {
             // Join → Aggregate on joined column: GROUP BY a column from the right side.
             // This tests that column offsets in the post-join aggregate are resolved
             // correctly (t2 columns start at index 3 in the concatenated join schema).
-            format!(
-                "SELECT t2.group_id, SUM(t1.val) FROM t1 JOIN t2 ON t1.id = t2.id GROUP BY t2.group_id"
-            )
+            "SELECT t2.group_id, SUM(t1.val) FROM t1 JOIN t2 ON t1.id = t2.id GROUP BY t2.group_id".to_string()
         }
         11 => {
             // Semi-join / IN-subquery: the planner lowers this to a LeftSemi join.
@@ -980,7 +978,7 @@ pub async fn run_fuzz_case_for_query(query: &str, seed: u64) {
     frontend.register_table("t1", t1_schema()).unwrap();
     frontend.register_table("t2", t2_schema()).unwrap();
 
-    let plan_node = match frontend.sql_to_plan_node(&query).await {
+    let plan_node = match frontend.sql_to_plan_node(query).await {
         Ok(p) => p,
         Err(_) => {
             // If the query failed compilation, skip
@@ -998,7 +996,7 @@ pub async fn run_fuzz_case_for_query(query: &str, seed: u64) {
     let out_0 = exec_tree.evaluate(&initial_dataset, 1);
     accumulate_output(&out_0, &mut inc_acc);
 
-    let df_0 = make_df_ctx_and_run(&initial_dataset, &query).await;
+    let df_0 = make_df_ctx_and_run(&initial_dataset, query).await;
     assert_eq!(inc_acc, df_0, "Fuzz Epoch 0 mismatch for query: {}", query);
 
     // ── Epoch 1: apply mixed delta (retractions + insertions) ─────────────
@@ -1013,7 +1011,7 @@ pub async fn run_fuzz_case_for_query(query: &str, seed: u64) {
     let out_1 = exec_tree.evaluate(&delta, 2);
     accumulate_output(&out_1, &mut inc_acc);
 
-    let df_1 = make_df_ctx_and_run(&dataset_after_1, &query).await;
+    let df_1 = make_df_ctx_and_run(&dataset_after_1, query).await;
     assert_eq!(inc_acc, df_1, "Fuzz Epoch 1 mismatch for query: {}", query);
 
     // ── Epoch 2: retract the rows that were inserted in epoch 1 ───────────
@@ -1031,7 +1029,7 @@ pub async fn run_fuzz_case_for_query(query: &str, seed: u64) {
     let out_2 = exec_tree.evaluate(&delta_2, 3);
     accumulate_output(&out_2, &mut inc_acc);
 
-    let df_2 = make_df_ctx_and_run(&dataset_after_2, &query).await;
+    let df_2 = make_df_ctx_and_run(&dataset_after_2, query).await;
     assert_eq!(
         inc_acc, df_2,
         "Fuzz Epoch 2 (cross-epoch retraction) mismatch for query: {}",

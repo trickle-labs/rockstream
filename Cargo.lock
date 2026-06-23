@@ -4705,19 +4705,28 @@ name = "rockstream-sql"
 version = "0.52.10"
 dependencies = [
  "arrow",
+ "async-trait",
  "datafusion",
  "hex",
+ "hmac 0.12.1",
  "object_store 0.12.5",
+ "reqwest",
+ "rockstream-gateway",
  "rockstream-ops",
  "rockstream-oracle",
  "rockstream-plan",
+ "rockstream-sim",
  "rockstream-storage",
  "rockstream-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
  "tracing",
 ]
 

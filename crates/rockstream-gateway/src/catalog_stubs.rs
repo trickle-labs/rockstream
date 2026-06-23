@@ -391,21 +391,29 @@ impl CatalogStubs {
             "hasrules".to_string(),
             "hastriggers".to_string(),
         ];
-        let rows: Vec<Vec<Option<String>>> = self
-            .list_views()
-            .into_iter()
-            .map(|v| {
-                vec![
-                    Some("public".to_string()),
-                    Some(v.name.clone()),
-                    Some("rockstream".to_string()),
-                    None,
-                    Some("f".to_string()),
-                    Some("f".to_string()),
-                    Some("f".to_string()),
-                ]
-            })
-            .collect();
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        for t in self.list_tables() {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(t.name.clone()),
+                Some("rockstream".to_string()),
+                None,
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+            ]);
+        }
+        for v in self.list_views() {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(v.name.clone()),
+                Some("rockstream".to_string()),
+                None,
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+            ]);
+        }
         CatalogResponse::rows(cols, rows)
     }
 
@@ -442,18 +450,23 @@ impl CatalogStubs {
             "relnamespace".to_string(),
             "relkind".to_string(),
         ];
-        let rows: Vec<Vec<Option<String>>> = self
-            .list_views()
-            .into_iter()
-            .map(|v| {
-                vec![
-                    Some(view_oid(&v.name).to_string()),
-                    Some(v.name.clone()),
-                    Some("2200".to_string()), // public namespace OID
-                    Some("v".to_string()),    // 'v' = view
-                ]
-            })
-            .collect();
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        for t in self.list_tables() {
+            rows.push(vec![
+                Some(view_oid(&t.name).to_string()),
+                Some(t.name.clone()),
+                Some("2200".to_string()),
+                Some("r".to_string()),
+            ]);
+        }
+        for v in self.list_views() {
+            rows.push(vec![
+                Some(view_oid(&v.name).to_string()),
+                Some(v.name.clone()),
+                Some("2200".to_string()),
+                Some("v".to_string()),
+            ]);
+        }
         CatalogResponse::rows(cols, rows)
     }
 
@@ -468,6 +481,18 @@ impl CatalogStubs {
             "attnotnull".to_string(),
         ];
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        for t in self.list_tables() {
+            let oid = view_oid(&t.name);
+            for (i, col) in t.columns.iter().enumerate() {
+                rows.push(vec![
+                    Some(oid.to_string()),
+                    Some(col.name.clone()),
+                    Some(arrow_type_to_pg_oid(&col.data_type).to_string()),
+                    Some((i as i16 + 1).to_string()),
+                    Some("f".to_string()),
+                ]);
+            }
+        }
         for v in self.list_views() {
             let oid = view_oid(&v.name);
             for (i, col) in v.columns.iter().enumerate() {
@@ -530,18 +555,23 @@ impl CatalogStubs {
             "table_name".to_string(),
             "table_type".to_string(),
         ];
-        let rows: Vec<Vec<Option<String>>> = self
-            .list_views()
-            .into_iter()
-            .map(|v| {
-                vec![
-                    Some("rockstream".to_string()),
-                    Some("public".to_string()),
-                    Some(v.name.clone()),
-                    Some("VIEW".to_string()),
-                ]
-            })
-            .collect();
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        for t in self.list_tables() {
+            rows.push(vec![
+                Some("rockstream".to_string()),
+                Some("public".to_string()),
+                Some(t.name.clone()),
+                Some("BASE TABLE".to_string()),
+            ]);
+        }
+        for v in self.list_views() {
+            rows.push(vec![
+                Some("rockstream".to_string()),
+                Some("public".to_string()),
+                Some(v.name.clone()),
+                Some("VIEW".to_string()),
+            ]);
+        }
         CatalogResponse::rows(cols, rows)
     }
 
@@ -557,6 +587,18 @@ impl CatalogStubs {
             "data_type".to_string(),
         ];
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        for t in self.list_tables() {
+            for (i, col) in t.columns.iter().enumerate() {
+                rows.push(vec![
+                    Some("rockstream".to_string()),
+                    Some("public".to_string()),
+                    Some(t.name.clone()),
+                    Some(col.name.clone()),
+                    Some((i + 1).to_string()),
+                    Some(arrow_type_to_pg_data_type(&col.data_type).to_string()),
+                ]);
+            }
+        }
         for v in self.list_views() {
             for (i, col) in v.columns.iter().enumerate() {
                 rows.push(vec![

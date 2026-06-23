@@ -466,7 +466,7 @@ async fn tpch_q1_lfs_epoch0_and_delta() {
         }
         acc.retain(|_, w| *w > 0);
         // acc now maps row → net_weight for positive rows only.
-        let positive_rows: Vec<Vec<i64>> = acc.into_iter().map(|(r, _)| r).collect();
+        let positive_rows: Vec<Vec<i64>> = acc.into_keys().collect();
         // Rebuild as ArrowZSet
         if positive_rows.is_empty() {
             ArrowZSet::empty(lineitem_0.schema())

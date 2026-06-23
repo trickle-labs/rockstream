@@ -46,7 +46,7 @@ async fn connect(addr: &str) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(
         &format!(
             "host=127.0.0.1 port={} user=test dbname=test",
-            addr.split(':').last().unwrap()
+            addr.split(':').next_back().unwrap()
         ),
         NoTls,
     )

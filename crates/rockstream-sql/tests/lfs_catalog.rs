@@ -796,7 +796,6 @@ async fn partial_index_planner_uses_index_when_predicate_implied() {
 /// Proof: drop_index removes catalog entry and internal view; query falls back to shard scan.
 #[tokio::test]
 async fn drop_index_removes_catalog_entry_and_state() {
-    use rockstream_sql::catalog::{IndexEntry, IndexState};
     use rockstream_sql::frontend::IndexFallbackReason;
     use rockstream_sql::frontend::IndexSelection;
 
@@ -946,7 +945,7 @@ async fn rebuild_index_produces_same_arrangement_as_create() {
 /// for a CREATE INDEX plan with known row count and column cardinality.
 #[tokio::test]
 async fn explain_estimate_reports_index_state_size() {
-    use rockstream_plan::{Expr, PlanNode};
+    use rockstream_plan::PlanNode;
     use rockstream_sql::estimate::explain_incremental_estimate;
 
     // Build a plan: IndexArrange(Source("orders"))

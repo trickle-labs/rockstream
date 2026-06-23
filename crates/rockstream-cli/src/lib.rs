@@ -401,7 +401,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             match start_gateway(opts).await {
                 Ok((local_addr, gw_handle)) => {
                     let _ = audit_log.append(
-                        &AuditEvent::now(SYSTEM_ACTOR, "gateway.started", &local_addr.to_string())
+                        &AuditEvent::now(SYSTEM_ACTOR, "gateway.started", local_addr.to_string())
                             .with_detail(format!("role={}", opts.role)),
                     );
                     tracing::info!(
@@ -433,7 +433,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     gw_handle.abort();
 
                     let _ = audit_log.append(
-                        &AuditEvent::now(SYSTEM_ACTOR, "gateway.stopped", &local_addr.to_string()),
+                        &AuditEvent::now(SYSTEM_ACTOR, "gateway.stopped", local_addr.to_string()),
                     );
                 }
                 Err(e) => {

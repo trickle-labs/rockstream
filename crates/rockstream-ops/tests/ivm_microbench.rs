@@ -695,7 +695,7 @@ fn ivm_join_then_aggregate_delta_1_pct() {
         let right_sum_for_k: i64 = (0..RIGHT_PER_KEY as i64).map(|i| (k + 1) * 10 + i).sum();
         // Epoch 0 sum − 1 left row removed (was value k*1000) × right_sum
         // The removed left row contributed right_sum_for_k to the group sum.
-        let expected_s = (RIGHT_PER_KEY as i64 * (k * 1000)) as i64; // original left v contribution
+        let expected_s = RIGHT_PER_KEY as i64 * (k * 1000); // original left v contribution
         let expected_new_s = {
             // sum was: RIGHT_PER_KEY * LEFT_PER_KEY * avg_right_v
             let old_right_sum: i64 = right_sum_for_k * LEFT_PER_KEY as i64;

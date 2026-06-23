@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn crash_during_commit_idempotent_recovery() {
         let mut sink = make_sink();
-        let state = sink.pre_commit(3, 10).unwrap();
+        let _state = sink.pre_commit(3, 10).unwrap();
         // Simulate partial commit: final written but sink_state not yet updated.
         sink.committed_final.insert(3);
         sink.delivered_epochs.insert(3);

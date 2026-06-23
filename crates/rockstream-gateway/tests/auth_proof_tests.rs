@@ -6,7 +6,7 @@ use object_store::memory::InMemory;
 use rockstream_gateway::{
     catalog_stubs::{CatalogStubs, CatalogView},
     multi_shard_reader::{can_pushdown_partial_agg, MultiShardReader},
-    server::{GatewayHandler, GatewayServer},
+    server::GatewayHandler,
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError,
 };
@@ -79,7 +79,7 @@ async fn proof_rbac_denies_cross_namespace_access() {
         let mut s = handler
             .sessions
             .entry(conn_id.to_string())
-            .or_insert_with(rockstream_gateway::session::SessionState::new);
+            .or_default();
         s.principal = rockstream_gateway::auth::Principal::Jwt {
             sub: "alice".to_string(),
         };
