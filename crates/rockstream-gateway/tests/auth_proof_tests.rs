@@ -76,10 +76,7 @@ async fn proof_rbac_denies_cross_namespace_access() {
 
     let conn_id = "alice-conn";
     {
-        let mut s = handler
-            .sessions
-            .entry(conn_id.to_string())
-            .or_default();
+        let mut s = handler.sessions.entry(conn_id.to_string()).or_default();
         s.principal = rockstream_gateway::auth::Principal::Jwt {
             sub: "alice".to_string(),
         };

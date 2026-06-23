@@ -2048,10 +2048,7 @@ async fn copy_in_auth_enforced_lfs() {
     // ── RS-2401: viewer_user cannot COPY IN ───────────────────────────────────
     let viewer_conn = "viewer-conn-001";
     {
-        let mut s = handler
-            .sessions
-            .entry(viewer_conn.to_string())
-            .or_default();
+        let mut s = handler.sessions.entry(viewer_conn.to_string()).or_default();
         s.principal = Principal::Jwt {
             sub: "viewer_user".to_string(),
         };
@@ -2082,10 +2079,7 @@ async fn copy_in_auth_enforced_lfs() {
     // ── PipelineOwner: owner_user can COPY IN ─────────────────────────────────
     let owner_conn = "owner-conn-001";
     {
-        let mut s = handler
-            .sessions
-            .entry(owner_conn.to_string())
-            .or_default();
+        let mut s = handler.sessions.entry(owner_conn.to_string()).or_default();
         s.principal = Principal::Jwt {
             sub: "owner_user".to_string(),
         };

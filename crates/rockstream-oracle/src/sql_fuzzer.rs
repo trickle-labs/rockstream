@@ -348,7 +348,8 @@ pub fn generate_random_query(seed: u64) -> String {
             // Join → Aggregate on joined column: GROUP BY a column from the right side.
             // This tests that column offsets in the post-join aggregate are resolved
             // correctly (t2 columns start at index 3 in the concatenated join schema).
-            "SELECT t2.group_id, SUM(t1.val) FROM t1 JOIN t2 ON t1.id = t2.id GROUP BY t2.group_id".to_string()
+            "SELECT t2.group_id, SUM(t1.val) FROM t1 JOIN t2 ON t1.id = t2.id GROUP BY t2.group_id"
+                .to_string()
         }
         11 => {
             // Semi-join / IN-subquery: the planner lowers this to a LeftSemi join.

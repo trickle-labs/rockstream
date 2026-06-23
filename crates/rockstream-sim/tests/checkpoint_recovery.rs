@@ -320,9 +320,8 @@ async fn create_minio_bucket_raw(port: u16, bucket: &str) {
     let canonical_request =
         format!("PUT\n/{bucket}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
     let req_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{date_stamp}/us-east-1/s3/aws4_request\n{req_hash}"
-    );
+    let string_to_sign =
+        format!("AWS4-HMAC-SHA256\n{amz_date}\n{date_stamp}/us-east-1/s3/aws4_request\n{req_hash}");
 
     let hmac_fn = |key: &[u8], data: &[u8]| -> Vec<u8> {
         let mut mac = HmacSha256::new_from_slice(key).unwrap();
