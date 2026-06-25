@@ -14,6 +14,10 @@ harness = false
 name = "perf_regression"
 harness = false
 
+[[bench]]
+name = "nexmark"
+harness = false
+
 [dependencies]
 rockstream-types = { workspace = true }
 rockstream-plan = { workspace = true }
@@ -31,6 +35,13 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 object_store = { workspace = true }
 rockstream-plan = { workspace = true }
+rockstream-gateway = { workspace = true }
+rockstream-sim = { workspace = true }
+tokio-postgres = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
+
+
 
 [dev-dependencies.testcontainers]
 workspace = true

@@ -4595,14 +4595,18 @@ name = "rockstream-ops"
 version = "0.52.10"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "criterion",
  "hex",
  "hmac 0.12.1",
  "object_store 0.12.5",
  "proptest",
+ "rand 0.8.6",
  "reqwest",
+ "rockstream-gateway",
  "rockstream-plan",
+ "rockstream-sim",
  "rockstream-storage",
  "rockstream-types",
  "sha2 0.10.9",
@@ -4611,6 +4615,7 @@ dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
  "tracing",
 ]
 
@@ -4619,13 +4624,27 @@ name = "rockstream-oracle"
 version = "0.52.10"
 dependencies = [
  "arrow",
+ "async-trait",
+ "bytes",
  "datafusion",
+ "hex",
+ "hmac 0.12.1",
+ "object_store 0.12.5",
  "proptest",
+ "rand 0.8.6",
+ "reqwest",
+ "rockstream-gateway",
  "rockstream-ops",
  "rockstream-plan",
+ "rockstream-sim",
  "rockstream-sql",
+ "rockstream-storage",
  "rockstream-types",
+ "sha2 0.10.9",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

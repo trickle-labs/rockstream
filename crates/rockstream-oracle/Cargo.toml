@@ -17,3 +17,18 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+rockstream-gateway = { workspace = true }
+object_store = { workspace = true }
+rockstream-sim = { workspace = true }
+tokio-postgres = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+rockstream-storage = { workspace = true }
+rand = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+
