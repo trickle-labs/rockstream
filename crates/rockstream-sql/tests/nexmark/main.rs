@@ -1092,6 +1092,2055 @@ async fn test_nexmark_q4_q9_lfs() {
 }
 
 #[tokio::test]
+async fn test_nexmark_q12_q13_lfs() {
+    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use object_store::memory::InMemory;
+    use rockstream_gateway::catalog_stubs::CatalogStubs;
+    use rockstream_gateway::server::GatewayServer;
+    use rockstream_gateway::subscribe_handler::deliver_snapshot;
+    use rockstream_gateway::subscribe_parser::parse_subscribe;
+    use rockstream_storage::ShardDb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("nexmark-q12-q13-lfs-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // Define SQL DDL queries
+    let create_person_ddl = "CREATE TABLE person (
+        id BIGINT,
+        name VARCHAR,
+        email_address VARCHAR,
+        credit_card VARCHAR,
+        city VARCHAR,
+        state VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_auction_ddl = "CREATE TABLE auction (
+        id BIGINT,
+        item_name VARCHAR,
+        description VARCHAR,
+        initial_bid BIGINT,
+        reserve BIGINT,
+        date_time BIGINT,
+        expires BIGINT,
+        seller BIGINT,
+        category BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_bid_ddl = "CREATE TABLE bid (
+        auction BIGINT,
+        bidder BIGINT,
+        price BIGINT,
+        channel VARCHAR,
+        url VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_side_input_ddl = "CREATE TABLE side_input (
+        key BIGINT,
+        value VARCHAR
+    )";
+
+    // Run CREATE TABLE statements
+    client
+        .simple_query(create_person_ddl)
+        .await
+        .expect("CREATE TABLE person failed");
+    client
+        .simple_query(create_auction_ddl)
+        .await
+        .expect("CREATE TABLE auction failed");
+    client
+        .simple_query(create_bid_ddl)
+        .await
+        .expect("CREATE TABLE bid failed");
+    client
+        .simple_query(create_side_input_ddl)
+        .await
+        .expect("CREATE TABLE side_input failed");
+
+    // Populate side_input with static lookup data
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-side-input-init'")
+        .await
+        .expect("SET idempotency_key failed");
+    client.simple_query("BEGIN").await.unwrap();
+    for key in 0..2000 {
+        client
+            .simple_query(&format!(
+                "INSERT INTO side_input (key, value) VALUES ({key}, 'val_{key}')"
+            ))
+            .await
+            .expect("INSERT into side_input failed");
+    }
+    client.simple_query("COMMIT").await.unwrap();
+
+    // Define standard CREATE VIEW statements for Nexmark q12–q13
+    client
+        .simple_query("CREATE VIEW q12 AS SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))")
+        .await
+        .expect("CREATE VIEW q12 failed");
+
+    client
+        .simple_query("CREATE VIEW q13 AS SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key")
+        .await
+        .expect("CREATE VIEW q13 failed");
+
+    // Generate 500 events
+    let mut gen = rockstream_sim::NexmarkGenerator::new(42);
+    let mut persons = Vec::new();
+    let mut auctions = Vec::new();
+    let mut bids = Vec::new();
+    let mut inserts = Vec::new();
+
+    for _ in 0..500 {
+        let event = gen.next().unwrap();
+        match &event {
+            rockstream_sim::NexmarkEvent::Person(p) => persons.push(p.clone()),
+            rockstream_sim::NexmarkEvent::Auction(a) => auctions.push(a.clone()),
+            rockstream_sim::NexmarkEvent::Bid(b) => bids.push(b.clone()),
+        }
+        inserts.push(event.to_insert_sql());
+    }
+
+    // Set idempotency key
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q12-q13-batch-1'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    // Begin txn
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    for sql in inserts {
+        client.simple_query(&sql).await.expect("INSERT failed");
+    }
+    // Commit txn
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    // Define oracle runner helper
+    let run_df_oracle = |query: String| {
+        let persons = &persons;
+        let auctions = &auctions;
+        let bids = &bids;
+        async move {
+            let ctx = SessionContext::new();
+
+            let person_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("email_address", DataType::Utf8, false),
+                Field::new("credit_card", DataType::Utf8, false),
+                Field::new("city", DataType::Utf8, false),
+                Field::new("state", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let p_batch = RecordBatch::try_new(
+                person_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        persons.iter().map(|p| p.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.email_address.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.credit_card.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.city.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.state.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        persons
+                            .iter()
+                            .map(|p| p.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let p_table = MemTable::try_new(person_schema, vec![vec![p_batch]]).unwrap();
+            ctx.register_table("person", Arc::new(p_table)).unwrap();
+
+            let auction_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("item_name", DataType::Utf8, false),
+                Field::new("description", DataType::Utf8, false),
+                Field::new("initial_bid", DataType::Int64, false),
+                Field::new("reserve", DataType::Int64, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("expires", DataType::Int64, false),
+                Field::new("seller", DataType::Int64, false),
+                Field::new("category", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let a_batch = RecordBatch::try_new(
+                auction_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.item_name.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.description.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.initial_bid as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.reserve as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.expires as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.seller as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.category as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions.iter().map(|a| a.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let a_table = MemTable::try_new(auction_schema, vec![vec![a_batch]]).unwrap();
+            ctx.register_table("auction", Arc::new(a_table)).unwrap();
+
+            let bid_schema = Arc::new(Schema::new(vec![
+                Field::new("auction", DataType::Int64, false),
+                Field::new("bidder", DataType::Int64, false),
+                Field::new("price", DataType::Int64, false),
+                Field::new("channel", DataType::Utf8, false),
+                Field::new("url", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let b_batch = RecordBatch::try_new(
+                bid_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.auction as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.bidder as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.price as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.channel.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.url.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.date_time as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let b_table = MemTable::try_new(bid_schema, vec![vec![b_batch]]).unwrap();
+            ctx.register_table("bid", Arc::new(b_table)).unwrap();
+
+            let side_input_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for key in 0..2000 {
+                keys.push(key as i64);
+                values.push(format!("val_{key}"));
+            }
+            let si_batch = RecordBatch::try_new(
+                side_input_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .unwrap();
+            let si_table = MemTable::try_new(side_input_schema, vec![vec![si_batch]]).unwrap();
+            ctx.register_table("side_input", Arc::new(si_table))
+                .unwrap();
+
+            let df = ctx.sql(&query).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let mut rows = Vec::new();
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let mut fields = Vec::new();
+                    for col in 0..batch.num_columns() {
+                        let array = batch.column(col);
+                        let val_str = if array.is_null(row) {
+                            "NULL".to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+                            (a.value(row) as i64).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringViewArray>()
+                        {
+                            a.value(row).to_string()
+                        } else {
+                            format!("{:?}", array)
+                        };
+                        fields.push(val_str);
+                    }
+                    rows.push(fields.join("\t"));
+                }
+            }
+            rows
+        }
+    };
+
+    // Verify q12–q13 results are bit-identical to the DataFusion batch oracle.
+    let views = ["q12", "q13"];
+    let oracle_queries = [
+        "SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
+        "SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key"
+    ];
+
+    for (view, query) in views.iter().zip(oracle_queries.iter()) {
+        // Query view via pgwire client
+        let psql_res = client
+            .simple_query(&format!("SELECT * FROM {view}"))
+            .await
+            .unwrap_or_else(|err| panic!("SELECT * FROM {view} failed: {err:?}"));
+        let mut psql_rows = Vec::new();
+        for msg in psql_res {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+                let mut fields = Vec::new();
+                for col in 0..r.len() {
+                    fields.push(r.get(col).unwrap_or("NULL").to_string());
+                }
+                psql_rows.push(fields.join("\t"));
+            }
+        }
+
+        // Run DataFusion oracle query
+        let oracle_rows = run_df_oracle(query.to_string()).await;
+
+        // Compare both results (unsorted, but sorted to compare set equivalence)
+        let psql_set: BTreeSet<String> = psql_rows.into_iter().collect();
+        let oracle_set: BTreeSet<String> = oracle_rows.into_iter().collect();
+        assert_eq!(
+            psql_set, oracle_set,
+            "bit-identical comparison failed for {view}"
+        );
+    }
+
+    // In-process SUBSCRIBE change log verification (P3)
+    for view in &views {
+        let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
+        let mut snapshot_rows = Vec::new();
+        let prefix = format!("view_output/{view}/");
+        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
+        for (k, v) in kvs {
+            snapshot_rows.push((
+                bytes::Bytes::copy_from_slice(&k),
+                bytes::Bytes::copy_from_slice(&v),
+            ));
+        }
+        let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
+        assert!(
+            !delivered.is_empty(),
+            "SUBSCRIBE snapshot failed for {view}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_nexmark_q14_q15_lfs() {
+    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use object_store::memory::InMemory;
+    use rockstream_gateway::catalog_stubs::CatalogStubs;
+    use rockstream_gateway::server::GatewayServer;
+    use rockstream_gateway::subscribe_handler::deliver_snapshot;
+    use rockstream_gateway::subscribe_parser::parse_subscribe;
+    use rockstream_storage::ShardDb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("nexmark-q14-q15-lfs-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // Define SQL DDL queries
+    let create_person_ddl = "CREATE TABLE person (
+        id BIGINT,
+        name VARCHAR,
+        email_address VARCHAR,
+        credit_card VARCHAR,
+        city VARCHAR,
+        state VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_auction_ddl = "CREATE TABLE auction (
+        id BIGINT,
+        item_name VARCHAR,
+        description VARCHAR,
+        initial_bid BIGINT,
+        reserve BIGINT,
+        date_time BIGINT,
+        expires BIGINT,
+        seller BIGINT,
+        category BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_bid_ddl = "CREATE TABLE bid (
+        auction BIGINT,
+        bidder BIGINT,
+        price BIGINT,
+        channel VARCHAR,
+        url VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    // Run CREATE TABLE statements
+    client
+        .simple_query(create_person_ddl)
+        .await
+        .expect("CREATE TABLE person failed");
+    client
+        .simple_query(create_auction_ddl)
+        .await
+        .expect("CREATE TABLE auction failed");
+    client
+        .simple_query(create_bid_ddl)
+        .await
+        .expect("CREATE TABLE bid failed");
+
+    // Define standard CREATE VIEW statements for Nexmark q14–q15
+    client
+        .simple_query("CREATE VIEW q14 AS SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid")
+        .await
+        .expect("CREATE VIEW q14 failed");
+
+    client
+        .simple_query("CREATE VIEW q15 AS SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))")
+        .await
+        .expect("CREATE VIEW q15 failed");
+
+    // Generate 500 events
+    let mut gen = rockstream_sim::NexmarkGenerator::new(42);
+    let mut persons = Vec::new();
+    let mut auctions = Vec::new();
+    let mut bids = Vec::new();
+    let mut inserts = Vec::new();
+
+    for _ in 0..500 {
+        let event = gen.next().unwrap();
+        match &event {
+            rockstream_sim::NexmarkEvent::Person(p) => persons.push(p.clone()),
+            rockstream_sim::NexmarkEvent::Auction(a) => auctions.push(a.clone()),
+            rockstream_sim::NexmarkEvent::Bid(b) => bids.push(b.clone()),
+        }
+        inserts.push(event.to_insert_sql());
+    }
+
+    // Set idempotency key
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q14-q15-batch-1'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    // Begin txn
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    for sql in inserts {
+        client.simple_query(&sql).await.expect("INSERT failed");
+    }
+    // Commit txn
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    // Define oracle runner helper
+    let run_df_oracle = |query: String| {
+        let persons = &persons;
+        let auctions = &auctions;
+        let bids = &bids;
+        async move {
+            let ctx = SessionContext::new();
+
+            let person_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("email_address", DataType::Utf8, false),
+                Field::new("credit_card", DataType::Utf8, false),
+                Field::new("city", DataType::Utf8, false),
+                Field::new("state", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let p_batch = RecordBatch::try_new(
+                person_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        persons.iter().map(|p| p.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.email_address.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.credit_card.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.city.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.state.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        persons
+                            .iter()
+                            .map(|p| p.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let p_table = MemTable::try_new(person_schema, vec![vec![p_batch]]).unwrap();
+            ctx.register_table("person", Arc::new(p_table)).unwrap();
+
+            let auction_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("item_name", DataType::Utf8, false),
+                Field::new("description", DataType::Utf8, false),
+                Field::new("initial_bid", DataType::Int64, false),
+                Field::new("reserve", DataType::Int64, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("expires", DataType::Int64, false),
+                Field::new("seller", DataType::Int64, false),
+                Field::new("category", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let a_batch = RecordBatch::try_new(
+                auction_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.item_name.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.description.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.initial_bid as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.reserve as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.expires as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.seller as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.category as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions.iter().map(|a| a.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let a_table = MemTable::try_new(auction_schema, vec![vec![a_batch]]).unwrap();
+            ctx.register_table("auction", Arc::new(a_table)).unwrap();
+
+            let bid_schema = Arc::new(Schema::new(vec![
+                Field::new("auction", DataType::Int64, false),
+                Field::new("bidder", DataType::Int64, false),
+                Field::new("price", DataType::Int64, false),
+                Field::new("channel", DataType::Utf8, false),
+                Field::new("url", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let b_batch = RecordBatch::try_new(
+                bid_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.auction as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.bidder as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.price as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.channel.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.url.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.date_time as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let b_table = MemTable::try_new(bid_schema, vec![vec![b_batch]]).unwrap();
+            ctx.register_table("bid", Arc::new(b_table)).unwrap();
+
+            let df = ctx.sql(&query).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let mut rows = Vec::new();
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let mut fields = Vec::new();
+                    for col in 0..batch.num_columns() {
+                        let array = batch.column(col);
+                        let val_str = if array.is_null(row) {
+                            "NULL".to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+                            (a.value(row) as i64).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringViewArray>()
+                        {
+                            a.value(row).to_string()
+                        } else {
+                            format!("{:?}", array)
+                        };
+                        fields.push(val_str);
+                    }
+                    rows.push(fields.join("\t"));
+                }
+            }
+            rows
+        }
+    };
+
+    // Verify q14–q15 results are bit-identical to the DataFusion batch oracle.
+    let views = ["q14", "q15"];
+    let oracle_queries = [
+        "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
+        "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))"
+    ];
+
+    for (view, query) in views.iter().zip(oracle_queries.iter()) {
+        // Query view via pgwire client
+        let psql_res = client
+            .simple_query(&format!("SELECT * FROM {view}"))
+            .await
+            .unwrap_or_else(|err| panic!("SELECT * FROM {view} failed: {err:?}"));
+        let mut psql_rows = Vec::new();
+        for msg in psql_res {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+                let mut fields = Vec::new();
+                for col in 0..r.len() {
+                    fields.push(r.get(col).unwrap_or("NULL").to_string());
+                }
+                psql_rows.push(fields.join("\t"));
+            }
+        }
+
+        // Run DataFusion oracle query
+        let oracle_rows = run_df_oracle(query.to_string()).await;
+
+        // Compare both results (unsorted, but sorted to compare set equivalence)
+        let psql_set: BTreeSet<String> = psql_rows.into_iter().collect();
+        let oracle_set: BTreeSet<String> = oracle_rows.into_iter().collect();
+        assert_eq!(
+            psql_set, oracle_set,
+            "bit-identical comparison failed for {view}"
+        );
+    }
+
+    // In-process SUBSCRIBE change log verification (P3)
+    for view in &views {
+        let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
+        let mut snapshot_rows = Vec::new();
+        let prefix = format!("view_output/{view}/");
+        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
+        for (k, v) in kvs {
+            snapshot_rows.push((
+                bytes::Bytes::copy_from_slice(&k),
+                bytes::Bytes::copy_from_slice(&v),
+            ));
+        }
+        let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
+        assert!(
+            !delivered.is_empty(),
+            "SUBSCRIBE snapshot failed for {view}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_nexmark_q16_q17_lfs() {
+    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use object_store::memory::InMemory;
+    use rockstream_gateway::catalog_stubs::CatalogStubs;
+    use rockstream_gateway::server::GatewayServer;
+    use rockstream_gateway::subscribe_handler::deliver_snapshot;
+    use rockstream_gateway::subscribe_parser::parse_subscribe;
+    use rockstream_storage::ShardDb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("nexmark-q16-q17-lfs-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // Define SQL DDL queries
+    let create_person_ddl = "CREATE TABLE person (
+        id BIGINT,
+        name VARCHAR,
+        email_address VARCHAR,
+        credit_card VARCHAR,
+        city VARCHAR,
+        state VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_auction_ddl = "CREATE TABLE auction (
+        id BIGINT,
+        item_name VARCHAR,
+        description VARCHAR,
+        initial_bid BIGINT,
+        reserve BIGINT,
+        date_time BIGINT,
+        expires BIGINT,
+        seller BIGINT,
+        category BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_bid_ddl = "CREATE TABLE bid (
+        auction BIGINT,
+        bidder BIGINT,
+        price BIGINT,
+        channel VARCHAR,
+        url VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    // Run CREATE TABLE statements
+    client
+        .simple_query(create_person_ddl)
+        .await
+        .expect("CREATE TABLE person failed");
+    client
+        .simple_query(create_auction_ddl)
+        .await
+        .expect("CREATE TABLE auction failed");
+    client
+        .simple_query(create_bid_ddl)
+        .await
+        .expect("CREATE TABLE bid failed");
+
+    // Define standard CREATE VIEW statements for Nexmark q16–q17
+    client
+        .simple_query("CREATE VIEW q16 AS SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))")
+        .await
+        .expect("CREATE VIEW q16 failed");
+
+    client
+        .simple_query("CREATE VIEW q17 AS SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))")
+        .await
+        .expect("CREATE VIEW q17 failed");
+
+    // Generate 500 events
+    let mut gen = rockstream_sim::NexmarkGenerator::new(42);
+    let mut persons = Vec::new();
+    let mut auctions = Vec::new();
+    let mut bids = Vec::new();
+    let mut inserts = Vec::new();
+
+    for _ in 0..500 {
+        let event = gen.next().unwrap();
+        match &event {
+            rockstream_sim::NexmarkEvent::Person(p) => persons.push(p.clone()),
+            rockstream_sim::NexmarkEvent::Auction(a) => auctions.push(a.clone()),
+            rockstream_sim::NexmarkEvent::Bid(b) => bids.push(b.clone()),
+        }
+        inserts.push(event.to_insert_sql());
+    }
+
+    // Set idempotency key
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q16-q17-batch-1'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    // Begin txn
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    for sql in inserts {
+        client.simple_query(&sql).await.expect("INSERT failed");
+    }
+    // Commit txn
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    // Define oracle runner helper
+    let run_df_oracle = |query: String| {
+        let persons = &persons;
+        let auctions = &auctions;
+        let bids = &bids;
+        async move {
+            let ctx = SessionContext::new();
+
+            let person_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("email_address", DataType::Utf8, false),
+                Field::new("credit_card", DataType::Utf8, false),
+                Field::new("city", DataType::Utf8, false),
+                Field::new("state", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let p_batch = RecordBatch::try_new(
+                person_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        persons.iter().map(|p| p.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.email_address.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.credit_card.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.city.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.state.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        persons
+                            .iter()
+                            .map(|p| p.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let p_table = MemTable::try_new(person_schema, vec![vec![p_batch]]).unwrap();
+            ctx.register_table("person", Arc::new(p_table)).unwrap();
+
+            let auction_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("item_name", DataType::Utf8, false),
+                Field::new("description", DataType::Utf8, false),
+                Field::new("initial_bid", DataType::Int64, false),
+                Field::new("reserve", DataType::Int64, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("expires", DataType::Int64, false),
+                Field::new("seller", DataType::Int64, false),
+                Field::new("category", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let a_batch = RecordBatch::try_new(
+                auction_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.item_name.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.description.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.initial_bid as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.reserve as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.expires as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.seller as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.category as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions.iter().map(|a| a.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let a_table = MemTable::try_new(auction_schema, vec![vec![a_batch]]).unwrap();
+            ctx.register_table("auction", Arc::new(a_table)).unwrap();
+
+            let bid_schema = Arc::new(Schema::new(vec![
+                Field::new("auction", DataType::Int64, false),
+                Field::new("bidder", DataType::Int64, false),
+                Field::new("price", DataType::Int64, false),
+                Field::new("channel", DataType::Utf8, false),
+                Field::new("url", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let b_batch = RecordBatch::try_new(
+                bid_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.auction as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.bidder as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.price as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.channel.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.url.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.date_time as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let b_table = MemTable::try_new(bid_schema, vec![vec![b_batch]]).unwrap();
+            ctx.register_table("bid", Arc::new(b_table)).unwrap();
+
+            let df = ctx.sql(&query).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let mut rows = Vec::new();
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let mut fields = Vec::new();
+                    for col in 0..batch.num_columns() {
+                        let array = batch.column(col);
+                        let val_str = if array.is_null(row) {
+                            "NULL".to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+                            (a.value(row) as i64).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringViewArray>()
+                        {
+                            a.value(row).to_string()
+                        } else {
+                            format!("{:?}", array)
+                        };
+                        fields.push(val_str);
+                    }
+                    rows.push(fields.join("\t"));
+                }
+            }
+            rows
+        }
+    };
+
+    // Verify q16–q17 results are bit-identical to the DataFusion batch oracle.
+    let views = ["q16", "q17"];
+    let oracle_queries = [
+        "SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
+        "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))"
+    ];
+
+    for (view, query) in views.iter().zip(oracle_queries.iter()) {
+        // Query view via pgwire client
+        let psql_res = client
+            .simple_query(&format!("SELECT * FROM {view}"))
+            .await
+            .unwrap_or_else(|err| panic!("SELECT * FROM {view} failed: {err:?}"));
+        let mut psql_rows = Vec::new();
+        for msg in psql_res {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+                let mut fields = Vec::new();
+                for col in 0..r.len() {
+                    fields.push(r.get(col).unwrap_or("NULL").to_string());
+                }
+                psql_rows.push(fields.join("\t"));
+            }
+        }
+
+        // Run DataFusion oracle query
+        let oracle_rows = run_df_oracle(query.to_string()).await;
+
+        // Compare both results (unsorted, but sorted to compare set equivalence)
+        let psql_set: BTreeSet<String> = psql_rows.into_iter().collect();
+        let oracle_set: BTreeSet<String> = oracle_rows.into_iter().collect();
+        assert_eq!(
+            psql_set, oracle_set,
+            "bit-identical comparison failed for {view}"
+        );
+    }
+
+    // In-process SUBSCRIBE change log verification (P3)
+    for view in &views {
+        let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
+        let mut snapshot_rows = Vec::new();
+        let prefix = format!("view_output/{view}/");
+        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
+        for (k, v) in kvs {
+            snapshot_rows.push((
+                bytes::Bytes::copy_from_slice(&k),
+                bytes::Bytes::copy_from_slice(&v),
+            ));
+        }
+        let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
+        assert!(
+            !delivered.is_empty(),
+            "SUBSCRIBE snapshot failed for {view}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_nexmark_q18_q19_lfs() {
+    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use object_store::memory::InMemory;
+    use rockstream_gateway::catalog_stubs::CatalogStubs;
+    use rockstream_gateway::server::GatewayServer;
+    use rockstream_gateway::subscribe_handler::deliver_snapshot;
+    use rockstream_gateway::subscribe_parser::parse_subscribe;
+    use rockstream_storage::ShardDb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("nexmark-q18-q19-lfs-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // Define SQL DDL queries
+    let create_person_ddl = "CREATE TABLE person (
+        id BIGINT,
+        name VARCHAR,
+        email_address VARCHAR,
+        credit_card VARCHAR,
+        city VARCHAR,
+        state VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_auction_ddl = "CREATE TABLE auction (
+        id BIGINT,
+        item_name VARCHAR,
+        description VARCHAR,
+        initial_bid BIGINT,
+        reserve BIGINT,
+        date_time BIGINT,
+        expires BIGINT,
+        seller BIGINT,
+        category BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_bid_ddl = "CREATE TABLE bid (
+        auction BIGINT,
+        bidder BIGINT,
+        price BIGINT,
+        channel VARCHAR,
+        url VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    // Run CREATE TABLE statements
+    client
+        .simple_query(create_person_ddl)
+        .await
+        .expect("CREATE TABLE person failed");
+    client
+        .simple_query(create_auction_ddl)
+        .await
+        .expect("CREATE TABLE auction failed");
+    client
+        .simple_query(create_bid_ddl)
+        .await
+        .expect("CREATE TABLE bid failed");
+
+    // Define standard CREATE VIEW statements for Nexmark q18–q19
+    client
+        .simple_query("CREATE VIEW q18 AS SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1")
+        .await
+        .expect("CREATE VIEW q18 failed");
+
+    client
+        .simple_query("CREATE VIEW q19 AS SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) as rn FROM bid ) WHERE rn <= 10")
+        .await
+        .expect("CREATE VIEW q19 failed");
+
+    // Generate 500 events
+    let mut gen = rockstream_sim::NexmarkGenerator::new(42);
+    let mut persons = Vec::new();
+    let mut auctions = Vec::new();
+    let mut bids = Vec::new();
+    let mut inserts = Vec::new();
+
+    for _ in 0..500 {
+        let event = gen.next().unwrap();
+        match &event {
+            rockstream_sim::NexmarkEvent::Person(p) => persons.push(p.clone()),
+            rockstream_sim::NexmarkEvent::Auction(a) => auctions.push(a.clone()),
+            rockstream_sim::NexmarkEvent::Bid(b) => bids.push(b.clone()),
+        }
+        inserts.push(event.to_insert_sql());
+    }
+
+    // Set idempotency key
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q18-q19-batch-1'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    // Begin txn
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    for sql in inserts {
+        client.simple_query(&sql).await.expect("INSERT failed");
+    }
+    // Commit txn
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    // Define oracle runner helper
+    let run_df_oracle = |query: String, current_bids: Vec<rockstream_sim::Bid>| {
+        let persons = persons.clone();
+        let auctions = auctions.clone();
+        async move {
+            let ctx = SessionContext::new();
+
+            let person_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("email_address", DataType::Utf8, false),
+                Field::new("credit_card", DataType::Utf8, false),
+                Field::new("city", DataType::Utf8, false),
+                Field::new("state", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let p_batch = RecordBatch::try_new(
+                person_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        persons.iter().map(|p| p.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.email_address.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.credit_card.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.city.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.state.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        persons
+                            .iter()
+                            .map(|p| p.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let p_table = MemTable::try_new(person_schema, vec![vec![p_batch]]).unwrap();
+            ctx.register_table("person", Arc::new(p_table)).unwrap();
+
+            let auction_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("item_name", DataType::Utf8, false),
+                Field::new("description", DataType::Utf8, false),
+                Field::new("initial_bid", DataType::Int64, false),
+                Field::new("reserve", DataType::Int64, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("expires", DataType::Int64, false),
+                Field::new("seller", DataType::Int64, false),
+                Field::new("category", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let a_batch = RecordBatch::try_new(
+                auction_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.item_name.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.description.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.initial_bid as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.reserve as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.expires as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.seller as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.category as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions.iter().map(|a| a.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let a_table = MemTable::try_new(auction_schema, vec![vec![a_batch]]).unwrap();
+            ctx.register_table("auction", Arc::new(a_table)).unwrap();
+
+            let bid_schema = Arc::new(Schema::new(vec![
+                Field::new("auction", DataType::Int64, false),
+                Field::new("bidder", DataType::Int64, false),
+                Field::new("price", DataType::Int64, false),
+                Field::new("channel", DataType::Utf8, false),
+                Field::new("url", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let b_batch = RecordBatch::try_new(
+                bid_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        current_bids
+                            .iter()
+                            .map(|b| b.auction as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        current_bids
+                            .iter()
+                            .map(|b| b.bidder as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        current_bids
+                            .iter()
+                            .map(|b| b.price as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        current_bids
+                            .iter()
+                            .map(|b| b.channel.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        current_bids
+                            .iter()
+                            .map(|b| b.url.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        current_bids
+                            .iter()
+                            .map(|b| b.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        current_bids
+                            .iter()
+                            .map(|b| b.extra.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let b_table = MemTable::try_new(bid_schema, vec![vec![b_batch]]).unwrap();
+            ctx.register_table("bid", Arc::new(b_table)).unwrap();
+
+            let df = ctx.sql(&query).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let mut rows = Vec::new();
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let mut fields = Vec::new();
+                    for col in 0..batch.num_columns() {
+                        let array = batch.column(col);
+                        let val_str = if array.is_null(row) {
+                            "NULL".to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+                            (a.value(row) as i64).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringViewArray>()
+                        {
+                            a.value(row).to_string()
+                        } else {
+                            format!("{:?}", array)
+                        };
+                        fields.push(val_str);
+                    }
+                    rows.push(fields.join("\t"));
+                }
+            }
+            rows
+        }
+    };
+
+    let views = ["q18", "q19"];
+    let oracle_queries = [
+        "SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1",
+        "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) as rn FROM bid ) WHERE rn <= 10"
+    ];
+
+    // 1. Verify initial state matches oracle
+    for (view, query) in views.iter().zip(oracle_queries.iter()) {
+        let psql_res = client
+            .simple_query(&format!("SELECT * FROM {view}"))
+            .await
+            .unwrap_or_else(|err| panic!("SELECT * FROM {view} failed: {err:?}"));
+        let mut psql_rows = Vec::new();
+        for msg in psql_res {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+                let mut fields = Vec::new();
+                for col in 0..r.len() {
+                    fields.push(r.get(col).unwrap_or("NULL").to_string());
+                }
+                psql_rows.push(fields.join("\t"));
+            }
+        }
+
+        let oracle_rows = run_df_oracle(query.to_string(), bids.clone()).await;
+        let psql_set: BTreeSet<String> = psql_rows.into_iter().collect();
+        let oracle_set: BTreeSet<String> = oracle_rows.into_iter().collect();
+        assert_eq!(
+            psql_set, oracle_set,
+            "Initial bit-identical comparison failed for {view}"
+        );
+    }
+
+    // 2. Perform retraction storm (delete 50 random bids)
+    let mut bids_to_delete = Vec::new();
+    let mut remaining_bids = bids.clone();
+    for i in (0..bids.len()).step_by(10).take(50) {
+        if i < bids.len() {
+            bids_to_delete.push(bids[i].clone());
+        }
+    }
+
+    // Remove deleted bids from remaining_bids
+    for to_del in &bids_to_delete {
+        if let Some(pos) = remaining_bids.iter().position(|b| {
+            b.auction == to_del.auction
+                && b.bidder == to_del.bidder
+                && b.price == to_del.price
+                && b.channel == to_del.channel
+                && b.url == to_del.url
+                && b.date_time == to_del.date_time
+                && b.extra == to_del.extra
+        }) {
+            remaining_bids.remove(pos);
+        }
+    }
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q18-q19-retractions'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    client.simple_query("BEGIN").await.unwrap();
+    for b in &bids_to_delete {
+        let sql = format!(
+            "DELETE FROM bid WHERE auction={}, bidder={}, price={}, channel='{}', url='{}', date_time={}, extra='{}'",
+            b.auction, b.bidder, b.price, b.channel, b.url, b.date_time, b.extra
+        );
+        client.simple_query(&sql).await.unwrap();
+    }
+    client.simple_query("COMMIT").await.unwrap();
+
+    // 3. Verify state after retractions matches oracle
+    for (view, query) in views.iter().zip(oracle_queries.iter()) {
+        let psql_res = client
+            .simple_query(&format!("SELECT * FROM {view}"))
+            .await
+            .unwrap_or_else(|err| panic!("SELECT * FROM {view} failed: {err:?}"));
+        let mut psql_rows = Vec::new();
+        for msg in psql_res {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+                let mut fields = Vec::new();
+                for col in 0..r.len() {
+                    fields.push(r.get(col).unwrap_or("NULL").to_string());
+                }
+                psql_rows.push(fields.join("\t"));
+            }
+        }
+
+        let oracle_rows = run_df_oracle(query.to_string(), remaining_bids.clone()).await;
+        let psql_set: BTreeSet<String> = psql_rows.into_iter().collect();
+        let oracle_set: BTreeSet<String> = oracle_rows.into_iter().collect();
+        assert_eq!(
+            psql_set, oracle_set,
+            "Retracted bit-identical comparison failed for {view}"
+        );
+    }
+
+    // In-process SUBSCRIBE change log verification (P3)
+    for view in &views {
+        let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
+        let mut snapshot_rows = Vec::new();
+        let prefix = format!("view_output/{view}/");
+        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
+        for (k, v) in kvs {
+            snapshot_rows.push((
+                bytes::Bytes::copy_from_slice(&k),
+                bytes::Bytes::copy_from_slice(&v),
+            ));
+        }
+        let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
+        assert!(
+            !delivered.is_empty(),
+            "SUBSCRIBE snapshot failed for {view}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_nexmark_q20_q22_lfs() {
+    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use object_store::memory::InMemory;
+    use rockstream_gateway::catalog_stubs::CatalogStubs;
+    use rockstream_gateway::server::GatewayServer;
+    use rockstream_gateway::subscribe_handler::deliver_snapshot;
+    use rockstream_gateway::subscribe_parser::parse_subscribe;
+    use rockstream_storage::ShardDb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("nexmark-q20-q22-lfs-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // Define SQL DDL queries
+    let create_person_ddl = "CREATE TABLE person (
+        id BIGINT,
+        name VARCHAR,
+        email_address VARCHAR,
+        credit_card VARCHAR,
+        city VARCHAR,
+        state VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_auction_ddl = "CREATE TABLE auction (
+        id BIGINT,
+        item_name VARCHAR,
+        description VARCHAR,
+        initial_bid BIGINT,
+        reserve BIGINT,
+        date_time BIGINT,
+        expires BIGINT,
+        seller BIGINT,
+        category BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_bid_ddl = "CREATE TABLE bid (
+        auction BIGINT,
+        bidder BIGINT,
+        price BIGINT,
+        channel VARCHAR,
+        url VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    // Run CREATE TABLE statements
+    client
+        .simple_query(create_person_ddl)
+        .await
+        .expect("CREATE TABLE person failed");
+    client
+        .simple_query(create_auction_ddl)
+        .await
+        .expect("CREATE TABLE auction failed");
+    client
+        .simple_query(create_bid_ddl)
+        .await
+        .expect("CREATE TABLE bid failed");
+
+    // Define CREATE VIEW statements for Nexmark q20–q22
+    client
+        .simple_query("CREATE VIEW q20 AS SELECT b.auction, b.bidder, b.price, b.date_time, a.category FROM bid b JOIN auction a ON b.auction = a.id WHERE a.category = 10")
+        .await
+        .expect("CREATE VIEW q20 failed");
+
+    client
+        .simple_query("CREATE VIEW q21 AS SELECT auction, bidder, CASE WHEN regexp_replace(channel, 'google|facebook', 'social') = 'social' THEN 'social_media' ELSE 'other' END as channel_id FROM bid")
+        .await
+        .expect("CREATE VIEW q21 failed");
+
+    client
+        .simple_query(
+            "CREATE VIEW q22 AS SELECT auction, bidder, split_part(url, '/', 4) as dir FROM bid",
+        )
+        .await
+        .expect("CREATE VIEW q22 failed");
+
+    // Generate 500 events
+    let mut gen = rockstream_sim::NexmarkGenerator::new(42);
+    let mut persons = Vec::new();
+    let mut auctions = Vec::new();
+    let mut bids = Vec::new();
+    let mut inserts = Vec::new();
+
+    for _ in 0..500 {
+        let event = gen.next().unwrap();
+        match &event {
+            rockstream_sim::NexmarkEvent::Person(p) => persons.push(p.clone()),
+            rockstream_sim::NexmarkEvent::Auction(a) => auctions.push(a.clone()),
+            rockstream_sim::NexmarkEvent::Bid(b) => bids.push(b.clone()),
+        }
+        inserts.push(event.to_insert_sql());
+    }
+
+    // Set idempotency key
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q20-q22-batch-1'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    // Begin txn
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    for sql in inserts {
+        client.simple_query(&sql).await.expect("INSERT failed");
+    }
+    // Commit txn
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    // Define oracle runner helper
+    let run_df_oracle = |query: String| {
+        let persons = &persons;
+        let auctions = &auctions;
+        let bids = &bids;
+        async move {
+            let ctx = SessionContext::new();
+
+            let person_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("email_address", DataType::Utf8, false),
+                Field::new("credit_card", DataType::Utf8, false),
+                Field::new("city", DataType::Utf8, false),
+                Field::new("state", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let p_batch = RecordBatch::try_new(
+                person_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        persons.iter().map(|p| p.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.email_address.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.credit_card.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.city.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.state.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        persons
+                            .iter()
+                            .map(|p| p.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let p_table = MemTable::try_new(person_schema, vec![vec![p_batch]]).unwrap();
+            ctx.register_table("person", Arc::new(p_table)).unwrap();
+
+            let auction_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("item_name", DataType::Utf8, false),
+                Field::new("description", DataType::Utf8, false),
+                Field::new("initial_bid", DataType::Int64, false),
+                Field::new("reserve", DataType::Int64, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("expires", DataType::Int64, false),
+                Field::new("seller", DataType::Int64, false),
+                Field::new("category", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let a_batch = RecordBatch::try_new(
+                auction_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.item_name.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.description.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.initial_bid as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.reserve as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.expires as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.seller as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.category as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions.iter().map(|a| a.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let a_table = MemTable::try_new(auction_schema, vec![vec![a_batch]]).unwrap();
+            ctx.register_table("auction", Arc::new(a_table)).unwrap();
+
+            let bid_schema = Arc::new(Schema::new(vec![
+                Field::new("auction", DataType::Int64, false),
+                Field::new("bidder", DataType::Int64, false),
+                Field::new("price", DataType::Int64, false),
+                Field::new("channel", DataType::Utf8, false),
+                Field::new("url", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let b_batch = RecordBatch::try_new(
+                bid_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.auction as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.bidder as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.price as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.channel.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.url.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.date_time as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let b_table = MemTable::try_new(bid_schema, vec![vec![b_batch]]).unwrap();
+            ctx.register_table("bid", Arc::new(b_table)).unwrap();
+
+            let df = ctx.sql(&query).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let mut rows = Vec::new();
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let mut fields = Vec::new();
+                    for col in 0..batch.num_columns() {
+                        let array = batch.column(col);
+                        let val_str = if array.is_null(row) {
+                            "NULL".to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+                            (a.value(row) as i64).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringViewArray>()
+                        {
+                            a.value(row).to_string()
+                        } else {
+                            format!("{:?}", array)
+                        };
+                        fields.push(val_str);
+                    }
+                    rows.push(fields.join("\t"));
+                }
+            }
+            rows
+        }
+    };
+
+    let views = ["q20", "q21", "q22"];
+    let oracle_queries = [
+        "SELECT b.auction, b.bidder, b.price, b.date_time, a.category FROM bid b JOIN auction a ON b.auction = a.id WHERE a.category = 10",
+        "SELECT auction, bidder, CASE WHEN regexp_replace(channel, 'google|facebook', 'social') = 'social' THEN 'social_media' ELSE 'other' END as channel_id FROM bid",
+        "SELECT auction, bidder, split_part(url, '/', 4) as dir FROM bid"
+    ];
+
+    for (view, query) in views.iter().zip(oracle_queries.iter()) {
+        let psql_res = client
+            .simple_query(&format!("SELECT * FROM {view}"))
+            .await
+            .unwrap_or_else(|err| panic!("SELECT * FROM {view} failed: {err:?}"));
+        let mut psql_rows = Vec::new();
+        for msg in psql_res {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+                let mut fields = Vec::new();
+                for col in 0..r.len() {
+                    fields.push(r.get(col).unwrap_or("NULL").to_string());
+                }
+                psql_rows.push(fields.join("\t"));
+            }
+        }
+
+        let oracle_rows = run_df_oracle(query.to_string()).await;
+        let psql_set: BTreeSet<String> = psql_rows.into_iter().collect();
+        let oracle_set: BTreeSet<String> = oracle_rows.into_iter().collect();
+        assert_eq!(
+            psql_set, oracle_set,
+            "bit-identical comparison failed for {view}"
+        );
+    }
+
+    // In-process SUBSCRIBE change log verification (P3)
+    for view in &views {
+        let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
+        let mut snapshot_rows = Vec::new();
+        let prefix = format!("view_output/{view}/");
+        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
+        let has_rows = !kvs.is_empty();
+        for (k, v) in kvs {
+            snapshot_rows.push((
+                bytes::Bytes::copy_from_slice(&k),
+                bytes::Bytes::copy_from_slice(&v),
+            ));
+        }
+        let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
+        if has_rows {
+            assert!(
+                !delivered.is_empty(),
+                "SUBSCRIBE snapshot failed for {view}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 #[cfg(feature = "testcontainers")]
 async fn test_nexmark_q0_q9_minio() {
     use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
@@ -1626,4 +3675,515 @@ async fn create_minio_bucket(port: u16, bucket: &str) {
         status.is_success() || status.as_u16() == 409,
         "CreateBucket failed: {status}"
     );
+}
+
+#[tokio::test]
+#[cfg(feature = "testcontainers")]
+async fn test_nexmark_q12_q22_minio() {
+    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use object_store::aws::AmazonS3Builder;
+    use rockstream_gateway::catalog_stubs::CatalogStubs;
+    use rockstream_gateway::server::GatewayServer;
+    use rockstream_gateway::subscribe_handler::deliver_snapshot;
+    use rockstream_gateway::subscribe_parser::parse_subscribe;
+    use rockstream_storage::ShardDb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::minio::MinIO;
+
+    let minio = match MinIO::default().start().await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Docker is not available, skipping MinIO test: {:?}", e);
+            return;
+        }
+    };
+    let host = minio.get_host().await.expect("host");
+    let port = minio.get_host_port_ipv4(9000).await.expect("port");
+    create_minio_bucket(port, "testbucket").await;
+
+    let store = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint(format!("http://{host}:{port}"))
+            .with_bucket_name("testbucket")
+            .with_access_key_id("minioadmin")
+            .with_secret_access_key("minioadmin")
+            .with_allow_http(true)
+            .build()
+            .expect("S3 builder"),
+    );
+
+    let shard_db = Arc::new(
+        ShardDb::builder("nexmark-q12-q22-minio-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    // Define SQL DDL queries
+    let create_person_ddl = "CREATE TABLE person (
+        id BIGINT,
+        name VARCHAR,
+        email_address VARCHAR,
+        credit_card VARCHAR,
+        city VARCHAR,
+        state VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_auction_ddl = "CREATE TABLE auction (
+        id BIGINT,
+        item_name VARCHAR,
+        description VARCHAR,
+        initial_bid BIGINT,
+        reserve BIGINT,
+        date_time BIGINT,
+        expires BIGINT,
+        seller BIGINT,
+        category BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_bid_ddl = "CREATE TABLE bid (
+        auction BIGINT,
+        bidder BIGINT,
+        price BIGINT,
+        channel VARCHAR,
+        url VARCHAR,
+        date_time BIGINT,
+        extra VARCHAR
+    )";
+
+    let create_side_input_ddl = "CREATE TABLE side_input (
+        key BIGINT,
+        value VARCHAR
+    )";
+
+    // Run CREATE TABLE statements
+    client
+        .simple_query(create_person_ddl)
+        .await
+        .expect("CREATE TABLE person failed");
+    client
+        .simple_query(create_auction_ddl)
+        .await
+        .expect("CREATE TABLE auction failed");
+    client
+        .simple_query(create_bid_ddl)
+        .await
+        .expect("CREATE TABLE bid failed");
+    client
+        .simple_query(create_side_input_ddl)
+        .await
+        .expect("CREATE TABLE side_input failed");
+
+    // Populate side_input with static lookup data
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-side-input-init'")
+        .await
+        .expect("SET idempotency_key failed");
+    client.simple_query("BEGIN").await.unwrap();
+    for key in 0..2000 {
+        client
+            .simple_query(&format!(
+                "INSERT INTO side_input (key, value) VALUES ({key}, 'val_{key}')"
+            ))
+            .await
+            .expect("INSERT into side_input failed");
+    }
+    client.simple_query("COMMIT").await.unwrap();
+
+    // Define views
+    client
+        .simple_query("CREATE VIEW q12 AS SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("CREATE VIEW q13 AS SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("CREATE VIEW q14 AS SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("CREATE VIEW q15 AS SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("CREATE VIEW q16 AS SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("CREATE VIEW q17 AS SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("CREATE VIEW q18 AS SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("CREATE VIEW q19 AS SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) as rn FROM bid ) WHERE rn <= 10")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("CREATE VIEW q20 AS SELECT b.auction, b.bidder, b.price, b.date_time, a.category FROM bid b JOIN auction a ON b.auction = a.id WHERE a.category = 10")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("CREATE VIEW q21 AS SELECT auction, bidder, CASE WHEN regexp_replace(channel, 'google|facebook', 'social') = 'social' THEN 'social_media' ELSE 'other' END as channel_id FROM bid")
+        .await
+        .unwrap();
+
+    client
+        .simple_query(
+            "CREATE VIEW q22 AS SELECT auction, bidder, split_part(url, '/', 4) as dir FROM bid",
+        )
+        .await
+        .unwrap();
+
+    // Generate 500 events
+    let mut gen = rockstream_sim::NexmarkGenerator::new(42);
+    let mut persons = Vec::new();
+    let mut auctions = Vec::new();
+    let mut bids = Vec::new();
+    let mut inserts = Vec::new();
+
+    for _ in 0..500 {
+        let event = gen.next().unwrap();
+        match &event {
+            rockstream_sim::NexmarkEvent::Person(p) => persons.push(p.clone()),
+            rockstream_sim::NexmarkEvent::Auction(a) => auctions.push(a.clone()),
+            rockstream_sim::NexmarkEvent::Bid(b) => bids.push(b.clone()),
+        }
+        inserts.push(event.to_insert_sql());
+    }
+
+    // Set idempotency key
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-minio-batch-1'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    // Begin txn
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    for sql in inserts {
+        client.simple_query(&sql).await.expect("INSERT failed");
+    }
+    // Commit txn
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    // Define oracle runner helper
+    let run_df_oracle = |query: String| {
+        let persons = &persons;
+        let auctions = &auctions;
+        let bids = &bids;
+        async move {
+            let ctx = SessionContext::new();
+
+            let person_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("email_address", DataType::Utf8, false),
+                Field::new("credit_card", DataType::Utf8, false),
+                Field::new("city", DataType::Utf8, false),
+                Field::new("state", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let p_batch = RecordBatch::try_new(
+                person_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        persons.iter().map(|p| p.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.email_address.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons
+                            .iter()
+                            .map(|p| p.credit_card.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.city.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.state.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        persons
+                            .iter()
+                            .map(|p| p.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        persons.iter().map(|p| p.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let p_table = MemTable::try_new(person_schema, vec![vec![p_batch]]).unwrap();
+            ctx.register_table("person", Arc::new(p_table)).unwrap();
+
+            let auction_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("item_name", DataType::Utf8, false),
+                Field::new("description", DataType::Utf8, false),
+                Field::new("initial_bid", DataType::Int64, false),
+                Field::new("reserve", DataType::Int64, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("expires", DataType::Int64, false),
+                Field::new("seller", DataType::Int64, false),
+                Field::new("category", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let a_batch = RecordBatch::try_new(
+                auction_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.id as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.item_name.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.description.clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.initial_bid as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.reserve as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.date_time as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.expires as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions.iter().map(|a| a.seller as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        auctions
+                            .iter()
+                            .map(|a| a.category as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        auctions.iter().map(|a| a.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let a_table = MemTable::try_new(auction_schema, vec![vec![a_batch]]).unwrap();
+            ctx.register_table("auction", Arc::new(a_table)).unwrap();
+
+            let bid_schema = Arc::new(Schema::new(vec![
+                Field::new("auction", DataType::Int64, false),
+                Field::new("bidder", DataType::Int64, false),
+                Field::new("price", DataType::Int64, false),
+                Field::new("channel", DataType::Utf8, false),
+                Field::new("url", DataType::Utf8, false),
+                Field::new("date_time", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, false),
+            ]));
+            let b_batch = RecordBatch::try_new(
+                bid_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.auction as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.bidder as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.price as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.channel.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.url.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        bids.iter().map(|b| b.date_time as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        bids.iter().map(|b| b.extra.clone()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let b_table = MemTable::try_new(bid_schema, vec![vec![b_batch]]).unwrap();
+            ctx.register_table("bid", Arc::new(b_table)).unwrap();
+
+            let side_input_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for key in 0..2000 {
+                keys.push(key as i64);
+                values.push(format!("val_{key}"));
+            }
+            let si_batch = RecordBatch::try_new(
+                side_input_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .unwrap();
+            let si_table = MemTable::try_new(side_input_schema, vec![vec![si_batch]]).unwrap();
+            ctx.register_table("side_input", Arc::new(si_table))
+                .unwrap();
+
+            let df = ctx.sql(&query).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let mut rows = Vec::new();
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let mut fields = Vec::new();
+                    for col in 0..batch.num_columns() {
+                        let array = batch.column(col);
+                        let val_str = if array.is_null(row) {
+                            "NULL".to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+                            (a.value(row) as i64).to_string()
+                        } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+                            a.value(row).to_string()
+                        } else if let Some(a) = array
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringViewArray>()
+                        {
+                            a.value(row).to_string()
+                        } else {
+                            format!("{:?}", array)
+                        };
+                        fields.push(val_str);
+                    }
+                    rows.push(fields.join("\t"));
+                }
+            }
+            rows
+        }
+    };
+
+    // Verify q12–q22 results are bit-identical to the DataFusion batch oracle.
+    let views = [
+        "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
+    ];
+    let oracle_queries = [
+        "SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
+        "SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key",
+        "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
+        "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
+        "SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
+        "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
+        "SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1",
+        "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) as rn FROM bid ) WHERE rn <= 10",
+        "SELECT b.auction, b.bidder, b.price, b.date_time, a.category FROM bid b JOIN auction a ON b.auction = a.id WHERE a.category = 10",
+        "SELECT auction, bidder, CASE WHEN regexp_replace(channel, 'google|facebook', 'social') = 'social' THEN 'social_media' ELSE 'other' END as channel_id FROM bid",
+        "SELECT auction, bidder, split_part(url, '/', 4) as dir FROM bid"
+    ];
+
+    for (view, query) in views.iter().zip(oracle_queries.iter()) {
+        let psql_res = client
+            .simple_query(&format!("SELECT * FROM {view}"))
+            .await
+            .unwrap_or_else(|err| panic!("SELECT * FROM {view} failed: {err:?}"));
+        let mut psql_rows = Vec::new();
+        for msg in psql_res {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+                let mut fields = Vec::new();
+                for col in 0..r.len() {
+                    fields.push(r.get(col).unwrap_or("NULL").to_string());
+                }
+                psql_rows.push(fields.join("\t"));
+            }
+        }
+
+        let oracle_rows = run_df_oracle(query.to_string()).await;
+        let psql_set: BTreeSet<String> = psql_rows.into_iter().collect();
+        let oracle_set: BTreeSet<String> = oracle_rows.into_iter().collect();
+        assert_eq!(
+            psql_set, oracle_set,
+            "bit-identical comparison failed for {view}"
+        );
+    }
+
+    // In-process SUBSCRIBE change log verification (P3)
+    for view in &views {
+        let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
+        let mut snapshot_rows = Vec::new();
+        let prefix = format!("view_output/{view}/");
+        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
+        let has_rows = !kvs.is_empty();
+        for (k, v) in kvs {
+            snapshot_rows.push((
+                bytes::Bytes::copy_from_slice(&k),
+                bytes::Bytes::copy_from_slice(&v),
+            ));
+        }
+        let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
+        if has_rows {
+            assert!(
+                !delivered.is_empty(),
+                "SUBSCRIBE snapshot failed for {view}"
+            );
+        }
+    }
 }

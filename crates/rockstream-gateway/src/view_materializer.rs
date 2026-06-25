@@ -498,6 +498,11 @@ fn array_value_to_string(array: &dyn arrow::array::Array, row: usize) -> String 
             .downcast_ref::<LargeStringArray>()
             .map(|a| a.value(row).to_string())
             .unwrap_or_default(),
+        DataType::Utf8View => array
+            .as_any()
+            .downcast_ref::<arrow::array::StringViewArray>()
+            .map(|a| a.value(row).to_string())
+            .unwrap_or_default(),
         _ => format!("{:?}", array.data_type()),
     }
 }

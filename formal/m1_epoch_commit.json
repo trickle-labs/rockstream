@@ -2,22 +2,22 @@
   "sourceInfo": {
     "fileName": "m1_epoch_commit.fizz",
     "start": {
-      "line": 5,
+      "line": 10,
       "column": 1
     },
     "end": {
-      "line": 96
+      "line": 139
     }
   },
   "invariants": [
     {
       "sourceInfo": {
         "start": {
-          "line": 69,
+          "line": 105,
           "column": 1
         },
         "end": {
-          "line": 73
+          "line": 109
         }
       },
       "name": "M1_S1_WriteBatchAtomicity",
@@ -27,11 +27,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 71,
+            "line": 107,
             "column": 5
           },
           "end": {
-            "line": 73
+            "line": 109
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -39,21 +39,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 71,
+                "line": 107,
                 "column": 5
               },
               "end": {
-                "line": 73
+                "line": 109
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 71,
+                  "line": 107,
                   "column": 5
                 },
                 "end": {
-                  "line": 71,
+                  "line": 107,
                   "column": 15
                 }
               },
@@ -61,11 +61,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 71,
+                    "line": 107,
                     "column": 12
                   },
                   "end": {
-                    "line": 71,
+                    "line": 107,
                     "column": 15
                   }
                 },
@@ -80,11 +80,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 73,
+          "line": 109,
           "column": 1
         },
         "end": {
-          "line": 77
+          "line": 113
         }
       },
       "name": "M1_S2_PerShardFrontierMonotonicity",
@@ -94,11 +94,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 74,
+            "line": 110,
             "column": 5
           },
           "end": {
-            "line": 77
+            "line": 113
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -106,21 +106,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 74,
+                "line": 110,
                 "column": 5
               },
               "end": {
-                "line": 77
+                "line": 113
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 74,
+                  "line": 110,
                   "column": 5
                 },
                 "end": {
-                  "line": 75,
+                  "line": 111,
                   "column": 49
                 }
               },
@@ -128,11 +128,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 74,
+                    "line": 110,
                     "column": 12
                   },
                   "end": {
-                    "line": 75,
+                    "line": 111,
                     "column": 49
                   }
                 },
@@ -147,11 +147,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 77,
+          "line": 113,
           "column": 1
         },
         "end": {
-          "line": 81
+          "line": 117
         }
       },
       "name": "M1_S3_CALMClusterCommitMonotonicity",
@@ -161,11 +161,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 78,
+            "line": 114,
             "column": 5
           },
           "end": {
-            "line": 81
+            "line": 117
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -173,22 +173,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 78,
+                "line": 114,
                 "column": 5
               },
               "end": {
-                "line": 79,
+                "line": 115,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 78,
+                  "line": 114,
                   "column": 5
                 },
                 "end": {
-                  "line": 78,
+                  "line": 114,
                   "column": 105
                 }
               },
@@ -198,21 +198,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 79,
+                "line": 115,
                 "column": 5
               },
               "end": {
-                "line": 81
+                "line": 117
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 79,
+                  "line": 115,
                   "column": 5
                 },
                 "end": {
-                  "line": 79,
+                  "line": 115,
                   "column": 53
                 }
               },
@@ -220,11 +220,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 79,
+                    "line": 115,
                     "column": 12
                   },
                   "end": {
-                    "line": 79,
+                    "line": 115,
                     "column": 53
                   }
                 },
@@ -239,11 +239,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 81,
+          "line": 117,
           "column": 1
         },
         "end": {
-          "line": 85
+          "line": 121
         }
       },
       "name": "M1_S4_CALMVerifiability",
@@ -253,11 +253,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 82,
+            "line": 118,
             "column": 5
           },
           "end": {
-            "line": 85
+            "line": 121
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -265,22 +265,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 82,
+                "line": 118,
                 "column": 5
               },
               "end": {
-                "line": 83,
+                "line": 119,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 82,
+                  "line": 118,
                   "column": 5
                 },
                 "end": {
-                  "line": 82,
+                  "line": 118,
                   "column": 105
                 }
               },
@@ -290,21 +290,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 83,
+                "line": 119,
                 "column": 5
               },
               "end": {
-                "line": 85
+                "line": 121
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 83,
+                  "line": 119,
                   "column": 5
                 },
                 "end": {
-                  "line": 83,
+                  "line": 119,
                   "column": 115
                 }
               },
@@ -312,11 +312,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 83,
+                    "line": 119,
                     "column": 12
                   },
                   "end": {
-                    "line": 83,
+                    "line": 119,
                     "column": 115
                   }
                 },
@@ -331,11 +331,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 85,
+          "line": 121,
           "column": 1
         },
         "end": {
-          "line": 88
+          "line": 131
         }
       },
       "name": "M1_S5_IdempotentReplay",
@@ -345,11 +345,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 86,
+            "line": 124,
             "column": 5
           },
           "end": {
-            "line": 88
+            "line": 131
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -357,21 +357,125 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 86,
+                "line": 124,
                 "column": 5
               },
               "end": {
-                "line": 88
+                "line": 129,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 124,
+                  "column": 5
+                },
+                "end": {
+                  "line": 129,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 124,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 129,
+                      "column": 4
+                    }
+                  },
+                  "condition": "duplicate_commit_delivered",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 127,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 129,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 127,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 129,
+                            "column": 4
+                          }
+                        },
+                        "returnStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 127,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 128,
+                              "column": 65
+                            }
+                          },
+                          "pyExpr": "(persisted_epoch_0 == snapshot_epoch_0_before_dup and\n                persisted_epoch_1 == snapshot_epoch_1_before_dup)",
+                          "expr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 127,
+                                "column": 16
+                              },
+                              "end": {
+                                "line": 128,
+                                "column": 65
+                              }
+                            },
+                            "pyExpr": "(persisted_epoch_0 == snapshot_epoch_0_before_dup and\n                persisted_epoch_1 == snapshot_epoch_1_before_dup)"
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 124,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 124,
+                        "column": 33
+                      }
+                    },
+                    "pyExpr": "duplicate_commit_delivered"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 129,
+                "column": 5
+              },
+              "end": {
+                "line": 131
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 86,
+                  "line": 129,
                   "column": 5
                 },
                 "end": {
-                  "line": 86,
+                  "line": 129,
                   "column": 15
                 }
               },
@@ -379,11 +483,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 86,
+                    "line": 129,
                     "column": 12
                   },
                   "end": {
-                    "line": 86,
+                    "line": 129,
                     "column": 15
                   }
                 },
@@ -393,16 +497,16 @@
           }
         ]
       },
-      "pyCode": "def M1_S5_IdempotentReplay():\n    return True\n\n"
+      "pyCode": "def M1_S5_IdempotentReplay():\n    # D6.5: After a duplicate commit delivery, the shard state must not change.\n    # Snapshot before duplicate is taken in DuplicateCommit0/1 actions.\n    if duplicate_commit_delivered:\n        # The persisted epoch must equal the snapshot taken before the dup\n        # (i.e. the duplicate had no effect on shard state).\n        return (persisted_epoch_0 == snapshot_epoch_0_before_dup and\n                persisted_epoch_1 == snapshot_epoch_1_before_dup)\n    return True\n\n"
     },
     {
       "sourceInfo": {
         "start": {
-          "line": 88,
+          "line": 131,
           "column": 1
         },
         "end": {
-          "line": 92
+          "line": 135
         }
       },
       "name": "M1_L1_EpochProgress",
@@ -413,11 +517,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 89,
+            "line": 132,
             "column": 5
           },
           "end": {
-            "line": 92
+            "line": 135
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -425,21 +529,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 89,
+                "line": 132,
                 "column": 5
               },
               "end": {
-                "line": 92
+                "line": 135
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 89,
+                  "line": 132,
                   "column": 5
                 },
                 "end": {
-                  "line": 90,
+                  "line": 133,
                   "column": 43
                 }
               },
@@ -447,11 +551,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 89,
+                    "line": 132,
                     "column": 12
                   },
                   "end": {
-                    "line": 90,
+                    "line": 133,
                     "column": 43
                   }
                 },
@@ -466,11 +570,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 92,
+          "line": 135,
           "column": 1
         },
         "end": {
-          "line": 96
+          "line": 139
         }
       },
       "name": "COV_M1",
@@ -480,11 +584,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 93,
+            "line": 136,
             "column": 5
           },
           "end": {
-            "line": 96
+            "line": 139
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -492,21 +596,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 93,
+                "line": 136,
                 "column": 5
               },
               "end": {
-                "line": 96
+                "line": 139
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 93,
+                  "line": 136,
                   "column": 5
                 },
                 "end": {
-                  "line": 95,
+                  "line": 138,
                   "column": 27
                 }
               },
@@ -514,11 +618,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 93,
+                    "line": 136,
                     "column": 12
                   },
                   "end": {
-                    "line": 95,
+                    "line": 138,
                     "column": 27
                   }
                 },
@@ -535,11 +639,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 8,
+          "line": 13,
           "column": 1
         },
         "end": {
-          "line": 20
+          "line": 30
         }
       },
       "name": "Init",
@@ -550,11 +654,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 9,
+            "line": 14,
             "column": 5
           },
           "end": {
-            "line": 20
+            "line": 30
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -562,22 +666,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 9,
+                "line": 14,
                 "column": 5
               },
               "end": {
-                "line": 10,
+                "line": 15,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 9,
+                  "line": 14,
                   "column": 5
                 },
                 "end": {
-                  "line": 9,
+                  "line": 14,
                   "column": 25
                 }
               },
@@ -587,22 +691,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 10,
+                "line": 15,
                 "column": 5
               },
               "end": {
-                "line": 11,
+                "line": 16,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 10,
+                  "line": 15,
                   "column": 5
                 },
                 "end": {
-                  "line": 10,
+                  "line": 15,
                   "column": 25
                 }
               },
@@ -612,22 +716,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 11,
+                "line": 16,
                 "column": 5
               },
               "end": {
-                "line": 12,
+                "line": 17,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 11,
+                  "line": 16,
                   "column": 5
                 },
                 "end": {
-                  "line": 11,
+                  "line": 16,
                   "column": 27
                 }
               },
@@ -637,22 +741,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 12,
+                "line": 17,
                 "column": 5
               },
               "end": {
-                "line": 13,
+                "line": 18,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 12,
+                  "line": 17,
                   "column": 5
                 },
                 "end": {
-                  "line": 12,
+                  "line": 17,
                   "column": 27
                 }
               },
@@ -662,22 +766,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 13,
+                "line": 18,
                 "column": 5
               },
               "end": {
-                "line": 15,
+                "line": 20,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 13,
+                  "line": 18,
                   "column": 5
                 },
                 "end": {
-                  "line": 13,
+                  "line": 18,
                   "column": 26
                 }
               },
@@ -687,117 +791,28 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 15,
+                "line": 20,
                 "column": 5
               },
               "end": {
-                "line": 16,
+                "line": 21,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 15,
+                  "line": 20,
                   "column": 5
                 },
                 "end": {
-                  "line": 15,
+                  "line": 20,
                   "column": 23
                 }
               },
               "code": "max_persisted_0 = 0"
             }
           },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 16,
-                "column": 5
-              },
-              "end": {
-                "line": 17,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 16,
-                  "column": 5
-                },
-                "end": {
-                  "line": 16,
-                  "column": 23
-                }
-              },
-              "code": "max_persisted_1 = 0"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 17,
-                "column": 5
-              },
-              "end": {
-                "line": 20
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 17,
-                  "column": 5
-                },
-                "end": {
-                  "line": 17,
-                  "column": 29
-                }
-              },
-              "code": "max_cluster_committed = 0"
-            }
-          }
-        ]
-      }
-    },
-    {
-      "sourceInfo": {
-        "start": {
-          "line": 20,
-          "column": 1
-        },
-        "end": {
-          "line": 34
-        }
-      },
-      "name": "CommitEpoch0",
-      "flow": "FLOW_ATOMIC",
-      "fairness": {
-        "sourceInfo": {
-          "start": {
-            "line": 20,
-            "column": 8
-          },
-          "end": {
-            "line": 20,
-            "column": 11
-          }
-        },
-        "level": "FAIRNESS_LEVEL_WEAK"
-      },
-      "block": {
-        "sourceInfo": {
-          "start": {
-            "line": 21,
-            "column": 5
-          },
-          "end": {
-            "line": 34
-          }
-        },
-        "flow": "FLOW_ATOMIC",
-        "stmts": [
           {
             "sourceInfo": {
               "start": {
@@ -809,7 +824,7 @@
                 "column": 4
               }
             },
-            "requireStmt": {
+            "pyStmt": {
               "sourceInfo": {
                 "start": {
                   "line": 21,
@@ -817,23 +832,10 @@
                 },
                 "end": {
                   "line": 21,
-                  "column": 41
+                  "column": 23
                 }
               },
-              "condition": "persisted_epoch_0 < MAX_EPOCH",
-              "conditionExpr": {
-                "sourceInfo": {
-                  "start": {
-                    "line": 21,
-                    "column": 13
-                  },
-                  "end": {
-                    "line": 21,
-                    "column": 41
-                  }
-                },
-                "pyExpr": "persisted_epoch_0 < MAX_EPOCH"
-              }
+              "code": "max_persisted_1 = 0"
             }
           },
           {
@@ -843,7 +845,7 @@
                 "column": 5
               },
               "end": {
-                "line": 23,
+                "line": 25,
                 "column": 4
               }
             },
@@ -855,6 +857,183 @@
                 },
                 "end": {
                   "line": 22,
+                  "column": 29
+                }
+              },
+              "code": "max_cluster_committed = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 25,
+                "column": 5
+              },
+              "end": {
+                "line": 26,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 25,
+                  "column": 5
+                },
+                "end": {
+                  "line": 25,
+                  "column": 38
+                }
+              },
+              "code": "duplicate_commit_delivered = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 26,
+                "column": 5
+              },
+              "end": {
+                "line": 27,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 26,
+                  "column": 5
+                },
+                "end": {
+                  "line": 26,
+                  "column": 35
+                }
+              },
+              "code": "snapshot_epoch_0_before_dup = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 27,
+                "column": 5
+              },
+              "end": {
+                "line": 30
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 27,
+                  "column": 5
+                },
+                "end": {
+                  "line": 27,
+                  "column": 35
+                }
+              },
+              "code": "snapshot_epoch_1_before_dup = 0"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 30,
+          "column": 1
+        },
+        "end": {
+          "line": 44
+        }
+      },
+      "name": "CommitEpoch0",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 30,
+            "column": 8
+          },
+          "end": {
+            "line": 30,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 31,
+            "column": 5
+          },
+          "end": {
+            "line": 44
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 31,
+                "column": 5
+              },
+              "end": {
+                "line": 32,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 31,
+                  "column": 5
+                },
+                "end": {
+                  "line": 31,
+                  "column": 41
+                }
+              },
+              "condition": "persisted_epoch_0 < MAX_EPOCH",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 31,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 31,
+                    "column": 41
+                  }
+                },
+                "pyExpr": "persisted_epoch_0 < MAX_EPOCH"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 32,
+                "column": 5
+              },
+              "end": {
+                "line": 33,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 32,
+                  "column": 5
+                },
+                "end": {
+                  "line": 32,
                   "column": 38
                 }
               },
@@ -864,22 +1043,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 23,
+                "line": 33,
                 "column": 5
               },
               "end": {
-                "line": 30,
+                "line": 40,
                 "column": 4
               }
             },
             "ifStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 23,
+                  "line": 33,
                   "column": 5
                 },
                 "end": {
-                  "line": 30,
+                  "line": 40,
                   "column": 4
                 }
               },
@@ -887,11 +1066,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 23,
+                      "line": 33,
                       "column": 8
                     },
                     "end": {
-                      "line": 30,
+                      "line": 40,
                       "column": 4
                     }
                   },
@@ -899,11 +1078,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 24,
+                        "line": 34,
                         "column": 9
                       },
                       "end": {
-                        "line": 30,
+                        "line": 40,
                         "column": 4
                       }
                     },
@@ -911,22 +1090,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 24,
+                            "line": 34,
                             "column": 9
                           },
                           "end": {
-                            "line": 25,
+                            "line": 35,
                             "column": 8
                           }
                         },
                         "pyStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 24,
+                              "line": 34,
                               "column": 9
                             },
                             "end": {
-                              "line": 24,
+                              "line": 34,
                               "column": 38
                             }
                           },
@@ -936,22 +1115,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 25,
+                            "line": 35,
                             "column": 9
                           },
                           "end": {
-                            "line": 26,
+                            "line": 36,
                             "column": 8
                           }
                         },
                         "pyStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 25,
+                              "line": 35,
                               "column": 9
                             },
                             "end": {
-                              "line": 25,
+                              "line": 35,
                               "column": 40
                             }
                           },
@@ -961,22 +1140,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 26,
+                            "line": 36,
                             "column": 9
                           },
                           "end": {
-                            "line": 30,
+                            "line": 40,
                             "column": 4
                           }
                         },
                         "ifStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 26,
+                              "line": 36,
                               "column": 9
                             },
                             "end": {
-                              "line": 30,
+                              "line": 40,
                               "column": 4
                             }
                           },
@@ -984,11 +1163,11 @@
                             {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 26,
+                                  "line": 36,
                                   "column": 12
                                 },
                                 "end": {
-                                  "line": 30,
+                                  "line": 40,
                                   "column": 4
                                 }
                               },
@@ -996,11 +1175,11 @@
                               "block": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 27,
+                                    "line": 37,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 30,
+                                    "line": 40,
                                     "column": 4
                                   }
                                 },
@@ -1008,22 +1187,22 @@
                                   {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 27,
+                                        "line": 37,
                                         "column": 13
                                       },
                                       "end": {
-                                        "line": 30,
+                                        "line": 40,
                                         "column": 4
                                       }
                                     },
                                     "pyStmt": {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 27,
+                                          "line": 37,
                                           "column": 13
                                         },
                                         "end": {
-                                          "line": 27,
+                                          "line": 37,
                                           "column": 47
                                         }
                                       },
@@ -1035,11 +1214,11 @@
                               "conditionExpr": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 26,
+                                    "line": 36,
                                     "column": 12
                                   },
                                   "end": {
-                                    "line": 26,
+                                    "line": 36,
                                     "column": 46
                                   }
                                 },
@@ -1054,11 +1233,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 23,
+                        "line": 33,
                         "column": 8
                       },
                       "end": {
-                        "line": 23,
+                        "line": 33,
                         "column": 40
                       }
                     },
@@ -1071,22 +1250,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 30,
+                "line": 40,
                 "column": 5
               },
               "end": {
-                "line": 31,
+                "line": 41,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 30,
+                  "line": 40,
                   "column": 5
                 },
                 "end": {
-                  "line": 30,
+                  "line": 40,
                   "column": 105
                 }
               },
@@ -1096,64 +1275,64 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 31,
+                "line": 41,
                 "column": 5
               },
               "end": {
-                "line": 34
+                "line": 44
               }
             },
             "ifStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 31,
+                  "line": 41,
                   "column": 5
                 },
                 "end": {
-                  "line": 34
+                  "line": 44
                 }
               },
               "branches": [
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 31,
+                      "line": 41,
                       "column": 8
                     },
                     "end": {
-                      "line": 34
+                      "line": 44
                     }
                   },
                   "condition": "cluster_committed > max_cluster_committed",
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 32,
+                        "line": 42,
                         "column": 9
                       },
                       "end": {
-                        "line": 34
+                        "line": 44
                       }
                     },
                     "stmts": [
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 32,
+                            "line": 42,
                             "column": 9
                           },
                           "end": {
-                            "line": 34
+                            "line": 44
                           }
                         },
                         "pyStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 32,
+                              "line": 42,
                               "column": 9
                             },
                             "end": {
-                              "line": 32,
+                              "line": 42,
                               "column": 49
                             }
                           },
@@ -1165,11 +1344,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 31,
+                        "line": 41,
                         "column": 8
                       },
                       "end": {
-                        "line": 31,
+                        "line": 41,
                         "column": 48
                       }
                     },
@@ -1185,11 +1364,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 34,
+          "line": 44,
           "column": 1
         },
         "end": {
-          "line": 48
+          "line": 58
         }
       },
       "name": "CommitEpoch1",
@@ -1197,11 +1376,11 @@
       "fairness": {
         "sourceInfo": {
           "start": {
-            "line": 34,
+            "line": 44,
             "column": 8
           },
           "end": {
-            "line": 34,
+            "line": 44,
             "column": 11
           }
         },
@@ -1210,11 +1389,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 35,
+            "line": 45,
             "column": 5
           },
           "end": {
-            "line": 48
+            "line": 58
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1222,22 +1401,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 35,
+                "line": 45,
                 "column": 5
               },
               "end": {
-                "line": 36,
+                "line": 46,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 35,
+                  "line": 45,
                   "column": 5
                 },
                 "end": {
-                  "line": 35,
+                  "line": 45,
                   "column": 41
                 }
               },
@@ -1245,11 +1424,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 35,
+                    "line": 45,
                     "column": 13
                   },
                   "end": {
-                    "line": 35,
+                    "line": 45,
                     "column": 41
                   }
                 },
@@ -1260,22 +1439,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 36,
+                "line": 46,
                 "column": 5
               },
               "end": {
-                "line": 37,
+                "line": 47,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 36,
+                  "line": 46,
                   "column": 5
                 },
                 "end": {
-                  "line": 36,
+                  "line": 46,
                   "column": 38
                 }
               },
@@ -1285,22 +1464,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 37,
+                "line": 47,
                 "column": 5
               },
               "end": {
-                "line": 44,
+                "line": 54,
                 "column": 4
               }
             },
             "ifStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 37,
+                  "line": 47,
                   "column": 5
                 },
                 "end": {
-                  "line": 44,
+                  "line": 54,
                   "column": 4
                 }
               },
@@ -1308,11 +1487,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 37,
+                      "line": 47,
                       "column": 8
                     },
                     "end": {
-                      "line": 44,
+                      "line": 54,
                       "column": 4
                     }
                   },
@@ -1320,11 +1499,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 38,
+                        "line": 48,
                         "column": 9
                       },
                       "end": {
-                        "line": 44,
+                        "line": 54,
                         "column": 4
                       }
                     },
@@ -1332,22 +1511,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 38,
+                            "line": 48,
                             "column": 9
                           },
                           "end": {
-                            "line": 39,
+                            "line": 49,
                             "column": 8
                           }
                         },
                         "pyStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 38,
+                              "line": 48,
                               "column": 9
                             },
                             "end": {
-                              "line": 38,
+                              "line": 48,
                               "column": 38
                             }
                           },
@@ -1357,22 +1536,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 39,
+                            "line": 49,
                             "column": 9
                           },
                           "end": {
-                            "line": 40,
+                            "line": 50,
                             "column": 8
                           }
                         },
                         "pyStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 39,
+                              "line": 49,
                               "column": 9
                             },
                             "end": {
-                              "line": 39,
+                              "line": 49,
                               "column": 40
                             }
                           },
@@ -1382,22 +1561,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 40,
+                            "line": 50,
                             "column": 9
                           },
                           "end": {
-                            "line": 44,
+                            "line": 54,
                             "column": 4
                           }
                         },
                         "ifStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 40,
+                              "line": 50,
                               "column": 9
                             },
                             "end": {
-                              "line": 44,
+                              "line": 54,
                               "column": 4
                             }
                           },
@@ -1405,11 +1584,11 @@
                             {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 40,
+                                  "line": 50,
                                   "column": 12
                                 },
                                 "end": {
-                                  "line": 44,
+                                  "line": 54,
                                   "column": 4
                                 }
                               },
@@ -1417,11 +1596,11 @@
                               "block": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 41,
+                                    "line": 51,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 44,
+                                    "line": 54,
                                     "column": 4
                                   }
                                 },
@@ -1429,22 +1608,22 @@
                                   {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 41,
+                                        "line": 51,
                                         "column": 13
                                       },
                                       "end": {
-                                        "line": 44,
+                                        "line": 54,
                                         "column": 4
                                       }
                                     },
                                     "pyStmt": {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 41,
+                                          "line": 51,
                                           "column": 13
                                         },
                                         "end": {
-                                          "line": 41,
+                                          "line": 51,
                                           "column": 47
                                         }
                                       },
@@ -1456,11 +1635,11 @@
                               "conditionExpr": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 40,
+                                    "line": 50,
                                     "column": 12
                                   },
                                   "end": {
-                                    "line": 40,
+                                    "line": 50,
                                     "column": 46
                                   }
                                 },
@@ -1475,11 +1654,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 37,
+                        "line": 47,
                         "column": 8
                       },
                       "end": {
-                        "line": 37,
+                        "line": 47,
                         "column": 40
                       }
                     },
@@ -1487,235 +1666,6 @@
                   }
                 }
               ]
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 44,
-                "column": 5
-              },
-              "end": {
-                "line": 45,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 44,
-                  "column": 5
-                },
-                "end": {
-                  "line": 44,
-                  "column": 105
-                }
-              },
-              "code": "cluster_committed = persisted_epoch_0 if persisted_epoch_0 < persisted_epoch_1 else persisted_epoch_1"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 45,
-                "column": 5
-              },
-              "end": {
-                "line": 48
-              }
-            },
-            "ifStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 45,
-                  "column": 5
-                },
-                "end": {
-                  "line": 48
-                }
-              },
-              "branches": [
-                {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 45,
-                      "column": 8
-                    },
-                    "end": {
-                      "line": 48
-                    }
-                  },
-                  "condition": "cluster_committed > max_cluster_committed",
-                  "block": {
-                    "sourceInfo": {
-                      "start": {
-                        "line": 46,
-                        "column": 9
-                      },
-                      "end": {
-                        "line": 48
-                      }
-                    },
-                    "stmts": [
-                      {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 46,
-                            "column": 9
-                          },
-                          "end": {
-                            "line": 48
-                          }
-                        },
-                        "pyStmt": {
-                          "sourceInfo": {
-                            "start": {
-                              "line": 46,
-                              "column": 9
-                            },
-                            "end": {
-                              "line": 46,
-                              "column": 49
-                            }
-                          },
-                          "code": "max_cluster_committed = cluster_committed"
-                        }
-                      }
-                    ]
-                  },
-                  "conditionExpr": {
-                    "sourceInfo": {
-                      "start": {
-                        "line": 45,
-                        "column": 8
-                      },
-                      "end": {
-                        "line": 45,
-                        "column": 48
-                      }
-                    },
-                    "pyExpr": "cluster_committed > max_cluster_committed"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
-      "sourceInfo": {
-        "start": {
-          "line": 48,
-          "column": 1
-        },
-        "end": {
-          "line": 58
-        }
-      },
-      "name": "CrashAndReplay0",
-      "flow": "FLOW_ATOMIC",
-      "fairness": {
-        "level": "FAIRNESS_LEVEL_UNFAIR"
-      },
-      "block": {
-        "sourceInfo": {
-          "start": {
-            "line": 49,
-            "column": 5
-          },
-          "end": {
-            "line": 58
-          }
-        },
-        "flow": "FLOW_ATOMIC",
-        "stmts": [
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 49,
-                "column": 5
-              },
-              "end": {
-                "line": 50,
-                "column": 4
-              }
-            },
-            "requireStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 49,
-                  "column": 5
-                },
-                "end": {
-                  "line": 49,
-                  "column": 30
-                }
-              },
-              "condition": "not crash_occurred",
-              "conditionExpr": {
-                "sourceInfo": {
-                  "start": {
-                    "line": 49,
-                    "column": 13
-                  },
-                  "end": {
-                    "line": 49,
-                    "column": 30
-                  }
-                },
-                "pyExpr": "not crash_occurred"
-              }
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 50,
-                "column": 5
-              },
-              "end": {
-                "line": 52,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 50,
-                  "column": 5
-                },
-                "end": {
-                  "line": 50,
-                  "column": 25
-                }
-              },
-              "code": "crash_occurred = True"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 52,
-                "column": 5
-              },
-              "end": {
-                "line": 54,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 52,
-                  "column": 5
-                },
-                "end": {
-                  "line": 52,
-                  "column": 27
-                }
-              },
-              "code": "worker_last_epoch_0 = 0"
             }
           },
           {
@@ -1737,10 +1687,10 @@
                 },
                 "end": {
                   "line": 54,
-                  "column": 33
+                  "column": 105
                 }
               },
-              "code": "recovered = persisted_epoch_0"
+              "code": "cluster_committed = persisted_epoch_0 if persisted_epoch_0 < persisted_epoch_1 else persisted_epoch_1"
             }
           },
           {
@@ -1774,7 +1724,7 @@
                       "line": 58
                     }
                   },
-                  "condition": "recovered >= worker_last_epoch_0",
+                  "condition": "cluster_committed > max_cluster_committed",
                   "block": {
                     "sourceInfo": {
                       "start": {
@@ -1804,10 +1754,10 @@
                             },
                             "end": {
                               "line": 56,
-                              "column": 39
+                              "column": 49
                             }
                           },
-                          "code": "worker_last_epoch_0 = recovered"
+                          "code": "max_cluster_committed = cluster_committed"
                         }
                       }
                     ]
@@ -1820,10 +1770,10 @@
                       },
                       "end": {
                         "line": 55,
-                        "column": 39
+                        "column": 48
                       }
                     },
-                    "pyExpr": "recovered >= worker_last_epoch_0"
+                    "pyExpr": "cluster_committed > max_cluster_committed"
                   }
                 }
               ]
@@ -1839,10 +1789,10 @@
           "column": 1
         },
         "end": {
-          "line": 69
+          "line": 68
         }
       },
-      "name": "CrashAndReplay1",
+      "name": "CrashAndReplay0",
       "flow": "FLOW_ATOMIC",
       "fairness": {
         "level": "FAIRNESS_LEVEL_UNFAIR"
@@ -1854,7 +1804,7 @@
             "column": 5
           },
           "end": {
-            "line": 69
+            "line": 68
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1944,7 +1894,7 @@
                   "column": 27
                 }
               },
-              "code": "worker_last_epoch_1 = 0"
+              "code": "worker_last_epoch_0 = 0"
             }
           },
           {
@@ -1969,7 +1919,7 @@
                   "column": 33
                 }
               },
-              "code": "recovered = persisted_epoch_1"
+              "code": "recovered = persisted_epoch_0"
             }
           },
           {
@@ -1979,7 +1929,7 @@
                 "column": 5
               },
               "end": {
-                "line": 69
+                "line": 68
               }
             },
             "ifStmt": {
@@ -1989,7 +1939,7 @@
                   "column": 5
                 },
                 "end": {
-                  "line": 69
+                  "line": 68
                 }
               },
               "branches": [
@@ -2000,10 +1950,10 @@
                       "column": 8
                     },
                     "end": {
-                      "line": 69
+                      "line": 68
                     }
                   },
-                  "condition": "recovered >= worker_last_epoch_1",
+                  "condition": "recovered >= worker_last_epoch_0",
                   "block": {
                     "sourceInfo": {
                       "start": {
@@ -2011,7 +1961,7 @@
                         "column": 9
                       },
                       "end": {
-                        "line": 69
+                        "line": 68
                       }
                     },
                     "stmts": [
@@ -2022,7 +1972,7 @@
                             "column": 9
                           },
                           "end": {
-                            "line": 69
+                            "line": 68
                           }
                         },
                         "pyStmt": {
@@ -2036,7 +1986,7 @@
                               "column": 39
                             }
                           },
-                          "code": "worker_last_epoch_1 = recovered"
+                          "code": "worker_last_epoch_0 = recovered"
                         }
                       }
                     ]
@@ -2052,10 +2002,831 @@
                         "column": 39
                       }
                     },
+                    "pyExpr": "recovered >= worker_last_epoch_0"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 68,
+          "column": 1
+        },
+        "end": {
+          "line": 81
+        }
+      },
+      "name": "CrashAndReplay1",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 69,
+            "column": 5
+          },
+          "end": {
+            "line": 81
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 69,
+                "column": 5
+              },
+              "end": {
+                "line": 70,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 69,
+                  "column": 5
+                },
+                "end": {
+                  "line": 69,
+                  "column": 30
+                }
+              },
+              "condition": "not crash_occurred",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 69,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 69,
+                    "column": 30
+                  }
+                },
+                "pyExpr": "not crash_occurred"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 70,
+                "column": 5
+              },
+              "end": {
+                "line": 72,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 70,
+                  "column": 5
+                },
+                "end": {
+                  "line": 70,
+                  "column": 25
+                }
+              },
+              "code": "crash_occurred = True"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 72,
+                "column": 5
+              },
+              "end": {
+                "line": 74,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 72,
+                  "column": 5
+                },
+                "end": {
+                  "line": 72,
+                  "column": 27
+                }
+              },
+              "code": "worker_last_epoch_1 = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 74,
+                "column": 5
+              },
+              "end": {
+                "line": 75,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 74,
+                  "column": 5
+                },
+                "end": {
+                  "line": 74,
+                  "column": 33
+                }
+              },
+              "code": "recovered = persisted_epoch_1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 75,
+                "column": 5
+              },
+              "end": {
+                "line": 81
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 75,
+                  "column": 5
+                },
+                "end": {
+                  "line": 81
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 75,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 81
+                    }
+                  },
+                  "condition": "recovered >= worker_last_epoch_1",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 76,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 81
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 76,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 81
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 76,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 76,
+                              "column": 39
+                            }
+                          },
+                          "code": "worker_last_epoch_1 = recovered"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 75,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 75,
+                        "column": 39
+                      }
+                    },
                     "pyExpr": "recovered >= worker_last_epoch_1"
                   }
                 }
               ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 81,
+          "column": 1
+        },
+        "end": {
+          "line": 94
+        }
+      },
+      "name": "DuplicateCommit0",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 82,
+            "column": 5
+          },
+          "end": {
+            "line": 94
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 82,
+                "column": 5
+              },
+              "end": {
+                "line": 83,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 82,
+                  "column": 5
+                },
+                "end": {
+                  "line": 82,
+                  "column": 33
+                }
+              },
+              "condition": "persisted_epoch_0 > 0",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 82,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 82,
+                    "column": 33
+                  }
+                },
+                "pyExpr": "persisted_epoch_0 > 0"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 83,
+                "column": 5
+              },
+              "end": {
+                "line": 84,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 83,
+                  "column": 5
+                },
+                "end": {
+                  "line": 83,
+                  "column": 42
+                }
+              },
+              "condition": "not duplicate_commit_delivered",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 83,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 83,
+                    "column": 42
+                  }
+                },
+                "pyExpr": "not duplicate_commit_delivered"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 84,
+                "column": 5
+              },
+              "end": {
+                "line": 85,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 84,
+                  "column": 5
+                },
+                "end": {
+                  "line": 84,
+                  "column": 51
+                }
+              },
+              "code": "snapshot_epoch_0_before_dup = persisted_epoch_0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 85,
+                "column": 5
+              },
+              "end": {
+                "line": 88,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 85,
+                  "column": 5
+                },
+                "end": {
+                  "line": 85,
+                  "column": 51
+                }
+              },
+              "code": "snapshot_epoch_1_before_dup = persisted_epoch_1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 88,
+                "column": 5
+              },
+              "end": {
+                "line": 89,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 88,
+                  "column": 5
+                },
+                "end": {
+                  "line": 88,
+                  "column": 41
+                }
+              },
+              "code": "already_persisted = persisted_epoch_0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 89,
+                "column": 5
+              },
+              "end": {
+                "line": 91,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 89,
+                  "column": 5
+                },
+                "end": {
+                  "line": 91,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 89,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 91,
+                      "column": 4
+                    }
+                  },
+                  "condition": "already_persisted >= persisted_epoch_0",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 90,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 91,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 90,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 91,
+                            "column": 4
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 90,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 90,
+                              "column": 45
+                            }
+                          },
+                          "code": "persisted_epoch_0 = already_persisted"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 89,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 89,
+                        "column": 45
+                      }
+                    },
+                    "pyExpr": "already_persisted >= persisted_epoch_0"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 91,
+                "column": 5
+              },
+              "end": {
+                "line": 94
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 91,
+                  "column": 5
+                },
+                "end": {
+                  "line": 91,
+                  "column": 37
+                }
+              },
+              "code": "duplicate_commit_delivered = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 94,
+          "column": 1
+        },
+        "end": {
+          "line": 105
+        }
+      },
+      "name": "DuplicateCommit1",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 95,
+            "column": 5
+          },
+          "end": {
+            "line": 105
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 95,
+                "column": 5
+              },
+              "end": {
+                "line": 96,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 95,
+                  "column": 5
+                },
+                "end": {
+                  "line": 95,
+                  "column": 33
+                }
+              },
+              "condition": "persisted_epoch_1 > 0",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 95,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 95,
+                    "column": 33
+                  }
+                },
+                "pyExpr": "persisted_epoch_1 > 0"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 96,
+                "column": 5
+              },
+              "end": {
+                "line": 97,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 96,
+                  "column": 5
+                },
+                "end": {
+                  "line": 96,
+                  "column": 42
+                }
+              },
+              "condition": "not duplicate_commit_delivered",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 96,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 96,
+                    "column": 42
+                  }
+                },
+                "pyExpr": "not duplicate_commit_delivered"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 97,
+                "column": 5
+              },
+              "end": {
+                "line": 98,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 97,
+                  "column": 5
+                },
+                "end": {
+                  "line": 97,
+                  "column": 51
+                }
+              },
+              "code": "snapshot_epoch_0_before_dup = persisted_epoch_0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 98,
+                "column": 5
+              },
+              "end": {
+                "line": 99,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 98,
+                  "column": 5
+                },
+                "end": {
+                  "line": 98,
+                  "column": 51
+                }
+              },
+              "code": "snapshot_epoch_1_before_dup = persisted_epoch_1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 99,
+                "column": 5
+              },
+              "end": {
+                "line": 100,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 99,
+                  "column": 5
+                },
+                "end": {
+                  "line": 99,
+                  "column": 41
+                }
+              },
+              "code": "already_persisted = persisted_epoch_1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 100,
+                "column": 5
+              },
+              "end": {
+                "line": 102,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 100,
+                  "column": 5
+                },
+                "end": {
+                  "line": 102,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 100,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 102,
+                      "column": 4
+                    }
+                  },
+                  "condition": "already_persisted >= persisted_epoch_1",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 101,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 102,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 101,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 102,
+                            "column": 4
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 101,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 101,
+                              "column": 45
+                            }
+                          },
+                          "code": "persisted_epoch_1 = already_persisted"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 100,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 100,
+                        "column": 45
+                      }
+                    },
+                    "pyExpr": "already_persisted >= persisted_epoch_1"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 102,
+                "column": 5
+              },
+              "end": {
+                "line": 105
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 102,
+                  "column": 5
+                },
+                "end": {
+                  "line": 102,
+                  "column": 37
+                }
+              },
+              "code": "duplicate_commit_delivered = True"
             }
           }
         ]
@@ -2066,21 +2837,21 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 5,
+          "line": 10,
           "column": 1
         },
         "end": {
-          "line": 8
+          "line": 13
         }
       },
       "pyStmt": {
         "sourceInfo": {
           "start": {
-            "line": 5,
+            "line": 10,
             "column": 1
           },
           "end": {
-            "line": 5,
+            "line": 10,
             "column": 13
           }
         },
