@@ -412,6 +412,7 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Mod,
     And,
     Or,
 }

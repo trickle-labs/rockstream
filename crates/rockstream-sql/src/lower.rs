@@ -77,6 +77,9 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
         }
 
         LogicalPlan::Projection(proj) => {
+            if let Some(topk_plan) = try_lower_topk_pattern(proj)? {
+                return Ok(topk_plan);
+            }
             let input = lower(&proj.input)?;
             let columns = proj
                 .expr
@@ -92,6 +95,67 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
         LogicalPlan::Aggregate(agg) => {
             let input = lower(&agg.input)?;
             let input_schema = agg.input.schema();
+
+            // Check if any group key is a date_bin tumbling window function
+            let mut date_bin_idx = None;
+            for (idx, e) in agg.group_expr.iter().enumerate() {
+                if find_date_bin(e).is_some() {
+                    date_bin_idx = Some(idx);
+                    break;
+                }
+            }
+
+            if let Some(tumble_idx) = date_bin_idx {
+                let sf = find_date_bin(&agg.group_expr[tumble_idx]).unwrap();
+                if sf.args.len() < 2 {
+                    return Err(SqlError::UnsupportedPlanNode {
+                        node_type: "date_bin_missing_args".to_string(),
+                    });
+                }
+                let window_size_ms = extract_interval_ms(&sf.args[0]).ok_or_else(|| {
+                    SqlError::UnsupportedPlanNode {
+                        node_type: "date_bin_invalid_interval".to_string(),
+                    }
+                })?;
+                let time_col =
+                    extract_column_index(&sf.args[1], input_schema).ok_or_else(|| {
+                        SqlError::UnsupportedPlanNode {
+                            node_type: "date_bin_invalid_time_col".to_string(),
+                        }
+                    })?;
+
+                let tumble_node = PlanNode::TumbleWindow {
+                    input: Box::new(input),
+                    time_col,
+                    window_size_ms,
+                    late_data_policy: rockstream_plan::LateDataPolicy::Drop,
+                };
+
+                // Re-compile group_by and aggregates with column index shifting
+                let mut group_by = Vec::new();
+                for (i, e) in agg.group_expr.iter().enumerate() {
+                    if i == tumble_idx {
+                        group_by.push(Expr::Column(0));
+                    } else {
+                        let mut lowered_e = lower_expr(e, input_schema)?;
+                        shift_expr_cols(&mut lowered_e);
+                        group_by.push(lowered_e);
+                    }
+                }
+
+                let mut aggregates = Vec::new();
+                for e in &agg.aggr_expr {
+                    let mut lowered_agg = lower_agg_expr(e, input_schema)?;
+                    shift_expr_cols(&mut lowered_agg.input);
+                    aggregates.push(lowered_agg);
+                }
+
+                return Ok(PlanNode::Aggregate {
+                    input: Box::new(tumble_node),
+                    group_by,
+                    aggregates,
+                });
+            }
 
             // DataFusion's optimizer converts `SELECT DISTINCT cols FROM t` to
             // `SELECT cols FROM t GROUP BY cols` (Aggregate with no aggregate
@@ -572,6 +636,7 @@ fn lower_binary_op(op: &DfOp) -> Result<BinaryOp, SqlError> {
         DfOp::Minus => Ok(BinaryOp::Sub),
         DfOp::Multiply => Ok(BinaryOp::Mul),
         DfOp::Divide => Ok(BinaryOp::Div),
+        DfOp::Modulo => Ok(BinaryOp::Mod),
         DfOp::And => Ok(BinaryOp::And),
         DfOp::Or => Ok(BinaryOp::Or),
         other => Err(SqlError::UnsupportedPlanNode {
@@ -1130,6 +1195,268 @@ fn resolve_views_and_snapshots(
             filter_pred,
         },
     }
+}
+
+// ─── Helper functions for time window and top-k compiling ───────────────────
+
+fn find_date_bin(expr: &DfExpr) -> Option<&datafusion::logical_expr::expr::ScalarFunction> {
+    match expr {
+        DfExpr::ScalarFunction(sf) if sf.func.name() == "date_bin" => Some(sf),
+        DfExpr::Alias(alias) => find_date_bin(&alias.expr),
+        DfExpr::Cast(cast) => find_date_bin(&cast.expr),
+        DfExpr::TryCast(cast) => find_date_bin(&cast.expr),
+        _ => None,
+    }
+}
+
+fn extract_interval_ms(expr: &DfExpr) -> Option<i64> {
+    match expr {
+        DfExpr::Literal(ScalarValue::IntervalMonthDayNano(Some(val)), _) => {
+            let ms = (val.days as i64 * 86_400_000) + (val.nanoseconds / 1_000_000);
+            Some(ms)
+        }
+        DfExpr::Literal(ScalarValue::IntervalDayTime(Some(val)), _) => {
+            let ms = (val.days as i64 * 86_400_000) + val.milliseconds as i64;
+            Some(ms)
+        }
+        DfExpr::Cast(cast) => extract_interval_ms(&cast.expr),
+        DfExpr::TryCast(cast) => extract_interval_ms(&cast.expr),
+        _ => None,
+    }
+}
+
+fn extract_column_index(expr: &DfExpr, schema: &DFSchema) -> Option<usize> {
+    match expr {
+        DfExpr::Column(col) => schema.index_of_column(col).ok(),
+        DfExpr::Cast(cast) => extract_column_index(&cast.expr, schema),
+        DfExpr::TryCast(cast) => extract_column_index(&cast.expr, schema),
+        _ => None,
+    }
+}
+
+fn shift_expr_cols(expr: &mut Expr) {
+    match expr {
+        Expr::Column(idx) => {
+            *idx += 1;
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            shift_expr_cols(left);
+            shift_expr_cols(right);
+        }
+        Expr::ScalarUdf { args, .. } => {
+            for arg in args {
+                shift_expr_cols(arg);
+            }
+        }
+        Expr::Literal(_) => {}
+    }
+}
+
+fn try_lower_topk_pattern(
+    outer_proj: &datafusion::logical_expr::Projection,
+) -> Result<Option<PlanNode>, SqlError> {
+    let mut current_input = outer_proj.input.as_ref();
+    while let LogicalPlan::SubqueryAlias(alias) = current_input {
+        current_input = &alias.input;
+    }
+
+    let filter = match current_input {
+        LogicalPlan::Filter(f) => f,
+        _ => return Ok(None),
+    };
+
+    let (rn_col, k) = match &filter.predicate {
+        DfExpr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+            datafusion::logical_expr::Operator::LtEq => {
+                if let DfExpr::Column(col) = left.as_ref() {
+                    if let DfExpr::Literal(ScalarValue::Int64(Some(k_val)), _) = right.as_ref() {
+                        (col, *k_val)
+                    } else if let DfExpr::Literal(ScalarValue::Int32(Some(k_val)), _) =
+                        right.as_ref()
+                    {
+                        (col, *k_val as i64)
+                    } else {
+                        return Ok(None);
+                    }
+                } else if let DfExpr::Column(col) = right.as_ref() {
+                    if let DfExpr::Literal(ScalarValue::Int64(Some(k_val)), _) = left.as_ref() {
+                        (col, *k_val)
+                    } else if let DfExpr::Literal(ScalarValue::Int32(Some(k_val)), _) =
+                        left.as_ref()
+                    {
+                        (col, *k_val as i64)
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            datafusion::logical_expr::Operator::Lt => {
+                if let DfExpr::Column(col) = left.as_ref() {
+                    if let DfExpr::Literal(ScalarValue::Int64(Some(k_val)), _) = right.as_ref() {
+                        (col, *k_val - 1)
+                    } else if let DfExpr::Literal(ScalarValue::Int32(Some(k_val)), _) =
+                        right.as_ref()
+                    {
+                        (col, (*k_val - 1) as i64)
+                    } else {
+                        return Ok(None);
+                    }
+                } else if let DfExpr::Column(col) = right.as_ref() {
+                    if let DfExpr::Literal(ScalarValue::Int64(Some(k_val)), _) = left.as_ref() {
+                        (col, *k_val - 1)
+                    } else if let DfExpr::Literal(ScalarValue::Int32(Some(k_val)), _) =
+                        left.as_ref()
+                    {
+                        (col, (*k_val - 1) as i64)
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    let rn_col_idx = filter.input.schema().index_of_column(rn_col).map_err(|e| {
+        SqlError::UnsupportedPlanNode {
+            node_type: format!("column_resolution_rn:{e}"),
+        }
+    })?;
+
+    let mut inner_input = filter.input.as_ref();
+    while let LogicalPlan::SubqueryAlias(alias) = inner_input {
+        inner_input = &alias.input;
+    }
+
+    let proj = match inner_input {
+        LogicalPlan::Projection(p) => p,
+        _ => return Ok(None),
+    };
+
+    let expr = &proj.expr[rn_col_idx];
+    let window_col = match expr {
+        DfExpr::Alias(alias) => &alias.expr,
+        other => other,
+    };
+
+    let col = match window_col {
+        DfExpr::Column(col) => col,
+        _ => return Ok(None),
+    };
+
+    let window_output_idx =
+        proj.input
+            .schema()
+            .index_of_column(col)
+            .map_err(|e| SqlError::UnsupportedPlanNode {
+                node_type: format!("column_resolution_window:{e}"),
+            })?;
+
+    let mut window_plan = proj.input.as_ref();
+    while let LogicalPlan::SubqueryAlias(alias) = window_plan {
+        window_plan = &alias.input;
+    }
+
+    let w = match window_plan {
+        LogicalPlan::Window(w) => w,
+        _ => return Ok(None),
+    };
+
+    let input_fields_count = w.input.schema().fields().len();
+    if window_output_idx < input_fields_count {
+        return Ok(None);
+    }
+    let window_expr_idx = window_output_idx - input_fields_count;
+    if window_expr_idx >= w.window_expr.len() {
+        return Ok(None);
+    }
+
+    let win_expr = &w.window_expr[window_expr_idx];
+    let wf = match win_expr {
+        DfExpr::WindowFunction(wf) => wf.as_ref(),
+        _ => return Ok(None),
+    };
+
+    let name = match &wf.fun {
+        WindowFunctionDefinition::WindowUDF(udwf) => udwf.name(),
+        _ => return Ok(None),
+    };
+    if name != "row_number" && name != "rank" {
+        return Ok(None);
+    }
+
+    if wf.params.order_by.is_empty() {
+        return Ok(None);
+    }
+    let sort = &wf.params.order_by[0];
+    if sort.asc {
+        return Ok(None);
+    }
+    let rank_col =
+        match &sort.expr {
+            DfExpr::Column(col) => w.input.schema().index_of_column(col).map_err(|e| {
+                SqlError::UnsupportedPlanNode {
+                    node_type: format!("column_resolution_order_by:{e}"),
+                }
+            })?,
+            _ => return Ok(None),
+        };
+
+    let mut partition_by = Vec::new();
+    for p_expr in &wf.params.partition_by {
+        if let DfExpr::Column(col) = p_expr {
+            let idx = w.input.schema().index_of_column(col).map_err(|e| {
+                SqlError::UnsupportedPlanNode {
+                    node_type: format!("column_resolution_partition_by:{e}"),
+                }
+            })?;
+            partition_by.push(idx);
+        } else {
+            return Ok(None);
+        }
+    }
+
+    let input_node = lower(&w.input)?;
+
+    let topk = PlanNode::TopK {
+        input: Box::new(input_node),
+        k: k as usize,
+        rank_col,
+        partition_by,
+    };
+
+    let mut columns = Vec::new();
+    for outer_expr in &outer_proj.expr {
+        let col = match outer_expr {
+            DfExpr::Column(c) => c,
+            DfExpr::Alias(alias) => {
+                if let DfExpr::Column(c) = alias.expr.as_ref() {
+                    c
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        };
+        let outer_col_idx = filter.input.schema().index_of_column(col).map_err(|e| {
+            SqlError::UnsupportedPlanNode {
+                node_type: format!("column_resolution_outer_proj:{e}"),
+            }
+        })?;
+        let inner_expr = &proj.expr[outer_col_idx];
+        let lowered = lower_expr(inner_expr, w.input.schema())?;
+        columns.push(lowered);
+    }
+
+    Ok(Some(PlanNode::Project {
+        input: Box::new(topk),
+        columns,
+    }))
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────

@@ -45,7 +45,7 @@ pub fn eval_i64(expr: &Expr, batch: &RecordBatch) -> Result<Vec<i64>, OpError> {
         }
 
         Expr::BinaryOp { op, left, right } => match op {
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                 let l = eval_i64(left, batch)?;
                 let r = eval_i64(right, batch)?;
                 Ok(l.into_iter()
@@ -57,6 +57,13 @@ pub fn eval_i64(expr: &Expr, batch: &RecordBatch) -> Result<Vec<i64>, OpError> {
                         BinaryOp::Div => {
                             if b != 0 {
                                 a / b
+                            } else {
+                                0
+                            }
+                        }
+                        BinaryOp::Mod => {
+                            if b != 0 {
+                                a % b
                             } else {
                                 0
                             }

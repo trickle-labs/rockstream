@@ -40,3 +40,5 @@ tokio-postgres = { workspace = true }
 async-trait = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+bytes = { workspace = true }
+

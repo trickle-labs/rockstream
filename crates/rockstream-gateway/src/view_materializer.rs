@@ -45,6 +45,7 @@ pub async fn materialize_views(
     changed_tables: &HashSet<String>,
 ) {
     if let Err(e) = try_materialize_views(catalog, shard_db, changed_tables).await {
+        eprintln!("VIEW MATERIALIZATION ERROR: {e}");
         tracing::warn!("view materialisation error (non-fatal): {e}");
     }
 }
@@ -148,10 +149,12 @@ async fn try_materialize_views(
             }
         }
 
-        shard_db
-            .write_batch(wb)
-            .await
-            .map_err(|e| format!("write({view_name}): {e}"))?;
+        if !wb.is_empty() {
+            shard_db
+                .write_batch(wb)
+                .await
+                .map_err(|e| format!("write({view_name}): {e}"))?;
+        }
 
         debug!(
             view = view_name,

@@ -4706,6 +4706,7 @@ version = "0.52.10"
 dependencies = [
  "arrow",
  "async-trait",
+ "bytes",
  "datafusion",
  "hex",
  "hmac 0.12.1",
