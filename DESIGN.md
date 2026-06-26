@@ -193,8 +193,9 @@ object storage.
 > rows back without a second round-trip (§12.8.2); and secondary indexes so
 > non-primary-key lookups on base tables do not require a full shard scan or
 > a user-managed materialized view (§13.9). Version schedule updated:
-> v0.43 extended to cover §12.8 features; secondary indexes land at v0.49
-> (new slot); v0.49–v0.54 shift to v0.50–v0.55.
+> v0.46 extended to cover §12.8 features; secondary indexes land at v0.52
+> (new slot); v0.40–v0.42 wire-protocol completion versions inserted;
+> downstream Phase 12–16 renumbered +3 (v0.43–v0.53).
 >
 > **v3.22 adds three HTAP and distributed-coordination improvements** grounded
 > in the existing frontier algebra: a `max_staleness` session parameter for
@@ -211,7 +212,7 @@ object storage.
 > or materialized-view compilation time. No operator state, no arrangement
 > shards, no `view_output/` storage — just a named SQL alias. This is the
 > Postgres-standard `CREATE VIEW` semantics and covers ad-hoc query composition,
-> building blocks for materialized views, and schema abstraction. Ships v0.40.
+> building blocks for materialized views, and schema abstraction. Ships v0.43.
 > Error codes `RS-1010`–`RS-1011` added. §5.7 and §12.1 updated.
 >
 > **v3.25 aligns user-facing terminology with four accepted ADRs** (workloads,
@@ -297,7 +298,7 @@ object storage.
 > 9. **System schema consolidation** (§12.6.1): the single canonical
 >    user-facing system schema is `rockstream_catalog`. The historical
 >    `rockstream.*` names are documented as legacy aliases scheduled for
->    removal in v0.50.
+>    removal in v0.53.
 > 10. **Error-code ranges and uniqueness** (§14.14): every `RS-XXXX` code
 >     lives in one reserved owner range and must be globally unique. CI
 >     fails on duplicates. Colliding coordinator and cold-tier codes are
@@ -401,7 +402,7 @@ attempting them would compromise the rest of the design:
   and `REPEATABLE READ` are fully supported by the existing vector-frontier
   model (§12.6) and cover the vast majority of analytical and streaming
   workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is scheduled
-  for v0.41 (Phase 14). Optimistic exact-key guarded writes for non-CRDT columns
+  for v0.51 (Phase 16). Optimistic exact-key guarded writes for non-CRDT columns
   and blind commutative writes for CRDT columns are planned pre-1.0 (§13.5.1).
   A *global* cross-shard `SERIALIZABLE` coordinator (one covering every shard)
   is an explicit non-goal. See
@@ -971,7 +972,7 @@ VIEW` opts into RockStream's IVM engine.
 | `RS-1010` | `view.inline_referenced_by_materialized` | Cannot drop inline view; one or more materialized views reference it. |
 | `RS-1011` | `view.inline_cycle_detected` | Inline view definition creates a circular reference. |
 
-**Ships**: v0.40.
+**Ships**: v0.43.
 
 ---
 
@@ -1919,7 +1920,7 @@ subsequent checkpoint.
 | `scatter_shards_pruned_total` | Shards skipped by column statistics. |
 | `shard_bloom_false_positive_total` | Shards included by Bloom that returned no matching rows. |
 
-**Ships**: v0.50 (Phase 10), after secondary indexes land at v0.49.
+**Ships**: v0.53 (Phase 16), after secondary indexes land at v0.52.
 
 ---
 
@@ -2622,7 +2623,7 @@ honored by any downstream view automatically. Tokens of disjoint source sets
 are independent; passing an unrelated token is a no-op (the wait condition
 is vacuously satisfied).
 
-The scalar single-source form previously used in v0.42 is retained on the
+The scalar single-source form previously used in v0.45 is retained on the
 wire only as the special case `source_progress.len() == 1`; the gateway
 always serializes the vector form going forward.
 
@@ -2721,7 +2722,7 @@ streaming workloads.
 | `READ COMMITTED` | Each statement pins to the latest published vector frontier at statement start. |
 | `REPEATABLE READ` | `BEGIN` pins the session to a specific vector frontier; all statements in the transaction see that snapshot. |
 | `SERIALIZABLE` | **Not supported** for cross-shard transactions (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
-| `SERIALIZABLE LOCAL` | v0.41: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
+| `SERIALIZABLE LOCAL` | v0.51: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
 
 **Optimistic write semantics** (§13.5.1): direct-write transactions may use
 optimistic exact-key guards (`RS-2008` on conflict) and blind CRDT writes
@@ -2755,8 +2756,8 @@ through the standard SQL interface.
 
 > **Legacy aliases.** Older specifications and earlier roadmap versions
 > referred to these tables under the unqualified `rockstream.*` prefix.
-> `rockstream.*` is accepted as a read-only alias through v0.45 and removed
-> in v0.50. The DLQ table previously named `rockstream_catalog.dead_letter_queue`
+> `rockstream.*` is accepted as a read-only alias through v0.48 and removed
+> in v0.53. The DLQ table previously named `rockstream_catalog.dead_letter_queue`
 > stays under `rockstream_catalog`; that naming was already correct.
 
 | Table | Source | Purpose |
@@ -3027,7 +3028,7 @@ read round-trips.
 
 #### 12.8.1 Session-Scoped Automatic Read-Your-Writes
 
-v0.42 added `wait_for=<FreshnessToken>` as an explicit per-query opt-in.
+v0.45 added `wait_for=<FreshnessToken>` as an explicit per-query opt-in.
 For OLTP patterns — write a row, then read it back — clients must thread the
 token from the write response into the next read. Standard database drivers
 do not do this, so application developers face stale reads unless they add
@@ -3096,7 +3097,7 @@ the only new state is one `Option<FreshnessToken>` per session and the
 | `session_wait_for_satisfied_ms` | Histogram: time from trigger to frontier satisfaction. |
 | `session_wait_for_timeout_total` | Count of queries that exceeded the SLO and fell through to current frontier. |
 
-**Ships**: v0.43 (extends the direct-write surface).
+**Ships**: v0.46 (extends the direct-write surface).
 
 #### 12.8.2 `INSERT ... RETURNING`
 
@@ -3136,11 +3137,11 @@ the response contains the written row as if it were a `SELECT` result.
 | Wait-for timeout | Returns `RS-2012`; partial row may be committed but not readable; client must retry with idempotency key. |
 
 `INSERT ... RETURNING` does **not** extend to `UPDATE ... RETURNING` or
-`DELETE ... RETURNING` in v0.43. Those variants require the gateway to read
+`DELETE ... RETURNING` in v0.46. Those variants require the gateway to read
 old state before the write, which adds read-modify-write latency. They ship
-at v0.35 (Phase 11 — Advanced DML & Scatter Pruning).
+at v0.45 (Phase 13 — Advanced DML & Scatter Pruning).
 
-**Ships**: v0.43 (extends the direct-write surface).
+**Ships**: v0.46 (extends the direct-write surface).
 
 #### 12.8.3 Session-Scoped Max-Staleness for Analytical Queries
 
@@ -3193,7 +3194,7 @@ attached to the cached cluster frontier.
 | `session_staleness_exceeded_total` | Count of queries where `max_staleness` was exceeded and the session fell through to the stale frontier. |
 | `session_frontier_age_ms` | Histogram: frontier age at `SELECT` time for sessions with `max_staleness` set. |
 
-**Ships**: v0.43 (extends the session ergonomics surface).
+**Ships**: v0.46 (extends the session ergonomics surface).
 
 ---
 
@@ -4859,7 +4860,7 @@ a dedicated assertion language, DLQ routing, per-row vs. batch-level
 semantics, and integration with alerting — each of which is a meaningful
 scope addition.
 
-**Planned phase.** Data quality is scheduled for **v0.39–v0.40** (Phase 13 —
+**Planned phase.** Data quality is scheduled for **v0.49–v0.50** (Phase 15 —
 Declarative Data Governance), designed as a plugin/extension layer:
 
 - `CREATE EXPECTATION <name> ON <view> AS <predicate>` DDL.
