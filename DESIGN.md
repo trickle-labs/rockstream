@@ -193,9 +193,10 @@ object storage.
 > rows back without a second round-trip (§12.8.2); and secondary indexes so
 > non-primary-key lookups on base tables do not require a full shard scan or
 > a user-managed materialized view (§13.9). Version schedule updated:
-> v0.46 extended to cover §12.8 features; secondary indexes land at v0.52
+> v0.46 extended to cover §12.8 features; secondary indexes land at v0.53
 > (new slot); v0.40–v0.42 wire-protocol completion versions inserted;
-> downstream Phase 12–16 renumbered +3 (v0.43–v0.53).
+> v0.43 FizzBee cold-tier model + simulator fidelity version inserted;
+> downstream Phase 12–16 renumbered +4 (v0.44–v0.54).
 >
 > **v3.22 adds three HTAP and distributed-coordination improvements** grounded
 > in the existing frontier algebra: a `max_staleness` session parameter for
@@ -212,7 +213,7 @@ object storage.
 > or materialized-view compilation time. No operator state, no arrangement
 > shards, no `view_output/` storage — just a named SQL alias. This is the
 > Postgres-standard `CREATE VIEW` semantics and covers ad-hoc query composition,
-> building blocks for materialized views, and schema abstraction. Ships v0.43.
+> building blocks for materialized views, and schema abstraction. Ships v0.44.
 > Error codes `RS-1010`–`RS-1011` added. §5.7 and §12.1 updated.
 >
 > **v3.25 aligns user-facing terminology with four accepted ADRs** (workloads,
@@ -298,7 +299,7 @@ object storage.
 > 9. **System schema consolidation** (§12.6.1): the single canonical
 >    user-facing system schema is `rockstream_catalog`. The historical
 >    `rockstream.*` names are documented as legacy aliases scheduled for
->    removal in v0.53.
+>    removal in v0.54.
 > 10. **Error-code ranges and uniqueness** (§14.14): every `RS-XXXX` code
 >     lives in one reserved owner range and must be globally unique. CI
 >     fails on duplicates. Colliding coordinator and cold-tier codes are
@@ -402,7 +403,7 @@ attempting them would compromise the rest of the design:
   and `REPEATABLE READ` are fully supported by the existing vector-frontier
   model (§12.6) and cover the vast majority of analytical and streaming
   workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is scheduled
-  for v0.51 (Phase 16). Optimistic exact-key guarded writes for non-CRDT columns
+  for v0.52 (Phase 16). Optimistic exact-key guarded writes for non-CRDT columns
   and blind commutative writes for CRDT columns are planned pre-1.0 (§13.5.1).
   A *global* cross-shard `SERIALIZABLE` coordinator (one covering every shard)
   is an explicit non-goal. See
@@ -972,7 +973,7 @@ VIEW` opts into RockStream's IVM engine.
 | `RS-1010` | `view.inline_referenced_by_materialized` | Cannot drop inline view; one or more materialized views reference it. |
 | `RS-1011` | `view.inline_cycle_detected` | Inline view definition creates a circular reference. |
 
-**Ships**: v0.43.
+**Ships**: v0.44.
 
 ---
 
@@ -1920,7 +1921,7 @@ subsequent checkpoint.
 | `scatter_shards_pruned_total` | Shards skipped by column statistics. |
 | `shard_bloom_false_positive_total` | Shards included by Bloom that returned no matching rows. |
 
-**Ships**: v0.53 (Phase 16), after secondary indexes land at v0.52.
+**Ships**: v0.54 (Phase 16), after secondary indexes land at v0.53.
 
 ---
 
@@ -2623,7 +2624,7 @@ honored by any downstream view automatically. Tokens of disjoint source sets
 are independent; passing an unrelated token is a no-op (the wait condition
 is vacuously satisfied).
 
-The scalar single-source form previously used in v0.45 is retained on the
+The scalar single-source form previously used in v0.46 is retained on the
 wire only as the special case `source_progress.len() == 1`; the gateway
 always serializes the vector form going forward.
 
@@ -2722,7 +2723,7 @@ streaming workloads.
 | `READ COMMITTED` | Each statement pins to the latest published vector frontier at statement start. |
 | `REPEATABLE READ` | `BEGIN` pins the session to a specific vector frontier; all statements in the transaction see that snapshot. |
 | `SERIALIZABLE` | **Not supported** for cross-shard transactions (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
-| `SERIALIZABLE LOCAL` | v0.51: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
+| `SERIALIZABLE LOCAL` | v0.52: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
 
 **Optimistic write semantics** (§13.5.1): direct-write transactions may use
 optimistic exact-key guards (`RS-2008` on conflict) and blind CRDT writes
@@ -2756,8 +2757,8 @@ through the standard SQL interface.
 
 > **Legacy aliases.** Older specifications and earlier roadmap versions
 > referred to these tables under the unqualified `rockstream.*` prefix.
-> `rockstream.*` is accepted as a read-only alias through v0.48 and removed
-> in v0.53. The DLQ table previously named `rockstream_catalog.dead_letter_queue`
+> `rockstream.*` is accepted as a read-only alias through v0.49 and removed
+> in v0.54. The DLQ table previously named `rockstream_catalog.dead_letter_queue`
 > stays under `rockstream_catalog`; that naming was already correct.
 
 | Table | Source | Purpose |
@@ -3028,7 +3029,7 @@ read round-trips.
 
 #### 12.8.1 Session-Scoped Automatic Read-Your-Writes
 
-v0.45 added `wait_for=<FreshnessToken>` as an explicit per-query opt-in.
+v0.46 added `wait_for=<FreshnessToken>` as an explicit per-query opt-in.
 For OLTP patterns — write a row, then read it back — clients must thread the
 token from the write response into the next read. Standard database drivers
 do not do this, so application developers face stale reads unless they add
@@ -3097,7 +3098,7 @@ the only new state is one `Option<FreshnessToken>` per session and the
 | `session_wait_for_satisfied_ms` | Histogram: time from trigger to frontier satisfaction. |
 | `session_wait_for_timeout_total` | Count of queries that exceeded the SLO and fell through to current frontier. |
 
-**Ships**: v0.46 (extends the direct-write surface).
+**Ships**: v0.47 (extends the direct-write surface).
 
 #### 12.8.2 `INSERT ... RETURNING`
 
@@ -3137,11 +3138,11 @@ the response contains the written row as if it were a `SELECT` result.
 | Wait-for timeout | Returns `RS-2012`; partial row may be committed but not readable; client must retry with idempotency key. |
 
 `INSERT ... RETURNING` does **not** extend to `UPDATE ... RETURNING` or
-`DELETE ... RETURNING` in v0.46. Those variants require the gateway to read
+`DELETE ... RETURNING` in v0.47. Those variants require the gateway to read
 old state before the write, which adds read-modify-write latency. They ship
-at v0.45 (Phase 13 — Advanced DML & Scatter Pruning).
+at v0.46 (Phase 13 — Advanced DML & Scatter Pruning).
 
-**Ships**: v0.46 (extends the direct-write surface).
+**Ships**: v0.47 (extends the direct-write surface).
 
 #### 12.8.3 Session-Scoped Max-Staleness for Analytical Queries
 
@@ -3194,7 +3195,7 @@ attached to the cached cluster frontier.
 | `session_staleness_exceeded_total` | Count of queries where `max_staleness` was exceeded and the session fell through to the stale frontier. |
 | `session_frontier_age_ms` | Histogram: frontier age at `SELECT` time for sessions with `max_staleness` set. |
 
-**Ships**: v0.46 (extends the session ergonomics surface).
+**Ships**: v0.47 (extends the session ergonomics surface).
 
 ---
 
@@ -3504,7 +3505,7 @@ transaction into one of five shapes:
 | Shape | Description | Pre-1.0? |
 |---|---|---:|
 | `ShardLocalSerializable` | Planner proves all reads/writes touch one shard; delegates to SlateDB transaction. | v0.41 |
-| `BlindCommutative` | All writes are registered CRDT operands with `read_dependent = false`. | v0.43+ |
+| `BlindCommutative` | All writes are registered CRDT operands with `read_dependent = false`. | v0.44+ |
 | `OptimisticExactKey` | Non-CRDT exact-key writes validated against per-row versions. | v0.41 |
 | `MixedCrdtAndOptimisticExactKey` | CRDT writes skip validation; non-CRDT exact-key writes validate. | post-1.0 |
 | `Unsupported` | Predicate reads, range reads, cross-shard uniqueness, foreign keys, or any shape requiring general serializability. Returns `RS-2009`. | No |
@@ -4087,7 +4088,7 @@ frontier lag per index.
 | `RS-2015` | `index.frontier_lag` | Index frontier lags base-table frontier by more than `index_max_lag_ms`; query fell back to base-table scan. |
 | `RS-2016` | `index.name_conflict` | `CREATE INDEX` name conflicts with existing table, view, or index name. |
 
-**Ships**: v0.49.
+**Ships**: v0.50.
 
 ---
 
@@ -4457,7 +4458,7 @@ ALTER NAMESPACE reporting PAUSE;
 ALTER NAMESPACE reporting RESUME;
 ```
 
-(In v3.27 and earlier these commands were spelled `ALTER SCHEMA`; the keyword `SCHEMA` is accepted as a deprecated alias for `NAMESPACE` through v0.45 and removed in v0.50.)
+(In v3.27 and earlier these commands were spelled `ALTER SCHEMA`; the keyword `SCHEMA` is accepted as a deprecated alias for `NAMESPACE` through v0.46 and removed in v0.51.)
 
 ### 14.11 Audit Log
 
@@ -4833,8 +4834,8 @@ The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
 adaptive per-operator parallelism**.
 
-**GA vs. Data Lake GA scope.** At v1.0 (v0.43 RC1), the cold-tier
-Iceberg/Delta sink (v0.33) and DuckDB/Spark/Trino table discovery via
+**GA vs. Data Lake GA scope.** At v1.0 (v0.54 RC1), the cold-tier
+Iceberg/Delta sink (v0.44) and DuckDB/Spark/Trino table discovery via
 registered external catalogs ship before the RC1 gate. The Iceberg REST
 Catalog server (§13.7) and the DuckLake catalog server (§13.8) remain
 post-1.0. The v1.0 positioning rests on: object-storage-native IVM, full SQL,
@@ -4860,7 +4861,7 @@ a dedicated assertion language, DLQ routing, per-row vs. batch-level
 semantics, and integration with alerting — each of which is a meaningful
 scope addition.
 
-**Planned phase.** Data quality is scheduled for **v0.49–v0.50** (Phase 15 —
+**Planned phase.** Data quality is scheduled for **v0.50–v0.51** (Phase 15 —
 Declarative Data Governance), designed as a plugin/extension layer:
 
 - `CREATE EXPECTATION <name> ON <view> AS <predicate>` DDL.
@@ -5132,15 +5133,15 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    fully exercised in simulation. Mitigation target: add
    `partial_write_probability: f64` to `SimObjectStore`'s fault model by
    v0.37; add a `PartialWriteRecoveryTest` to the law-faults corpus.
-   Status: **[UNMITIGATED]** — blocks cold-tier exactly-once claim at v0.45.
+   Status: **[MITIGATED in v0.43]** — cold-tier exactly-once claim unblocked at v0.44.
 
 2. **Kafka transactional broker timeout** — `SimNetwork` can inject message
    drops but does not model Kafka broker-side transaction timeout (which
    aborts open transactions after `transaction.timeout.ms`). Consequence:
    the `CheckBeforeCommit` recovery path for `KafkaSink` is not exercised in
    simulation. Mitigation: add a `kafka_tx_timeout_probability` fault
-   parameter to the Kafka connector simulator before v0.43.
-   Status: **[UNMITIGATED]** — blocks Kafka exactly-once claim at v0.43.
+   parameter to the Kafka connector simulator before v0.44.
+   Status: **[MITIGATED in v0.43]** — Kafka exactly-once claim unblocked at v0.44.
 
 3. **S3 LIST consistency delays** — `SimObjectStore` returns synchronously
    consistent LIST results; real S3 may return stale LIST responses for
@@ -5158,7 +5159,7 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    Status: **[DEFERRED]** — low risk in practice; gRPC handles reassembly.
 
 Each `[UNMITIGATED]` gap must be resolved before the corresponding feature
-reaches the Integration Beta gate (v0.45). Gaps are tracked in the
+reaches the Integration Beta gate (v0.46). Gaps are tracked in the
 simulation coverage matrix and the Phase 6 known-gaps list in
 IMPLEMENTATION_PLAN.md.
 

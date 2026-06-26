@@ -148,10 +148,10 @@ These names orient readers; they are not calendar commitments.
 | Postgres Pillar ✅ Done | v0.26 | Read, write, subscribe, and read-your-writes over the Postgres wire protocol. |
 | Soaks Complete ✅ Done | v0.31 | Ingestion connectors live; failure-detection, shard-reassignment, and freshness-recovery SLOs validated under real cloud pressure. |
 | Private Beta Ready ✅ Done | v0.32 | Secondary indexes enable single-digit-ms point lookups on non-primary keys; open for early-adopter onboarding. |
-| Nexmark Correctness Complete | v0.36 | Nexmark q0–q9 and q12–q22 bit-identical to DataFusion batch oracle; retraction/UPDATE correctness proven via Z-set INSERT+UPDATE+DELETE sequences through all Nexmark views. (q10 Parquet sink: Phase 12; q11 session windows: v0.47.) |
+| Nexmark Correctness Complete | v0.36 | Nexmark q0–q9 and q12–q22 bit-identical to DataFusion batch oracle; retraction/UPDATE correctness proven via Z-set INSERT+UPDATE+DELETE sequences through all Nexmark views. (q10 Parquet sink: Phase 12; q11 session windows: v0.48.) |
 | Wire Protocol Complete | v0.39 | Extended query protocol, full Postgres type OID coverage, ORM driver compatibility (SQLAlchemy, Prisma, Hibernate), PgBouncer transaction-mode pooling, protocol fuzzing, and concurrent-connection stress; any standard Postgres driver works without workarounds. |
 | Wire Protocol End-User Complete | v0.42 | SCRAM-SHA-256/MD5 password auth, driver session bootstrap, full transaction/savepoint state machine, LISTEN/NOTIFY, and a green driver-compatibility matrix (psql, psycopg3, tokio-postgres, pgx, PgJDBC, node-postgres, SQLAlchemy, Prisma); a reference application runs end-to-end over pgwire unmodified, with a ≥90% gateway coverage gate. |
-| v1.0 Release | v0.53 | All v0.1–v0.52 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged. |
+| v1.0 Release | v0.54 | All v0.1–v0.53 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged. |
 
 ---
 
@@ -269,37 +269,38 @@ integration with another process).
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.43 | Cold-Tier Sinks & Simulator Fixes | Iceberg and Delta sinks exporting periodic columnar Parquet snapshots to object storage; update `SimRuntime` to mock partial object writes; bridges RockStream to the Data Lakehouse for external engines (DuckDB, Trino, Databricks). | External engines can query RockStream-generated Iceberg tables with zero data corruption. | Unit, LFS, MinIO, TC |
-| v0.44 | Deep FinOps Optimizations | Route latency-sensitive metadata (`shard_meta/`) to AWS S3 Express One Zone; tier older compacted SSTs to S3 Standard-IA; validate running the stateless worker pool entirely on Spot/preemptible instances. | TCO benchmarks show >50% reduction in steady-state operational costs compared to v0.31. | Unit, LFS, MinIO, TC |
+| v0.43 | FizzBee Cold-Tier Protocol Model & Simulator Fidelity | Before any cold-tier sink code is written, model-check the cold-tier exactly-once commit protocol in FizzBee (binding pre-implementation requirement from v0.18); simultaneously close all three UNMITIGATED simulation fidelity gaps from DESIGN.md §17 that block cold-tier and Kafka exactly-once claims. Deliverables: `formal/m5_cold_tier_sink.fizz` with safety invariants (no duplicates, no data loss under partial-write faults, manifest-pointer atomicity) and liveness (`committed_epoch` always advances); paired runtime `assert!`s in `rockstream-connectors`; add `partial_write_probability: f64` to `SimObjectStore` and a `PartialWriteRecoveryTest` to the law-faults corpus (gap 1); add `kafka_tx_timeout_probability` fault parameter to the Kafka connector simulator (gap 2); pull forward `list_staleness_epochs` if not yet landed in v0.42 (gap 3); update DESIGN.md §17 gap statuses to `[MITIGATED]`. | `formal/m5_cold_tier_sink.fizz` is green with all safety and liveness invariants at CI-fast bounds; injecting `partial_write_probability=0.5` triggers truncated bytes and the cold-tier recovery test passes without duplicate output (new `partial_write_recovery_tests.rs`, LFS + MinIO); `kafka_tx_timeout_probability` exercises the `CheckBeforeCommit` recovery path; all three §17 simulation gaps are updated to `[MITIGATED]`; all existing workspace tests pass. | Unit, LFS, MinIO, TC |
+| v0.44 | Cold-Tier Sinks | Iceberg and Delta sinks exporting periodic columnar Parquet snapshots to object storage; bridges RockStream to the Data Lakehouse for external engines (DuckDB, Trino, Databricks). The simulator fidelity foundation from v0.43 backs all crash-recovery paths with proper partial-write fault injection. | External engines can query RockStream-generated Iceberg tables with zero data corruption; `partial_write_probability` fault injection passes without any duplicate or missing rows in the sink output. | Unit, LFS, MinIO, TC |
+| v0.45 | Deep FinOps Optimizations | Route latency-sensitive metadata (`shard_meta/`) to AWS S3 Express One Zone; tier older compacted SSTs to S3 Standard-IA; validate running the stateless worker pool entirely on Spot/preemptible instances. | TCO benchmarks show >50% reduction in steady-state operational costs compared to v0.31. | Unit, LFS, MinIO, TC |
 
 ### Phase 13 — Network Efficiency & Advanced DML
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.45 | Advanced DML & Scatter Pruning | `UPDATE … RETURNING` and `DELETE … RETURNING` (read-modify-write semantics); piggyback min/max bounds and Bloom filters onto the frontier summary to prune unneeded shards during multi-shard point lookups. | Multi-shard point reads safely bypass >90% of shards based on frontier summary Bloom filters. | Unit, LFS, MinIO, TC |
-| v0.46 | Zero-Copy IPC & AZ-Aware Shuffle | Upgrade same-host gRPC loopbacks to Apache Arrow Flight Shared Memory; make the hierarchical exchange subsystem aware of physical availability zones (AZs) to eliminate cross-AZ egress during shuffle. | Zero byte-copying observed in CPU profiles for same-host worker exchanges; cross-AZ traffic drops to near zero during shuffle phases. | Unit, LFS, MinIO, TC |
+| v0.46 | Advanced DML & Scatter Pruning | `UPDATE … RETURNING` and `DELETE … RETURNING` (read-modify-write semantics); piggyback min/max bounds and Bloom filters onto the frontier summary to prune unneeded shards during multi-shard point lookups. | Multi-shard point reads safely bypass >90% of shards based on frontier summary Bloom filters. | Unit, LFS, MinIO, TC |
+| v0.47 | Zero-Copy IPC & AZ-Aware Shuffle | Upgrade same-host gRPC loopbacks to Apache Arrow Flight Shared Memory; make the hierarchical exchange subsystem aware of physical availability zones (AZs) to eliminate cross-AZ egress during shuffle. | Zero byte-copying observed in CPU profiles for same-host worker exchanges; cross-AZ traffic drops to near zero during shuffle phases. | Unit, LFS, MinIO, TC |
 
 ### Phase 14 — Complex Analytics & Compute Tuning
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.47 | Advanced Streaming Analytics | SQL compiler support for recursive CTEs (`WITH RECURSIVE`) for graph algorithms and fixed-point IVM, lateral joins for nested JSON/arrays, and hopping/session windows. | Transitive closures and sessionization queries incrementally maintain state correctly against the correctness oracle. | Unit, LFS, MinIO, TC |
-| v0.48 | Hot-Path Compute Optimizations | WAL elision for derived intermediate operator shards; link `max_rows_per_quantum` directly to network buffer depth to provide tight backpressure coupling. | Throughput on complex DAGs increases by >30% due to reduced intermediate WAL write amplification. | Unit, LFS, MinIO, TC |
+| v0.48 | Advanced Streaming Analytics | SQL compiler support for recursive CTEs (`WITH RECURSIVE`) for graph algorithms and fixed-point IVM, lateral joins for nested JSON/arrays, and hopping/session windows. | Transitive closures and sessionization queries incrementally maintain state correctly against the correctness oracle. | Unit, LFS, MinIO, TC |
+| v0.49 | Hot-Path Compute Optimizations | WAL elision for derived intermediate operator shards; link `max_rows_per_quantum` directly to network buffer depth to provide tight backpressure coupling. | Throughput on complex DAGs increases by >30% due to reduced intermediate WAL write amplification. | Unit, LFS, MinIO, TC |
 
 ### Phase 15 — Declarative Data Governance
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.49 | Inline Expectations & Lineage Diagnostics | `CREATE EXPECTATION` syntax; specialized "Expectation Operator" injected into the DAG to evaluate rows and zero out Z-set weights for failed records before they reach `ViewSink`; hooks into `EXPLAIN INCREMENTAL ANALYZE`. | Malformed records injected into upstream sources never reach downstream `ViewSink` outputs. | Unit, LFS, MinIO, TC |
-| v0.50 | DLQ Routing & State Degradation | Transactionally forward failed rows to an internal base-table shard (canonical Dead Letter Queue); implement state degradation policies (`warn`, `degrade`, `block`); guarantee exactly-once processing for failed rows. | Failed records are durably queryable in `rockstream_catalog.dead_letter_queue` alongside exactly-once commit boundaries. | Unit, LFS, MinIO, TC |
+| v0.50 | Inline Expectations & Lineage Diagnostics | `CREATE EXPECTATION` syntax; specialized "Expectation Operator" injected into the DAG to evaluate rows and zero out Z-set weights for failed records before they reach `ViewSink`; hooks into `EXPLAIN INCREMENTAL ANALYZE`. | Malformed records injected into upstream sources never reach downstream `ViewSink` outputs. | Unit, LFS, MinIO, TC |
+| v0.51 | DLQ Routing & State Degradation | Transactionally forward failed rows to an internal base-table shard (canonical Dead Letter Queue); implement state degradation policies (`warn`, `degrade`, `block`); guarantee exactly-once processing for failed rows. | Failed records are durably queryable in `rockstream_catalog.dead_letter_queue` alongside exactly-once commit boundaries. | Unit, LFS, MinIO, TC |
 
 ### Phase 16 — Enterprise Validation & 1.0 Finalization
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.51 | Isolation & Validation Hooks | Validate non-CRDT exact-key writes against per-row versions to prevent blind overwrites; support single-shard `SERIALIZABLE LOCAL` isolation via SlateDB transactions for standard ACID transactional workflows. | Concurrent conflicting writes to the same key on a single shard correctly trigger serialization anomalies/aborts. | Unit, LFS, MinIO, TC |
-| v0.52 | Simulator Maturity & Auto-Tuning Lock | Finalize shift from bounded defaults to fully SLO-driven adaptive control loops; update `SimRuntime` to model Kafka broker-side transaction timeouts (`transaction.timeout.ms`); close final known testing gap for external-system edge cases. | Simulator accurately reproduces and recovers from aborted Kafka transaction edge-cases. | Unit, LFS, MinIO, TC |
-| v0.53 | v1.0 Release Candidate (RC1) | Activate all features from v0.1 through v0.52 simultaneously; run comprehensive chaos, performance, and scaling soak under maximum cluster pressure within a single cloud region. **v1.0 Release** milestone → tag `v1.0.0`. | No P0 or P1 bugs discovered during a 2-week continuous automated chaos cycle. | Unit, LFS, MinIO, TC |
+| v0.52 | Isolation & Validation Hooks | Validate non-CRDT exact-key writes against per-row versions to prevent blind overwrites; support single-shard `SERIALIZABLE LOCAL` isolation via SlateDB transactions for standard ACID transactional workflows. | Concurrent conflicting writes to the same key on a single shard correctly trigger serialization anomalies/aborts. | Unit, LFS, MinIO, TC |
+| v0.53 | Simulator Maturity & Auto-Tuning Lock | Finalize shift from bounded defaults to fully SLO-driven adaptive control loops; close final known testing gap for external-system edge cases. | Simulator accurately reproduces and recovers from all remaining external-system edge-cases. | Unit, LFS, MinIO, TC |
+| v0.54 | v1.0 Release Candidate (RC1) | Activate all features from v0.1 through v0.53 simultaneously; run comprehensive chaos, performance, and scaling soak under maximum cluster pressure within a single cloud region. **v1.0 Release** milestone → tag `v1.0.0`. | No P0 or P1 bugs discovered during a 2-week continuous automated chaos cycle. | Unit, LFS, MinIO, TC |
 
 ---
 
@@ -319,7 +320,8 @@ the design is verified before the implementation exists.
 | v0.20 | M4 self-fencing model (D6.1–D6.2) | `formal/m4_self_fencing.fizz` | M4-S1…S4, M4-L1…L2, COV-M4 | M4 model green (justifies writer re-election); paired `assert!`s in `rockstream-runtime` |
 | v0.21 | M3 sink-2PC model (D6.3–D6.4) + M1 duplication variant (D6.5) | `formal/m3_sink_2pc.fizz` (×3 idempotency profiles), `formal/m1_epoch_commit.fizz` (duplication) | M3-S1…S4, M3-L1, COV-M3; M1-S5 under duplication | M3 model green (M3-S3 composed with M1 `cluster_committed`); paired `assert!`s in `rockstream-connectors`, `-runtime` |
 | v0.22 | Continuous verification + findings (D6.6, DC.1–DC.4) | all `.fizz` specs, `formal/findings.md` | all M1–M4 safety + liveness | All four models green at CI-fast and relaxed bounds; path-coupling check live; counterexamples replayed forever as regression seeds |
-| v0.23–v0.53 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M4 | A coordination-protocol change without a model touch fails CI; the v0.53 RC1 gate re-runs the relaxed-bounds sweep |
+| v0.43 | M5 cold-tier exactly-once model (pre-implementation) | `formal/m5_cold_tier_sink.fizz` | M5-S1 (no duplicates under partial-write fault), M5-S2 (no data loss), M5-S3 (manifest-pointer atomicity), M5-L1 (`committed_epoch` always advances), COV-M5 | M5 model green at CI-fast bounds; all safety and liveness assertions hold; paired `assert!`s added to `rockstream-connectors`; any counterexample archived in `formal/findings.md` and replayed as a permanent `SimRuntime` regression seed |
+| v0.23–v0.54 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M5 | A coordination-protocol change without a model touch fails CI; the v0.54 RC1 gate re-runs the relaxed-bounds sweep |
 
 Every row above maps each FizzBee invariant to a paired runtime `assert!` per
 [FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6; CI cross-checks that every
@@ -346,18 +348,18 @@ build thereafter.
 | Phase 9 — Operational HTAP Ergonomics | v0.32 | Continuous verification |
 | Phase 10 — Nexmark Correctness Suite | v0.33 – v0.36 | Continuous verification |
 | Phase 11 — PostgreSQL Wire Protocol Hardening | v0.37 – v0.42 | Continuous verification |
-| Phase 12 — The Data Lake Bridge & FinOps | v0.43 – v0.44 | Continuous verification |
-| Phase 13 — Network Efficiency & Advanced DML | v0.45 – v0.46 | Continuous verification |
-| Phase 14 — Complex Analytics & Compute Tuning | v0.47 – v0.48 | Continuous verification |
-| Phase 15 — Declarative Data Governance | v0.49 – v0.50 | Continuous verification |
-| Phase 16 — Enterprise Validation & 1.0 Finalization | v0.51 – v0.53 | Continuous verification + relaxed-bounds sweep at RC1 |
+| Phase 12 — The Data Lake Bridge & FinOps | v0.43 – v0.45 | Continuous verification |
+| Phase 13 — Network Efficiency & Advanced DML | v0.46 – v0.47 | Continuous verification |
+| Phase 14 — Complex Analytics & Compute Tuning | v0.48 – v0.49 | Continuous verification |
+| Phase 15 — Declarative Data Governance | v0.50 – v0.51 | Continuous verification |
+| Phase 16 — Enterprise Validation & 1.0 Finalization | v0.52 – v0.54 | Continuous verification + relaxed-bounds sweep at RC1 |
 
-Fifty-three versions at ~6 person-weeks each is the full path from an empty
+Fifty-four versions at ~6 person-weeks each is the full path from an empty
 repository to a production-ready, enterprise-grade 1.0. The order is fixed:
 correctness on one shard is proven before distribution, distribution is made
 fault-tolerant before the Postgres layer depends on it, ingestion connectors
 and crucible soaks validate real-world pressure before HTAP ergonomics, the
 Nexmark suite certifies end-to-end correctness (including retraction/Z-set semantics) on the full stack,
 PostgreSQL wire protocol hardening (v0.37–v0.39) and end-user certification (v0.40–v0.42) ensure any standard driver works without workarounds and that a complete application can be built on the wire protocol alone,
-and the data lake bridge, network optimizations, complex analytics, and data
-governance layers close out 1.0 through v0.53.
+and the data lake bridge (with its FizzBee pre-model and simulator fidelity foundation at v0.43), network optimizations, complex analytics, and data
+governance layers close out 1.0 through v0.54.

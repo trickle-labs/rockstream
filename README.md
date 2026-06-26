@@ -136,7 +136,7 @@ commutativity — or an explicit machine-readable reason why it cannot.
 
 When a merge law is in effect, RockStream can apply partial aggregates directly in
 storage without a read-modify-write cycle, push combining steps to the producer
-side of a network shuffle, and prune compaction safely. Starting at v0.46, you can
+side of a network shuffle, and prune compaction safely. Starting at v0.47, you can
 define your own **CRDT column types** — counters, sets, last-write-wins registers —
 that merge correctly across concurrent writes by construction.
 
@@ -239,9 +239,9 @@ Each roadmap version is sized at roughly **10 person-weeks** of implementation e
 | Single-Shard Beta | v0.27 | Advanced IVM feature-complete for serious single-node testing |
 | Distributed Alpha | v0.36 | Multi-shard execution, frontier protocol, recovery, and exactly-once basics work |
 | Integration Beta | v0.42 | Postgres gateway, direct writes, and major external connectors work end to end |
-| Production Beta | v0.52 | Observability, auth, upgrades, security review, and long soaks ready for a pilot |
+| Production Beta | v0.53 | Observability, auth, upgrades, security review, and long soaks ready for a pilot |
 | Data Lake GA | v0.44 | Cold-tier Iceberg/Delta sinks, native Iceberg REST catalog, external tool consumption proven |
-| 1.0 | post-v0.53 | Tagged only after a real production workload succeeds without design exceptions |
+| 1.0 | post-v0.54 | Tagged only after a real production workload succeeds without design exceptions |
 
 ### Phase Summary
 

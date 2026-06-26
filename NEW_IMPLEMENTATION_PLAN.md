@@ -63,7 +63,7 @@ beyond v1.0; each slots behind an abstraction already built without a rewrite.
   point/range reads needed for correctness.
 
 The following were previously deferred and are **now scheduled** in Phases 8–14
-(v0.27–v0.43):
+(v0.27–v0.44):
 - `COPY` bulk load and first-party Kafka/S3 connectors (v0.27–v0.28).
 - Secondary indexes (v0.32) and scatter-pruning Bloom filters (v0.35).
 - `SERIALIZABLE LOCAL` transactions and optimistic exact-key writes (v0.41).
