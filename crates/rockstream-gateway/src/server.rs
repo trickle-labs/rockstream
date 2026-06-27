@@ -10,27 +10,37 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::datasource::memory::MemTable;
+use datafusion::prelude::SessionContext;
 use futures::SinkExt;
 use futures::{stream, Sink, StreamExt};
 use pgwire::api::auth::{
-    finish_authentication, save_startup_parameters_to_metadata, DefaultServerParameterProvider,
+    finish_authentication, save_startup_parameters_to_metadata, ServerParameterProvider,
     StartupHandler,
 };
-use pgwire::api::copy::CopyHandler;
+use pgwire::api::copy::{
+    send_copy_both_response, send_copy_in_response, send_copy_out_response, CopyHandler,
+};
 use pgwire::api::portal::Portal;
-use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::query::{send_execution_response, ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
     FieldInfo, QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
+use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{
     CopyData, CopyData as MsgCopyData, CopyDone, CopyDone as MsgCopyDone, CopyFail,
     CopyOutResponse as MsgCopyOutResponse,
 };
-use pgwire::messages::response::CommandComplete;
+use pgwire::messages::extendedquery::{
+    Bind, BindComplete, Close, CloseComplete, Parse, ParseComplete, PortalSuspended,
+    TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
+};
+use pgwire::messages::response::{CommandComplete, EmptyQueryResponse};
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
@@ -44,6 +54,454 @@ use crate::copy_state::{
 use crate::session::{FreshnessToken, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
+use crate::GatewayError;
+
+// Task-local storage for connection ID and portal format
+tokio::task_local! {
+    pub static CONN_ID: String;
+    pub static PORTAL_FORMAT: pgwire::api::portal::Format;
+}
+
+// ── S1 Custom Parameter Provider ──────────────────────────────────────────────
+
+#[derive(Debug, Default)]
+pub struct GatewayServerParameterProvider;
+
+impl ServerParameterProvider for GatewayServerParameterProvider {
+    fn server_parameters<C>(&self, _client: &C) -> Option<std::collections::HashMap<String, String>>
+    where
+        C: ClientInfo,
+    {
+        let mut params = std::collections::HashMap::new();
+        params.insert("server_version".to_owned(), "14.9 (RockStream)".to_owned());
+        params.insert("server_encoding".to_owned(), "UTF8".to_owned());
+        params.insert("client_encoding".to_owned(), "UTF8".to_owned());
+        params.insert("integer_datetimes".to_owned(), "on".to_owned());
+        params.insert("standard_conforming_strings".to_owned(), "on".to_owned());
+        params.insert("DateStyle".to_owned(), "ISO, YMD".to_owned());
+        params.insert("IntervalStyle".to_owned(), "postgres".to_owned());
+        Some(params)
+    }
+}
+
+// ── S2 Prepared Statement Structures ──────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    pub name: String,
+    pub sql: String,
+    pub parameter_types: Vec<Type>,
+}
+
+#[derive(Debug)]
+pub struct PreparedStatementCache {
+    catalog: Arc<CatalogStubs>,
+}
+
+#[async_trait]
+impl QueryParser for PreparedStatementCache {
+    type Statement = PreparedStatement;
+
+    async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<Self::Statement> {
+        let parameter_types = infer_parameter_types(&self.catalog, sql).await;
+        Ok(PreparedStatement {
+            name: String::new(),
+            sql: sql.to_string(),
+            parameter_types,
+        })
+    }
+}
+
+// Helper functions for parameter type inference
+async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
+    let mut indices = std::collections::BTreeSet::new();
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut max_idx = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > start {
+                if let Ok(num_str) = std::str::from_utf8(&bytes[start..i]) {
+                    if let Ok(idx) = num_str.parse::<usize>() {
+                        indices.insert(idx);
+                        if idx > max_idx {
+                            max_idx = idx;
+                        }
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    if max_idx == 0 {
+        return vec![];
+    }
+
+    let mut inferred_types = vec![Type::TEXT; max_idx];
+
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let mut explicit_casts = std::collections::HashMap::new();
+    if let Ok(statements) = sqlparser::parser::Parser::parse_sql(&dialect, sql) {
+        for stmt in &statements {
+            struct AstVisitor<'a> {
+                casts: &'a mut std::collections::HashMap<usize, Type>,
+            }
+            impl<'a> AstVisitor<'a> {
+                fn visit_expr(&mut self, expr: &sqlparser::ast::Expr) {
+                    use sqlparser::ast::{Expr, Value};
+                    match expr {
+                        Expr::Cast {
+                            expr: inner,
+                            data_type,
+                            ..
+                        } => {
+                            if let Expr::Value(v) = &**inner {
+                                if let Value::Placeholder(name) = &v.value {
+                                    if name.starts_with('$') {
+                                        if let Ok(idx) = name[1..].parse::<usize>() {
+                                            self.casts
+                                                .insert(idx, map_data_type_to_pg_type(data_type));
+                                        }
+                                    }
+                                }
+                            } else {
+                                self.visit_expr(inner);
+                            }
+                        }
+                        Expr::Nested(inner) => {
+                            self.visit_expr(inner);
+                        }
+                        Expr::BinaryOp { left, right, .. } => {
+                            self.visit_expr(left);
+                            self.visit_expr(right);
+                        }
+                        Expr::Function(func) => {
+                            use sqlparser::ast::{FunctionArg, FunctionArguments};
+                            match &func.args {
+                                FunctionArguments::List(arg_list) => {
+                                    for arg in &arg_list.args {
+                                        match arg {
+                                            FunctionArg::Unnamed(arg_expr) => {
+                                                use sqlparser::ast::FunctionArgExpr;
+                                                if let FunctionArgExpr::Expr(e) = arg_expr {
+                                                    self.visit_expr(e);
+                                                }
+                                            }
+                                            FunctionArg::Named { arg, .. } => {
+                                                use sqlparser::ast::FunctionArgExpr;
+                                                if let FunctionArgExpr::Expr(e) = arg {
+                                                    self.visit_expr(e);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Expr::InList {
+                            expr: inner, list, ..
+                        } => {
+                            self.visit_expr(inner);
+                            for e in list {
+                                self.visit_expr(e);
+                            }
+                        }
+                        Expr::Between {
+                            expr: inner,
+                            low,
+                            high,
+                            ..
+                        } => {
+                            self.visit_expr(inner);
+                            self.visit_expr(low);
+                            self.visit_expr(high);
+                        }
+                        Expr::Case {
+                            operand,
+                            conditions,
+                            else_result,
+                            ..
+                        } => {
+                            if let Some(op) = operand {
+                                self.visit_expr(op);
+                            }
+                            for cond in conditions {
+                                self.visit_expr(&cond.condition);
+                                self.visit_expr(&cond.result);
+                            }
+                            if let Some(res) = else_result {
+                                self.visit_expr(res);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut visitor = AstVisitor {
+                casts: &mut explicit_casts,
+            };
+            match stmt {
+                sqlparser::ast::Statement::Query(q) => {
+                    if let sqlparser::ast::SetExpr::Select(select) = &*q.body {
+                        for projection in &select.projection {
+                            use sqlparser::ast::SelectItem;
+                            match projection {
+                                SelectItem::UnnamedExpr(expr) => visitor.visit_expr(expr),
+                                SelectItem::ExprWithAlias { expr, .. } => visitor.visit_expr(expr),
+                                _ => {}
+                            }
+                        }
+                        if let Some(selection) = &select.selection {
+                            visitor.visit_expr(selection);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for (idx, ty) in &explicit_casts {
+        if *idx > 0 && *idx <= max_idx {
+            inferred_types[*idx - 1] = ty.clone();
+        }
+    }
+
+    let ctx = SessionContext::new();
+    for view in catalog.list_views() {
+        let mut fields = Vec::new();
+        for col in &view.columns {
+            fields.push(Field::new(
+                &col.name,
+                string_to_arrow_datatype(&col.data_type),
+                true,
+            ));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        match MemTable::try_new(schema, vec![vec![]]) {
+            Ok(mem_table) => {
+                let _ = ctx.register_table(
+                    datafusion::sql::TableReference::from(view.name.as_str()),
+                    Arc::new(mem_table),
+                );
+            }
+            Err(e) => {
+                eprintln!("Failed to create MemTable for view {}: {:?}", view.name, e);
+            }
+        }
+    }
+    for table in catalog.list_tables() {
+        let mut fields = Vec::new();
+        for col in &table.columns {
+            fields.push(Field::new(
+                &col.name,
+                string_to_arrow_datatype(&col.data_type),
+                true,
+            ));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        match MemTable::try_new(schema, vec![vec![]]) {
+            Ok(mem_table) => {
+                let _ = ctx.register_table(
+                    datafusion::sql::TableReference::from(table.name.as_str()),
+                    Arc::new(mem_table),
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to create MemTable for table {}: {:?}",
+                    table.name, e
+                );
+            }
+        }
+    }
+
+    let mut df_inferred = std::collections::HashMap::new();
+    match ctx.sql(sql).await {
+        Ok(df) => {
+            if let Ok(opt_plan) = df.into_optimized_plan() {
+                visit_plan_expressions(&opt_plan, &mut |expr| {
+                    visit_expr_placeholders(expr, &mut |id, dt| {
+                        if id.starts_with('$') {
+                            if let Ok(idx) = id[1..].parse::<usize>() {
+                                if let Some(arrow_dt) = dt {
+                                    df_inferred.insert(idx, pg_type_from_arrow_datatype(arrow_dt));
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+        }
+        Err(e) => {
+            eprintln!("DataFusion parse/infer failed for SQL ({}): {:?}", sql, e);
+        }
+    }
+
+    for (idx, ty) in df_inferred {
+        if idx > 0 && idx <= max_idx {
+            if !explicit_casts.contains_key(&idx) {
+                inferred_types[idx - 1] = ty;
+            }
+        }
+    }
+
+    inferred_types
+}
+
+fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType {
+    use datafusion::arrow::datatypes::DataType;
+    match dt {
+        "Int32" => DataType::Int32,
+        "Int64" => DataType::Int64,
+        "Float64" => DataType::Float64,
+        "Utf8" | "LargeUtf8" => DataType::Utf8,
+        "Boolean" => DataType::Boolean,
+        "Binary" | "LargeBinary" => DataType::Binary,
+        "Timestamp" => {
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None)
+        }
+        _ => DataType::Utf8,
+    }
+}
+
+fn pg_type_from_arrow_datatype(dt: &datafusion::arrow::datatypes::DataType) -> Type {
+    use datafusion::arrow::datatypes::DataType;
+    let oid = match dt {
+        DataType::Int32 => 23,
+        DataType::Int64 => 20,
+        DataType::Float64 => 701,
+        DataType::Utf8 | DataType::LargeUtf8 => 25,
+        DataType::Boolean => 16,
+        DataType::Binary | DataType::LargeBinary => 17,
+        DataType::Timestamp(_, _) => 1114,
+        _ => 25,
+    };
+    pg_type_from_oid(oid)
+}
+
+fn map_data_type_to_pg_type(dt: &sqlparser::ast::DataType) -> Type {
+    use sqlparser::ast::DataType;
+    match dt {
+        DataType::Integer(_) => Type::INT4,
+        DataType::BigInt(_) => Type::INT8,
+        DataType::Double(..) => Type::FLOAT8,
+        DataType::Float8 => Type::FLOAT8,
+        DataType::Float(..) => Type::FLOAT4,
+        DataType::Int8(..) => Type::INT8,
+        DataType::Int4(..) => Type::INT4,
+        DataType::Int2(..) => Type::INT2,
+        DataType::Text => Type::TEXT,
+        DataType::Boolean => Type::BOOL,
+        DataType::Bytea => Type::BYTEA,
+        DataType::Custom(name, _) => {
+            let n = name.to_string().to_lowercase();
+            match n.as_str() {
+                "int4" | "integer" | "int" => Type::INT4,
+                "int8" | "bigint" => Type::INT8,
+                "float8" | "double" | "float" => Type::FLOAT8,
+                "text" | "varchar" => Type::TEXT,
+                "bool" | "boolean" => Type::BOOL,
+                "bytea" => Type::BYTEA,
+                "timestamp" => Type::TIMESTAMP,
+                _ => Type::TEXT,
+            }
+        }
+        _ => Type::TEXT,
+    }
+}
+
+fn visit_plan_expressions<F>(plan: &datafusion::logical_expr::LogicalPlan, f: &mut F)
+where
+    F: FnMut(&datafusion::logical_expr::Expr),
+{
+    use datafusion::logical_expr::LogicalPlan;
+    match plan {
+        LogicalPlan::Projection(proj) => {
+            for expr in &proj.expr {
+                f(expr);
+            }
+        }
+        LogicalPlan::Filter(filter) => {
+            f(&filter.predicate);
+        }
+        LogicalPlan::Aggregate(agg) => {
+            for expr in &agg.group_expr {
+                f(expr);
+            }
+            for expr in &agg.aggr_expr {
+                f(expr);
+            }
+        }
+        LogicalPlan::Join(join) => {
+            if let Some(expr) = &join.filter {
+                f(expr);
+            }
+        }
+        LogicalPlan::Window(window) => {
+            for expr in &window.window_expr {
+                f(expr);
+            }
+        }
+        LogicalPlan::Sort(sort) => {
+            for sort_expr in &sort.expr {
+                f(&sort_expr.expr);
+            }
+        }
+        _ => {}
+    }
+
+    for input in plan.inputs() {
+        visit_plan_expressions(input, f);
+    }
+}
+
+fn visit_expr_placeholders<F>(expr: &datafusion::logical_expr::Expr, f: &mut F)
+where
+    F: FnMut(&String, &Option<datafusion::arrow::datatypes::DataType>),
+{
+    use datafusion::logical_expr::Expr;
+    match expr {
+        Expr::Placeholder(placeholder) => {
+            let dt = placeholder
+                .field
+                .as_ref()
+                .map(|field| field.data_type().clone());
+            f(&placeholder.id, &dt);
+        }
+        _ => {
+            use datafusion::common::tree_node::TreeNode;
+            let _ = expr.apply(|e| {
+                if let Expr::Placeholder(placeholder) = e {
+                    let dt = placeholder
+                        .field
+                        .as_ref()
+                        .map(|field| field.data_type().clone());
+                    f(&placeholder.id, &dt);
+                }
+                Ok::<_, datafusion::error::DataFusionError>(
+                    datafusion::common::tree_node::TreeNodeRecursion::Continue,
+                )
+            });
+        }
+    }
+}
+
+// ── S2 metrics ────────────────────────────────────────────────────────────────
+
+pub static PREPARED_STATEMENTS_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PORTALS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // ── S9 metrics ────────────────────────────────────────────────────────────────
 
@@ -81,6 +539,14 @@ fn pg_type_from_oid(oid: i32) -> Type {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PortalState {
+    pub rows: Vec<pgwire::messages::data::DataRow>,
+    pub schema: Arc<Vec<FieldInfo>>,
+    pub command_tag: String,
+    pub offset: usize,
+}
+
 // ── GatewayHandler ────────────────────────────────────────────────────────────
 
 /// Core handler shared across all pgwire protocol phases.
@@ -89,7 +555,10 @@ fn pg_type_from_oid(oid: i32) -> Type {
 pub struct GatewayHandler {
     catalog: Arc<CatalogStubs>,
     view_reader: Arc<dyn ViewReader>,
-    query_parser: Arc<NoopQueryParser>,
+    query_parser: Arc<PreparedStatementCache>,
+    prepared_statements: Arc<DashMap<String, std::collections::HashSet<String>>>,
+    active_portals: Arc<DashMap<String, std::collections::HashSet<String>>>,
+    portal_states: Arc<DashMap<(String, String), PortalState>>, // (conn_id, portal_name) -> PortalState
     /// Per-connection write buffers keyed by connection ID.
     /// Bound: WRITE_BUFFER_LIMIT_BYTES per connection (64 MiB).
     write_buffers: Arc<DashMap<String, WriteBuffer>>,
@@ -114,9 +583,12 @@ pub struct GatewayHandler {
 impl GatewayHandler {
     pub fn new(catalog: Arc<CatalogStubs>, view_reader: Arc<dyn ViewReader>) -> Self {
         GatewayHandler {
-            catalog,
+            catalog: catalog.clone(),
             view_reader,
-            query_parser: Arc::new(NoopQueryParser),
+            query_parser: Arc::new(PreparedStatementCache { catalog }),
+            prepared_statements: Arc::new(DashMap::new()),
+            active_portals: Arc::new(DashMap::new()),
+            portal_states: Arc::new(DashMap::new()),
             write_buffers: Arc::new(DashMap::new()),
             copy_states: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
@@ -135,9 +607,12 @@ impl GatewayHandler {
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) -> Self {
         GatewayHandler {
-            catalog,
+            catalog: catalog.clone(),
             view_reader,
-            query_parser: Arc::new(NoopQueryParser),
+            query_parser: Arc::new(PreparedStatementCache { catalog }),
+            prepared_statements: Arc::new(DashMap::new()),
+            active_portals: Arc::new(DashMap::new()),
+            portal_states: Arc::new(DashMap::new()),
             write_buffers: Arc::new(DashMap::new()),
             copy_states: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
@@ -148,6 +623,91 @@ impl GatewayHandler {
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
             audit_log: None,
         }
+    }
+
+    async fn do_query_single<'a, 'b: 'a, C>(
+        &'b self,
+        client: &mut C,
+        query: &'a str,
+        conn_id: &str,
+    ) -> PgWireResult<Vec<Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
+        let ql = query.trim().to_lowercase();
+        if ql.starts_with("copy ") && ql.contains(" from stdin") {
+            return self.handle_copy_from_stdin(query, &conn_id);
+        }
+
+        // COPY OUT: stream CopyData messages directly through the client sink.
+        if ql.starts_with("copy ") && ql.contains(" to stdout") {
+            if let Some(view_name) = parse_copy_to_stdout_view(query) {
+                let rows = self
+                    .view_reader
+                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                let row_count = rows.len();
+
+                let col_count = self
+                    .catalog
+                    .get_view(&view_name)
+                    .map(|v| v.columns.len())
+                    .unwrap_or(1);
+
+                // 1. CopyOutResponse
+                let copy_out_resp =
+                    MsgCopyOutResponse::new(0, col_count as i16, vec![0i16; col_count]);
+                client
+                    .feed(PgWireBackendMessage::CopyOutResponse(copy_out_resp))
+                    .await?;
+
+                // 2. CopyData — one message per row (tab-separated text + newline)
+                for row in &rows {
+                    let mut data = row.clone();
+                    data.push(b'\n');
+                    let copy_data = MsgCopyData::new(bytes::Bytes::from(data));
+                    client
+                        .feed(PgWireBackendMessage::CopyData(copy_data))
+                        .await?;
+                }
+
+                // 3. CopyDone
+                client
+                    .feed(PgWireBackendMessage::CopyDone(MsgCopyDone::new()))
+                    .await?;
+                client.flush().await?;
+
+                // 4. Return CommandComplete — pgwire on_query will send it and
+                //    then send ReadyForQuery since state is no longer CopyInProgress.
+                return Ok(vec![Response::Execution(
+                    Tag::new(&format!("COPY {row_count}")).with_rows(row_count),
+                )]);
+            }
+        }
+
+        // DEALLOCATE [ALL] or DEALLOCATE <statement_name>
+        if ql.starts_with("deallocate") {
+            let q_trim = query.trim().trim_end_matches(';');
+            let name_part = q_trim["deallocate".len()..].trim();
+            let name_part_lower = name_part.to_lowercase();
+            if name_part_lower == "all" {
+                self.prepared_statements.remove(conn_id);
+                self.active_portals.remove(conn_id);
+                self.portal_states.retain(|k, _| k.0 != conn_id);
+            } else {
+                let stmt_name = name_part.trim_matches('"').trim_matches('\'');
+                if let Some(mut stmts) = self.prepared_statements.get_mut(conn_id) {
+                    stmts.remove(stmt_name);
+                }
+            }
+            return Ok(vec![Response::Execution(Tag::new("DEALLOCATE"))]);
+        }
+
+        self.dispatch_async_with_conn(query, Some(conn_id)).await
     }
 
     pub fn with_audit_log(mut self, log: Arc<rockstream_control::audit::FileAuditLog>) -> Self {
@@ -661,38 +1221,37 @@ impl GatewayHandler {
         let schema_fields: Vec<FieldInfo> = if let Some(cv) = self.catalog.get_view(view_name) {
             cv.columns
                 .iter()
-                .map(|c| {
+                .enumerate()
+                .map(|(idx, c)| {
                     let oid = arrow_type_to_pg_oid(&c.data_type);
-                    FieldInfo::new(
-                        c.name.clone(),
-                        None,
-                        None,
-                        pg_type_from_oid(oid),
-                        FieldFormat::Text,
-                    )
+                    let format = PORTAL_FORMAT
+                        .try_with(|f| f.format_for(idx))
+                        .unwrap_or(FieldFormat::Text);
+                    FieldInfo::new(c.name.clone(), None, None, pg_type_from_oid(oid), format)
                 })
                 .collect()
         } else if let Some(ct) = self.catalog.get_table(view_name) {
             ct.columns
                 .iter()
-                .map(|c| {
+                .enumerate()
+                .map(|(idx, c)| {
                     let oid = arrow_type_to_pg_oid(&c.data_type);
-                    FieldInfo::new(
-                        c.name.clone(),
-                        None,
-                        None,
-                        pg_type_from_oid(oid),
-                        FieldFormat::Text,
-                    )
+                    let format = PORTAL_FORMAT
+                        .try_with(|f| f.format_for(idx))
+                        .unwrap_or(FieldFormat::Text);
+                    FieldInfo::new(c.name.clone(), None, None, pg_type_from_oid(oid), format)
                 })
                 .collect()
         } else {
+            let format = PORTAL_FORMAT
+                .try_with(|f| f.format_for(0))
+                .unwrap_or(FieldFormat::Text);
             vec![FieldInfo::new(
                 "result".to_string(),
                 None,
                 None,
                 Type::TEXT,
-                FieldFormat::Text,
+                format,
             )]
         };
 
@@ -762,9 +1321,27 @@ impl GatewayHandler {
             let fields: Vec<&str> = row_str.split('\t').collect();
             for i in 0..col_count {
                 let val: Option<&str> = fields.get(i).copied();
-                encoder
-                    .encode_field(&val)
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                let datatype = schema_ref[i].datatype();
+                let encode_res = match *datatype {
+                    Type::INT8 => {
+                        let parsed = val.and_then(|s| s.parse::<i64>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::INT4 => {
+                        let parsed = val.and_then(|s| s.parse::<i32>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::FLOAT8 => {
+                        let parsed = val.and_then(|s| s.parse::<f64>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::BOOL => {
+                        let parsed = val.map(|s| s == "t" || s == "true" || s == "1");
+                        encoder.encode_field(&parsed)
+                    }
+                    _ => encoder.encode_field(&val),
+                };
+                encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             }
             encoder.finish()
         });
@@ -1758,7 +2335,13 @@ impl StartupHandler for GatewayHandler {
                 }
             }
 
-            finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
+            if let Some(conn_id) = CONN_ID.try_with(|id| id.clone()).ok() {
+                client
+                    .metadata_mut()
+                    .insert("_rs_conn_id".to_string(), conn_id);
+            }
+
+            finish_authentication(client, &GatewayServerParameterProvider::default()).await?;
         }
         Ok(())
     }
@@ -1777,7 +2360,7 @@ impl SimpleQueryHandler for GatewayHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         // Extract or generate a stable per-connection ID stored in client metadata.
-        let conn_id = {
+        let conn_id = CONN_ID.try_with(|id| id.clone()).unwrap_or_else(|_| {
             let existing = client.metadata().get("_rs_conn_id").cloned();
             if let Some(id) = existing {
                 id
@@ -1789,7 +2372,7 @@ impl SimpleQueryHandler for GatewayHandler {
                     .insert("_rs_conn_id".to_string(), id.clone());
                 id
             }
-        };
+        });
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
@@ -1808,70 +2391,377 @@ impl SimpleQueryHandler for GatewayHandler {
             }
         }
 
-        // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
-        let ql = query.trim().to_lowercase();
-        if ql.starts_with("copy ") && ql.contains(" from stdin") {
-            return self.handle_copy_from_stdin(query, &conn_id);
+        let is_empty_query = query.chars().all(|c| c.is_whitespace() || c == ';');
+        if is_empty_query {
+            return Ok(vec![Response::EmptyQuery]);
         }
 
-        // COPY OUT: stream CopyData messages directly through the client sink.
-        if ql.starts_with("copy ") && ql.contains(" to stdout") {
-            if let Some(view_name) = parse_copy_to_stdout_view(query) {
-                let rows = self
-                    .view_reader
-                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
-                    .await
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                let row_count = rows.len();
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(vec![Response::EmptyQuery]);
+        }
 
-                let col_count = self
-                    .catalog
-                    .get_view(&view_name)
-                    .map(|v| v.columns.len())
-                    .unwrap_or(1);
+        // Parse query using sqlparser to check for semicolon-separated statements.
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        if let Ok(statements) = sqlparser::parser::Parser::parse_sql(&dialect, trimmed) {
+            let active_statements: Vec<_> = statements
+                .into_iter()
+                .filter(|s| {
+                    let s_str = s.to_string();
+                    !s_str.trim().is_empty() && s_str.trim() != ";"
+                })
+                .collect();
 
-                // 1. CopyOutResponse
-                let copy_out_resp =
-                    MsgCopyOutResponse::new(0, col_count as i16, vec![0i16; col_count]);
-                client
-                    .feed(PgWireBackendMessage::CopyOutResponse(copy_out_resp))
-                    .await?;
-
-                // 2. CopyData — one message per row (tab-separated text + newline)
-                for row in &rows {
-                    let mut data = row.clone();
-                    data.push(b'\n');
-                    let copy_data = MsgCopyData::new(bytes::Bytes::from(data));
-                    client
-                        .feed(PgWireBackendMessage::CopyData(copy_data))
-                        .await?;
+            if active_statements.is_empty() {
+                return Ok(vec![Response::EmptyQuery]);
+            }
+            if active_statements.len() > 1 {
+                let mut all_responses = Vec::new();
+                for stmt in active_statements {
+                    let stmt_sql = stmt.to_string();
+                    let res = self.do_query_single(client, &stmt_sql, &conn_id).await?;
+                    for r in res {
+                        all_responses.push(promote_response(r));
+                    }
                 }
-
-                // 3. CopyDone
-                client
-                    .feed(PgWireBackendMessage::CopyDone(MsgCopyDone::new()))
-                    .await?;
-                client.flush().await?;
-
-                // 4. Return CommandComplete — pgwire on_query will send it and
-                //    then send ReadyForQuery since state is no longer CopyInProgress.
-                return Ok(vec![Response::Execution(
-                    Tag::new(&format!("COPY {row_count}")).with_rows(row_count),
-                )]);
+                let coerced: Vec<Response<'a>> = all_responses.into_iter().map(|r| r).collect();
+                return Ok(coerced);
+            } else if active_statements.len() == 1 {
+                return self.do_query_single(client, query, &conn_id).await;
             }
         }
 
-        self.dispatch_async_with_conn(query, Some(&conn_id)).await
+        self.do_query_single(client, query, &conn_id).await
     }
 }
 
 #[async_trait]
 impl ExtendedQueryHandler for GatewayHandler {
-    type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type Statement = PreparedStatement;
+    type QueryParser = PreparedStatementCache;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         self.query_parser.clone()
+    }
+
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let conn_id = client
+            .metadata()
+            .get("_rs_conn_id")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let stmt_name = message.name.clone().unwrap_or_default();
+
+        // Check prepared statements limit
+        {
+            let mut conn_stmts = self.prepared_statements.entry(conn_id.clone()).or_default();
+            if conn_stmts.len() >= 1000 && !conn_stmts.contains(&stmt_name) {
+                let err: PgWireError =
+                    GatewayError::PreparedStatementsLimitExceeded { limit: 1000 }.into();
+                return Err(err);
+            }
+            conn_stmts.insert(stmt_name.clone());
+            PREPARED_STATEMENTS_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let parser = self.query_parser();
+        let types = message
+            .type_oids
+            .iter()
+            .map(|oid| Type::from_oid(*oid).unwrap_or(Type::UNKNOWN))
+            .collect::<Vec<Type>>();
+        let parsed_stmt = parser.parse_sql(&message.query, &types).await?;
+
+        let stmt = StoredStatement::new(
+            message
+                .name
+                .clone()
+                .unwrap_or_else(|| pgwire::api::DEFAULT_NAME.to_owned()),
+            parsed_stmt,
+            types,
+        );
+
+        client.portal_store().put_statement(Arc::new(stmt));
+        client
+            .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let conn_id = client
+            .metadata()
+            .get("_rs_conn_id")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let portal_name = message.portal_name.clone().unwrap_or_default();
+
+        // Check portals limit
+        {
+            let mut conn_portals = self.active_portals.entry(conn_id.clone()).or_default();
+            if conn_portals.len() >= 1000 && !conn_portals.contains(&portal_name) {
+                let err: PgWireError = GatewayError::PortalsLimitExceeded { limit: 1000 }.into();
+                return Err(err);
+            }
+            conn_portals.insert(portal_name.clone());
+            PORTALS_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let statement_name = message
+            .statement_name
+            .as_deref()
+            .unwrap_or(pgwire::api::DEFAULT_NAME);
+
+        if let Some(statement) = client.portal_store().get_statement(statement_name) {
+            let portal = Portal::try_new(&message, statement)?;
+            client.portal_store().put_portal(Arc::new(portal));
+            self.portal_states
+                .remove(&(conn_id.clone(), portal_name.clone()));
+            client
+                .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+                .await?;
+            Ok(())
+        } else {
+            Err(PgWireError::StatementNotFound(statement_name.to_owned()))
+        }
+    }
+
+    async fn on_close<C>(&self, client: &mut C, message: Close) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let conn_id = client
+            .metadata()
+            .get("_rs_conn_id")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        match message.target_type {
+            TARGET_TYPE_BYTE_STATEMENT => {
+                client.portal_store().rm_statement(name);
+                if let Some(mut stmts) = self.prepared_statements.get_mut(&conn_id) {
+                    if stmts.remove(name) {
+                        PREPARED_STATEMENTS_COUNT.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            TARGET_TYPE_BYTE_PORTAL => {
+                client.portal_store().rm_portal(name);
+                if let Some(mut portals) = self.active_portals.get_mut(&conn_id) {
+                    if portals.remove(name) {
+                        PORTALS_COUNT.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                self.portal_states
+                    .remove(&(conn_id.clone(), name.to_string()));
+            }
+            _ => {}
+        }
+        client
+            .send(PgWireBackendMessage::CloseComplete(CloseComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_execute<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Execute,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let conn_id = client
+            .metadata()
+            .get("_rs_conn_id")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let portal_name = message
+            .name
+            .clone()
+            .unwrap_or_else(|| pgwire::api::DEFAULT_NAME.to_string());
+
+        // Get portal
+        let portal = if let Some(p) = client.portal_store().get_portal(&portal_name) {
+            p
+        } else {
+            return Err(PgWireError::PortalNotFound(portal_name));
+        };
+
+        // Make sure client connection state is set
+        client.set_state(pgwire::api::PgWireConnectionState::QueryInProgress);
+
+        let format = portal.result_column_format.clone();
+        PORTAL_FORMAT
+            .scope(format, async move {
+                // Check if we already have cached results for this portal.
+                let cached = self
+                    .portal_states
+                    .get(&(conn_id.clone(), portal_name.clone()))
+                    .map(|r| {
+                        (
+                            r.rows.clone(),
+                            r.schema.clone(),
+                            r.command_tag.clone(),
+                            r.offset,
+                        )
+                    });
+
+                let (rows, schema, command_tag, offset) = if let Some(state) = cached {
+                    state
+                } else {
+                    match ExtendedQueryHandler::do_query(
+                        self,
+                        client,
+                        portal.as_ref(),
+                        message.max_rows as usize,
+                    )
+                    .await?
+                    {
+                        Response::EmptyQuery => {
+                            client
+                                .send(PgWireBackendMessage::EmptyQueryResponse(
+                                    EmptyQueryResponse::new(),
+                                ))
+                                .await?;
+                            client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                            return Ok(());
+                        }
+                        Response::Query(results) => {
+                            let command_tag = results.command_tag().to_owned();
+                            let schema = results.row_schema();
+                            let mut data_rows = results.data_rows();
+                            let mut rows = Vec::new();
+                            while let Some(row) = data_rows.next().await {
+                                rows.push(row?);
+                            }
+
+                            let new_state = PortalState {
+                                rows: rows.clone(),
+                                schema: schema.clone(),
+                                command_tag: command_tag.clone(),
+                                offset: 0,
+                            };
+                            self.portal_states
+                                .insert((conn_id.clone(), portal_name.clone()), new_state);
+                            (rows, schema, command_tag, 0)
+                        }
+                        Response::Execution(tag) => {
+                            send_execution_response(client, tag).await?;
+                            client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                            return Ok(());
+                        }
+                        Response::TransactionStart(tag) => {
+                            send_execution_response(client, tag).await?;
+                            let mut transaction_status = client.transaction_status();
+                            transaction_status = transaction_status.to_in_transaction_state();
+                            client.set_transaction_status(transaction_status);
+                            client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                            return Ok(());
+                        }
+                        Response::TransactionEnd(tag) => {
+                            send_execution_response(client, tag).await?;
+                            let mut transaction_status = client.transaction_status();
+                            transaction_status = transaction_status.to_idle_state();
+                            client.set_transaction_status(transaction_status);
+                            client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                            return Ok(());
+                        }
+                        Response::Error(err) => {
+                            client
+                                .send(PgWireBackendMessage::ErrorResponse((*err).into()))
+                                .await?;
+                            let mut transaction_status = client.transaction_status();
+                            transaction_status = transaction_status.to_error_state();
+                            client.set_transaction_status(transaction_status);
+                            client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                            return Ok(());
+                        }
+                        Response::CopyIn(result) => {
+                            client.set_state(pgwire::api::PgWireConnectionState::CopyInProgress(
+                                true,
+                            ));
+                            send_copy_in_response(client, result).await?;
+                            return Ok(());
+                        }
+                        Response::CopyOut(result) => {
+                            client.set_state(pgwire::api::PgWireConnectionState::CopyInProgress(
+                                true,
+                            ));
+                            send_copy_out_response(client, result).await?;
+                            return Ok(());
+                        }
+                        Response::CopyBoth(result) => {
+                            client.set_state(pgwire::api::PgWireConnectionState::CopyInProgress(
+                                true,
+                            ));
+                            send_copy_both_response(client, result).await?;
+                            return Ok(());
+                        }
+                    }
+                };
+
+                let max_rows = message.max_rows as usize;
+                let limit = if max_rows > 0 {
+                    max_rows
+                } else {
+                    rows.len() - offset
+                };
+
+                let end = std::cmp::min(offset + limit, rows.len());
+                let mut rows_sent = 0;
+                for i in offset..end {
+                    client
+                        .feed(PgWireBackendMessage::DataRow(rows[i].clone()))
+                        .await?;
+                    rows_sent += 1;
+                }
+
+                let new_offset = offset + rows_sent;
+                let suspended = max_rows > 0 && new_offset < rows.len();
+
+                if suspended {
+                    if let Some(mut state) = self
+                        .portal_states
+                        .get_mut(&(conn_id.clone(), portal_name.clone()))
+                    {
+                        state.offset = new_offset;
+                    }
+                    client
+                        .send(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
+                        .await?;
+                } else {
+                    self.portal_states
+                        .remove(&(conn_id.clone(), portal_name.clone()));
+                    let tag = Tag::new(&command_tag).with_rows(rows.len());
+                    client
+                        .send(PgWireBackendMessage::CommandComplete(tag.into()))
+                        .await?;
+                }
+
+                client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                Ok(())
+            })
+            .await
     }
 
     async fn do_describe_statement<C>(
@@ -1886,8 +2776,11 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let fields = describe_fields_for_query(&self.catalog, &target.statement);
-        Ok(DescribeStatementResponse::new(vec![], fields))
+        let fields = describe_fields_for_query(&self.catalog, &target.statement.sql);
+        Ok(DescribeStatementResponse::new(
+            target.statement.parameter_types.clone(),
+            fields,
+        ))
     }
 
     async fn do_describe_portal<C>(
@@ -1902,7 +2795,7 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let fields = describe_fields_for_query(&self.catalog, target.statement.statement.as_str());
+        let fields = describe_fields_for_query(&self.catalog, &target.statement.statement.sql);
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -1920,7 +2813,7 @@ impl ExtendedQueryHandler for GatewayHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         // Ensure a stable connection ID is stored for COPY IN routing.
-        let conn_id = {
+        let conn_id = CONN_ID.try_with(|id| id.clone()).unwrap_or_else(|_| {
             let existing = client.metadata().get("_rs_conn_id").cloned();
             if let Some(id) = existing {
                 id
@@ -1932,7 +2825,7 @@ impl ExtendedQueryHandler for GatewayHandler {
                     .insert("_rs_conn_id".to_string(), id.clone());
                 id
             }
-        };
+        });
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
@@ -1951,7 +2844,7 @@ impl ExtendedQueryHandler for GatewayHandler {
             }
         }
 
-        let query = portal.statement.statement.as_str();
+        let query = portal.statement.statement.sql.as_str();
         let ql = query.trim().to_lowercase();
 
         // COPY IN via extended query protocol (e.g. tokio_postgres.copy_in()).
@@ -2334,11 +3227,23 @@ impl GatewayServer {
         loop {
             let (socket, _peer) = listener.accept().await?;
             let factory_ref = factory.clone();
-            tokio::spawn(async move {
+            use rand::Rng;
+            let conn_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
+            tokio::spawn(CONN_ID.scope(conn_id, async move {
+                let mut socket = socket;
+                let mut buf = [0u8; 8];
+                if let Ok(n) = socket.peek(&mut buf).await {
+                    if n >= 8 && buf == [0, 0, 0, 8, 4, 210, 22, 47] {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let _ = socket.read_exact(&mut buf).await;
+                        let _ = socket.write_all(b"N").await;
+                        let _ = socket.flush().await;
+                    }
+                }
                 if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
                     tracing::debug!("gateway connection error: {e}");
                 }
-            });
+            }));
         }
     }
 
@@ -2358,11 +3263,23 @@ impl GatewayServer {
                     break;
                 };
                 let factory_ref = factory.clone();
-                tokio::spawn(async move {
+                use rand::Rng;
+                let conn_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
+                tokio::spawn(CONN_ID.scope(conn_id, async move {
+                    let mut socket = socket;
+                    let mut buf = [0u8; 8];
+                    if let Ok(n) = socket.peek(&mut buf).await {
+                        if n >= 8 && buf == [0, 0, 0, 8, 4, 210, 22, 47] {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let _ = socket.read_exact(&mut buf).await;
+                            let _ = socket.write_all(b"N").await;
+                            let _ = socket.flush().await;
+                        }
+                    }
                     if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
                         tracing::debug!("gateway connection error: {e}");
                     }
-                });
+                }));
             }
         });
         Ok((local_addr, handle))
@@ -2539,9 +3456,11 @@ fn parse_copy_to_stdout_view(q: &str) -> Option<String> {
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
     if let Some(view_name) = extract_view_name_from_select(q) {
         if let Some(cv) = catalog.get_view(&view_name) {
-            return cv
+            let select_cols = infer_select_columns(q);
+            let res: Vec<FieldInfo> = cv
                 .columns
                 .iter()
+                .filter(|c| select_cols.is_empty() || select_cols.contains(&c.name.to_lowercase()))
                 .map(|c| {
                     let oid = arrow_type_to_pg_oid(&c.data_type);
                     FieldInfo::new(
@@ -2553,6 +3472,7 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
                     )
                 })
                 .collect();
+            return res;
         }
     }
     vec![]

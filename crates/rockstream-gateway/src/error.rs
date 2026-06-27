@@ -8,6 +8,12 @@ pub enum GatewayError {
     #[error("[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED or REPEATABLE READ")]
     SerializableNotSupported,
 
+    #[error("[RS-2600] limit.prepared_statements_exceeded: prepared statement limit of {limit} exceeded for this connection. next_steps: Deallocate unused prepared statements using DEALLOCATE.")]
+    PreparedStatementsLimitExceeded { limit: usize },
+
+    #[error("[RS-2601] limit.portals_exceeded: portal limit of {limit} exceeded for this connection. next_steps: Close unused portals.")]
+    PortalsLimitExceeded { limit: usize },
+
     #[error("View not found: {0}")]
     ViewNotFound(String),
 
@@ -56,6 +62,22 @@ pub enum GatewayError {
 impl From<pgwire::error::PgWireError> for GatewayError {
     fn from(e: pgwire::error::PgWireError) -> Self {
         GatewayError::PgWire(e.to_string())
+    }
+}
+
+impl From<GatewayError> for pgwire::error::PgWireError {
+    fn from(e: GatewayError) -> Self {
+        let code = match &e {
+            GatewayError::PreparedStatementsLimitExceeded { .. } => "53200".to_string(),
+            GatewayError::PortalsLimitExceeded { .. } => "53200".to_string(),
+            GatewayError::SerializableNotSupported => "25001".to_string(),
+            _ => "XX000".to_string(),
+        };
+        pgwire::error::PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+            "ERROR".to_string(),
+            code,
+            e.to_string(),
+        )))
     }
 }
 
