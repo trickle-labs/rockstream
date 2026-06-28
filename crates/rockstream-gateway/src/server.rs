@@ -152,6 +152,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         for stmt in &statements {
             struct AstVisitor<'a> {
                 casts: &'a mut std::collections::HashMap<usize, Type>,
+                in_any: bool,
             }
             impl<'a> AstVisitor<'a> {
                 fn visit_expr(&mut self, expr: &sqlparser::ast::Expr) {
@@ -174,6 +175,31 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                             } else {
                                 self.visit_expr(inner);
                             }
+                        }
+                        Expr::Value(v) => {
+                            if let Value::Placeholder(name) = &v.value {
+                                if name.starts_with('$') {
+                                    if let Ok(idx) = name[1..].parse::<usize>() {
+                                        if self.in_any {
+                                            self.casts.insert(idx, Type::TEXT_ARRAY);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Expr::AnyOp { left, right, .. } => {
+                            self.visit_expr(left);
+                            let old_any = self.in_any;
+                            self.in_any = true;
+                            self.visit_expr(right);
+                            self.in_any = old_any;
+                        }
+                        Expr::AllOp { left, right, .. } => {
+                            self.visit_expr(left);
+                            let old_any = self.in_any;
+                            self.in_any = true;
+                            self.visit_expr(right);
+                            self.in_any = old_any;
                         }
                         Expr::Nested(inner) => {
                             self.visit_expr(inner);
@@ -249,6 +275,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
 
             let mut visitor = AstVisitor {
                 casts: &mut explicit_casts,
+                in_any: false,
             };
             match stmt {
                 sqlparser::ast::Statement::Query(q) => {
@@ -362,8 +389,10 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
 fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType {
     use datafusion::arrow::datatypes::DataType;
     match dt {
+        "Int16" => DataType::Int16,
         "Int32" => DataType::Int32,
         "Int64" => DataType::Int64,
+        "Float32" => DataType::Float32,
         "Float64" => DataType::Float64,
         "Utf8" | "LargeUtf8" => DataType::Utf8,
         "Boolean" => DataType::Boolean,
@@ -371,6 +400,36 @@ fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType 
         "Timestamp" => {
             DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None)
         }
+        "TimestampTz" => DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Microsecond,
+            Some("+00:00".into()),
+        ),
+        "Date32" | "Date64" => DataType::Date32,
+        "Time32" | "Time64" => DataType::Time32(datafusion::arrow::datatypes::TimeUnit::Second),
+        "Uuid" | "UUID" => DataType::FixedSizeBinary(16),
+        "Decimal" | "Decimal128" | "Decimal256" => DataType::Decimal128(38, 10),
+        "Json" | "JSON" | "Jsonb" | "JSONB" => DataType::Utf8,
+        "Varchar" | "VARCHAR" => DataType::Utf8,
+        "Char" | "CHAR" => DataType::Utf8,
+        "Interval" => DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::MonthDayNano),
+        "_int4" | "List(Int32)" => DataType::List(std::sync::Arc::new(
+            datafusion::arrow::datatypes::Field::new("item", DataType::Int32, true),
+        )),
+        "_int8" | "List(Int64)" => DataType::List(std::sync::Arc::new(
+            datafusion::arrow::datatypes::Field::new("item", DataType::Int64, true),
+        )),
+        "_text" | "List(Utf8)" => DataType::List(std::sync::Arc::new(
+            datafusion::arrow::datatypes::Field::new("item", DataType::Utf8, true),
+        )),
+        "_float8" | "List(Float64)" => DataType::List(std::sync::Arc::new(
+            datafusion::arrow::datatypes::Field::new("item", DataType::Float64, true),
+        )),
+        "_bool" | "List(Boolean)" => DataType::List(std::sync::Arc::new(
+            datafusion::arrow::datatypes::Field::new("item", DataType::Boolean, true),
+        )),
+        "_uuid" | "List(Uuid)" => DataType::List(std::sync::Arc::new(
+            datafusion::arrow::datatypes::Field::new("item", DataType::FixedSizeBinary(16), true),
+        )),
         _ => DataType::Utf8,
     }
 }
@@ -378,13 +437,32 @@ fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType 
 fn pg_type_from_arrow_datatype(dt: &datafusion::arrow::datatypes::DataType) -> Type {
     use datafusion::arrow::datatypes::DataType;
     let oid = match dt {
+        DataType::Int16 => 21,
         DataType::Int32 => 23,
         DataType::Int64 => 20,
+        DataType::Float32 => 700,
         DataType::Float64 => 701,
         DataType::Utf8 | DataType::LargeUtf8 => 25,
         DataType::Boolean => 16,
         DataType::Binary | DataType::LargeBinary => 17,
-        DataType::Timestamp(_, _) => 1114,
+        DataType::Timestamp(_, None) => 1114,
+        DataType::Timestamp(_, Some(_)) => 1184,
+        DataType::Date32 | DataType::Date64 => 1082,
+        DataType::Time32(_) | DataType::Time64(_) => 1083,
+        DataType::FixedSizeBinary(16) => 2950,
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 1700,
+        DataType::Interval(_) | DataType::Duration(_) => 1186,
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            match field.data_type() {
+                DataType::Int32 => 1007,
+                DataType::Int64 => 1016,
+                DataType::Utf8 | DataType::LargeUtf8 => 1009,
+                DataType::Float64 => 1022,
+                DataType::Boolean => 1000,
+                DataType::FixedSizeBinary(16) => 2951,
+                _ => 1009,
+            }
+        }
         _ => 25,
     };
     pg_type_from_oid(oid)
@@ -407,17 +485,76 @@ fn map_data_type_to_pg_type(dt: &sqlparser::ast::DataType) -> Type {
         DataType::Custom(name, _) => {
             let n = name.to_string().to_lowercase();
             match n.as_str() {
+                "int2" | "smallint" => Type::INT2,
                 "int4" | "integer" | "int" => Type::INT4,
                 "int8" | "bigint" => Type::INT8,
+                "float4" | "real" => Type::FLOAT4,
                 "float8" | "double" | "float" => Type::FLOAT8,
                 "text" | "varchar" => Type::TEXT,
                 "bool" | "boolean" => Type::BOOL,
                 "bytea" => Type::BYTEA,
                 "timestamp" => Type::TIMESTAMP,
+                "timestamptz" => Type::TIMESTAMPTZ,
+                "date" => Type::DATE,
+                "time" => Type::TIME,
+                "uuid" => Type::UUID,
+                "numeric" | "decimal" => Type::NUMERIC,
+                "json" => Type::JSON,
+                "jsonb" => Type::JSONB,
+                "interval" => Type::INTERVAL,
+                "_int4" => Type::INT4_ARRAY,
+                "_int8" => Type::INT8_ARRAY,
+                "_text" => Type::TEXT_ARRAY,
+                "_float8" => Type::FLOAT8_ARRAY,
+                "_bool" => Type::BOOL_ARRAY,
+                "_uuid" => Type::UUID_ARRAY,
                 _ => Type::TEXT,
             }
         }
-        _ => Type::TEXT,
+        _ => {
+            let s = format!("{:?}", dt).to_lowercase();
+            if s.contains("smallint") {
+                Type::INT2
+            } else if s.contains("timestamp") && s.contains("timezone") {
+                Type::TIMESTAMPTZ
+            } else if s.contains("timestamp") {
+                Type::TIMESTAMP
+            } else if s.contains("date") {
+                Type::DATE
+            } else if s.contains("time") {
+                Type::TIME
+            } else if s.contains("uuid") {
+                Type::UUID
+            } else if s.contains("numeric") || s.contains("decimal") {
+                Type::NUMERIC
+            } else if s.contains("json") {
+                Type::JSON
+            } else if s.contains("varchar") {
+                Type::VARCHAR
+            } else if s.contains("char") {
+                Type::CHAR
+            } else if s.contains("interval") {
+                Type::INTERVAL
+            } else if s.contains("array") {
+                if s.contains("int4") || s.contains("integer") {
+                    Type::INT4_ARRAY
+                } else if s.contains("int8") || s.contains("bigint") {
+                    Type::INT8_ARRAY
+                } else if s.contains("text") || s.contains("varchar") {
+                    Type::TEXT_ARRAY
+                } else if s.contains("float8") || s.contains("double") {
+                    Type::FLOAT8_ARRAY
+                } else if s.contains("bool") {
+                    Type::BOOL_ARRAY
+                } else if s.contains("uuid") {
+                    Type::UUID_ARRAY
+                } else {
+                    Type::TEXT_ARRAY
+                }
+            } else {
+                Type::TEXT
+            }
+        }
     }
 }
 
@@ -528,13 +665,31 @@ enum WaitResult {
 
 fn pg_type_from_oid(oid: i32) -> Type {
     match oid {
+        21 => Type::INT2,
         23 => Type::INT4,
         20 => Type::INT8,
+        700 => Type::FLOAT4,
         701 => Type::FLOAT8,
         25 => Type::TEXT,
         16 => Type::BOOL,
         17 => Type::BYTEA,
         1114 => Type::TIMESTAMP,
+        1184 => Type::TIMESTAMPTZ,
+        1082 => Type::DATE,
+        1083 => Type::TIME,
+        2950 => Type::UUID,
+        1700 => Type::NUMERIC,
+        114 => Type::JSON,
+        3802 => Type::JSONB,
+        1043 => Type::VARCHAR,
+        1042 => Type::CHAR,
+        1186 => Type::INTERVAL,
+        1007 => Type::INT4_ARRAY,
+        1016 => Type::INT8_ARRAY,
+        1009 => Type::TEXT_ARRAY,
+        1022 => Type::FLOAT8_ARRAY,
+        1000 => Type::BOOL_ARRAY,
+        2951 => Type::UUID_ARRAY,
         _ => Type::TEXT,
     }
 }
@@ -741,7 +896,11 @@ impl GatewayHandler {
 
     /// Dispatch a synchronous (non-view-read) query and return pgwire responses.
     /// Returns `None` if the query needs async handling (DML, COMMIT, ROLLBACK, SELECT).
-    fn dispatch_sync<'a>(&'a self, query: &'a str) -> Option<PgWireResult<Vec<Response<'a>>>> {
+    fn dispatch_sync<'a>(
+        &'a self,
+        query: &'a str,
+        principal_name: &str,
+    ) -> Option<PgWireResult<Vec<Response<'a>>>> {
         let q = query.trim();
         let ql = q.to_lowercase();
 
@@ -755,7 +914,7 @@ impl GatewayHandler {
         }
 
         // Catalog stubs
-        if let Some(catalog_resp) = self.catalog.handle_query(q) {
+        if let Some(catalog_resp) = self.catalog.handle_query(q, principal_name) {
             return Some(Ok(vec![catalog_resp_to_response(catalog_resp)]));
         }
 
@@ -946,7 +1105,17 @@ impl GatewayHandler {
             )))]);
         }
 
-        if let Some(result) = self.dispatch_sync(query) {
+        let principal_name = if let Some(id) = conn_id {
+            if let Some(session) = self.sessions.get(id) {
+                session.principal.identity().to_string()
+            } else {
+                "postgres".to_string()
+            }
+        } else {
+            "postgres".to_string()
+        };
+
+        if let Some(result) = self.dispatch_sync(query, &principal_name) {
             // Promote lifetime — responses from dispatch_sync hold no borrows
             // from `query`, only owned data.
             return result.map(|v| v.into_iter().map(promote_response).collect());
@@ -1128,15 +1297,44 @@ impl GatewayHandler {
             raw_rows[0].iter().filter(|&&b| b == b'\t').count() + 1
         };
 
-        let schema_fields: Vec<FieldInfo> = (0..n_cols)
-            .map(|i| {
-                let name = col_names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("col_{i}"));
-                FieldInfo::new(name, None, None, Type::INT8, FieldFormat::Text)
-            })
-            .collect();
+        let schema_fields: Vec<FieldInfo> = if let Some(cv) = self.catalog.get_view(view_name) {
+            cv.columns
+                .iter()
+                .enumerate()
+                .map(|(idx, c)| {
+                    let oid = crate::catalog_stubs::arrow_type_to_pg_oid(&c.data_type);
+                    let format = PORTAL_FORMAT
+                        .try_with(|f| f.format_for(idx))
+                        .unwrap_or(FieldFormat::Text);
+                    FieldInfo::new(c.name.clone(), None, None, pg_type_from_oid(oid), format)
+                })
+                .collect()
+        } else if let Some(ct) = self.catalog.get_table(view_name) {
+            ct.columns
+                .iter()
+                .enumerate()
+                .map(|(idx, c)| {
+                    let oid = crate::catalog_stubs::arrow_type_to_pg_oid(&c.data_type);
+                    let format = PORTAL_FORMAT
+                        .try_with(|f| f.format_for(idx))
+                        .unwrap_or(FieldFormat::Text);
+                    FieldInfo::new(c.name.clone(), None, None, pg_type_from_oid(oid), format)
+                })
+                .collect()
+        } else {
+            (0..n_cols)
+                .map(|i| {
+                    let name = col_names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("col_{i}"));
+                    let format = PORTAL_FORMAT
+                        .try_with(|f| f.format_for(i))
+                        .unwrap_or(FieldFormat::Text);
+                    FieldInfo::new(name, None, None, Type::INT8, format)
+                })
+                .collect()
+        };
 
         let schema = Arc::new(schema_fields);
         let schema_ref = schema.clone();
@@ -1146,9 +1344,36 @@ impl GatewayHandler {
             let col_count = schema_ref.len();
             let fields: Vec<&str> = row_str.split('\t').collect();
             for i in 0..col_count {
-                encoder
-                    .encode_field(&fields.get(i).copied())
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                let val: Option<&str> = fields.get(i).copied();
+                let datatype = schema_ref[i].datatype();
+                let encode_res = match *datatype {
+                    Type::INT2 => {
+                        let parsed = val.and_then(|s| s.parse::<i16>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::INT4 => {
+                        let parsed = val.and_then(|s| s.parse::<i32>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::INT8 => {
+                        let parsed = val.and_then(|s| s.parse::<i64>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::FLOAT4 => {
+                        let parsed = val.and_then(|s| s.parse::<f32>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::FLOAT8 => {
+                        let parsed = val.and_then(|s| s.parse::<f64>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::BOOL => {
+                        let parsed = val.map(|s| s == "t" || s == "true" || s == "1");
+                        encoder.encode_field(&parsed)
+                    }
+                    _ => encoder.encode_field(&val),
+                };
+                encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             }
             encoder.finish()
         });
@@ -1323,12 +1548,20 @@ impl GatewayHandler {
                 let val: Option<&str> = fields.get(i).copied();
                 let datatype = schema_ref[i].datatype();
                 let encode_res = match *datatype {
-                    Type::INT8 => {
-                        let parsed = val.and_then(|s| s.parse::<i64>().ok());
+                    Type::INT2 => {
+                        let parsed = val.and_then(|s| s.parse::<i16>().ok());
                         encoder.encode_field(&parsed)
                     }
                     Type::INT4 => {
                         let parsed = val.and_then(|s| s.parse::<i32>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::INT8 => {
+                        let parsed = val.and_then(|s| s.parse::<i64>().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::FLOAT4 => {
+                        let parsed = val.and_then(|s| s.parse::<f32>().ok());
                         encoder.encode_field(&parsed)
                     }
                     Type::FLOAT8 => {
@@ -3454,6 +3687,17 @@ fn parse_copy_to_stdout_view(q: &str) -> Option<String> {
 
 /// Build FieldInfo list for a query (for DESCRIBE).
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
+    if let Some(catalog_resp) = catalog.handle_query(q, "postgres") {
+        match catalog_resp {
+            CatalogResponse::Rows { columns, .. } => {
+                return columns
+                    .iter()
+                    .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+                    .collect();
+            }
+            _ => {}
+        }
+    }
     if let Some(view_name) = extract_view_name_from_select(q) {
         if let Some(cv) = catalog.get_view(&view_name) {
             let select_cols = infer_select_columns(q);

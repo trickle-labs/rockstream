@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use object_store::memory::InMemory;
 use rockstream_gateway::{
-    catalog_stubs::{CatalogColumn, CatalogIndexState, CatalogStubs, CatalogTable, CatalogView},
+    catalog_stubs::{CatalogColumn, CatalogIndexState, CatalogIndexEntry, CatalogStubs, CatalogTable, CatalogView},
     view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -493,6 +493,13 @@ async fn _proof_orm_schema_reflection_impl() {
         ],
         namespace: "public".to_string(),
     });
+    catalog.add_index(CatalogIndexEntry {
+        name: "orders_mv_idx".to_string(),
+        table: "orders_mv".to_string(),
+        index_cols: vec!["id".to_string()],
+        state: CatalogIndexState::Ready,
+        op_id: Some(101),
+    });
 
     let (port, _handle) = start_gateway_noop(catalog).await;
 
@@ -609,6 +616,100 @@ async fn _proof_orm_schema_reflection_impl() {
         attr_rows.iter().any(|(n, t)| n == "amount" && t == "701"),
         "expected amount/OID-701 in pg_attribute; got {attr_rows:?}"
     );
+
+    // Test pg_index
+    let rows = client
+        .simple_query("SELECT indexrelid, indrelid, indkey FROM pg_catalog.pg_index")
+        .await
+        .expect("pg_index failed");
+    assert!(!rows.is_empty(), "expected index row in pg_index");
+
+    // Test extended pg_class with indexes (relkind = 'i')
+    let rows = client
+        .simple_query("SELECT relname FROM pg_catalog.pg_class WHERE relkind = 'i'")
+        .await
+        .expect("pg_class index query failed");
+    let index_names: Vec<String> = rows
+        .iter()
+        .filter_map(|m| {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+                r.get("relname").map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(index_names.contains(&"orders_mv_idx".to_string()), "expected orders_mv_idx in pg_class; got {:?}", index_names);
+
+    // Test pg_proc
+    let rows = client
+        .simple_query("SELECT proname, prokind FROM pg_catalog.pg_proc")
+        .await
+        .expect("pg_proc failed");
+    let proc_names: Vec<String> = rows
+        .iter()
+        .filter_map(|m| {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+                r.get("proname").map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(proc_names.contains(&"count".to_string()), "expected count in pg_proc");
+
+    // Test pg_constraint
+    client
+        .simple_query("SELECT conname FROM pg_catalog.pg_constraint")
+        .await
+        .expect("pg_constraint failed");
+
+    // Test pg_description
+    client
+        .simple_query("SELECT description FROM pg_catalog.pg_description")
+        .await
+        .expect("pg_description failed");
+
+    // Test pg_enum
+    client
+        .simple_query("SELECT enumlabel FROM pg_catalog.pg_enum")
+        .await
+        .expect("pg_enum failed");
+
+    // Test pg_roles
+    let rows = client
+        .simple_query("SELECT rolname FROM pg_catalog.pg_roles")
+        .await
+        .expect("pg_roles failed");
+    assert!(!rows.is_empty(), "expected roles row");
+
+    // Test pg_user
+    let rows = client
+        .simple_query("SELECT usename FROM pg_catalog.pg_user")
+        .await
+        .expect("pg_user failed");
+    assert!(!rows.is_empty(), "expected user row");
+
+    // Test information_schema tables
+    client
+        .simple_query("SELECT constraint_name FROM information_schema.key_column_usage")
+        .await
+        .expect("key_column_usage failed");
+
+    client
+        .simple_query("SELECT constraint_type FROM information_schema.table_constraints")
+        .await
+        .expect("table_constraints failed");
+
+    client
+        .simple_query("SELECT privilege_type FROM information_schema.column_privileges")
+        .await
+        .expect("column_privileges failed");
+
+    client
+        .simple_query("SELECT constraint_name FROM information_schema.referential_constraints")
+        .await
+        .expect("referential_constraints failed");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

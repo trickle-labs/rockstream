@@ -7,24 +7,61 @@ use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 /// Postgres type OIDs used in RowDescription fields.
+pub const PG_OID_INT2: i32 = 21;
 pub const PG_OID_INT4: i32 = 23;
 pub const PG_OID_INT8: i32 = 20;
+pub const PG_OID_FLOAT4: i32 = 700;
 pub const PG_OID_FLOAT8: i32 = 701;
 pub const PG_OID_TEXT: i32 = 25;
 pub const PG_OID_BOOL: i32 = 16;
 pub const PG_OID_BYTEA: i32 = 17;
 pub const PG_OID_TIMESTAMP: i32 = 1114;
+pub const PG_OID_TIMESTAMPTZ: i32 = 1184;
+pub const PG_OID_DATE: i32 = 1082;
+pub const PG_OID_TIME: i32 = 1083;
+pub const PG_OID_UUID: i32 = 2950;
+pub const PG_OID_NUMERIC: i32 = 1700;
+pub const PG_OID_JSON: i32 = 114;
+pub const PG_OID_JSONB: i32 = 3802;
+pub const PG_OID_VARCHAR: i32 = 1043;
+pub const PG_OID_CHAR: i32 = 1042;
+pub const PG_OID_INTERVAL: i32 = 1186;
+
+pub const PG_OID_ARRAY_INT4: i32 = 1007;
+pub const PG_OID_ARRAY_INT8: i32 = 1016;
+pub const PG_OID_ARRAY_TEXT: i32 = 1009;
+pub const PG_OID_ARRAY_FLOAT8: i32 = 1022;
+pub const PG_OID_ARRAY_BOOL: i32 = 1000;
+pub const PG_OID_ARRAY_UUID: i32 = 2951;
 
 /// Map an Arrow data type name to a Postgres type OID.
 pub fn arrow_type_to_pg_oid(arrow_type: &str) -> i32 {
     match arrow_type {
+        "Int16" => PG_OID_INT2,
         "Int32" => PG_OID_INT4,
         "Int64" => PG_OID_INT8,
+        "Float32" => PG_OID_FLOAT4,
         "Float64" => PG_OID_FLOAT8,
         "Utf8" | "LargeUtf8" => PG_OID_TEXT,
         "Boolean" => PG_OID_BOOL,
         "Binary" | "LargeBinary" => PG_OID_BYTEA,
         "Timestamp" | "TimestampMicrosecond" | "TimestampNanosecond" => PG_OID_TIMESTAMP,
+        "TimestampTz" => PG_OID_TIMESTAMPTZ,
+        "Date32" | "Date64" => PG_OID_DATE,
+        "Time32" | "Time64" => PG_OID_TIME,
+        "Uuid" | "UUID" => PG_OID_UUID,
+        "Decimal" | "Decimal128" | "Decimal256" => PG_OID_NUMERIC,
+        "Json" | "JSON" => PG_OID_JSON,
+        "Jsonb" | "JSONB" => PG_OID_JSONB,
+        "Varchar" | "VARCHAR" => PG_OID_VARCHAR,
+        "Char" | "CHAR" => PG_OID_CHAR,
+        "Interval" => PG_OID_INTERVAL,
+        "_int4" | "List(Int32)" => PG_OID_ARRAY_INT4,
+        "_int8" | "List(Int64)" => PG_OID_ARRAY_INT8,
+        "_text" | "List(Utf8)" => PG_OID_ARRAY_TEXT,
+        "_float8" | "List(Float64)" => PG_OID_ARRAY_FLOAT8,
+        "_bool" | "List(Boolean)" => PG_OID_ARRAY_BOOL,
+        "_uuid" | "List(Uuid)" => PG_OID_ARRAY_UUID,
         _ => PG_OID_TEXT,
     }
 }
@@ -33,8 +70,10 @@ pub fn arrow_type_to_pg_oid(arrow_type: &str) -> i32 {
 /// `information_schema.columns.data_type`).
 pub fn arrow_type_to_pg_data_type(arrow_type: &str) -> &'static str {
     match arrow_type {
+        "Int16" => "smallint",
         "Int32" => "integer",
         "Int64" => "bigint",
+        "Float32" => "real",
         "Float64" => "double precision",
         "Utf8" | "LargeUtf8" => "text",
         "Boolean" => "boolean",
@@ -42,6 +81,22 @@ pub fn arrow_type_to_pg_data_type(arrow_type: &str) -> &'static str {
         "Timestamp" | "TimestampMicrosecond" | "TimestampNanosecond" => {
             "timestamp without time zone"
         }
+        "TimestampTz" => "timestamp with time zone",
+        "Date32" | "Date64" => "date",
+        "Time32" | "Time64" => "time without time zone",
+        "Uuid" | "UUID" => "uuid",
+        "Decimal" | "Decimal128" | "Decimal256" => "numeric",
+        "Json" | "JSON" => "json",
+        "Jsonb" | "JSONB" => "jsonb",
+        "Varchar" | "VARCHAR" => "character varying",
+        "Char" | "CHAR" => "character",
+        "Interval" => "interval",
+        "_int4" | "List(Int32)" => "integer[]",
+        "_int8" | "List(Int64)" => "bigint[]",
+        "_text" | "List(Utf8)" => "text[]",
+        "_float8" | "List(Float64)" => "double precision[]",
+        "_bool" | "List(Boolean)" => "boolean[]",
+        "_uuid" | "List(Uuid)" => "uuid[]",
         _ => "text",
     }
 }
@@ -318,26 +373,33 @@ impl CatalogStubs {
         names
     }
 
+    /// List all registered indexes.
+    pub fn list_indexes(&self) -> Vec<CatalogIndexEntry> {
+        let inner = self.inner.read().unwrap();
+        let mut idxs: Vec<CatalogIndexEntry> = inner.indexes.values().cloned().collect();
+        idxs.sort_by(|a, b| a.name.cmp(&b.name));
+        idxs
+    }
+
     /// Dispatch a query string to a catalog handler. Returns `Some(rows)` if
     /// this is a recognized catalog query, `None` if the query should be
     /// forwarded to the normal query path.
     ///
     /// Rows are returned as `Vec<Vec<Option<String>>>`, one inner Vec per row.
-    pub fn handle_query(&self, query: &str) -> Option<CatalogResponse> {
+    pub fn handle_query(&self, query: &str, principal_name: &str) -> Option<CatalogResponse> {
         let q = query.trim();
+        let ql = q.to_lowercase();
 
         // SHOW commands
-        if q.eq_ignore_ascii_case("show server_version")
-            || q.eq_ignore_ascii_case("show server_version;")
-        {
+        if ql.contains("server_version") {
             return Some(CatalogResponse::rows(
                 vec!["server_version".to_string()],
                 vec![vec![Some("14.0".to_string())]],
             ));
         }
 
-        if q.eq_ignore_ascii_case("show transaction_isolation")
-            || q.eq_ignore_ascii_case("show transaction_isolation;")
+        if ql.contains("transaction_isolation")
+            || ql.contains("transaction isolation level")
         {
             return Some(CatalogResponse::rows(
                 vec!["transaction_isolation".to_string()],
@@ -345,51 +407,91 @@ impl CatalogStubs {
             ));
         }
 
-        let ql = q.to_lowercase();
+        if ql.contains("standard_conforming_strings") {
+            return Some(CatalogResponse::rows(
+                vec!["standard_conforming_strings".to_string()],
+                vec![vec![Some("on".to_string())]],
+            ));
+        }
 
         // SET commands → CommandComplete("SET")
         if ql.starts_with("set ") || ql.starts_with("set\t") {
             return Some(CatalogResponse::CommandComplete("SET".to_string()));
         }
 
+        // functions
+        if ql.contains("version()") {
+            return Some(self.version());
+        }
+        if ql.contains("current_schema()") {
+            return Some(self.current_schema());
+        }
+        if ql.contains("current_database()") {
+            return Some(self.current_database());
+        }
+        if ql.contains("current_setting") {
+            return Some(self.current_setting(&ql));
+        }
+
+        let requested_cols = parse_select_columns(query);
+
         // pg_catalog queries
-        if ql.contains("pg_catalog.pg_tables")
-            || ql.contains("pg_tables") && ql.contains("pg_catalog")
-        {
-            return Some(self.pg_tables());
+        if ql.contains("pg_attribute") {
+            return Some(self.pg_attribute(&requested_cols));
         }
-        if ql.contains("pg_catalog.pg_views")
-            || (ql.contains("pg_views") && ql.contains("pg_catalog"))
-        {
-            return Some(self.pg_views());
+        if ql.contains("pg_type") {
+            return Some(self.pg_type(&requested_cols));
         }
-        if ql.contains("pg_catalog.pg_class")
-            || (ql.contains("pg_class") && ql.contains("pg_catalog"))
-        {
-            return Some(self.pg_class());
+        if ql.contains("pg_class") {
+            return Some(self.pg_class(&requested_cols));
         }
-        if ql.contains("pg_catalog.pg_attribute")
-            || (ql.contains("pg_attribute") && ql.contains("pg_catalog"))
-        {
-            return Some(self.pg_attribute());
+        if ql.contains("pg_proc") {
+            return Some(self.pg_proc(&requested_cols));
         }
-        if ql.contains("pg_catalog.pg_namespace")
-            || (ql.contains("pg_namespace") && ql.contains("pg_catalog"))
-        {
-            return Some(self.pg_namespace());
+        if ql.contains("pg_index") {
+            return Some(self.pg_index(&requested_cols));
         }
-        if ql.contains("pg_catalog.pg_type")
-            || (ql.contains("pg_type") && ql.contains("pg_catalog"))
-        {
-            return Some(self.pg_type());
+        if ql.contains("pg_constraint") {
+            return Some(self.pg_constraint(&requested_cols));
+        }
+        if ql.contains("pg_description") {
+            return Some(self.pg_description(&requested_cols));
+        }
+        if ql.contains("pg_enum") {
+            return Some(self.pg_enum(&requested_cols));
+        }
+        if ql.contains("pg_roles") {
+            return Some(self.pg_roles(principal_name, &requested_cols));
+        }
+        if ql.contains("pg_user") {
+            return Some(self.pg_user(principal_name, &requested_cols));
+        }
+        if ql.contains("pg_namespace") {
+            return Some(self.pg_namespace(&requested_cols));
+        }
+        if ql.contains("pg_tables") {
+            return Some(self.pg_tables(&requested_cols));
+        }
+        if ql.contains("pg_views") {
+            return Some(self.pg_views(&requested_cols));
         }
 
         // information_schema
         if ql.contains("information_schema.tables") {
-            return Some(self.information_schema_tables());
+            return Some(self.information_schema_tables(&requested_cols));
         }
         if ql.contains("information_schema.columns") {
-            return Some(self.information_schema_columns());
+            return Some(self.information_schema_columns(&requested_cols));
+        }
+        if ql.contains("information_schema.key_column_usage")
+            || ql.contains("key_column_usage")
+        {
+            return Some(self.key_column_usage(&requested_cols));
+        }
+        if ql.contains("information_schema.referential_constraints")
+            || ql.contains("referential_constraints")
+        {
+            return Some(self.referential_constraints(&requested_cols));
         }
 
         None
@@ -397,238 +499,772 @@ impl CatalogStubs {
 
     // ── pg_catalog.pg_tables ──────────────────────────────────────────────────
 
-    fn pg_tables(&self) -> CatalogResponse {
-        let cols = vec![
-            "schemaname".to_string(),
-            "tablename".to_string(),
-            "tableowner".to_string(),
-            "tablespace".to_string(),
-            "hasindexes".to_string(),
-            "hasrules".to_string(),
-            "hastriggers".to_string(),
-        ];
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    fn pg_tables(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "schemaname".to_string(),
+                "tablename".to_string(),
+                "tableowner".to_string(),
+                "hasindexes".to_string(),
+                "hasrules".to_string(),
+                "hastriggers".to_string(),
+                "rowsecurity".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
         for t in self.list_tables() {
-            rows.push(vec![
-                Some("public".to_string()),
-                Some(t.name.clone()),
-                Some("rockstream".to_string()),
-                None,
-                Some("f".to_string()),
-                Some("f".to_string()),
-                Some("f".to_string()),
-            ]);
-        }
-        for v in self.list_views() {
-            rows.push(vec![
-                Some("public".to_string()),
-                Some(v.name.clone()),
-                Some("rockstream".to_string()),
-                None,
-                Some("f".to_string()),
-                Some("f".to_string()),
-                Some("f".to_string()),
-            ]);
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "schemaname" => Some("public".to_string()),
+                    "tablename" => Some(t.name.clone()),
+                    "tableowner" => Some("rockstream".to_string()),
+                    "hasindexes" => Some("f".to_string()),
+                    "hasrules" => Some("f".to_string()),
+                    "hastriggers" => Some("f".to_string()),
+                    "rowsecurity" => Some("f".to_string()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
         }
         CatalogResponse::rows(cols, rows)
     }
 
-    // ── pg_catalog.pg_views ──────────────────────────────────────────────────
+    // ── pg_catalog.pg_views ───────────────────────────────────────────────────
 
-    fn pg_views(&self) -> CatalogResponse {
-        let cols = vec![
-            "schemaname".to_string(),
-            "viewname".to_string(),
-            "viewowner".to_string(),
-            "definition".to_string(),
-        ];
-        let rows: Vec<Vec<Option<String>>> = self
-            .list_views()
-            .into_iter()
-            .map(|v| {
-                vec![
-                    Some("public".to_string()),
-                    Some(v.name.clone()),
-                    Some("rockstream".to_string()),
-                    Some(v.sql.clone()),
-                ]
-            })
-            .collect();
+    fn pg_views(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "schemaname".to_string(),
+                "viewname".to_string(),
+                "viewowner".to_string(),
+                "definition".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
+        for v in self.list_views() {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "schemaname" => Some("public".to_string()),
+                    "viewname" => Some(v.name.clone()),
+                    "viewowner" => Some("rockstream".to_string()),
+                    "definition" => Some(v.sql.clone()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
         CatalogResponse::rows(cols, rows)
     }
 
-    // ── pg_catalog.pg_class ──────────────────────────────────────────────────
+    // ── pg_catalog.pg_class ───────────────────────────────────────────────────
 
-    fn pg_class(&self) -> CatalogResponse {
-        let cols = vec![
-            "oid".to_string(),
-            "relname".to_string(),
-            "relnamespace".to_string(),
-            "relkind".to_string(),
-        ];
+    fn pg_class(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "relname".to_string(),
+                "relnamespace".to_string(),
+                "relkind".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut items = Vec::new();
         for t in self.list_tables() {
-            rows.push(vec![
-                Some(view_oid(&t.name).to_string()),
-                Some(t.name.clone()),
-                Some("2200".to_string()),
-                Some("r".to_string()),
-            ]);
+            items.push((view_oid(&t.name), t.name.clone(), "r"));
         }
         for v in self.list_views() {
-            rows.push(vec![
-                Some(view_oid(&v.name).to_string()),
-                Some(v.name.clone()),
-                Some("2200".to_string()),
-                Some("v".to_string()),
-            ]);
+            items.push((view_oid(&v.name), v.name.clone(), "v"));
+        }
+        for idx in self.list_indexes() {
+            items.push((view_oid(&idx.name), idx.name.clone(), "i"));
+        }
+        for (oid, name, kind) in items {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "oid" => Some(oid.to_string()),
+                    "relname" => Some(name.clone()),
+                    "relnamespace" => Some("2200".to_string()),
+                    "relkind" => Some(kind.to_string()),
+                    "relhasrules" => Some("f".to_string()),
+                    "relhastriggers" => Some("f".to_string()),
+                    "relispartition" => Some("f".to_string()),
+                    _ => {
+                        if c.contains("id") {
+                            Some("0".to_string())
+                        } else if c.contains("has") || c.contains("is") {
+                            Some("f".to_string())
+                        } else {
+                            Some("".to_string())
+                        }
+                    }
+                };
+                row.push(val);
+            }
+            rows.push(row);
         }
         CatalogResponse::rows(cols, rows)
     }
 
     // ── pg_catalog.pg_attribute ──────────────────────────────────────────────
 
-    fn pg_attribute(&self) -> CatalogResponse {
-        let cols = vec![
-            "attrelid".to_string(),
-            "attname".to_string(),
-            "atttypid".to_string(),
-            "attnum".to_string(),
-            "attnotnull".to_string(),
-        ];
+    fn pg_attribute(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() || requested_cols.contains(&"*".to_string()) {
+            vec![
+                "nspname".to_string(),
+                "relname".to_string(),
+                "attname".to_string(),
+                "atttypid".to_string(),
+                "attnotnull".to_string(),
+                "atttypmod".to_string(),
+                "attlen".to_string(),
+                "typtypmod".to_string(),
+                "attnum".to_string(),
+                "attidentity".to_string(),
+                "attgenerated".to_string(),
+                "adsrc".to_string(),
+                "description".to_string(),
+                "typbasetype".to_string(),
+                "typtype".to_string(),
+                "format_type".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut items = Vec::new();
         for t in self.list_tables() {
             let oid = view_oid(&t.name);
             for (i, col) in t.columns.iter().enumerate() {
-                rows.push(vec![
-                    Some(oid.to_string()),
-                    Some(col.name.clone()),
-                    Some(arrow_type_to_pg_oid(&col.data_type).to_string()),
-                    Some((i as i16 + 1).to_string()),
-                    Some("f".to_string()),
-                ]);
+                items.push((
+                    oid,
+                    t.name.clone(),
+                    col.name.clone(),
+                    arrow_type_to_pg_oid(&col.data_type),
+                    arrow_type_to_pg_data_type(&col.data_type),
+                    i as i16 + 1,
+                ));
             }
         }
         for v in self.list_views() {
             let oid = view_oid(&v.name);
             for (i, col) in v.columns.iter().enumerate() {
-                rows.push(vec![
-                    Some(oid.to_string()),
-                    Some(col.name.clone()),
-                    Some(arrow_type_to_pg_oid(&col.data_type).to_string()),
-                    Some((i as i16 + 1).to_string()),
-                    Some("f".to_string()),
-                ]);
+                items.push((
+                    oid,
+                    v.name.clone(),
+                    col.name.clone(),
+                    arrow_type_to_pg_oid(&col.data_type),
+                    arrow_type_to_pg_data_type(&col.data_type),
+                    i as i16 + 1,
+                ));
             }
+        }
+        for (attrelid, relname, attname, atttypid, format_type, attnum) in items {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "attrelid" => Some(attrelid.to_string()),
+                    "relname" | "table_name" => Some(relname.clone()),
+                    "attname" | "name" => Some(attname.clone()),
+                    "atttypid" => Some(atttypid.to_string()),
+                    "format_type" => Some(format_type.to_string()),
+                    "attnum" => Some(attnum.to_string()),
+                    "attnotnull" | "not_null" => Some("f".to_string()),
+                    "atthasdef" | "default" => None,
+                    "attidentity" | "identity_options" => None,
+                    "attgenerated" | "generated" => Some("".to_string()),
+                    "comment" => None,
+                    "collation" => None,
+                    "is_dropped" | "attisdropped" => Some("f".to_string()),
+                    "nspname" => Some("public".to_string()),
+                    "atttypmod" => Some("-1".to_string()),
+                    "attlen" => Some("-1".to_string()),
+                    "typtypmod" => Some("-1".to_string()),
+                    "adsrc" => None,
+                    "description" => None,
+                    "typbasetype" => Some("0".to_string()),
+                    "typtype" => Some("b".to_string()),
+                    _ => {
+                        if c.contains("id") {
+                            Some("0".to_string())
+                        } else if c.contains("has") || c.contains("is") {
+                            Some("f".to_string())
+                        } else {
+                            Some("".to_string())
+                        }
+                    }
+                };
+                row.push(val);
+            }
+            rows.push(row);
         }
         CatalogResponse::rows(cols, rows)
     }
 
     // ── pg_catalog.pg_namespace ──────────────────────────────────────────────
 
-    fn pg_namespace(&self) -> CatalogResponse {
-        let cols = vec!["oid".to_string(), "nspname".to_string()];
-        let rows = vec![vec![Some("2200".to_string()), Some("public".to_string())]];
-        CatalogResponse::rows(cols, rows)
+    fn pg_namespace(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec!["oid".to_string(), "nspname".to_string()]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut row = Vec::new();
+        for c in &cols {
+            let val = match c.as_str() {
+                "oid" => Some("2200".to_string()),
+                "nspname" => Some("public".to_string()),
+                _ => Some("".to_string()),
+            };
+            row.push(val);
+        }
+        CatalogResponse::rows(cols, vec![row])
     }
 
     // ── pg_catalog.pg_type ───────────────────────────────────────────────────
 
-    fn pg_type(&self) -> CatalogResponse {
-        let cols = vec![
-            "oid".to_string(),
-            "typname".to_string(),
-            "typlen".to_string(),
-        ];
+    fn pg_type(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec!["oid".to_string(), "typname".to_string(), "typlen".to_string()]
+        } else {
+            requested_cols.to_vec()
+        };
         let type_rows = vec![
-            (PG_OID_INT4, "int4", 4i32),
-            (PG_OID_INT8, "int8", 8),
-            (PG_OID_FLOAT8, "float8", 8),
-            (PG_OID_TEXT, "text", -1),
-            (PG_OID_BOOL, "bool", 1),
-            (PG_OID_BYTEA, "bytea", -1),
-            (PG_OID_TIMESTAMP, "timestamp", 8),
+            (PG_OID_INT2, "int2", 2i32, 0, 11, "b"),
+            (PG_OID_INT4, "int4", 4i32, 1007, 11, "b"),
+            (PG_OID_INT8, "int8", 8, 1016, 11, "b"),
+            (PG_OID_FLOAT4, "float4", 4, 0, 11, "b"),
+            (PG_OID_FLOAT8, "float8", 8, 1022, 11, "b"),
+            (PG_OID_TEXT, "text", -1, 1009, 11, "b"),
+            (PG_OID_BOOL, "bool", 1, 1000, 11, "b"),
+            (PG_OID_BYTEA, "bytea", -1, 0, 11, "b"),
+            (PG_OID_TIMESTAMP, "timestamp", 8, 0, 11, "b"),
+            (PG_OID_TIMESTAMPTZ, "timestamptz", 8, 0, 11, "b"),
+            (PG_OID_DATE, "date", 4, 0, 11, "b"),
+            (PG_OID_TIME, "time", 8, 0, 11, "b"),
+            (PG_OID_UUID, "uuid", 16, 2951, 11, "b"),
+            (PG_OID_NUMERIC, "numeric", -1, 0, 11, "b"),
+            (PG_OID_JSON, "json", -1, 0, 11, "b"),
+            (PG_OID_JSONB, "jsonb", -1, 0, 11, "b"),
+            (PG_OID_VARCHAR, "varchar", -1, 0, 11, "b"),
+            (PG_OID_CHAR, "bpchar", -1, 0, 11, "b"),
+            (PG_OID_INTERVAL, "interval", 16, 0, 11, "b"),
+            (PG_OID_ARRAY_INT4, "_int4", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_INT8, "_int8", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_TEXT, "_text", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_FLOAT8, "_float8", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_BOOL, "_bool", -1, 0, 11, "b"),
+            (PG_OID_ARRAY_UUID, "_uuid", -1, 0, 11, "b"),
         ];
-        let rows = type_rows
-            .into_iter()
-            .map(|(oid, name, len)| {
-                vec![
-                    Some(oid.to_string()),
-                    Some(name.to_string()),
-                    Some(len.to_string()),
-                ]
-            })
-            .collect();
+        let mut rows = Vec::new();
+        for (oid, name, len, typarray, typnamespace, typtype) in type_rows {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "oid" => Some(oid.to_string()),
+                    "typname" | "domname" => Some(name.to_string()),
+                    "typlen" => Some(len.to_string()),
+                    "typarray" => Some(typarray.to_string()),
+                    "typnamespace" => Some(typnamespace.to_string()),
+                    "typtype" => Some(typtype.to_string()),
+                    "attype" => Some(name.to_string()),
+                    "typbasetype" => Some("0".to_string()),
+                    "typtypmod" => Some("-1".to_string()),
+                    _ => {
+                        if c.contains("id") {
+                            Some("0".to_string())
+                        } else {
+                            Some("".to_string())
+                        }
+                    }
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
         CatalogResponse::rows(cols, rows)
     }
 
     // ── information_schema.tables ────────────────────────────────────────────
 
-    fn information_schema_tables(&self) -> CatalogResponse {
-        let cols = vec![
-            "table_catalog".to_string(),
-            "table_schema".to_string(),
-            "table_name".to_string(),
-            "table_type".to_string(),
-        ];
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    fn information_schema_tables(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "table_catalog".to_string(),
+                "table_schema".to_string(),
+                "table_name".to_string(),
+                "table_type".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
+        let mut items = Vec::new();
         for t in self.list_tables() {
-            rows.push(vec![
-                Some("rockstream".to_string()),
-                Some("public".to_string()),
-                Some(t.name.clone()),
-                Some("BASE TABLE".to_string()),
-            ]);
+            items.push((t.name.clone(), "BASE TABLE"));
         }
         for v in self.list_views() {
-            rows.push(vec![
-                Some("rockstream".to_string()),
-                Some("public".to_string()),
-                Some(v.name.clone()),
-                Some("VIEW".to_string()),
-            ]);
+            items.push((v.name.clone(), "VIEW"));
+        }
+        for (name, table_type) in items {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "table_catalog" => Some("rockstream".to_string()),
+                    "table_schema" => Some("public".to_string()),
+                    "table_name" => Some(name.clone()),
+                    "table_type" => Some(table_type.to_string()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
         }
         CatalogResponse::rows(cols, rows)
     }
 
     // ── information_schema.columns ───────────────────────────────────────────
 
-    fn information_schema_columns(&self) -> CatalogResponse {
-        let cols = vec![
-            "table_catalog".to_string(),
-            "table_schema".to_string(),
-            "table_name".to_string(),
-            "column_name".to_string(),
-            "ordinal_position".to_string(),
-            "data_type".to_string(),
-        ];
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    fn information_schema_columns(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "table_catalog".to_string(),
+                "table_schema".to_string(),
+                "table_name".to_string(),
+                "column_name".to_string(),
+                "ordinal_position".to_string(),
+                "data_type".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
+        let mut items = Vec::new();
         for t in self.list_tables() {
             for (i, col) in t.columns.iter().enumerate() {
-                rows.push(vec![
-                    Some("rockstream".to_string()),
-                    Some("public".to_string()),
-                    Some(t.name.clone()),
-                    Some(col.name.clone()),
-                    Some((i + 1).to_string()),
-                    Some(arrow_type_to_pg_data_type(&col.data_type).to_string()),
-                ]);
+                items.push((t.name.clone(), col.name.clone(), i + 1, arrow_type_to_pg_data_type(&col.data_type)));
             }
         }
         for v in self.list_views() {
             for (i, col) in v.columns.iter().enumerate() {
-                rows.push(vec![
-                    Some("rockstream".to_string()),
-                    Some("public".to_string()),
-                    Some(v.name.clone()),
-                    Some(col.name.clone()),
-                    Some((i + 1).to_string()),
-                    Some(arrow_type_to_pg_data_type(&col.data_type).to_string()),
-                ]);
+                items.push((v.name.clone(), col.name.clone(), i + 1, arrow_type_to_pg_data_type(&col.data_type)));
             }
+        }
+        for (table_name, column_name, pos, data_type) in items {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "table_catalog" => Some("rockstream".to_string()),
+                    "table_schema" => Some("public".to_string()),
+                    "table_name" => Some(table_name.clone()),
+                    "column_name" => Some(column_name.clone()),
+                    "ordinal_position" => Some(pos.to_string()),
+                    "data_type" => Some(data_type.to_string()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
         }
         CatalogResponse::rows(cols, rows)
     }
+
+    // ── pg_catalog.pg_proc ────────────────────────────────────────────────────
+
+    fn pg_proc(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "proname".to_string(),
+                "pronamespace".to_string(),
+                "prorettype".to_string(),
+                "proargtypes".to_string(),
+                "prokind".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let raw_rows = vec![
+            (2147, "count", 11, 20, "", "a"),
+            (2108, "sum", 11, 20, "", "a"),
+            (2101, "avg", 11, 1700, "", "a"),
+            (2130, "min", 11, 25, "", "a"),
+            (2115, "max", 11, 25, "", "a"),
+        ];
+        let mut rows = Vec::new();
+        for (oid, proname, pronamespace, prorettype, proargtypes, prokind) in raw_rows {
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "oid" => Some(oid.to_string()),
+                    "proname" => Some(proname.to_string()),
+                    "pronamespace" => Some(pronamespace.to_string()),
+                    "prorettype" => Some(prorettype.to_string()),
+                    "proargtypes" => Some(proargtypes.to_string()),
+                    "prokind" => Some(prokind.to_string()),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        CatalogResponse::rows(cols, rows)
+    }
+
+    // ── pg_catalog.pg_constraint ──────────────────────────────────────────────
+
+    fn pg_constraint(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "conname".to_string(),
+                "connamespace".to_string(),
+                "contype".to_string(),
+                "conrelid".to_string(),
+                "contypid".to_string(),
+                "conindid".to_string(),
+                "confrelid".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── pg_catalog.pg_index ───────────────────────────────────────────────────
+
+    fn pg_index(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "indexrelid".to_string(),
+                "indrelid".to_string(),
+                "indisunique".to_string(),
+                "indisprimary".to_string(),
+                "indkey".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut rows = Vec::new();
+        for idx in self.list_indexes() {
+            let indexrelid = view_oid(&idx.name).to_string();
+            let indrelid = view_oid(&idx.table).to_string();
+            let mut indkey_vals = Vec::new();
+            if let Some(t) = self.get_table(&idx.table) {
+                for col_name in &idx.index_cols {
+                    if let Some(pos) = t.columns.iter().position(|c| &c.name == col_name) {
+                        indkey_vals.push((pos + 1).to_string());
+                    }
+                }
+            } else if let Some(v) = self.get_view(&idx.table) {
+                for col_name in &idx.index_cols {
+                    if let Some(pos) = v.columns.iter().position(|c| &c.name == col_name) {
+                        indkey_vals.push((pos + 1).to_string());
+                    }
+                }
+            }
+            if indkey_vals.is_empty() {
+                indkey_vals.push("1".to_string());
+            }
+            let mut row = Vec::new();
+            for c in &cols {
+                let val = match c.as_str() {
+                    "indexrelid" => Some(indexrelid.clone()),
+                    "indrelid" => Some(indrelid.clone()),
+                    "indisunique" => Some("f".to_string()),
+                    "indisprimary" => Some("f".to_string()),
+                    "indkey" => Some(indkey_vals.join(" ")),
+                    _ => Some("".to_string()),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        CatalogResponse::rows(cols, rows)
+    }
+
+    // ── pg_catalog.pg_description ─────────────────────────────────────────────
+
+    fn pg_description(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "objoid".to_string(),
+                "classoid".to_string(),
+                "objsubid".to_string(),
+                "description".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── pg_catalog.pg_enum ────────────────────────────────────────────────────
+
+    fn pg_enum(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "enumtypid".to_string(),
+                "enumsortorder".to_string(),
+                "enumlabel".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── pg_catalog.pg_roles ───────────────────────────────────────────────────
+
+    fn pg_roles(&self, principal_name: &str, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "oid".to_string(),
+                "rolname".to_string(),
+                "rolsuper".to_string(),
+                "rolinherit".to_string(),
+                "rolcreaterole".to_string(),
+                "rolcreatedb".to_string(),
+                "rolcanlogin".to_string(),
+                "rolconnlimit".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut row = Vec::new();
+        for c in &cols {
+            let val = match c.as_str() {
+                "oid" => Some(view_oid(principal_name).to_string()),
+                "rolname" => Some(principal_name.to_string()),
+                "rolsuper" => Some("t".to_string()),
+                "rolinherit" => Some("t".to_string()),
+                "rolcreaterole" => Some("t".to_string()),
+                "rolcreatedb" => Some("t".to_string()),
+                "rolcanlogin" => Some("t".to_string()),
+                "rolconnlimit" => Some("-1".to_string()),
+                _ => Some("".to_string()),
+            };
+            row.push(val);
+        }
+        CatalogResponse::rows(cols, vec![row])
+    }
+
+    // ── pg_catalog.pg_user ────────────────────────────────────────────────────
+
+    fn pg_user(&self, principal_name: &str, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "usename".to_string(),
+                "usesysid".to_string(),
+                "usecreatedb".to_string(),
+                "usesuper".to_string(),
+                "usecatupd".to_string(),
+                "valuntil".to_string(),
+                "useconfig".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        let mut row = Vec::new();
+        for c in &cols {
+            let val = match c.as_str() {
+                "usename" => Some(principal_name.to_string()),
+                "usesysid" => Some(view_oid(principal_name).to_string()),
+                "usecreatedb" => Some("t".to_string()),
+                "usesuper" => Some("t".to_string()),
+                "usecatupd" => Some("t".to_string()),
+                "valuntil" => None,
+                "useconfig" => None,
+                _ => Some("".to_string()),
+            };
+            row.push(val);
+        }
+        CatalogResponse::rows(cols, vec![row])
+    }
+
+    // ── information_schema.key_column_usage ──────────────────────────────────
+
+    fn key_column_usage(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "constraint_catalog".to_string(),
+                "constraint_schema".to_string(),
+                "constraint_name".to_string(),
+                "table_catalog".to_string(),
+                "table_schema".to_string(),
+                "table_name".to_string(),
+                "column_name".to_string(),
+                "ordinal_position".to_string(),
+                "position_in_unique_constraint".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── information_schema.referential_constraints ───────────────────────────
+
+    fn referential_constraints(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty() {
+            vec![
+                "constraint_catalog".to_string(),
+                "constraint_schema".to_string(),
+                "constraint_name".to_string(),
+                "unique_constraint_catalog".to_string(),
+                "unique_constraint_schema".to_string(),
+                "unique_constraint_name".to_string(),
+                "match_option".to_string(),
+                "update_rule".to_string(),
+                "delete_rule".to_string(),
+            ]
+        } else {
+            requested_cols.to_vec()
+        };
+        CatalogResponse::rows(cols, Vec::new())
+    }
+
+    // ── pg_catalog functions ─────────────────────────────────────────────────
+
+    fn version(&self) -> CatalogResponse {
+        let cols = vec!["version".to_string()];
+        let rows = vec![vec![Some("PostgreSQL 14.0 (RockStream)".to_string())]];
+        CatalogResponse::rows(cols, rows)
+    }
+
+    fn current_schema(&self) -> CatalogResponse {
+        let cols = vec!["current_schema".to_string()];
+        let rows = vec![vec![Some("public".to_string())]];
+        CatalogResponse::rows(cols, rows)
+    }
+
+    fn current_database(&self) -> CatalogResponse {
+        let cols = vec!["current_database".to_string()];
+        let rows = vec![vec![Some("rockstream".to_string())]];
+        CatalogResponse::rows(cols, rows)
+    }
+
+    fn current_setting(&self, query: &str) -> CatalogResponse {
+        let cols = vec!["current_setting".to_string()];
+        let val = if query.contains("transaction_isolation") {
+            "read committed"
+        } else if query.contains("server_version_num") {
+            "140000"
+        } else if query.contains("standard_conforming_strings") {
+            "on"
+        } else {
+            ""
+        };
+        let rows = vec![vec![Some(val.to_string())]];
+        CatalogResponse::rows(cols, rows)
+    }
+}
+
+/// Helper to parse SELECT column names/aliases from query.
+fn parse_select_columns(query: &str) -> Vec<String> {
+    let ql = query.to_lowercase();
+    let select_idx = match ql.find("select") {
+        Some(idx) => idx + 6,
+        None => return Vec::new(),
+    };
+    // Find "from" at paren level 0
+    let mut from_idx = None;
+    let mut paren_level = 0;
+    let chars: Vec<char> = query.chars().collect();
+    let mut i = select_idx;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '(' {
+            paren_level += 1;
+        } else if c == ')' {
+            if paren_level > 0 {
+                paren_level -= 1;
+            }
+        } else if c.is_alphabetic() && paren_level == 0 {
+            if i + 4 <= chars.len() {
+                let word: String = chars[i..i+4].iter().collect();
+                if word.eq_ignore_ascii_case("from") {
+                    let prev_char = if i > 0 { chars[i-1] } else { ' ' };
+                    let next_char = if i + 4 < chars.len() { chars[i+4] } else { ' ' };
+                    if !prev_char.is_alphanumeric() && !next_char.is_alphanumeric() {
+                        from_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let from_idx = match from_idx {
+        Some(idx) => idx,
+        None => return Vec::new(),
+    };
+    if from_idx <= select_idx {
+        return Vec::new();
+    }
+    let select_part = &query[select_idx..from_idx];
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut paren_level = 0;
+    for c in select_part.chars() {
+        if c == '(' {
+            paren_level += 1;
+            current.push(c);
+        } else if c == ')' {
+            if paren_level > 0 {
+                paren_level -= 1;
+            }
+            current.push(c);
+        } else if c == ',' && paren_level == 0 {
+            parts.push(current.trim().to_string());
+            current = String::new();
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+
+    let mut cols = Vec::new();
+    for part in parts {
+        // Normalize whitespace (newlines, tabs, extra spaces)
+        let part_normalized = part
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .join(" ");
+        let part_lower = part_normalized.to_lowercase();
+
+        if let Some(as_idx) = part_lower.rfind(" as ") {
+            let alias = part_normalized[as_idx + 4..].trim().trim_matches('"').trim();
+            cols.push(alias.to_string());
+        } else {
+            let words: Vec<&str> = part_normalized.split_whitespace().collect();
+            if let Some(last_word) = words.last() {
+                let last_word = last_word.trim_matches('"').trim();
+                if let Some(dot_idx) = last_word.rfind('.') {
+                    cols.push(last_word[dot_idx + 1..].to_string());
+                } else {
+                    cols.push(last_word.to_string());
+                }
+            }
+        }
+    }
+    cols
 }
 
 /// A response from the catalog stub handler.

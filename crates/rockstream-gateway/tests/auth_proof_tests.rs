@@ -8,7 +8,7 @@ use rockstream_gateway::{
     multi_shard_reader::{can_pushdown_partial_agg, MultiShardReader},
     server::GatewayHandler,
     view_reader::{ViewReadStrategy, ViewReader},
-    GatewayError,
+    GatewayError, GatewayServer,
 };
 use rockstream_storage::{PartialAggSpec, ShardDb, ShardReader};
 
