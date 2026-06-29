@@ -2365,21 +2365,24 @@ impl GatewayHandler {
         let cursor_name = after_declare[..cursor_pos].trim().to_string();
         // Everything after "cursor [WITH HOLD|WITHOUT HOLD] for " is the query
         let rest = &after_declare[cursor_pos + " cursor ".len()..];
-        let for_pos = match rest.find(" for ") {
-            Some(p) => p,
-            None => {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
-                        "missing FOR in DECLARE CURSOR".to_string()),
-                )))]);
-            }
-        };
+        // Handle: rest starts with "for " directly (no scroll/hold options), or " for " embedded
+        if !rest.starts_with("for ") && !rest.contains(" for ") {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
+                    "missing FOR in DECLARE CURSOR".to_string()),
+            )))]);
+        }
         // Original-case query
         let ql_cursor_pos = "declare ".len() + cursor_pos;
         let ql_for_search = &q[ql_cursor_pos + " cursor ".len()..];
-        let inner_start = ql_for_search.to_lowercase().find(" for ")
-            .map(|p| p + " for ".len())
-            .unwrap_or(0);
+        let lower_for_search = ql_for_search.to_lowercase();
+        let inner_start = if lower_for_search.starts_with("for ") {
+            "for ".len()
+        } else {
+            lower_for_search.find(" for ")
+                .map(|p| p + " for ".len())
+                .unwrap_or(0)
+        };
         let inner_sql = ql_for_search[inner_start..].trim();
 
         let conn_id_str = match conn_id {

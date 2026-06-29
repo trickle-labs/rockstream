@@ -65,7 +65,7 @@ fn random_sql() -> BoxedStrategy<String> {
 
 /// A sequence of 1-10 SQL statements.
 fn random_sequence() -> BoxedStrategy<Vec<String>> {
-    prop::collection::vec(random_sql(), 1..=10)
+    prop::collection::vec(random_sql(), 1..=10).boxed()
 }
 
 // ── Shared server ─────────────────────────────────────────────────────────────

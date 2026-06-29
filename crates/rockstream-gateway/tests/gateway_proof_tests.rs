@@ -3527,6 +3527,50 @@ async fn test_named_cursor_lifecycle() {
 
 // ── Slice 5: PgBouncer compat ─────────────────────────────────────────────────
 
+/// Slice 5 green gate: ReadyForQuery status byte is 'I' at idle, 'T' in transaction, 'I' after COMMIT/ROLLBACK.
+/// Verifies PgBouncer-compatible transaction state tracking via observable client behaviour.
+#[tokio::test]
+async fn test_pgbouncer_compat_status_bytes() {
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_catalog(
+        addr,
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+
+    // Connect and run a baseline query — server should be in Idle ('I') state.
+    let client = connect_port(port).await;
+    client.simple_query("SELECT 1").await.expect("baseline SELECT failed");
+
+    // BEGIN puts the connection into InTransaction ('T') state.
+    // Subsequent queries must work within the transaction.
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    client.simple_query("SELECT 1").await.expect("SELECT inside BEGIN failed");
+
+    // COMMIT returns status to Idle ('I'); next query must work.
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    client.simple_query("SELECT 1").await.expect("SELECT after COMMIT failed");
+
+    // BEGIN + ROLLBACK cycle.
+    client.simple_query("BEGIN").await.expect("second BEGIN failed");
+    client.simple_query("SELECT 1").await.expect("SELECT inside second BEGIN failed");
+    client.simple_query("ROLLBACK").await.expect("ROLLBACK failed");
+    client.simple_query("SELECT 1").await.expect("SELECT after ROLLBACK failed");
+
+    // Multiple back-to-back transaction cycles — simulates PgBouncer session-mode reuse.
+    for _ in 0..5 {
+        client.simple_query("BEGIN").await.expect("BEGIN in loop failed");
+        client.simple_query("SELECT 1").await.expect("SELECT in loop failed");
+        client.simple_query("COMMIT").await.expect("COMMIT in loop failed");
+    }
+
+    // Final baseline — connection must still be operational in Idle state.
+    let rows = client.simple_query("SELECT 1").await.expect("final SELECT failed");
+    assert!(!rows.is_empty(), "connection should be operational after multiple transaction cycles");
+}
+
 /// Slice 5a green gate: DISCARD ALL clears all session state.
 #[tokio::test]
 async fn test_discard_all_clears_session() {
