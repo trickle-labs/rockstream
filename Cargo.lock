@@ -4568,6 +4568,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.12.1",
+ "md5",
  "object_store 0.12.5",
  "pgwire",
  "proptest",

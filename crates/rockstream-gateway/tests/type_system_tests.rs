@@ -1,11 +1,10 @@
-use std::sync::Arc;
 use pgwire::api::Type;
 use rockstream_gateway::catalog_stubs::{
-    arrow_type_to_pg_data_type, arrow_type_to_pg_oid, PG_OID_BOOL, PG_OID_BYTEA, PG_OID_DATE,
-    PG_OID_FLOAT4, PG_OID_FLOAT8, PG_OID_INT2, PG_OID_INT4, PG_OID_INT8, PG_OID_INTERVAL,
-    PG_OID_JSON, PG_OID_JSONB, PG_OID_NUMERIC, PG_OID_TIME, PG_OID_TIMESTAMP, PG_OID_TIMESTAMPTZ,
-    PG_OID_UUID, PG_OID_VARCHAR, PG_OID_CHAR, PG_OID_ARRAY_BOOL, PG_OID_ARRAY_FLOAT8,
-    PG_OID_ARRAY_INT4, PG_OID_ARRAY_INT8, PG_OID_ARRAY_TEXT, PG_OID_ARRAY_UUID,
+    arrow_type_to_pg_data_type, arrow_type_to_pg_oid, PG_OID_ARRAY_BOOL, PG_OID_ARRAY_FLOAT8,
+    PG_OID_ARRAY_INT4, PG_OID_ARRAY_INT8, PG_OID_ARRAY_TEXT, PG_OID_ARRAY_UUID, PG_OID_BOOL,
+    PG_OID_BYTEA, PG_OID_CHAR, PG_OID_DATE, PG_OID_FLOAT4, PG_OID_FLOAT8, PG_OID_INT2, PG_OID_INT4,
+    PG_OID_INT8, PG_OID_INTERVAL, PG_OID_JSON, PG_OID_JSONB, PG_OID_NUMERIC, PG_OID_TIME,
+    PG_OID_TIMESTAMP, PG_OID_TIMESTAMPTZ, PG_OID_UUID, PG_OID_VARCHAR,
 };
 use rockstream_gateway::protocol::pg_type_from_name;
 use rockstream_gateway::{
@@ -13,6 +12,7 @@ use rockstream_gateway::{
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
+use std::sync::Arc;
 use tokio_postgres::NoTls;
 
 #[test]
@@ -26,22 +26,42 @@ fn test_type_mappings_s1() {
         ("Float64", PG_OID_FLOAT8, "double precision", Type::FLOAT8),
         ("Boolean", PG_OID_BOOL, "boolean", Type::BOOL),
         ("Binary", PG_OID_BYTEA, "bytea", Type::BYTEA),
-        ("Timestamp", PG_OID_TIMESTAMP, "timestamp without time zone", Type::TIMESTAMP),
-        ("TimestampTz", PG_OID_TIMESTAMPTZ, "timestamp with time zone", Type::TIMESTAMPTZ),
+        (
+            "Timestamp",
+            PG_OID_TIMESTAMP,
+            "timestamp without time zone",
+            Type::TIMESTAMP,
+        ),
+        (
+            "TimestampTz",
+            PG_OID_TIMESTAMPTZ,
+            "timestamp with time zone",
+            Type::TIMESTAMPTZ,
+        ),
         ("Date32", PG_OID_DATE, "date", Type::DATE),
         ("Time32", PG_OID_TIME, "time without time zone", Type::TIME),
         ("Uuid", PG_OID_UUID, "uuid", Type::UUID),
         ("Decimal", PG_OID_NUMERIC, "numeric", Type::NUMERIC),
         ("Json", PG_OID_JSON, "json", Type::JSON),
         ("Jsonb", PG_OID_JSONB, "jsonb", Type::JSONB),
-        ("Varchar", PG_OID_VARCHAR, "character varying", Type::VARCHAR),
+        (
+            "Varchar",
+            PG_OID_VARCHAR,
+            "character varying",
+            Type::VARCHAR,
+        ),
         ("Char", PG_OID_CHAR, "character", Type::CHAR),
         ("Interval", PG_OID_INTERVAL, "interval", Type::INTERVAL),
         // Array variants
         ("_int4", PG_OID_ARRAY_INT4, "integer[]", Type::INT4_ARRAY),
         ("_int8", PG_OID_ARRAY_INT8, "bigint[]", Type::INT8_ARRAY),
         ("_text", PG_OID_ARRAY_TEXT, "text[]", Type::TEXT_ARRAY),
-        ("_float8", PG_OID_ARRAY_FLOAT8, "double precision[]", Type::FLOAT8_ARRAY),
+        (
+            "_float8",
+            PG_OID_ARRAY_FLOAT8,
+            "double precision[]",
+            Type::FLOAT8_ARRAY,
+        ),
         ("_bool", PG_OID_ARRAY_BOOL, "boolean[]", Type::BOOL_ARRAY),
         ("_uuid", PG_OID_ARRAY_UUID, "uuid[]", Type::UUID_ARRAY),
     ];
@@ -94,12 +114,30 @@ async fn test_binary_encoding_unit() {
         name: "numeric_view".to_string(),
         sql: "SELECT * FROM numeric_view".to_string(),
         columns: vec![
-            CatalogColumn { name: "c_int2".to_string(), data_type: "Int16".to_string() },
-            CatalogColumn { name: "c_int4".to_string(), data_type: "Int32".to_string() },
-            CatalogColumn { name: "c_int8".to_string(), data_type: "Int64".to_string() },
-            CatalogColumn { name: "c_float4".to_string(), data_type: "Float32".to_string() },
-            CatalogColumn { name: "c_float64".to_string(), data_type: "Float64".to_string() },
-            CatalogColumn { name: "c_bool".to_string(), data_type: "Boolean".to_string() },
+            CatalogColumn {
+                name: "c_int2".to_string(),
+                data_type: "Int16".to_string(),
+            },
+            CatalogColumn {
+                name: "c_int4".to_string(),
+                data_type: "Int32".to_string(),
+            },
+            CatalogColumn {
+                name: "c_int8".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            CatalogColumn {
+                name: "c_float4".to_string(),
+                data_type: "Float32".to_string(),
+            },
+            CatalogColumn {
+                name: "c_float64".to_string(),
+                data_type: "Float64".to_string(),
+            },
+            CatalogColumn {
+                name: "c_bool".to_string(),
+                data_type: "Boolean".to_string(),
+            },
         ],
         namespace: "public".to_string(),
     });
@@ -148,9 +186,9 @@ async fn test_binary_encoding_unit() {
 #[cfg(feature = "testcontainers")]
 #[tokio::test]
 async fn test_binary_encoding_postgres_comparison() {
+    use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;
-    use testcontainers::runners::AsyncRunner;
 
     let postgres_container = GenericImage::new("postgres", "14-alpine")
         .with_env_var("POSTGRES_DB", "postgres")
@@ -161,14 +199,19 @@ async fn test_binary_encoding_postgres_comparison() {
         .expect("Failed to start Postgres container");
 
     let host = postgres_container.get_host().await.expect("get host");
-    let pg_port = postgres_container.get_host_port_ipv4(5432).await.expect("get port");
+    let pg_port = postgres_container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("get port");
 
     // Connect to real Postgres container with retry loop
     let pg_client = {
         let mut client_opt = None;
         for i in 0..30 {
             match tokio_postgres::connect(
-                &format!("host={host} port={pg_port} user=postgres password=postgres dbname=postgres"),
+                &format!(
+                    "host={host} port={pg_port} user=postgres password=postgres dbname=postgres"
+                ),
                 NoTls,
             )
             .await
@@ -206,7 +249,10 @@ async fn test_binary_encoding_postgres_comparison() {
     .await
     .unwrap();
 
-    let pg_stmt = pg_client.prepare("SELECT * FROM test_numeric").await.unwrap();
+    let pg_stmt = pg_client
+        .prepare("SELECT * FROM test_numeric")
+        .await
+        .unwrap();
     let pg_rows = pg_client.query(&pg_stmt, &[]).await.unwrap();
     assert_eq!(pg_rows.len(), 1);
     let pg_row = &pg_rows[0];
@@ -217,12 +263,30 @@ async fn test_binary_encoding_postgres_comparison() {
         name: "numeric_view".to_string(),
         sql: "SELECT * FROM numeric_view".to_string(),
         columns: vec![
-            CatalogColumn { name: "c_int2".to_string(), data_type: "Int16".to_string() },
-            CatalogColumn { name: "c_int4".to_string(), data_type: "Int32".to_string() },
-            CatalogColumn { name: "c_int8".to_string(), data_type: "Int64".to_string() },
-            CatalogColumn { name: "c_float4".to_string(), data_type: "Float32".to_string() },
-            CatalogColumn { name: "c_float64".to_string(), data_type: "Float64".to_string() },
-            CatalogColumn { name: "c_bool".to_string(), data_type: "Boolean".to_string() },
+            CatalogColumn {
+                name: "c_int2".to_string(),
+                data_type: "Int16".to_string(),
+            },
+            CatalogColumn {
+                name: "c_int4".to_string(),
+                data_type: "Int32".to_string(),
+            },
+            CatalogColumn {
+                name: "c_int8".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            CatalogColumn {
+                name: "c_float4".to_string(),
+                data_type: "Float32".to_string(),
+            },
+            CatalogColumn {
+                name: "c_float64".to_string(),
+                data_type: "Float64".to_string(),
+            },
+            CatalogColumn {
+                name: "c_bool".to_string(),
+                data_type: "Boolean".to_string(),
+            },
         ],
         namespace: "public".to_string(),
     });
@@ -263,9 +327,9 @@ async fn test_binary_encoding_postgres_comparison() {
 #[cfg(feature = "testcontainers")]
 #[tokio::test]
 async fn test_orm_conformance() {
+    use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;
-    use testcontainers::runners::AsyncRunner;
 
     async fn run_cmd_checked(
         container: &testcontainers::ContainerAsync<testcontainers::GenericImage>,
@@ -301,12 +365,30 @@ async fn test_orm_conformance() {
         name: "numeric_view".to_string(),
         sql: "SELECT * FROM numeric_view".to_string(),
         columns: vec![
-            CatalogColumn { name: "c_int2".to_string(), data_type: "Int16".to_string() },
-            CatalogColumn { name: "c_int4".to_string(), data_type: "Int32".to_string() },
-            CatalogColumn { name: "c_int8".to_string(), data_type: "Int64".to_string() },
-            CatalogColumn { name: "c_float4".to_string(), data_type: "Float32".to_string() },
-            CatalogColumn { name: "c_float64".to_string(), data_type: "Float64".to_string() },
-            CatalogColumn { name: "c_bool".to_string(), data_type: "Boolean".to_string() },
+            CatalogColumn {
+                name: "c_int2".to_string(),
+                data_type: "Int16".to_string(),
+            },
+            CatalogColumn {
+                name: "c_int4".to_string(),
+                data_type: "Int32".to_string(),
+            },
+            CatalogColumn {
+                name: "c_int8".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            CatalogColumn {
+                name: "c_float4".to_string(),
+                data_type: "Float32".to_string(),
+            },
+            CatalogColumn {
+                name: "c_float64".to_string(),
+                data_type: "Float64".to_string(),
+            },
+            CatalogColumn {
+                name: "c_bool".to_string(),
+                data_type: "Boolean".to_string(),
+            },
         ],
         namespace: "public".to_string(),
     });
@@ -364,7 +446,11 @@ assert 'c_bool' in names",
     );
     run_cmd_checked(
         &python_container,
-        vec!["sh", "-c", &format!("cat << 'EOF' > /tmp/diagnostic.py\n{}\nEOF", python_script)],
+        vec![
+            "sh",
+            "-c",
+            &format!("cat << 'EOF' > /tmp/diagnostic.py\n{}\nEOF", python_script),
+        ],
         "write diagnostic.py",
     )
     .await;
@@ -384,7 +470,11 @@ assert 'c_bool' in names",
 
     run_cmd_checked(
         &node_container,
-        vec!["sh", "-c", "mkdir -p /app && cd /app && npm init -y && npm install -q prisma @prisma/client"],
+        vec![
+            "sh",
+            "-c",
+            "mkdir -p /app && cd /app && npm init -y && npm install -q prisma @prisma/client",
+        ],
         "npm install prisma",
     )
     .await;
@@ -400,7 +490,12 @@ assert 'c_bool' in names",
         "cd /app && DATABASE_URL=postgresql://test:test@{}:{}/test npx prisma db pull",
         host_ip, port
     );
-    run_cmd_checked(&node_container, vec!["sh", "-c", &pull_cmd], "prisma db pull").await;
+    run_cmd_checked(
+        &node_container,
+        vec!["sh", "-c", &pull_cmd],
+        "prisma db pull",
+    )
+    .await;
 
     // 3. Hibernate / JDBC E2E Test
     let openjdk_container = GenericImage::new("eclipse-temurin", "17-jdk")
@@ -462,7 +557,12 @@ assert 'c_bool' in names",
     )
     .await;
 
-    run_cmd_checked(&openjdk_container, vec!["javac", "TestJDBC.java"], "javac compile").await;
+    run_cmd_checked(
+        &openjdk_container,
+        vec!["javac", "TestJDBC.java"],
+        "javac compile",
+    )
+    .await;
 
     run_cmd_checked(
         &openjdk_container,

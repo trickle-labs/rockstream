@@ -9,7 +9,10 @@ use std::time::Instant;
 
 use object_store::memory::InMemory;
 use rockstream_gateway::{
-    catalog_stubs::{CatalogColumn, CatalogIndexState, CatalogIndexEntry, CatalogStubs, CatalogTable, CatalogView},
+    catalog_stubs::{
+        CatalogColumn, CatalogIndexEntry, CatalogIndexState, CatalogStubs, CatalogTable,
+        CatalogView,
+    },
     view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -639,7 +642,11 @@ async fn _proof_orm_schema_reflection_impl() {
             }
         })
         .collect();
-    assert!(index_names.contains(&"orders_mv_idx".to_string()), "expected orders_mv_idx in pg_class; got {:?}", index_names);
+    assert!(
+        index_names.contains(&"orders_mv_idx".to_string()),
+        "expected orders_mv_idx in pg_class; got {:?}",
+        index_names
+    );
 
     // Test pg_proc
     let rows = client
@@ -656,7 +663,10 @@ async fn _proof_orm_schema_reflection_impl() {
             }
         })
         .collect();
-    assert!(proc_names.contains(&"count".to_string()), "expected count in pg_proc");
+    assert!(
+        proc_names.contains(&"count".to_string()),
+        "expected count in pg_proc"
+    );
 
     // Test pg_constraint
     client
@@ -3301,20 +3311,50 @@ fn test_all_rs_codes_have_sqlstate() {
 
     let cases: Vec<(&str, GatewayError)> = vec![
         ("25001", GatewayError::SerializableNotSupported),
-        ("53200", GatewayError::PreparedStatementsLimitExceeded { limit: 100 }),
+        (
+            "53200",
+            GatewayError::PreparedStatementsLimitExceeded { limit: 100 },
+        ),
         ("53200", GatewayError::PortalsLimitExceeded { limit: 100 }),
         ("42P01", GatewayError::ViewNotFound("v".into())),
         ("54000", GatewayError::ResultSetTooLarge),
-        ("53100", GatewayError::ShardBackpressure { current_bytes: 1, limit_bytes: 2 }),
+        (
+            "53100",
+            GatewayError::ShardBackpressure {
+                current_bytes: 1,
+                limit_bytes: 2,
+            },
+        ),
         ("XX000", GatewayError::IdempotencyKeyRequired),
-        ("42P01", GatewayError::CopyTableNotFound { table: "t".into() }),
-        ("22000", GatewayError::CopyColumnCountMismatch { expected: 2, got: 1 }),
+        (
+            "42P01",
+            GatewayError::CopyTableNotFound { table: "t".into() },
+        ),
+        (
+            "22000",
+            GatewayError::CopyColumnCountMismatch {
+                expected: 2,
+                got: 1,
+            },
+        ),
         ("57014", GatewayError::QueryCancelled),
         ("34000", GatewayError::CursorNotFound { name: "c".into() }),
-        ("42P03", GatewayError::CursorAlreadyExists { name: "c".into() }),
+        (
+            "42P03",
+            GatewayError::CursorAlreadyExists { name: "c".into() },
+        ),
         ("53200", GatewayError::MemoryLimitExceeded),
         ("57014", GatewayError::StatementTimeout),
-        ("53300", GatewayError::ConnectionLimitExceeded { limit: 10_000 }),
+        (
+            "53300",
+            GatewayError::ConnectionLimitExceeded { limit: 10_000 },
+        ),
+        (
+            "28P01",
+            GatewayError::InvalidPassword {
+                user: "alice".into(),
+            },
+        ),
         ("0A000", GatewayError::NotSupported("x".into())),
         ("42601", GatewayError::ParseError("x".into())),
         ("XX000", GatewayError::PgWire("x".into())),
@@ -3349,7 +3389,9 @@ impl ViewReader for SlowViewReader {
         tokio::time::sleep(tokio::time::Duration::from_millis(self.sleep_ms)).await;
         Ok(vec![b"row1".to_vec()])
     }
-    fn published_frontier(&self) -> Option<u64> { None }
+    fn published_frontier(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Slice 2 green gate: CancelRequest aborts a slow query and the connection
@@ -3384,7 +3426,9 @@ async fn test_cancel_request_aborts_query() {
     .await
     .expect("connect");
     let cancel_token = client.cancel_token();
-    tokio::spawn(async move { conn_task.await.ok(); });
+    tokio::spawn(async move {
+        conn_task.await.ok();
+    });
 
     // Issue a slow query in the background
     let query_handle = tokio::spawn(async move {
@@ -3395,7 +3439,10 @@ async fn test_cancel_request_aborts_query() {
 
     // Wait 50ms then cancel
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    cancel_token.cancel_query(NoTls).await.expect("cancel_query");
+    cancel_token
+        .cancel_query(NoTls)
+        .await
+        .expect("cancel_query");
 
     let (result, elapsed) = query_handle.await.unwrap();
 
@@ -3408,8 +3455,14 @@ async fn test_cancel_request_aborts_query() {
 
     // Connection reuse: new connection should work fine
     let client2 = connect_port(port).await;
-    let rows = client2.simple_query("SELECT 1").await.expect("second query after cancel");
-    assert!(!rows.is_empty(), "connection reuse after cancel should work");
+    let rows = client2
+        .simple_query("SELECT 1")
+        .await
+        .expect("second query after cancel");
+    assert!(
+        !rows.is_empty(),
+        "connection reuse after cancel should work"
+    );
 }
 
 // ── Slice 3: Named Cursors ────────────────────────────────────────────────────
@@ -3427,11 +3480,16 @@ async fn test_named_cursor_lifecycle() {
     for i in 0u32..250 {
         let key = format!("view_output/cursor_view/{:08}", i);
         let value = format!("row_{i}");
-        shard_db.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+        shard_db
+            .put(key.as_bytes(), value.as_bytes())
+            .await
+            .unwrap();
     }
     shard_db.flush().await.unwrap();
 
-    let reader = ShardReader::open("cursor-shard", store.clone()).await.unwrap();
+    let reader = ShardReader::open("cursor-shard", store.clone())
+        .await
+        .unwrap();
     let view_reader = Arc::new(HotOnlyViewReader {
         shard_reader: Arc::new(reader),
         frontier_epoch: Some(1),
@@ -3475,7 +3533,11 @@ async fn test_named_cursor_lifecycle() {
         .await
         .expect("FETCH ALL failed");
     let data_rows2 = data_rows_from(&rows2);
-    assert_eq!(data_rows2.len(), 150, "FETCH ALL should return remaining 150 rows");
+    assert_eq!(
+        data_rows2.len(),
+        150,
+        "FETCH ALL should return remaining 150 rows"
+    );
 
     // FETCH from exhausted cursor — 0 rows, no error
     let rows3 = client
@@ -3483,7 +3545,11 @@ async fn test_named_cursor_lifecycle() {
         .await
         .expect("FETCH on exhausted cursor failed");
     let data_rows3 = data_rows_from(&rows3);
-    assert_eq!(data_rows3.len(), 0, "FETCH on exhausted cursor should return 0 rows");
+    assert_eq!(
+        data_rows3.len(),
+        0,
+        "FETCH on exhausted cursor should return 0 rows"
+    );
 
     // DECLARE second cursor and use MOVE to skip 50 rows
     client
@@ -3502,7 +3568,11 @@ async fn test_named_cursor_lifecycle() {
         .await
         .expect("FETCH 10 after MOVE failed");
     let data_rows4 = data_rows_from(&rows4);
-    assert_eq!(data_rows4.len(), 10, "FETCH 10 after MOVE 50 should return 10 rows");
+    assert_eq!(
+        data_rows4.len(),
+        10,
+        "FETCH 10 after MOVE 50 should return 10 rows"
+    );
 
     // CLOSE cur1
     client
@@ -3517,8 +3587,14 @@ async fn test_named_cursor_lifecycle() {
         .expect("CLOSE ALL failed");
 
     // Connection still works
-    let ping = client.simple_query("SELECT 1").await.expect("ping after CLOSE ALL");
-    assert!(!ping.is_empty(), "connection should remain usable after CLOSE ALL");
+    let ping = client
+        .simple_query("SELECT 1")
+        .await
+        .expect("ping after CLOSE ALL");
+    assert!(
+        !ping.is_empty(),
+        "connection should remain usable after CLOSE ALL"
+    );
 }
 
 // ── Slice 4: Streaming row delivery ──────────────────────────────────────────
@@ -3542,33 +3618,69 @@ async fn test_pgbouncer_compat_status_bytes() {
 
     // Connect and run a baseline query — server should be in Idle ('I') state.
     let client = connect_port(port).await;
-    client.simple_query("SELECT 1").await.expect("baseline SELECT failed");
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("baseline SELECT failed");
 
     // BEGIN puts the connection into InTransaction ('T') state.
     // Subsequent queries must work within the transaction.
     client.simple_query("BEGIN").await.expect("BEGIN failed");
-    client.simple_query("SELECT 1").await.expect("SELECT inside BEGIN failed");
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("SELECT inside BEGIN failed");
 
     // COMMIT returns status to Idle ('I'); next query must work.
     client.simple_query("COMMIT").await.expect("COMMIT failed");
-    client.simple_query("SELECT 1").await.expect("SELECT after COMMIT failed");
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("SELECT after COMMIT failed");
 
     // BEGIN + ROLLBACK cycle.
-    client.simple_query("BEGIN").await.expect("second BEGIN failed");
-    client.simple_query("SELECT 1").await.expect("SELECT inside second BEGIN failed");
-    client.simple_query("ROLLBACK").await.expect("ROLLBACK failed");
-    client.simple_query("SELECT 1").await.expect("SELECT after ROLLBACK failed");
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("second BEGIN failed");
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("SELECT inside second BEGIN failed");
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("ROLLBACK failed");
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("SELECT after ROLLBACK failed");
 
     // Multiple back-to-back transaction cycles — simulates PgBouncer session-mode reuse.
     for _ in 0..5 {
-        client.simple_query("BEGIN").await.expect("BEGIN in loop failed");
-        client.simple_query("SELECT 1").await.expect("SELECT in loop failed");
-        client.simple_query("COMMIT").await.expect("COMMIT in loop failed");
+        client
+            .simple_query("BEGIN")
+            .await
+            .expect("BEGIN in loop failed");
+        client
+            .simple_query("SELECT 1")
+            .await
+            .expect("SELECT in loop failed");
+        client
+            .simple_query("COMMIT")
+            .await
+            .expect("COMMIT in loop failed");
     }
 
     // Final baseline — connection must still be operational in Idle state.
-    let rows = client.simple_query("SELECT 1").await.expect("final SELECT failed");
-    assert!(!rows.is_empty(), "connection should be operational after multiple transaction cycles");
+    let rows = client
+        .simple_query("SELECT 1")
+        .await
+        .expect("final SELECT failed");
+    assert!(
+        !rows.is_empty(),
+        "connection should be operational after multiple transaction cycles"
+    );
 }
 
 /// Slice 5a green gate: DISCARD ALL clears all session state.
@@ -3585,11 +3697,20 @@ async fn test_discard_all_clears_session() {
     let client = connect_port(port).await;
 
     // Set a GUC, then DISCARD ALL should reset it
-    client.simple_query("SET rockstream.wait_for_timeout_ms = 99999").await.expect("SET");
-    client.simple_query("DISCARD ALL").await.expect("DISCARD ALL");
+    client
+        .simple_query("SET rockstream.wait_for_timeout_ms = 99999")
+        .await
+        .expect("SET");
+    client
+        .simple_query("DISCARD ALL")
+        .await
+        .expect("DISCARD ALL");
 
     // Connection still functional after DISCARD ALL
-    let rows = client.simple_query("SELECT 1").await.expect("SELECT after DISCARD ALL");
+    let rows = client
+        .simple_query("SELECT 1")
+        .await
+        .expect("SELECT after DISCARD ALL");
     assert!(!rows.is_empty(), "connection should work after DISCARD ALL");
 }
 
@@ -3610,7 +3731,10 @@ async fn test_reset_all_preserves_cursors() {
     client.simple_query("RESET ALL").await.expect("RESET ALL");
 
     // Connection still functional
-    let rows = client.simple_query("SELECT 1").await.expect("SELECT after RESET ALL");
+    let rows = client
+        .simple_query("SELECT 1")
+        .await
+        .expect("SELECT after RESET ALL");
     assert!(!rows.is_empty(), "connection should work after RESET ALL");
 }
 
@@ -3647,12 +3771,419 @@ async fn test_pg_stat_activity_shows_connection() {
     // Verify required columns are present with correct structure
     let first_row = rows[0];
     assert!(first_row.get(0).is_some(), "pid column should be present");
-    assert!(first_row.get(1).is_some(), "usename column should be present");
-    assert!(first_row.get(2).is_some(), "application_name column should be present");
+    assert!(
+        first_row.get(1).is_some(),
+        "usename column should be present"
+    );
+    assert!(
+        first_row.get(2).is_some(),
+        "application_name column should be present"
+    );
     assert!(first_row.get(3).is_some(), "state column should be present");
     let state = first_row.get(3).unwrap_or("").to_string();
     assert!(
         state == "idle" || state == "active",
         "state should be 'idle' or 'active', got: {state}"
+    );
+}
+
+// ── v0.40: Role Catalog + SCRAM auth tests ────────────────────────────────────
+
+/// S1 green gate: test_role_catalog_create_alter_drop
+/// Unit test: create role alice/pencil, verify verifiers non-empty, alter password, drop.
+#[test]
+fn test_role_catalog_create_alter_drop() {
+    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
+
+    let catalog = RoleCatalog::new();
+    assert_eq!(catalog.len(), 0);
+
+    // Create role
+    let entry = create_role_entry("alice", "pencil");
+    assert!(
+        !entry.scram_salted_password.is_empty(),
+        "salted_password must be non-empty"
+    );
+    assert!(!entry.scram_salt.is_empty(), "salt must be non-empty");
+    assert_eq!(entry.scram_iterations, 4096);
+    assert!(entry
+        .md5_hash
+        .as_deref()
+        .map(|h| h.starts_with("md5"))
+        .unwrap_or(false));
+
+    catalog.insert(entry).expect("insert should succeed");
+    assert_eq!(catalog.len(), 1);
+
+    // Get and verify
+    let got = catalog.get("alice").expect("alice should exist");
+    assert_eq!(got.username, "alice");
+    assert!(!got.scram_salted_password.is_empty());
+
+    // Alter password
+    let updated = catalog.update_password("alice", "newpass");
+    assert!(
+        updated,
+        "update_password should return true for existing user"
+    );
+
+    // Verify new salted_password differs
+    let got2 = catalog.get("alice").expect("alice should still exist");
+    assert!(!got2.scram_salted_password.is_empty());
+
+    // Drop
+    let removed = catalog.remove("alice");
+    assert!(removed, "remove should return true");
+    assert_eq!(catalog.len(), 0);
+    assert!(catalog.get("alice").is_none());
+}
+
+/// S5 green gate: test_scram_auth_flow_unit
+/// End-to-end SCRAM handshake via tokio-postgres client against in-process gateway.
+#[tokio::test]
+async fn test_scram_auth_flow_unit() {
+    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
+
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    let role_catalog = Arc::new(RoleCatalog::new());
+    role_catalog
+        .insert(create_role_entry("alice", "pencil"))
+        .expect("insert alice");
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server =
+        GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+
+    let (client, conn) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={port} user=alice password=pencil dbname=test sslmode=disable"
+        ),
+        NoTls,
+    )
+    .await
+    .expect("SCRAM auth should succeed for alice/pencil");
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("conn error: {e}");
+        }
+    });
+
+    let rows = client
+        .simple_query("SELECT 1")
+        .await
+        .expect("SELECT 1 should work after SCRAM auth");
+    assert!(!rows.is_empty(), "should have at least one row");
+}
+
+/// S6 green gate: test_md5_auth_flow_unit
+/// End-to-end MD5 handshake via tokio-postgres client against in-process gateway.
+#[tokio::test]
+async fn test_md5_auth_flow_unit() {
+    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
+
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    let role_catalog = Arc::new(RoleCatalog::new());
+    role_catalog
+        .insert(create_role_entry("bob", "secret"))
+        .expect("insert bob");
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server =
+        GatewayServer::with_md5_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+
+    let (client, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=bob password=secret dbname=test sslmode=disable"),
+        NoTls,
+    )
+    .await
+    .expect("MD5 auth should succeed for bob/secret");
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("conn error: {e}");
+        }
+    });
+
+    let rows = client
+        .simple_query("SELECT 1")
+        .await
+        .expect("SELECT 1 should work after MD5 auth");
+    assert!(!rows.is_empty(), "should have at least one row");
+
+    // Wrong password must fail
+    let bad = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=bob password=wrong dbname=test sslmode=disable"),
+        NoTls,
+    )
+    .await;
+    assert!(bad.is_err(), "wrong password should be rejected");
+}
+
+/// S7 green gate: test_bootstrap_functions
+/// Verify current_user, session_user, pg_backend_pid, pg_is_in_recovery,
+/// pg_postmaster_start_time, txid_current, current_schemas via live gateway.
+#[tokio::test]
+async fn test_bootstrap_functions() {
+    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
+
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    let role_catalog = Arc::new(RoleCatalog::new());
+    role_catalog
+        .insert(create_role_entry("alice", "pencil"))
+        .expect("insert alice");
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server =
+        GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+
+    let (client, conn) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={port} user=alice password=pencil dbname=test sslmode=disable"
+        ),
+        NoTls,
+    )
+    .await
+    .expect("connect failed");
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("conn error: {e}");
+        }
+    });
+
+    // current_user
+    let rows = client
+        .simple_query("SELECT current_user")
+        .await
+        .expect("SELECT current_user");
+    let data = data_rows_from(&rows);
+    assert!(!data.is_empty(), "expected rows for current_user");
+    let val = data[0].get(0).unwrap_or("");
+    assert_eq!(val, "alice", "current_user should be alice");
+
+    // session_user
+    let rows = client
+        .simple_query("SELECT session_user")
+        .await
+        .expect("SELECT session_user");
+    let data = data_rows_from(&rows);
+    let val = data[0].get(0).unwrap_or("");
+    assert_eq!(val, "alice", "session_user should be alice");
+
+    // pg_backend_pid() — must be a non-negative integer string
+    let rows = client
+        .simple_query("SELECT pg_backend_pid()")
+        .await
+        .expect("SELECT pg_backend_pid()");
+    let data = data_rows_from(&rows);
+    assert!(!data.is_empty(), "expected rows for pg_backend_pid");
+    let pid_str = data[0].get(0).unwrap_or("0");
+    assert!(
+        pid_str.parse::<u64>().is_ok(),
+        "pg_backend_pid should be numeric, got: {pid_str}"
+    );
+
+    // pg_is_in_recovery() — must be "f"
+    let rows = client
+        .simple_query("SELECT pg_is_in_recovery()")
+        .await
+        .expect("SELECT pg_is_in_recovery()");
+    let data = data_rows_from(&rows);
+    let val = data[0].get(0).unwrap_or("");
+    assert_eq!(val, "f", "pg_is_in_recovery() should return f");
+
+    // pg_postmaster_start_time() — must be a non-empty timestamp string
+    let rows = client
+        .simple_query("SELECT pg_postmaster_start_time()")
+        .await
+        .expect("SELECT pg_postmaster_start_time()");
+    let data = data_rows_from(&rows);
+    let ts = data[0].get(0).unwrap_or("");
+    assert!(
+        !ts.is_empty(),
+        "pg_postmaster_start_time should be non-empty"
+    );
+    assert!(
+        ts.contains('-'),
+        "pg_postmaster_start_time should look like a date: {ts}"
+    );
+
+    // txid_current() — must be "0"
+    let rows = client
+        .simple_query("SELECT txid_current()")
+        .await
+        .expect("SELECT txid_current()");
+    let data = data_rows_from(&rows);
+    let val = data[0].get(0).unwrap_or("");
+    assert_eq!(val, "0", "txid_current() should return 0");
+
+    // current_schemas(false) — must contain "public"
+    let rows = client
+        .simple_query("SELECT current_schemas(false)")
+        .await
+        .expect("SELECT current_schemas(false)");
+    let data = data_rows_from(&rows);
+    let val = data[0].get(0).unwrap_or("");
+    assert!(
+        val.contains("public"),
+        "current_schemas(false) should contain public, got: {val}"
+    );
+
+    // version() — must start with "PostgreSQL 14."
+    let rows = client
+        .simple_query("SELECT version()")
+        .await
+        .expect("SELECT version()");
+    let data = data_rows_from(&rows);
+    let val = data[0].get(0).unwrap_or("");
+    assert!(
+        val.starts_with("PostgreSQL 14."),
+        "version should start with PostgreSQL 14., got: {val}"
+    );
+}
+
+/// S8 green gate: test_guc_round_trip
+/// SET search_path / client_encoding / timezone then SHOW verifies round-trip.
+#[tokio::test]
+async fn test_guc_round_trip() {
+    use rockstream_gateway::role_catalog::{create_role_entry, RoleCatalog};
+
+    let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+    let role_catalog = Arc::new(RoleCatalog::new());
+    role_catalog
+        .insert(create_role_entry("alice", "pencil"))
+        .expect("insert alice");
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server =
+        GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+
+    let (client, conn) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={port} user=alice password=pencil dbname=test sslmode=disable"
+        ),
+        NoTls,
+    )
+    .await
+    .expect("connect failed");
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("conn error: {e}");
+        }
+    });
+
+    // SET and SHOW search_path
+    client
+        .simple_query("SET search_path = 'app'")
+        .await
+        .expect("SET search_path");
+    let rows = client
+        .simple_query("SHOW search_path")
+        .await
+        .expect("SHOW search_path");
+    let data = data_rows_from(&rows);
+    let val = data[0].get(0).unwrap_or("");
+    assert_eq!(val, "app", "SHOW search_path should return 'app' after SET");
+
+    // SET and SHOW client_encoding
+    client
+        .simple_query("SET client_encoding = 'UTF8'")
+        .await
+        .expect("SET client_encoding");
+    let rows = client
+        .simple_query("SHOW client_encoding")
+        .await
+        .expect("SHOW client_encoding");
+    let data = data_rows_from(&rows);
+    let val = data[0].get(0).unwrap_or("");
+    assert_eq!(val, "UTF8", "SHOW client_encoding should return UTF8");
+
+    // SET and SHOW timezone
+    client
+        .simple_query("SET timezone = 'America/New_York'")
+        .await
+        .expect("SET timezone");
+    let rows = client
+        .simple_query("SHOW timezone")
+        .await
+        .expect("SHOW timezone");
+    let data = data_rows_from(&rows);
+    let val = data[0].get(0).unwrap_or("");
+    assert_eq!(
+        val, "America/New_York",
+        "SHOW timezone should return the set value"
+    );
+}
+
+/// S9 green gate: test_search_path_view_resolution
+/// Unqualified view SELECT is only served when the view's namespace is in search_path.
+/// Uses Trust auth (GatewayServer::with_catalog) to avoid ACL checks in read_view_response.
+#[tokio::test]
+async fn test_search_path_view_resolution() {
+    use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView};
+
+    let catalog = CatalogStubs::new();
+
+    // Register a view in namespace "public"
+    catalog.add_view_in_namespace(CatalogView {
+        name: "myview".to_string(),
+        namespace: "public".to_string(),
+        sql: "SELECT 1 AS id".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int32".to_string(),
+        }],
+    });
+
+    let (port, _handle) = start_gateway_noop(catalog).await;
+    let client = connect_port(port).await;
+
+    // search_path = public → unqualified SELECT must succeed (no error)
+    client
+        .simple_query("SET search_path = 'public'")
+        .await
+        .expect("SET search_path public");
+    let result = client.simple_query("SELECT * FROM myview").await;
+    assert!(
+        result.is_ok(),
+        "SELECT myview with search_path=public should succeed, got: {:?}",
+        result.err()
+    );
+
+    // search_path = other → unqualified SELECT must fail with 42P01
+    client
+        .simple_query("SET search_path = 'other'")
+        .await
+        .expect("SET search_path other");
+    let result = client.simple_query("SELECT * FROM myview").await;
+    assert!(
+        result.is_err(),
+        "SELECT myview with search_path=other should fail"
+    );
+    let err = result.unwrap_err();
+    let err_msg = if let Some(db_err) = err.as_db_error() {
+        format!("{} {}", db_err.code().code(), db_err.message())
+    } else {
+        err.to_string()
+    };
+    assert!(
+        err_msg.contains("42P01") || err_msg.contains("does not exist"),
+        "error should reference 42P01 or 'does not exist', got: {err_msg}"
+    );
+
+    // Qualified SELECT (public.myview) must succeed regardless of search_path
+    let result = client.simple_query("SELECT * FROM public.myview").await;
+    assert!(
+        result.is_ok(),
+        "qualified SELECT public.myview should succeed regardless of search_path, got: {:?}",
+        result.err()
     );
 }

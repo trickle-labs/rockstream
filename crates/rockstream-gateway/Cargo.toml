@@ -27,6 +27,7 @@ dashmap.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 base64 = "0.22"
+md5.workspace = true
 rockstream-control.workspace = true
 arrow.workspace = true
 datafusion.workspace = true

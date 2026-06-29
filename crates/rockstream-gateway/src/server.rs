@@ -45,14 +45,21 @@ use pgwire::messages::startup::BackendKeyData;
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
-use crate::auth::{AuthMode, JwtVerifier, Principal};
+use base64::engine::general_purpose::STANDARD as B64_STANDARD;
+use base64::Engine as _;
+
+use crate::auth::{
+    scram_server_key, scram_server_signature, scram_stored_key, verify_client_proof, AuthMode,
+    JwtVerifier, Principal,
+};
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogStubs, CatalogTable,
 };
 use crate::copy_state::{
     CopyState, COPY_IN_BUFFER_ROWS, COPY_IN_FLUSH_BYTES, MAX_COPY_IN_BATCH_ROWS,
 };
-use crate::session::{FreshnessToken, SessionState};
+use crate::role_catalog::RoleCatalog;
+use crate::session::{FreshnessToken, ScramAuthState, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
 use crate::GatewayError;
@@ -71,10 +78,15 @@ pub struct CancelToken {
 impl CancelToken {
     pub fn new() -> Self {
         let (tx, rx) = tokio::sync::watch::channel(false);
-        Self { tx: Arc::new(tx), rx }
+        Self {
+            tx: Arc::new(tx),
+            rx,
+        }
     }
     /// Signal cancellation.
-    pub fn cancel(&self) { let _ = self.tx.send(true); }
+    pub fn cancel(&self) {
+        let _ = self.tx.send(true);
+    }
     /// Async future that resolves when cancelled.
     pub async fn cancelled(&mut self) {
         let _ = self.rx.wait_for(|v| *v).await;
@@ -759,6 +771,8 @@ pub struct GatewayHandler {
     auth_mode: AuthMode,
     /// Optional JWT verifier (populated when auth_mode == Oidc).
     jwt_verifier: Option<Arc<JwtVerifier>>,
+    /// Role catalog for SCRAM/MD5 auth (always present; empty for Off/Oidc/Mtls).
+    pub role_catalog: Arc<RoleCatalog>,
     /// ACL store for RBAC enforcement.
     pub acl_store: Arc<rockstream_control::AclStore>,
     /// Namespace catalog.
@@ -785,6 +799,7 @@ impl GatewayHandler {
             shard_db: None,
             auth_mode: AuthMode::Off,
             jwt_verifier: None,
+            role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
             audit_log: None,
@@ -810,6 +825,7 @@ impl GatewayHandler {
             shard_db: Some(shard_db),
             auth_mode: AuthMode::Off,
             jwt_verifier: None,
+            role_catalog: Arc::new(RoleCatalog::new()),
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
             audit_log: None,
@@ -936,7 +952,7 @@ impl GatewayHandler {
     fn dispatch_sync<'a>(
         &'a self,
         query: &'a str,
-        principal_name: &str,
+        session_info: &crate::catalog_stubs::SessionInfo,
     ) -> Option<PgWireResult<Vec<Response<'a>>>> {
         let q = query.trim();
         let ql = q.to_lowercase();
@@ -951,7 +967,7 @@ impl GatewayHandler {
         }
 
         // Catalog stubs
-        if let Some(catalog_resp) = self.catalog.handle_query(q, principal_name) {
+        if let Some(catalog_resp) = self.catalog.handle_query(q, session_info) {
             return Some(Ok(vec![catalog_resp_to_response(catalog_resp)]));
         }
 
@@ -960,28 +976,68 @@ impl GatewayHandler {
         if ql.contains("pg_stat_activity") && ql.contains("from") {
             let schema = Arc::new(vec![
                 FieldInfo::new("pid".to_string(), None, None, Type::INT4, FieldFormat::Text),
-                FieldInfo::new("usename".to_string(), None, None, Type::TEXT, FieldFormat::Text),
-                FieldInfo::new("application_name".to_string(), None, None, Type::TEXT, FieldFormat::Text),
-                FieldInfo::new("state".to_string(), None, None, Type::TEXT, FieldFormat::Text),
-                FieldInfo::new("query".to_string(), None, None, Type::TEXT, FieldFormat::Text),
-                FieldInfo::new("query_start".to_string(), None, None, Type::TIMESTAMP, FieldFormat::Text),
-                FieldInfo::new("client_addr".to_string(), None, None, Type::TEXT, FieldFormat::Text),
+                FieldInfo::new(
+                    "usename".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "application_name".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "state".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "query".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "query_start".to_string(),
+                    None,
+                    None,
+                    Type::TIMESTAMP,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "client_addr".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
             ]);
             // Snapshot sessions
-            let snapshot: Vec<(u32, String, String, String)> = self.sessions.iter().map(|entry| {
-                let session = entry.value();
-                let pid = session.backend_pid;
-                let usename = match &session.principal {
-                    crate::auth::Principal::Jwt { sub } => sub.clone(),
-                    _ => "postgres".to_string(),
-                };
-                let app_name = session.application_name.clone();
-                let state = match session.tx_status {
-                    crate::session::TxStatus::Idle => "idle".to_string(),
-                    _ => "active".to_string(),
-                };
-                (pid, usename, app_name, state)
-            }).collect();
+            let snapshot: Vec<(u32, String, String, String)> = self
+                .sessions
+                .iter()
+                .map(|entry| {
+                    let session = entry.value();
+                    let pid = session.backend_pid;
+                    let usename = match &session.principal {
+                        crate::auth::Principal::Jwt { sub } => sub.clone(),
+                        _ => "postgres".to_string(),
+                    };
+                    let app_name = session.application_name.clone();
+                    let state = match session.tx_status {
+                        crate::session::TxStatus::Idle => "idle".to_string(),
+                        _ => "active".to_string(),
+                    };
+                    (pid, usename, app_name, state)
+                })
+                .collect();
             let schema_ref = schema.clone();
             let data_stream = stream::iter(snapshot).map(move |(pid, usename, app_name, state)| {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
@@ -989,15 +1045,16 @@ impl GatewayHandler {
                 encoder.encode_field(&Some(usename.as_str()))?;
                 encoder.encode_field(&Some(app_name.as_str()))?;
                 encoder.encode_field(&Some(state.as_str()))?;
-                encoder.encode_field(&Some(""))? ; // query
+                encoder.encode_field(&Some(""))?; // query
                 encoder.encode_field::<Option<&str>>(&None)?; // query_start
                 encoder.encode_field::<Option<&str>>(&None)?; // client_addr
                 encoder.finish()
             });
-            return Some(Ok(vec![promote_response(Response::Query(QueryResponse::new(schema, data_stream)))]));
+            return Some(Ok(vec![promote_response(Response::Query(
+                QueryResponse::new(schema, data_stream),
+            ))]));
         }
         // ── End Slice 6 ────────────────────────────────────────────────────────
-
 
         // COPY <view> TO STDOUT — handled via streaming in do_query; skip here.
         // CREATE VIEW / CREATE MATERIALIZED VIEW
@@ -1070,7 +1127,7 @@ impl GatewayHandler {
                         .trim()
                         .trim_matches('\'')
                         .to_string()
-                } else if let Some(pos) = ql.find(" to ") {
+                } else if let Some(pos) = q.to_lowercase().find(" to ") {
                     q[pos + 4..]
                         .trim()
                         .trim_end_matches(';')
@@ -1093,6 +1150,7 @@ impl GatewayHandler {
                     .or_insert_with(SessionState::new);
                 session.current_namespace = ns.clone();
                 session.search_path = ns;
+                session.search_path_set = true;
             }
             return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
         }
@@ -1186,17 +1244,119 @@ impl GatewayHandler {
             )))]);
         }
 
-        let principal_name = if let Some(id) = conn_id {
-            if let Some(session) = self.sessions.get(id) {
-                session.principal.identity().to_string()
+        // S8: Generic SET <key> [=|TO] <value> — store in session GUC params.
+        // Must come after the specific SET handlers (SET rockstream.*, SET search_path).
+        // Exclude SET TRANSACTION so dispatch_sync can enforce SERIALIZABLE → RS-2003.
+        if (ql.starts_with("set ") || ql.starts_with("set local "))
+            && !ql.starts_with("set rockstream.")
+            && !ql.starts_with("set local rockstream.")
+            && !ql.starts_with("set search_path")
+            && !ql.starts_with("set local search_path")
+            && !ql.starts_with("set transaction")
+            && !ql.starts_with("set local transaction")
+        {
+            if let Some(id) = conn_id {
+                let remainder = if ql.starts_with("set local ") {
+                    &q["set local ".len()..]
+                } else {
+                    &q["set ".len()..]
+                };
+                let remainder = remainder.trim().trim_end_matches(';');
+                let (key, raw_val) = if let Some(eq_pos) = remainder.find('=') {
+                    (
+                        remainder[..eq_pos].trim().to_lowercase(),
+                        remainder[eq_pos + 1..].trim().to_string(),
+                    )
+                } else if let Some(to_pos) = remainder.to_lowercase().find(" to ") {
+                    (
+                        remainder[..to_pos].trim().to_lowercase(),
+                        remainder[to_pos + 4..].trim().to_string(),
+                    )
+                } else {
+                    (String::new(), String::new())
+                };
+                if !key.is_empty() {
+                    let val = raw_val
+                        .trim_end_matches(';')
+                        .trim()
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .to_string();
+                    let mut session = self
+                        .sessions
+                        .entry(id.to_string())
+                        .or_insert_with(SessionState::new);
+                    if session.guc_params.len() < crate::session::MAX_GUC_PARAMS
+                        || session.guc_params.contains_key(&key)
+                    {
+                        session.guc_params.insert(key, val);
+                    }
+                }
+            }
+            return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
+        }
+
+        // S8: SHOW <key> — return from session GUC params or session fields.
+        if ql.starts_with("show ") {
+            let key_raw = ql["show ".len()..].trim().trim_end_matches(';').to_string();
+            let session_val: Option<String> = if let Some(id) = conn_id {
+                self.sessions.get(id).map(|s| {
+                    // guc_params first, then session fields, then defaults
+                    if let Some(v) = s.guc_params.get(&key_raw) {
+                        return v.clone();
+                    }
+                    match key_raw.as_str() {
+                        "search_path" => s.search_path.clone(),
+                        "client_encoding" | "server_encoding" => "UTF8".to_string(),
+                        "timezone" => "UTC".to_string(),
+                        "application_name" => s.application_name.clone(),
+                        _ => String::new(),
+                    }
+                })
             } else {
-                "postgres".to_string()
+                None
+            };
+            if let Some(val) = session_val {
+                // Only intercept if we have a non-empty value or it's search_path
+                if !val.is_empty() || key_raw == "search_path" {
+                    let schema = Arc::new(vec![FieldInfo::new(
+                        key_raw.clone(),
+                        None,
+                        None,
+                        Type::TEXT,
+                        FieldFormat::Text,
+                    )]);
+                    let schema_ref = schema.clone();
+                    let data_stream = stream::iter(vec![val]).map(move |v| {
+                        let mut encoder = DataRowEncoder::new(schema_ref.clone());
+                        encoder.encode_field(&Some(v.as_str()))?;
+                        encoder.finish()
+                    });
+                    return Ok(vec![promote_response(Response::Query(QueryResponse::new(
+                        schema,
+                        data_stream,
+                    )))]);
+                }
+            }
+            // Fall through to catalog stubs for static SHOW values (server_version, etc.)
+        }
+
+        // Build SessionInfo for catalog handlers
+        let session_info = if let Some(id) = conn_id {
+            if let Some(session) = self.sessions.get(id) {
+                crate::catalog_stubs::SessionInfo {
+                    backend_pid: session.backend_pid,
+                    search_path: session.search_path.clone(),
+                    principal_name: session.principal.identity().to_string(),
+                }
+            } else {
+                crate::catalog_stubs::SessionInfo::default()
             }
         } else {
-            "postgres".to_string()
+            crate::catalog_stubs::SessionInfo::default()
         };
 
-        if let Some(result) = self.dispatch_sync(query, &principal_name) {
+        if let Some(result) = self.dispatch_sync(query, &session_info) {
             // Promote lifetime — responses from dispatch_sync hold no borrows
             // from `query`, only owned data.
             return result.map(|v| v.into_iter().map(promote_response).collect());
@@ -1302,6 +1462,39 @@ impl GatewayHandler {
 
             if let Some(view_name) = extract_view_name_from_select(q) {
                 if !view_name.starts_with("pg_") && !view_name.starts_with("information_schema") {
+                    // S9: search_path-aware resolution for unqualified view names.
+                    // Only applies when search_path was explicitly configured via SET.
+                    let is_qualified = ql.contains(&format!(".{}", view_name.to_lowercase()));
+                    if !is_qualified {
+                        let (search_path, path_was_set) = if let Some(id) = conn_id {
+                            self.sessions
+                                .get(id)
+                                .map(|s| (s.search_path.clone(), s.search_path_set))
+                                .unwrap_or_else(|| ("public".to_string(), false))
+                        } else {
+                            ("public".to_string(), false)
+                        };
+                        if path_was_set {
+                            let path_parts: Vec<&str> =
+                                search_path.split(',').map(|s| s.trim()).collect();
+                            // If the view exists but is not in the search_path, reject.
+                            if self.catalog.get_view(&view_name).is_some()
+                                && self.catalog.resolve_view(&view_name, &path_parts).is_none()
+                            {
+                                return Ok(vec![promote_response(Response::Error(Box::new(
+                                    ErrorInfo::new(
+                                        "ERROR".to_string(),
+                                        "42P01".to_string(),
+                                        format!(
+                                            "relation \"{}\" does not exist (not in search_path: {})",
+                                            view_name, search_path
+                                        ),
+                                    ),
+                                )))]);
+                            }
+                        }
+                    }
+
                     // Try index-accelerated point lookup before falling back to full scan.
                     if let Some(responses) = self.maybe_index_point_lookup(q, &view_name).await? {
                         return Ok(responses);
@@ -1320,7 +1513,7 @@ impl GatewayHandler {
                                 ErrorInfo::new(
                                     "ERROR".to_string(),
                                     "57014".to_string(),
-                                    "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or adjust client timeout settings.".to_string(),
+                                    "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings.".to_string(),
                                 )
                             )))])
                         }
@@ -2291,7 +2484,9 @@ impl GatewayHandler {
             // Clear all copy state
             self.copy_states.remove(id);
             // Clear all portals for this connection
-            let portal_keys: Vec<_> = self.portal_states.iter()
+            let portal_keys: Vec<_> = self
+                .portal_states
+                .iter()
                 .filter(|e| e.key().0 == id)
                 .map(|e| e.key().clone())
                 .collect();
@@ -2317,7 +2512,9 @@ impl GatewayHandler {
                 session.session_wait_for_enabled = true;
             }
         }
-        Ok(vec![promote_response(Response::Execution(Tag::new("DISCARD ALL")))])
+        Ok(vec![promote_response(Response::Execution(Tag::new(
+            "DISCARD ALL",
+        )))])
     }
 
     /// RESET ALL: reset GUC settings without clearing cursors or prepared statements.
@@ -2333,7 +2530,9 @@ impl GatewayHandler {
                 // Note: cursors, prepared statements, portals are NOT cleared by RESET ALL
             }
         }
-        Ok(vec![promote_response(Response::Execution(Tag::new("RESET")))])
+        Ok(vec![promote_response(Response::Execution(Tag::new(
+            "RESET",
+        )))])
     }
 
     // ── End Slice 5 ───────────────────────────────────────────────────────────
@@ -2357,8 +2556,11 @@ impl GatewayHandler {
             Some(p) => p,
             None => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
-                        "syntax error in DECLARE CURSOR".to_string()),
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42601".to_string(),
+                        "syntax error in DECLARE CURSOR".to_string(),
+                    ),
                 )))]);
             }
         };
@@ -2368,8 +2570,11 @@ impl GatewayHandler {
         // Handle: rest starts with "for " directly (no scroll/hold options), or " for " embedded
         if !rest.starts_with("for ") && !rest.contains(" for ") {
             return Ok(vec![promote_response(Response::Error(Box::new(
-                ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
-                    "missing FOR in DECLARE CURSOR".to_string()),
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42601".to_string(),
+                    "missing FOR in DECLARE CURSOR".to_string(),
+                ),
             )))]);
         }
         // Original-case query
@@ -2379,7 +2584,8 @@ impl GatewayHandler {
         let inner_start = if lower_for_search.starts_with("for ") {
             "for ".len()
         } else {
-            lower_for_search.find(" for ")
+            lower_for_search
+                .find(" for ")
                 .map(|p| p + " for ".len())
                 .unwrap_or(0)
         };
@@ -2389,15 +2595,21 @@ impl GatewayHandler {
             Some(id) => id,
             None => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_string(), "XX000".to_string(),
-                        "DECLARE requires a connection context".to_string()),
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "DECLARE requires a connection context".to_string(),
+                    ),
                 )))]);
             }
         };
 
         // Check cursor limit
         let cursor_count = {
-            let session = self.sessions.entry(conn_id_str.to_string()).or_insert_with(SessionState::new);
+            let session = self
+                .sessions
+                .entry(conn_id_str.to_string())
+                .or_insert_with(SessionState::new);
             session.cursors.len()
         };
         if cursor_count >= MAX_CURSORS_PER_CONNECTION {
@@ -2409,7 +2621,10 @@ impl GatewayHandler {
 
         // Check for duplicate cursor name
         {
-            let session = self.sessions.entry(conn_id_str.to_string()).or_insert_with(SessionState::new);
+            let session = self
+                .sessions
+                .entry(conn_id_str.to_string())
+                .or_insert_with(SessionState::new);
             if session.cursors.contains_key(&cursor_name) {
                 return Ok(vec![promote_response(Response::Error(Box::new(
                     ErrorInfo::new("ERROR".to_string(), "42P03".to_string(),
@@ -2422,7 +2637,9 @@ impl GatewayHandler {
         let rows: Vec<Vec<u8>> = if let Some(view_name) = extract_view_name_from_select(inner_sql) {
             if let Some(shard_db) = &self.shard_db {
                 let prefix = format!("view_output/{view_name}/");
-                shard_db.scan_prefix(prefix.as_bytes()).await
+                shard_db
+                    .scan_prefix(prefix.as_bytes())
+                    .await
                     .map(|kvs| kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
                     .unwrap_or_default()
             } else {
@@ -2437,14 +2654,18 @@ impl GatewayHandler {
 
         // Store in session
         {
-            let mut session = self.sessions.entry(conn_id_str.to_string()).or_insert_with(SessionState::new);
-            session.cursors.insert(cursor_name.clone(), CursorState {
-                rows,
-                position: 0,
-            });
+            let mut session = self
+                .sessions
+                .entry(conn_id_str.to_string())
+                .or_insert_with(SessionState::new);
+            session
+                .cursors
+                .insert(cursor_name.clone(), CursorState { rows, position: 0 });
         }
 
-        Ok(vec![promote_response(Response::Execution(Tag::new("DECLARE")))])
+        Ok(vec![promote_response(Response::Execution(Tag::new(
+            "DECLARE",
+        )))])
     }
 
     fn handle_fetch_cursor(
@@ -2455,10 +2676,15 @@ impl GatewayHandler {
     ) -> PgWireResult<Vec<Response<'static>>> {
         let conn_id_str = match conn_id {
             Some(id) => id,
-            None => return Ok(vec![promote_response(Response::Error(Box::new(
-                ErrorInfo::new("ERROR".to_string(), "XX000".to_string(),
-                    "FETCH requires a connection context".to_string()),
-            )))]),
+            None => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "FETCH requires a connection context".to_string(),
+                    ),
+                )))])
+            }
         };
 
         // Parse: FETCH [FORWARD] <n|ALL> FROM <name>
@@ -2473,13 +2699,19 @@ impl GatewayHandler {
             } else {
                 count_part
             };
-            let name_part = after_fetch[from_pos + " from ".len()..].trim()
-                .trim_end_matches(';').trim().to_string();
+            let name_part = after_fetch[from_pos + " from ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
             (count_part.to_string(), name_part)
         } else {
             return Ok(vec![promote_response(Response::Error(Box::new(
-                ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
-                    "syntax error in FETCH: missing FROM".to_string()),
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42601".to_string(),
+                    "syntax error in FETCH: missing FROM".to_string(),
+                ),
             )))]);
         };
 
@@ -2527,18 +2759,26 @@ impl GatewayHandler {
 
         // Build DataRow responses
         let schema = Arc::new(vec![FieldInfo::new(
-            "result".to_string(), None, None, Type::TEXT, FieldFormat::Text,
+            "result".to_string(),
+            None,
+            None,
+            Type::TEXT,
+            FieldFormat::Text,
         )]);
         let schema_ref = schema.clone();
         let data_stream = futures::stream::iter(fetched_rows).map(move |row| {
             let mut encoder = DataRowEncoder::new(schema_ref.clone());
             let s = String::from_utf8_lossy(&row).into_owned();
-            encoder.encode_field(&Some(s.as_str()))
+            encoder
+                .encode_field(&Some(s.as_str()))
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             encoder.finish()
         });
 
-        Ok(vec![promote_response(Response::Query(QueryResponse::new(schema, data_stream)))])
+        Ok(vec![promote_response(Response::Query(QueryResponse::new(
+            schema,
+            data_stream,
+        )))])
     }
 
     /// MOVE [FORWARD] n FROM <name> | MOVE ALL FROM <name>
@@ -2550,10 +2790,15 @@ impl GatewayHandler {
     ) -> PgWireResult<Vec<Response<'static>>> {
         let conn_id_str = match conn_id {
             Some(id) => id,
-            None => return Ok(vec![promote_response(Response::Error(Box::new(
-                ErrorInfo::new("ERROR".to_string(), "XX000".to_string(),
-                    "MOVE requires a connection context".to_string()),
-            )))]),
+            None => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "MOVE requires a connection context".to_string(),
+                    ),
+                )))])
+            }
         };
 
         let after_move = ql["move ".len()..].trim();
@@ -2564,13 +2809,19 @@ impl GatewayHandler {
             } else {
                 count_part
             };
-            let name_part = after_move[from_pos + " from ".len()..].trim()
-                .trim_end_matches(';').trim().to_string();
+            let name_part = after_move[from_pos + " from ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
             (count_part.to_string(), name_part)
         } else {
             return Ok(vec![promote_response(Response::Error(Box::new(
-                ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
-                    "syntax error in MOVE: missing FROM".to_string()),
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42601".to_string(),
+                    "syntax error in MOVE: missing FROM".to_string(),
+                ),
             )))]);
         };
 
@@ -2599,8 +2850,11 @@ impl GatewayHandler {
             }
         } else {
             return Ok(vec![promote_response(Response::Error(Box::new(
-                ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
-                    format!("[RS-2051] cursor.not_found: cursor '{cursor_name}' does not exist.")),
+                ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "34000".to_string(),
+                    format!("[RS-2051] cursor.not_found: cursor '{cursor_name}' does not exist."),
+                ),
             )))]);
         };
 
@@ -2618,13 +2872,22 @@ impl GatewayHandler {
     ) -> PgWireResult<Vec<Response<'static>>> {
         let conn_id_str = match conn_id {
             Some(id) => id,
-            None => return Ok(vec![promote_response(Response::Error(Box::new(
-                ErrorInfo::new("ERROR".to_string(), "XX000".to_string(),
-                    "CLOSE requires a connection context".to_string()),
-            )))]),
+            None => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "CLOSE requires a connection context".to_string(),
+                    ),
+                )))])
+            }
         };
 
-        let name = ql["close ".len()..].trim().trim_end_matches(';').trim().to_string();
+        let name = ql["close ".len()..]
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
 
         if name == "all" {
             if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
@@ -2641,7 +2904,9 @@ impl GatewayHandler {
             }
         }
 
-        Ok(vec![promote_response(Response::Execution(Tag::new("CLOSE")))])
+        Ok(vec![promote_response(Response::Execution(Tag::new(
+            "CLOSE",
+        )))])
     }
 
     // ── End Slice 3 ───────────────────────────────────────────────────────────
@@ -2989,8 +3254,20 @@ impl StartupHandler for GatewayHandler {
         pgwire::error::PgWireError:
             From<<C as futures::Sink<pgwire::messages::PgWireBackendMessage>>::Error>,
     {
+        use pgwire::api::PgWireConnectionState;
+        use pgwire::messages::response::{ReadyForQuery, TransactionStatus};
+        use pgwire::messages::startup::{Authentication, ParameterStatus};
+
+        // ── Initial Startup message ───────────────────────────────────────────
         if let pgwire::messages::PgWireFrontendMessage::Startup(ref startup) = message {
             save_startup_parameters_to_metadata(client, startup);
+
+            let app_name = startup
+                .parameters
+                .iter()
+                .find(|(k, _)| k.to_lowercase() == "application_name")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
 
             match &self.auth_mode {
                 AuthMode::Off => {
@@ -3063,20 +3340,93 @@ impl StartupHandler for GatewayHandler {
                         .metadata_mut()
                         .insert("_rs_principal".to_string(), format!("cert:{cn}"));
                 }
+                AuthMode::Scram => {
+                    if let Ok(conn_id) = CONN_ID.try_with(|id| id.clone()) {
+                        client
+                            .metadata_mut()
+                            .insert("_rs_conn_id".to_string(), conn_id.clone());
+                        {
+                            let mut session = self
+                                .sessions
+                                .entry(conn_id.clone())
+                                .or_insert_with(SessionState::new);
+                            session.application_name = app_name;
+                            session.scram_auth_state = ScramAuthState::Idle;
+                        }
+                        if self.cancellation_registry.len() < MAX_CONNECTIONS {
+                            let token = CANCEL_TOKEN
+                                .try_with(|t| t.clone())
+                                .unwrap_or_else(|_| CancelToken::new());
+                            if let Some(session) = self.sessions.get(&conn_id) {
+                                self.cancellation_registry
+                                    .insert((session.backend_pid, session.cancel_secret), token);
+                            }
+                        }
+                        client
+                            .send(PgWireBackendMessage::Authentication(Authentication::SASL(
+                                vec!["SCRAM-SHA-256".to_owned()],
+                            )))
+                            .await?;
+                        client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                    } else {
+                        // No CONN_ID — fallback (e.g. test without task-local scope)
+                        client
+                            .send(PgWireBackendMessage::Authentication(Authentication::SASL(
+                                vec!["SCRAM-SHA-256".to_owned()],
+                            )))
+                            .await?;
+                        client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                    }
+                    return Ok(());
+                }
+                AuthMode::Md5 => {
+                    // S6 (second half): send MD5 challenge
+                    if let Ok(conn_id) = CONN_ID.try_with(|id| id.clone()) {
+                        client
+                            .metadata_mut()
+                            .insert("_rs_conn_id".to_string(), conn_id.clone());
+                        let salt: [u8; 4] = rand::random();
+                        {
+                            let mut session = self
+                                .sessions
+                                .entry(conn_id.clone())
+                                .or_insert_with(SessionState::new);
+                            session.application_name = app_name;
+                            session.md5_auth_salt = Some(salt);
+                        }
+                        if self.cancellation_registry.len() < MAX_CONNECTIONS {
+                            let token = CANCEL_TOKEN
+                                .try_with(|t| t.clone())
+                                .unwrap_or_else(|_| CancelToken::new());
+                            if let Some(session) = self.sessions.get(&conn_id) {
+                                self.cancellation_registry
+                                    .insert((session.backend_pid, session.cancel_secret), token);
+                            }
+                        }
+                        client
+                            .send(PgWireBackendMessage::Authentication(
+                                Authentication::MD5Password(salt.to_vec()),
+                            ))
+                            .await?;
+                        client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                    } else {
+                        let salt: [u8; 4] = rand::random();
+                        client
+                            .send(PgWireBackendMessage::Authentication(
+                                Authentication::MD5Password(salt.to_vec()),
+                            ))
+                            .await?;
+                        client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                    }
+                    return Ok(());
+                }
             }
 
-            // Extract application_name from startup params (v0.39 PgBouncer compat)
-            let app_name = startup
-                .parameters
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == "application_name")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
+            // Off / Oidc / Mtls: finish authentication with per-connection pid/secret
             if let Some(conn_id) = CONN_ID.try_with(|id| id.clone()).ok() {
                 client
                     .metadata_mut()
                     .insert("_rs_conn_id".to_string(), conn_id.clone());
-                // Create session and register cancellation token
                 let (pid, secret) = {
                     let mut session = self
                         .sessions
@@ -3085,40 +3435,32 @@ impl StartupHandler for GatewayHandler {
                     session.application_name = app_name;
                     (session.backend_pid, session.cancel_secret)
                 };
-                // Register (pid, secret) -> token if MAX_CONNECTIONS not exceeded
                 if self.cancellation_registry.len() < MAX_CONNECTIONS {
                     let token = CANCEL_TOKEN
                         .try_with(|t| t.clone())
                         .unwrap_or_else(|_| CancelToken::new());
                     self.cancellation_registry.insert((pid, secret), token);
                 }
-                // Send AuthOk + ParameterStatus
-                use pgwire::messages::startup::{Authentication, ParameterStatus};
-                use pgwire::messages::response::ReadyForQuery;
                 client
                     .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
                     .await?;
-                if let Some(params) = GatewayServerParameterProvider::default()
-                    .server_parameters(client)
+                if let Some(params) =
+                    GatewayServerParameterProvider::default().server_parameters(client)
                 {
                     for (k, v) in params {
                         client
-                            .feed(PgWireBackendMessage::ParameterStatus(
-                                ParameterStatus::new(k, v),
-                            ))
+                            .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                                k, v,
+                            )))
                             .await?;
                     }
                 }
-                // Send our BackendKeyData with per-connection pid+secret
                 client
                     .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
                         pid as i32,
                         secret as i32,
                     )))
                     .await?;
-                // ReadyForQuery
-                use pgwire::api::PgWireConnectionState;
-                use pgwire::messages::response::TransactionStatus;
                 client
                     .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                         TransactionStatus::Idle,
@@ -3128,7 +3470,301 @@ impl StartupHandler for GatewayHandler {
             } else {
                 finish_authentication(client, &GatewayServerParameterProvider::default()).await?;
             }
+            return Ok(());
         }
+
+        // ── Password / SASL exchange messages ────────────────────────────────
+        if let pgwire::messages::PgWireFrontendMessage::PasswordMessageFamily(msg) = message {
+            let conn_id = client
+                .metadata()
+                .get("_rs_conn_id")
+                .cloned()
+                .unwrap_or_default();
+
+            match &self.auth_mode {
+                AuthMode::Scram => {
+                    // Read current auth state
+                    let auth_state = self
+                        .sessions
+                        .get(&conn_id)
+                        .map(|s| s.scram_auth_state.clone())
+                        .unwrap_or(ScramAuthState::Idle);
+
+                    match auth_state {
+                        ScramAuthState::Idle => {
+                            // SASLInitialResponse — client-first-message
+                            let sasl_resp = msg.into_sasl_initial_response()?;
+                            let data = sasl_resp.data.ok_or_else(|| {
+                                pgwire::error::PgWireError::UserError(Box::new(
+                                    pgwire::error::ErrorInfo::new(
+                                        "FATAL".to_string(),
+                                        "28P01".to_string(),
+                                        "empty SASLInitialResponse".to_string(),
+                                    ),
+                                ))
+                            })?;
+                            let client_first = String::from_utf8_lossy(&data).into_owned();
+
+                            // Parse gs2-header by skipping to byte after second comma.
+                            // RFC 5802: gs2-header ends at second comma; bare starts after.
+                            let client_first_bare = {
+                                let mut comma_count = 0u32;
+                                let mut start = 0usize;
+                                for (i, c) in client_first.char_indices() {
+                                    if c == ',' {
+                                        comma_count += 1;
+                                        if comma_count == 2 {
+                                            start = i + 1;
+                                            break;
+                                        }
+                                    }
+                                }
+                                client_first[start..].to_string()
+                            };
+
+                            // Postgres SCRAM: username is always empty in the SASL message ("n=,");
+                            // the actual username comes from the startup "user" parameter.
+                            let username = client
+                                .metadata()
+                                .get(pgwire::api::METADATA_USER)
+                                .cloned()
+                                .unwrap_or_default();
+
+                            // Extract client nonce from "r=nonce"
+                            let client_nonce = client_first_bare
+                                .split(',')
+                                .find(|p| p.starts_with("r="))
+                                .and_then(|p| p.strip_prefix("r="))
+                                .unwrap_or("")
+                                .to_string();
+
+                            // Look up user in role catalog
+                            let role = self.role_catalog.get(&username).ok_or_else(|| {
+                                pgwire::error::PgWireError::UserError(Box::new(
+                                    pgwire::error::ErrorInfo::new(
+                                        "FATAL".to_string(),
+                                        "28P01".to_string(),
+                                        format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
+                                    ),
+                                ))
+                            })?;
+
+                            // Build server-first-message
+                            let server_nonce_suffix: String =
+                                B64_STANDARD.encode(rand::random::<[u8; 18]>());
+                            let server_nonce = format!("{client_nonce}{server_nonce_suffix}");
+                            let salt_b64 = B64_STANDARD.encode(&role.scram_salt);
+                            let server_first = format!(
+                                "r={server_nonce},s={salt_b64},i={}",
+                                role.scram_iterations
+                            );
+
+                            // auth_message prefix: client_first_bare + "," + server_first
+                            let auth_message_prefix = format!("{client_first_bare},{server_first}");
+
+                            // Store state in session
+                            if let Some(mut session) = self.sessions.get_mut(&conn_id) {
+                                session.scram_auth_state = ScramAuthState::ServerFirstSent {
+                                    salted_password: role.scram_salted_password.clone(),
+                                    server_nonce: server_nonce.clone(),
+                                    auth_message: auth_message_prefix,
+                                    username,
+                                };
+                            }
+
+                            client
+                                .send(PgWireBackendMessage::Authentication(
+                                    Authentication::SASLContinue(bytes::Bytes::from(server_first)),
+                                ))
+                                .await?;
+                        }
+
+                        ScramAuthState::ServerFirstSent {
+                            salted_password,
+                            server_nonce,
+                            auth_message: auth_msg_prefix,
+                            username,
+                        } => {
+                            // SASLResponse — client-final-message
+                            let sasl_resp = msg.into_sasl_response()?;
+                            let client_final =
+                                String::from_utf8_lossy(&sasl_resp.data).into_owned();
+
+                            // Parse client-final: c=...,r=...,p=...
+                            let r_val = client_final
+                                .split(',')
+                                .find(|p| p.starts_with("r="))
+                                .and_then(|p| p.strip_prefix("r="))
+                                .unwrap_or("");
+                            if r_val != server_nonce {
+                                return Err(pgwire::error::PgWireError::UserError(Box::new(
+                                    pgwire::error::ErrorInfo::new(
+                                        "FATAL".to_string(),
+                                        "28P01".to_string(),
+                                        format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
+                                    ),
+                                )));
+                            }
+
+                            let proof_b64 = client_final
+                                .split(',')
+                                .find(|p| p.starts_with("p="))
+                                .and_then(|p| p.strip_prefix("p="))
+                                .unwrap_or("");
+
+                            // client-final-without-proof = everything before ",p="
+                            let client_final_without_proof = client_final
+                                .find(",p=")
+                                .map(|i| &client_final[..i])
+                                .unwrap_or(&client_final);
+
+                            // Complete auth-message
+                            let auth_message =
+                                format!("{auth_msg_prefix},{client_final_without_proof}");
+
+                            // Verify
+                            let stored_key = scram_stored_key(&salted_password);
+                            if !verify_client_proof(&stored_key, proof_b64, &auth_message) {
+                                // Reset state
+                                if let Some(mut session) = self.sessions.get_mut(&conn_id) {
+                                    session.scram_auth_state = ScramAuthState::Idle;
+                                }
+                                return Err(pgwire::error::PgWireError::UserError(Box::new(
+                                    pgwire::error::ErrorInfo::new(
+                                        "FATAL".to_string(),
+                                        "28P01".to_string(),
+                                        format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
+                                    ),
+                                )));
+                            }
+
+                            // Compute and send server signature
+                            let server_key = scram_server_key(&salted_password);
+                            let server_sig = scram_server_signature(&server_key, &auth_message);
+                            let server_sig_b64 = B64_STANDARD.encode(server_sig);
+                            client
+                                .feed(PgWireBackendMessage::Authentication(
+                                    Authentication::SASLFinal(bytes::Bytes::from(format!(
+                                        "v={server_sig_b64}"
+                                    ))),
+                                ))
+                                .await?;
+
+                            // Update principal and reset auth state
+                            let (pid, secret) =
+                                if let Some(mut session) = self.sessions.get_mut(&conn_id) {
+                                    session.principal = Principal::ScramUser {
+                                        username: username.clone(),
+                                    };
+                                    session.scram_auth_state = ScramAuthState::Idle;
+                                    (session.backend_pid, session.cancel_secret)
+                                } else {
+                                    (0u32, 0u32)
+                                };
+
+                            // Complete authentication
+                            client
+                                .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
+                                .await?;
+                            if let Some(params) =
+                                GatewayServerParameterProvider::default().server_parameters(client)
+                            {
+                                for (k, v) in params {
+                                    client
+                                        .feed(PgWireBackendMessage::ParameterStatus(
+                                            ParameterStatus::new(k, v),
+                                        ))
+                                        .await?;
+                                }
+                            }
+                            client
+                                .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+                                    pid as i32,
+                                    secret as i32,
+                                )))
+                                .await?;
+                            client
+                                .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                                    TransactionStatus::Idle,
+                                )))
+                                .await?;
+                            client.set_state(PgWireConnectionState::ReadyForQuery);
+                        }
+                    }
+                }
+                AuthMode::Md5 => {
+                    // S6 (second half): verify MD5 password
+                    let conn_id_clone = conn_id.clone();
+                    let username = client.metadata().get("user").cloned().unwrap_or_default();
+                    let salt = self
+                        .sessions
+                        .get(&conn_id_clone)
+                        .and_then(|s| s.md5_auth_salt)
+                        .unwrap_or([0u8; 4]);
+
+                    let pwd_msg = msg.into_password()?;
+                    let client_response = pwd_msg.password;
+
+                    let role = self.role_catalog.get(&username);
+                    let valid = role
+                        .as_ref()
+                        .and_then(|r| r.md5_hash.as_deref())
+                        .map(|stored| {
+                            crate::auth::verify_md5(stored, &username, &salt, &client_response)
+                        })
+                        .unwrap_or(false);
+
+                    if !valid {
+                        return Err(pgwire::error::PgWireError::UserError(Box::new(
+                            pgwire::error::ErrorInfo::new(
+                                "FATAL".to_string(),
+                                "28P01".to_string(),
+                                format!("[RS-2401] auth.invalid_password: password authentication failed for user '{username}'. next_steps: Check password and retry"),
+                            ),
+                        )));
+                    }
+
+                    let (pid, secret) =
+                        if let Some(mut session) = self.sessions.get_mut(&conn_id_clone) {
+                            session.principal = Principal::ScramUser {
+                                username: username.clone(),
+                            };
+                            (session.backend_pid, session.cancel_secret)
+                        } else {
+                            (0u32, 0u32)
+                        };
+
+                    client
+                        .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
+                        .await?;
+                    if let Some(params) =
+                        GatewayServerParameterProvider::default().server_parameters(client)
+                    {
+                        for (k, v) in params {
+                            client
+                                .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                                    k, v,
+                                )))
+                                .await?;
+                        }
+                    }
+                    client
+                        .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+                            pid as i32,
+                            secret as i32,
+                        )))
+                        .await?;
+                    client
+                        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                            TransactionStatus::Idle,
+                        )))
+                        .await?;
+                    client.set_state(PgWireConnectionState::ReadyForQuery);
+                }
+                _ => {}
+            }
+        }
+
         Ok(())
     }
 }
@@ -3976,6 +4612,38 @@ impl GatewayServer {
         }
     }
 
+    /// Create a gateway with SCRAM-SHA-256 auth and a pre-populated RoleCatalog.
+    pub fn with_scram_auth(
+        addr: std::net::SocketAddr,
+        catalog: Arc<CatalogStubs>,
+        view_reader: Arc<dyn ViewReader>,
+        role_catalog: Arc<RoleCatalog>,
+    ) -> Self {
+        let mut handler = GatewayHandler::new(catalog, view_reader);
+        handler.auth_mode = AuthMode::Scram;
+        handler.role_catalog = role_catalog;
+        GatewayServer {
+            addr,
+            handler: Arc::new(handler),
+        }
+    }
+
+    /// Create a gateway with MD5 auth and a pre-populated RoleCatalog.
+    pub fn with_md5_auth(
+        addr: std::net::SocketAddr,
+        catalog: Arc<CatalogStubs>,
+        view_reader: Arc<dyn ViewReader>,
+        role_catalog: Arc<RoleCatalog>,
+    ) -> Self {
+        let mut handler = GatewayHandler::new(catalog, view_reader);
+        handler.auth_mode = AuthMode::Md5;
+        handler.role_catalog = role_catalog;
+        GatewayServer {
+            addr,
+            handler: Arc::new(handler),
+        }
+    }
+
     /// Create a gateway with OIDC auth enabled (for auth integration tests).
     pub fn with_shard_db_and_auth(
         addr: std::net::SocketAddr,
@@ -4019,35 +4687,48 @@ impl GatewayServer {
             let conn_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
             let cancel_token = CancelToken::new();
             let token_for_task = cancel_token.clone();
-            tokio::spawn(CANCEL_TOKEN.scope(token_for_task, CONN_ID.scope(conn_id, async move {
-                let mut socket = socket;
-                let mut buf = [0u8; 16];
-                if let Ok(n) = socket.peek(&mut buf).await {
-                    // SSLRequest: [0,0,0,8, 4,210,22,47]
-                    if n >= 8 && buf[..8] == [0, 0, 0, 8, 4, 210, 22, 47] {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut ssl_buf = [0u8; 8];
-                        let _ = socket.read_exact(&mut ssl_buf).await;
-                        let _ = socket.write_all(b"N").await;
-                        let _ = socket.flush().await;
-                    }
-                    // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
-                    else if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
-                        use tokio::io::AsyncReadExt;
-                        let mut cancel_buf = [0u8; 16];
-                        let _ = socket.read_exact(&mut cancel_buf).await;
-                        let pid = u32::from_be_bytes([cancel_buf[8], cancel_buf[9], cancel_buf[10], cancel_buf[11]]);
-                        let secret = u32::from_be_bytes([cancel_buf[12], cancel_buf[13], cancel_buf[14], cancel_buf[15]]);
-                        if let Some(token) = registry_ref.get(&(pid, secret)) {
-                            token.cancel();
+            tokio::spawn(CANCEL_TOKEN.scope(
+                token_for_task,
+                CONN_ID.scope(conn_id, async move {
+                    let mut socket = socket;
+                    let mut buf = [0u8; 16];
+                    if let Ok(n) = socket.peek(&mut buf).await {
+                        // SSLRequest: [0,0,0,8, 4,210,22,47]
+                        if n >= 8 && buf[..8] == [0, 0, 0, 8, 4, 210, 22, 47] {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let mut ssl_buf = [0u8; 8];
+                            let _ = socket.read_exact(&mut ssl_buf).await;
+                            let _ = socket.write_all(b"N").await;
+                            let _ = socket.flush().await;
                         }
-                        return; // CancelRequest connections don't do further work
+                        // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
+                        else if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
+                            use tokio::io::AsyncReadExt;
+                            let mut cancel_buf = [0u8; 16];
+                            let _ = socket.read_exact(&mut cancel_buf).await;
+                            let pid = u32::from_be_bytes([
+                                cancel_buf[8],
+                                cancel_buf[9],
+                                cancel_buf[10],
+                                cancel_buf[11],
+                            ]);
+                            let secret = u32::from_be_bytes([
+                                cancel_buf[12],
+                                cancel_buf[13],
+                                cancel_buf[14],
+                                cancel_buf[15],
+                            ]);
+                            if let Some(token) = registry_ref.get(&(pid, secret)) {
+                                token.cancel();
+                            }
+                            return; // CancelRequest connections don't do further work
+                        }
                     }
-                }
-                if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
-                    tracing::debug!("gateway connection error: {e}");
-                }
-            })));
+                    if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
+                        tracing::debug!("gateway connection error: {e}");
+                    }
+                }),
+            ));
         }
     }
 
@@ -4073,35 +4754,50 @@ impl GatewayServer {
                 let conn_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
                 let cancel_token = CancelToken::new();
                 let token_for_task = cancel_token.clone();
-                tokio::spawn(CANCEL_TOKEN.scope(token_for_task, CONN_ID.scope(conn_id, async move {
-                    let mut socket = socket;
-                    let mut buf = [0u8; 16];
-                    if let Ok(n) = socket.peek(&mut buf).await {
-                        // SSLRequest: [0,0,0,8, 4,210,22,47]
-                        if n >= 8 && buf[..8] == [0, 0, 0, 8, 4, 210, 22, 47] {
-                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                            let mut ssl_buf = [0u8; 8];
-                            let _ = socket.read_exact(&mut ssl_buf).await;
-                            let _ = socket.write_all(b"N").await;
-                            let _ = socket.flush().await;
-                        }
-                        // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
-                        else if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
-                            use tokio::io::AsyncReadExt;
-                            let mut cancel_buf = [0u8; 16];
-                            let _ = socket.read_exact(&mut cancel_buf).await;
-                            let pid = u32::from_be_bytes([cancel_buf[8], cancel_buf[9], cancel_buf[10], cancel_buf[11]]);
-                            let secret = u32::from_be_bytes([cancel_buf[12], cancel_buf[13], cancel_buf[14], cancel_buf[15]]);
-                            if let Some(token) = registry_ref.get(&(pid, secret)) {
-                                token.cancel();
+                tokio::spawn(CANCEL_TOKEN.scope(
+                    token_for_task,
+                    CONN_ID.scope(conn_id, async move {
+                        let mut socket = socket;
+                        let mut buf = [0u8; 16];
+                        if let Ok(n) = socket.peek(&mut buf).await {
+                            // SSLRequest: [0,0,0,8, 4,210,22,47]
+                            if n >= 8 && buf[..8] == [0, 0, 0, 8, 4, 210, 22, 47] {
+                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                let mut ssl_buf = [0u8; 8];
+                                let _ = socket.read_exact(&mut ssl_buf).await;
+                                let _ = socket.write_all(b"N").await;
+                                let _ = socket.flush().await;
                             }
-                            return; // CancelRequest connections don't do further work
+                            // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
+                            else if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
+                                use tokio::io::AsyncReadExt;
+                                let mut cancel_buf = [0u8; 16];
+                                let _ = socket.read_exact(&mut cancel_buf).await;
+                                let pid = u32::from_be_bytes([
+                                    cancel_buf[8],
+                                    cancel_buf[9],
+                                    cancel_buf[10],
+                                    cancel_buf[11],
+                                ]);
+                                let secret = u32::from_be_bytes([
+                                    cancel_buf[12],
+                                    cancel_buf[13],
+                                    cancel_buf[14],
+                                    cancel_buf[15],
+                                ]);
+                                if let Some(token) = registry_ref.get(&(pid, secret)) {
+                                    token.cancel();
+                                }
+                                return; // CancelRequest connections don't do further work
+                            }
                         }
-                    }
-                    if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
-                        tracing::debug!("gateway connection error: {e}");
-                    }
-                })));
+                        if let Err(e) =
+                            pgwire::tokio::process_socket(socket, None, factory_ref).await
+                        {
+                            tracing::debug!("gateway connection error: {e}");
+                        }
+                    }),
+                ));
             }
         });
         Ok((local_addr, handle))
@@ -4276,7 +4972,9 @@ fn parse_copy_to_stdout_view(q: &str) -> Option<String> {
 
 /// Build FieldInfo list for a query (for DESCRIBE).
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
-    if let Some(catalog_resp) = catalog.handle_query(q, "postgres") {
+    if let Some(catalog_resp) =
+        catalog.handle_query(q, &crate::catalog_stubs::SessionInfo::default())
+    {
         match catalog_resp {
             CatalogResponse::Rows { columns, .. } => {
                 return columns

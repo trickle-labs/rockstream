@@ -2,6 +2,30 @@
 
 use std::collections::HashMap;
 
+/// Maximum GUC parameters stored per connection.
+/// Fill-level metric: `guc_params.len()`.
+/// Backpressure: excess SET commands are silently accepted but not stored.
+pub const MAX_GUC_PARAMS: usize = 100;
+
+/// SCRAM-SHA-256 per-connection auth state machine.
+#[derive(Debug, Clone, Default)]
+pub enum ScramAuthState {
+    /// No SCRAM exchange in progress.
+    #[default]
+    Idle,
+    /// Server-first message has been sent; waiting for client-final.
+    ServerFirstSent {
+        /// SaltedPassword from the RoleCatalog.
+        salted_password: Vec<u8>,
+        /// Full nonce (client_nonce + server_nonce).
+        server_nonce: String,
+        /// Partial auth-message: `client_first_bare + "," + server_first`.
+        auth_message: String,
+        /// Username extracted from client-first-message.
+        username: String,
+    },
+}
+
 /// Isolation level for a gateway session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsolationLevel {
@@ -125,6 +149,14 @@ pub struct SessionState {
     pub cursors: HashMap<String, CursorState>,
     /// application_name startup parameter (v0.39).
     pub application_name: String,
+    /// Per-connection SCRAM-SHA-256 auth state (v0.40).
+    pub scram_auth_state: ScramAuthState,
+    /// 4-byte salt sent for MD5 auth challenge (v0.40).
+    pub md5_auth_salt: Option<[u8; 4]>,
+    /// Per-connection GUC parameters set via SET (v0.40). Bound: MAX_GUC_PARAMS.
+    pub guc_params: HashMap<String, String>,
+    /// True when search_path was explicitly set via SET (v0.40, S9). Enables search_path-aware view resolution.
+    pub search_path_set: bool,
 }
 
 impl Default for SessionState {
@@ -154,6 +186,10 @@ impl SessionState {
             tx_status: TxStatus::Idle,
             cursors: HashMap::new(),
             application_name: String::new(),
+            scram_auth_state: ScramAuthState::Idle,
+            md5_auth_salt: None,
+            guc_params: HashMap::new(),
+            search_path_set: false,
         }
     }
 
@@ -183,6 +219,23 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S4 green gate: test_session_state_scram_fields
+    #[test]
+    fn test_session_state_scram_fields() {
+        let s = SessionState::new();
+        assert!(
+            matches!(s.scram_auth_state, ScramAuthState::Idle),
+            "default scram_auth_state must be Idle"
+        );
+        assert!(
+            s.md5_auth_salt.is_none(),
+            "default md5_auth_salt must be None"
+        );
+        assert!(s.guc_params.is_empty(), "default guc_params must be empty");
+        // MAX_GUC_PARAMS constant is accessible
+        assert_eq!(MAX_GUC_PARAMS, 100);
+    }
 
     #[test]
     fn last_written_epoch_upgraded_to_freshness_token() {

@@ -4,7 +4,28 @@
 //! catalogs. All responses are synthesised from the in-memory view catalog.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
+use std::time::SystemTime;
+
+/// Session context passed to catalog query handlers.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub backend_pid: u32,
+    pub search_path: String,
+    pub principal_name: String,
+}
+
+impl Default for SessionInfo {
+    fn default() -> Self {
+        SessionInfo {
+            backend_pid: 0,
+            search_path: "public".to_string(),
+            principal_name: "postgres".to_string(),
+        }
+    }
+}
+
+static SERVER_START_TIME: OnceLock<SystemTime> = OnceLock::new();
 
 /// Postgres type OIDs used in RowDescription fields.
 pub const PG_OID_INT2: i32 = 21;
@@ -386,7 +407,7 @@ impl CatalogStubs {
     /// forwarded to the normal query path.
     ///
     /// Rows are returned as `Vec<Vec<Option<String>>>`, one inner Vec per row.
-    pub fn handle_query(&self, query: &str, principal_name: &str) -> Option<CatalogResponse> {
+    pub fn handle_query(&self, query: &str, session_info: &SessionInfo) -> Option<CatalogResponse> {
         let q = query.trim();
         let ql = q.to_lowercase();
 
@@ -398,9 +419,7 @@ impl CatalogStubs {
             ));
         }
 
-        if ql.contains("transaction_isolation")
-            || ql.contains("transaction isolation level")
-        {
+        if ql.contains("transaction_isolation") || ql.contains("transaction isolation level") {
             return Some(CatalogResponse::rows(
                 vec!["transaction_isolation".to_string()],
                 vec![vec![Some("read committed".to_string())]],
@@ -412,11 +431,6 @@ impl CatalogStubs {
                 vec!["standard_conforming_strings".to_string()],
                 vec![vec![Some("on".to_string())]],
             ));
-        }
-
-        // SET commands → CommandComplete("SET")
-        if ql.starts_with("set ") || ql.starts_with("set\t") {
-            return Some(CatalogResponse::CommandComplete("SET".to_string()));
         }
 
         // functions
@@ -461,10 +475,10 @@ impl CatalogStubs {
             return Some(self.pg_enum(&requested_cols));
         }
         if ql.contains("pg_roles") {
-            return Some(self.pg_roles(principal_name, &requested_cols));
+            return Some(self.pg_roles(&session_info.principal_name, &requested_cols));
         }
         if ql.contains("pg_user") {
-            return Some(self.pg_user(principal_name, &requested_cols));
+            return Some(self.pg_user(&session_info.principal_name, &requested_cols));
         }
         if ql.contains("pg_namespace") {
             return Some(self.pg_namespace(&requested_cols));
@@ -483,9 +497,7 @@ impl CatalogStubs {
         if ql.contains("information_schema.columns") {
             return Some(self.information_schema_columns(&requested_cols));
         }
-        if ql.contains("information_schema.key_column_usage")
-            || ql.contains("key_column_usage")
-        {
+        if ql.contains("information_schema.key_column_usage") || ql.contains("key_column_usage") {
             return Some(self.key_column_usage(&requested_cols));
         }
         if ql.contains("information_schema.referential_constraints")
@@ -494,6 +506,143 @@ impl CatalogStubs {
             return Some(self.referential_constraints(&requested_cols));
         }
 
+        // S7: bootstrap functions and identity keywords (SELECT without FROM)
+        if ql.starts_with("select ") && !ql.contains(" from ") {
+            if ql.contains("current_user") {
+                return Some(CatalogResponse::rows(
+                    vec!["current_user".to_string()],
+                    vec![vec![Some(session_info.principal_name.clone())]],
+                ));
+            }
+            if ql.contains("session_user") {
+                return Some(CatalogResponse::rows(
+                    vec!["session_user".to_string()],
+                    vec![vec![Some(session_info.principal_name.clone())]],
+                ));
+            }
+            if ql.contains("current_schemas(") {
+                let include_implicit = ql.contains("true");
+                let mut parts: Vec<String> = if include_implicit {
+                    vec!["pg_catalog".to_string()]
+                } else {
+                    vec![]
+                };
+                for s in session_info.search_path.split(',') {
+                    let trimmed = s.trim().to_string();
+                    if !trimmed.is_empty() {
+                        parts.push(trimmed);
+                    }
+                }
+                let arr = format!("{{{}}}", parts.join(","));
+                return Some(CatalogResponse::rows(
+                    vec!["current_schemas".to_string()],
+                    vec![vec![Some(arr)]],
+                ));
+            }
+            if ql.contains("pg_backend_pid(") {
+                return Some(CatalogResponse::rows(
+                    vec!["pg_backend_pid".to_string()],
+                    vec![vec![Some(session_info.backend_pid.to_string())]],
+                ));
+            }
+            if ql.contains("pg_is_in_recovery(") {
+                return Some(CatalogResponse::rows(
+                    vec!["pg_is_in_recovery".to_string()],
+                    vec![vec![Some("f".to_string())]],
+                ));
+            }
+            if ql.contains("set_config(") {
+                let val = parse_set_config_value(q).unwrap_or_default();
+                return Some(CatalogResponse::rows(
+                    vec!["set_config".to_string()],
+                    vec![vec![Some(val)]],
+                ));
+            }
+            if ql.contains("pg_postmaster_start_time(") {
+                let t = *SERVER_START_TIME.get_or_init(SystemTime::now);
+                let ts = format_system_time(t);
+                return Some(CatalogResponse::rows(
+                    vec!["pg_postmaster_start_time".to_string()],
+                    vec![vec![Some(ts)]],
+                ));
+            }
+            if ql.contains("txid_current(") {
+                return Some(CatalogResponse::rows(
+                    vec!["txid_current".to_string()],
+                    vec![vec![Some("0".to_string())]],
+                ));
+            }
+        }
+
+        // S7: SHOW ALL
+        if ql.trim_end_matches(';') == "show all" {
+            let cols = vec![
+                "name".to_string(),
+                "setting".to_string(),
+                "description".to_string(),
+            ];
+            let params: &[(&str, &str, &str)] = &[
+                (
+                    "search_path",
+                    session_info.search_path.as_str(),
+                    "Schema search path",
+                ),
+                ("client_encoding", "UTF8", "Client-side character encoding"),
+                ("server_encoding", "UTF8", "Server-side character encoding"),
+                (
+                    "transaction_isolation",
+                    "read committed",
+                    "Transaction isolation level",
+                ),
+                (
+                    "standard_conforming_strings",
+                    "on",
+                    "Standard conforming strings",
+                ),
+                ("DateStyle", "ISO, YMD", "Date/time format"),
+                ("integer_datetimes", "on", "Integer timestamps"),
+                ("server_version", "14.9", "Server version"),
+                ("timezone", "UTC", "Timezone"),
+                ("application_name", "", "Application name"),
+            ];
+            let rows: Vec<Vec<Option<String>>> = params
+                .iter()
+                .map(|(name, val, desc)| {
+                    vec![
+                        Some(name.to_string()),
+                        Some(val.to_string()),
+                        Some(desc.to_string()),
+                    ]
+                })
+                .collect();
+            return Some(CatalogResponse::rows(cols, rows));
+        }
+
+        // S7: SHOW client_encoding / SHOW server_encoding
+        if ql.starts_with("show ") {
+            let key = ql["show ".len()..].trim().trim_end_matches(';');
+            if key == "client_encoding" || key == "server_encoding" {
+                return Some(CatalogResponse::rows(
+                    vec![key.to_string()],
+                    vec![vec![Some("UTF8".to_string())]],
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// Resolve a view by name within a given search_path (S9 search-path-aware lookup).
+    pub fn resolve_view(&self, name: &str, search_path: &[&str]) -> Option<CatalogView> {
+        let inner = self.inner.read().unwrap();
+        if let Some(view) = inner.views.get(name) {
+            if search_path
+                .iter()
+                .any(|s| s.trim() == view.namespace.as_str())
+            {
+                return Some(view.clone());
+            }
+        }
         None
     }
 
@@ -736,7 +885,11 @@ impl CatalogStubs {
 
     fn pg_type(&self, requested_cols: &[String]) -> CatalogResponse {
         let cols = if requested_cols.is_empty() {
-            vec!["oid".to_string(), "typname".to_string(), "typlen".to_string()]
+            vec![
+                "oid".to_string(),
+                "typname".to_string(),
+                "typlen".to_string(),
+            ]
         } else {
             requested_cols.to_vec()
         };
@@ -853,12 +1006,22 @@ impl CatalogStubs {
         let mut items = Vec::new();
         for t in self.list_tables() {
             for (i, col) in t.columns.iter().enumerate() {
-                items.push((t.name.clone(), col.name.clone(), i + 1, arrow_type_to_pg_data_type(&col.data_type)));
+                items.push((
+                    t.name.clone(),
+                    col.name.clone(),
+                    i + 1,
+                    arrow_type_to_pg_data_type(&col.data_type),
+                ));
             }
         }
         for v in self.list_views() {
             for (i, col) in v.columns.iter().enumerate() {
-                items.push((v.name.clone(), col.name.clone(), i + 1, arrow_type_to_pg_data_type(&col.data_type)));
+                items.push((
+                    v.name.clone(),
+                    col.name.clone(),
+                    i + 1,
+                    arrow_type_to_pg_data_type(&col.data_type),
+                ));
             }
         }
         for (table_name, column_name, pos, data_type) in items {
@@ -1140,7 +1303,10 @@ impl CatalogStubs {
 
     fn version(&self) -> CatalogResponse {
         let cols = vec!["version".to_string()];
-        let rows = vec![vec![Some("PostgreSQL 14.0 (RockStream)".to_string())]];
+        let rows = vec![vec![Some(
+            "PostgreSQL 14.9 (RockStream) on x86_64-unknown-linux-gnu, compiled by rustc, 64-bit"
+                .to_string(),
+        )]];
         CatalogResponse::rows(cols, rows)
     }
 
@@ -1172,6 +1338,61 @@ impl CatalogStubs {
     }
 }
 
+/// Parse the second quoted string argument from `set_config('key', 'value', is_local)`.
+fn parse_set_config_value(query: &str) -> Option<String> {
+    let mut quote_count = 0u32;
+    let mut in_quote = false;
+    let mut collecting = false;
+    let mut val = String::new();
+    for c in query.chars() {
+        if c == '\'' {
+            if in_quote {
+                if collecting {
+                    return Some(val);
+                }
+                in_quote = false;
+                quote_count += 1;
+            } else {
+                in_quote = true;
+                if quote_count == 1 {
+                    collecting = true;
+                }
+            }
+        } else if collecting && in_quote {
+            val.push(c);
+        }
+    }
+    None
+}
+
+/// Format a SystemTime as ISO 8601 without chrono (YYYY-MM-DD HH:MM:SS+00).
+fn format_system_time(t: SystemTime) -> String {
+    let duration = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let secs = duration.as_secs();
+    let secs_of_day = secs % 86400;
+    let days = secs / 86400;
+    let h = secs_of_day / 3600;
+    let m = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}+00", y, mo, d, h, m, s)
+}
+
+/// Rata Die civil_from_days algorithm (no-dep calendar math).
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y as i32, mo as u32, d as u32)
+}
+
 /// Helper to parse SELECT column names/aliases from query.
 fn parse_select_columns(query: &str) -> Vec<String> {
     let ql = query.to_lowercase();
@@ -1194,10 +1415,14 @@ fn parse_select_columns(query: &str) -> Vec<String> {
             }
         } else if c.is_alphabetic() && paren_level == 0 {
             if i + 4 <= chars.len() {
-                let word: String = chars[i..i+4].iter().collect();
+                let word: String = chars[i..i + 4].iter().collect();
                 if word.eq_ignore_ascii_case("from") {
-                    let prev_char = if i > 0 { chars[i-1] } else { ' ' };
-                    let next_char = if i + 4 < chars.len() { chars[i+4] } else { ' ' };
+                    let prev_char = if i > 0 { chars[i - 1] } else { ' ' };
+                    let next_char = if i + 4 < chars.len() {
+                        chars[i + 4]
+                    } else {
+                        ' '
+                    };
                     if !prev_char.is_alphanumeric() && !next_char.is_alphanumeric() {
                         from_idx = Some(i);
                         break;
@@ -1243,14 +1468,14 @@ fn parse_select_columns(query: &str) -> Vec<String> {
     let mut cols = Vec::new();
     for part in parts {
         // Normalize whitespace (newlines, tabs, extra spaces)
-        let part_normalized = part
-            .split_whitespace()
-            .collect::<Vec<&str>>()
-            .join(" ");
+        let part_normalized = part.split_whitespace().collect::<Vec<&str>>().join(" ");
         let part_lower = part_normalized.to_lowercase();
 
         if let Some(as_idx) = part_lower.rfind(" as ") {
-            let alias = part_normalized[as_idx + 4..].trim().trim_matches('"').trim();
+            let alias = part_normalized[as_idx + 4..]
+                .trim()
+                .trim_matches('"')
+                .trim();
             cols.push(alias.to_string());
         } else {
             let words: Vec<&str> = part_normalized.split_whitespace().collect();

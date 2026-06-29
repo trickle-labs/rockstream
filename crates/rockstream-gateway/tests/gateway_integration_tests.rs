@@ -307,7 +307,10 @@ async fn test_pgbouncer_pooled_transactions() {
             });
             for _ in 0..txns_per_client {
                 client.simple_query("BEGIN").await.expect("BEGIN failed");
-                client.simple_query("SELECT 1").await.expect("SELECT in txn failed");
+                client
+                    .simple_query("SELECT 1")
+                    .await
+                    .expect("SELECT in txn failed");
                 client.simple_query("COMMIT").await.expect("COMMIT failed");
             }
         }));

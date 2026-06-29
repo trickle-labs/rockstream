@@ -23,6 +23,7 @@ pub mod copy_state;
 pub mod error;
 pub mod multi_shard_reader;
 pub mod protocol;
+pub mod role_catalog;
 pub mod server;
 pub mod session;
 pub mod subscribe_handler;
@@ -34,5 +35,7 @@ pub mod write_buffer;
 pub use error::GatewayError;
 pub use server::{GatewayServer, MAX_CONNECTIONS};
 pub use session::{CursorState, TxStatus, MAX_CURSORS_PER_CONNECTION};
-pub use view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader, ROWS_IN_FLIGHT_BATCH, STREAM_BATCH_BYTES};
+pub use view_reader::{
+    HotOnlyViewReader, ViewReadStrategy, ViewReader, ROWS_IN_FLIGHT_BATCH, STREAM_BATCH_BYTES,
+};
 pub use write_buffer::{DmlOp, WriteBuffer, WRITE_BUFFER_LIMIT_BYTES};

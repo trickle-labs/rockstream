@@ -73,6 +73,11 @@ pub enum GatewayError {
     #[error("[RS-2055] limit.connection_limit_exceeded: server-wide connection limit of {limit} reached. next_steps: Close idle connections or increase max_connections.")]
     ConnectionLimitExceeded { limit: usize },
 
+    /// [RS-2401] auth.invalid_password — password authentication failed for user.
+    /// SQLSTATE: 28P01 (invalid_password) / severity: FATAL
+    #[error("[RS-2401] auth.invalid_password: password authentication failed for user '{user}'. next_steps: Check password and retry")]
+    InvalidPassword { user: String },
+
     #[error("Not supported: {0}")]
     NotSupported(String),
 
@@ -113,6 +118,7 @@ pub fn sqlstate_for(e: &GatewayError) -> &'static str {
         GatewayError::MemoryLimitExceeded => "53200",
         GatewayError::StatementTimeout => "57014",
         GatewayError::ConnectionLimitExceeded { .. } => "53300",
+        GatewayError::InvalidPassword { .. } => "28P01",
         GatewayError::NotSupported(_) => "0A000",
         GatewayError::ParseError(_) => "42601",
         GatewayError::Storage(_) => "XX000",
@@ -124,9 +130,13 @@ pub fn sqlstate_for(e: &GatewayError) -> &'static str {
 impl From<GatewayError> for pgwire::error::PgWireError {
     fn from(e: GatewayError) -> Self {
         let code = sqlstate_for(&e).to_string();
+        let severity = match &e {
+            GatewayError::InvalidPassword { .. } => "FATAL",
+            _ => "ERROR",
+        };
         let msg = e.to_string();
         pgwire::error::PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-            "ERROR".to_string(),
+            severity.to_string(),
             code,
             msg,
         )))
