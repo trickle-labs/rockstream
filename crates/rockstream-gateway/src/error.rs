@@ -18,7 +18,7 @@ pub enum GatewayError {
     ViewNotFound(String),
 
     /// Bound: result set exceeds `max_in_flight_rows`.
-    #[error("Result set too large: exceeded max_in_flight_rows bound")]
+    #[error("[RS-2040] limit.result_set_too_large: result set exceeded max_in_flight_rows bound. next_steps: Add a LIMIT clause or paginate using cursors.")]
     ResultSetTooLarge,
 
     /// [RS-2019] write.shard_backpressure — per-connection write buffer exceeded WRITE_BUFFER_LIMIT_BYTES.
@@ -43,6 +43,36 @@ pub enum GatewayError {
     #[error("[RS-2501] copy.column_count_mismatch: expected {expected} fields but got {got}. next_steps: Check that the TSV row matches the column count declared in COPY or the catalog.")]
     CopyColumnCountMismatch { expected: usize, got: usize },
 
+    /// [RS-2050] query.cancelled — query was cancelled by a CancelRequest.
+    /// SQLSTATE: 57014 (query_canceled)
+    #[error("[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or adjust client timeout settings.")]
+    QueryCancelled,
+
+    /// [RS-2051] cursor.not_found — FETCH/MOVE/CLOSE referenced a cursor that does not exist.
+    /// SQLSTATE: 34000 (invalid_cursor_name)
+    #[error("[RS-2051] cursor.not_found: cursor '{name}' does not exist. next_steps: Use DECLARE to open a cursor before FETCH/MOVE/CLOSE.")]
+    CursorNotFound { name: String },
+
+    /// [RS-2052] cursor.already_exists — DECLARE attempted to open a cursor that is already open.
+    /// SQLSTATE: 42P03 (duplicate_cursor)
+    #[error("[RS-2052] cursor.already_exists: cursor '{name}' already exists. next_steps: CLOSE the existing cursor or use a different name.")]
+    CursorAlreadyExists { name: String },
+
+    /// [RS-2053] limit.memory_limit_exceeded — per-connection memory limit exceeded.
+    /// SQLSTATE: 53200 (out_of_memory)
+    #[error("[RS-2053] limit.memory_limit_exceeded: per-connection memory limit exceeded. next_steps: Close unused cursors, reduce result set sizes, or split the query.")]
+    MemoryLimitExceeded,
+
+    /// [RS-2054] query.statement_timeout — query exceeded the configured statement timeout.
+    /// SQLSTATE: 57014 (query_canceled)
+    #[error("[RS-2054] query.statement_timeout: query exceeded the configured statement timeout. next_steps: Increase statement_timeout or optimize the query.")]
+    StatementTimeout,
+
+    /// [RS-2055] limit.connection_limit_exceeded — server-wide connection limit reached.
+    /// SQLSTATE: 53300 (too_many_connections)
+    #[error("[RS-2055] limit.connection_limit_exceeded: server-wide connection limit of {limit} reached. next_steps: Close idle connections or increase max_connections.")]
+    ConnectionLimitExceeded { limit: usize },
+
     #[error("Not supported: {0}")]
     NotSupported(String),
 
@@ -65,18 +95,40 @@ impl From<pgwire::error::PgWireError> for GatewayError {
     }
 }
 
+/// Return the 5-char Postgres SQLSTATE code for a `GatewayError`.
+pub fn sqlstate_for(e: &GatewayError) -> &'static str {
+    match e {
+        GatewayError::SerializableNotSupported => "25001",
+        GatewayError::PreparedStatementsLimitExceeded { .. } => "53200",
+        GatewayError::PortalsLimitExceeded { .. } => "53200",
+        GatewayError::ViewNotFound(_) => "42P01",
+        GatewayError::ResultSetTooLarge => "54000",
+        GatewayError::ShardBackpressure { .. } => "53100",
+        GatewayError::IdempotencyKeyRequired => "XX000",
+        GatewayError::CopyTableNotFound { .. } => "42P01",
+        GatewayError::CopyColumnCountMismatch { .. } => "22000",
+        GatewayError::QueryCancelled => "57014",
+        GatewayError::CursorNotFound { .. } => "34000",
+        GatewayError::CursorAlreadyExists { .. } => "42P03",
+        GatewayError::MemoryLimitExceeded => "53200",
+        GatewayError::StatementTimeout => "57014",
+        GatewayError::ConnectionLimitExceeded { .. } => "53300",
+        GatewayError::NotSupported(_) => "0A000",
+        GatewayError::ParseError(_) => "42601",
+        GatewayError::Storage(_) => "XX000",
+        GatewayError::Io(_) => "XX000",
+        GatewayError::PgWire(_) => "XX000",
+    }
+}
+
 impl From<GatewayError> for pgwire::error::PgWireError {
     fn from(e: GatewayError) -> Self {
-        let code = match &e {
-            GatewayError::PreparedStatementsLimitExceeded { .. } => "53200".to_string(),
-            GatewayError::PortalsLimitExceeded { .. } => "53200".to_string(),
-            GatewayError::SerializableNotSupported => "25001".to_string(),
-            _ => "XX000".to_string(),
-        };
+        let code = sqlstate_for(&e).to_string();
+        let msg = e.to_string();
         pgwire::error::PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
             "ERROR".to_string(),
             code,
-            e.to_string(),
+            msg,
         )))
     }
 }

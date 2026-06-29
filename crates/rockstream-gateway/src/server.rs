@@ -41,6 +41,7 @@ use pgwire::messages::extendedquery::{
     TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
 };
 use pgwire::messages::response::{CommandComplete, EmptyQueryResponse};
+use pgwire::messages::startup::BackendKeyData;
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
@@ -56,10 +57,35 @@ use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
 use crate::GatewayError;
 
-// Task-local storage for connection ID and portal format
+// ── Cancellation primitive ────────────────────────────────────────────────────
+
+/// Per-connection cancel handle. Backed by `tokio::sync::watch`.
+/// `cancel()` sets the flag; `cancelled()` is an async future that resolves
+/// when the flag is set.
+#[derive(Clone)]
+pub struct CancelToken {
+    tx: Arc<tokio::sync::watch::Sender<bool>>,
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        Self { tx: Arc::new(tx), rx }
+    }
+    /// Signal cancellation.
+    pub fn cancel(&self) { let _ = self.tx.send(true); }
+    /// Async future that resolves when cancelled.
+    pub async fn cancelled(&mut self) {
+        let _ = self.rx.wait_for(|v| *v).await;
+    }
+}
+
+// Task-local storage for connection ID, portal format, and cancellation token
 tokio::task_local! {
     pub static CONN_ID: String;
     pub static PORTAL_FORMAT: pgwire::api::portal::Format;
+    pub static CANCEL_TOKEN: CancelToken;
 }
 
 // ── S1 Custom Parameter Provider ──────────────────────────────────────────────
@@ -654,6 +680,11 @@ pub static SESSION_WAIT_FOR_TIMEOUT_TOTAL: std::sync::atomic::AtomicU64 =
 
 // ── S8 WaitResult ─────────────────────────────────────────────────────────────
 
+/// Maximum number of simultaneous connections.
+/// Used to bound CancellationRegistry and ActivityRegistry.
+/// Fill-level metric: `cancellation_registry.len()`.
+pub const MAX_CONNECTIONS: usize = 10_000;
+
 #[derive(Debug)]
 enum WaitResult {
     Satisfied { elapsed_ms: u64 },
@@ -733,6 +764,10 @@ pub struct GatewayHandler {
     /// Namespace catalog.
     namespace_catalog: Arc<rockstream_control::NamespaceCatalog>,
     audit_log: Option<Arc<rockstream_control::audit::FileAuditLog>>,
+    /// CancelRequest registry: (backend_pid, cancel_secret) -> CancelToken.
+    /// Bound: MAX_CONNECTIONS = 10_000 entries.
+    /// Fill-level metric: registry.len().
+    pub cancellation_registry: Arc<DashMap<(u32, u32), CancelToken>>,
 }
 
 impl GatewayHandler {
@@ -753,6 +788,7 @@ impl GatewayHandler {
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
             audit_log: None,
+            cancellation_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -777,6 +813,7 @@ impl GatewayHandler {
             acl_store: Arc::new(rockstream_control::AclStore::new()),
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
             audit_log: None,
+            cancellation_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -917,6 +954,50 @@ impl GatewayHandler {
         if let Some(catalog_resp) = self.catalog.handle_query(q, principal_name) {
             return Some(Ok(vec![catalog_resp_to_response(catalog_resp)]));
         }
+
+        // ── Slice 6: pg_stat_activity virtual table ────────────────────────────
+        // Handle: SELECT ... FROM pg_stat_activity [WHERE ...]
+        if ql.contains("pg_stat_activity") && ql.contains("from") {
+            let schema = Arc::new(vec![
+                FieldInfo::new("pid".to_string(), None, None, Type::INT4, FieldFormat::Text),
+                FieldInfo::new("usename".to_string(), None, None, Type::TEXT, FieldFormat::Text),
+                FieldInfo::new("application_name".to_string(), None, None, Type::TEXT, FieldFormat::Text),
+                FieldInfo::new("state".to_string(), None, None, Type::TEXT, FieldFormat::Text),
+                FieldInfo::new("query".to_string(), None, None, Type::TEXT, FieldFormat::Text),
+                FieldInfo::new("query_start".to_string(), None, None, Type::TIMESTAMP, FieldFormat::Text),
+                FieldInfo::new("client_addr".to_string(), None, None, Type::TEXT, FieldFormat::Text),
+            ]);
+            // Snapshot sessions
+            let snapshot: Vec<(u32, String, String, String)> = self.sessions.iter().map(|entry| {
+                let session = entry.value();
+                let pid = session.backend_pid;
+                let usename = match &session.principal {
+                    crate::auth::Principal::Jwt { sub } => sub.clone(),
+                    _ => "postgres".to_string(),
+                };
+                let app_name = session.application_name.clone();
+                let state = match session.tx_status {
+                    crate::session::TxStatus::Idle => "idle".to_string(),
+                    _ => "active".to_string(),
+                };
+                (pid, usename, app_name, state)
+            }).collect();
+            let schema_ref = schema.clone();
+            let data_stream = stream::iter(snapshot).map(move |(pid, usename, app_name, state)| {
+                let mut encoder = DataRowEncoder::new(schema_ref.clone());
+                encoder.encode_field(&Some(pid.to_string().as_str()))?;
+                encoder.encode_field(&Some(usename.as_str()))?;
+                encoder.encode_field(&Some(app_name.as_str()))?;
+                encoder.encode_field(&Some(state.as_str()))?;
+                encoder.encode_field(&Some(""))? ; // query
+                encoder.encode_field::<Option<&str>>(&None)?; // query_start
+                encoder.encode_field::<Option<&str>>(&None)?; // client_addr
+                encoder.finish()
+            });
+            return Some(Ok(vec![promote_response(Response::Query(QueryResponse::new(schema, data_stream)))]));
+        }
+        // ── End Slice 6 ────────────────────────────────────────────────────────
+
 
         // COPY <view> TO STDOUT — handled via streaming in do_query; skip here.
         // CREATE VIEW / CREATE MATERIALIZED VIEW
@@ -1131,6 +1212,39 @@ impl GatewayHandler {
             return self.handle_rollback(conn_id).await;
         }
 
+        // ── Slice 5: PgBouncer compat commands ──────────────────────────────
+        // DISCARD ALL: clear cursors, prepared statements, portals, session state.
+        if ql == "discard all" || ql == "discard all;" {
+            return self.handle_discard_all(conn_id);
+        }
+        // RESET ALL: reset GUC settings only (keep cursors, prepared statements).
+        if ql == "reset all" || ql == "reset all;" {
+            return self.handle_reset_all(conn_id);
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
+        // ── Slice 3: Named Cursor commands ────────────────────────────────────
+        // DECLARE <name> CURSOR FOR <query>
+        if ql.starts_with("declare ") && ql.contains(" cursor ") {
+            return self.handle_declare_cursor(q, &ql, conn_id).await;
+        }
+
+        // FETCH [FORWARD] n FROM <name> | FETCH ALL FROM <name>
+        if ql.starts_with("fetch ") {
+            return self.handle_fetch_cursor(q, &ql, conn_id);
+        }
+
+        // MOVE [FORWARD] n FROM <name> | MOVE ALL FROM <name>
+        if ql.starts_with("move ") {
+            return self.handle_move_cursor(q, &ql, conn_id);
+        }
+
+        // CLOSE <name> | CLOSE ALL
+        if ql.starts_with("close ") {
+            return self.handle_close_cursor(q, &ql, conn_id);
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         // INSERT — accumulate in write buffer.
         if ql.starts_with("insert into ") {
             return self.handle_insert(q, conn_id).await;
@@ -1194,9 +1308,23 @@ impl GatewayHandler {
                     }
                     let limit = extract_limit(q);
                     let order_by = extract_order_by(q);
-                    return self
-                        .read_view_response(&view_name, limit, order_by, conn_id)
-                        .await;
+                    // Wrap read in cancellation select (Slice 2)
+                    let mut cancel_token = CANCEL_TOKEN
+                        .try_with(|t| t.clone())
+                        .unwrap_or_else(|_| CancelToken::new());
+                    let read_fut = self.read_view_response(&view_name, limit, order_by, conn_id);
+                    return tokio::select! {
+                        res = read_fut => res,
+                        _ = cancel_token.cancelled() => {
+                            Ok(vec![promote_response(Response::Error(Box::new(
+                                ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "57014".to_string(),
+                                    "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or adjust client timeout settings.".to_string(),
+                                )
+                            )))])
+                        }
+                    };
                 }
             }
         }
@@ -2149,6 +2277,372 @@ impl GatewayHandler {
         ))])
     }
 
+    // ── Slice 5: PgBouncer compat ─────────────────────────────────────────────
+
+    /// DISCARD ALL: reset all session state for connection pooler compatibility.
+    /// Clears: cursors, prepared statements, portals, write buffer, idempotency key,
+    /// source_epoch_envelope, wait_for_token, pinned_frontier, TxStatus → Idle.
+    fn handle_discard_all(&self, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
+        if let Some(id) = conn_id {
+            // Clear write buffer
+            if let Some(mut wb) = self.write_buffers.get_mut(id) {
+                wb.clear();
+            }
+            // Clear all copy state
+            self.copy_states.remove(id);
+            // Clear all portals for this connection
+            let portal_keys: Vec<_> = self.portal_states.iter()
+                .filter(|e| e.key().0 == id)
+                .map(|e| e.key().clone())
+                .collect();
+            for k in portal_keys {
+                self.portal_states.remove(&k);
+            }
+            // Clear prepared statements set for this connection
+            self.prepared_statements.remove(id);
+            self.active_portals.remove(id);
+            // Reset session state
+            if let Some(mut session) = self.sessions.get_mut(id) {
+                session.cursors.clear();
+                session.idempotency_key = None;
+                session.source_epoch_envelope = None;
+                session.wait_for_token = None;
+                session.last_written_epoch = None;
+                session.pinned_frontier = None;
+                session.tx_status = crate::session::TxStatus::Idle;
+                session.search_path = "public".to_string();
+                session.current_namespace = "public".to_string();
+                session.isolation_level = crate::session::IsolationLevel::ReadCommitted;
+                session.session_wait_for_timeout_ms = 5_000;
+                session.session_wait_for_enabled = true;
+            }
+        }
+        Ok(vec![promote_response(Response::Execution(Tag::new("DISCARD ALL")))])
+    }
+
+    /// RESET ALL: reset GUC settings without clearing cursors or prepared statements.
+    /// Resets: search_path, isolation_level, wait_for_timeout_ms, session_wait_for_enabled.
+    fn handle_reset_all(&self, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
+        if let Some(id) = conn_id {
+            if let Some(mut session) = self.sessions.get_mut(id) {
+                session.search_path = "public".to_string();
+                session.current_namespace = "public".to_string();
+                session.isolation_level = crate::session::IsolationLevel::ReadCommitted;
+                session.session_wait_for_timeout_ms = 5_000;
+                session.session_wait_for_enabled = true;
+                // Note: cursors, prepared statements, portals are NOT cleared by RESET ALL
+            }
+        }
+        Ok(vec![promote_response(Response::Execution(Tag::new("RESET")))])
+    }
+
+    // ── End Slice 5 ───────────────────────────────────────────────────────────
+
+    // ── Slice 3: Named Cursor handlers ────────────────────────────────────────
+
+    /// DECLARE <name> CURSOR FOR <query>
+    /// Executes the query eagerly, stores rows in session.cursors.
+    /// Bound: MAX_CURSORS_PER_CONNECTION = 100 per connection.
+    async fn handle_declare_cursor(
+        &self,
+        q: &str,
+        ql: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        use crate::session::{CursorState, MAX_CURSORS_PER_CONNECTION};
+        // Parse: DECLARE <name> [NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR <query>
+        // Simple regex-free parse: after "declare " find "cursor" keyword
+        let after_declare = &ql["declare ".len()..].trim_start();
+        let cursor_pos = match after_declare.find(" cursor ") {
+            Some(p) => p,
+            None => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
+                        "syntax error in DECLARE CURSOR".to_string()),
+                )))]);
+            }
+        };
+        let cursor_name = after_declare[..cursor_pos].trim().to_string();
+        // Everything after "cursor [WITH HOLD|WITHOUT HOLD] for " is the query
+        let rest = &after_declare[cursor_pos + " cursor ".len()..];
+        let for_pos = match rest.find(" for ") {
+            Some(p) => p,
+            None => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
+                        "missing FOR in DECLARE CURSOR".to_string()),
+                )))]);
+            }
+        };
+        // Original-case query
+        let ql_cursor_pos = "declare ".len() + cursor_pos;
+        let ql_for_search = &q[ql_cursor_pos + " cursor ".len()..];
+        let inner_start = ql_for_search.to_lowercase().find(" for ")
+            .map(|p| p + " for ".len())
+            .unwrap_or(0);
+        let inner_sql = ql_for_search[inner_start..].trim();
+
+        let conn_id_str = match conn_id {
+            Some(id) => id,
+            None => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_string(), "XX000".to_string(),
+                        "DECLARE requires a connection context".to_string()),
+                )))]);
+            }
+        };
+
+        // Check cursor limit
+        let cursor_count = {
+            let session = self.sessions.entry(conn_id_str.to_string()).or_insert_with(SessionState::new);
+            session.cursors.len()
+        };
+        if cursor_count >= MAX_CURSORS_PER_CONNECTION {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new("ERROR".to_string(), "42P03".to_string(),
+                    format!("[RS-2052] cursor.already_exists: too many open cursors (max {MAX_CURSORS_PER_CONNECTION}). next_steps: CLOSE the existing cursor or use a different name.")),
+            )))]);
+        }
+
+        // Check for duplicate cursor name
+        {
+            let session = self.sessions.entry(conn_id_str.to_string()).or_insert_with(SessionState::new);
+            if session.cursors.contains_key(&cursor_name) {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_string(), "42P03".to_string(),
+                        format!("[RS-2052] cursor.already_exists: cursor '{cursor_name}' already exists. next_steps: CLOSE the existing cursor or use a different name.")),
+                )))]);
+            }
+        }
+
+        // Execute the inner query to collect rows
+        let rows: Vec<Vec<u8>> = if let Some(view_name) = extract_view_name_from_select(inner_sql) {
+            if let Some(shard_db) = &self.shard_db {
+                let prefix = format!("view_output/{view_name}/");
+                shard_db.scan_prefix(prefix.as_bytes()).await
+                    .map(|kvs| kvs.into_iter().map(|(_, v)| v.to_vec()).collect())
+                    .unwrap_or_default()
+            } else {
+                self.view_reader
+                    .read_view(&view_name, None, ViewReadStrategy::HotOnly)
+                    .await
+                    .unwrap_or_default()
+            }
+        } else {
+            vec![]
+        };
+
+        // Store in session
+        {
+            let mut session = self.sessions.entry(conn_id_str.to_string()).or_insert_with(SessionState::new);
+            session.cursors.insert(cursor_name.clone(), CursorState {
+                rows,
+                position: 0,
+            });
+        }
+
+        Ok(vec![promote_response(Response::Execution(Tag::new("DECLARE")))])
+    }
+
+    fn handle_fetch_cursor(
+        &self,
+        q: &str,
+        ql: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        let conn_id_str = match conn_id {
+            Some(id) => id,
+            None => return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new("ERROR".to_string(), "XX000".to_string(),
+                    "FETCH requires a connection context".to_string()),
+            )))]),
+        };
+
+        // Parse: FETCH [FORWARD] <n|ALL> FROM <name>
+        // or: FETCH ALL FROM <name>
+        let after_fetch = ql["fetch ".len()..].trim();
+
+        let (count_str, cursor_name) = if let Some(from_pos) = after_fetch.find(" from ") {
+            let count_part = after_fetch[..from_pos].trim();
+            // Strip "forward" keyword
+            let count_part = if count_part.starts_with("forward ") {
+                count_part["forward ".len()..].trim()
+            } else {
+                count_part
+            };
+            let name_part = after_fetch[from_pos + " from ".len()..].trim()
+                .trim_end_matches(';').trim().to_string();
+            (count_part.to_string(), name_part)
+        } else {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
+                    "syntax error in FETCH: missing FROM".to_string()),
+            )))]);
+        };
+
+        let fetch_all = count_str == "all";
+        let fetch_count: usize = if fetch_all {
+            usize::MAX
+        } else {
+            count_str.parse().unwrap_or(0)
+        };
+
+        // Get session rows
+        let session_opt = self.sessions.get(conn_id_str);
+        let cursor_data = match &session_opt {
+            Some(session) => session.cursors.get(&cursor_name).map(|c| {
+                let start = c.position;
+                let end = if fetch_all {
+                    c.rows.len()
+                } else {
+                    (c.position + fetch_count).min(c.rows.len())
+                };
+                (start, end, c.rows[start..end].to_vec())
+            }),
+            None => None,
+        };
+        drop(session_opt);
+
+        let (start, end, fetched_rows) = match cursor_data {
+            Some(d) => d,
+            None => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
+                        format!("[RS-2051] cursor.not_found: cursor '{cursor_name}' does not exist. next_steps: Use DECLARE to open a cursor before FETCH/MOVE/CLOSE.")),
+                )))]);
+            }
+        };
+
+        // Advance position
+        if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
+            if let Some(cursor) = session.cursors.get_mut(&cursor_name) {
+                cursor.position = end;
+            }
+        }
+
+        let n_fetched = fetched_rows.len();
+
+        // Build DataRow responses
+        let schema = Arc::new(vec![FieldInfo::new(
+            "result".to_string(), None, None, Type::TEXT, FieldFormat::Text,
+        )]);
+        let schema_ref = schema.clone();
+        let data_stream = futures::stream::iter(fetched_rows).map(move |row| {
+            let mut encoder = DataRowEncoder::new(schema_ref.clone());
+            let s = String::from_utf8_lossy(&row).into_owned();
+            encoder.encode_field(&Some(s.as_str()))
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            encoder.finish()
+        });
+
+        Ok(vec![promote_response(Response::Query(QueryResponse::new(schema, data_stream)))])
+    }
+
+    /// MOVE [FORWARD] n FROM <name> | MOVE ALL FROM <name>
+    fn handle_move_cursor(
+        &self,
+        q: &str,
+        ql: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        let conn_id_str = match conn_id {
+            Some(id) => id,
+            None => return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new("ERROR".to_string(), "XX000".to_string(),
+                    "MOVE requires a connection context".to_string()),
+            )))]),
+        };
+
+        let after_move = ql["move ".len()..].trim();
+        let (count_str, cursor_name) = if let Some(from_pos) = after_move.find(" from ") {
+            let count_part = after_move[..from_pos].trim();
+            let count_part = if count_part.starts_with("forward ") {
+                count_part["forward ".len()..].trim()
+            } else {
+                count_part
+            };
+            let name_part = after_move[from_pos + " from ".len()..].trim()
+                .trim_end_matches(';').trim().to_string();
+            (count_part.to_string(), name_part)
+        } else {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new("ERROR".to_string(), "42601".to_string(),
+                    "syntax error in MOVE: missing FROM".to_string()),
+            )))]);
+        };
+
+        let move_all = count_str == "all";
+        let move_count: usize = if move_all {
+            usize::MAX
+        } else {
+            count_str.parse().unwrap_or(0)
+        };
+
+        let moved = if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
+            if let Some(cursor) = session.cursors.get_mut(&cursor_name) {
+                let start = cursor.position;
+                let end = if move_all {
+                    cursor.rows.len()
+                } else {
+                    (cursor.position + move_count).min(cursor.rows.len())
+                };
+                cursor.position = end;
+                end - start
+            } else {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
+                        format!("[RS-2051] cursor.not_found: cursor '{cursor_name}' does not exist. next_steps: Use DECLARE to open a cursor before FETCH/MOVE/CLOSE.")),
+                )))]);
+            }
+        } else {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
+                    format!("[RS-2051] cursor.not_found: cursor '{cursor_name}' does not exist.")),
+            )))]);
+        };
+
+        Ok(vec![promote_response(Response::Execution(
+            Tag::new("MOVE").with_rows(moved),
+        ))])
+    }
+
+    /// CLOSE <name> | CLOSE ALL
+    fn handle_close_cursor(
+        &self,
+        q: &str,
+        ql: &str,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        let conn_id_str = match conn_id {
+            Some(id) => id,
+            None => return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new("ERROR".to_string(), "XX000".to_string(),
+                    "CLOSE requires a connection context".to_string()),
+            )))]),
+        };
+
+        let name = ql["close ".len()..].trim().trim_end_matches(';').trim().to_string();
+
+        if name == "all" {
+            if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
+                session.cursors.clear();
+            }
+        } else {
+            if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
+                if session.cursors.remove(&name).is_none() {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
+                            format!("[RS-2051] cursor.not_found: cursor '{name}' does not exist. next_steps: Use DECLARE to open a cursor before FETCH/MOVE/CLOSE.")),
+                    )))]);
+                }
+            }
+        }
+
+        Ok(vec![promote_response(Response::Execution(Tag::new("CLOSE")))])
+    }
+
+    // ── End Slice 3 ───────────────────────────────────────────────────────────
+
     /// INSERT handler: accumulate rows in the write buffer.
     async fn handle_insert(
         &self,
@@ -2568,13 +3062,69 @@ impl StartupHandler for GatewayHandler {
                 }
             }
 
+            // Extract application_name from startup params (v0.39 PgBouncer compat)
+            let app_name = startup
+                .parameters
+                .iter()
+                .find(|(k, _)| k.to_lowercase() == "application_name")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
             if let Some(conn_id) = CONN_ID.try_with(|id| id.clone()).ok() {
                 client
                     .metadata_mut()
-                    .insert("_rs_conn_id".to_string(), conn_id);
+                    .insert("_rs_conn_id".to_string(), conn_id.clone());
+                // Create session and register cancellation token
+                let (pid, secret) = {
+                    let mut session = self
+                        .sessions
+                        .entry(conn_id.clone())
+                        .or_insert_with(SessionState::new);
+                    session.application_name = app_name;
+                    (session.backend_pid, session.cancel_secret)
+                };
+                // Register (pid, secret) -> token if MAX_CONNECTIONS not exceeded
+                if self.cancellation_registry.len() < MAX_CONNECTIONS {
+                    let token = CANCEL_TOKEN
+                        .try_with(|t| t.clone())
+                        .unwrap_or_else(|_| CancelToken::new());
+                    self.cancellation_registry.insert((pid, secret), token);
+                }
+                // Send AuthOk + ParameterStatus
+                use pgwire::messages::startup::{Authentication, ParameterStatus};
+                use pgwire::messages::response::ReadyForQuery;
+                client
+                    .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
+                    .await?;
+                if let Some(params) = GatewayServerParameterProvider::default()
+                    .server_parameters(client)
+                {
+                    for (k, v) in params {
+                        client
+                            .feed(PgWireBackendMessage::ParameterStatus(
+                                ParameterStatus::new(k, v),
+                            ))
+                            .await?;
+                    }
+                }
+                // Send our BackendKeyData with per-connection pid+secret
+                client
+                    .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+                        pid as i32,
+                        secret as i32,
+                    )))
+                    .await?;
+                // ReadyForQuery
+                use pgwire::api::PgWireConnectionState;
+                use pgwire::messages::response::TransactionStatus;
+                client
+                    .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                        TransactionStatus::Idle,
+                    )))
+                    .await?;
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+            } else {
+                finish_authentication(client, &GatewayServerParameterProvider::default()).await?;
             }
-
-            finish_authentication(client, &GatewayServerParameterProvider::default()).await?;
         }
         Ok(())
     }
@@ -3453,30 +4003,48 @@ impl GatewayServer {
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
         let factory = Arc::new(GatewayHandlerFactory {
-            handler: self.handler,
+            handler: self.handler.clone(),
         });
+        let registry = self.handler.cancellation_registry.clone();
         let listener = TcpListener::bind(self.addr).await?;
         tracing::info!("Gateway listening on {}", self.addr);
         loop {
             let (socket, _peer) = listener.accept().await?;
             let factory_ref = factory.clone();
+            let registry_ref = registry.clone();
             use rand::Rng;
             let conn_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
-            tokio::spawn(CONN_ID.scope(conn_id, async move {
+            let cancel_token = CancelToken::new();
+            let token_for_task = cancel_token.clone();
+            tokio::spawn(CANCEL_TOKEN.scope(token_for_task, CONN_ID.scope(conn_id, async move {
                 let mut socket = socket;
-                let mut buf = [0u8; 8];
+                let mut buf = [0u8; 16];
                 if let Ok(n) = socket.peek(&mut buf).await {
-                    if n >= 8 && buf == [0, 0, 0, 8, 4, 210, 22, 47] {
+                    // SSLRequest: [0,0,0,8, 4,210,22,47]
+                    if n >= 8 && buf[..8] == [0, 0, 0, 8, 4, 210, 22, 47] {
                         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let _ = socket.read_exact(&mut buf).await;
+                        let mut ssl_buf = [0u8; 8];
+                        let _ = socket.read_exact(&mut ssl_buf).await;
                         let _ = socket.write_all(b"N").await;
                         let _ = socket.flush().await;
+                    }
+                    // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
+                    else if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
+                        use tokio::io::AsyncReadExt;
+                        let mut cancel_buf = [0u8; 16];
+                        let _ = socket.read_exact(&mut cancel_buf).await;
+                        let pid = u32::from_be_bytes([cancel_buf[8], cancel_buf[9], cancel_buf[10], cancel_buf[11]]);
+                        let secret = u32::from_be_bytes([cancel_buf[12], cancel_buf[13], cancel_buf[14], cancel_buf[15]]);
+                        if let Some(token) = registry_ref.get(&(pid, secret)) {
+                            token.cancel();
+                        }
+                        return; // CancelRequest connections don't do further work
                     }
                 }
                 if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
                     tracing::debug!("gateway connection error: {e}");
                 }
-            }));
+            })));
         }
     }
 
@@ -3486,8 +4054,9 @@ impl GatewayServer {
         self,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
         let factory = Arc::new(GatewayHandlerFactory {
-            handler: self.handler,
+            handler: self.handler.clone(),
         });
+        let registry = self.handler.cancellation_registry.clone();
         let listener = TcpListener::bind(self.addr).await?;
         let local_addr = listener.local_addr()?;
         let handle = tokio::spawn(async move {
@@ -3496,23 +4065,40 @@ impl GatewayServer {
                     break;
                 };
                 let factory_ref = factory.clone();
+                let registry_ref = registry.clone();
                 use rand::Rng;
                 let conn_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
-                tokio::spawn(CONN_ID.scope(conn_id, async move {
+                let cancel_token = CancelToken::new();
+                let token_for_task = cancel_token.clone();
+                tokio::spawn(CANCEL_TOKEN.scope(token_for_task, CONN_ID.scope(conn_id, async move {
                     let mut socket = socket;
-                    let mut buf = [0u8; 8];
+                    let mut buf = [0u8; 16];
                     if let Ok(n) = socket.peek(&mut buf).await {
-                        if n >= 8 && buf == [0, 0, 0, 8, 4, 210, 22, 47] {
+                        // SSLRequest: [0,0,0,8, 4,210,22,47]
+                        if n >= 8 && buf[..8] == [0, 0, 0, 8, 4, 210, 22, 47] {
                             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                            let _ = socket.read_exact(&mut buf).await;
+                            let mut ssl_buf = [0u8; 8];
+                            let _ = socket.read_exact(&mut ssl_buf).await;
                             let _ = socket.write_all(b"N").await;
                             let _ = socket.flush().await;
+                        }
+                        // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
+                        else if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
+                            use tokio::io::AsyncReadExt;
+                            let mut cancel_buf = [0u8; 16];
+                            let _ = socket.read_exact(&mut cancel_buf).await;
+                            let pid = u32::from_be_bytes([cancel_buf[8], cancel_buf[9], cancel_buf[10], cancel_buf[11]]);
+                            let secret = u32::from_be_bytes([cancel_buf[12], cancel_buf[13], cancel_buf[14], cancel_buf[15]]);
+                            if let Some(token) = registry_ref.get(&(pid, secret)) {
+                                token.cancel();
+                            }
+                            return; // CancelRequest connections don't do further work
                         }
                     }
                     if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
                         tracing::debug!("gateway connection error: {e}");
                     }
-                }));
+                })));
             }
         });
         Ok((local_addr, handle))

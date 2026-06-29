@@ -1,4 +1,6 @@
-//! Per-connection session state: isolation level, frontier pinning, freshness tokens.
+//! Per-connection session state: isolation level, frontier pinning, freshness tokens, cursors.
+
+use std::collections::HashMap;
 
 /// Isolation level for a gateway session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -44,6 +46,42 @@ impl FreshnessToken {
     }
 }
 
+/// Maximum number of cursors open simultaneously per connection.
+/// Fill-level metric: `cursors.len()`.
+/// Backpressure: `RS-2052` / SQLSTATE 42P03.
+pub const MAX_CURSORS_PER_CONNECTION: usize = 100;
+
+/// Transaction status byte — mirrors the Postgres ReadyForQuery status byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TxStatus {
+    /// Not in a transaction block (`'I'`).
+    #[default]
+    Idle,
+    /// Inside a transaction block (`'T'`).
+    InTransaction,
+    /// Inside a failed transaction block (`'E'`).
+    Failed,
+}
+
+impl TxStatus {
+    pub fn as_byte(self) -> u8 {
+        match self {
+            TxStatus::Idle => b'I',
+            TxStatus::InTransaction => b'T',
+            TxStatus::Failed => b'E',
+        }
+    }
+}
+
+/// State of a single named cursor.
+#[derive(Debug, Clone)]
+pub struct CursorState {
+    /// All rows (tab-separated bytes) collected from the query at DECLARE time.
+    pub rows: Vec<Vec<u8>>,
+    /// Current read position (0-indexed).
+    pub position: usize,
+}
+
 /// Per-connection session state.
 ///
 /// Tracks isolation level and the pinned frontier epoch (set at `BEGIN` for
@@ -76,6 +114,17 @@ pub struct SessionState {
     pub current_namespace: String,
     /// Authenticated principal for this session (v0.26).
     pub principal: crate::auth::Principal,
+    /// Backend PID for this connection (used in BackendKeyData and pg_stat_activity).
+    pub backend_pid: u32,
+    /// Per-connection cancel secret (used in BackendKeyData / CancelRequest).
+    pub cancel_secret: u32,
+    /// Current transaction status (for ReadyForQuery status byte).
+    pub tx_status: TxStatus,
+    /// Open named cursors. Bound: MAX_CURSORS_PER_CONNECTION.
+    /// Fill-level metric: `cursors.len()`.
+    pub cursors: HashMap<String, CursorState>,
+    /// application_name startup parameter (v0.39).
+    pub application_name: String,
 }
 
 impl Default for SessionState {
@@ -86,6 +135,8 @@ impl Default for SessionState {
 
 impl SessionState {
     pub fn new() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
         SessionState {
             pinned_frontier: None,
             isolation_level: IsolationLevel::ReadCommitted,
@@ -98,6 +149,11 @@ impl SessionState {
             session_wait_for_enabled: true,
             current_namespace: "public".to_string(),
             principal: crate::auth::Principal::System,
+            backend_pid: rng.gen(),
+            cancel_secret: rng.gen(),
+            tx_status: TxStatus::Idle,
+            cursors: HashMap::new(),
+            application_name: String::new(),
         }
     }
 
@@ -108,9 +164,11 @@ impl SessionState {
         }
     }
 
-    /// Handle `COMMIT` or `ROLLBACK`: clear the pinned frontier.
+    /// Handle `COMMIT` or `ROLLBACK`: clear the pinned frontier and cursors.
     pub fn end_transaction(&mut self) {
         self.pinned_frontier = None;
+        self.cursors.clear();
+        self.tx_status = TxStatus::Idle;
     }
 
     /// Frontier to use for this statement. Returns the pinned frontier if set,

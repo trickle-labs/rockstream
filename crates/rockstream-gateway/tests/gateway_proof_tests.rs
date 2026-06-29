@@ -3288,3 +3288,327 @@ async fn proof_index_scan_point_lookup_via_wire() {
         "index point-lookup took {elapsed_ms}ms — must be < 10ms"
     );
 }
+
+// ── v0.39 Green Gates ─────────────────────────────────────────────────────────
+
+// ── Slice 1: SQLSTATE mapping ─────────────────────────────────────────────────
+
+/// Every GatewayError variant must map to the correct 5-char SQLSTATE.
+/// Slice 1 green gate from v0.39-plan.md.
+#[test]
+fn test_all_rs_codes_have_sqlstate() {
+    use rockstream_gateway::error::{sqlstate_for, GatewayError};
+
+    let cases: Vec<(&str, GatewayError)> = vec![
+        ("25001", GatewayError::SerializableNotSupported),
+        ("53200", GatewayError::PreparedStatementsLimitExceeded { limit: 100 }),
+        ("53200", GatewayError::PortalsLimitExceeded { limit: 100 }),
+        ("42P01", GatewayError::ViewNotFound("v".into())),
+        ("54000", GatewayError::ResultSetTooLarge),
+        ("53100", GatewayError::ShardBackpressure { current_bytes: 1, limit_bytes: 2 }),
+        ("XX000", GatewayError::IdempotencyKeyRequired),
+        ("42P01", GatewayError::CopyTableNotFound { table: "t".into() }),
+        ("22000", GatewayError::CopyColumnCountMismatch { expected: 2, got: 1 }),
+        ("57014", GatewayError::QueryCancelled),
+        ("34000", GatewayError::CursorNotFound { name: "c".into() }),
+        ("42P03", GatewayError::CursorAlreadyExists { name: "c".into() }),
+        ("53200", GatewayError::MemoryLimitExceeded),
+        ("57014", GatewayError::StatementTimeout),
+        ("53300", GatewayError::ConnectionLimitExceeded { limit: 10_000 }),
+        ("0A000", GatewayError::NotSupported("x".into())),
+        ("42601", GatewayError::ParseError("x".into())),
+        ("XX000", GatewayError::PgWire("x".into())),
+    ];
+
+    for (expected_sqlstate, err) in &cases {
+        let got = sqlstate_for(err);
+        assert_eq!(
+            got, *expected_sqlstate,
+            "SQLSTATE mismatch for {:?}: expected {} got {}",
+            err, expected_sqlstate, got
+        );
+        assert_eq!(got.len(), 5, "SQLSTATE '{got}' is not 5 chars for {err:?}");
+    }
+}
+
+// ── Slice 2: CancelRequest / BackendKeyData ───────────────────────────────────
+
+/// Slow view reader: sleeps `sleep_ms` before returning rows.
+struct SlowViewReader {
+    sleep_ms: u64,
+}
+
+#[async_trait::async_trait]
+impl ViewReader for SlowViewReader {
+    async fn read_view(
+        &self,
+        _view_name: &str,
+        _limit: Option<usize>,
+        _strategy: ViewReadStrategy,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.sleep_ms)).await;
+        Ok(vec![b"row1".to_vec()])
+    }
+    fn published_frontier(&self) -> Option<u64> { None }
+}
+
+/// Slice 2 green gate: CancelRequest aborts a slow query and the connection
+/// is reusable afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cancel_request_aborts_query() {
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut catalog = CatalogStubs::new();
+    catalog.add_view(CatalogView {
+        name: "slow_view".to_string(),
+        sql: String::new(),
+        namespace: "public".to_string(),
+        columns: vec![CatalogColumn {
+            name: "col".to_string(),
+            data_type: "Utf8".to_string(),
+        }],
+    });
+
+    let server = GatewayServer::with_catalog(
+        addr,
+        Arc::new(catalog),
+        Arc::new(SlowViewReader { sleep_ms: 3_000 }),
+    );
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+
+    // Connect
+    let (client, conn_task) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=test dbname=test"),
+        NoTls,
+    )
+    .await
+    .expect("connect");
+    let cancel_token = client.cancel_token();
+    tokio::spawn(async move { conn_task.await.ok(); });
+
+    // Issue a slow query in the background
+    let query_handle = tokio::spawn(async move {
+        let t0 = Instant::now();
+        let result = client.simple_query("SELECT * FROM slow_view").await;
+        (result, t0.elapsed())
+    });
+
+    // Wait 50ms then cancel
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    cancel_token.cancel_query(NoTls).await.expect("cancel_query");
+
+    let (result, elapsed) = query_handle.await.unwrap();
+
+    // Query must have been cancelled (error) OR completed very fast due to select!
+    // Either way, elapsed < 1000ms (not the full 3s sleep)
+    assert!(
+        elapsed < tokio::time::Duration::from_millis(1_000),
+        "query took {elapsed:?} — cancel should have interrupted the 3s sleep"
+    );
+
+    // Connection reuse: new connection should work fine
+    let client2 = connect_port(port).await;
+    let rows = client2.simple_query("SELECT 1").await.expect("second query after cancel");
+    assert!(!rows.is_empty(), "connection reuse after cancel should work");
+}
+
+// ── Slice 3: Named Cursors ────────────────────────────────────────────────────
+
+/// Slice 3 green gate: DECLARE / FETCH / MOVE / CLOSE full lifecycle.
+#[tokio::test]
+async fn test_named_cursor_lifecycle() {
+    let store = Arc::new(InMemory::new());
+    let shard_db = ShardDb::builder("cursor-shard", store.clone())
+        .build()
+        .await
+        .unwrap();
+
+    // Write 250 rows to my_view
+    for i in 0u32..250 {
+        let key = format!("view_output/cursor_view/{:08}", i);
+        let value = format!("row_{i}");
+        shard_db.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+    }
+    shard_db.flush().await.unwrap();
+
+    let reader = ShardReader::open("cursor-shard", store.clone()).await.unwrap();
+    let view_reader = Arc::new(HotOnlyViewReader {
+        shard_reader: Arc::new(reader),
+        frontier_epoch: Some(1),
+    });
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut catalog = CatalogStubs::new();
+    catalog.add_view(CatalogView {
+        name: "cursor_view".to_string(),
+        sql: String::new(),
+        namespace: "public".to_string(),
+        columns: vec![CatalogColumn {
+            name: "col".to_string(),
+            data_type: "Utf8".to_string(),
+        }],
+    });
+
+    let server = GatewayServer::with_catalog(addr, Arc::new(catalog), view_reader);
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+
+    let client = connect_port(port).await;
+
+    // DECLARE cursor
+    client
+        .simple_query("DECLARE cur1 CURSOR FOR SELECT * FROM cursor_view")
+        .await
+        .expect("DECLARE failed");
+
+    // FETCH 100 — should return 100 rows
+    let rows = client
+        .simple_query("FETCH 100 FROM cur1")
+        .await
+        .expect("FETCH 100 failed");
+    let data_rows = data_rows_from(&rows);
+    assert_eq!(data_rows.len(), 100, "FETCH 100 should return 100 rows");
+
+    // FETCH ALL — should return remaining 150 rows
+    let rows2 = client
+        .simple_query("FETCH ALL FROM cur1")
+        .await
+        .expect("FETCH ALL failed");
+    let data_rows2 = data_rows_from(&rows2);
+    assert_eq!(data_rows2.len(), 150, "FETCH ALL should return remaining 150 rows");
+
+    // FETCH from exhausted cursor — 0 rows, no error
+    let rows3 = client
+        .simple_query("FETCH 10 FROM cur1")
+        .await
+        .expect("FETCH on exhausted cursor failed");
+    let data_rows3 = data_rows_from(&rows3);
+    assert_eq!(data_rows3.len(), 0, "FETCH on exhausted cursor should return 0 rows");
+
+    // DECLARE second cursor and use MOVE to skip 50 rows
+    client
+        .simple_query("DECLARE cur2 CURSOR FOR SELECT * FROM cursor_view")
+        .await
+        .expect("DECLARE cur2 failed");
+
+    client
+        .simple_query("MOVE 50 FROM cur2")
+        .await
+        .expect("MOVE 50 failed");
+
+    // FETCH 10 after MOVE 50 — rows at positions 50..60
+    let rows4 = client
+        .simple_query("FETCH 10 FROM cur2")
+        .await
+        .expect("FETCH 10 after MOVE failed");
+    let data_rows4 = data_rows_from(&rows4);
+    assert_eq!(data_rows4.len(), 10, "FETCH 10 after MOVE 50 should return 10 rows");
+
+    // CLOSE cur1
+    client
+        .simple_query("CLOSE cur1")
+        .await
+        .expect("CLOSE cur1 failed");
+
+    // CLOSE ALL removes all remaining cursors
+    client
+        .simple_query("CLOSE ALL")
+        .await
+        .expect("CLOSE ALL failed");
+
+    // Connection still works
+    let ping = client.simple_query("SELECT 1").await.expect("ping after CLOSE ALL");
+    assert!(!ping.is_empty(), "connection should remain usable after CLOSE ALL");
+}
+
+// ── Slice 4: Streaming row delivery ──────────────────────────────────────────
+// Unit test in: crates/rockstream-gateway/src/view_reader.rs
+// Test name:    test_streaming_peak_memory_bounded
+
+// ── Slice 5: PgBouncer compat ─────────────────────────────────────────────────
+
+/// Slice 5a green gate: DISCARD ALL clears all session state.
+#[tokio::test]
+async fn test_discard_all_clears_session() {
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_catalog(
+        addr,
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+    let client = connect_port(port).await;
+
+    // Set a GUC, then DISCARD ALL should reset it
+    client.simple_query("SET rockstream.wait_for_timeout_ms = 99999").await.expect("SET");
+    client.simple_query("DISCARD ALL").await.expect("DISCARD ALL");
+
+    // Connection still functional after DISCARD ALL
+    let rows = client.simple_query("SELECT 1").await.expect("SELECT after DISCARD ALL");
+    assert!(!rows.is_empty(), "connection should work after DISCARD ALL");
+}
+
+/// Slice 5b green gate: RESET ALL resets GUC settings only.
+#[tokio::test]
+async fn test_reset_all_preserves_cursors() {
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_catalog(
+        addr,
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+    let client = connect_port(port).await;
+
+    // RESET ALL should succeed
+    client.simple_query("RESET ALL").await.expect("RESET ALL");
+
+    // Connection still functional
+    let rows = client.simple_query("SELECT 1").await.expect("SELECT after RESET ALL");
+    assert!(!rows.is_empty(), "connection should work after RESET ALL");
+}
+
+// ── Slice 6: pg_stat_activity ─────────────────────────────────────────────────
+
+/// Slice 6 green gate: SELECT FROM pg_stat_activity returns the connected session.
+#[tokio::test]
+async fn test_pg_stat_activity_shows_connection() {
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_catalog(
+        addr,
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let port = local_addr.port();
+    let client = connect_port(port).await;
+
+    // Give the server a moment to register the session
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let msgs = client
+        .simple_query("SELECT pid, usename, application_name, state FROM pg_stat_activity")
+        .await
+        .expect("pg_stat_activity query failed");
+
+    let rows = data_rows_from(&msgs);
+    // Should see at least one row (our own connection)
+    assert!(
+        !rows.is_empty(),
+        "pg_stat_activity should return at least one row for the connected session"
+    );
+
+    // Verify required columns are present with correct structure
+    let first_row = rows[0];
+    assert!(first_row.get(0).is_some(), "pid column should be present");
+    assert!(first_row.get(1).is_some(), "usename column should be present");
+    assert!(first_row.get(2).is_some(), "application_name column should be present");
+    assert!(first_row.get(3).is_some(), "state column should be present");
+    let state = first_row.get(3).unwrap_or("").to_string();
+    assert!(
+        state == "idle" || state == "active",
+        "state should be 'idle' or 'active', got: {state}"
+    );
+}

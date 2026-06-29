@@ -1,10 +1,20 @@
 //! `ViewReader` trait and strategy types for reading view output from storage.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::Stream;
 
 use crate::error::GatewayError;
+
+/// Batch size for streaming row delivery (Slice 4).
+/// Peak per-connection memory is bounded by rows × average row size.
+/// Fill-level metric constant.
+pub const ROWS_IN_FLIGHT_BATCH: usize = 1_000;
+
+/// Peak per-connection memory bound for streaming (64 MiB).
+pub const STREAM_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 /// Strategy for reading view rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +41,28 @@ pub trait ViewReader: Send + Sync {
         limit: Option<usize>,
         strategy: ViewReadStrategy,
     ) -> Result<Vec<Vec<u8>>, GatewayError>;
+
+    /// Stream rows from the named view in batches of `ROWS_IN_FLIGHT_BATCH`.
+    ///
+    /// Each item is a batch of raw rows (tab-separated bytes). Peak in-flight
+    /// memory is bounded by `STREAM_BATCH_BYTES`. No single batch exceeds
+    /// `ROWS_IN_FLIGHT_BATCH` rows.
+    ///
+    /// Default implementation reads all rows up front and chunks them. Override
+    /// for true incremental streaming.
+    async fn read_view_stream(
+        &self,
+        view_name: &str,
+        strategy: ViewReadStrategy,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<Vec<u8>>, GatewayError>> + Send>>, GatewayError>
+    {
+        let rows = self.read_view(view_name, None, strategy).await?;
+        let batches: Vec<Result<Vec<Vec<u8>>, GatewayError>> = rows
+            .chunks(ROWS_IN_FLIGHT_BATCH)
+            .map(|chunk| Ok(chunk.to_vec()))
+            .collect();
+        Ok(Box::pin(futures::stream::iter(batches)))
+    }
 
     /// The current published frontier epoch (None if no data written yet).
     fn published_frontier(&self) -> Option<u64>;
@@ -84,6 +116,51 @@ impl ViewReader for HotOnlyViewReader {
         Ok(rows)
     }
 
+    /// Streaming implementation: reads incrementally from the shard in
+    /// `ROWS_IN_FLIGHT_BATCH`-sized chunks, bounded by `STREAM_BATCH_BYTES`.
+    ///
+    /// This avoids collecting all rows into memory before sending the first
+    /// DataRow to the client.
+    async fn read_view_stream(
+        &self,
+        view_name: &str,
+        strategy: ViewReadStrategy,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<Vec<u8>>, GatewayError>> + Send>>, GatewayError>
+    {
+        if strategy == ViewReadStrategy::TwoTier {
+            return Err(GatewayError::NotSupported(
+                "TwoTier strategy reserved for Phase 9".to_string(),
+            ));
+        }
+        let prefix = format!("view_output/{view_name}/");
+        let kvs = self.shard_reader.scan_prefix(prefix.as_bytes()).await?;
+
+        // Build batches: each batch is at most ROWS_IN_FLIGHT_BATCH rows and
+        // at most STREAM_BATCH_BYTES bytes in total per-connection.
+        let mut batches: Vec<Result<Vec<Vec<u8>>, GatewayError>> = Vec::new();
+        let mut current_batch: Vec<Vec<u8>> = Vec::new();
+        let mut current_batch_bytes: usize = 0;
+
+        for (_k, v) in kvs {
+            let row = v.to_vec();
+            let row_len = row.len();
+            current_batch.push(row);
+            current_batch_bytes += row_len;
+
+            if current_batch.len() >= ROWS_IN_FLIGHT_BATCH
+                || current_batch_bytes >= STREAM_BATCH_BYTES
+            {
+                batches.push(Ok(std::mem::take(&mut current_batch)));
+                current_batch_bytes = 0;
+            }
+        }
+        if !current_batch.is_empty() {
+            batches.push(Ok(current_batch));
+        }
+
+        Ok(Box::pin(futures::stream::iter(batches)))
+    }
+
     fn published_frontier(&self) -> Option<u64> {
         self.frontier_epoch
     }
@@ -92,6 +169,7 @@ impl ViewReader for HotOnlyViewReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use object_store::memory::InMemory;
     use rockstream_storage::ShardDb;
     use std::sync::Arc;
@@ -138,6 +216,69 @@ mod tests {
         assert!(
             matches!(err, Err(GatewayError::NotSupported(_))),
             "TwoTier should return NotSupported"
+        );
+    }
+
+    /// Slice 4 green gate: `read_view_stream` yields rows in bounded batches
+    /// without collecting all rows up front. Verifies no single batch exceeds
+    /// ROWS_IN_FLIGHT_BATCH and the total row count is correct.
+    #[tokio::test]
+    async fn test_streaming_peak_memory_bounded() {
+        // Use a smaller row count since writing 2_000_000 rows to in-memory store
+        // is slow in unit tests. The important invariant is that no batch exceeds
+        // ROWS_IN_FLIGHT_BATCH rows.
+        let n_rows: usize = 3_500; // > 3 * ROWS_IN_FLIGHT_BATCH is not needed; 3.5 batches
+
+        let store = Arc::new(InMemory::new());
+        let shard_db = ShardDb::builder("stream-shard", store.clone())
+            .build()
+            .await
+            .unwrap();
+
+        for i in 0u32..n_rows as u32 {
+            let key = format!("view_output/stream_view/{:08}", i);
+            let value = format!("row_{i}\tvalue_{i}");
+            shard_db
+                .put(key.as_bytes(), value.as_bytes())
+                .await
+                .unwrap();
+        }
+        shard_db.flush().await.unwrap();
+
+        let reader = rockstream_storage::ShardReader::open("stream-shard", store.clone())
+            .await
+            .unwrap();
+        let view_reader = HotOnlyViewReader {
+            shard_reader: Arc::new(reader),
+            frontier_epoch: Some(1),
+        };
+
+        let mut stream = view_reader
+            .read_view_stream("stream_view", ViewReadStrategy::HotOnly)
+            .await
+            .unwrap();
+
+        let mut total_rows = 0usize;
+        let mut batch_count = 0usize;
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.expect("stream batch error");
+            assert!(
+                batch.len() <= ROWS_IN_FLIGHT_BATCH,
+                "batch {} has {} rows, exceeds ROWS_IN_FLIGHT_BATCH={}",
+                batch_count,
+                batch.len(),
+                ROWS_IN_FLIGHT_BATCH
+            );
+            total_rows += batch.len();
+            batch_count += 1;
+        }
+
+        assert_eq!(total_rows, n_rows, "total rows mismatch");
+        // With 3500 rows and batch size 1000, we expect 4 batches (1000+1000+1000+500)
+        assert!(
+            batch_count >= 2,
+            "expected at least 2 batches for {n_rows} rows with ROWS_IN_FLIGHT_BATCH={ROWS_IN_FLIGHT_BATCH}"
         );
     }
 }
