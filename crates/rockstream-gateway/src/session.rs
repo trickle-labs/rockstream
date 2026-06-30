@@ -157,6 +157,10 @@ pub struct SessionState {
     pub guc_params: HashMap<String, String>,
     /// True when search_path was explicitly set via SET (v0.40, S9). Enables search_path-aware view resolution.
     pub search_path_set: bool,
+    /// True when an explicit BEGIN block is active (v0.41).
+    pub in_explicit_block: bool,
+    /// SET LOCAL overrides — cleared at COMMIT or ROLLBACK (v0.41).
+    pub local_guc_params: HashMap<String, String>,
 }
 
 impl Default for SessionState {
@@ -190,6 +194,8 @@ impl SessionState {
             md5_auth_salt: None,
             guc_params: HashMap::new(),
             search_path_set: false,
+            in_explicit_block: false,
+            local_guc_params: HashMap::new(),
         }
     }
 
@@ -200,11 +206,39 @@ impl SessionState {
         }
     }
 
-    /// Handle `COMMIT` or `ROLLBACK`: clear the pinned frontier and cursors.
+    /// Enter an explicit transaction block (BEGIN).
+    pub fn begin_explicit(&mut self) {
+        self.in_explicit_block = true;
+        self.tx_status = TxStatus::InTransaction;
+    }
+
+    /// Flip to Failed state — only when inside an explicit block.
+    pub fn fail_transaction(&mut self) {
+        if self.in_explicit_block {
+            self.tx_status = TxStatus::Failed;
+        }
+    }
+
+    /// Returns true when the session is in a failed explicit transaction block.
+    pub fn is_in_failed_block(&self) -> bool {
+        self.tx_status == TxStatus::Failed
+    }
+
+    /// Look up a GUC value: local_guc_params first, then guc_params.
+    pub fn effective_guc<'a>(&'a self, key: &str) -> Option<&'a str> {
+        self.local_guc_params
+            .get(key)
+            .or_else(|| self.guc_params.get(key))
+            .map(|s| s.as_str())
+    }
+
+    /// Handle `COMMIT` or `ROLLBACK`: clear the pinned frontier, cursors, and local GUC.
     pub fn end_transaction(&mut self) {
         self.pinned_frontier = None;
         self.cursors.clear();
         self.tx_status = TxStatus::Idle;
+        self.in_explicit_block = false;
+        self.local_guc_params.clear();
     }
 
     /// Frontier to use for this statement. Returns the pinned frontier if set,
@@ -219,6 +253,27 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S3 green gate: transaction state machine new/begin/fail/end lifecycle.
+    #[test]
+    fn test_transaction_state_machine() {
+        let mut s = SessionState::new();
+        assert_eq!(s.tx_status, TxStatus::Idle);
+        assert!(!s.in_explicit_block);
+
+        s.begin_explicit();
+        assert_eq!(s.tx_status, TxStatus::InTransaction);
+        assert!(s.in_explicit_block);
+
+        s.fail_transaction();
+        assert_eq!(s.tx_status, TxStatus::Failed);
+        assert!(s.is_in_failed_block());
+
+        s.end_transaction();
+        assert_eq!(s.tx_status, TxStatus::Idle);
+        assert!(!s.in_explicit_block);
+        assert!(s.local_guc_params.is_empty());
+    }
 
     /// S4 green gate: test_session_state_scram_fields
     #[test]

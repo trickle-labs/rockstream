@@ -9,6 +9,9 @@ use crate::error::GatewayError;
 /// Named upper bound for per-connection write buffer (64 MiB).
 pub const WRITE_BUFFER_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Named upper bound for savepoints per transaction.
+pub const MAX_SAVEPOINTS_PER_BUFFER: usize = 128;
+
 /// A single DML operation buffered before COMMIT.
 #[derive(Debug, Clone)]
 pub enum DmlOp {
@@ -75,6 +78,8 @@ pub struct WriteBuffer {
     byte_count: usize,
     /// Named upper bound: `WRITE_BUFFER_LIMIT_BYTES`.
     limit_bytes: usize,
+    /// Named savepoints: (name, ops_len at save time). Bound: MAX_SAVEPOINTS_PER_BUFFER.
+    savepoints: Vec<(String, usize)>,
 }
 
 impl WriteBuffer {
@@ -84,6 +89,7 @@ impl WriteBuffer {
             ops: Vec::new(),
             byte_count: 0,
             limit_bytes: WRITE_BUFFER_LIMIT_BYTES,
+            savepoints: Vec::new(),
         }
     }
 
@@ -114,6 +120,72 @@ impl WriteBuffer {
     pub fn clear(&mut self) {
         self.ops.clear();
         self.byte_count = 0;
+        self.savepoints.clear();
+    }
+
+    /// Create or overwrite a named savepoint at the current ops position.
+    ///
+    /// Postgres semantics: SAVEPOINT with existing name replaces the prior entry.
+    /// Returns `SavepointLimitExceeded` when a new entry would exceed `MAX_SAVEPOINTS_PER_BUFFER`.
+    pub fn create_savepoint(&mut self, name: &str) -> Result<(), GatewayError> {
+        let pos = self.ops.len();
+        // If name already exists, overwrite it (Postgres replace semantics).
+        if let Some(idx) = self.savepoints.iter().rposition(|(n, _)| n == name) {
+            self.savepoints[idx] = (name.to_string(), pos);
+            return Ok(());
+        }
+        if self.savepoints.len() == MAX_SAVEPOINTS_PER_BUFFER {
+            return Err(GatewayError::SavepointLimitExceeded {
+                limit: MAX_SAVEPOINTS_PER_BUFFER,
+            });
+        }
+        self.savepoints.push((name.to_string(), pos));
+        Ok(())
+    }
+
+    /// Release a named savepoint and all savepoints after it.
+    ///
+    /// Does NOT discard ops (RELEASE commits ops up to the point where the savepoint was created).
+    pub fn release_savepoint(&mut self, name: &str) -> Result<(), GatewayError> {
+        let idx = self
+            .savepoints
+            .iter()
+            .rposition(|(n, _)| n == name)
+            .ok_or_else(|| GatewayError::SavepointNotFound {
+                name: name.to_string(),
+            })?;
+        self.savepoints.truncate(idx);
+        Ok(())
+    }
+
+    /// Roll back ops to the named savepoint position.
+    ///
+    /// Removes savepoints after (but not including) the matched entry so further
+    /// ROLLBACK TO the same savepoint name remains valid (Postgres semantics).
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<(), GatewayError> {
+        let idx = self
+            .savepoints
+            .iter()
+            .rposition(|(n, _)| n == name)
+            .ok_or_else(|| GatewayError::SavepointNotFound {
+                name: name.to_string(),
+            })?;
+        let ops_len = self.savepoints[idx].1;
+        self.ops.truncate(ops_len);
+        self.byte_count = self.ops.iter().map(|op| op.byte_size()).sum();
+        // Keep the matched savepoint; drop all entries after it.
+        self.savepoints.truncate(idx + 1);
+        Ok(())
+    }
+
+    /// Clear all savepoints — called at COMMIT and ROLLBACK.
+    pub fn clear_savepoints(&mut self) {
+        self.savepoints.clear();
+    }
+
+    /// Fill-level metric: number of active savepoints.
+    pub fn savepoints_len(&self) -> usize {
+        self.savepoints.len()
     }
 
     /// Current byte count (fill-level metric: `direct_write_pending_bytes`).
@@ -183,6 +255,7 @@ mod tests {
             ops: Vec::new(),
             byte_count: 0,
             limit_bytes: 10, // 10 bytes — far smaller than any real op
+            savepoints: Vec::new(),
         };
 
         let op = make_insert("t", "hello");
@@ -195,5 +268,84 @@ mod tests {
             GatewayError::ShardBackpressure { .. } => {}
             e => panic!("expected ShardBackpressure, got {e:?}"),
         }
+    }
+
+    /// S2 green gate: ROLLBACK TO s truncates ops; savepoint s remains.
+    #[test]
+    fn savepoint_create_rollback_to() {
+        let mut buf = WriteBuffer::new();
+        buf.push(make_insert("t", "1")).unwrap();
+        buf.push(make_insert("t", "2")).unwrap();
+        buf.push(make_insert("t", "3")).unwrap();
+        buf.create_savepoint("s").unwrap();
+        buf.push(make_insert("t", "4")).unwrap();
+        buf.push(make_insert("t", "5")).unwrap();
+        buf.rollback_to_savepoint("s").unwrap();
+        assert_eq!(buf.len(), 3);
+        assert!(
+            buf.savepoints.iter().any(|(n, _)| n == "s"),
+            "savepoint 's' should remain after ROLLBACK TO"
+        );
+    }
+
+    /// S2 green gate: RELEASE does not discard ops.
+    #[test]
+    fn savepoint_release_does_not_discard() {
+        let mut buf = WriteBuffer::new();
+        buf.push(make_insert("t", "1")).unwrap();
+        buf.create_savepoint("s").unwrap();
+        buf.push(make_insert("t", "2")).unwrap();
+        buf.push(make_insert("t", "3")).unwrap();
+        buf.release_savepoint("s").unwrap();
+        assert_eq!(buf.len(), 3, "release must not discard ops");
+        assert!(
+            buf.savepoints.is_empty(),
+            "savepoints should be empty after release"
+        );
+    }
+
+    /// S2 green gate: rollback_to nonexistent name returns SavepointNotFound.
+    #[test]
+    fn savepoint_not_found_returns_error() {
+        let mut buf = WriteBuffer::new();
+        match buf.rollback_to_savepoint("nonexistent") {
+            Err(GatewayError::SavepointNotFound { name }) => {
+                assert_eq!(name, "nonexistent");
+            }
+            other => panic!("expected SavepointNotFound, got {other:?}"),
+        }
+    }
+
+    /// S2 green gate: exceeding MAX_SAVEPOINTS_PER_BUFFER returns SavepointLimitExceeded.
+    #[test]
+    fn savepoint_limit_exceeded() {
+        let mut buf = WriteBuffer::new();
+        for i in 0..MAX_SAVEPOINTS_PER_BUFFER {
+            buf.create_savepoint(&format!("sp_{i}")).unwrap();
+        }
+        match buf.create_savepoint("overflow") {
+            Err(GatewayError::SavepointLimitExceeded { limit }) => {
+                assert_eq!(limit, MAX_SAVEPOINTS_PER_BUFFER);
+            }
+            other => panic!("expected SavepointLimitExceeded, got {other:?}"),
+        }
+    }
+
+    /// S2 green gate: SAVEPOINT with existing name overwrites (Postgres semantics).
+    #[test]
+    fn savepoint_overwrite_replaces() {
+        let mut buf = WriteBuffer::new();
+        buf.push(make_insert("t", "1")).unwrap();
+        buf.create_savepoint("s").unwrap(); // ops_len = 1
+        buf.push(make_insert("t", "2")).unwrap();
+        buf.push(make_insert("t", "3")).unwrap();
+        buf.create_savepoint("s").unwrap(); // ops_len = 3 (overwrite)
+        buf.push(make_insert("t", "4")).unwrap();
+        buf.rollback_to_savepoint("s").unwrap();
+        assert_eq!(
+            buf.len(),
+            3,
+            "should roll back to the overwritten savepoint position"
+        );
     }
 }

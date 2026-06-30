@@ -3358,6 +3358,17 @@ fn test_all_rs_codes_have_sqlstate() {
         ("0A000", GatewayError::NotSupported("x".into())),
         ("42601", GatewayError::ParseError("x".into())),
         ("XX000", GatewayError::PgWire("x".into())),
+        ("25P02", GatewayError::InFailedSqlTransaction),
+        (
+            "3B001",
+            GatewayError::SavepointNotFound { name: "s".into() },
+        ),
+        ("0A000", GatewayError::TwoPhaseNotSupported),
+        ("54000", GatewayError::SavepointLimitExceeded { limit: 128 }),
+        (
+            "54000",
+            GatewayError::NotifyChannelLimitExceeded { limit: 1000 },
+        ),
     ];
 
     for (expected_sqlstate, err) in &cases {
@@ -4185,5 +4196,125 @@ async fn test_search_path_view_resolution() {
         result.is_ok(),
         "qualified SELECT public.myview should succeed regardless of search_path, got: {:?}",
         result.err()
+    );
+}
+
+// ── v0.41 Slice 4 green gate ─────────────────────────────────────────────────
+
+/// S4 green gate: commands inside a failed explicit block return SQLSTATE 25P02;
+/// ROLLBACK exits the failed block and the connection becomes usable again.
+#[tokio::test]
+async fn test_failed_block_blocks_commands() {
+    let (port, _handle) =
+        start_gateway_noop(rockstream_gateway::catalog_stubs::CatalogStubs::new()).await;
+    let client = connect_port(port).await;
+
+    // BEGIN — enters InTransaction
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+
+    // Force an error inside the explicit block: SERIALIZABLE → RS-2003 Error response
+    let result = client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .await;
+    let got_error = match &result {
+        Err(e) => e.as_db_error().is_some(),
+        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("ERROR")),
+    };
+    assert!(
+        got_error,
+        "expected error from SERIALIZABLE inside BEGIN, got: {result:?}"
+    );
+
+    // Now inside failed block — any non-ROLLBACK command must return SQLSTATE 25P02
+    let blocked = client.simple_query("SELECT 1").await;
+    let has_25p02 = match &blocked {
+        Err(e) => e
+            .as_db_error()
+            .map(|d| d.code().code() == "25P02")
+            .unwrap_or(false),
+        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("25P02")),
+    };
+    assert!(
+        has_25p02,
+        "expected SQLSTATE 25P02 from command in failed block, got: {blocked:?}"
+    );
+
+    // ROLLBACK must succeed and exit the failed block
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("ROLLBACK from failed block failed");
+
+    // Connection must be usable again after ROLLBACK
+    let after = client.simple_query("SELECT 1").await;
+    assert!(
+        after.is_ok(),
+        "connection should be usable after ROLLBACK from failed block, got: {after:?}"
+    );
+}
+
+// ── v0.41 Slice 6 green gate ─────────────────────────────────────────────────
+
+/// S6 green gate: SET LOCAL reverts on ROLLBACK; SET (non-local) persists.
+#[tokio::test]
+async fn test_set_local_reverts_on_rollback() {
+    let (port, _handle) =
+        start_gateway_noop(rockstream_gateway::catalog_stubs::CatalogStubs::new()).await;
+    let client = connect_port(port).await;
+
+    // Establish a session-level value.
+    client
+        .simple_query("SET search_path = 'original'")
+        .await
+        .expect("SET search_path failed");
+
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+
+    // Override at transaction scope.
+    client
+        .simple_query("SET LOCAL search_path = 'local_value'")
+        .await
+        .expect("SET LOCAL failed");
+
+    // SHOW inside transaction must return the local override.
+    let msgs = client
+        .simple_query("SHOW search_path")
+        .await
+        .expect("SHOW search_path inside BEGIN failed");
+    let val_inside: Option<String> = msgs.iter().find_map(|m| {
+        if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+            r.get(0).map(|v| v.to_string())
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        val_inside.as_deref(),
+        Some("local_value"),
+        "expected local_value inside transaction, got: {val_inside:?}"
+    );
+
+    // ROLLBACK — SET LOCAL value must be discarded.
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("ROLLBACK failed");
+
+    // SHOW after ROLLBACK must return the original session-level value.
+    let msgs2 = client
+        .simple_query("SHOW search_path")
+        .await
+        .expect("SHOW search_path after ROLLBACK failed");
+    let val_after: Option<String> = msgs2.iter().find_map(|m| {
+        if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+            r.get(0).map(|v| v.to_string())
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        val_after.as_deref(),
+        Some("original"),
+        "expected original after ROLLBACK, got: {val_after:?}"
     );
 }

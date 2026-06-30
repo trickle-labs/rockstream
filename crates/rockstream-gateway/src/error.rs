@@ -78,6 +78,26 @@ pub enum GatewayError {
     #[error("[RS-2401] auth.invalid_password: password authentication failed for user '{user}'. next_steps: Check password and retry")]
     InvalidPassword { user: String },
 
+    /// [RS-2560] transaction.in_failed_sql_transaction — SQLSTATE 25P02
+    #[error("[RS-2560] transaction.in_failed_sql_transaction: query cannot run inside a failed transaction block. next_steps: Issue ROLLBACK to exit the failed block, then retry.")]
+    InFailedSqlTransaction,
+
+    /// [RS-2561] transaction.savepoint_not_found — SQLSTATE 3B001
+    #[error("[RS-2561] transaction.savepoint_not_found: savepoint '{name}' does not exist. next_steps: Use SAVEPOINT <name> to create one before ROLLBACK TO.")]
+    SavepointNotFound { name: String },
+
+    /// [RS-2562] transaction.two_phase_not_supported — SQLSTATE 0A000
+    #[error("[RS-2562] transaction.two_phase_not_supported: PREPARE TRANSACTION / XA two-phase commit is not supported. next_steps: Use a single-phase COMMIT instead.")]
+    TwoPhaseNotSupported,
+
+    /// [RS-2563] transaction.savepoint_limit_exceeded — SQLSTATE 54000
+    #[error("[RS-2563] transaction.savepoint_limit_exceeded: per-transaction savepoint limit of {limit} exceeded. next_steps: RELEASE earlier savepoints before creating new ones.")]
+    SavepointLimitExceeded { limit: usize },
+
+    /// [RS-2564] notify.channel_limit_exceeded — SQLSTATE 54000
+    #[error("[RS-2564] notify.channel_limit_exceeded: notify channel limit of {limit} exceeded. next_steps: UNLISTEN unused channels.")]
+    NotifyChannelLimitExceeded { limit: usize },
+
     #[error("Not supported: {0}")]
     NotSupported(String),
 
@@ -119,6 +139,11 @@ pub fn sqlstate_for(e: &GatewayError) -> &'static str {
         GatewayError::StatementTimeout => "57014",
         GatewayError::ConnectionLimitExceeded { .. } => "53300",
         GatewayError::InvalidPassword { .. } => "28P01",
+        GatewayError::InFailedSqlTransaction => "25P02",
+        GatewayError::SavepointNotFound { .. } => "3B001",
+        GatewayError::TwoPhaseNotSupported => "0A000",
+        GatewayError::SavepointLimitExceeded { .. } => "54000",
+        GatewayError::NotifyChannelLimitExceeded { .. } => "54000",
         GatewayError::NotSupported(_) => "0A000",
         GatewayError::ParseError(_) => "42601",
         GatewayError::Storage(_) => "XX000",

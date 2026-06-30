@@ -58,11 +58,13 @@ use crate::catalog_stubs::{
 use crate::copy_state::{
     CopyState, COPY_IN_BUFFER_ROWS, COPY_IN_FLUSH_BYTES, MAX_COPY_IN_BATCH_ROWS,
 };
+use crate::notify_registry::NotifyRegistry;
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
 use crate::GatewayError;
+use pgwire::messages::response::NotificationResponse;
 
 // ── Cancellation primitive ────────────────────────────────────────────────────
 
@@ -782,6 +784,10 @@ pub struct GatewayHandler {
     /// Bound: MAX_CONNECTIONS = 10_000 entries.
     /// Fill-level metric: registry.len().
     pub cancellation_registry: Arc<DashMap<(u32, u32), CancelToken>>,
+    /// LISTEN/NOTIFY channel registry. Bound: MAX_NOTIFY_CHANNELS = 1_000 channels.
+    pub notify_registry: Arc<NotifyRegistry>,
+    /// Transactional NOTIFYs buffered until COMMIT. Bound: MAX_OUTBOX_PER_CONNECTION.
+    pending_notifies: Arc<DashMap<String, Vec<(String, String)>>>,
 }
 
 impl GatewayHandler {
@@ -804,6 +810,8 @@ impl GatewayHandler {
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
             audit_log: None,
             cancellation_registry: Arc::new(DashMap::new()),
+            notify_registry: Arc::new(NotifyRegistry::new()),
+            pending_notifies: Arc::new(DashMap::new()),
         }
     }
 
@@ -830,6 +838,8 @@ impl GatewayHandler {
             namespace_catalog: Arc::new(rockstream_control::NamespaceCatalog::new()),
             audit_log: None,
             cancellation_registry: Arc::new(DashMap::new()),
+            notify_registry: Arc::new(NotifyRegistry::new()),
+            pending_notifies: Arc::new(DashMap::new()),
         }
     }
 
@@ -844,6 +854,20 @@ impl GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // Drain pending notifications and send them before processing the query.
+        // This delivers notifications from other connections to this one.
+        {
+            let pending = self.notify_registry.drain_outbox(conn_id);
+            for (channel, payload, pid) in pending {
+                let notif = NotificationResponse::new(pid, channel, payload);
+                client
+                    .feed(PgWireBackendMessage::NotificationResponse(notif))
+                    .await
+                    .map_err(PgWireError::from)?;
+            }
+            client.flush().await.map_err(PgWireError::from)?;
+        }
+
         // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
         let ql = query.trim().to_lowercase();
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
@@ -1084,12 +1108,7 @@ impl GatewayHandler {
             return Some(self.handle_mark_index_ready(q));
         }
 
-        // Transaction control
-        if ql == "begin" || ql == "begin;" || ql.starts_with("begin ") {
-            return Some(Ok(vec![Response::TransactionStart(
-                Tag::new("BEGIN").with_rows(0),
-            )]));
-        }
+        // BEGIN is handled in dispatch_async_with_conn (needs session state for idempotency).
 
         // COMMIT and ROLLBACK are handled in dispatch_async (need write buffer access).
 
@@ -1111,6 +1130,228 @@ impl GatewayHandler {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        // ── Aborted-transaction guard ────────────────────────────────────────────
+        // Any command inside a failed block is bounced with SQLSTATE 25P02, except
+        // ROLLBACK (which exits the failed block) and ROLLBACK TO <name> (which
+        // re-activates the block from a savepoint).
+        if let Some(id) = conn_id {
+            let in_failed = self
+                .sessions
+                .get(id)
+                .map(|s| s.is_in_failed_block())
+                .unwrap_or(false);
+            if in_failed {
+                let is_rollback =
+                    ql == "rollback" || ql == "rollback;" || ql.starts_with("rollback to");
+                if !is_rollback {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "25P02".to_owned(),
+                            "[RS-2560] transaction.in_failed_sql_transaction: query cannot run inside a failed transaction block. next_steps: Issue ROLLBACK to exit the failed block, then retry.".to_owned(),
+                        ),
+                    )))]);
+                }
+            }
+        }
+
+        // ── BEGIN — with idempotency (already in transaction → silent succeed) ──
+        if ql == "begin" || ql == "begin;" || ql.starts_with("begin ") {
+            if let Some(id) = conn_id {
+                let tx_status = self
+                    .sessions
+                    .get(id)
+                    .map(|s| s.tx_status)
+                    .unwrap_or(crate::session::TxStatus::Idle);
+                if tx_status == crate::session::TxStatus::InTransaction {
+                    // Already in a transaction — succeed silently (Postgres issues a warning
+                    // but we keep it simple in v0.41).
+                    return Ok(vec![promote_response(Response::Execution(
+                        Tag::new("BEGIN").with_rows(0),
+                    ))]);
+                }
+                let mut session = self
+                    .sessions
+                    .entry(id.to_string())
+                    .or_insert_with(SessionState::new);
+                session.begin_explicit();
+                let current_frontier = self
+                    .shard_db
+                    .as_ref()
+                    .map(|db| db.last_epoch().load(std::sync::atomic::Ordering::Acquire));
+                session.begin(current_frontier);
+            }
+            return Ok(vec![promote_response(Response::TransactionStart(
+                Tag::new("BEGIN").with_rows(0),
+            ))]);
+        }
+
+        // ── END alias for COMMIT ─────────────────────────────────────────────────
+        if ql == "end" || ql == "end;" {
+            let result = self.handle_commit(conn_id).await;
+            if let Some(id) = conn_id {
+                if result.is_ok() {
+                    if let Some(mut session) = self.sessions.get_mut(id) {
+                        session.end_transaction();
+                    }
+                }
+            }
+            return result;
+        }
+
+        // ── SAVEPOINT commands ────────────────────────────────────────────────────
+        if ql.starts_with("savepoint ") {
+            let name = q["savepoint ".len()..].trim().trim_end_matches(';').trim();
+            if let Some(id) = conn_id {
+                let in_block = self
+                    .sessions
+                    .get(id)
+                    .map(|s| s.in_explicit_block)
+                    .unwrap_or(false);
+                if !in_block {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "3B001".to_owned(),
+                            "SAVEPOINT can only be used in transaction blocks".to_owned(),
+                        ),
+                    )))]);
+                }
+                self.write_buffers
+                    .entry(id.to_string())
+                    .or_default()
+                    .create_savepoint(name)
+                    .map_err(PgWireError::from)?;
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("SAVEPOINT").with_rows(0),
+            ))]);
+        }
+
+        if ql.starts_with("release savepoint ") || ql.starts_with("release ") {
+            let after = if ql.starts_with("release savepoint ") {
+                &q["release savepoint ".len()..]
+            } else {
+                &q["release ".len()..]
+            };
+            let name = after.trim().trim_end_matches(';').trim();
+            if let Some(id) = conn_id {
+                self.write_buffers
+                    .entry(id.to_string())
+                    .or_default()
+                    .release_savepoint(name)
+                    .map_err(PgWireError::from)?;
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("RELEASE").with_rows(0),
+            ))]);
+        }
+
+        if ql.starts_with("rollback to savepoint ") || ql.starts_with("rollback to ") {
+            let after = if ql.starts_with("rollback to savepoint ") {
+                &q["rollback to savepoint ".len()..]
+            } else {
+                &q["rollback to ".len()..]
+            };
+            let name = after.trim().trim_end_matches(';').trim();
+            if let Some(id) = conn_id {
+                self.write_buffers
+                    .entry(id.to_string())
+                    .or_default()
+                    .rollback_to_savepoint(name)
+                    .map_err(PgWireError::from)?;
+                // ROLLBACK TO reactivates a failed transaction block.
+                if let Some(mut session) = self.sessions.get_mut(id) {
+                    if session.tx_status == crate::session::TxStatus::Failed {
+                        session.tx_status = crate::session::TxStatus::InTransaction;
+                    }
+                }
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("ROLLBACK").with_rows(0),
+            ))]);
+        }
+
+        // Two-phase commit — not supported.
+        if ql.starts_with("prepare transaction")
+            || ql.starts_with("commit prepared")
+            || ql.starts_with("rollback prepared")
+        {
+            return Err(crate::error::GatewayError::TwoPhaseNotSupported.into());
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
+        // ── S8: LISTEN/UNLISTEN/NOTIFY ────────────────────────────────────────────
+        if ql == "listen" || ql.starts_with("listen ") {
+            if let Some(id) = conn_id {
+                let channel = q["listen".len()..].trim().trim_end_matches(';').trim();
+                if !channel.is_empty() {
+                    self.notify_registry
+                        .subscribe(channel, id)
+                        .map_err(PgWireError::from)?;
+                }
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("LISTEN").with_rows(0),
+            ))]);
+        }
+
+        if ql == "unlisten" || ql == "unlisten *" || ql.starts_with("unlisten ") {
+            if let Some(id) = conn_id {
+                let rest = q["unlisten".len()..].trim().trim_end_matches(';').trim();
+                if rest.is_empty() || rest == "*" {
+                    self.notify_registry.unsubscribe_all(id);
+                    self.pending_notifies.remove(id);
+                } else {
+                    self.notify_registry.unsubscribe(rest, id);
+                }
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("UNLISTEN").with_rows(0),
+            ))]);
+        }
+
+        if ql == "notify" || ql.starts_with("notify ") {
+            let rest = q["notify".len()..].trim().trim_end_matches(';').trim();
+            let (channel, payload) = if let Some(comma_pos) = rest.find(',') {
+                let ch = rest[..comma_pos].trim().to_string();
+                let pl = rest[comma_pos + 1..]
+                    .trim()
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_string();
+                (ch, pl)
+            } else {
+                (rest.to_string(), String::new())
+            };
+            if let Some(id) = conn_id {
+                let in_block = self
+                    .sessions
+                    .get(id)
+                    .map(|s| s.in_explicit_block)
+                    .unwrap_or(false);
+                if in_block {
+                    let mut outbox = self.pending_notifies.entry(id.to_string()).or_default();
+                    if outbox.len() < crate::notify_registry::MAX_OUTBOX_PER_CONNECTION {
+                        outbox.push((channel, payload));
+                    }
+                } else {
+                    let sender_pid = self
+                        .sessions
+                        .get(id)
+                        .map(|s| s.backend_pid as i32)
+                        .unwrap_or(0);
+                    self.notify_registry.deliver(&channel, &payload, sender_pid);
+                }
+            } else {
+                self.notify_registry.deliver(&channel, &payload, 0);
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("NOTIFY").with_rows(0),
+            ))]);
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
         // SET rockstream.* must be intercepted before catalog stubs handle generic SET commands.
         if ql.starts_with("set rockstream.") || ql.starts_with("set local rockstream.") {
             return self.handle_set_rockstream(q, &ql, conn_id);
@@ -1118,6 +1359,7 @@ impl GatewayHandler {
 
         // SET search_path = <namespace> (v0.26 namespace isolation)
         if ql.starts_with("set search_path") || ql.starts_with("set local search_path") {
+            let is_local = ql.starts_with("set local search_path");
             if let Some(id) = conn_id {
                 // Extract namespace: SET search_path = <ns> or SET search_path TO <ns>
                 let after_eq = if let Some(pos) = ql.find('=') {
@@ -1148,9 +1390,17 @@ impl GatewayHandler {
                     .sessions
                     .entry(id.to_string())
                     .or_insert_with(SessionState::new);
-                session.current_namespace = ns.clone();
-                session.search_path = ns;
-                session.search_path_set = true;
+                if is_local {
+                    // SET LOCAL: store in local_guc_params; cleared at ROLLBACK/COMMIT.
+                    session
+                        .local_guc_params
+                        .insert("search_path".to_string(), ns);
+                } else {
+                    session.current_namespace = ns.clone();
+                    session.search_path = ns.clone();
+                    session.guc_params.insert("search_path".to_string(), ns);
+                    session.search_path_set = true;
+                }
             }
             return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
         }
@@ -1244,6 +1494,32 @@ impl GatewayHandler {
             )))]);
         }
 
+        // S6: SET TRANSACTION ISOLATION LEVEL / SET TRANSACTION READ ONLY|WRITE
+        if ql.starts_with("set transaction") || ql.starts_with("set local transaction") {
+            if ql.contains("isolation level") {
+                if ql.contains("serializable") {
+                    // Fall through to dispatch_sync which returns RS-2003.
+                } else if let Some(id) = conn_id {
+                    let level = if ql.contains("repeatable read") {
+                        crate::session::IsolationLevel::RepeatableRead
+                    } else {
+                        crate::session::IsolationLevel::ReadCommitted
+                    };
+                    let mut session = self
+                        .sessions
+                        .entry(id.to_string())
+                        .or_insert_with(SessionState::new);
+                    session.isolation_level = level;
+                    return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
+                } else {
+                    return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
+                }
+            } else {
+                // SET TRANSACTION READ ONLY / READ WRITE — accept silently.
+                return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
+            }
+        }
+
         // S8: Generic SET <key> [=|TO] <value> — store in session GUC params.
         // Must come after the specific SET handlers (SET rockstream.*, SET search_path).
         // Exclude SET TRANSACTION so dispatch_sync can enforce SERIALIZABLE → RS-2003.
@@ -1255,8 +1531,9 @@ impl GatewayHandler {
             && !ql.starts_with("set transaction")
             && !ql.starts_with("set local transaction")
         {
+            let is_local = ql.starts_with("set local ");
             if let Some(id) = conn_id {
-                let remainder = if ql.starts_with("set local ") {
+                let remainder = if is_local {
                     &q["set local ".len()..]
                 } else {
                     &q["set ".len()..]
@@ -1286,7 +1563,9 @@ impl GatewayHandler {
                         .sessions
                         .entry(id.to_string())
                         .or_insert_with(SessionState::new);
-                    if session.guc_params.len() < crate::session::MAX_GUC_PARAMS
+                    if is_local {
+                        session.local_guc_params.insert(key, val);
+                    } else if session.guc_params.len() < crate::session::MAX_GUC_PARAMS
                         || session.guc_params.contains_key(&key)
                     {
                         session.guc_params.insert(key, val);
@@ -1301,9 +1580,9 @@ impl GatewayHandler {
             let key_raw = ql["show ".len()..].trim().trim_end_matches(';').to_string();
             let session_val: Option<String> = if let Some(id) = conn_id {
                 self.sessions.get(id).map(|s| {
-                    // guc_params first, then session fields, then defaults
-                    if let Some(v) = s.guc_params.get(&key_raw) {
-                        return v.clone();
+                    // local_guc_params first (SET LOCAL), then guc_params, then session fields
+                    if let Some(v) = s.effective_guc(&key_raw) {
+                        return v.to_owned();
                     }
                     match key_raw.as_str() {
                         "search_path" => s.search_path.clone(),
@@ -1359,17 +1638,45 @@ impl GatewayHandler {
         if let Some(result) = self.dispatch_sync(query, &session_info) {
             // Promote lifetime — responses from dispatch_sync hold no borrows
             // from `query`, only owned data.
-            return result.map(|v| v.into_iter().map(promote_response).collect());
+            let result = result.map(|v| v.into_iter().map(promote_response).collect());
+            let is_error = result.is_err()
+                || result.as_ref().is_ok_and(|v: &Vec<Response<'_>>| {
+                    v.iter().any(|r| matches!(r, Response::Error(_)))
+                });
+            if is_error {
+                if let Some(id) = conn_id {
+                    if let Some(mut session) = self.sessions.get_mut(id) {
+                        session.fail_transaction();
+                    }
+                }
+            }
+            return result;
         }
 
         // COMMIT — flush write buffer to shard atomically.
         if ql == "commit" || ql == "commit;" {
-            return self.handle_commit(conn_id).await;
+            let result = self.handle_commit(conn_id).await;
+            if result.is_ok() {
+                if let Some(id) = conn_id {
+                    if let Some(mut session) = self.sessions.get_mut(id) {
+                        session.end_transaction();
+                    }
+                }
+            }
+            return result;
         }
 
         // ROLLBACK — discard write buffer.
         if ql == "rollback" || ql == "rollback;" {
-            return self.handle_rollback(conn_id).await;
+            let result = self.handle_rollback(conn_id).await;
+            if result.is_ok() {
+                if let Some(id) = conn_id {
+                    if let Some(mut session) = self.sessions.get_mut(id) {
+                        session.end_transaction();
+                    }
+                }
+            }
+            return result;
         }
 
         // ── Slice 5: PgBouncer compat commands ──────────────────────────────
@@ -1407,17 +1714,41 @@ impl GatewayHandler {
 
         // INSERT — accumulate in write buffer.
         if ql.starts_with("insert into ") {
-            return self.handle_insert(q, conn_id).await;
+            let result = self.handle_insert(q, conn_id).await;
+            if result.is_err() {
+                if let Some(id) = conn_id {
+                    if let Some(mut session) = self.sessions.get_mut(id) {
+                        session.fail_transaction();
+                    }
+                }
+            }
+            return result;
         }
 
         // UPDATE — accumulate in write buffer.
         if ql.starts_with("update ") {
-            return self.handle_update(q, conn_id).await;
+            let result = self.handle_update(q, conn_id).await;
+            if result.is_err() {
+                if let Some(id) = conn_id {
+                    if let Some(mut session) = self.sessions.get_mut(id) {
+                        session.fail_transaction();
+                    }
+                }
+            }
+            return result;
         }
 
         // DELETE — accumulate in write buffer.
         if ql.starts_with("delete from ") {
-            return self.handle_delete(q, conn_id).await;
+            let result = self.handle_delete(q, conn_id).await;
+            if result.is_err() {
+                if let Some(id) = conn_id {
+                    if let Some(mut session) = self.sessions.get_mut(id) {
+                        session.fail_transaction();
+                    }
+                }
+            }
+            return result;
         }
 
         // SELECT … FROM <view> [LIMIT n]
@@ -1506,7 +1837,7 @@ impl GatewayHandler {
                         .try_with(|t| t.clone())
                         .unwrap_or_else(|_| CancelToken::new());
                     let read_fut = self.read_view_response(&view_name, limit, order_by, conn_id);
-                    return tokio::select! {
+                    let result = tokio::select! {
                         res = read_fut => res,
                         _ = cancel_token.cancelled() => {
                             Ok(vec![promote_response(Response::Error(Box::new(
@@ -1518,6 +1849,18 @@ impl GatewayHandler {
                             )))])
                         }
                     };
+                    let is_error = result.is_err()
+                        || result.as_ref().is_ok_and(|v: &Vec<Response<'_>>| {
+                            v.iter().any(|r| matches!(r, Response::Error(_)))
+                        });
+                    if is_error {
+                        if let Some(id) = conn_id {
+                            if let Some(mut session) = self.sessions.get_mut(id) {
+                                session.fail_transaction();
+                            }
+                        }
+                    }
+                    return result;
                 }
             }
         }
@@ -2286,6 +2629,20 @@ impl GatewayHandler {
     }
 
     /// COMMIT handler: flush write buffer to ShardDb atomically.
+    /// Deliver any transactional NOTIFYs buffered during this transaction.
+    fn flush_pending_notifies(&self, conn_id: &str) {
+        if let Some((_, pending)) = self.pending_notifies.remove(conn_id) {
+            let sender_pid = self
+                .sessions
+                .get(conn_id)
+                .map(|s| s.backend_pid as i32)
+                .unwrap_or(0);
+            for (channel, payload) in pending {
+                self.notify_registry.deliver(&channel, &payload, sender_pid);
+            }
+        }
+    }
+
     async fn handle_commit(&self, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
         let Some(conn_id) = conn_id else {
             return Ok(vec![promote_response(Response::TransactionEnd(
@@ -2294,7 +2651,10 @@ impl GatewayHandler {
         };
 
         let mut entry = self.write_buffers.entry(conn_id.to_string()).or_default();
+        entry.clear_savepoints();
         if entry.is_empty() {
+            // No DML — still deliver any transactional NOTIFYs.
+            self.flush_pending_notifies(conn_id);
             return Ok(vec![promote_response(Response::TransactionEnd(
                 Tag::new("COMMIT").with_rows(0),
             ))]);
@@ -2302,6 +2662,7 @@ impl GatewayHandler {
 
         let Some(shard_db) = &self.shard_db else {
             // No shard — discard buffer, return COMMIT (best effort without storage)
+            self.flush_pending_notifies(conn_id);
             entry.clear();
             return Ok(vec![promote_response(Response::TransactionEnd(
                 Tag::new("COMMIT").with_rows(0),
@@ -2453,6 +2814,9 @@ impl GatewayHandler {
             session.last_written_epoch = Some(FreshnessToken::new(table_name, epoch));
         }
 
+        // Deliver transactional NOTIFYs buffered during this transaction.
+        self.flush_pending_notifies(conn_id);
+
         Ok(vec![promote_response(Response::TransactionEnd(
             Tag::new("COMMIT").with_rows(affected),
         ))])
@@ -2464,6 +2828,8 @@ impl GatewayHandler {
             if let Some(mut entry) = self.write_buffers.get_mut(conn_id) {
                 entry.clear();
             }
+            // Discard transactional NOTIFYs — aborted.
+            self.pending_notifies.remove(conn_id);
         }
         Ok(vec![promote_response(Response::TransactionEnd(
             Tag::new("ROLLBACK").with_rows(0),
@@ -2511,6 +2877,9 @@ impl GatewayHandler {
                 session.session_wait_for_timeout_ms = 5_000;
                 session.session_wait_for_enabled = true;
             }
+            // Unsubscribe from all LISTEN channels and discard pending NOTIFYs.
+            self.notify_registry.unsubscribe_all(id);
+            self.pending_notifies.remove(id);
         }
         Ok(vec![promote_response(Response::Execution(Tag::new(
             "DISCARD ALL",
@@ -4724,9 +5093,15 @@ impl GatewayServer {
                             return; // CancelRequest connections don't do further work
                         }
                     }
-                    if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
+                    if let Err(e) =
+                        pgwire::tokio::process_socket(socket, None, factory_ref.clone()).await
+                    {
                         tracing::debug!("gateway connection error: {e}");
                     }
+                    // Cleanup LISTEN subscriptions on disconnect.
+                    let cid = CONN_ID.with(|id| id.clone());
+                    factory_ref.handler.notify_registry.unsubscribe_all(&cid);
+                    factory_ref.handler.pending_notifies.remove(&cid);
                 }),
             ));
         }
@@ -4792,10 +5167,14 @@ impl GatewayServer {
                             }
                         }
                         if let Err(e) =
-                            pgwire::tokio::process_socket(socket, None, factory_ref).await
+                            pgwire::tokio::process_socket(socket, None, factory_ref.clone()).await
                         {
                             tracing::debug!("gateway connection error: {e}");
                         }
+                        // Cleanup LISTEN subscriptions on disconnect.
+                        let cid = CONN_ID.with(|id| id.clone());
+                        factory_ref.handler.notify_registry.unsubscribe_all(&cid);
+                        factory_ref.handler.pending_notifies.remove(&cid);
                     }),
                 ));
             }

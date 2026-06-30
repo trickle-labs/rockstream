@@ -22,6 +22,7 @@ pub mod change_log;
 pub mod copy_state;
 pub mod error;
 pub mod multi_shard_reader;
+pub mod notify_registry;
 pub mod protocol;
 pub mod role_catalog;
 pub mod server;
