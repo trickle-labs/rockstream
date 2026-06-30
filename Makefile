@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage release verify verify-relaxed path-coupling
+.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage coverage-gate release verify verify-relaxed path-coupling
 
 # Build the workspace
 build:
@@ -53,6 +53,15 @@ exit-criteria:
 coverage:
 	cargo llvm-cov --workspace --lcov --output-path lcov.info
 	@echo "Coverage written to lcov.info"
+
+# Enforce coverage thresholds for rockstream-gateway (requires cargo-llvm-cov).
+# Fails with non-zero exit if line coverage < 90% or branch coverage < 85%.
+coverage-gate:
+	cargo llvm-cov --package rockstream-gateway --fail-under-lines 90
+	cargo llvm-cov --package rockstream-gateway \
+		--include-files 'protocol.rs,server.rs,session.rs,auth.rs' \
+		--fail-under-branches 85
+	@echo "Coverage gate passed."
 
 # End-to-end test: exercises all three required test backends (Unit, LFS, MinIO/TC).
 #

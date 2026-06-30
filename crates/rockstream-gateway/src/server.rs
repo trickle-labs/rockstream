@@ -1089,6 +1089,11 @@ impl GatewayHandler {
             return Some(self.handle_create_view(q));
         }
 
+        // REFRESH MATERIALIZED VIEW
+        if ql.starts_with("refresh materialized view ") {
+            return Some(Ok(self.handle_refresh_materialized_view(q)));
+        }
+
         // CREATE TABLE [IF NOT EXISTS] — register in catalog
         if ql.starts_with("create table ") || ql.starts_with("create table if not exists ") {
             return Some(self.handle_create_table(q));
@@ -1167,7 +1172,7 @@ impl GatewayHandler {
                     // Already in a transaction — succeed silently (Postgres issues a warning
                     // but we keep it simple in v0.41).
                     return Ok(vec![promote_response(Response::Execution(
-                        Tag::new("BEGIN").with_rows(0),
+                        Tag::new("BEGIN"),
                     ))]);
                 }
                 let mut session = self
@@ -1182,7 +1187,7 @@ impl GatewayHandler {
                 session.begin(current_frontier);
             }
             return Ok(vec![promote_response(Response::TransactionStart(
-                Tag::new("BEGIN").with_rows(0),
+                Tag::new("BEGIN"),
             ))]);
         }
 
@@ -1224,7 +1229,7 @@ impl GatewayHandler {
                     .map_err(PgWireError::from)?;
             }
             return Ok(vec![promote_response(Response::Execution(
-                Tag::new("SAVEPOINT").with_rows(0),
+                Tag::new("SAVEPOINT"),
             ))]);
         }
 
@@ -1243,7 +1248,7 @@ impl GatewayHandler {
                     .map_err(PgWireError::from)?;
             }
             return Ok(vec![promote_response(Response::Execution(
-                Tag::new("RELEASE").with_rows(0),
+                Tag::new("RELEASE"),
             ))]);
         }
 
@@ -1268,7 +1273,7 @@ impl GatewayHandler {
                 }
             }
             return Ok(vec![promote_response(Response::Execution(
-                Tag::new("ROLLBACK").with_rows(0),
+                Tag::new("ROLLBACK"),
             ))]);
         }
 
@@ -1865,7 +1870,206 @@ impl GatewayHandler {
             }
         }
 
+        // DataFusion execution path for literal SELECT queries (no recognized FROM clause).
+        // Handles queries like `SELECT 42`, `SELECT 42 AS n`, `SELECT now()`, etc.
+        if ql.starts_with("select ") {
+            if let Some(responses) = self.try_datafusion_select(q).await {
+                return Ok(responses);
+            }
+        }
+
         Ok(vec![promote_response(Response::Execution(Tag::new("OK")))])
+    }
+
+    /// Execute a SELECT query directly via DataFusion when it doesn't reference
+    /// any catalog view/table (or references tables we can register as empty
+    /// MemTables so DataFusion can resolve column types).
+    ///
+    /// Returns `Some(responses)` on success, `None` if DataFusion cannot execute
+    /// the query (caller falls through to the `Tag::new("OK")` response).
+    async fn try_datafusion_select(&self, q: &str) -> Option<Vec<Response<'static>>> {
+        use datafusion::arrow::array::{
+            Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+            StringArray,
+        };
+        use datafusion::arrow::datatypes::DataType as ArrowDataType;
+
+        // Build a DataFusion session and register catalog objects as empty MemTables
+        // so the planner can resolve any referenced names.
+        let ctx = SessionContext::new();
+        for view in self.catalog.list_views() {
+            let mut fields = Vec::new();
+            for col in &view.columns {
+                fields.push(Field::new(
+                    &col.name,
+                    string_to_arrow_datatype(&col.data_type),
+                    true,
+                ));
+            }
+            let schema = Arc::new(Schema::new(fields));
+            if let Ok(mem_table) = MemTable::try_new(schema, vec![vec![]]) {
+                let _ = ctx.register_table(
+                    datafusion::sql::TableReference::from(view.name.as_str()),
+                    Arc::new(mem_table),
+                );
+            }
+        }
+        for table in self.catalog.list_tables() {
+            let mut fields = Vec::new();
+            for col in &table.columns {
+                fields.push(Field::new(
+                    &col.name,
+                    string_to_arrow_datatype(&col.data_type),
+                    true,
+                ));
+            }
+            let schema = Arc::new(Schema::new(fields));
+            if let Ok(mem_table) = MemTable::try_new(schema, vec![vec![]]) {
+                let _ = ctx.register_table(
+                    datafusion::sql::TableReference::from(table.name.as_str()),
+                    Arc::new(mem_table),
+                );
+            }
+        }
+
+        let df = match ctx.sql(q).await {
+            Ok(df) => df,
+            Err(_) => return None,
+        };
+
+        let batches = match df.collect().await {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+
+        if batches.is_empty() {
+            // Return an empty result set — build schema from the first batch schema if any.
+            return None;
+        }
+
+        // Build FieldInfo list from the Arrow schema of the first batch.
+        let arrow_schema = batches[0].schema();
+        let schema_fields: Vec<FieldInfo> = arrow_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, f)| {
+                let pg_type = match f.data_type() {
+                    ArrowDataType::Int16 => Type::INT2,
+                    ArrowDataType::Int32 => Type::INT4,
+                    ArrowDataType::Int64 => Type::INT8,
+                    ArrowDataType::Float32 => Type::FLOAT4,
+                    ArrowDataType::Float64 => Type::FLOAT8,
+                    ArrowDataType::Boolean => Type::BOOL,
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Type::TEXT,
+                    _ => Type::TEXT,
+                };
+                let format = PORTAL_FORMAT
+                    .try_with(|fmt| fmt.format_for(idx))
+                    .unwrap_or(FieldFormat::Text);
+                FieldInfo::new(f.name().clone(), None, None, pg_type, format)
+            })
+            .collect();
+
+        let schema = Arc::new(schema_fields);
+
+        // Collect all rows from all batches into a flat list of string-encoded rows.
+        let mut encoded_rows: Vec<Vec<Option<String>>> = Vec::new();
+        for batch in &batches {
+            let num_rows = batch.num_rows();
+            let num_cols = batch.num_columns();
+            for row_idx in 0..num_rows {
+                let mut row_vals: Vec<Option<String>> = Vec::with_capacity(num_cols);
+                for col_idx in 0..num_cols {
+                    let col = batch.column(col_idx);
+                    if col.is_null(row_idx) {
+                        row_vals.push(None);
+                        continue;
+                    }
+                    let val = match col.data_type() {
+                        ArrowDataType::Int16 => {
+                            col.as_any().downcast_ref::<Int16Array>()
+                                .map(|a| a.value(row_idx).to_string())
+                        }
+                        ArrowDataType::Int32 => {
+                            col.as_any().downcast_ref::<Int32Array>()
+                                .map(|a| a.value(row_idx).to_string())
+                        }
+                        ArrowDataType::Int64 => {
+                            col.as_any().downcast_ref::<Int64Array>()
+                                .map(|a| a.value(row_idx).to_string())
+                        }
+                        ArrowDataType::Float32 => {
+                            col.as_any().downcast_ref::<Float32Array>()
+                                .map(|a| a.value(row_idx).to_string())
+                        }
+                        ArrowDataType::Float64 => {
+                            col.as_any().downcast_ref::<Float64Array>()
+                                .map(|a| a.value(row_idx).to_string())
+                        }
+                        ArrowDataType::Boolean => {
+                            col.as_any().downcast_ref::<BooleanArray>()
+                                .map(|a| if a.value(row_idx) { "t".to_string() } else { "f".to_string() })
+                        }
+                        ArrowDataType::Utf8 => {
+                            col.as_any().downcast_ref::<StringArray>()
+                                .map(|a| a.value(row_idx).to_string())
+                        }
+                        _ => {
+                            // Fallback: cast to StringArray or use debug representation.
+                            col.as_any().downcast_ref::<StringArray>()
+                                .map(|a| a.value(row_idx).to_string())
+                        }
+                    };
+                    row_vals.push(val);
+                }
+                encoded_rows.push(row_vals);
+            }
+        }
+
+        let schema_ref = schema.clone();
+        let data_stream = stream::iter(encoded_rows).map(move |row_vals| {
+            let mut encoder = DataRowEncoder::new(schema_ref.clone());
+            for (col_idx, val) in row_vals.iter().enumerate() {
+                let datatype = schema_ref[col_idx].datatype();
+                let encode_res = match *datatype {
+                    Type::INT2 => {
+                        let parsed: Option<i16> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::INT4 => {
+                        let parsed: Option<i32> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::INT8 => {
+                        let parsed: Option<i64> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::FLOAT4 => {
+                        let parsed: Option<f32> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::FLOAT8 => {
+                        let parsed: Option<f64> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::BOOL => {
+                        let parsed: Option<bool> = val.as_deref().map(|s| s == "t" || s == "true" || s == "1");
+                        encoder.encode_field(&parsed)
+                    }
+                    _ => {
+                        let s: Option<&str> = val.as_deref();
+                        encoder.encode_field(&s)
+                    }
+                };
+                if let Err(e) = encode_res {
+                    return Err(PgWireError::ApiError(Box::new(e)));
+                }
+            }
+            encoder.finish()
+        });
+
+        Some(vec![Response::Query(QueryResponse::new(schema, data_stream))])
     }
 
     /// Try to serve a SELECT via an index arrangement point lookup.
@@ -2316,6 +2520,45 @@ impl GatewayHandler {
         Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))])
     }
 
+    fn handle_refresh_materialized_view(&self, q: &str) -> Vec<Response<'static>> {
+        let ql = q.trim().to_lowercase();
+        let after = ql
+            .strip_prefix("refresh materialized view ")
+            .unwrap_or("")
+            .trim();
+        let view_name = after
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .rsplit('.')
+            .next()
+            .unwrap_or(after)
+            .trim_matches('"')
+            .to_string();
+
+        if view_name.is_empty() || self.catalog.get_view(&view_name).is_none() {
+            return vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P01".to_owned(),
+                format!(
+                    "[RS-2001] refresh_materialized_view.not_found: materialized view '{}' does not exist. Next steps: verify the view name with \\dv in psql.",
+                    view_name
+                ),
+            ))))];
+        }
+
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "refresh_materialized_view",
+                &view_name,
+            ));
+        }
+
+        vec![promote_response(Response::Execution(
+            Tag::new("REFRESH MATERIALIZED VIEW").with_rows(0),
+        ))]
+    }
+
     fn handle_create_table<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let if_not_exists = ql.contains("if not exists");
@@ -2646,7 +2889,7 @@ impl GatewayHandler {
     async fn handle_commit(&self, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
         let Some(conn_id) = conn_id else {
             return Ok(vec![promote_response(Response::TransactionEnd(
-                Tag::new("COMMIT").with_rows(0),
+                Tag::new("COMMIT"),
             ))]);
         };
 
@@ -2656,7 +2899,7 @@ impl GatewayHandler {
             // No DML — still deliver any transactional NOTIFYs.
             self.flush_pending_notifies(conn_id);
             return Ok(vec![promote_response(Response::TransactionEnd(
-                Tag::new("COMMIT").with_rows(0),
+                Tag::new("COMMIT"),
             ))]);
         }
 
@@ -2665,7 +2908,7 @@ impl GatewayHandler {
             self.flush_pending_notifies(conn_id);
             entry.clear();
             return Ok(vec![promote_response(Response::TransactionEnd(
-                Tag::new("COMMIT").with_rows(0),
+                Tag::new("COMMIT"),
             ))]);
         };
 
@@ -2692,7 +2935,7 @@ impl GatewayHandler {
                     // Already committed — discard buffer and return COMMIT noop
                     entry.clear();
                     return Ok(vec![promote_response(Response::TransactionEnd(
-                        Tag::new("COMMIT").with_rows(0),
+                        Tag::new("COMMIT"),
                     ))]);
                 }
                 Ok(None) => {} // proceed
@@ -2832,7 +3075,7 @@ impl GatewayHandler {
             self.pending_notifies.remove(conn_id);
         }
         Ok(vec![promote_response(Response::TransactionEnd(
-            Tag::new("ROLLBACK").with_rows(0),
+            Tag::new("ROLLBACK"),
         ))])
     }
 
@@ -4647,7 +4890,18 @@ impl ExtendedQueryHandler for GatewayHandler {
                 .unwrap_or(Response::Execution(Tag::new("OK"))));
         }
 
-        let responses = self.dispatch_async_with_conn(query, Some(&conn_id)).await?;
+        // Parameter substitution: when the query has `$1`, `$2`, … placeholders
+        // AND the portal has bound values, substitute them so that DataFusion
+        // (and any other execution path) can evaluate the literals directly.
+        let effective_query: String;
+        let dispatch_query: &str = if !portal.parameters.is_empty() && query.contains('$') {
+            effective_query = substitute_params(query, &portal.parameters);
+            &effective_query
+        } else {
+            query
+        };
+
+        let responses = self.dispatch_async_with_conn(dispatch_query, Some(&conn_id)).await?;
         Ok(responses
             .into_iter()
             .next()
@@ -5385,6 +5639,27 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
             return res;
         }
     }
+    // For literal SELECT queries (no FROM / no recognized view), infer column names
+    // from the SELECT list. This ensures RowDescription and DataRow field counts match
+    // when try_datafusion_select executes the query.
+    let ql = q.trim().to_lowercase();
+    if ql.starts_with("select ") {
+        let cols = infer_select_columns(q);
+        if !cols.is_empty() {
+            return cols
+                .iter()
+                .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+                .collect();
+        }
+        // Fallback: return a single anonymous column so field counts match
+        return vec![FieldInfo::new(
+            "?column?".to_string(),
+            None,
+            None,
+            Type::TEXT,
+            FieldFormat::Text,
+        )];
+    }
     vec![]
 }
 
@@ -5589,6 +5864,62 @@ fn extract_sql_refs(sql: &str) -> Vec<String> {
     }
     deps.dedup();
     deps
+}
+
+/// Substitute `$1`, `$2`, … placeholders in `sql` with their bound values.
+///
+/// - `None` parameter → `NULL`
+/// - `Some(bytes)` that parses as a number → inserted as-is (no quotes)
+/// - `Some(bytes)` that is valid UTF-8 text → wrapped in single-quoted string
+///   with internal single-quotes escaped as `''`
+/// - `Some(bytes)` that is not valid UTF-8 → `NULL`
+///
+/// The function also strips PostgreSQL-style type casts (e.g. `$1::int`) from
+/// the placeholders before substitution so DataFusion can evaluate the literal.
+fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
+    let mut result = sql.to_string();
+    // Work from the highest index downward so that replacing `$10` before `$1`
+    // doesn't corrupt earlier replacements.
+    for (i, param) in params.iter().enumerate().rev() {
+        let placeholder = format!("${}", i + 1);
+        let replacement = match param {
+            None => "NULL".to_string(),
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Err(_) => "NULL".to_string(),
+                Ok(s) => {
+                    // If the value is purely numeric (integer or float), use it bare.
+                    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                        s.to_string()
+                    } else {
+                        // Escape single-quotes and wrap in single quotes.
+                        format!("'{}'", s.replace('\'', "''"))
+                    }
+                }
+            },
+        };
+        // Replace `$N::cast_type` as well as bare `$N`.
+        // We do a simple regex-free replacement: find `$N` and strip any
+        // trailing `::identifier` before inserting the replacement.
+        let placeholder_with_cast = format!("{}::", placeholder);
+        // Replace cast variants first (greedy: strip until non-alphanumeric/underscore).
+        let mut new_result = String::with_capacity(result.len());
+        let mut remaining = result.as_str();
+        while let Some(pos) = remaining.find(&placeholder_with_cast) {
+            new_result.push_str(&remaining[..pos]);
+            new_result.push_str(&replacement);
+            let after = &remaining[pos + placeholder_with_cast.len()..];
+            // Skip the cast type name (letters, digits, underscores).
+            let skip = after
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            remaining = &after[skip..];
+        }
+        new_result.push_str(remaining);
+        result = new_result;
+        // Now replace bare `$N` placeholders.
+        result = result.replace(&placeholder, &replacement);
+    }
+    result
 }
 
 // ── DML parsers ───────────────────────────────────────────────────────────────

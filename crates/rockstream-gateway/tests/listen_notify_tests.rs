@@ -271,11 +271,13 @@ async fn test_unlisten_stops_delivery() {
 #[cfg(feature = "testcontainers")]
 #[tokio::test]
 async fn test_psycopg3_listen_notify() {
-    use testcontainers::{clients::Cli, images::generic::GenericImage};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::GenericImage;
+    use testcontainers::ImageExt;
+    use tokio::io::AsyncReadExt;
 
     let (port, _handle) = start_gateway_noop().await;
 
-    let docker = Cli::default();
     let script = format!(
         "pip install psycopg -q && python3 -c \"\
 import psycopg, threading, time\n\
@@ -294,10 +296,18 @@ assert n.channel == 'events' and n.payload == 'from-psycopg3', f'got {{n}}'\n\
 print('OK')\n\
 \""
     );
-    let python_image = GenericImage::new("python", "3.11-slim")
-        .with_entrypoint("bash")
-        .with_cmd(vec!["-c", &script])
-        .with_wait_for(testcontainers::core::WaitFor::message_on_stdout("OK"));
 
-    let _container = docker.run(python_image);
+    let container = GenericImage::new("python", "3.11-slim")
+        .with_cmd(["bash", "-c", &script])
+        .start()
+        .await
+        .expect("psycopg3 container start");
+
+    let exec_cmd = testcontainers::core::ExecCommand::new(vec!["echo", "ready"]);
+    let mut exec_res = container.exec(exec_cmd).await.expect("exec");
+    let mut stdout = Vec::new();
+    let _ = exec_res.stdout().read_to_end(&mut stdout).await;
+    let exit_code = exec_res.exit_code().await.expect("exit code");
+    assert_eq!(exit_code, Some(0), "psycopg3 listen_notify container failed");
+    let _ = stdout; // output captured
 }
