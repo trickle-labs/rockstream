@@ -795,7 +795,7 @@ cat ./rockstream-data/support-bundle-*.json
 ```json
 {
   "generated_at_ms": …,
-  "system_info": { "version": "0.52.10", "os": "macos", "arch": "aarch64", "role": "all" },
+  "system_info": { "version": "0.42.0", "os": "macos", "arch": "aarch64", "role": "all" },
   "metrics":     { "uptime_ms": …, "audit_events_emitted": 9 },
   "audit_events": [ … the full audit log … ]
 }
