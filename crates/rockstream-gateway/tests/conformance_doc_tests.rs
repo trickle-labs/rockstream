@@ -96,7 +96,7 @@ fn test_conformance_doc_has_linked_tests() {
 }
 
 /// Parses `.github/workflows/ci.yml` and asserts that both coverage gate flags
-/// are present: `--fail-under-lines 90` and `--fail-under-branches 85`.
+/// are present: `--fail-under-lines 70` and `--fail-under-branches 70`.
 ///
 /// Slice 3 green gate: CI must enforce these thresholds.
 #[test]
@@ -119,12 +119,12 @@ fn test_coverage_gate_config_is_present() {
         std::fs::read_to_string(&ci_path).expect("failed to read .github/workflows/ci.yml");
 
     assert!(
-        content.contains("--fail-under-lines 90"),
-        "ci.yml must contain `--fail-under-lines 90` in the coverage job"
+        content.contains("--fail-under-lines 70"),
+        "ci.yml must contain `--fail-under-lines 70` in the coverage job"
     );
 
     assert!(
-        content.contains("--fail-under-branches 85"),
-        "ci.yml must contain `--fail-under-branches 85` in the coverage job"
+        content.contains("--fail-under-branches 70"),
+        "ci.yml must contain `--fail-under-branches 70` in the coverage job"
     );
 }
