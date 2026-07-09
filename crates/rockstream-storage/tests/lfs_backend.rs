@@ -295,8 +295,8 @@ async fn lfs_determinism_gate_bit_identical_kv_state() {
     );
 
     for (i, ((k1, v1), (k2, v2))) in state1.iter().zip(state2.iter()).enumerate() {
-        assert_eq!(k1, k2, "key mismatch at position {i}: {:?} vs {:?}", k1, k2);
-        assert_eq!(v1, v2, "value mismatch at position {i} for key {:?}", k1);
+        assert_eq!(k1, k2, "key mismatch at position {i}: {k1:?} vs {k2:?}");
+        assert_eq!(v1, v2, "value mismatch at position {i} for key {k1:?}");
     }
 }
 
@@ -446,8 +446,7 @@ async fn fencing_lfs() {
     let err = result.unwrap_err();
     assert!(
         matches!(err, StorageError::Fenced),
-        "Expected StorageError::Fenced, got: {:?}",
-        err
+        "Expected StorageError::Fenced, got: {err:?}"
     );
 
     // 4. Closing the fenced writer should also handle the error or be safe.

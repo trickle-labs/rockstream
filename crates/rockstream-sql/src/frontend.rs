@@ -599,7 +599,7 @@ impl SqlFrontend {
             .table(table)
             .await
             .map_err(|e| SqlError::ParseError {
-                message: format!("table '{}' not found: {}", table, e),
+                message: format!("table '{table}' not found: {e}"),
             })?;
         let schema_fields = schema.schema().fields().clone();
         let col_names: Vec<String> = schema_fields.iter().map(|f| f.name().clone()).collect();
@@ -610,8 +610,7 @@ impl SqlFrontend {
                 .position(|n| n == col_name)
                 .ok_or_else(|| SqlError::DdlParseError {
                     message: format!(
-                        "column '{}' not found in table '{}'; available: {:?}",
-                        col_name, table, col_names
+                        "column '{col_name}' not found in table '{table}'; available: {col_names:?}"
                     ),
                 })
         };
@@ -634,7 +633,7 @@ impl SqlFrontend {
             pk_cols: pk_col_indices.clone(),
             filter_pred: None, // predicate lowering deferred; stored as SQL text
         };
-        let internal_view_name = format!("__idx_{}", index_name);
+        let internal_view_name = format!("__idx_{index_name}");
         let plan = PlanNode::ViewSink {
             view_name: internal_view_name.clone(),
             pk: pk_col_indices.clone(),
@@ -682,7 +681,7 @@ impl SqlFrontend {
         // Remove index catalog entry.
         catalog.remove_index(index_name).await?;
         // Remove internal view entry (best-effort: ignore if already absent).
-        let internal_view_name = format!("__idx_{}", index_name);
+        let internal_view_name = format!("__idx_{index_name}");
         catalog.remove_view(&internal_view_name).await?;
         Ok(())
     }
