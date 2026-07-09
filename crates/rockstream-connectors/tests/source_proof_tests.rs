@@ -653,7 +653,7 @@ fn test_source_coordination_sim() {
                         // Handle simulated connection drop by retrying (zero-loss retry path)
                         retries += 1;
                     }
-                    Err(e) => panic!("unexpected error: {:?}", e),
+                    Err(e) => panic!("unexpected error: {e:?}"),
                 }
                 sim_rt.advance_time(std::time::Duration::from_millis(1));
             }
