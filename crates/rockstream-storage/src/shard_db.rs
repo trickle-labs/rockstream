@@ -169,9 +169,7 @@ impl ShardDb {
                     let old_epoch = self.last_epoch.load(Ordering::SeqCst);
                     assert!(
                         epoch >= old_epoch,
-                        "M1-S2: committed_epoch read must be non-decreasing (got {}, was {})",
-                        epoch,
-                        old_epoch
+                        "M1-S2: committed_epoch read must be non-decreasing (got {epoch}, was {old_epoch})"
                     );
                     self.last_epoch.store(epoch, Ordering::SeqCst);
                 }
@@ -187,9 +185,7 @@ impl ShardDb {
             let old_epoch = self.last_epoch.load(Ordering::SeqCst);
             assert!(
                 new_epoch >= old_epoch,
-                "M1-S2: committed_epoch must be non-decreasing (got {}, was {})",
-                new_epoch,
-                old_epoch
+                "M1-S2: committed_epoch must be non-decreasing (got {new_epoch}, was {old_epoch})"
             );
             self.last_epoch.store(new_epoch, Ordering::SeqCst);
         }
@@ -226,9 +222,7 @@ impl ShardDb {
                     let old_epoch = self.last_epoch.load(Ordering::SeqCst);
                     assert!(
                         new_epoch >= old_epoch,
-                        "M1-S2: committed_epoch must be non-decreasing (got {}, was {})",
-                        new_epoch,
-                        old_epoch
+                        "M1-S2: committed_epoch must be non-decreasing (got {new_epoch}, was {old_epoch})"
                     );
                     self.last_epoch.store(new_epoch, Ordering::SeqCst);
                 }
@@ -886,7 +880,7 @@ mod partial_agg_tests {
 
         for i in 0u64..100 {
             let group = i % 5;
-            let key = format!("view_output/orders_mv/{:016x}", i);
+            let key = format!("view_output/orders_mv/{i:016x}");
             let val = format!("{group}\t{}", group * 10);
             shard.put(key.as_bytes(), val.as_bytes()).await.unwrap();
         }
@@ -902,7 +896,7 @@ mod partial_agg_tests {
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 5, "expected 5 groups, got {}", result.len());
+        assert_eq!(result.len(), 5, "expected 5 groups, got {len}", len = result.len());
     }
 
     // ── S6: partial_agg_shard_query_too_large_returns_rs2002 ─────────────────
@@ -917,7 +911,7 @@ mod partial_agg_tests {
             .unwrap();
 
         for i in 0u64..10 {
-            let key = format!("view_output/mv/{:016x}", i);
+            let key = format!("view_output/mv/{i:016x}");
             let val = format!("{i}\t{}", i * 5);
             shard.put(key.as_bytes(), val.as_bytes()).await.unwrap();
         }
@@ -933,8 +927,7 @@ mod partial_agg_tests {
             .await;
         assert!(
             matches!(err, Err(StorageError::PartialAggResultTooLarge { .. })),
-            "expected PartialAggResultTooLarge, got {:?}",
-            err
+            "expected PartialAggResultTooLarge, got {err:?}"
         );
         let msg = err.unwrap_err().to_string();
         assert!(
