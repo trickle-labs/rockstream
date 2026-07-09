@@ -489,8 +489,7 @@ async fn fencing_minio() {
     let err = result.unwrap_err();
     assert!(
         matches!(err, StorageError::Fenced),
-        "Expected StorageError::Fenced on MinIO, got: {:?}",
-        err
+        "Expected StorageError::Fenced on MinIO, got: {err:?}"
     );
 
     // 4. Clean close.
