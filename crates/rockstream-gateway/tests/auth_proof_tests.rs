@@ -177,7 +177,8 @@ async fn proof_end_to_end_postgres_pillar_tc() {
     let catalog = Arc::new(CatalogStubs::default());
     let view_reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server = rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db);
+    let server =
+        rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db);
     let (local_addr, _handle) = server.serve_background().await.unwrap();
 
     let (client, conn) = tokio_postgres::connect(
