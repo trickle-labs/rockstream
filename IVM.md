@@ -1324,8 +1324,8 @@ the downstream consumer asserts it again on receipt.
    (similar to Apache Arrow Row format) for arrangement values, since
    arrangements are mostly point-accessed. Benchmark in Phase 3.
 
-5. **Materialize-style compaction of arrangements?**
-  Materialize aggressively compacts its arrangements past the consumer
+5. **Aggressive frontier-based compaction of arrangements?**
+  Some differential-dataflow systems aggressively compact their arrangements past the consumer
   frontier (drops historical versions no one will query). SlateDB compaction
   filters can help only after a snapshot-safety proof; we may still need
   active arrangement consolidation for long-running queries.

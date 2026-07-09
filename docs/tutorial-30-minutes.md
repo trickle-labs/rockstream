@@ -40,7 +40,7 @@ don't exist yet, this guide does two things:
 
 Before any commands, it helps to understand *why* RockStream thinks about data
 the way it does. If you come from a traditional relational database (PostgreSQL,
-MySQL) or a batch warehouse (Snowflake, BigQuery, Redshift), you are used to a
+MySQL) or a batch warehouse, you are used to a
 **pull-based, batch-oriented** world.
 
 In that world, data sits quietly on disk. When you want a report, you run a

@@ -1,7 +1,7 @@
 # RockStream: Massively-Parallel Incremental View Maintenance on SlateDB
 
 A design for a horizontally-scalable, full-SQL incremental view maintenance (IVM)
-system inspired by DBSP, Materialize (Differential Dataflow)
+system inspired by DBSP and differential dataflow theory
 — built on a mesh of SlateDB instances backed by
 object storage.
 
@@ -54,8 +54,8 @@ object storage.
 > `pg_catalog` / `information_schema` stubs for ORM compatibility, Postgres type
 > OID mapping, and an internal source connector so clients can write rows
 > directly without an external Kafka or Postgres. `SERIALIZABLE` is explicitly
-> out of scope (§1.1, §12.6). Positioning: same tier as Materialize,
-> not a Neon-style Postgres drop-in.
+> out of scope (§1.1, §12.6). Positioning: a distributed streaming-SQL
+> platform, not a Postgres drop-in.
 >
 > **v3.7 is a future-proofing pass inspired by FoundationDB**: deterministic
 > simulation testing as a first-class testing strategy (§17), an explicit
@@ -346,7 +346,7 @@ object storage.
     - [13.8 Native DuckLake Catalog Server (deferred)](#138-native-ducklake-catalog-server-deferred)
     - [13.9 Secondary Indexes](#139-secondary-indexes)
 14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
-15. [Comparison to Prior Art](#15-comparison-to-prior-art)
+15. [Design Positioning](#15-design-positioning)
 16. [Optimality Assessment (v3.7)](#16-optimality-assessment-v37)
 17. [Simulation Testing](#17-simulation-testing)
 18. [Appendix: Key Encoding Reference](#appendix-key-encoding-reference)
@@ -460,7 +460,7 @@ antichain of timestamps such that an operator promises not to emit any future up
 at timestamps `≤` any element of the frontier. Frontiers advance monotonically.
 
 This is the only correct way to track progress through multi-input operators
-(joins, unions, recursive queries). Materialize uses this; we use the same primitive.
+(joins, unions, recursive queries).
 
 ### Recursion
 
@@ -2817,7 +2817,7 @@ entries including the full audit log.
 
 **Positioning**: with the Postgres wire layer plus the internal source connector
 (§13.5), RockStream operates as a *streaming SQL platform with Postgres-compatible
-read access* — the same tier as Materialize, not Neon. Clients
+read access*, not as a general-purpose transactional Postgres replacement. Clients
 write rows directly; the IVM engine keeps views fresh; `psql` queries views.
 
 ### 12.6.2 COPY Protocol
@@ -4814,21 +4814,23 @@ audit log.
 
 ---
 
-## 15. Comparison to Prior Art
+## 15. Design Positioning
 
-| Aspect | Materialize | **RockStream** |
-|---|---|---|
-| **SQL coverage** | Full ANSI + recursion | Full ANSI + recursion |
-| **Theoretical model** | Differential Dataflow | DBSP + DD frontiers |
-| **State backend** | LSM in-memory + S3 spill | **SlateDB** (S3-native) |
-| **Compute-storage split** | Tight | **Fully decoupled** |
-| **Single-node baseline** | Excellent | Good |
-| **Horizontal scale** | Limited | **Excellent** |
-| **Object-storage native** | Partial | **Yes (end-to-end)** |
-| **Postgres wire protocol** | Yes | **Yes (§12.6)** |
-| **Direct DML writes** | No (CDC only) | **Yes (§13.5)** |
-| **SERIALIZABLE isolation** | Emulated | **No (§1.1)** |
-| **Open source** | Yes | Yes |
+RockStream's design point relative to other streaming-SQL and differential-dataflow
+systems in this space:
+
+| Aspect | RockStream |
+|---|---|
+| **SQL coverage** | Full ANSI + recursion |
+| **Theoretical model** | DBSP + DD frontiers |
+| **State backend** | **SlateDB** (S3-native) |
+| **Compute-storage split** | **Fully decoupled** |
+| **Horizontal scale** | **Excellent** |
+| **Object-storage native** | **Yes (end-to-end)** |
+| **Postgres wire protocol** | **Yes (§12.6)** |
+| **Direct DML writes** | **Yes (§13.5)** |
+| **SERIALIZABLE isolation** | **No (§1.1)** |
+| **Open source** | Yes |
 
 The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
@@ -4846,10 +4848,10 @@ until they are released.
 
 ### 15.1 Explicitly Deferred: Data Quality / Expectations
 
-Systems like Delta Live Tables (Databricks), dbt tests, Dagster asset checks,
-and Soda provide declarative data-quality expectations: row-level assertions,
-column constraints, freshness checks, and anomaly detection integrated into the
-pipeline lifecycle. RockStream does **not** include a data-quality subsystem in
+Declarative data-quality expectations — row-level assertions, column
+constraints, freshness checks, and anomaly detection integrated into the
+pipeline lifecycle — are a well-established pattern in modern data pipeline
+tooling. RockStream does **not** include a data-quality subsystem in
 v1.0.
 
 **Rationale for deferral.** Data-quality expectations are valuable but

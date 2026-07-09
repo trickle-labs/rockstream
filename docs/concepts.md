@@ -38,9 +38,10 @@ them fresh by computing only what changed.
 What makes RockStream different from the other systems in this space is the
 combination it picks. PostgreSQL has materialized views, but you have to
 refresh them manually or pay the cost of triggers; it doesn't scale beyond
-one machine. Materialize is a streaming system built around
-this idea, but it holds a lot of state in memory and has its own runtime
-to manage. Snowflake dynamic tables get you a similar feel but live inside a
+one machine. Other streaming systems are built around
+this idea, but they hold a lot of state in memory and have their own runtime
+to manage. Declarative incremental-view features in cloud data warehouses
+get you a similar feel but live inside a
 warehouse with its own pricing model. Pg-trickle adds incremental views to
 PostgreSQL itself, which is wonderful for a single-database deployment but
 inherits PostgreSQL's single-machine ceiling. RockStream sits at a particular
@@ -1960,11 +1961,11 @@ For the underlying ideas, the foundational papers are:
 - **The CALM theorem** (Hellerstein, Alvaro): the formal basis for the
   monotone-frontier commit invariant.
 
-The other systems worth reading for comparison are **Materialize**
-(streaming SQL, single-node memory-resident state), and
+The other systems worth reading for comparison are streaming SQL systems with
+single-node memory-resident state, and
 **pg-trickle** (incremental
-maintenance inside PostgreSQL), and **Snowflake dynamic tables**
-(declarative incremental maintenance in a warehouse).
+maintenance inside PostgreSQL), and declarative incremental-maintenance
+features in cloud data warehouses.
 
 ---
 

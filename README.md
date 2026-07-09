@@ -118,7 +118,7 @@ You can also **insert, update, and delete rows directly** into RockStream tables
 no separate database or Kafka topic is required to get data in. The change feeds your
 views automatically, the same way an external source would. RockStream is not aiming
 to replace Postgres for high-concurrency transactional workloads; it sits in the same
-tier as streaming-SQL systems like Materialize, with the convenience
+tier as streaming-SQL systems, with the convenience
 of being reachable through standard Postgres tooling.
 
 SQL also supports standard `CREATE VIEW` — a **inline view** stored as a reusable
