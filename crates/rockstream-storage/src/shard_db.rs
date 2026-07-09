@@ -896,7 +896,12 @@ mod partial_agg_tests {
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 5, "expected 5 groups, got {len}", len = result.len());
+        assert_eq!(
+            result.len(),
+            5,
+            "expected 5 groups, got {len}",
+            len = result.len()
+        );
     }
 
     // ── S6: partial_agg_shard_query_too_large_returns_rs2002 ─────────────────
