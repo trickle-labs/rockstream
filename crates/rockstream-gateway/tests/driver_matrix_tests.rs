@@ -80,8 +80,8 @@ async fn spawn_smoke_gateway() -> (u16, String, tokio::task::JoinHandle<()>) {
     let (local_addr, handle) = server.serve_background().await.unwrap();
     let port = local_addr.port();
     // Containers access the host via host.docker.internal on macOS/Windows, or the detected IP on Linux
-    let host_ip = std::env::var("DOCKER_HOST_IP")
-        .unwrap_or_else(|_| "host.docker.internal".to_string());
+    let host_ip =
+        std::env::var("DOCKER_HOST_IP").unwrap_or_else(|_| "host.docker.internal".to_string());
     (port, host_ip, handle)
 }
 
@@ -157,10 +157,7 @@ async fn run_smoke_suite_in_process(port: u16) {
         .await; // result not asserted
 
     // Check 5: transactions + savepoints
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("check5: BEGIN");
+    client.simple_query("BEGIN").await.expect("check5: BEGIN");
     client
         .simple_query("SAVEPOINT s1")
         .await
@@ -172,10 +169,7 @@ async fn run_smoke_suite_in_process(port: u16) {
     client.simple_query("COMMIT").await.expect("check5: COMMIT");
 
     // Check 6: named cursors
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("check6: BEGIN");
+    client.simple_query("BEGIN").await.expect("check6: BEGIN");
     client
         .simple_query("DECLARE c1 CURSOR FOR SELECT 1 AS n")
         .await
@@ -188,10 +182,7 @@ async fn run_smoke_suite_in_process(port: u16) {
         .simple_query("CLOSE c1")
         .await
         .expect("check6: CLOSE c1");
-    client
-        .simple_query("COMMIT")
-        .await
-        .expect("check6: COMMIT");
+    client.simple_query("COMMIT").await.expect("check6: COMMIT");
 
     // Check 7: COPY FROM STDIN — the full COPY wire path (CopyInResponse, CopyData,
     // CopyDone, CommandComplete) is proven by `test_golden_wire_copy_in` which uses
@@ -220,7 +211,10 @@ async fn run_smoke_suite_in_process(port: u16) {
         .simple_query("SELECT 1")
         .await
         .expect("check9: connection alive after full suite");
-    assert!(!msgs9.is_empty(), "check9: connection dead after full suite");
+    assert!(
+        !msgs9.is_empty(),
+        "check9: connection dead after full suite"
+    );
 }
 
 // ── Container helper: build and exec a psql smoke script ─────────────────────
@@ -562,12 +556,7 @@ async fn test_libpq_smoke() {
         "write libpq smoke script",
     )
     .await;
-    run_cmd_checked(
-        &container,
-        vec!["sh", "/tmp/smoke.sh"],
-        "libpq smoke suite",
-    )
-    .await;
+    run_cmd_checked(&container, vec!["sh", "/tmp/smoke.sh"], "libpq smoke suite").await;
 }
 
 // ── Slice 4b: psycopg3 ────────────────────────────────────────────────────────
@@ -689,7 +678,11 @@ async fn test_node_postgres_smoke() {
 
     run_cmd_checked(
         &container,
-        vec!["sh", "-c", "mkdir -p /app && cd /app && npm init -y && npm install -q pg"],
+        vec![
+            "sh",
+            "-c",
+            "mkdir -p /app && cd /app && npm init -y && npm install -q pg",
+        ],
         "npm install pg",
     )
     .await;
@@ -793,7 +786,11 @@ async fn test_prisma_smoke() {
     // Prisma smoke: run prisma init then db pull (verifies pg_catalog introspection).
     run_cmd_checked(
         &container,
-        vec!["sh", "-c", "cd /app && npx prisma init --datasource-provider postgresql"],
+        vec![
+            "sh",
+            "-c",
+            "cd /app && npx prisma init --datasource-provider postgresql",
+        ],
         "prisma init",
     )
     .await;

@@ -24,21 +24,21 @@ fn test_conformance_doc_has_linked_tests() {
         doc_path
     );
 
-    let content = std::fs::read_to_string(&doc_path)
-        .expect("failed to read docs/pgwire-conformance.md");
+    let content =
+        std::fs::read_to_string(&doc_path).expect("failed to read docs/pgwire-conformance.md");
 
     // Extract all `filename.rs::function_name` references from the doc.
     let mut links: Vec<(String, String)> = Vec::new();
     for token in content.split_whitespace() {
         // Strip Markdown table separators and backticks
-        let token = token
-            .trim_matches('`')
-            .trim_matches('|')
-            .trim_matches('`');
+        let token = token.trim_matches('`').trim_matches('|').trim_matches('`');
         if let Some(sep) = token.find("::") {
             let file = &token[..sep];
             let func = &token[sep + 2..];
-            if file.ends_with(".rs") && !func.is_empty() && func.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            if file.ends_with(".rs")
+                && !func.is_empty()
+                && func.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
                 links.push((file.to_string(), func.to_string()));
             }
         }
@@ -50,7 +50,11 @@ fn test_conformance_doc_has_linked_tests() {
     );
 
     let tests_dir = manifest_dir.join("tests");
-    assert!(tests_dir.exists(), "tests/ directory not found at {:?}", tests_dir);
+    assert!(
+        tests_dir.exists(),
+        "tests/ directory not found at {:?}",
+        tests_dir
+    );
 
     // Collect all test function names from the test corpus.
     let mut known_functions: HashSet<String> = HashSet::new();
@@ -111,8 +115,8 @@ fn test_coverage_gate_config_is_present() {
         ci_path
     );
 
-    let content = std::fs::read_to_string(&ci_path)
-        .expect("failed to read .github/workflows/ci.yml");
+    let content =
+        std::fs::read_to_string(&ci_path).expect("failed to read .github/workflows/ci.yml");
 
     assert!(
         content.contains("--fail-under-lines 90"),

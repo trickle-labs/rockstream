@@ -50,7 +50,9 @@ fn golden_path(name: &str) -> PathBuf {
 }
 
 fn should_bless() -> bool {
-    std::env::var("BLESS_GOLDENS").map(|v| v == "1").unwrap_or(false)
+    std::env::var("BLESS_GOLDENS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// Normalize the server→client byte stream for stable golden comparison.
@@ -170,9 +172,7 @@ fn check_or_bless_golden(name: &str, captured: &[u8]) {
 /// the backend → client.
 ///
 /// Returns `(proxy_port, captured_receiver)`.
-async fn spawn_capture_proxy(
-    backend_port: u16,
-) -> (u16, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+async fn spawn_capture_proxy(backend_port: u16) -> (u16, tokio::sync::oneshot::Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_port = listener.local_addr().unwrap().port();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -286,7 +286,10 @@ async fn test_golden_wire_startup_scram() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let captured = cap_rx.await.expect("capture channel closed");
-    assert!(!captured.is_empty(), "expected captured bytes for startup_scram");
+    assert!(
+        !captured.is_empty(),
+        "expected captured bytes for startup_scram"
+    );
 
     check_or_bless_golden("startup_scram.bin", &captured);
 }
@@ -305,7 +308,10 @@ async fn test_golden_wire_simple_query() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let captured = cap_rx.await.expect("capture channel closed");
-    assert!(!captured.is_empty(), "expected captured bytes for simple_query");
+    assert!(
+        !captured.is_empty(),
+        "expected captured bytes for simple_query"
+    );
 
     check_or_bless_golden("simple_query.bin", &captured);
 }
@@ -319,17 +325,17 @@ async fn test_golden_wire_extended_query() {
 
     // Use the extended query protocol via a prepared statement.
     // The gateway processes Parse/Bind/Execute/Sync and returns ParseComplete/BindComplete/CommandComplete.
-    let stmt = client
-        .prepare("SELECT 1 AS n")
-        .await
-        .unwrap();
+    let stmt = client.prepare("SELECT 1 AS n").await.unwrap();
     let _ = client.query(&stmt, &[]).await;
 
     drop(client);
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let captured = cap_rx.await.expect("capture channel closed");
-    assert!(!captured.is_empty(), "expected captured bytes for extended_query");
+    assert!(
+        !captured.is_empty(),
+        "expected captured bytes for extended_query"
+    );
 
     check_or_bless_golden("extended_query.bin", &captured);
 }
@@ -357,7 +363,10 @@ async fn test_golden_wire_error_flow() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let captured = cap_rx.await.expect("capture channel closed");
-    assert!(!captured.is_empty(), "expected captured bytes for error_flow");
+    assert!(
+        !captured.is_empty(),
+        "expected captured bytes for error_flow"
+    );
 
     check_or_bless_golden("error_flow.bin", &captured);
 }
@@ -381,7 +390,10 @@ async fn test_golden_wire_transaction() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let captured = cap_rx.await.expect("capture channel closed");
-    assert!(!captured.is_empty(), "expected captured bytes for transaction");
+    assert!(
+        !captured.is_empty(),
+        "expected captured bytes for transaction"
+    );
 
     check_or_bless_golden("transaction.bin", &captured);
 }
@@ -394,9 +406,7 @@ async fn test_golden_wire_copy_in() {
     let client = connect_port(proxy_port).await;
 
     // Attempt a COPY IN — gateway enters CopyInResponse mode.
-    let sink_result = client
-        .copy_in("COPY t FROM STDIN")
-        .await;
+    let sink_result = client.copy_in("COPY t FROM STDIN").await;
 
     if let Ok(sink) = sink_result {
         use bytes::Bytes;
@@ -435,7 +445,10 @@ async fn test_golden_wire_listen_notify() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let captured = cap_rx.await.expect("capture channel closed");
-    assert!(!captured.is_empty(), "expected captured bytes for listen_notify");
+    assert!(
+        !captured.is_empty(),
+        "expected captured bytes for listen_notify"
+    );
 
     check_or_bless_golden("listen_notify.bin", &captured);
 }

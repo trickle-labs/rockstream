@@ -1171,9 +1171,9 @@ impl GatewayHandler {
                 if tx_status == crate::session::TxStatus::InTransaction {
                     // Already in a transaction — succeed silently (Postgres issues a warning
                     // but we keep it simple in v0.41).
-                    return Ok(vec![promote_response(Response::Execution(
-                        Tag::new("BEGIN"),
-                    ))]);
+                    return Ok(vec![promote_response(Response::Execution(Tag::new(
+                        "BEGIN",
+                    )))]);
                 }
                 let mut session = self
                     .sessions
@@ -1228,9 +1228,9 @@ impl GatewayHandler {
                     .create_savepoint(name)
                     .map_err(PgWireError::from)?;
             }
-            return Ok(vec![promote_response(Response::Execution(
-                Tag::new("SAVEPOINT"),
-            ))]);
+            return Ok(vec![promote_response(Response::Execution(Tag::new(
+                "SAVEPOINT",
+            )))]);
         }
 
         if ql.starts_with("release savepoint ") || ql.starts_with("release ") {
@@ -1247,9 +1247,9 @@ impl GatewayHandler {
                     .release_savepoint(name)
                     .map_err(PgWireError::from)?;
             }
-            return Ok(vec![promote_response(Response::Execution(
-                Tag::new("RELEASE"),
-            ))]);
+            return Ok(vec![promote_response(Response::Execution(Tag::new(
+                "RELEASE",
+            )))]);
         }
 
         if ql.starts_with("rollback to savepoint ") || ql.starts_with("rollback to ") {
@@ -1272,9 +1272,9 @@ impl GatewayHandler {
                     }
                 }
             }
-            return Ok(vec![promote_response(Response::Execution(
-                Tag::new("ROLLBACK"),
-            ))]);
+            return Ok(vec![promote_response(Response::Execution(Tag::new(
+                "ROLLBACK",
+            )))]);
         }
 
         // Two-phase commit — not supported.
@@ -1987,37 +1987,43 @@ impl GatewayHandler {
                         continue;
                     }
                     let val = match col.data_type() {
-                        ArrowDataType::Int16 => {
-                            col.as_any().downcast_ref::<Int16Array>()
-                                .map(|a| a.value(row_idx).to_string())
-                        }
-                        ArrowDataType::Int32 => {
-                            col.as_any().downcast_ref::<Int32Array>()
-                                .map(|a| a.value(row_idx).to_string())
-                        }
-                        ArrowDataType::Int64 => {
-                            col.as_any().downcast_ref::<Int64Array>()
-                                .map(|a| a.value(row_idx).to_string())
-                        }
-                        ArrowDataType::Float32 => {
-                            col.as_any().downcast_ref::<Float32Array>()
-                                .map(|a| a.value(row_idx).to_string())
-                        }
-                        ArrowDataType::Float64 => {
-                            col.as_any().downcast_ref::<Float64Array>()
-                                .map(|a| a.value(row_idx).to_string())
-                        }
+                        ArrowDataType::Int16 => col
+                            .as_any()
+                            .downcast_ref::<Int16Array>()
+                            .map(|a| a.value(row_idx).to_string()),
+                        ArrowDataType::Int32 => col
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .map(|a| a.value(row_idx).to_string()),
+                        ArrowDataType::Int64 => col
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .map(|a| a.value(row_idx).to_string()),
+                        ArrowDataType::Float32 => col
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .map(|a| a.value(row_idx).to_string()),
+                        ArrowDataType::Float64 => col
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .map(|a| a.value(row_idx).to_string()),
                         ArrowDataType::Boolean => {
-                            col.as_any().downcast_ref::<BooleanArray>()
-                                .map(|a| if a.value(row_idx) { "t".to_string() } else { "f".to_string() })
+                            col.as_any().downcast_ref::<BooleanArray>().map(|a| {
+                                if a.value(row_idx) {
+                                    "t".to_string()
+                                } else {
+                                    "f".to_string()
+                                }
+                            })
                         }
-                        ArrowDataType::Utf8 => {
-                            col.as_any().downcast_ref::<StringArray>()
-                                .map(|a| a.value(row_idx).to_string())
-                        }
+                        ArrowDataType::Utf8 => col
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .map(|a| a.value(row_idx).to_string()),
                         _ => {
                             // Fallback: cast to StringArray or use debug representation.
-                            col.as_any().downcast_ref::<StringArray>()
+                            col.as_any()
+                                .downcast_ref::<StringArray>()
                                 .map(|a| a.value(row_idx).to_string())
                         }
                     };
@@ -2054,7 +2060,8 @@ impl GatewayHandler {
                         encoder.encode_field(&parsed)
                     }
                     Type::BOOL => {
-                        let parsed: Option<bool> = val.as_deref().map(|s| s == "t" || s == "true" || s == "1");
+                        let parsed: Option<bool> =
+                            val.as_deref().map(|s| s == "t" || s == "true" || s == "1");
                         encoder.encode_field(&parsed)
                     }
                     _ => {
@@ -2069,7 +2076,10 @@ impl GatewayHandler {
             encoder.finish()
         });
 
-        Some(vec![Response::Query(QueryResponse::new(schema, data_stream))])
+        Some(vec![Response::Query(QueryResponse::new(
+            schema,
+            data_stream,
+        ))])
     }
 
     /// Try to serve a SELECT via an index arrangement point lookup.
@@ -2888,9 +2898,9 @@ impl GatewayHandler {
 
     async fn handle_commit(&self, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
         let Some(conn_id) = conn_id else {
-            return Ok(vec![promote_response(Response::TransactionEnd(
-                Tag::new("COMMIT"),
-            ))]);
+            return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
+                "COMMIT",
+            )))]);
         };
 
         let mut entry = self.write_buffers.entry(conn_id.to_string()).or_default();
@@ -2898,18 +2908,18 @@ impl GatewayHandler {
         if entry.is_empty() {
             // No DML — still deliver any transactional NOTIFYs.
             self.flush_pending_notifies(conn_id);
-            return Ok(vec![promote_response(Response::TransactionEnd(
-                Tag::new("COMMIT"),
-            ))]);
+            return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
+                "COMMIT",
+            )))]);
         }
 
         let Some(shard_db) = &self.shard_db else {
             // No shard — discard buffer, return COMMIT (best effort without storage)
             self.flush_pending_notifies(conn_id);
             entry.clear();
-            return Ok(vec![promote_response(Response::TransactionEnd(
-                Tag::new("COMMIT"),
-            ))]);
+            return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
+                "COMMIT",
+            )))]);
         };
 
         // ── Idempotency check ─────────────────────────────────────────────────
@@ -2934,9 +2944,9 @@ impl GatewayHandler {
                 Ok(Some(_prev_epoch)) => {
                     // Already committed — discard buffer and return COMMIT noop
                     entry.clear();
-                    return Ok(vec![promote_response(Response::TransactionEnd(
-                        Tag::new("COMMIT"),
-                    ))]);
+                    return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
+                        "COMMIT",
+                    )))]);
                 }
                 Ok(None) => {} // proceed
                 Err(e) => {
@@ -3074,9 +3084,9 @@ impl GatewayHandler {
             // Discard transactional NOTIFYs — aborted.
             self.pending_notifies.remove(conn_id);
         }
-        Ok(vec![promote_response(Response::TransactionEnd(
-            Tag::new("ROLLBACK"),
-        ))])
+        Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
+            "ROLLBACK",
+        )))])
     }
 
     // ── Slice 5: PgBouncer compat ─────────────────────────────────────────────
@@ -4901,7 +4911,9 @@ impl ExtendedQueryHandler for GatewayHandler {
             query
         };
 
-        let responses = self.dispatch_async_with_conn(dispatch_query, Some(&conn_id)).await?;
+        let responses = self
+            .dispatch_async_with_conn(dispatch_query, Some(&conn_id))
+            .await?;
         Ok(responses
             .into_iter()
             .next()

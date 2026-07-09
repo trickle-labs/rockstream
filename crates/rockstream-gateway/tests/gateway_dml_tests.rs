@@ -112,12 +112,9 @@ async fn test_refresh_materialized_view_roundtrip() {
         .await
         .expect("REFRESH MATERIALIZED VIEW on existing view should succeed");
 
-    let found_complete = msgs.iter().any(|m| {
-        matches!(
-            m,
-            tokio_postgres::SimpleQueryMessage::CommandComplete(_)
-        )
-    });
+    let found_complete = msgs
+        .iter()
+        .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)));
     assert!(
         found_complete,
         "expected CommandComplete after REFRESH MATERIALIZED VIEW, got: {msgs:?}"
@@ -135,14 +132,9 @@ async fn test_refresh_materialized_view_roundtrip() {
                 e.to_string().contains("RS-2001")
             }
         }
-        Ok(msgs) => msgs
-            .iter()
-            .any(|m| format!("{m:?}").contains("RS-2001")),
+        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("RS-2001")),
     };
-    assert!(
-        got_error,
-        "expected RS-2001 for missing view, got: {err:?}"
-    );
+    assert!(got_error, "expected RS-2001 for missing view, got: {err:?}");
 }
 
 /// CREATE VIEW registers in catalog; SELECT from newly created view does not error.
@@ -163,12 +155,9 @@ async fn test_create_view_and_select() {
         .await
         .expect("SELECT from newly created view should not error");
 
-    let found_complete = msgs.iter().any(|m| {
-        matches!(
-            m,
-            tokio_postgres::SimpleQueryMessage::CommandComplete(_)
-        )
-    });
+    let found_complete = msgs
+        .iter()
+        .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)));
     assert!(
         found_complete,
         "expected CommandComplete after SELECT from view, got: {msgs:?}"
@@ -186,12 +175,9 @@ async fn test_delete_accumulates_in_write_buffer() {
         .await
         .expect("DELETE should not error");
 
-    let found_complete = msgs.iter().any(|m| {
-        matches!(
-            m,
-            tokio_postgres::SimpleQueryMessage::CommandComplete(_)
-        )
-    });
+    let found_complete = msgs
+        .iter()
+        .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)));
     assert!(
         found_complete,
         "expected CommandComplete after DELETE, got: {msgs:?}"

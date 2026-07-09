@@ -308,6 +308,10 @@ print('OK')\n\
     let mut stdout = Vec::new();
     let _ = exec_res.stdout().read_to_end(&mut stdout).await;
     let exit_code = exec_res.exit_code().await.expect("exit code");
-    assert_eq!(exit_code, Some(0), "psycopg3 listen_notify container failed");
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "psycopg3 listen_notify container failed"
+    );
     let _ = stdout; // output captured
 }

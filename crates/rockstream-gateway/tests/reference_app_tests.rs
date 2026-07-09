@@ -124,8 +124,8 @@ async fn spawn_ref_gateway() -> (u16, String) {
 
     let port = local_addr.port();
     // Containers access the host via host.docker.internal on macOS/Windows.
-    let host_ip = std::env::var("DOCKER_HOST_IP")
-        .unwrap_or_else(|_| "host.docker.internal".to_string());
+    let host_ip =
+        std::env::var("DOCKER_HOST_IP").unwrap_or_else(|_| "host.docker.internal".to_string());
     (port, host_ip)
 }
 
@@ -194,24 +194,28 @@ async fn test_prisma_reference_app() {
     // Install pg driver.
     run_cmd_checked(
         &container,
-        vec!["sh", "-c", "mkdir -p /app && cd /app && npm init -y && npm install -q pg"],
+        vec![
+            "sh",
+            "-c",
+            "mkdir -p /app && cd /app && npm init -y && npm install -q pg",
+        ],
         "npm install pg",
     )
     .await;
 
     // Copy the reference app files into the container via exec.
-    let app_js =
-        std::fs::read_to_string(app_dir.join("app.js")).expect("read app.js");
-    let migration_sql =
-        std::fs::read_to_string(app_dir.join("migrations").join("001_initial.sql"))
-            .expect("read migration sql");
+    let app_js = std::fs::read_to_string(app_dir.join("app.js")).expect("read app.js");
+    let migration_sql = std::fs::read_to_string(app_dir.join("migrations").join("001_initial.sql"))
+        .expect("read migration sql");
 
     run_cmd_checked(
         &container,
         vec![
             "sh",
             "-c",
-            &format!("mkdir -p /app/migrations && cat > /app/app.js << 'HEREDOC'\n{app_js}\nHEREDOC"),
+            &format!(
+                "mkdir -p /app/migrations && cat > /app/app.js << 'HEREDOC'\n{app_js}\nHEREDOC"
+            ),
         ],
         "write app.js",
     )
@@ -233,7 +237,11 @@ async fn test_prisma_reference_app() {
     // Run the reference app.
     run_cmd_checked(
         &container,
-        vec!["sh", "-c", &format!("cd /app && DATABASE_URL='{db_url}' node app.js")],
+        vec![
+            "sh",
+            "-c",
+            &format!("cd /app && DATABASE_URL='{db_url}' node app.js"),
+        ],
         "prisma reference app",
     )
     .await;
@@ -286,8 +294,8 @@ async fn test_sqlalchemy_reference_app() {
     let app_py = std::fs::read_to_string(app_dir.join("app.py")).expect("read app.py");
     let alembic_ini =
         std::fs::read_to_string(app_dir.join("alembic.ini")).expect("read alembic.ini");
-    let env_py = std::fs::read_to_string(app_dir.join("alembic").join("env.py"))
-        .expect("read env.py");
+    let env_py =
+        std::fs::read_to_string(app_dir.join("alembic").join("env.py")).expect("read env.py");
     let migration_py = std::fs::read_to_string(
         app_dir
             .join("alembic")
@@ -298,11 +306,7 @@ async fn test_sqlalchemy_reference_app() {
 
     run_cmd_checked(
         &container,
-        vec![
-            "sh",
-            "-c",
-            "mkdir -p /app/alembic/versions",
-        ],
+        vec!["sh", "-c", "mkdir -p /app/alembic/versions"],
         "mkdir alembic",
     )
     .await;
@@ -311,7 +315,10 @@ async fn test_sqlalchemy_reference_app() {
         (app_py.as_str(), "/app/app.py"),
         (alembic_ini.as_str(), "/app/alembic.ini"),
         (env_py.as_str(), "/app/alembic/env.py"),
-        (migration_py.as_str(), "/app/alembic/versions/001_initial_schema.py"),
+        (
+            migration_py.as_str(),
+            "/app/alembic/versions/001_initial_schema.py",
+        ),
     ] {
         run_cmd_checked(
             &container,
@@ -328,7 +335,11 @@ async fn test_sqlalchemy_reference_app() {
     // Run the reference app.
     run_cmd_checked(
         &container,
-        vec!["sh", "-c", &format!("cd /app && DATABASE_URL='{db_url}' python app.py")],
+        vec![
+            "sh",
+            "-c",
+            &format!("cd /app && DATABASE_URL='{db_url}' python app.py"),
+        ],
         "sqlalchemy reference app",
     )
     .await;
