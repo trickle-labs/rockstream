@@ -150,9 +150,7 @@ impl FrontierAggregator {
                     // M2-S4 assertion: meet > old is already guaranteed here.
                     assert!(
                         meet >= old,
-                        "M2-S4: stale write rejected — meet {} < published {}",
-                        meet,
-                        old
+                        "M2-S4: stale write rejected — meet {meet} < published {old}"
                     );
                     inner.published = Some(meet);
                 }
