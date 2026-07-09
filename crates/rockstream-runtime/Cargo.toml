@@ -25,7 +25,7 @@ futures = { workspace = true }
 [build-dependencies]
 tonic-build = "0.12"
 prost-build = "0.13"
-protobuf-src = "2.1"
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 rockstream-control = { workspace = true }
