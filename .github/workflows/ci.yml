@@ -83,10 +83,19 @@ jobs:
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: cargo llvm-cov (workspace lcov)
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: cargo llvm-cov (gateway line ≥70%)
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov --package rockstream-gateway --fail-under-lines 70
       - name: cargo llvm-cov (gateway branch ≥70% for core files)
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: |
           cargo llvm-cov --package rockstream-gateway \
             --include-files 'protocol.rs,server.rs,session.rs,auth.rs' \

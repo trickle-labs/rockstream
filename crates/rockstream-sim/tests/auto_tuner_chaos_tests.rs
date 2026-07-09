@@ -277,7 +277,6 @@ async fn create_minio_bucket(port: u16, bucket: &str) {
     );
 }
 
-#[allow(clippy::manual_is_multiple_of)]
 fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let sod = secs % 86400;
     let mut days = (secs / 86400) as u32;
@@ -286,7 +285,7 @@ fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let s = (sod % 60) as u32;
     let mut year = 1970u32;
     loop {
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
         let dy = if leap { 366 } else { 365 };
         if days < dy {
             break;
@@ -294,7 +293,7 @@ fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
         days -= dy;
         year += 1;
     }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let dpm: [u32; 12] = [
         31,
         if leap { 29 } else { 28 },
