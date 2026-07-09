@@ -182,7 +182,7 @@ impl Iterator for NexmarkGenerator {
             let id = self.next_person_id;
             self.next_person_id += 1;
 
-            let name = format!("Person {}", id);
+            let name = format!("Person {id}");
             let email_address = format!(
                 "person_{}@{}",
                 id,
@@ -197,7 +197,7 @@ impl Iterator for NexmarkGenerator {
             };
             let city = CITIES[self.rng.gen_range(0..CITIES.len())].to_string();
             let state = STATES[self.rng.gen_range(0..STATES.len())].to_string();
-            let extra = format!("extra info for person {}", id);
+            let extra = format!("extra info for person {id}");
 
             let person = Person {
                 id,
@@ -226,7 +226,7 @@ impl Iterator for NexmarkGenerator {
                 ITEM_NAMES[self.rng.gen_range(0..ITEM_NAMES.len())],
                 id
             );
-            let description = format!("A high quality {} up for auction", item_name);
+            let description = format!("A high quality {item_name} up for auction");
             let initial_bid = self.rng.gen_range(10..1000);
             let reserve = initial_bid + self.rng.gen_range(50..500);
             let expires = self.current_time + self.rng.gen_range(60_000..600_000);
@@ -239,7 +239,7 @@ impl Iterator for NexmarkGenerator {
             };
 
             let category = self.rng.gen_range(1..=10);
-            let extra = format!("auction extra {}", id);
+            let extra = format!("auction extra {id}");
 
             let auction = Auction {
                 id,
@@ -278,8 +278,8 @@ impl Iterator for NexmarkGenerator {
 
             let price = self.rng.gen_range(100..5000);
             let channel = CHANNELS[self.rng.gen_range(0..CHANNELS.len())].to_string();
-            let url = format!("http://example.com/auction/{}", auction);
-            let extra = format!("bid extra info for {}", auction);
+            let url = format!("http://example.com/auction/{auction}");
+            let extra = format!("bid extra info for {auction}");
 
             let bid = Bid {
                 auction,
