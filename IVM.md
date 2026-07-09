@@ -3,7 +3,7 @@
 How RockStream's incremental view maintenance works, derived from a deep
 reading of two production IVM systems:
 
-1. **Feldera DBSP** (`../feldera`) — a Rust-native streaming dataflow engine.
+1. **DBSP** (`../dbsp`) — a mathematical framework for streaming dataflow.
    Compiles SQL via Apache Calcite into a *circuit* of strongly typed operators
    that process Z-set batches in memory and on local disk. Provably correct via
    the DBSP calculus.
@@ -12,7 +12,7 @@ reading of two production IVM systems:
    emits a single SQL `WITH` chain (the "delta query"), and executes that
    query inside Postgres to compute deltas from change buffer tables.
 
-We adopt the **semantic model** from Feldera/DBSP (native Z-set operators,
+We adopt the **semantic model** from DBSP (native Z-set operators,
 long-lived circuits, traces/arrangements, frontier-based scheduling) and use
 pg_trickle as the **correctness oracle** for hard SQL edge cases. pg_trickle's
 per-operator SQL differentiation rules are reference material, not runtime
@@ -47,7 +47,7 @@ and recursive DRed fallback.
 
 ## 1. What the Two Reference Systems Actually Do
 
-### Feldera DBSP
+### DBSP
 
 ```
 SQL (Calcite parse + optimize)
@@ -89,7 +89,7 @@ Key building blocks observed in source:
 - **Recursive circuits** (`operator/recursive.rs`, `IterativeCircuit`):
   nested-time-scope feedback loops with `Z1` (delay) and `Distinct`.
 - **Checkpointer** (`circuit/checkpointer.rs`): periodic durable snapshot of
-  every Spine + circuit state to a `feldera_storage` path.
+  every Spine + circuit state to a `dbsp_storage` path.
 
 Strengths: provably correct, supports the entire DBSP calculus, very fast
 per-core, mature SQL coverage. Weaknesses: tight compute-storage coupling,
@@ -153,7 +153,7 @@ scaling, recursion has stack-depth caveats.
 
 ## 2. Side-By-Side Comparison
 
-| Dimension | Feldera DBSP | pg_trickle | RockStream |
+| Dimension | DBSP | pg_trickle | RockStream |
 |---|---|---|---|
 | **Query input** | SQL (Calcite) | SQL (Postgres parser) | SQL (DataFusion) |
 | **Plan IR** | Calcite RelNode → DBSPCircuit | `OpTree` (~20 variants) | `PlanIR` (DataFusion LogicalPlan + IVM annotations) |
@@ -162,7 +162,7 @@ scaling, recursion has stack-depth caveats.
 | **Operator execution** | Long-lived Rust functions in a fixed circuit | Generated SQL re-run per refresh by Postgres planner | Long-lived Rust operator instances, vectorized expression eval via DataFusion physical expressions |
 | **State (arrangements)** | Spine of file-backed batches on local NVMe | Stream table itself = state; auxiliary `__pgt_count` columns | SlateDB shard, indexed Z-set encoded as KV (see §9) |
 | **Scheduling** | Fixed graph + work scheduler | EDF + demand-driven cadence + diamond groups | Frontier-driven dataflow scheduler (§10) |
-| **Recursion** | `IterativeCircuit` with nested timestamps, `Z1`, `Distinct` | Generated WITH RECURSIVE in delta SQL | Same nested-timestamp approach as Feldera |
+| **Recursion** | `IterativeCircuit` with nested timestamps, `Z1`, `Distinct` | Generated WITH RECURSIVE in delta SQL | Same nested-timestamp approach as DBSP |
 | **Bootstrap** | Replay inputs through circuit | Initial full materialize then differential | "Snapshot mode" diff with no prev state, then switch to delta (§12) |
 | **Checkpointing** | Whole-circuit checkpoint via storage layer | Postgres WAL gives durability for free | Per-shard SlateDB checkpoint + cluster barrier (DESIGN.md §11) |
 | **Distribution** | `Runtime` thread pool, single-process | Single Postgres backend | Mesh of shards across workers (DESIGN.md §3) |
@@ -199,19 +199,19 @@ scaling, recursion has stack-depth caveats.
   structurally: every multi-input operator's frontier meet enforces it
   automatically, with no explicit group concept or user API.
 
-### From Feldera DBSP — the *runtime*
+### From DBSP — the *runtime*
 
 - **Long-lived circuit of typed operators**. Compiling SQL to a fresh
-  generated-Rust binary (as Feldera does) is too operationally heavy for a
+  generated-Rust binary is too operationally heavy for a
   cloud service; but the *runtime model* — a fixed dataflow graph of
   long-lived operator instances that consume typed batches — is exactly what
   we want.
 - **Arrangement / Spine concept**. An *arrangement* is a current indexed
   Z-set that an operator can query at any time. Joins query their other
   side's arrangement; aggregations query their own previous output. Our
-  arrangements live in SlateDB (see §9) instead of Feldera's Spine, but the
+  arrangements live in SlateDB (see §9) instead of the DBSP Spine, but the
   abstraction is identical.
-- **Nested timestamp / recursive circuit pattern** (Feldera's
+- **Nested timestamp / recursive circuit pattern** (the DBSP
   `IterativeCircuit` + `Z1`). Adopted wholesale for `WITH RECURSIVE` — it's
   the cleanest known solution.
 - **Differential-style frontier semantics** for progress tracking.
@@ -221,8 +221,8 @@ scaling, recursion has stack-depth caveats.
 
 ### What we deliberately reject
 
-- **Feldera's generated-Rust artifact as the primary deployment model**.
-  Feldera's compiler can serialize circuits as Rust and its DBSP runtime is
+- **The generated-Rust artifact as the primary deployment model**.
+  The DBSP compiler can serialize circuits as Rust and the DBSP runtime is
   dynamic enough to construct circuits programmatically. RockStream chooses a
   fixed interpreted `OpKind` graph for operational simplicity; code generation
   may be added later for hot paths, but is not required for v1.
@@ -761,13 +761,13 @@ async fn run(self) {
 }
 ```
 
-This is **Feldera's circuit-runtime model** adapted to async tasks and SlateDB,
+This is **the DBSP circuit-runtime model** adapted to async tasks and SlateDB,
 with shard-level group commit added to avoid one object-store/WAL durability
 event per operator per epoch.
 
 ### 8.3 Code Generation vs. Interpretation
 
-We do **not** generate Rust source code per query (Feldera's approach). Every
+We do **not** generate Rust source code per query (the DBSP generated-Rust approach). Every
 operator is a polymorphic Rust struct parameterized by:
 - DataFusion `PhysicalExpr` for filters / projections / aggregates / join
   residuals.
@@ -777,8 +777,8 @@ The inner loop is fast because DataFusion's expression executor is vectorized
 and benefits from LLVM autovectorization. The cost of interpretation is
 amortized over thousands of rows per batch.
 
-This is the same approach RisingWave takes and is operationally simpler than
-Feldera's per-query Rust compilation.
+This is the same approach taken by other distributed streaming SQL systems and is operationally simpler than
+per-query Rust compilation.
 
 ---
 
@@ -896,8 +896,8 @@ loop {
 }
 ```
 
-The scheduler is intentionally **async and ownership-free**. Feldera's
-`DynamicScheduler` (see `crates/dbsp/src/circuit/schedule.rs`) tracks
+The scheduler is intentionally **async and ownership-free**. The
+`DynamicScheduler` in single-process DBSP (see `crates/dbsp/src/circuit/schedule.rs`) tracks
 stream ownership and rejects topologies with `OwnershipConflict` so it can
 statically choose owned-vs-borrowed reads. That model is right for a single
 worker process; in a distributed shard mesh, the same logical stream is
@@ -966,7 +966,7 @@ matches the per-shard autonomy that the rest of the design depends on.
 
 ## 11. Recursion (`WITH RECURSIVE`)
 
-The runtime shape is adopted from Feldera's `IterativeCircuit`, with the
+The runtime shape is adopted from the DBSP `IterativeCircuit`, with the
 strategy selection lessons from pg_trickle:
 
 ```
@@ -1014,13 +1014,13 @@ Every recursive operator also has a configured maximum iteration count and a
 frontier-stall alarm; exceeding either fails the epoch conservatively instead
 of looping forever.
 
-This is the same model Feldera uses (`crates/dbsp/src/operator/recursive.rs`,
+This is the same model used in DBSP (`crates/dbsp/src/operator/recursive.rs`,
 `IterativeCircuit`, `Z1`), extended with pg_trickle's practical DRed and
 recomputation fallback rules.
 
 ### 11.1 Distributed Recursion
 
-Feldera's `IterativeCircuit` is **local to one worker** — the inner loop
+The single-process DBSP `IterativeCircuit` is **local to one worker** — the inner loop
 runs on a single thread with shared in-process state. RockStream allows the
 recursive scope to span shards by lifting two pieces into the distributed
 layer:
@@ -1315,7 +1315,7 @@ the downstream consumer asserts it again on receipt.
    If profiling shows the interpretation overhead dominates for trivial
    queries, we can add a per-circuit code-gen pass that emits a specialized
    Rust function — but only as an optimization, not as the primary model.
-   Feldera's experience suggests interpretation is fine for non-trivial
+   The DBSP reference implementation suggests interpretation is fine for non-trivial
    queries.
 
 4. **Arrangement format: Arrow rows vs. typed-batch?**

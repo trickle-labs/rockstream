@@ -24,7 +24,7 @@ over.
 
 This technique is called **Incremental View Maintenance** (IVM), and the precise
 mathematical form RockStream uses comes from a body of work called **DBSP** — the
-theory behind [Feldera](https://feldera.com/) and, in spirit, the differential
+theory behind DBSP and, in spirit, the differential
 dataflow that powers [Materialize](https://materialize.com/). The reason
 RockStream leans so hard on a *theory* rather than a bag of hand-written rules is
 that incremental computation is treacherous. It is easy to write an

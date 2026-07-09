@@ -1,7 +1,7 @@
 # RockStream: Massively-Parallel Incremental View Maintenance on SlateDB
 
 A design for a horizontally-scalable, full-SQL incremental view maintenance (IVM)
-system inspired by Feldera (DBSP), Materialize (Differential Dataflow), and RisingWave
+system inspired by DBSP, Materialize (Differential Dataflow)
 — built on a mesh of SlateDB instances backed by
 object storage.
 
@@ -54,7 +54,7 @@ object storage.
 > `pg_catalog` / `information_schema` stubs for ORM compatibility, Postgres type
 > OID mapping, and an internal source connector so clients can write rows
 > directly without an external Kafka or Postgres. `SERIALIZABLE` is explicitly
-> out of scope (§1.1, §12.6). Positioning: same tier as Materialize / RisingWave,
+> out of scope (§1.1, §12.6). Positioning: same tier as Materialize,
 > not a Neon-style Postgres drop-in.
 >
 > **v3.7 is a future-proofing pass inspired by FoundationDB**: deterministic
@@ -410,7 +410,7 @@ attempting them would compromise the rest of the design:
   [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md).
 - **A global write sequence number.** SlateDB's per-DB sequence is local. We
   do not synthesize a cluster-wide sequence on top of it.
-- **Loading or linking pg_trickle / Feldera at runtime.** Neither is a Cargo
+- **Loading or linking pg_trickle at runtime.** It is not a Cargo
   dependency. They are reference material and test oracles only.
 - **Active-active multi-region writes.** The single-writer fence per shard is
   a hard constraint against concurrent writers in different regions. Multi-region
@@ -469,7 +469,7 @@ Recursive queries (`WITH RECURSIVE`, transitive closure, graph algorithms) use
 formalization via the `I` (integrate) and `D` (differentiate) operators applied
 in nested time scopes.
 
-Feldera's `IterativeCircuit` (`crates/dbsp/src/operator/recursive.rs`) is
+The `IterativeCircuit` pattern (`crates/dbsp/src/operator/recursive.rs`) is
 **local to one circuit on one worker**. RockStream lifts this into the
 distributed setting by allowing `Exchange` operators inside a recursive scope
 so the inner-time iteration can re-partition data each round. The iteration
@@ -786,7 +786,7 @@ original estimate and the observed values side-by-side.
 - Substrait support for cross-language tooling.
 - Active community; used by InfluxDB IOx, Comet, Ballista, etc.
 
-We use Feldera's `sql-to-dbsp` as the reference for SQL-to-DBSP semantics and
+We use the DBSP `sql-to-dbsp` approach as the reference for SQL-to-DBSP semantics and
 pg_trickle as the reference for concrete SQL edge cases. The RockStream runtime
 does not execute generated SQL and does not copy pg_trickle's CTEs into the hot path.
 It compiles SQL into native DBSP-style operators and validates their behavior
@@ -806,7 +806,7 @@ The incrementalization step (4) and operator runtime are specified in detail in
   used to identify edge cases and build regression tests: the EC-01 join fix,
   Q07 double-counting correction, Q21 SemiJoin correction, FULL JOIN NULL
   handling in SUM, recursive DRed fallback, and similar cases.
-- The runtime is a **long-lived circuit of typed operators** (Feldera's model)
+- The runtime is a **long-lived circuit of typed operators** (DBSP's model)
   rather than per-epoch SQL re-execution (pg_trickle's model). Each operator
   is a long-lived async task that consumes `RecordBatch` deltas and maintains
   one or more **arrangements** (indexed Z-sets) on its assigned SlateDB shard.
@@ -2817,7 +2817,7 @@ entries including the full audit log.
 
 **Positioning**: with the Postgres wire layer plus the internal source connector
 (§13.5), RockStream operates as a *streaming SQL platform with Postgres-compatible
-read access* — the same tier as Materialize and RisingWave, not Neon. Clients
+read access* — the same tier as Materialize, not Neon. Clients
 write rows directly; the IVM engine keeps views fresh; `psql` queries views.
 
 ### 12.6.2 COPY Protocol
@@ -4700,8 +4700,8 @@ Backpressure is cooperative credit flow: receivers grant credits to senders;
 senders block on credit exhaustion; this propagates upstream as growing
 `frontier_lag_ms` long before any data loss is possible. No operator blocks
 on a sibling's progress; only on its own credits and its own input
-frontier. This is the structural reason RockStream does not adopt Feldera's
-`DynamicScheduler` ownership model.
+frontier. This is the structural reason RockStream does not adopt a
+single-process `DynamicScheduler` ownership model.
 
 Admission control sits in front of every `CREATE MATERIALIZED VIEW`, every
 `CREATE WORKLOAD`, and every autotuner expansion. It refuses requests that
@@ -4816,19 +4816,19 @@ audit log.
 
 ## 15. Comparison to Prior Art
 
-| Aspect | Feldera | Materialize | RisingWave | **RockStream** |
-|---|---|---|---|---|
-| **SQL coverage** | Full ANSI + recursion | Full ANSI + recursion | Full ANSI | Full ANSI + recursion |
-| **Theoretical model** | DBSP | Differential Dataflow | DBSP-like | DBSP + DD frontiers |
-| **State backend** | RocksDB (local NVMe) | LSM in-memory + S3 spill | Hummock (S3-native) | **SlateDB** (S3-native) |
-| **Compute-storage split** | Tight | Tight | Decoupled | **Fully decoupled** |
-| **Single-node baseline** | Excellent | Excellent | Good | Good |
-| **Horizontal scale** | Limited (single-node focus) | Limited | Excellent | **Excellent** |
-| **Object-storage native** | No | Partial | Yes | **Yes (end-to-end)** |
-| **Postgres wire protocol** | No | Yes | Yes | **Yes (§12.6)** |
-| **Direct DML writes** | No | No (CDC only) | No (CDC only) | **Yes (§13.5)** |
-| **SERIALIZABLE isolation** | No | Emulated | Emulated | **No (§1.1)** |
-| **Open source** | Yes | Yes | Yes | Yes |
+| Aspect | Materialize | **RockStream** |
+|---|---|---|
+| **SQL coverage** | Full ANSI + recursion | Full ANSI + recursion |
+| **Theoretical model** | Differential Dataflow | DBSP + DD frontiers |
+| **State backend** | LSM in-memory + S3 spill | **SlateDB** (S3-native) |
+| **Compute-storage split** | Tight | **Fully decoupled** |
+| **Single-node baseline** | Excellent | Good |
+| **Horizontal scale** | Limited | **Excellent** |
+| **Object-storage native** | Partial | **Yes (end-to-end)** |
+| **Postgres wire protocol** | Yes | **Yes (§12.6)** |
+| **Direct DML writes** | No (CDC only) | **Yes (§13.5)** |
+| **SERIALIZABLE isolation** | Emulated | **No (§1.1)** |
+| **Open source** | Yes | Yes |
 
 The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
@@ -4895,9 +4895,9 @@ compaction filters (§5.3, §8.5). Manifest and WAL costs are explicit budgets
 
 ### 16.2 Does the runtime model fit a sharded object-store backend?
 
-**Yes, after diverging from Feldera in three places.** RockStream borrows
-Feldera's circuit-of-typed-operators design but (a) schedules operators
-asynchronously per shard rather than via Feldera's synchronous
+**Yes, with three deliberate design choices.** RockStream uses the
+circuit-of-typed-operators design from DBSP but (a) schedules operators
+asynchronously per shard rather than via a synchronous
 `DynamicScheduler`, (b) treats arrangements as SlateDB-backed indexed Z-sets
 rather than in-memory Spines, and (c) makes `Exchange` first-class so
 cross-shard ownership is never an `OwnershipConflict` error.

@@ -118,7 +118,7 @@ You can also **insert, update, and delete rows directly** into RockStream tables
 no separate database or Kafka topic is required to get data in. The change feeds your
 views automatically, the same way an external source would. RockStream is not aiming
 to replace Postgres for high-concurrency transactional workloads; it sits in the same
-tier as streaming-SQL systems like Materialize and RisingWave, with the convenience
+tier as streaming-SQL systems like Materialize, with the convenience
 of being reachable through standard Postgres tooling.
 
 SQL also supports standard `CREATE VIEW` — a **inline view** stored as a reusable
@@ -193,10 +193,9 @@ RockStream is inspired by production systems and implementation research:
 
 | System | What it does |
 |---|---|
-| **[Feldera](https://feldera.com/)** | Uses mathematical theory (DBSP) to guarantee that incremental results are always identical to what a full re-computation would produce |
+| **[DBSP](https://github.com/vmware-research/database-stream-processor)** | Mathematical theory that guarantees incremental results are always identical to what a full re-computation would produce |
 | **[pg_trickle](https://github.com/trickle-labs/pg-trickle)** | Shows how to turn SQL views into practical per-operator delta rules, with many hard correctness cases worked through in PostgreSQL |
 | **[SlateDB](https://slatedb.io/)** | Provides the cloud-native object-storage-backed LSM that RockStream uses as its durable shard and arrangement store |
-| **[RisingWave](https://risingwave.com/)** | A streaming database that maintains materialized views in real time |
 
 RockStream brings these ideas to an open, cloud-native storage foundation.
 
