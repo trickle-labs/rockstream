@@ -485,7 +485,7 @@ pub fn generate_prometheus_metrics() -> String {
         out.push_str("# HELP flush_duration_seconds_sum Cumulative duration of all flushes.\n");
         out.push_str("# TYPE flush_duration_seconds_sum counter\n");
         let sum_sec = reg.flush_duration_sum_ms.load(Ordering::Relaxed) as f64 / 1000.0;
-        out.push_str(&format!("flush_duration_seconds_sum {:.4}\n\n", sum_sec));
+        out.push_str(&format!("flush_duration_seconds_sum {sum_sec:.4}\n\n"));
 
         // 11. flush_duration_seconds_count
         out.push_str("# HELP flush_duration_seconds_count Total count of flushes.\n");
@@ -499,7 +499,7 @@ pub fn generate_prometheus_metrics() -> String {
         out.push_str("# HELP flush_duration_seconds_last Latency of the last flush operation.\n");
         out.push_str("# TYPE flush_duration_seconds_last gauge\n");
         let last_sec = reg.flush_duration_last_ms.load(Ordering::Relaxed) as f64 / 1000.0;
-        out.push_str(&format!("flush_duration_seconds_last {:.4}\n\n", last_sec));
+        out.push_str(&format!("flush_duration_seconds_last {last_sec:.4}\n\n"));
 
         // 13. slatedb_manifest_write_total
         out.push_str("# HELP slatedb_manifest_write_total Total manifest writes.\n");

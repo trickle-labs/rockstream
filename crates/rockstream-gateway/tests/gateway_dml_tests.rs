@@ -49,16 +49,6 @@ async fn connect_port(port: u16) -> tokio_postgres::Client {
     client
 }
 
-fn data_rows_from(
-    msgs: &[tokio_postgres::SimpleQueryMessage],
-) -> Vec<&tokio_postgres::SimpleQueryRow> {
-    msgs.iter()
-        .filter_map(|m| match m {
-            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
-            _ => None,
-        })
-        .collect()
-}
 
 /// UPDATE returns CommandComplete "UPDATE 1" and the gateway accumulates the
 /// update in the write buffer.
