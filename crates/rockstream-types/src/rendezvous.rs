@@ -85,9 +85,7 @@ mod tests {
             let count = *distribution.get(shard).unwrap_or(&0);
             assert!(
                 (1600..=2400).contains(&count),
-                "Shard {} got {} buckets, expected roughly 2000",
-                shard,
-                count
+                "Shard {shard} got {count} buckets, expected roughly 2000"
             );
         }
     }
@@ -128,8 +126,7 @@ mod tests {
         let migration_ratio = migrated_to_new as f64 / num_buckets as f64;
         assert!(
             (0.15..=0.25).contains(&migration_ratio),
-            "Migration ratio to new shard was {}, expected ~20%",
-            migration_ratio
+            "Migration ratio to new shard was {migration_ratio}, expected ~20%"
         );
 
         // 2. Strict Rendezvous guarantee: NO buckets should migrate between existing shards
