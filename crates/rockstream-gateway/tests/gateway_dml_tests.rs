@@ -49,7 +49,6 @@ async fn connect_port(port: u16) -> tokio_postgres::Client {
     client
 }
 
-
 /// UPDATE returns CommandComplete "UPDATE 1" and the gateway accumulates the
 /// update in the write buffer.
 #[tokio::test]
