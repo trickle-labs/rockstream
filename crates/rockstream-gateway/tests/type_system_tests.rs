@@ -180,7 +180,7 @@ async fn test_binary_encoding_unit() {
     assert_eq!(val_int8, 9223372036854775807);
     assert!((val_float4 - 123.45).abs() < 1e-4);
     assert!((val_float64 - 678.901).abs() < 1e-9);
-    assert_eq!(val_bool, true);
+    assert!(val_bool);
 }
 
 #[cfg(feature = "testcontainers")]

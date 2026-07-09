@@ -3410,7 +3410,7 @@ impl ViewReader for SlowViewReader {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cancel_request_aborts_query() {
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut catalog = CatalogStubs::new();
+    let catalog = CatalogStubs::new();
     catalog.add_view(CatalogView {
         name: "slow_view".to_string(),
         sql: String::new(),
@@ -3455,7 +3455,7 @@ async fn test_cancel_request_aborts_query() {
         .await
         .expect("cancel_query");
 
-    let (result, elapsed) = query_handle.await.unwrap();
+    let (_result, elapsed) = query_handle.await.unwrap();
 
     // Query must have been cancelled (error) OR completed very fast due to select!
     // Either way, elapsed < 1000ms (not the full 3s sleep)
@@ -3507,7 +3507,7 @@ async fn test_named_cursor_lifecycle() {
     });
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut catalog = CatalogStubs::new();
+    let catalog = CatalogStubs::new();
     catalog.add_view(CatalogView {
         name: "cursor_view".to_string(),
         sql: String::new(),

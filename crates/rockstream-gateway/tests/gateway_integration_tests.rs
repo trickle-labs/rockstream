@@ -248,7 +248,6 @@ async fn test_concurrent_1000_connections_no_errors() {
 
     let mut handles = Vec::with_capacity(n_connections);
     for _ in 0..n_connections {
-        let port = port;
         handles.push(tokio::spawn(async move {
             let (client, conn) = tokio_postgres::connect(
                 &format!("host=127.0.0.1 port={port} user=test dbname=test"),
@@ -292,7 +291,6 @@ async fn test_pgbouncer_pooled_transactions() {
 
     let mut handles = Vec::with_capacity(n_clients);
     for _ in 0..n_clients {
-        let port = port;
         handles.push(tokio::spawn(async move {
             let (client, conn) = tokio_postgres::connect(
                 &format!("host=127.0.0.1 port={port} user=test dbname=test"),

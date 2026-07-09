@@ -17,7 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::NoTls;
 
 use rockstream_gateway::{
-    catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView},
+    catalog_stubs::CatalogStubs,
     role_catalog::{create_role_entry, RoleCatalog},
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
