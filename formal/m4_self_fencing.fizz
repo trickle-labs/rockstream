@@ -31,7 +31,24 @@ MAX_CHECKPOINT = 2
 # every worker still reach isolation/self-fence at least once (enough for
 # COV-M4 and the self-fencing safety properties) while guaranteeing the
 # outage-injection actions eventually stop competing with real progress.
-MAX_OUTAGES = 2
+#
+# v0.42.3: lowered from 2 to 1. At MAX_OUTAGES=2 (with NUM_WORKERS=3,
+# NUM_SHARDS=2, SELF_FENCE_AFTER=2, MAX_EPOCH=1, MAX_CHECKPOINT=1 — i.e.
+# smaller than the committed bounds in every other dimension) exhaustive BFS
+# already explored 497,088 nodes / 31,068 unique states in ~92s; combined
+# with the full bounds below this reproduces the >800k-node, non-terminating
+# growth recorded in formal/findings.md. MAX_OUTAGES is by far the single
+# largest driver of the state-space explosion (each permitted outage
+# multiplies the interleavings of Lose/Recover with every other action), far
+# more than NUM_WORKERS/NUM_SHARDS/MAX_EPOCH/MAX_CHECKPOINT individually. At
+# MAX_OUTAGES=1, every other bound stays at its original committed value
+# (NUM_WORKERS=3, NUM_SHARDS=2, SELF_FENCE_AFTER=3, MAX_EPOCH=2,
+# MAX_CHECKPOINT=2) and exhaustive BFS still reaches every safety invariant,
+# COV-M4, and both liveness properties (M4-L1, M4-L2) — see findings.md for
+# final counts. A shared run-wide cap of 1 still lets the checker explore
+# both outage kinds (LoseControlContact and LoseObjectStoreContact) across
+# different branches of the state space, just not both within the same run.
+MAX_OUTAGES = 1
 
 # ─── State ──────────────────────────────────────────────────────────────────
 
@@ -108,6 +125,19 @@ atomic fair action GrantLease:
     cp = controlplane
 
     require w.status == "active"
+    # v0.42.3 fix: a worker the failure detector has already declared dead
+    # must never be (re-)granted a lease, even though its `status` is still
+    # "active" (it only flips to "terminated" once it crosses
+    # SELF_FENCE_AFTER and self-fences). Without this, an exhaustive-BFS
+    # counterexample shows the control plane repeatedly re-granting a shard's
+    # lease back to its own just-declared-dead former holder forever, so the
+    # lease never reaches a live worker — the `oneof worker_id` parameter
+    # binding that keeps re-electing worker#0 satisfies FizzBee's
+    # action-level (not per-binding) fairness for `fair action GrantLease`,
+    # masking this as a spurious liveness failure rather than a real
+    # protocol bug. This was found and fixed while making M4_L1_RecoveryProgress
+    # tractable (v0.42.3).
+    require worker_id not in cp.dead_workers
     require cp.leases[shard_id] == -1 or cp.leases[shard_id] in cp.dead_workers
 
     # Advance fence epoch (CAS — strictly higher token).

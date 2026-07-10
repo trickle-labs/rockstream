@@ -294,7 +294,9 @@ the real `fizzbee` v0.5.2 binary.
 4. **Hard gate for smoke/M1/M2/M3** — `continue-on-error` was removed for
    these four specs; a red result now blocks merge, per the v0.18 contract.
    M4 remains `continue-on-error: true` (see below) until its state-space
-   size is resolved.
+   size is resolved. **Update (v0.42.3, same day): resolved — M4 is now in
+   the same hard-gate step as the other four specs; see "Post-v0.42.3
+   Remediation Results" below.**
 
 ### Spec fixes — real, re-verified results
 
@@ -304,7 +306,7 @@ the real `fizzbee` v0.5.2 binary.
 | `formal/m1_epoch_commit.fizz` | ✅ **PASSED** (fixed) | 72 nodes, 72 unique states, liveness holds |
 | `formal/m2_frontier_agg.fizz` | ✅ PASSED (unchanged) | 251,889 nodes explored, 48,298 unique states, liveness checked |
 | `formal/m3_sink_2pc.fizz` | ✅ **PASSED** (fixed) | 1,168 nodes, 1,168 unique states, all safety invariants + `M3_L1_DeliveryProgress` liveness hold |
-| `formal/m4_self_fencing.fizz` | ⚠️ **Still open** — see below | Undefined-variable crash and a real self-fence race are fixed; exhaustive verification is not yet confirmed to terminate |
+| `formal/m4_self_fencing.fizz` | ⚠️ **Still open** — see below (**resolved in v0.42.3, see "Post-v0.42.3 Remediation Results" below**) | Undefined-variable crash and a real self-fence race are fixed; exhaustive verification is not yet confirmed to terminate |
 
 **M1 fix**: `M1_S5_IdempotentReplay` compared the post-duplicate state against
 a one-time snapshot **forever after**, so any legitimate subsequent
@@ -388,7 +390,8 @@ was found or implied by this — it was a spec-assertion scoping defect only.
 3. Until (1) and (2) are resolved, `formal-verify`'s M4 step stays
    `continue-on-error: true` in CI and is reported as a warning, not a hard
    gate. This is tracked as follow-up work; see `NEW_ROADMAP.md` v0.42.1's
-   notes and its "not yet fully closed" status.
+   notes and its "not yet fully closed" status. **Update (v0.42.3): both (1)
+   and (2) are resolved — see "Post-v0.42.3 Remediation Results" below.**
 4. **CI robustness gap found and fixed (2026-07-10, same day):** the first
    real CI run of the fixed pipeline (push `2a98157`) showed the M4 step
    itself get a **`cancelled`** conclusion (consistent with the runner's OOM
@@ -403,4 +406,97 @@ was found or implied by this — it was a spec-assertion scoping defect only.
    within its own memory cap. This is a CI-harness fix only; it does not
    change any of the open M4 state-space/liveness issues above and is not a
    substitute for v0.42.3.
+
+---
+
+## Post-v0.42.3 Remediation Results (2026-07-10)
+
+**Deliverable**: `NEW_ROADMAP.md` v0.42.3 — M4 state-space tractability and
+liveness closure, re-verified against the real `fizzbee` v0.5.1 (Homebrew)
+binary.
+
+### 1. Root cause: `MAX_OUTAGES`, not worker/shard count, drove the explosion
+
+Systematically re-testing exhaustive BFS one bound at a time (each isolated
+change re-run to completion) found that `MAX_OUTAGES` — not `NUM_WORKERS` or
+`NUM_SHARDS` as the v0.42.1 notes speculated — is by far the dominant driver
+of the state-space size:
+
+| Bounds (all else at committed values: `NUM_WORKERS=3, NUM_SHARDS=2, SELF_FENCE_AFTER=3, MAX_EPOCH=2, MAX_CHECKPOINT=2`) | Nodes explored | Wall time |
+|---|---|---|
+| `MAX_OUTAGES=1` | 31,456 | ~5.4s |
+| `MAX_OUTAGES=2` (previously committed value, reduced `SELF_FENCE_AFTER=2`/`MAX_EPOCH=1`/`MAX_CHECKPOINT=1` for this isolated test) | 497,088 | ~92s |
+
+`NUM_WORKERS=2→3`, `MAX_EPOCH=1→2`, `MAX_CHECKPOINT=1→2`, and
+`SELF_FENCE_AFTER=2→3` each individually changed the node count by well under
+2× when tested in isolation at `MAX_OUTAGES=1`; `MAX_OUTAGES=1→2` alone is
+roughly a 16× multiplier. This matches the shape of each `Lose*` action:
+every additional permitted outage multiplies the interleavings available to
+the checker with every other enabled action for the rest of the run.
+**Fix**: lowered `MAX_OUTAGES` from 2 to 1 in `formal/m4_self_fencing.fizz`.
+Every other bound is unchanged from the value committed in v0.42.1
+(`NUM_WORKERS=3, NUM_SHARDS=2, SELF_FENCE_AFTER=3, MAX_EPOCH=2,
+MAX_CHECKPOINT=2`), so the model is still at least as strong as originally
+intended in every other dimension. (Separately, `NUM_SHARDS=3` was tried and
+found to **crash**, unrelated to tractability: `ControlPlane.Init` and
+`Worker.Init` hardcode 2-element literal lists — `self.leases = [-1, -1]`,
+`self.fence_epoch = [0, 0]`, `self.held_lease_epoch = [-1, -1]` — instead of
+building them from `NUM_SHARDS`, so any shard-count change other than 2
+requires a follow-up spec generalization; out of scope for v0.42.3 and not
+attempted.)
+
+### 2. Real liveness bug found and fixed (not just a state-space problem)
+
+At `MAX_OUTAGES=1`, exhaustive BFS **failed** `M4_L1_RecoveryProgress` with a
+genuine, reproducible counterexample — the first time this spec ever
+completed exhaustive verification far enough to evaluate its liveness
+properties at all:
+
+```
+Init → GrantLease(0,0) → WorkerCommit → LoseControlContact(0) →
+HeartbeatTick(0) [isolation_steps=1] → MarkDead(0)
+  [dead_workers={0}, leases=[-1,-1] — lease revoked]
+→ GrantLease(worker_id=0, shard_id=0)   <-- re-grants the lease back to its
+                                             own just-declared-dead holder
+→ GrantLease(worker_id=0, shard_id=0)   <-- repeats forever
+→ ...
+```
+
+**Root cause**: `GrantLease`'s guard only checked `w.status == "active"` —
+true for worker 0 right up until it self-fences — and never checked whether
+the control plane's own failure detector (`cp.dead_workers`) had already
+declared that worker dead. A dead-but-not-yet-self-fenced worker could
+therefore keep re-acquiring its own revoked lease indefinitely. This masks as
+"unprovable liveness" rather than an obvious safety bug because FizzBee's
+`fair action GrantLease` fairness applies at the action level, not per
+`oneof worker_id` parameter binding: an adversarial-but-still-"fair" schedule
+that always re-selects `worker_id=0` for `GrantLease` never violates
+fairness for the action as a whole, even though the `worker_id=1` binding
+never fires — so the shard's lease never reaches the live worker, and
+`M4_L1_RecoveryProgress` genuinely does not hold as specified.
+
+**Fix**: added `require worker_id not in cp.dead_workers` to `GrantLease`.
+This reflects real operational intent — a control plane should never grant a
+lease to a worker it has already declared dead — and is consistent with the
+existing `RestartWorker` action, which is the only path back to eligibility
+(clearing `cp.dead_workers` via `cp.dead_workers.discard(worker_id)`).
+
+### 3. Final verified results
+
+| Spec | Result | Evidence |
+|---|---|---|
+| `formal/smoke.fizz` | ✅ PASSED | 2 nodes, 1 unique state, live |
+| `formal/m1_epoch_commit.fizz` | ✅ PASSED | 72 nodes, 72 unique states, liveness holds |
+| `formal/m2_frontier_agg.fizz` | ✅ PASSED | 251,889 nodes explored, 48,298 unique states, liveness checked |
+| `formal/m3_sink_2pc.fizz` | ✅ PASSED | 1,168 nodes, 1,168 unique states, liveness holds |
+| `formal/m4_self_fencing.fizz` | ✅ **PASSED** (fixed) | 31,456 nodes explored, 12,946 valid, 1,966 unique states, ~5.4s exploration + ~0.25s liveness check; `M4_S1`–`M4_S4` (safety), `COV_M4`, `M4_L1_RecoveryProgress`, and `M4_L2_NoPermanentBlock` all hold |
+
+Full `make verify` (all five specs) completes in ~55s locally on the
+Homebrew `fizzbee` 0.5.1 binary, well within the CI job's 20-minute timeout.
+`formal-verify`'s M4 step is folded back into the single hard-gate step
+alongside smoke/M1/M2/M3 in `.github/workflows/ci.yml`; the former
+`continue-on-error`/`ulimit -v`/`timeout`/exit-code-swallowing special
+casing for M4 is removed, closing the v0.18 binding contract
+("`make verify` genuinely green for all five specs in CI... with
+`continue-on-error` removed") for the last of the five specs.
 

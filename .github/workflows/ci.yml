@@ -42,7 +42,7 @@ jobs:
   formal-verify:
     name: Formal verify (M1–M4)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,52 +91,24 @@ jobs:
           install_dir=$(find /tmp/fizzbee-install -mindepth 1 -maxdepth 1 -type d | head -1)
           echo "$install_dir" >> "$GITHUB_PATH"
           "$install_dir/fizzbee" --version || true
-      # M1 (smoke + epoch-commit), M2 (frontier aggregation), and M3 (sink 2PC)
-      # are genuinely green (safety + liveness) as of the v0.42.1 fix — see
-      # formal/findings.md "Post-v0.42.1 Remediation". They are a hard gate:
-      # a red result here blocks merge, per the binding v0.18 contract.
-      - name: Formal verify — smoke, M1, M2, M3 (hard gate)
+      # M1 (smoke + epoch-commit), M2 (frontier aggregation), M3 (sink 2PC),
+      # and M4 (self-fencing) are all genuinely green (safety + liveness) as
+      # of the v0.42.3 fix — see formal/findings.md "Post-v0.42.3
+      # Remediation". All five specs are a hard gate: a red result here
+      # blocks merge, per the binding v0.18 contract. M4's exhaustive BFS
+      # completes in ~6s / ~31,000 nodes at MAX_OUTAGES lowered from 2 to 1
+      # (every other bound unchanged from its original committed value —
+      # see formal/m4_self_fencing.fizz and findings.md for the full
+      # state-space analysis); its former `continue-on-error`/non-blocking
+      # special-casing and per-subshell memory/wall-clock caps are removed.
+      - name: Formal verify — smoke, M1, M2, M3, M4 (hard gate)
         if: steps.filter.outputs.run == 'true'
         run: |
           fizz formal/smoke.fizz
           fizz formal/m1_epoch_commit.fizz
           fizz formal/m2_frontier_agg.fizz
           fizz formal/m3_sink_2pc.fizz
-      # M4's safety invariants hold under bounded simulation, but exhaustive
-      # BFS verification at the committed NUM_WORKERS=3 bound has not been
-      # confirmed to terminate in reasonable time/memory (observed >800k
-      # explored nodes and still growing at NUM_WORKERS=2 in local testing),
-      # and simulation-mode liveness checks produced results that could not
-      # be distinguished from bounded-exploration artifacts (see
-      # formal/findings.md). Until the state space is made tractable
-      # (symmetry reduction or tighter bounds) or confirmed to terminate,
-      # M4 is reported but does not block merge.
-      #
-      # v0.42.1 fix: running this unbounded on a real runner let an exploding
-      # M4 get OOM-killed by the *runner*, which GitHub Actions reports as a
-      # "cancelled" step conclusion — a status `continue-on-error` does NOT
-      # suppress (it only suppresses "failure"), so an exploding M4 was
-      # silently turning the whole hard-gate job red despite the intent for
-      # it to be non-blocking. Cap the subshell's virtual memory so fizz
-      # fails *within itself* (an ordinary non-zero exit) well before the
-      # runner-level OOM killer would act, and bound wall-clock time as a
-      # second safety net; both are swallowed here so the step's own outcome
-      # never depends on M4 actually finishing.
-      - name: Formal verify — M4 (non-blocking pending state-space fix)
-        if: steps.filter.outputs.run == 'true'
-        id: formal_verify_m4
-        run: |
-          set +e
-          ( ulimit -v 6291456; timeout 1200 fizz formal/m4_self_fencing.fizz )
-          m4_exit=$?
-          echo "exit_code=$m4_exit" >> "$GITHUB_OUTPUT"
-          exit 0
-      - name: Report M4 status
-        if: steps.filter.outputs.run == 'true' && steps.formal_verify_m4.outputs.exit_code != '0'
-        run: |
-          echo "::warning::M4 (self-fencing) formal verification did not complete/pass within this job's bounds (exit code ${{ steps.formal_verify_m4.outputs.exit_code }})."
-          echo "See formal/findings.md and NEW_ROADMAP.md v0.42.1/v0.42.3 for the tracked state-space tractability issue."
-          echo "See formal/findings.md and FIZZBEE_TEST_PLAN.md for model status."
+          fizz formal/m4_self_fencing.fizz
 
   coverage:
     name: Coverage
