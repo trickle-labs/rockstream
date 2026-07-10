@@ -1,607 +1,633 @@
-//! Batch reference oracle for inner-join correctness verification.
+//! Oracle property tests for the inner equi-join operator (v0.8 — IVM-4).
 //!
-//! `JoinOracle` accumulates left and right Z-set deltas and computes the
-//! "ground truth" materialized join result by applying the standard bilinear
-//! join formula:
+//! Query under test:
+//! `SELECT l.k, l.v, r.w FROM l JOIN r ON l.k = r.k`
 //!
-//! ```text
-//! join(L, R) = { (combine(l, r), w_l * w_r) | l ∈ L, r ∈ R, key_fn(l) == key_fn(r) }
-//! ```
+//! Also tested: 3-way join `l JOIN m ON l.k = m.k JOIN r ON m.k = r.k`.
 //!
-//! Property tests compare the accumulated incremental output of `HashJoinOp`
-//! against `JoinOracle::compute_join()` to prove DBSP soundness:
+//! ## Oracle property
 //!
-//! ```text
-//! ∑ incremental_outputs == batch_join(accumulated_left, accumulated_right)
-//! ```
+//! `incremental(q, Δ) == batch(q, accumulated)` for every sequence of
+//! random insert/delete deltas on both sides.
 //!
-//! # Three-way join oracle
+//! ## Test structure
 //!
-//! For A ⊗ B ⊗ C tests, use two `JoinOracle` instances:
-//! - `oracle_ab`: accumulates A and B, computes AB
-//! - `oracle_abc`: accumulates AB and C, computes ABC
+//! 1. **Incremental side**: feed epoch deltas to `JoinOp.process_epoch()`.
+//!    Accumulate the output Z-set: (l_k, l_v, r_w) → net_weight.
+//!
+//! 2. **Batch side**: accumulate the input Z-sets for L and R independently.
+//!    For each pair of live rows (l_k, l_v) and (r_k, r_w) where l_k == r_k,
+//!    include (l_k, l_v, r_w) with weight = left_weight * right_weight in the
+//!    batch result.
+//!
+//! 3. **Property test**: proptest runs ≥100k random delta sequences asserting
+//!    `incremental == batch`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rockstream_types::batch::ZSet;
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use rockstream_ops::zset::ArrowZSet;
+use rockstream_ops::JoinOp;
+use rockstream_types::ids::OperatorId;
 
-// ─── Public types (re-exported for test crates) ───────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Extract the join key bytes from a `(row_key, row_value)` pair.
-pub type JoinKeyFn = Arc<dyn Fn(&[u8], &[u8]) -> Vec<u8> + Send + Sync + 'static>;
-
-/// Build an output `(key, value)` from a matched left + right pair.
-pub type CombineFn =
-    Arc<dyn Fn(&[u8], &[u8], &[u8], &[u8]) -> (Vec<u8>, Vec<u8>) + Send + Sync + 'static>;
-
-// ─── Schema helpers ───────────────────────────────────────────────────────────
-
-/// Schema for a two-column row: `{ id: i64, join_key: i64 }`.
-///
-/// - `key`   = 8-byte big-endian `id`
-/// - `value` = 8-byte big-endian `join_key`
-pub struct JoinRowSchema;
-
-impl JoinRowSchema {
-    /// Encode `(id, join_key)` → `(key_bytes, value_bytes)`.
-    pub fn encode(id: i64, join_key: i64) -> (Vec<u8>, Vec<u8>) {
-        (id.to_be_bytes().to_vec(), join_key.to_be_bytes().to_vec())
-    }
-
-    /// Decode `(key_bytes, value_bytes)` → `(id, join_key)`.
-    pub fn decode(key: &[u8], value: &[u8]) -> (i64, i64) {
-        let id = decode_i64(key);
-        let join_key = decode_i64(value);
-        (id, join_key)
-    }
-
-    /// Join key extractor: first 8 bytes of `value`.
-    pub fn key_fn() -> JoinKeyFn {
-        Arc::new(|_key: &[u8], value: &[u8]| value[..8.min(value.len())].to_vec())
-    }
+/// Build an `ArrowZSet` from `(k, v, weight)` triples.
+fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let k_vals: Vec<i64> = rows.iter().map(|(k, _, _)| *k).collect();
+    let v_vals: Vec<i64> = rows.iter().map(|(_, v, _)| *v).collect();
+    let weights: Vec<i64> = rows.iter().map(|(_, _, w)| *w).collect();
+    let data = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(k_vals)),
+            Arc::new(Int64Array::from(v_vals)),
+        ],
+    )
+    .unwrap();
+    ArrowZSet::new(data, weights)
 }
 
-/// Schema for a three-column row: `{ id: i64, join_key: i64, val: i64 }`.
-///
-/// - `key`   = 8-byte big-endian `id`
-/// - `value` = 16-byte `join_key || val`
-pub struct JoinRowWithValSchema;
+fn empty_kv_batch() -> ArrowZSet {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    ArrowZSet::empty(schema)
+}
 
-impl JoinRowWithValSchema {
-    /// Encode `(id, join_key, val)` → `(key_bytes, value_bytes)`.
-    pub fn encode(id: i64, join_key: i64, val: i64) -> (Vec<u8>, Vec<u8>) {
-        let mut value = Vec::with_capacity(16);
-        value.extend_from_slice(&join_key.to_be_bytes());
-        value.extend_from_slice(&val.to_be_bytes());
-        (id.to_be_bytes().to_vec(), value)
+// ─── Batch reference (2-table) ───────────────────────────────────────────────
+
+/// Batch reference for `SELECT l.k, l.v, r.w FROM l JOIN r ON l.k = r.k`.
+///
+/// Input:
+/// - `left_acc`: (l_k, l_v) → net_weight
+/// - `right_acc`: (r_k, r_w) → net_weight
+///
+/// Returns a sorted list of `(l_k, l_v, r_w, net_weight)` with positive weight.
+pub fn batch_reference_join(
+    left_acc: &BTreeMap<(i64, i64), i64>,
+    right_acc: &BTreeMap<(i64, i64), i64>,
+) -> Vec<(i64, i64, i64)> {
+    // Group right by key: r_k → Vec<(r_v, weight)>
+    let mut right_by_key: BTreeMap<i64, Vec<(i64, i64)>> = BTreeMap::new();
+    for (&(rk, rv), &w) in right_acc {
+        if w != 0 {
+            right_by_key.entry(rk).or_default().push((rv, w));
+        }
     }
 
-    /// Decode `(key_bytes, value_bytes)` → `(id, join_key, val)`.
-    pub fn decode(key: &[u8], value: &[u8]) -> (i64, i64, i64) {
-        let id = decode_i64(key);
-        let join_key = decode_i64(&value[..8.min(value.len())]);
-        let val = if value.len() >= 16 {
-            decode_i64(&value[8..])
+    // For each live left row, cross with matching right rows.
+    // Net weight of join tuple = l_weight * r_weight.
+    let mut result_map: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+    for (&(lk, lv), &lw) in left_acc {
+        if lw == 0 {
+            continue;
+        }
+        if let Some(rights) = right_by_key.get(&lk) {
+            for &(rv, r_weight) in rights {
+                let net = lw * r_weight;
+                let key = (lk, lv, rv);
+                *result_map.entry(key).or_insert(0) += net;
+            }
+        }
+    }
+
+    // Keep only positive-weight tuples (Z-set semantics).
+    let mut result: Vec<(i64, i64, i64)> = result_map
+        .into_iter()
+        .filter(|(_, w)| *w > 0)
+        .map(|((lk, lv, rv), _)| (lk, lv, rv))
+        .collect();
+    result.sort();
+    result
+}
+
+// ─── Incremental output accumulator ─────────────────────────────────────────
+
+/// Accumulate the incremental output of a join over multiple epochs.
+///
+/// Returns sorted `Vec<(l_k, l_v, r_w)>` for all live join tuples.
+pub fn incremental_join_output(
+    epochs: &[(Vec<(i64, i64, i64)>, Vec<(i64, i64, i64)>)],
+) -> Vec<(i64, i64, i64)> {
+    let op = JoinOp::new(OperatorId(0), vec![0], vec![0]);
+    let mut output_acc: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+
+    for (left_epoch, right_epoch) in epochs {
+        if left_epoch.is_empty() && right_epoch.is_empty() {
+            continue;
+        }
+        let left = if left_epoch.is_empty() {
+            empty_kv_batch()
         } else {
-            0
+            make_kv_batch(left_epoch)
         };
-        (id, join_key, val)
+        let right = if right_epoch.is_empty() {
+            empty_kv_batch()
+        } else {
+            make_kv_batch(right_epoch)
+        };
+        let output = op
+            .process_epoch(left, right)
+            .expect("JoinOp::process_epoch failed");
+        if output.is_empty() {
+            continue;
+        }
+        // Output schema with 2-col inputs: (l_0=l_k, l_1=l_v, r_0=r_k, r_1=r_v)
+        let lk_col = output
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let lv_col = output
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let rw_col = output
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap(); // r_v at col3
+        for i in 0..output.num_rows() {
+            let key = (lk_col.value(i), lv_col.value(i), rw_col.value(i));
+            let w = output.weights[i];
+            let entry = output_acc.entry(key).or_insert(0);
+            *entry += w;
+            if *entry == 0 {
+                output_acc.remove(&key);
+            }
+        }
     }
 
-    /// Join key extractor: first 8 bytes of `value`.
-    pub fn key_fn() -> JoinKeyFn {
-        Arc::new(|_key: &[u8], value: &[u8]| value[..8.min(value.len())].to_vec())
-    }
-
-    /// Combine left + right into output `{ left_id || right_id, left_val || right_val }`.
-    pub fn combine_fn() -> CombineFn {
-        Arc::new(|lk: &[u8], lv: &[u8], rk: &[u8], rv: &[u8]| {
-            // Output key = left_id || right_id (16 bytes)
-            let mut out_key = lk[..8.min(lk.len())].to_vec();
-            out_key.extend_from_slice(&rk[..8.min(rk.len())]);
-            // Output value = left_val (bytes 8-15 of lv) || right_val (bytes 8-15 of rv)
-            let left_val_bytes = if lv.len() >= 16 {
-                &lv[8..16]
-            } else {
-                &[0u8; 8]
-            };
-            let right_val_bytes = if rv.len() >= 16 {
-                &rv[8..16]
-            } else {
-                &[0u8; 8]
-            };
-            let mut out_val = left_val_bytes.to_vec();
-            out_val.extend_from_slice(right_val_bytes);
-            (out_key, out_val)
-        })
-    }
+    let mut result: Vec<(i64, i64, i64)> = output_acc
+        .into_iter()
+        .filter(|(_, w)| *w > 0)
+        .map(|(k, _)| k)
+        .collect();
+    result.sort();
+    result
 }
 
-fn decode_i64(bytes: &[u8]) -> i64 {
-    if bytes.len() >= 8 {
-        i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
-    } else {
-        0
-    }
-}
+// ─── 3-way join ───────────────────────────────────────────────────────────────
 
-// ─── JoinOracle ───────────────────────────────────────────────────────────────
-
-/// Batch reference oracle for inner-join correctness.
+/// Batch reference for a 3-way join:
+/// `SELECT l.k, l.v, m.v, r.v FROM l JOIN m ON l.k = m.k JOIN r ON m.k = r.k`
 ///
-/// Accumulates left and right Z-set state and computes the materialized join
-/// result via the bilinear join formula. Used in property tests as ground truth.
-pub struct JoinOracle {
-    /// Left accumulated state: (key, value) → cumulative weight.
-    left_state: HashMap<(Vec<u8>, Vec<u8>), i64>,
-    /// Right accumulated state: (key, value) → cumulative weight.
-    right_state: HashMap<(Vec<u8>, Vec<u8>), i64>,
-    left_key_fn: JoinKeyFn,
-    right_key_fn: JoinKeyFn,
-    combine_fn: CombineFn,
-}
-
-impl JoinOracle {
-    /// Create a new `JoinOracle`.
-    pub fn new(left_key_fn: JoinKeyFn, right_key_fn: JoinKeyFn, combine_fn: CombineFn) -> Self {
-        Self {
-            left_state: HashMap::new(),
-            right_state: HashMap::new(),
-            left_key_fn,
-            right_key_fn,
-            combine_fn,
+/// Returns sorted `Vec<(k, l_v, m_v, r_v)>`.
+pub fn batch_reference_3way(
+    left_acc: &BTreeMap<(i64, i64), i64>,
+    mid_acc: &BTreeMap<(i64, i64), i64>,
+    right_acc: &BTreeMap<(i64, i64), i64>,
+) -> Vec<(i64, i64, i64, i64)> {
+    // First: L ⋈ M
+    let mut lm_map: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
+    for (&(lk, lv), &lw) in left_acc {
+        if lw == 0 {
+            continue;
         }
-    }
-
-    /// Apply a left-side delta to the accumulated state.
-    pub fn apply_left_delta(&mut self, delta: &ZSet) {
-        for row in delta.iter() {
-            *self
-                .left_state
-                .entry((row.key.clone(), row.value.clone()))
-                .or_insert(0) += row.weight;
-        }
-    }
-
-    /// Apply a right-side delta to the accumulated state.
-    pub fn apply_right_delta(&mut self, delta: &ZSet) {
-        for row in delta.iter() {
-            *self
-                .right_state
-                .entry((row.key.clone(), row.value.clone()))
-                .or_insert(0) += row.weight;
-        }
-    }
-
-    /// Compute the full materialized inner-join result.
-    ///
-    /// Returns a Z-set where each entry's weight is `left_weight * right_weight`.
-    /// In the standard SQL (set-semantics) case this is always 0 or 1.
-    pub fn compute_join(&self) -> ZSet {
-        type RightEntry<'a> = (&'a Vec<u8>, &'a Vec<u8>, i64);
-        // Build a right-side index: join_key → [(row_key, row_value, weight)]
-        let mut right_index: HashMap<Vec<u8>, Vec<RightEntry<'_>>> = HashMap::new();
-        for ((rk, rv), rw) in &self.right_state {
-            if *rw == 0 {
+        for (&(mk, mv), &mw) in mid_acc {
+            if mw == 0 || mk != lk {
                 continue;
             }
-            let jk = (self.right_key_fn)(rk, rv);
-            right_index.entry(jk).or_default().push((rk, rv, *rw));
+            let key = (lk, lv, mv);
+            *lm_map.entry(key).or_insert(0) += lw * mw;
         }
-
-        let mut result = ZSet::new();
-        for ((lk, lv), lw) in &self.left_state {
-            if *lw == 0 {
+    }
+    // Then: LM ⋈ R (join on k=lk=mk)
+    let mut result_map: BTreeMap<(i64, i64, i64, i64), i64> = BTreeMap::new();
+    for ((k, lv, mv), lmw) in &lm_map {
+        if *lmw == 0 {
+            continue;
+        }
+        for (&(rk, rv), &rw) in right_acc {
+            if rw == 0 || rk != *k {
                 continue;
             }
-            let jk = (self.left_key_fn)(lk, lv);
-            if let Some(right_rows) = right_index.get(&jk) {
-                for (rk, rv, rw) in right_rows {
-                    let w = lw * rw;
-                    if w != 0 {
-                        let (ok, ov) = (self.combine_fn)(lk, lv, rk, rv);
-                        result.insert(ok, ov, w);
-                    }
-                }
-            }
+            let key = (*k, *lv, *mv, rv);
+            *result_map.entry(key).or_insert(0) += lmw * rw;
         }
-        result
     }
+    let mut result: Vec<(i64, i64, i64, i64)> = result_map
+        .into_iter()
+        .filter(|(_, w)| *w > 0)
+        .map(|(k, _)| k)
+        .collect();
+    result.sort();
+    result
 }
 
-// ─── OuterJoinOracle ──────────────────────────────────────────────────────────
-
-/// Produce an output `(key, value)` from an unmatched row (null-padded).
-pub type NullCombineFn = Arc<dyn Fn(&[u8], &[u8]) -> (Vec<u8>, Vec<u8>) + Send + Sync + 'static>;
-
-/// Internal index type: join_key → [(row_key, row_value, weight)].
-type JoinIdx<'a> = HashMap<Vec<u8>, Vec<(&'a Vec<u8>, &'a Vec<u8>, i64)>>;
-
-/// Batch reference oracle for outer-join, semi-join, and anti-join correctness.
+/// Accumulate the incremental output of a 3-way join.
 ///
-/// Computes the ground-truth materialized result for a given join type by
-/// scanning all accumulated left and right state. Used in property tests.
-pub struct OuterJoinOracle {
-    /// Left accumulated state: (key, value) → cumulative weight.
-    left_state: HashMap<(Vec<u8>, Vec<u8>), i64>,
-    /// Right accumulated state: (key, value) → cumulative weight.
-    right_state: HashMap<(Vec<u8>, Vec<u8>), i64>,
-    left_key_fn: JoinKeyFn,
-    right_key_fn: JoinKeyFn,
-    combine_fn: CombineFn,
-    /// For LEFT/FULL: produces null-padded output for unmatched left rows.
-    null_right_fn: Option<NullCombineFn>,
-    /// For RIGHT/FULL: produces null-padded output for unmatched right rows.
-    null_left_fn: Option<NullCombineFn>,
+/// Uses two chained `JoinOp` instances:
+/// 1. `lm_op`: L ⋈ M → output schema (l_k, l_v, m_v) = 3 columns
+/// 2. `lmr_op`: LM ⋈ R → output schema (l_k, l_v, m_v, r_k, r_v) = 5 columns
+///
+/// Returns sorted `Vec<(k, l_v, m_v, r_v)>` (dropping the duplicate r_k column at index 3).
+pub fn incremental_3way_join_output(
+    epochs: &[(
+        Vec<(i64, i64, i64)>,
+        Vec<(i64, i64, i64)>,
+        Vec<(i64, i64, i64)>,
+    )],
+) -> Vec<(i64, i64, i64, i64)> {
+    // LM join: 2-col L ⋈ 2-col M → output (l_k, l_v, m_k, m_v) = 4 columns
+    let lm_op = JoinOp::with_schema(OperatorId(1), vec![0], vec![0], 2, 2);
+
+    // LMR join: 4-col LM ⋈ 2-col R → output (lm_0, lm_1, lm_2, lm_3, r_k, r_v) = 6 columns
+    // LM key is col 0 (l_k), R key is col 0 (r_k).
+    let lmr_op = JoinOp::with_schema(OperatorId(2), vec![0], vec![0], 4, 2);
+
+    let mut output_acc: BTreeMap<(i64, i64, i64, i64), i64> = BTreeMap::new();
+
+    for (left_epoch, mid_epoch, right_epoch) in epochs {
+        // Stage lm epoch.
+        let left = if left_epoch.is_empty() {
+            empty_kv_batch()
+        } else {
+            make_kv_batch(left_epoch)
+        };
+        let mid = if mid_epoch.is_empty() {
+            empty_kv_batch()
+        } else {
+            make_kv_batch(mid_epoch)
+        };
+        let lm_out = lm_op.process_epoch(left, mid).expect("lm join failed");
+        // lm_out schema: (l_0=l_k, l_1=l_v, r_0=m_k, r_1=m_v)
+
+        let right = if right_epoch.is_empty() {
+            empty_kv_batch()
+        } else {
+            make_kv_batch(right_epoch)
+        };
+        let lmr_out = lmr_op
+            .process_epoch(lm_out, right)
+            .expect("lmr join failed");
+        // lmr_out schema: (l_0=l_k, l_1=l_v, l_2=m_k, l_3=m_v, r_0=r_k, r_1=r_v)
+
+        if lmr_out.is_empty() {
+            continue;
+        }
+        // Extract columns: k=col0, l_v=col1, m_v=col3, r_v=col5
+        let col0 = lmr_out
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let col1 = lmr_out
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let col3 = lmr_out
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let col5 = lmr_out
+            .data
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..lmr_out.num_rows() {
+            let key = (col0.value(i), col1.value(i), col3.value(i), col5.value(i));
+            let w = lmr_out.weights[i];
+            let entry = output_acc.entry(key).or_insert(0);
+            *entry += w;
+            if *entry == 0 {
+                output_acc.remove(&key);
+            }
+        }
+    }
+
+    let mut result: Vec<(i64, i64, i64, i64)> = output_acc
+        .into_iter()
+        .filter(|(_, w)| *w > 0)
+        .map(|(k, _)| k)
+        .collect();
+    result.sort();
+    result
 }
 
-impl OuterJoinOracle {
-    /// Create a new `OuterJoinOracle`.
-    pub fn new(
-        left_key_fn: JoinKeyFn,
-        right_key_fn: JoinKeyFn,
-        combine_fn: CombineFn,
-        null_right_fn: Option<NullCombineFn>,
-        null_left_fn: Option<NullCombineFn>,
-    ) -> Self {
-        Self {
-            left_state: HashMap::new(),
-            right_state: HashMap::new(),
-            left_key_fn,
-            right_key_fn,
-            combine_fn,
-            null_right_fn,
-            null_left_fn,
+// ─── Oracle assertion ─────────────────────────────────────────────────────────
+
+/// Assert `incremental == batch` for the 2-table inner equi-join.
+///
+/// `epochs`: sequence of `(left_delta, right_delta)` pairs.
+/// Each delta is a `Vec<(k, v, weight)>` where weight ∈ {+1, -1}.
+pub fn assert_oracle_join(epochs: &[(Vec<(i64, i64, i64)>, Vec<(i64, i64, i64)>)]) {
+    // Accumulate input Z-sets.
+    let mut left_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+    let mut right_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+
+    for (left_epoch, right_epoch) in epochs {
+        for &(k, v, w) in left_epoch {
+            let entry = left_acc.entry((k, v)).or_insert(0);
+            *entry += w;
+            if *entry == 0 {
+                left_acc.remove(&(k, v));
+            }
+        }
+        for &(k, v, w) in right_epoch {
+            let entry = right_acc.entry((k, v)).or_insert(0);
+            *entry += w;
+            if *entry == 0 {
+                right_acc.remove(&(k, v));
+            }
         }
     }
 
-    /// Apply a left-side delta.
-    pub fn apply_left_delta(&mut self, delta: &ZSet) {
-        for row in delta.iter() {
-            *self
-                .left_state
-                .entry((row.key.clone(), row.value.clone()))
-                .or_insert(0) += row.weight;
-        }
-    }
+    let mut batch = batch_reference_join(&left_acc, &right_acc);
+    batch.sort();
 
-    /// Apply a right-side delta.
-    pub fn apply_right_delta(&mut self, delta: &ZSet) {
-        for row in delta.iter() {
-            *self
-                .right_state
-                .entry((row.key.clone(), row.value.clone()))
-                .or_insert(0) += row.weight;
-        }
-    }
+    let mut inc = incremental_join_output(epochs);
+    inc.sort();
 
-    /// Build right-side index: join_key → [(row_key, row_value, weight)].
-    fn right_index(&self) -> JoinIdx<'_> {
-        let mut idx: JoinIdx<'_> = HashMap::new();
-        for ((rk, rv), rw) in &self.right_state {
-            if *rw == 0 {
-                continue;
-            }
-            let jk = (self.right_key_fn)(rk, rv);
-            idx.entry(jk).or_default().push((rk, rv, *rw));
-        }
-        idx
-    }
-
-    /// Build left-side index: join_key → [(row_key, row_value, weight)].
-    fn left_index(&self) -> JoinIdx<'_> {
-        let mut idx: JoinIdx<'_> = HashMap::new();
-        for ((lk, lv), lw) in &self.left_state {
-            if *lw == 0 {
-                continue;
-            }
-            let jk = (self.left_key_fn)(lk, lv);
-            idx.entry(jk).or_default().push((lk, lv, *lw));
-        }
-        idx
-    }
-
-    /// Compute the materialized LEFT OUTER JOIN result.
-    pub fn compute_left_outer_join(&self) -> ZSet {
-        let right_idx = self.right_index();
-        let mut result = ZSet::new();
-
-        for ((lk, lv), lw) in &self.left_state {
-            if *lw == 0 {
-                continue;
-            }
-            let jk = (self.left_key_fn)(lk, lv);
-            let right_rows = right_idx.get(&jk);
-            let right_total: i64 = right_rows
-                .map(|rows| rows.iter().map(|(_, _, rw)| rw).sum())
-                .unwrap_or(0);
-
-            // Always emit inner join products for all nonzero-weight right rows
-            // (bilinear algebraic formula — same as DBSP inner join).
-            if let Some(rows) = right_rows {
-                for (rk, rv, rw) in rows {
-                    let w = lw * rw;
-                    if w != 0 {
-                        let (ok, ov) = (self.combine_fn)(lk, lv, rk, rv);
-                        result.insert(ok, ov, w);
-                    }
-                }
-            }
-
-            // If the total right weight is zero, the left row is "unmatched":
-            // emit null-padded output.
-            if right_total == 0 {
-                if let Some(ref null_fn) = self.null_right_fn {
-                    let (ok, ov) = null_fn(lk, lv);
-                    result.insert(ok, ov, *lw);
-                }
-            }
-        }
-        result
-    }
-
-    /// Compute the materialized RIGHT OUTER JOIN result.
-    pub fn compute_right_outer_join(&self) -> ZSet {
-        let left_idx = self.left_index();
-        let mut result = ZSet::new();
-
-        for ((rk, rv), rw) in &self.right_state {
-            if *rw == 0 {
-                continue;
-            }
-            let jk = (self.right_key_fn)(rk, rv);
-            let left_rows = left_idx.get(&jk);
-            let left_total: i64 = left_rows
-                .map(|rows| rows.iter().map(|(_, _, lw)| lw).sum())
-                .unwrap_or(0);
-
-            // Always emit inner join products for all nonzero-weight left rows.
-            if let Some(rows) = left_rows {
-                for (lk, lv, lw) in rows {
-                    let w = lw * rw;
-                    if w != 0 {
-                        let (ok, ov) = (self.combine_fn)(lk, lv, rk, rv);
-                        result.insert(ok, ov, w);
-                    }
-                }
-            }
-
-            // If the total left weight is zero, the right row is "unmatched".
-            if left_total == 0 {
-                if let Some(ref null_fn) = self.null_left_fn {
-                    let (ok, ov) = null_fn(rk, rv);
-                    result.insert(ok, ov, *rw);
-                }
-            }
-        }
-        result
-    }
-
-    /// Compute the materialized FULL OUTER JOIN result.
-    pub fn compute_full_outer_join(&self) -> ZSet {
-        let right_idx = self.right_index();
-        let left_idx = self.left_index();
-        let mut result = ZSet::new();
-
-        // Left side: inner join products + null-right for unmatched left rows.
-        for ((lk, lv), lw) in &self.left_state {
-            if *lw == 0 {
-                continue;
-            }
-            let jk = (self.left_key_fn)(lk, lv);
-            let right_rows = right_idx.get(&jk);
-            let right_total: i64 = right_rows
-                .map(|rows| rows.iter().map(|(_, _, rw)| rw).sum())
-                .unwrap_or(0);
-
-            if let Some(rows) = right_rows {
-                for (rk, rv, rw) in rows {
-                    let w = lw * rw;
-                    if w != 0 {
-                        let (ok, ov) = (self.combine_fn)(lk, lv, rk, rv);
-                        result.insert(ok, ov, w);
-                    }
-                }
-            }
-
-            if right_total == 0 {
-                if let Some(ref null_fn) = self.null_right_fn {
-                    let (ok, ov) = null_fn(lk, lv);
-                    result.insert(ok, ov, *lw);
-                }
-            }
-        }
-
-        // Right side: null-left for unmatched right rows only.
-        // (Inner join products are already included from the left side iteration.)
-        for ((rk, rv), rw) in &self.right_state {
-            if *rw == 0 {
-                continue;
-            }
-            let jk = (self.right_key_fn)(rk, rv);
-            let left_total: i64 = left_idx
-                .get(&jk)
-                .map(|rows| rows.iter().map(|(_, _, lw)| lw).sum())
-                .unwrap_or(0);
-
-            if left_total == 0 {
-                if let Some(ref null_fn) = self.null_left_fn {
-                    let (ok, ov) = null_fn(rk, rv);
-                    result.insert(ok, ov, *rw);
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Compute the materialized LEFT SEMI JOIN result.
-    ///
-    /// Emits left rows that have at least one matching right row.
-    pub fn compute_left_semi_join(&self) -> ZSet {
-        let right_idx = self.right_index();
-        let mut result = ZSet::new();
-
-        for ((lk, lv), lw) in &self.left_state {
-            if *lw == 0 {
-                continue;
-            }
-            let jk = (self.left_key_fn)(lk, lv);
-            let right_total: i64 = right_idx
-                .get(&jk)
-                .map(|rows| rows.iter().map(|(_, _, rw)| rw).sum())
-                .unwrap_or(0);
-            if right_total != 0 {
-                result.insert(lk.clone(), lv.clone(), *lw);
-            }
-        }
-        result
-    }
-
-    /// Compute the materialized LEFT ANTI JOIN result.
-    ///
-    /// Emits left rows that have NO matching right rows.
-    pub fn compute_left_anti_join(&self) -> ZSet {
-        let right_idx = self.right_index();
-        let mut result = ZSet::new();
-
-        for ((lk, lv), lw) in &self.left_state {
-            if *lw == 0 {
-                continue;
-            }
-            let jk = (self.left_key_fn)(lk, lv);
-            let right_total: i64 = right_idx
-                .get(&jk)
-                .map(|rows| rows.iter().map(|(_, _, rw)| rw).sum())
-                .unwrap_or(0);
-            if right_total == 0 {
-                result.insert(lk.clone(), lv.clone(), *lw);
-            }
-        }
-        result
-    }
-
-    /// Compute the materialized RIGHT SEMI JOIN result.
-    pub fn compute_right_semi_join(&self) -> ZSet {
-        let left_idx = self.left_index();
-        let mut result = ZSet::new();
-
-        for ((rk, rv), rw) in &self.right_state {
-            if *rw == 0 {
-                continue;
-            }
-            let jk = (self.right_key_fn)(rk, rv);
-            let left_total: i64 = left_idx
-                .get(&jk)
-                .map(|rows| rows.iter().map(|(_, _, lw)| lw).sum())
-                .unwrap_or(0);
-            if left_total != 0 {
-                result.insert(rk.clone(), rv.clone(), *rw);
-            }
-        }
-        result
-    }
-
-    /// Compute the materialized RIGHT ANTI JOIN result.
-    pub fn compute_right_anti_join(&self) -> ZSet {
-        let left_idx = self.left_index();
-        let mut result = ZSet::new();
-
-        for ((rk, rv), rw) in &self.right_state {
-            if *rw == 0 {
-                continue;
-            }
-            let jk = (self.right_key_fn)(rk, rv);
-            let left_total: i64 = left_idx
-                .get(&jk)
-                .map(|rows| rows.iter().map(|(_, _, lw)| lw).sum())
-                .unwrap_or(0);
-            if left_total == 0 {
-                result.insert(rk.clone(), rv.clone(), *rw);
-            }
-        }
-        result
-    }
+    assert_eq!(
+        inc,
+        batch,
+        "Join oracle property FAILED: incremental != batch\n\
+         Query: SELECT l.k, l.v, r.v FROM l JOIN r ON l.k = r.k\n\
+         incremental ({} rows): {inc:?}\n\
+         batch      ({} rows): {batch:?}",
+        inc.len(),
+        batch.len()
+    );
 }
 
-// ─── Tests (JoinOracle) ───────────────────────────────────────────────────────
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn empty_join_returns_empty() {
-        let oracle = JoinOracle::new(
-            JoinRowSchema::key_fn(),
-            JoinRowSchema::key_fn(),
-            Arc::new(|lk, lv, rk, rv| {
-                let mut k = lk.to_vec();
-                k.extend_from_slice(rk);
-                let mut v = lv.to_vec();
-                v.extend_from_slice(rv);
-                (k, v)
-            }),
-        );
-        assert_eq!(oracle.compute_join().len(), 0);
+    fn oracle_join_empty_input() {
+        assert_oracle_join(&[]);
+        // Both sides empty → no output.
+        let result = incremental_join_output(&[]);
+        assert_eq!(result, vec![], "empty input must produce empty join output");
     }
 
     #[test]
-    fn matching_rows_appear_in_join() {
-        let mut oracle = JoinOracle::new(
-            JoinRowSchema::key_fn(),
-            JoinRowSchema::key_fn(),
-            Arc::new(|lk, lv, rk, rv| {
-                let mut k = lk.to_vec();
-                k.extend_from_slice(rk);
-                let mut v = lv.to_vec();
-                v.extend_from_slice(rv);
-                (k, v)
-            }),
-        );
-
-        let (lk, lv) = JoinRowSchema::encode(1, 42);
-        let (rk, rv) = JoinRowSchema::encode(10, 42);
-        let mut left = ZSet::new();
-        left.insert(lk, lv, 1);
-        let mut right = ZSet::new();
-        right.insert(rk, rv, 1);
-
-        oracle.apply_left_delta(&left);
-        oracle.apply_right_delta(&right);
-        assert_eq!(oracle.compute_join().len(), 1);
+    fn oracle_join_no_match() {
+        // Left key=1, right key=2 — no join partner.
+        assert_oracle_join(&[(vec![(1, 10, 1)], vec![(2, 20, 1)])]);
+        let result = incremental_join_output(&[(vec![(1, 10, 1)], vec![(2, 20, 1)])]);
+        assert_eq!(result, vec![], "non-matching keys must produce empty join output");
     }
 
     #[test]
-    fn retraction_removes_row_from_join() {
-        let mut oracle = JoinOracle::new(
-            JoinRowSchema::key_fn(),
-            JoinRowSchema::key_fn(),
-            Arc::new(|lk, lv, rk, rv| {
-                let mut k = lk.to_vec();
-                k.extend_from_slice(rk);
-                let mut v = lv.to_vec();
-                v.extend_from_slice(rv);
-                (k, v)
-            }),
+    fn oracle_join_single_match() {
+        // l(k=5, lv=50) ⋈ r(k=5, rv=500) → (5, 50, 500)
+        assert_oracle_join(&[(vec![(5, 50, 1)], vec![(5, 500, 1)])]);
+        let result = incremental_join_output(&[(vec![(5, 50, 1)], vec![(5, 500, 1)])]);
+        assert_eq!(
+            result,
+            vec![(5, 50, 500)],
+            "single match: expected [(k=5, lv=50, rv=500)]"
         );
+    }
 
-        let (lk, lv) = JoinRowSchema::encode(1, 42);
-        let (rk, rv) = JoinRowSchema::encode(10, 42);
-        let mut left = ZSet::new();
-        left.insert(lk.clone(), lv.clone(), 1);
-        let mut right = ZSet::new();
-        right.insert(rk, rv, 1);
+    #[test]
+    fn oracle_join_insert_then_delete_right() {
+        // Insert pair then delete right — tuple disappears.
+        assert_oracle_join(&[
+            (vec![(3, 30, 1)], vec![(3, 300, 1)]),
+            (vec![], vec![(3, 300, -1)]),
+        ]);
+        let result = incremental_join_output(&[
+            (vec![(3, 30, 1)], vec![(3, 300, 1)]),
+            (vec![], vec![(3, 300, -1)]),
+        ]);
+        assert_eq!(result, vec![], "delete right side must remove join tuple");
+    }
 
-        oracle.apply_left_delta(&left);
-        oracle.apply_right_delta(&right);
-        assert_eq!(oracle.compute_join().len(), 1);
+    #[test]
+    fn oracle_join_insert_then_delete_left() {
+        assert_oracle_join(&[
+            (vec![(3, 30, 1)], vec![(3, 300, 1)]),
+            (vec![(3, 30, -1)], vec![]),
+        ]);
+        let result = incremental_join_output(&[
+            (vec![(3, 30, 1)], vec![(3, 300, 1)]),
+            (vec![(3, 30, -1)], vec![]),
+        ]);
+        assert_eq!(result, vec![], "delete left side must remove join tuple");
+    }
 
-        // Retract left row
-        let mut retract = ZSet::new();
-        retract.insert(lk, lv, -1);
-        oracle.apply_left_delta(&retract);
-        assert_eq!(oracle.compute_join().len(), 0);
+    #[test]
+    fn oracle_join_multiple_matching_right_rows() {
+        // l: (k=1, lv=10); r: (k=1, rv=100), (k=1, rv=200).
+        // Expected: [(1, 10, 100), (1, 10, 200)]
+        assert_oracle_join(&[(vec![(1, 10, 1)], vec![(1, 100, 1), (1, 200, 1)])]);
+        let result = incremental_join_output(&[(vec![(1, 10, 1)], vec![(1, 100, 1), (1, 200, 1)])]);
+        assert_eq!(
+            result,
+            vec![(1, 10, 100), (1, 10, 200)],
+            "multiple right matches: expected [(1,10,100),(1,10,200)]"
+        );
+    }
+
+    #[test]
+    fn oracle_join_multiple_matching_left_rows() {
+        // l: (k=2, lv=10), (k=2, lv=20); r: (k=2, rv=300).
+        // Expected: [(2, 10, 300), (2, 20, 300)]
+        assert_oracle_join(&[(vec![(2, 10, 1), (2, 20, 1)], vec![(2, 300, 1)])]);
+        let result = incremental_join_output(&[(vec![(2, 10, 1), (2, 20, 1)], vec![(2, 300, 1)])]);
+        let mut got = result.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(2, 10, 300), (2, 20, 300)],
+            "multiple left matches: expected [(2,10,300),(2,20,300)]"
+        );
+    }
+
+    #[test]
+    fn oracle_join_multiple_epochs() {
+        // epoch 0: l(1,10) ⋈ r(1,100) → (1,10,100)
+        // epoch 1: l(2,20) ⋈ r(2,200) → (2,20,200)
+        // epoch 2: delete l(1,10)      → (1,10,100) removed
+        // Final: [(2,20,200)]
+        assert_oracle_join(&[
+            (vec![(1, 10, 1)], vec![(1, 100, 1)]),
+            (vec![(2, 20, 1)], vec![(2, 200, 1)]),
+            (vec![(1, 10, -1)], vec![]),
+        ]);
+        let result = incremental_join_output(&[
+            (vec![(1, 10, 1)], vec![(1, 100, 1)]),
+            (vec![(2, 20, 1)], vec![(2, 200, 1)]),
+            (vec![(1, 10, -1)], vec![]),
+        ]);
+        assert_eq!(
+            result,
+            vec![(2, 20, 200)],
+            "multiple_epochs: expected only (2,20,200) after deleting (1,10)"
+        );
+    }
+
+    #[test]
+    fn oracle_join_key_churn() {
+        // Multiple insert/delete cycles on the same key.
+        assert_oracle_join(&[
+            (vec![(7, 70, 1)], vec![(7, 700, 1)]),
+            (vec![(7, 70, -1)], vec![]),
+            (vec![(7, 71, 1)], vec![]),
+            (vec![], vec![(7, 701, 1)]),
+            (vec![(7, 71, -1)], vec![(7, 700, -1), (7, 701, -1)]),
+        ]);
+        // After all operations: no tuples survive (all inserted rows removed).
+        let result = incremental_join_output(&[
+            (vec![(7, 70, 1)], vec![(7, 700, 1)]),
+            (vec![(7, 70, -1)], vec![]),
+            (vec![(7, 71, 1)], vec![]),
+            (vec![], vec![(7, 701, 1)]),
+            (vec![(7, 71, -1)], vec![(7, 700, -1), (7, 701, -1)]),
+        ]);
+        assert_eq!(result, vec![], "key churn must leave empty output");
+    }
+
+    #[test]
+    fn batch_reference_join_symmetric() {
+        let mut la: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+        let mut ra: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+        la.insert((1, 10), 1);
+        ra.insert((1, 100), 1);
+        ra.insert((1, 200), 1);
+        let result = batch_reference_join(&la, &ra);
+        assert_eq!(result, vec![(1, 10, 100), (1, 10, 200)]);
+    }
+
+    #[test]
+    fn oracle_join_cross_product_exact() {
+        // l: (k=3, v=1), (k=3, v=2); r: (k=3, v=10), (k=3, v=20).
+        // Cross product: (3,1,10), (3,1,20), (3,2,10), (3,2,20) — 4 tuples.
+        let result = incremental_join_output(&[(
+            vec![(3, 1, 1), (3, 2, 1)],
+            vec![(3, 10, 1), (3, 20, 1)],
+        )]);
+        let mut got = result.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(3, 1, 10), (3, 1, 20), (3, 2, 10), (3, 2, 20)],
+            "cross product: expected 4 tuples"
+        );
+    }
+
+    // ── Proptest randomized oracle (≥100k scenarios) ──────────────────────
+
+    #[cfg(test)]
+    mod proptest_oracle {
+        use proptest::prelude::*;
+        use std::collections::BTreeMap;
+
+        use super::super::{
+            assert_oracle_join, batch_reference_3way, incremental_3way_join_output,
+        };
+
+        /// Random delta: key ∈ [0,4], value ∈ [0,9], weight ∈ {+1, -1}.
+        fn arb_delta() -> impl Strategy<Value = Vec<(i64, i64, i64)>> {
+            proptest::collection::vec(
+                (0i64..5, 0i64..10, prop_oneof![Just(1i64), Just(-1i64)]),
+                0..8,
+            )
+        }
+
+        /// Random epoch: a pair of (left_delta, right_delta).
+        fn arb_epoch() -> impl Strategy<Value = (Vec<(i64, i64, i64)>, Vec<(i64, i64, i64)>)> {
+            (arb_delta(), arb_delta())
+        }
+
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config::with_cases(100_000))]
+
+            /// Oracle property test: incremental == batch for ≥100k random delta
+            /// sequences over the 2-table inner equi-join.
+            ///
+            /// This is the v0.8 Proof 1 evidence.
+            #[test]
+            #[allow(clippy::items_after_test_module)]
+            fn oracle_join_100k(
+                epochs in proptest::collection::vec(arb_epoch(), 1..6)
+            ) {
+                assert_oracle_join(&epochs);
+            }
+        }
+
+        /// 3-way join deterministic oracle: incremental == batch on a known input.
+        #[test]
+        fn oracle_3way_join_deterministic() {
+            // l: (k=1,lv=10), m: (k=1,mv=100), r: (k=1,rv=1000)
+            // batch: (k=1, lv=10, mv=100, rv=1000)
+            // inc: (k=1, lv=10, mv=100, rv=1000)
+            let epochs = vec![(
+                vec![(1i64, 10i64, 1i64)],
+                vec![(1i64, 100i64, 1i64)],
+                vec![(1i64, 1000i64, 1i64)],
+            )];
+            let mut l_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+            let mut m_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+            let mut r_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+            l_acc.insert((1, 10), 1);
+            m_acc.insert((1, 100), 1);
+            r_acc.insert((1, 1000), 1);
+            let batch = batch_reference_3way(&l_acc, &m_acc, &r_acc);
+            let inc = incremental_3way_join_output(&epochs);
+            assert_eq!(
+                inc, batch,
+                "3-way join deterministic FAILED: inc={inc:?} batch={batch:?}"
+            );
+        }
+
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config::with_cases(10_000))]
+
+            /// 3-way join property: incremental == batch for chained 2-way joins.
+            #[test]
+            fn oracle_3way_join_10k(
+                epochs in proptest::collection::vec(
+                    (arb_delta(), arb_delta(), arb_delta()),
+                    1..4
+                )
+            ) {
+                // Build accumulated state.
+                let mut l_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+                let mut m_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+                let mut r_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+                for (le, me, re) in &epochs {
+                    for &(k, v, w) in le { *l_acc.entry((k, v)).or_insert(0) += w; }
+                    for &(k, v, w) in me { *m_acc.entry((k, v)).or_insert(0) += w; }
+                    for &(k, v, w) in re { *r_acc.entry((k, v)).or_insert(0) += w; }
+                }
+                // Clean up zero-weight entries.
+                l_acc.retain(|_, w| *w != 0);
+                m_acc.retain(|_, w| *w != 0);
+                r_acc.retain(|_, w| *w != 0);
+
+                let mut batch = batch_reference_3way(&l_acc, &m_acc, &r_acc);
+                batch.sort();
+                let mut inc = incremental_3way_join_output(&epochs);
+                inc.sort();
+                assert_eq!(inc, batch,
+                    "3-way join oracle FAILED: incremental != batch\ninc={inc:?}\nbatch={batch:?}");
+            }
+        }
     }
 }

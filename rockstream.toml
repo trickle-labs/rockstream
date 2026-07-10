@@ -1,4 +1,4 @@
-# RockStream Configuration (v0.49)
+# RockStream Configuration (v0.50)
 
 [cluster]
 min_epoch_ms = 10

@@ -1,125 +1,153 @@
-//! Project operator for RockStream IVM.
+//! Project operator: stateless column projection / scalar expression evaluation.
 //!
-//! Applies a projection to each row in a `ZSetBatch`, transforming
-//! (key, value) bytes according to the provided mapping function.
+//! `ProjectOp` evaluates a list of expressions against each row of an
+//! `ArrowZSet`, producing a new `ArrowZSet` with the projected columns.
+//! Weights are preserved unchanged.
 //!
-//! Project is a **linear** (stateless) operator: it applies independently
-//! to each row. If two input rows project to the same output row, their
-//! weights are additive (the Z-set insert semantics handle this naturally).
-//!
-//! # DataFusion expression evaluation
-//!
-//! `ProjectOperator::with_datafusion_exprs` accepts a list of DataFusion
-//! `PhysicalExpr` column expressions plus a `RowCodec`. Projection is
-//! evaluated via DataFusion's vectorised expression engine.
+//! DBSP linear-operator rule: `ΔProject(Δx) = Project(Δx)`.
 
 use std::sync::Arc;
 
-use rockstream_types::batch::{ZSetBatch, ZSetRow};
-use rockstream_types::merge_law::MergeLawId;
-use rockstream_types::timestamp::Epoch;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use rockstream_plan::Expr;
 
-use crate::operator::Operator;
-use crate::row_codec::RowCodec;
+use crate::error::OpError;
+use crate::expr::eval_to_array;
+use crate::op::Operator;
+use crate::zset::ArrowZSet;
 
-/// Projection function type: maps `(key, value)` bytes to an optional output
-/// `(new_key, new_value)`. Returning `None` drops the row (equivalent to a
-/// combined filter+project).
-pub type ProjectFn =
-    Arc<dyn Fn(&[u8], &[u8]) -> Option<(Vec<u8>, Vec<u8>)> + Send + Sync + 'static>;
-
-/// IVM project operator: transforms each row's (key, value) bytes.
-pub struct ProjectOperator {
-    project: ProjectFn,
-    name: String,
+/// A named projection expression: `expr AS name`.
+#[derive(Debug, Clone)]
+pub struct NamedExpr {
+    /// The output column name.
+    pub name: String,
+    /// The expression to evaluate.
+    pub expr: Expr,
 }
 
-impl ProjectOperator {
-    /// Create a `ProjectOperator` from a plain Rust closure.
-    pub fn new(name: impl Into<String>, project: ProjectFn) -> Self {
-        Self {
-            project,
+impl NamedExpr {
+    pub fn new(name: impl Into<String>, expr: Expr) -> Self {
+        NamedExpr {
             name: name.into(),
+            expr,
         }
     }
+}
 
-    /// Create a `ProjectOperator` backed by DataFusion `PhysicalExpr` column
-    /// expressions evaluated on Arrow `RecordBatch`es.
+/// A stateless projection operator.
+pub struct ProjectOp {
+    /// The output expressions with their column names.
+    exprs: Vec<NamedExpr>,
+    /// Output schema (derived from `exprs`; all Int64 for v0.4).
+    output_schema: SchemaRef,
+}
+
+impl ProjectOp {
+    /// Create a projection operator from named expressions.
     ///
-    /// `exprs` is an ordered list of expressions defining the output columns.
-    /// `output_codec` encodes the resulting Arrow row back to `(key, value)`.
-    pub fn with_datafusion_exprs(
-        name: impl Into<String>,
-        exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
-        input_codec: Arc<dyn RowCodec>,
-        output_codec: Arc<dyn RowCodec>,
-    ) -> Self {
-        let project: ProjectFn = Arc::new(move |key: &[u8], value: &[u8]| {
-            let row = ZSetRow {
-                key: key.to_vec(),
-                value: value.to_vec(),
-                weight: 1,
-            };
-            let batch = input_codec.encode_batch(&[row]);
-
-            // Evaluate each expression to produce output columns.
-            let result_columns: Vec<_> = exprs
-                .iter()
-                .map(|expr| {
-                    expr.evaluate(&batch)
-                        .expect("DataFusion projection expression failed")
-                        .into_array(1)
-                        .expect("empty array from projection")
-                })
-                .collect();
-
-            // Build output RecordBatch from evaluated columns.
-            let out_schema = output_codec.schema();
-            let out_batch = arrow::record_batch::RecordBatch::try_new(out_schema, result_columns)
-                .expect("projection output RecordBatch construction failed");
-
-            output_codec.decode_batch_single(&out_batch)
-        });
-
-        Self {
-            project,
-            name: name.into(),
+    /// For v0.4, all output columns are `Int64`.
+    pub fn new(exprs: Vec<NamedExpr>) -> Self {
+        let fields: Vec<Field> = exprs
+            .iter()
+            .map(|ne| Field::new(&ne.name, DataType::Int64, false))
+            .collect();
+        let output_schema = Arc::new(Schema::new(fields));
+        ProjectOp {
+            exprs,
+            output_schema,
         }
+    }
+
+    /// Apply the projection to a single delta batch.
+    pub fn apply(&self, input: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        if input.is_empty() {
+            return Ok(ArrowZSet::empty(self.output_schema.clone()));
+        }
+        let cols: Vec<Arc<dyn arrow::array::Array>> = self
+            .exprs
+            .iter()
+            .map(|ne| eval_to_array(&ne.expr, &input.data))
+            .collect::<Result<Vec<_>, _>>()?;
+        let new_data =
+            RecordBatch::try_new(self.output_schema.clone(), cols).map_err(OpError::arrow)?;
+        Ok(ArrowZSet::new(new_data, input.weights))
     }
 }
 
-#[async_trait::async_trait]
-impl Operator for ProjectOperator {
-    async fn process(
-        &mut self,
-        input: &rockstream_types::batch::SourceBatch,
-    ) -> rockstream_types::batch::SinkBatch {
-        rockstream_types::batch::SinkBatch {
-            record_count: input.record_count,
-            epoch: input.epoch,
-        }
+impl Operator for ProjectOp {
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.apply(delta)
     }
-
-    async fn process_delta(&mut self, input: &ZSetBatch) -> ZSetBatch {
-        let mut out = rockstream_types::batch::ZSet::new();
-        for row in input.zset.iter() {
-            if let Some((new_key, new_value)) = (self.project)(&row.key, &row.value) {
-                out.insert(new_key, new_value, row.weight);
-            }
-        }
-        ZSetBatch {
-            zset: out,
-            epoch: input.epoch,
-        }
-    }
-
-    async fn epoch_complete(&mut self, _epoch: Epoch) {}
 
     fn name(&self) -> &str {
-        &self.name
+        "ProjectOp"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::lit;
+    use arrow::array::Int64Array;
+    use rockstream_plan::{BinaryOp, Expr};
+
+    /// Build: `SELECT a AS a, b*2 AS c`
+    fn project_a_b2() -> ProjectOp {
+        ProjectOp::new(vec![
+            NamedExpr::new("a", Expr::Column(0)),
+            NamedExpr::new(
+                "c",
+                Expr::BinaryOp {
+                    op: BinaryOp::Mul,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(lit(2)),
+                },
+            ),
+        ])
     }
 
-    fn merge_law(&self) -> Option<MergeLawId> {
-        None
+    #[test]
+    fn project_basic() {
+        let input = ArrowZSet::from_ab_rows(&[(1, 3), (2, 6)], 1);
+        let op = project_a_b2();
+        let out = op.apply(input).unwrap();
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(out.schema().field(0).name(), "a");
+        assert_eq!(out.schema().field(1).name(), "c");
+        let a_col = out
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let c_col = out
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(a_col.value(0), 1);
+        assert_eq!(c_col.value(0), 6); // 3*2
+        assert_eq!(a_col.value(1), 2);
+        assert_eq!(c_col.value(1), 12); // 6*2
+    }
+
+    #[test]
+    fn project_preserves_weights() {
+        let mut zs = ArrowZSet::from_ab_rows(&[(1, 3), (2, 6)], 1);
+        zs.weights = vec![1, -1];
+        let op = project_a_b2();
+        let out = op.apply(zs).unwrap();
+        assert_eq!(out.weights, vec![1, -1]);
+    }
+
+    #[test]
+    fn project_empty_input() {
+        let input = ArrowZSet::from_ab_rows(&[], 1);
+        let op = project_a_b2();
+        let out = op.apply(input).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(out.schema().field(0).name(), "a");
     }
 }

@@ -1,105 +1,93 @@
-//! Same-worker loopback exchange channel.
-//!
-//! `LoopbackChannel` wraps a bounded `tokio::mpsc` channel.  Because source
-//! and target live in the same process, **zero network calls** are made.
-//! This is verifiable: [`LoopbackChannel::network_call_count`] is always 0.
-//!
-//! The channel capacity controls backpressure: a slow receiver will cause
-//! the sender's `send` to await when the channel is full, naturally slowing
-//! the pipeline without unbounded buffering.
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use rockstream_ops::zset::ArrowZSet;
+use rockstream_storage::shard_db::ShardDb;
+use rockstream_types::ids::ShardId;
 
-/// A single exchange batch: a vector of `(key_bytes, value_bytes)` pairs.
-pub type ExchangeBatch = Vec<(Vec<u8>, Vec<u8>)>;
+use crate::client::ShardState;
+use crate::exchange::persistence::{delete_outbox, persist_inbox, persist_outbox};
+use crate::exchange::serialization::{deserialize_zset, serialize_zset};
+use crate::exchange::service::ExchangeRegistry;
 
-/// Sender half of a same-worker loopback channel.
+/// Routes exchange batches locally within the same worker process.
 #[derive(Clone)]
-pub struct LoopbackChannel {
-    tx: mpsc::Sender<ExchangeBatch>,
+pub struct LoopbackRouter {
+    registry: ExchangeRegistry,
+    active_shards: Arc<RwLock<HashMap<ShardId, ShardState>>>,
 }
 
-/// Receiver half of a same-worker loopback channel.
-pub struct LoopbackReceiver {
-    rx: mpsc::Receiver<ExchangeBatch>,
-}
-
-impl LoopbackChannel {
-    /// Create a new loopback channel pair.
-    ///
-    /// `capacity` sets the number of in-flight batches before back-pressure
-    /// kicks in; 64 is a reasonable default.
-    pub fn new(capacity: usize) -> (Self, LoopbackReceiver) {
-        let (tx, rx) = mpsc::channel(capacity);
-        (LoopbackChannel { tx }, LoopbackReceiver { rx })
+impl LoopbackRouter {
+    /// Create a new LoopbackRouter.
+    pub fn new(
+        registry: ExchangeRegistry,
+        active_shards: Arc<RwLock<HashMap<ShardId, ShardState>>>,
+    ) -> Self {
+        LoopbackRouter {
+            registry,
+            active_shards,
+        }
     }
 
-    /// Send a batch through the in-process channel.
+    /// Retrieve the ShardDb for a given shard.
+    fn get_db(&self, shard_id: ShardId) -> Result<ShardDb, String> {
+        let shards = self.active_shards.read();
+        shards
+            .get(&shard_id)
+            .and_then(|state| state.db.clone())
+            .ok_or_else(|| format!("Shard db not active for shard {:?}", shard_id))
+    }
+
+    /// Route a batch over the loopback path.
     ///
-    /// Awaits if the channel is full (credit backpressure in effect).
-    pub async fn send(
+    /// Persists outbox metadata to the source shard db, inbox metadata to the
+    /// target shard db, and forwards the ZSet directly to the target inlet.
+    pub async fn route_loopback(
         &self,
-        batch: ExchangeBatch,
-    ) -> Result<(), mpsc::error::SendError<ExchangeBatch>> {
-        self.tx.send(batch).await
-    }
+        exchange_id: u64,
+        src_shard: u32,
+        target_shard: u32,
+        epoch: u64,
+        seq: u64,
+        zset: &ArrowZSet,
+    ) -> Result<(), String> {
+        let src_db = self.get_db(ShardId(src_shard as u64))?;
+        let target_db = self.get_db(ShardId(target_shard as u64))?;
 
-    /// Number of network calls made by this channel.
-    ///
-    /// Always 0: the loopback path never crosses the network boundary.
-    pub fn network_call_count(&self) -> u64 {
-        0
-    }
-}
+        // 1. Serialize payload to bytes (Arrow IPC)
+        let payload = serialize_zset(zset)?;
 
-impl LoopbackReceiver {
-    /// Receive the next batch, or `None` if all senders have been dropped.
-    pub async fn recv(&mut self) -> Option<ExchangeBatch> {
-        self.rx.recv().await
-    }
-}
+        // 2. Persist to outbox on the source shard db
+        persist_outbox(&src_db, exchange_id, target_shard, epoch, seq, &payload).await?;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+        // 3. Persist to inbox on the target shard db
+        persist_inbox(&target_db, exchange_id, src_shard, epoch, seq, &payload).await?;
 
-    #[tokio::test]
-    async fn loopback_roundtrip() {
-        let (ch, mut rx) = LoopbackChannel::new(16);
-        let batch = vec![(b"key1".to_vec(), b"val1".to_vec())];
-        ch.send(batch.clone()).await.expect("send ok");
-        let received = rx.recv().await.expect("recv ok");
-        assert_eq!(received, batch);
-    }
+        // 4. Look up target inlet
+        let inlet = self
+            .registry
+            .get(exchange_id, target_shard)
+            .ok_or_else(|| {
+                format!(
+                    "No local inlet registered for exchange={}, shard={}",
+                    exchange_id, target_shard
+                )
+            })?;
 
-    #[tokio::test]
-    async fn loopback_zero_network_calls() {
-        let (ch, _rx) = LoopbackChannel::new(8);
-        assert_eq!(ch.network_call_count(), 0);
-        let _ch2 = ch.clone();
-        assert_eq!(_ch2.network_call_count(), 0);
-    }
+        // 5. Deserialize to ensure same-process loopback matches wire format verification
+        let recovered_zset = deserialize_zset(&payload, inlet.schema.clone())?;
 
-    #[tokio::test]
-    async fn loopback_sender_drop_closes_receiver() {
-        let (ch, mut rx) = LoopbackChannel::new(8);
-        drop(ch);
-        assert!(rx.recv().await.is_none());
-    }
+        // 6. Forward to local inlet channel
+        inlet
+            .sender
+            .send(recovered_zset)
+            .await
+            .map_err(|e| format!("Failed to forward to local inlet: {:?}", e))?;
 
-    #[tokio::test]
-    async fn loopback_multiple_batches() {
-        let (ch, mut rx) = LoopbackChannel::new(8);
-        for i in 0u8..4 {
-            ch.send(vec![(vec![i], vec![i * 2])])
-                .await
-                .expect("send ok");
-        }
-        drop(ch);
-        let mut count = 0usize;
-        while rx.recv().await.is_some() {
-            count += 1;
-        }
-        assert_eq!(count, 4);
+        // 7. Delete from outbox once successfully delivered
+        delete_outbox(&src_db, exchange_id, target_shard, epoch, seq).await?;
+
+        Ok(())
     }
 }

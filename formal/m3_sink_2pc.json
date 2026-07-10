@@ -1,0 +1,4721 @@
+{
+  "sourceInfo": {
+    "fileName": "m3_sink_2pc.fizz",
+    "start": {
+      "line": 18,
+      "column": 1
+    },
+    "end": {
+      "line": 280
+    }
+  },
+  "invariants": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 206,
+          "column": 1
+        },
+        "end": {
+          "line": 221
+        }
+      },
+      "name": "M3_S1_NoDuplicateDelivery",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 207,
+            "column": 5
+          },
+          "end": {
+            "line": 221
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 207,
+                "column": 5
+              },
+              "end": {
+                "line": 208,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 207,
+                  "column": 5
+                },
+                "end": {
+                  "line": 207,
+                  "column": 24
+                }
+              },
+              "code": "ext = externalsystem"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 208,
+                "column": 5
+              },
+              "end": {
+                "line": 210,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 208,
+                  "column": 5
+                },
+                "end": {
+                  "line": 208,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 210,
+                "column": 5
+              },
+              "end": {
+                "line": 214,
+                "column": 4
+              }
+            },
+            "forStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 210,
+                  "column": 5
+                },
+                "end": {
+                  "line": 214,
+                  "column": 4
+                }
+              },
+              "loopVars": [
+                "epoch"
+              ],
+              "pyExpr": "ext.delivered_epochs",
+              "block": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 211,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 214,
+                    "column": 4
+                  }
+                },
+                "stmts": [
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 211,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 214,
+                        "column": 4
+                      }
+                    },
+                    "ifStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 211,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 214,
+                          "column": 4
+                        }
+                      },
+                      "branches": [
+                        {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 211,
+                              "column": 12
+                            },
+                            "end": {
+                              "line": 214,
+                              "column": 4
+                            }
+                          },
+                          "condition": "s.sink_pending_epoch == epoch",
+                          "block": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 212,
+                                "column": 13
+                              },
+                              "end": {
+                                "line": 214,
+                                "column": 4
+                              }
+                            },
+                            "stmts": [
+                              {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 212,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 214,
+                                    "column": 4
+                                  }
+                                },
+                                "ifStmt": {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 212,
+                                      "column": 13
+                                    },
+                                    "end": {
+                                      "line": 214,
+                                      "column": 4
+                                    }
+                                  },
+                                  "branches": [
+                                    {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 212,
+                                          "column": 16
+                                        },
+                                        "end": {
+                                          "line": 214,
+                                          "column": 4
+                                        }
+                                      },
+                                      "condition": "s.sink_state == 0",
+                                      "block": {
+                                        "sourceInfo": {
+                                          "start": {
+                                            "line": 213,
+                                            "column": 17
+                                          },
+                                          "end": {
+                                            "line": 214,
+                                            "column": 4
+                                          }
+                                        },
+                                        "stmts": [
+                                          {
+                                            "sourceInfo": {
+                                              "start": {
+                                                "line": 213,
+                                                "column": 17
+                                              },
+                                              "end": {
+                                                "line": 214,
+                                                "column": 4
+                                              }
+                                            },
+                                            "returnStmt": {
+                                              "sourceInfo": {
+                                                "start": {
+                                                  "line": 213,
+                                                  "column": 17
+                                                },
+                                                "end": {
+                                                  "line": 213,
+                                                  "column": 28
+                                                }
+                                              },
+                                              "pyExpr": "False",
+                                              "expr": {
+                                                "sourceInfo": {
+                                                  "start": {
+                                                    "line": 213,
+                                                    "column": 24
+                                                  },
+                                                  "end": {
+                                                    "line": 213,
+                                                    "column": 28
+                                                  }
+                                                },
+                                                "pyExpr": "False"
+                                              }
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      "conditionExpr": {
+                                        "sourceInfo": {
+                                          "start": {
+                                            "line": 212,
+                                            "column": 16
+                                          },
+                                          "end": {
+                                            "line": 212,
+                                            "column": 32
+                                          }
+                                        },
+                                        "pyExpr": "s.sink_state == 0"
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            ]
+                          },
+                          "conditionExpr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 211,
+                                "column": 12
+                              },
+                              "end": {
+                                "line": 211,
+                                "column": 40
+                              }
+                            },
+                            "pyExpr": "s.sink_pending_epoch == epoch"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 210,
+                    "column": 18
+                  },
+                  "end": {
+                    "line": 210,
+                    "column": 37
+                  }
+                },
+                "pyExpr": "ext.delivered_epochs"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 214,
+                "column": 5
+              },
+              "end": {
+                "line": 221
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 214,
+                  "column": 5
+                },
+                "end": {
+                  "line": 214,
+                  "column": 15
+                }
+              },
+              "pyExpr": "True",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 214,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 214,
+                    "column": 15
+                  }
+                },
+                "pyExpr": "True"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M3_S1_NoDuplicateDelivery():\n    ext = externalsystem\n    s = shard\n    # If an epoch is delivered, its sink_state must be PreCommitted or Committed.\n    for epoch in ext.delivered_epochs:\n        if s.sink_pending_epoch == epoch:\n            if s.sink_state == 0:  # Idle \u2014 should not be delivered without staging\n                return False\n    return True\n\n# M3-S2: No lost delivery (conditional on cluster checkpoint).\n# If a cluster checkpoint has committed epoch e, then eventually\n# delivered_epochs must contain e.\n# (Liveness half is M3-L1; here we check the safety prefix: if committed AND\n# the sink phase is Committed, it must appear in delivered_epochs.)\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 221,
+          "column": 1
+        },
+        "end": {
+          "line": 238
+        }
+      },
+      "name": "M3_S2_NoLostDelivery",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 222,
+            "column": 5
+          },
+          "end": {
+            "line": 238
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 222,
+                "column": 5
+              },
+              "end": {
+                "line": 223,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 222,
+                  "column": 5
+                },
+                "end": {
+                  "line": 222,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 223,
+                "column": 5
+              },
+              "end": {
+                "line": 224,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 223,
+                  "column": 5
+                },
+                "end": {
+                  "line": 223,
+                  "column": 24
+                }
+              },
+              "code": "ext = externalsystem"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 224,
+                "column": 5
+              },
+              "end": {
+                "line": 226,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 224,
+                  "column": 5
+                },
+                "end": {
+                  "line": 224,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 226,
+                "column": 5
+              },
+              "end": {
+                "line": 229,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 226,
+                  "column": 5
+                },
+                "end": {
+                  "line": 229,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 226,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 229,
+                      "column": 4
+                    }
+                  },
+                  "condition": "sk.phase == 2",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 227,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 229,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 227,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 229,
+                            "column": 4
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 227,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 229,
+                              "column": 4
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 227,
+                                  "column": 12
+                                },
+                                "end": {
+                                  "line": 229,
+                                  "column": 4
+                                }
+                              },
+                              "condition": "sk.staged_epoch not in ext.delivered_epochs",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 228,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 229,
+                                    "column": 4
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 228,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 229,
+                                        "column": 4
+                                      }
+                                    },
+                                    "returnStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 228,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 228,
+                                          "column": 24
+                                        }
+                                      },
+                                      "pyExpr": "False",
+                                      "expr": {
+                                        "sourceInfo": {
+                                          "start": {
+                                            "line": 228,
+                                            "column": 20
+                                          },
+                                          "end": {
+                                            "line": 228,
+                                            "column": 24
+                                          }
+                                        },
+                                        "pyExpr": "False"
+                                      }
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 227,
+                                    "column": 12
+                                  },
+                                  "end": {
+                                    "line": 227,
+                                    "column": 54
+                                  }
+                                },
+                                "pyExpr": "sk.staged_epoch not in ext.delivered_epochs"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 226,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 226,
+                        "column": 20
+                      }
+                    },
+                    "pyExpr": "sk.phase == 2"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 229,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 229,
+                  "column": 5
+                },
+                "end": {
+                  "line": 233,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 229,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 233,
+                      "column": 4
+                    }
+                  },
+                  "condition": "s.sink_state == 2",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 231,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 233,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 231,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 233,
+                            "column": 4
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 231,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 233,
+                              "column": 4
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 231,
+                                  "column": 12
+                                },
+                                "end": {
+                                  "line": 233,
+                                  "column": 4
+                                }
+                              },
+                              "condition": "s.sink_pending_epoch > 0 and s.sink_pending_epoch not in ext.delivered_epochs",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 232,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 233,
+                                    "column": 4
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 232,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 233,
+                                        "column": 4
+                                      }
+                                    },
+                                    "returnStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 232,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 232,
+                                          "column": 24
+                                        }
+                                      },
+                                      "pyExpr": "False",
+                                      "expr": {
+                                        "sourceInfo": {
+                                          "start": {
+                                            "line": 232,
+                                            "column": 20
+                                          },
+                                          "end": {
+                                            "line": 232,
+                                            "column": 24
+                                          }
+                                        },
+                                        "pyExpr": "False"
+                                      }
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 231,
+                                    "column": 12
+                                  },
+                                  "end": {
+                                    "line": 231,
+                                    "column": 88
+                                  }
+                                },
+                                "pyExpr": "s.sink_pending_epoch > 0 and s.sink_pending_epoch not in ext.delivered_epochs"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 229,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 229,
+                        "column": 24
+                      }
+                    },
+                    "pyExpr": "s.sink_state == 2"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 233,
+                "column": 5
+              },
+              "end": {
+                "line": 238
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 233,
+                  "column": 5
+                },
+                "end": {
+                  "line": 233,
+                  "column": 15
+                }
+              },
+              "pyExpr": "True",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 233,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 233,
+                    "column": 15
+                  }
+                },
+                "pyExpr": "True"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M3_S2_NoLostDelivery():\n    sk = sinkconnector\n    ext = externalsystem\n    s = shard\n    # If the sink has committed an epoch, it must be in delivered_epochs.\n    if sk.phase == 2:\n        if sk.staged_epoch not in ext.delivered_epochs:\n            return False\n    if s.sink_state == 2:\n        # Committed state: epoch should be delivered.\n        if s.sink_pending_epoch > 0 and s.sink_pending_epoch not in ext.delivered_epochs:\n            return False\n    return True\n\n# M3-S3: Checkpoint-coupled commit.\n# A sink epoch transitions to Committed only after cluster_committed >= that epoch.\n# Composed with M1's cluster_committed predicate.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 238,
+          "column": 1
+        },
+        "end": {
+          "line": 257
+        }
+      },
+      "name": "M3_S3_CheckpointCoupledCommit",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 239,
+            "column": 5
+          },
+          "end": {
+            "line": 257
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 239,
+                "column": 5
+              },
+              "end": {
+                "line": 240,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 239,
+                  "column": 5
+                },
+                "end": {
+                  "line": 239,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 240,
+                "column": 5
+              },
+              "end": {
+                "line": 242,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 240,
+                  "column": 5
+                },
+                "end": {
+                  "line": 240,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 242,
+                "column": 5
+              },
+              "end": {
+                "line": 246,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 242,
+                  "column": 5
+                },
+                "end": {
+                  "line": 246,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 242,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 246,
+                      "column": 4
+                    }
+                  },
+                  "condition": "sk.phase == 2",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 243,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 246,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 243,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 246,
+                            "column": 4
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 243,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 246,
+                              "column": 4
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 243,
+                                  "column": 12
+                                },
+                                "end": {
+                                  "line": 246,
+                                  "column": 4
+                                }
+                              },
+                              "condition": "cp.cluster_committed < sk.staged_epoch",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 244,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 246,
+                                    "column": 4
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 244,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 246,
+                                        "column": 4
+                                      }
+                                    },
+                                    "returnStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 244,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 244,
+                                          "column": 24
+                                        }
+                                      },
+                                      "pyExpr": "False",
+                                      "expr": {
+                                        "sourceInfo": {
+                                          "start": {
+                                            "line": 244,
+                                            "column": 20
+                                          },
+                                          "end": {
+                                            "line": 244,
+                                            "column": 24
+                                          }
+                                        },
+                                        "pyExpr": "False"
+                                      }
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 243,
+                                    "column": 12
+                                  },
+                                  "end": {
+                                    "line": 243,
+                                    "column": 49
+                                  }
+                                },
+                                "pyExpr": "cp.cluster_committed < sk.staged_epoch"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 242,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 242,
+                        "column": 20
+                      }
+                    },
+                    "pyExpr": "sk.phase == 2"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 246,
+                "column": 5
+              },
+              "end": {
+                "line": 247,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 246,
+                  "column": 5
+                },
+                "end": {
+                  "line": 246,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 247,
+                "column": 5
+              },
+              "end": {
+                "line": 250,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 247,
+                  "column": 5
+                },
+                "end": {
+                  "line": 250,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 247,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 250,
+                      "column": 4
+                    }
+                  },
+                  "condition": "s.sink_state == 2",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 248,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 250,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 248,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 250,
+                            "column": 4
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 248,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 250,
+                              "column": 4
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 248,
+                                  "column": 12
+                                },
+                                "end": {
+                                  "line": 250,
+                                  "column": 4
+                                }
+                              },
+                              "condition": "s.sink_pending_epoch > 0 and cp.cluster_committed < s.sink_pending_epoch",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 249,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 250,
+                                    "column": 4
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 249,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 250,
+                                        "column": 4
+                                      }
+                                    },
+                                    "returnStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 249,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 249,
+                                          "column": 24
+                                        }
+                                      },
+                                      "pyExpr": "False",
+                                      "expr": {
+                                        "sourceInfo": {
+                                          "start": {
+                                            "line": 249,
+                                            "column": 20
+                                          },
+                                          "end": {
+                                            "line": 249,
+                                            "column": 24
+                                          }
+                                        },
+                                        "pyExpr": "False"
+                                      }
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 248,
+                                    "column": 12
+                                  },
+                                  "end": {
+                                    "line": 248,
+                                    "column": 83
+                                  }
+                                },
+                                "pyExpr": "s.sink_pending_epoch > 0 and cp.cluster_committed < s.sink_pending_epoch"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 247,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 247,
+                        "column": 24
+                      }
+                    },
+                    "pyExpr": "s.sink_state == 2"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 250,
+                "column": 5
+              },
+              "end": {
+                "line": 257
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 250,
+                  "column": 5
+                },
+                "end": {
+                  "line": 250,
+                  "column": 15
+                }
+              },
+              "pyExpr": "True",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 250,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 250,
+                    "column": 15
+                  }
+                },
+                "pyExpr": "True"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M3_S3_CheckpointCoupledCommit():\n    sk = sinkconnector\n    cp = controlplane\n    # If the sink is in Committed phase, the cluster must have committed the epoch.\n    if sk.phase == 2:\n        if cp.cluster_committed < sk.staged_epoch:\n            return False\n    # Also check durable state: sink_state=Committed implies cluster_committed >= epoch.\n    s = shard\n    if s.sink_state == 2:\n        if s.sink_pending_epoch > 0 and cp.cluster_committed < s.sink_pending_epoch:\n            return False\n    return True\n\n# M3-S4: Recovery dispatch idempotency.\n# For each SinkIdempotencyProfile, the recovery path from every crash point\n# reaches the correct terminal state (Committed or Idle).\n# Modelled as: after recovery, the sink either commits idempotently or\n# stays in a valid state (PreCommitted waiting for cluster checkpoint).\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 257,
+          "column": 1
+        },
+        "end": {
+          "line": 272
+        }
+      },
+      "name": "M3_S4_RecoveryDispatchIdempotency",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 258,
+            "column": 5
+          },
+          "end": {
+            "line": 272
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 258,
+                "column": 5
+              },
+              "end": {
+                "line": 259,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 258,
+                  "column": 5
+                },
+                "end": {
+                  "line": 258,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 259,
+                "column": 5
+              },
+              "end": {
+                "line": 264,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 259,
+                  "column": 5
+                },
+                "end": {
+                  "line": 259,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 264,
+                "column": 5
+              },
+              "end": {
+                "line": 267,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 264,
+                  "column": 5
+                },
+                "end": {
+                  "line": 267,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 264,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 267,
+                      "column": 4
+                    }
+                  },
+                  "condition": "s.sink_state == 2 and sk.phase == 1",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 266,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 267,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 266,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 267,
+                            "column": 4
+                          }
+                        },
+                        "returnStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 266,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 266,
+                              "column": 20
+                            }
+                          },
+                          "pyExpr": "False",
+                          "expr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 266,
+                                "column": 16
+                              },
+                              "end": {
+                                "line": 266,
+                                "column": 20
+                              }
+                            },
+                            "pyExpr": "False"
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 264,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 264,
+                        "column": 42
+                      }
+                    },
+                    "pyExpr": "s.sink_state == 2 and sk.phase == 1"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 267,
+                "column": 5
+              },
+              "end": {
+                "line": 272
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 267,
+                  "column": 5
+                },
+                "end": {
+                  "line": 267,
+                  "column": 15
+                }
+              },
+              "pyExpr": "True",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 267,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 267,
+                    "column": 15
+                  }
+                },
+                "pyExpr": "True"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M3_S4_RecoveryDispatchIdempotency():\n    sk = sinkconnector\n    s = shard\n    # If sink durable state is PreCommitted but ephemeral is Idle,\n    # the next action must be RecoverFromCrash (no permanent stuck state).\n    # We assert the invariant: durable and ephemeral states are consistent\n    # once recovery has run (i.e. no impossible combinations exist).\n    if s.sink_state == 2 and sk.phase == 1:\n        # Durable says Committed but ephemeral says PreCommitted \u2192 impossible.\n        return False\n    return True\n\n# M3-L1: Delivery progress.\n# Under fair commit and recovery actions, every epoch that reaches\n# cluster_committed is eventually added to delivered_epochs.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 272,
+          "column": 1
+        },
+        "end": {
+          "line": 278
+        }
+      },
+      "name": "M3_L1_DeliveryProgress",
+      "temporalOperators": [
+        "always",
+        "eventually"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 273,
+            "column": 5
+          },
+          "end": {
+            "line": 278
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 273,
+                "column": 5
+              },
+              "end": {
+                "line": 278
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 273,
+                  "column": 5
+                },
+                "end": {
+                  "line": 273,
+                  "column": 36
+                }
+              },
+              "pyExpr": "delivery_progress_reached",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 273,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 273,
+                    "column": 36
+                  }
+                },
+                "pyExpr": "delivery_progress_reached"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M3_L1_DeliveryProgress():\n    return delivery_progress_reached\n\n# \u2500\u2500\u2500 Coverage \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n# COV-M3: A state exists where the sink crashes between pre_commit and commit.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 278,
+          "column": 1
+        },
+        "end": {
+          "line": 280
+        }
+      },
+      "name": "COV_M3",
+      "temporalOperators": [
+        "exists"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 279,
+            "column": 5
+          },
+          "end": {
+            "line": 280
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 279,
+                "column": 5
+              },
+              "end": {
+                "line": 280
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 279,
+                  "column": 5
+                },
+                "end": {
+                  "line": 279,
+                  "column": 50
+                }
+              },
+              "pyExpr": "crash_between_precommit_commit_observed",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 279,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 279,
+                    "column": 50
+                  }
+                },
+                "pyExpr": "crash_between_precommit_commit_observed"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def COV_M3():\n    return crash_between_precommit_commit_observed\n"
+    }
+  ],
+  "actions": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 28,
+          "column": 1
+        },
+        "end": {
+          "line": 35
+        }
+      },
+      "name": "Init",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_STRONG"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 30,
+            "column": 5
+          },
+          "end": {
+            "line": 35
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 30,
+                "column": 5
+              },
+              "end": {
+                "line": 31,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 30,
+                  "column": 5
+                },
+                "end": {
+                  "line": 30,
+                  "column": 51
+                }
+              },
+              "code": "crash_between_precommit_commit_observed = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 31,
+                "column": 5
+              },
+              "end": {
+                "line": 32,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 31,
+                  "column": 5
+                },
+                "end": {
+                  "line": 31,
+                  "column": 40
+                }
+              },
+              "code": "duplicate_delivery_attempted = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 32,
+                "column": 5
+              },
+              "end": {
+                "line": 35
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 32,
+                  "column": 5
+                },
+                "end": {
+                  "line": 32,
+                  "column": 37
+                }
+              },
+              "code": "delivery_progress_reached = False"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 77,
+          "column": 1
+        },
+        "end": {
+          "line": 87
+        }
+      },
+      "name": "AdvanceShardEpoch",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 77,
+            "column": 8
+          },
+          "end": {
+            "line": 77,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 78,
+            "column": 5
+          },
+          "end": {
+            "line": 87
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 78,
+                "column": 5
+              },
+              "end": {
+                "line": 79,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 78,
+                  "column": 5
+                },
+                "end": {
+                  "line": 78,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 79,
+                "column": 5
+              },
+              "end": {
+                "line": 80,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 79,
+                  "column": 5
+                },
+                "end": {
+                  "line": 79,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 80,
+                "column": 5
+              },
+              "end": {
+                "line": 81,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 80,
+                  "column": 5
+                },
+                "end": {
+                  "line": 80,
+                  "column": 41
+                }
+              },
+              "condition": "s.committed_epoch < MAX_EPOCH",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 80,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 80,
+                    "column": 41
+                  }
+                },
+                "pyExpr": "s.committed_epoch < MAX_EPOCH"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 81,
+                "column": 5
+              },
+              "end": {
+                "line": 83,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 81,
+                  "column": 5
+                },
+                "end": {
+                  "line": 81,
+                  "column": 45
+                }
+              },
+              "code": "s.committed_epoch = s.committed_epoch + 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 83,
+                "column": 5
+              },
+              "end": {
+                "line": 87
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 83,
+                  "column": 5
+                },
+                "end": {
+                  "line": 83,
+                  "column": 44
+                }
+              },
+              "code": "cp.cluster_committed = s.committed_epoch"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 87,
+          "column": 1
+        },
+        "end": {
+          "line": 106
+        }
+      },
+      "name": "SinkPreCommit",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 87,
+            "column": 8
+          },
+          "end": {
+            "line": 87,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 88,
+            "column": 5
+          },
+          "end": {
+            "line": 106
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 88,
+                "column": 5
+              },
+              "end": {
+                "line": 89,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 88,
+                  "column": 5
+                },
+                "end": {
+                  "line": 88,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 89,
+                "column": 5
+              },
+              "end": {
+                "line": 90,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 89,
+                  "column": 5
+                },
+                "end": {
+                  "line": 89,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 90,
+                "column": 5
+              },
+              "end": {
+                "line": 91,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 90,
+                  "column": 5
+                },
+                "end": {
+                  "line": 90,
+                  "column": 25
+                }
+              },
+              "condition": "sk.phase == 0",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 90,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 90,
+                    "column": 25
+                  }
+                },
+                "pyExpr": "sk.phase == 0"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 91,
+                "column": 5
+              },
+              "end": {
+                "line": 92,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 91,
+                  "column": 5
+                },
+                "end": {
+                  "line": 91,
+                  "column": 47
+                }
+              },
+              "condition": "s.committed_epoch > sk.staged_epoch",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 91,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 91,
+                    "column": 47
+                  }
+                },
+                "pyExpr": "s.committed_epoch > sk.staged_epoch"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 92,
+                "column": 5
+              },
+              "end": {
+                "line": 94,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 92,
+                  "column": 5
+                },
+                "end": {
+                  "line": 92,
+                  "column": 36
+                }
+              },
+              "code": "target_epoch = s.committed_epoch"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 94,
+                "column": 5
+              },
+              "end": {
+                "line": 95,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 94,
+                  "column": 5
+                },
+                "end": {
+                  "line": 94,
+                  "column": 20
+                }
+              },
+              "code": "s.sink_state = 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 95,
+                "column": 5
+              },
+              "end": {
+                "line": 96,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 95,
+                  "column": 5
+                },
+                "end": {
+                  "line": 95,
+                  "column": 39
+                }
+              },
+              "code": "s.sink_pending_epoch = target_epoch"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 96,
+                "column": 5
+              },
+              "end": {
+                "line": 97,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 96,
+                  "column": 5
+                },
+                "end": {
+                  "line": 96,
+                  "column": 16
+                }
+              },
+              "code": "sk.phase = 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 97,
+                "column": 5
+              },
+              "end": {
+                "line": 100,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 97,
+                  "column": 5
+                },
+                "end": {
+                  "line": 97,
+                  "column": 34
+                }
+              },
+              "code": "sk.staged_epoch = target_epoch"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 100,
+                "column": 5
+              },
+              "end": {
+                "line": 106
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 100,
+                  "column": 5
+                },
+                "end": {
+                  "line": 106
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 100,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 106
+                    }
+                  },
+                  "condition": "SINK_PROFILE == 1",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 101,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 106
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 101,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 102,
+                            "column": 8
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 101,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 101,
+                              "column": 28
+                            }
+                          },
+                          "code": "ext = externalsystem"
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 102,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 106
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 102,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 102,
+                              "column": 49
+                            }
+                          },
+                          "code": "ext.fencing_token = ext.fencing_token + 1"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 100,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 100,
+                        "column": 24
+                      }
+                    },
+                    "pyExpr": "SINK_PROFILE == 1"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 106,
+          "column": 1
+        },
+        "end": {
+          "line": 115
+        }
+      },
+      "name": "CrashBeforePreCommit",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 107,
+            "column": 5
+          },
+          "end": {
+            "line": 115
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 107,
+                "column": 5
+              },
+              "end": {
+                "line": 108,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 107,
+                  "column": 5
+                },
+                "end": {
+                  "line": 107,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 108,
+                "column": 5
+              },
+              "end": {
+                "line": 110,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 108,
+                  "column": 5
+                },
+                "end": {
+                  "line": 108,
+                  "column": 25
+                }
+              },
+              "condition": "sk.phase == 0",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 108,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 108,
+                    "column": 25
+                  }
+                },
+                "pyExpr": "sk.phase == 0"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 110,
+                "column": 5
+              },
+              "end": {
+                "line": 111,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 110,
+                  "column": 5
+                },
+                "end": {
+                  "line": 110,
+                  "column": 16
+                }
+              },
+              "code": "sk.phase = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 111,
+                "column": 5
+              },
+              "end": {
+                "line": 115
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 111,
+                  "column": 5
+                },
+                "end": {
+                  "line": 111,
+                  "column": 23
+                }
+              },
+              "code": "sk.staged_epoch = 0"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 115,
+          "column": 1
+        },
+        "end": {
+          "line": 126
+        }
+      },
+      "name": "CrashBetweenPreCommitAndCommit",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 116,
+            "column": 5
+          },
+          "end": {
+            "line": 126
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 116,
+                "column": 5
+              },
+              "end": {
+                "line": 117,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 116,
+                  "column": 5
+                },
+                "end": {
+                  "line": 116,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 117,
+                "column": 5
+              },
+              "end": {
+                "line": 119,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 117,
+                  "column": 5
+                },
+                "end": {
+                  "line": 117,
+                  "column": 25
+                }
+              },
+              "condition": "sk.phase == 1",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 117,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 117,
+                    "column": 25
+                  }
+                },
+                "pyExpr": "sk.phase == 1"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 121,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 119,
+                  "column": 5
+                },
+                "end": {
+                  "line": 119,
+                  "column": 50
+                }
+              },
+              "code": "crash_between_precommit_commit_observed = True"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 121,
+                "column": 5
+              },
+              "end": {
+                "line": 122,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 121,
+                  "column": 5
+                },
+                "end": {
+                  "line": 121,
+                  "column": 16
+                }
+              },
+              "code": "sk.phase = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 122,
+                "column": 5
+              },
+              "end": {
+                "line": 126
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 122,
+                  "column": 5
+                },
+                "end": {
+                  "line": 122,
+                  "column": 23
+                }
+              },
+              "code": "sk.staged_epoch = 0"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 126,
+          "column": 1
+        },
+        "end": {
+          "line": 139
+        }
+      },
+      "name": "RecoverFromCrash",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 126,
+            "column": 8
+          },
+          "end": {
+            "line": 126,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 127,
+            "column": 5
+          },
+          "end": {
+            "line": 139
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 127,
+                "column": 5
+              },
+              "end": {
+                "line": 128,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 127,
+                  "column": 5
+                },
+                "end": {
+                  "line": 127,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 129,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 128,
+                  "column": 5
+                },
+                "end": {
+                  "line": 128,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 129,
+                "column": 5
+              },
+              "end": {
+                "line": 130,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 129,
+                  "column": 5
+                },
+                "end": {
+                  "line": 129,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 130,
+                "column": 5
+              },
+              "end": {
+                "line": 131,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 130,
+                  "column": 5
+                },
+                "end": {
+                  "line": 130,
+                  "column": 25
+                }
+              },
+              "condition": "sk.phase == 0",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 130,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 130,
+                    "column": 25
+                  }
+                },
+                "pyExpr": "sk.phase == 0"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 131,
+                "column": 5
+              },
+              "end": {
+                "line": 132,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 131,
+                  "column": 5
+                },
+                "end": {
+                  "line": 131,
+                  "column": 29
+                }
+              },
+              "condition": "s.sink_state == 1",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 131,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 131,
+                    "column": 29
+                  }
+                },
+                "pyExpr": "s.sink_state == 1"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 132,
+                "column": 5
+              },
+              "end": {
+                "line": 134,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 132,
+                  "column": 5
+                },
+                "end": {
+                  "line": 132,
+                  "column": 39
+                }
+              },
+              "code": "target_epoch = s.sink_pending_epoch"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 134,
+                "column": 5
+              },
+              "end": {
+                "line": 135,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 134,
+                  "column": 5
+                },
+                "end": {
+                  "line": 134,
+                  "column": 34
+                }
+              },
+              "code": "sk.staged_epoch = target_epoch"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 135,
+                "column": 5
+              },
+              "end": {
+                "line": 139
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 135,
+                  "column": 5
+                },
+                "end": {
+                  "line": 135,
+                  "column": 16
+                }
+              },
+              "code": "sk.phase = 1"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 139,
+          "column": 1
+        },
+        "end": {
+          "line": 171
+        }
+      },
+      "name": "SinkCommit",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 139,
+            "column": 8
+          },
+          "end": {
+            "line": 139,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 140,
+            "column": 5
+          },
+          "end": {
+            "line": 171
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 140,
+                "column": 5
+              },
+              "end": {
+                "line": 141,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 140,
+                  "column": 5
+                },
+                "end": {
+                  "line": 140,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 141,
+                "column": 5
+              },
+              "end": {
+                "line": 142,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 141,
+                  "column": 5
+                },
+                "end": {
+                  "line": 141,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 142,
+                "column": 5
+              },
+              "end": {
+                "line": 143,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 142,
+                  "column": 5
+                },
+                "end": {
+                  "line": 142,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 143,
+                "column": 5
+              },
+              "end": {
+                "line": 144,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 143,
+                  "column": 5
+                },
+                "end": {
+                  "line": 143,
+                  "column": 24
+                }
+              },
+              "code": "ext = externalsystem"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 144,
+                "column": 5
+              },
+              "end": {
+                "line": 145,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 144,
+                  "column": 5
+                },
+                "end": {
+                  "line": 144,
+                  "column": 25
+                }
+              },
+              "condition": "sk.phase == 1",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 144,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 144,
+                    "column": 25
+                  }
+                },
+                "pyExpr": "sk.phase == 1"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 145,
+                "column": 5
+              },
+              "end": {
+                "line": 147,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 145,
+                  "column": 5
+                },
+                "end": {
+                  "line": 145,
+                  "column": 51
+                }
+              },
+              "condition": "cp.cluster_committed >= sk.staged_epoch",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 145,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 145,
+                    "column": 51
+                  }
+                },
+                "pyExpr": "cp.cluster_committed >= sk.staged_epoch"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 147,
+                "column": 5
+              },
+              "end": {
+                "line": 150,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 147,
+                  "column": 5
+                },
+                "end": {
+                  "line": 147,
+                  "column": 34
+                }
+              },
+              "code": "target_epoch = sk.staged_epoch"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 150,
+                "column": 5
+              },
+              "end": {
+                "line": 164,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 150,
+                  "column": 5
+                },
+                "end": {
+                  "line": 164,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 150,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 153,
+                      "column": 4
+                    }
+                  },
+                  "condition": "SINK_PROFILE == 0",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 152,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 153,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 152,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 153,
+                            "column": 4
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 152,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 152,
+                              "column": 68
+                            }
+                          },
+                          "code": "ext.delivered_epochs = ext.delivered_epochs | {target_epoch}"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 150,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 150,
+                        "column": 24
+                      }
+                    },
+                    "pyExpr": "SINK_PROFILE == 0"
+                  }
+                },
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 153,
+                      "column": 5
+                    },
+                    "end": {
+                      "line": 157,
+                      "column": 4
+                    }
+                  },
+                  "condition": "SINK_PROFILE == 1",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 155,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 157,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 155,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 156,
+                            "column": 8
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 155,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 155,
+                              "column": 68
+                            }
+                          },
+                          "code": "ext.delivered_epochs = ext.delivered_epochs | {target_epoch}"
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 156,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 157,
+                            "column": 4
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 156,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 156,
+                              "column": 39
+                            }
+                          },
+                          "code": "ext.tx_status[target_epoch] = 2"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 153,
+                        "column": 10
+                      },
+                      "end": {
+                        "line": 153,
+                        "column": 26
+                      }
+                    },
+                    "pyExpr": "SINK_PROFILE == 1"
+                  }
+                },
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 157,
+                      "column": 5
+                    },
+                    "end": {
+                      "line": 164,
+                      "column": 4
+                    }
+                  },
+                  "condition": "True",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 159,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 164,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 159,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 161,
+                            "column": 8
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 159,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 161,
+                              "column": 8
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 159,
+                                  "column": 12
+                                },
+                                "end": {
+                                  "line": 161,
+                                  "column": 8
+                                }
+                              },
+                              "condition": "target_epoch not in ext.delivered_epochs",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 160,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 161,
+                                    "column": 8
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 160,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 161,
+                                        "column": 8
+                                      }
+                                    },
+                                    "pyStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 160,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 160,
+                                          "column": 72
+                                        }
+                                      },
+                                      "code": "ext.delivered_epochs = ext.delivered_epochs | {target_epoch}"
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 159,
+                                    "column": 12
+                                  },
+                                  "end": {
+                                    "line": 159,
+                                    "column": 51
+                                  }
+                                },
+                                "pyExpr": "target_epoch not in ext.delivered_epochs"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 161,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 164,
+                            "column": 4
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 161,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 161,
+                              "column": 39
+                            }
+                          },
+                          "code": "ext.tx_status[target_epoch] = 2"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "pyExpr": "True"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 164,
+                "column": 5
+              },
+              "end": {
+                "line": 165,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 164,
+                  "column": 5
+                },
+                "end": {
+                  "line": 164,
+                  "column": 20
+                }
+              },
+              "code": "s.sink_state = 2"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 165,
+                "column": 5
+              },
+              "end": {
+                "line": 167,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 165,
+                  "column": 5
+                },
+                "end": {
+                  "line": 165,
+                  "column": 16
+                }
+              },
+              "code": "sk.phase = 2"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 167,
+                "column": 5
+              },
+              "end": {
+                "line": 171
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 167,
+                  "column": 5
+                },
+                "end": {
+                  "line": 167,
+                  "column": 36
+                }
+              },
+              "code": "delivery_progress_reached = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 171,
+          "column": 1
+        },
+        "end": {
+          "line": 181
+        }
+      },
+      "name": "SinkFinalize",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 171,
+            "column": 8
+          },
+          "end": {
+            "line": 171,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 172,
+            "column": 5
+          },
+          "end": {
+            "line": 181
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 172,
+                "column": 5
+              },
+              "end": {
+                "line": 173,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 172,
+                  "column": 5
+                },
+                "end": {
+                  "line": 172,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 173,
+                "column": 5
+              },
+              "end": {
+                "line": 174,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 173,
+                  "column": 5
+                },
+                "end": {
+                  "line": 173,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 174,
+                "column": 5
+              },
+              "end": {
+                "line": 175,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 174,
+                  "column": 5
+                },
+                "end": {
+                  "line": 174,
+                  "column": 25
+                }
+              },
+              "condition": "sk.phase == 2",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 174,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 174,
+                    "column": 25
+                  }
+                },
+                "pyExpr": "sk.phase == 2"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 175,
+                "column": 5
+              },
+              "end": {
+                "line": 176,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 175,
+                  "column": 5
+                },
+                "end": {
+                  "line": 175,
+                  "column": 16
+                }
+              },
+              "code": "sk.phase = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 176,
+                "column": 5
+              },
+              "end": {
+                "line": 177,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 176,
+                  "column": 5
+                },
+                "end": {
+                  "line": 176,
+                  "column": 23
+                }
+              },
+              "code": "sk.staged_epoch = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 177,
+                "column": 5
+              },
+              "end": {
+                "line": 181
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 177,
+                  "column": 5
+                },
+                "end": {
+                  "line": 177,
+                  "column": 20
+                }
+              },
+              "code": "s.sink_state = 0"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 181,
+          "column": 1
+        },
+        "end": {
+          "line": 195
+        }
+      },
+      "name": "InjectDuplicateDelivery",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 182,
+            "column": 5
+          },
+          "end": {
+            "line": 195
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 182,
+                "column": 5
+              },
+              "end": {
+                "line": 183,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 182,
+                  "column": 5
+                },
+                "end": {
+                  "line": 182,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 183,
+                "column": 5
+              },
+              "end": {
+                "line": 184,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 183,
+                  "column": 5
+                },
+                "end": {
+                  "line": 183,
+                  "column": 24
+                }
+              },
+              "code": "ext = externalsystem"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 184,
+                "column": 5
+              },
+              "end": {
+                "line": 185,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 184,
+                  "column": 5
+                },
+                "end": {
+                  "line": 184,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 185,
+                "column": 5
+              },
+              "end": {
+                "line": 186,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 185,
+                  "column": 5
+                },
+                "end": {
+                  "line": 185,
+                  "column": 25
+                }
+              },
+              "condition": "sk.phase == 1",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 185,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 185,
+                    "column": 25
+                  }
+                },
+                "pyExpr": "sk.phase == 1"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 186,
+                "column": 5
+              },
+              "end": {
+                "line": 187,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 186,
+                  "column": 5
+                },
+                "end": {
+                  "line": 186,
+                  "column": 56
+                }
+              },
+              "condition": "s.sink_pending_epoch in ext.delivered_epochs",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 186,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 186,
+                    "column": 56
+                  }
+                },
+                "pyExpr": "s.sink_pending_epoch in ext.delivered_epochs"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 187,
+                "column": 5
+              },
+              "end": {
+                "line": 195
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 187,
+                  "column": 5
+                },
+                "end": {
+                  "line": 187,
+                  "column": 39
+                }
+              },
+              "code": "duplicate_delivery_attempted = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 195,
+          "column": 1
+        },
+        "end": {
+          "line": 206
+        }
+      },
+      "name": "CommitClusterCheckpoint",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 195,
+            "column": 8
+          },
+          "end": {
+            "line": 195,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 196,
+            "column": 5
+          },
+          "end": {
+            "line": 206
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 196,
+                "column": 5
+              },
+              "end": {
+                "line": 197,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 196,
+                  "column": 5
+                },
+                "end": {
+                  "line": 196,
+                  "column": 30
+                }
+              },
+              "code": "cc = checkpointcoordinator"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 197,
+                "column": 5
+              },
+              "end": {
+                "line": 198,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 197,
+                  "column": 5
+                },
+                "end": {
+                  "line": 197,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 198,
+                "column": 5
+              },
+              "end": {
+                "line": 199,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 198,
+                  "column": 5
+                },
+                "end": {
+                  "line": 198,
+                  "column": 32
+                }
+              },
+              "condition": "cc.round < MAX_EPOCH",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 198,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 198,
+                    "column": 32
+                  }
+                },
+                "pyExpr": "cc.round < MAX_EPOCH"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 199,
+                "column": 5
+              },
+              "end": {
+                "line": 206
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 199,
+                  "column": 5
+                },
+                "end": {
+                  "line": 199,
+                  "column": 27
+                }
+              },
+              "code": "cc.round = cc.round + 1"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "stmts": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 18,
+          "column": 1
+        },
+        "end": {
+          "line": 24
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 18,
+            "column": 1
+          },
+          "end": {
+            "line": 18,
+            "column": 13
+          }
+        },
+        "code": "MAX_EPOCH = 3"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 24,
+          "column": 1
+        },
+        "end": {
+          "line": 28
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 24,
+            "column": 1
+          },
+          "end": {
+            "line": 24,
+            "column": 16
+          }
+        },
+        "code": "SINK_PROFILE = 0"
+      }
+    }
+  ],
+  "roles": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 35,
+          "column": 1
+        },
+        "end": {
+          "line": 44
+        }
+      },
+      "name": "ControlPlane",
+      "actions": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 36,
+              "column": 5
+            },
+            "end": {
+              "line": 44
+            }
+          },
+          "name": "Init",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "level": "FAIRNESS_LEVEL_STRONG"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 39,
+                "column": 9
+              },
+              "end": {
+                "line": 44
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 39,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 40,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 39,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 39,
+                      "column": 34
+                    }
+                  },
+                  "code": "self.cluster_committed = 0"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 40,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 44
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 40,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 40,
+                      "column": 33
+                    }
+                  },
+                  "code": "self.checkpoint_index = 0"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 44,
+          "column": 1
+        },
+        "end": {
+          "line": 52
+        }
+      },
+      "name": "Shard",
+      "actions": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 45,
+              "column": 5
+            },
+            "end": {
+              "line": 52
+            }
+          },
+          "name": "Init",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "level": "FAIRNESS_LEVEL_STRONG"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 46,
+                "column": 9
+              },
+              "end": {
+                "line": 52
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 46,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 48,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 46,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 46,
+                      "column": 32
+                    }
+                  },
+                  "code": "self.committed_epoch = 0"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 48,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 49,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 48,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 48,
+                      "column": 27
+                    }
+                  },
+                  "code": "self.sink_state = 0"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 49,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 52
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 49,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 49,
+                      "column": 35
+                    }
+                  },
+                  "code": "self.sink_pending_epoch = 0"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 53,
+          "column": 1
+        },
+        "end": {
+          "line": 59
+        }
+      },
+      "name": "SinkConnector",
+      "actions": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 54,
+              "column": 5
+            },
+            "end": {
+              "line": 59
+            }
+          },
+          "name": "Init",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "level": "FAIRNESS_LEVEL_STRONG"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 55,
+                "column": 9
+              },
+              "end": {
+                "line": 59
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 55,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 56,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 55,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 55,
+                      "column": 22
+                    }
+                  },
+                  "code": "self.phase = 0"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 56,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 59
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 56,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 56,
+                      "column": 29
+                    }
+                  },
+                  "code": "self.staged_epoch = 0"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "decorators": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 52,
+              "column": 1
+            },
+            "end": {
+              "line": 53
+            }
+          },
+          "name": "state",
+          "args": [
+            {
+              "sourceInfo": {
+                "start": {
+                  "line": 52,
+                  "column": 8
+                },
+                "end": {
+                  "line": 52,
+                  "column": 42
+                }
+              },
+              "pyExpr": "ephemeral=[\"phase\", \"staged_epoch\"]",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 52,
+                    "column": 8
+                  },
+                  "end": {
+                    "line": 52,
+                    "column": 42
+                  }
+                },
+                "pyExpr": "ephemeral=[\"phase\", \"staged_epoch\"]"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 59,
+          "column": 1
+        },
+        "end": {
+          "line": 69
+        }
+      },
+      "name": "ExternalSystem",
+      "actions": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 60,
+              "column": 5
+            },
+            "end": {
+              "line": 69
+            }
+          },
+          "name": "Init",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "level": "FAIRNESS_LEVEL_STRONG"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 62,
+                "column": 9
+              },
+              "end": {
+                "line": 69
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 62,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 64,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 62,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 62,
+                      "column": 37
+                    }
+                  },
+                  "code": "self.delivered_epochs = set()"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 64,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 66,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 64,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 64,
+                      "column": 30
+                    }
+                  },
+                  "code": "self.fencing_token = 0"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 66,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 69
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 66,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 66,
+                      "column": 27
+                    }
+                  },
+                  "code": "self.tx_status = {}"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 69,
+          "column": 1
+        },
+        "end": {
+          "line": 77
+        }
+      },
+      "name": "CheckpointCoordinator",
+      "actions": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 70,
+              "column": 5
+            },
+            "end": {
+              "line": 77
+            }
+          },
+          "name": "Init",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "level": "FAIRNESS_LEVEL_STRONG"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 71,
+                "column": 9
+              },
+              "end": {
+                "line": 77
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 71,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 77
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 71,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 71,
+                      "column": 22
+                    }
+                  },
+                  "code": "self.round = 0"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "frontMatter": {}
+}

@@ -46,11 +46,18 @@ fn collect_refs(plan: &PlanNode, out: &mut Vec<String>) {
         PlanNode::Window { input, .. } => collect_refs(input, out),
         PlanNode::TumbleWindow { input, .. } => collect_refs(input, out),
         PlanNode::TopK { input, .. } => collect_refs(input, out),
-        PlanNode::Join { left, right, .. } => {
+        PlanNode::Join { left, right, .. }
+        | PlanNode::InnerJoin { left, right, .. }
+        | PlanNode::OuterJoin { left, right, .. } => {
             collect_refs(left, out);
             collect_refs(right, out);
         }
         PlanNode::Union { left, right } => {
+            collect_refs(left, out);
+            collect_refs(right, out);
+        }
+        PlanNode::Distinct { input, .. } => collect_refs(input, out),
+        PlanNode::Intersect { left, right, .. } | PlanNode::Except { left, right, .. } => {
             collect_refs(left, out);
             collect_refs(right, out);
         }
@@ -59,6 +66,11 @@ fn collect_refs(plan: &PlanNode, out: &mut Vec<String>) {
             collect_refs(step, out);
         }
         PlanNode::Lateral { input, .. } => collect_refs(input, out),
+        // v0.4 additions
+        PlanNode::ViewSink { child, .. } => collect_refs(child, out),
+        PlanNode::Exchange { child, .. } => collect_refs(child, out),
+        // v0.32: IndexArrange
+        PlanNode::IndexArrange { input, .. } => collect_refs(input, out),
     }
 }
 

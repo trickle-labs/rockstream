@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-exit-criteria.sh — enforce that every version marked ✅ Done in
-# ROADMAP.md has a complete sign-off file in sign-offs/.
+# NEW_ROADMAP.md has a complete sign-off file in sign-offs/.
 #
 # Called by CI on every push and PR. Also callable locally: ./scripts/check-exit-criteria.sh
 #
@@ -9,19 +9,20 @@
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
-ROADMAP="$ROOT/ROADMAP.md"
+ROADMAP="$ROOT/NEW_ROADMAP.md"
 SIGNOFFS_DIR="$ROOT/sign-offs"
 ERRORS=0
 
 # Extract versions marked Done from roadmap version table rows.
-# Rows look like: | v0.1 | ✅ Done | ...
+# A Done row carries the explicit marker "✅ Done", e.g.:
+#   | v0.1 | Workspace and CI ✅ Done | ... |
 # We only extract the version from the first column to avoid false matches
 # on version numbers mentioned inside the row description text.
-done_versions=$(grep -E '^\| v[0-9]+\.[0-9]+ \|.*Done' "$ROADMAP" \
+done_versions=$(grep -E '^\| v[0-9]+\.[0-9]+ \|.*✅ Done' "$ROADMAP" \
   | sed 's/^| \(v[0-9]*\.[0-9]*\) |.*/\1/' || true)
 
 if [ -z "$done_versions" ]; then
-  echo "No versions marked Done in ROADMAP.md."
+  echo "No versions marked Done in NEW_ROADMAP.md."
   exit 0
 fi
 
@@ -29,7 +30,7 @@ for version in $done_versions; do
   signoff="$SIGNOFFS_DIR/${version}.md"
 
   if [ ! -f "$signoff" ]; then
-    echo "MISSING: $version is marked Done in ROADMAP.md but sign-offs/${version}.md does not exist."
+    echo "MISSING: $version is marked Done in NEW_ROADMAP.md but sign-offs/${version}.md does not exist."
     echo "  Run: make approve VERSION=${version#v}"
     ERRORS=$((ERRORS + 1))
     continue

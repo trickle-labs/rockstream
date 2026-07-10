@@ -11,79 +11,139 @@
 //! - `CompleteThroughToken` — emitted by monotone (semilattice) laws to signal
 //!   partial progress ahead of the cluster frontier.
 
-use crate::ids::{OperatorId, ShardId, WorkerId};
+use crate::ids::{OperatorId, ShardId, SourceId, WorkerId};
 use crate::merge_law::MergeLawId;
 use crate::timestamp::Epoch;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::collections::BTreeMap;
 
-/// An antichain of timestamps representing a progress frontier.
-///
-/// The antichain is the set of minimal elements — no element in the set
-/// is less-than-or-equal-to any other element in the set.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Antichain<T> {
-    elements: Vec<T>,
+pub use antichain::{Antichain, Frontier, Lattice, ProductTimestamp};
+
+/// RockStream progress-merge algebra (NOT a mathematical lattice in general:
+/// `FreshnessToken` is intentionally non-idempotent due to its hash field).
+pub trait ProgressMerge {
+    /// Greatest lower bound (or approximate GLB for non-idempotent types).
+    fn meet(&self, other: &Self) -> Self;
+    /// Least upper bound (or approximate LUB for non-idempotent types).
+    fn join(&self, other: &Self) -> Self;
 }
 
-impl<T: Ord + Clone> Antichain<T> {
-    /// Create an empty antichain (representing "no progress").
-    pub fn empty() -> Self {
+/// Progress details for a single source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SourceProgress {
+    pub source_epoch: Epoch,
+    pub event_time_watermark_ms: Option<i64>,
+}
+
+impl SourceProgress {
+    pub fn new(source_epoch: Epoch, event_time_watermark_ms: Option<i64>) -> Self {
         Self {
-            elements: Vec::new(),
-        }
-    }
-
-    /// Create an antichain from a single element.
-    pub fn from_elem(elem: T) -> Self {
-        Self {
-            elements: vec![elem],
-        }
-    }
-
-    /// Returns the elements of the antichain.
-    pub fn elements(&self) -> &[T] {
-        &self.elements
-    }
-
-    /// Returns true if the antichain is empty.
-    pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
-    }
-
-    /// Returns the number of elements in the antichain.
-    pub fn len(&self) -> usize {
-        self.elements.len()
-    }
-
-    /// Returns true if `time` is less than or equal to some element in the frontier.
-    ///
-    /// If this returns true, the time has NOT yet been completed.
-    pub fn less_equal(&self, time: &T) -> bool {
-        self.elements.iter().any(|e| e <= time)
-    }
-
-    /// Insert an element, maintaining the antichain invariant.
-    pub fn insert(&mut self, elem: T) {
-        // Remove any elements that are >= the new element.
-        self.elements.retain(|e| elem > *e);
-        // Only insert if no existing element is <= the new one.
-        if !self.elements.iter().any(|e| *e <= elem) {
-            self.elements.push(elem);
+            source_epoch,
+            event_time_watermark_ms,
         }
     }
 }
 
-impl<T: Ord + Clone + fmt::Display> fmt::Display for Antichain<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[")?;
-        for (i, elem) in self.elements.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
+impl ProgressMerge for SourceProgress {
+    fn meet(&self, other: &Self) -> Self {
+        if self.source_epoch < other.source_epoch {
+            *self
+        } else if self.source_epoch > other.source_epoch {
+            *other
+        } else {
+            Self {
+                source_epoch: self.source_epoch,
+                event_time_watermark_ms: match (
+                    self.event_time_watermark_ms,
+                    other.event_time_watermark_ms,
+                ) {
+                    (Some(w1), Some(w2)) => Some(std::cmp::min(w1, w2)),
+                    (Some(w1), None) => Some(w1),
+                    (None, Some(w2)) => Some(w2),
+                    (None, None) => None,
+                },
             }
-            write!(f, "{elem}")?;
         }
-        write!(f, "]")
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        if self.source_epoch > other.source_epoch {
+            *self
+        } else if self.source_epoch < other.source_epoch {
+            *other
+        } else {
+            Self {
+                source_epoch: self.source_epoch,
+                event_time_watermark_ms: match (
+                    self.event_time_watermark_ms,
+                    other.event_time_watermark_ms,
+                ) {
+                    (Some(w1), Some(w2)) => Some(std::cmp::max(w1, w2)),
+                    (Some(w1), None) => Some(w1),
+                    (None, Some(w2)) => Some(w2),
+                    (None, None) => None,
+                },
+            }
+        }
+    }
+}
+
+/// A vector-valued progress token representing progress across multiple sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessToken {
+    pub source_progress: BTreeMap<SourceId, SourceProgress>,
+    pub cluster_frontier_hash: u64,
+}
+
+impl FreshnessToken {
+    pub fn new(
+        source_progress: BTreeMap<SourceId, SourceProgress>,
+        cluster_frontier_hash: u64,
+    ) -> Self {
+        Self {
+            source_progress,
+            cluster_frontier_hash,
+        }
+    }
+
+    /// Retrieve the minimum event_time_watermark_ms across all sources.
+    pub fn watermark_ms(&self) -> Option<i64> {
+        self.source_progress
+            .values()
+            .filter_map(|p| p.event_time_watermark_ms)
+            .min()
+    }
+}
+
+impl ProgressMerge for FreshnessToken {
+    fn meet(&self, other: &Self) -> Self {
+        let mut source_progress = BTreeMap::new();
+        for (id, p1) in &self.source_progress {
+            if let Some(p2) = other.source_progress.get(id) {
+                source_progress.insert(*id, p1.meet(p2));
+            }
+        }
+        let cluster_frontier_hash = self.cluster_frontier_hash ^ other.cluster_frontier_hash;
+        Self {
+            source_progress,
+            cluster_frontier_hash,
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut source_progress = self.source_progress.clone();
+        for (id, p2) in &other.source_progress {
+            if let Some(p1) = source_progress.get(id) {
+                source_progress.insert(*id, p1.join(p2));
+            } else {
+                source_progress.insert(*id, *p2);
+            }
+        }
+        let cluster_frontier_hash = self.cluster_frontier_hash ^ other.cluster_frontier_hash;
+        Self {
+            source_progress,
+            cluster_frontier_hash,
+        }
     }
 }
 
@@ -92,30 +152,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn antichain_from_elem() {
-        let ac = Antichain::from_elem(5u64);
-        assert_eq!(ac.elements(), &[5]);
-    }
+    fn test_freshness_token_lattice_properties() {
+        use crate::ids::SourceId;
+        use std::collections::BTreeMap;
 
-    #[test]
-    fn antichain_empty() {
-        let ac: Antichain<u64> = Antichain::empty();
-        assert!(ac.is_empty());
-        assert_eq!(ac.len(), 0);
-    }
+        let s1 = SourceId(1);
+        let s2 = SourceId(2);
 
-    #[test]
-    fn antichain_less_equal() {
-        let ac = Antichain::from_elem(5u64);
-        assert!(ac.less_equal(&5));
-        assert!(ac.less_equal(&6));
-        assert!(!ac.less_equal(&4));
-    }
+        let p1 = SourceProgress::new(10, Some(100));
+        let p2 = SourceProgress::new(20, Some(200));
+        let p3 = SourceProgress::new(15, Some(150));
 
-    #[test]
-    fn antichain_display() {
-        let ac = Antichain::from_elem(42u64);
-        assert_eq!(ac.to_string(), "[42]");
+        let mut map_a = BTreeMap::new();
+        map_a.insert(s1, p1);
+        map_a.insert(s2, p2);
+        let tok_a = FreshnessToken::new(map_a, 12345);
+
+        let mut map_b = BTreeMap::new();
+        map_b.insert(s1, p3);
+        let tok_b = FreshnessToken::new(map_b, 67890);
+
+        // Meet (intersection, element-wise min)
+        let meet = tok_a.meet(&tok_b);
+        assert_eq!(meet.source_progress.len(), 1);
+        assert_eq!(meet.source_progress.get(&s1), Some(&p1)); // min of 10 and 15 is 10
+
+        // Join (union, element-wise max)
+        let join = tok_a.join(&tok_b);
+        assert_eq!(join.source_progress.len(), 2);
+        assert_eq!(join.source_progress.get(&s1), Some(&p3)); // max of 10 and 15 is 15
+        assert_eq!(join.source_progress.get(&s2), Some(&p2));
+
+        // Commutativity
+        assert_eq!(
+            tok_a.meet(&tok_b).source_progress,
+            tok_b.meet(&tok_a).source_progress
+        );
+        assert_eq!(
+            tok_a.join(&tok_b).source_progress,
+            tok_b.join(&tok_a).source_progress
+        );
     }
 }
 

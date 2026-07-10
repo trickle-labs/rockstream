@@ -1,7 +1,7 @@
 # RockStream: Massively-Parallel Incremental View Maintenance on SlateDB
 
 A design for a horizontally-scalable, full-SQL incremental view maintenance (IVM)
-system inspired by Feldera (DBSP), Materialize (Differential Dataflow), and RisingWave
+system inspired by DBSP and differential dataflow theory
 — built on a mesh of SlateDB instances backed by
 object storage.
 
@@ -54,8 +54,8 @@ object storage.
 > `pg_catalog` / `information_schema` stubs for ORM compatibility, Postgres type
 > OID mapping, and an internal source connector so clients can write rows
 > directly without an external Kafka or Postgres. `SERIALIZABLE` is explicitly
-> out of scope (§1.1, §12.6). Positioning: same tier as Materialize / RisingWave,
-> not a Neon-style Postgres drop-in.
+> out of scope (§1.1, §12.6). Positioning: a distributed streaming-SQL
+> platform, not a Postgres drop-in.
 >
 > **v3.7 is a future-proofing pass inspired by FoundationDB**: deterministic
 > simulation testing as a first-class testing strategy (§17), an explicit
@@ -193,8 +193,10 @@ object storage.
 > rows back without a second round-trip (§12.8.2); and secondary indexes so
 > non-primary-key lookups on base tables do not require a full shard scan or
 > a user-managed materialized view (§13.9). Version schedule updated:
-> v0.43 extended to cover §12.8 features; secondary indexes land at v0.49
-> (new slot); v0.49–v0.54 shift to v0.50–v0.55.
+> v0.46 extended to cover §12.8 features; secondary indexes land at v0.53
+> (new slot); v0.40–v0.42 wire-protocol completion versions inserted;
+> v0.43 FizzBee cold-tier model + simulator fidelity version inserted;
+> downstream Phase 12–16 renumbered +4 (v0.44–v0.54).
 >
 > **v3.22 adds three HTAP and distributed-coordination improvements** grounded
 > in the existing frontier algebra: a `max_staleness` session parameter for
@@ -211,7 +213,7 @@ object storage.
 > or materialized-view compilation time. No operator state, no arrangement
 > shards, no `view_output/` storage — just a named SQL alias. This is the
 > Postgres-standard `CREATE VIEW` semantics and covers ad-hoc query composition,
-> building blocks for materialized views, and schema abstraction. Ships v0.40.
+> building blocks for materialized views, and schema abstraction. Ships v0.44.
 > Error codes `RS-1010`–`RS-1011` added. §5.7 and §12.1 updated.
 >
 > **v3.25 aligns user-facing terminology with four accepted ADRs** (workloads,
@@ -297,7 +299,7 @@ object storage.
 > 9. **System schema consolidation** (§12.6.1): the single canonical
 >    user-facing system schema is `rockstream_catalog`. The historical
 >    `rockstream.*` names are documented as legacy aliases scheduled for
->    removal in v0.50.
+>    removal in v0.54.
 > 10. **Error-code ranges and uniqueness** (§14.14): every `RS-XXXX` code
 >     lives in one reserved owner range and must be globally unique. CI
 >     fails on duplicates. Colliding coordinator and cold-tier codes are
@@ -344,7 +346,7 @@ object storage.
     - [13.8 Native DuckLake Catalog Server (deferred)](#138-native-ducklake-catalog-server-deferred)
     - [13.9 Secondary Indexes](#139-secondary-indexes)
 14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
-15. [Comparison to Prior Art](#15-comparison-to-prior-art)
+15. [Design Positioning](#15-design-positioning)
 16. [Optimality Assessment (v3.7)](#16-optimality-assessment-v37)
 17. [Simulation Testing](#17-simulation-testing)
 18. [Appendix: Key Encoding Reference](#appendix-key-encoding-reference)
@@ -400,15 +402,15 @@ attempting them would compromise the rest of the design:
   sequence number, which is an explicit non-goal (see below). `READ COMMITTED`
   and `REPEATABLE READ` are fully supported by the existing vector-frontier
   model (§12.6) and cover the vast majority of analytical and streaming
-  workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is a candidate
-  extension (v0.51). Optimistic exact-key guarded writes for non-CRDT columns
+  workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is scheduled
+  for v0.52 (Phase 16). Optimistic exact-key guarded writes for non-CRDT columns
   and blind commutative writes for CRDT columns are planned pre-1.0 (§13.5.1).
   A *global* cross-shard `SERIALIZABLE` coordinator (one covering every shard)
   is an explicit non-goal. See
   [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md).
 - **A global write sequence number.** SlateDB's per-DB sequence is local. We
   do not synthesize a cluster-wide sequence on top of it.
-- **Loading or linking pg_trickle / Feldera at runtime.** Neither is a Cargo
+- **Loading or linking pg_trickle at runtime.** It is not a Cargo
   dependency. They are reference material and test oracles only.
 - **Active-active multi-region writes.** The single-writer fence per shard is
   a hard constraint against concurrent writers in different regions. Multi-region
@@ -417,8 +419,8 @@ attempting them would compromise the rest of the design:
   an idempotent join-semilattice column could become a region-spanning surface
   later, but no version through 1.0 promises that path.
 - **Arbitrary user-defined merge functions before the built-in CRDT catalog
-  ships.** `CREATE MERGE LAW` is gated on the v0.51 built-in catalog and shared
-  property-test suite (§6.11; [ideas/crdts.md](ideas/crdts.md)).
+  ships.** `CREATE MERGE LAW` is gated on a post-1.0 release of the built-in
+  catalog and shared property-test suite (§6.11; [ideas/crdts.md](ideas/crdts.md)).
 - **Per-query cost accounting ($/query) in the hot path.** Cost visibility in
   `EXPLAIN ESTIMATE` is a design goal; per-query billing middleware and
   chargeback to tenants is an application-layer concern out of scope.
@@ -458,7 +460,7 @@ antichain of timestamps such that an operator promises not to emit any future up
 at timestamps `≤` any element of the frontier. Frontiers advance monotonically.
 
 This is the only correct way to track progress through multi-input operators
-(joins, unions, recursive queries). Materialize uses this; we use the same primitive.
+(joins, unions, recursive queries).
 
 ### Recursion
 
@@ -467,7 +469,7 @@ Recursive queries (`WITH RECURSIVE`, transitive closure, graph algorithms) use
 formalization via the `I` (integrate) and `D` (differentiate) operators applied
 in nested time scopes.
 
-Feldera's `IterativeCircuit` (`crates/dbsp/src/operator/recursive.rs`) is
+The `IterativeCircuit` pattern (`crates/dbsp/src/operator/recursive.rs`) is
 **local to one circuit on one worker**. RockStream lifts this into the
 distributed setting by allowing `Exchange` operators inside a recursive scope
 so the inner-time iteration can re-partition data each round. The iteration
@@ -784,7 +786,7 @@ original estimate and the observed values side-by-side.
 - Substrait support for cross-language tooling.
 - Active community; used by InfluxDB IOx, Comet, Ballista, etc.
 
-We use Feldera's `sql-to-dbsp` as the reference for SQL-to-DBSP semantics and
+We use the DBSP `sql-to-dbsp` approach as the reference for SQL-to-DBSP semantics and
 pg_trickle as the reference for concrete SQL edge cases. The RockStream runtime
 does not execute generated SQL and does not copy pg_trickle's CTEs into the hot path.
 It compiles SQL into native DBSP-style operators and validates their behavior
@@ -804,7 +806,7 @@ The incrementalization step (4) and operator runtime are specified in detail in
   used to identify edge cases and build regression tests: the EC-01 join fix,
   Q07 double-counting correction, Q21 SemiJoin correction, FULL JOIN NULL
   handling in SUM, recursive DRed fallback, and similar cases.
-- The runtime is a **long-lived circuit of typed operators** (Feldera's model)
+- The runtime is a **long-lived circuit of typed operators** (DBSP's model)
   rather than per-epoch SQL re-execution (pg_trickle's model). Each operator
   is a long-lived async task that consumes `RecordBatch` deltas and maintains
   one or more **arrangements** (indexed Z-sets) on its assigned SlateDB shard.
@@ -971,7 +973,7 @@ VIEW` opts into RockStream's IVM engine.
 | `RS-1010` | `view.inline_referenced_by_materialized` | Cannot drop inline view; one or more materialized views reference it. |
 | `RS-1011` | `view.inline_cycle_detected` | Inline view definition creates a circular reference. |
 
-**Ships**: v0.40.
+**Ships**: v0.44.
 
 ---
 
@@ -1514,8 +1516,8 @@ in [ideas/crdts.md](ideas/crdts.md); the design-level commitments are:
 
 7. **User-visible CRDT column types** (`COUNTER`, `MAX_REGISTER`,
    `MIN_REGISTER`, `LWW`, `G_SET`, `OR_SET`, plus `APPROX_*` sketches)
-   land in v0.43–v0.45 once the internal law contract is proven.
-   `CREATE MERGE LAW` for user-defined laws is gated until v0.51 and
+   are post-1.0 once the internal law contract is proven.
+   `CREATE MERGE LAW` for user-defined laws is deferred post-1.0 and
    the built-in catalog property suite must accept it before it can be
    used in a `PlanNode`. Non-idempotent laws written through the
    direct-write gateway require either exact-once source offsets or an
@@ -1919,7 +1921,7 @@ subsequent checkpoint.
 | `scatter_shards_pruned_total` | Shards skipped by column statistics. |
 | `shard_bloom_false_positive_total` | Shards included by Bloom that returned no matching rows. |
 
-**Ships**: v0.50 (Phase 10), after secondary indexes land at v0.49.
+**Ships**: v0.54 (Phase 16), after secondary indexes land at v0.53.
 
 ---
 
@@ -2622,7 +2624,7 @@ honored by any downstream view automatically. Tokens of disjoint source sets
 are independent; passing an unrelated token is a no-op (the wait condition
 is vacuously satisfied).
 
-The scalar single-source form previously used in v0.42 is retained on the
+The scalar single-source form previously used in v0.46 is retained on the
 wire only as the special case `source_progress.len() == 1`; the gateway
 always serializes the vector form going forward.
 
@@ -2721,7 +2723,7 @@ streaming workloads.
 | `READ COMMITTED` | Each statement pins to the latest published vector frontier at statement start. |
 | `REPEATABLE READ` | `BEGIN` pins the session to a specific vector frontier; all statements in the transaction see that snapshot. |
 | `SERIALIZABLE` | **Not supported** for cross-shard transactions (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
-| `SERIALIZABLE LOCAL` | Candidate v0.51: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
+| `SERIALIZABLE LOCAL` | v0.52: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
 
 **Optimistic write semantics** (§13.5.1): direct-write transactions may use
 optimistic exact-key guards (`RS-2008` on conflict) and blind CRDT writes
@@ -2742,7 +2744,7 @@ guarantee.
 **Postgres wire protocol does NOT imply a Postgres drop-in.** DDL (`CREATE
 TABLE`, `ALTER TABLE`) is handled via `CREATE MATERIALIZED VIEW` / `CREATE VIEW` /
 `CREATE WORKLOAD` semantics. Write DML goes through the internal source connector (§13.5).
-Extensions, `COPY`, `LISTEN`/`NOTIFY`, and advisory locks are out of scope.
+`COPY FROM STDIN` (text format) is supported as of v0.27 (§12.6.2). `LISTEN`/`NOTIFY` and advisory locks remain out of scope.
 
 ### 12.6.1 The `rockstream_catalog` System Schema
 
@@ -2755,8 +2757,8 @@ through the standard SQL interface.
 
 > **Legacy aliases.** Older specifications and earlier roadmap versions
 > referred to these tables under the unqualified `rockstream.*` prefix.
-> `rockstream.*` is accepted as a read-only alias through v0.45 and removed
-> in v0.50. The DLQ table previously named `rockstream_catalog.dead_letter_queue`
+> `rockstream.*` is accepted as a read-only alias through v0.49 and removed
+> in v0.54. The DLQ table previously named `rockstream_catalog.dead_letter_queue`
 > stays under `rockstream_catalog`; that naming was already correct.
 
 | Table | Source | Purpose |
@@ -2815,8 +2817,42 @@ entries including the full audit log.
 
 **Positioning**: with the Postgres wire layer plus the internal source connector
 (§13.5), RockStream operates as a *streaming SQL platform with Postgres-compatible
-read access* — the same tier as Materialize and RisingWave, not Neon. Clients
+read access*, not as a general-purpose transactional Postgres replacement. Clients
 write rows directly; the IVM engine keeps views fresh; `psql` queries views.
+
+### 12.6.2 COPY Protocol
+
+As of v0.27, `COPY <table> FROM STDIN` (text format, tab-separated values) is
+supported directly via the Postgres wire layer.
+
+**Flow:**
+1. Client sends `COPY <table> [(col1, col2, ...)] FROM STDIN`.
+2. Gateway parses the statement, resolves column list from the catalog if not
+   specified, and sends `CopyInResponse`.
+3. Client streams `CopyData` messages (TSV rows terminated by `\.\n`).
+4. Client sends `CopyDone`; gateway flushes the final batch and responds with
+   `CommandComplete COPY N`.
+
+**Memory safety (auto-flush):**  
+Each per-connection COPY IN buffer is bounded by two named limits:
+- `MAX_COPY_IN_BATCH_ROWS = 10_000 rows`
+- `COPY_IN_FLUSH_BYTES = 64 MiB`
+
+Whichever limit is reached first triggers an auto-flush: the current batch is
+committed to the shard as a `WriteBatch` (put-only, no range-deletion), and the
+buffer is reset. The fill-level metric `COPY_IN_BUFFER_ROWS` (gauge) tracks the
+current row count across all active COPY IN connections.
+
+**Error codes:**
+| Code | Slug | Trigger |
+|------|------|---------|
+| RS-2500 | `copy.table_not_found` | COPY target table not in catalog |
+| RS-2501 | `copy.column_count_mismatch` | TSV field count ≠ declared column count |
+
+**Auth:** `pipeline_owner` role required (RS-2400/RS-2401 otherwise). See §12.5.
+
+**No range-delete dependency.** Flush uses `WriteBatch::put` only (identical to
+the regular `COMMIT` path). No scan-and-delete is required.
 
 ---
 
@@ -2956,9 +2992,9 @@ The gateway planner selects `TwoTier` when all of the following hold:
 For all other queries (point lookups, range scans by partition key, subscribe),
 the gateway always uses `HotOnly` regardless of whether a cold tier exists.
 
-In Phase 8 (v0.40), only `HotOnly` is implemented. The `ViewReadStrategy`
+In Phase 7 (v0.26 ✅ done), only `HotOnly` is implemented. The `ViewReadStrategy`
 enum and the `ViewReader` trait are defined in full so that the cold-tier
-implementation (Phase 12 / v0.53) slot-fits without touching the gateway
+implementation (Phase 10 / v0.33) slot-fits without touching the gateway
 planner.
 
 #### 12.7.4 Competitive Position
@@ -2979,10 +3015,9 @@ becomes competitive for ad-hoc analytics over its own data as well.
 
 #### 12.7.5 Implementation Scope
 
-The cold tier is a future extension. Phase 9 obligation: define `ViewReader` /
-`ViewReadStrategy` with cold-tier slots and implement `HotOnly`. The cold-tier
-`TwoTier` path and the cold-snapshot checkpoint writer are deferred to a later
-roadmap version. See IMPLEMENTATION_PLAN.md §Phase 9.
+The `HotOnly` gateway path shipped in Phase 7 (v0.26, ✅ done). The cold-tier
+`TwoTier` path and the cold-snapshot checkpoint writer ship at v0.33 (Phase 10
+of NEW_ROADMAP.md — Cold-Tier Sinks & Simulator Fixes).
 
 ---
 
@@ -2994,7 +3029,7 @@ read round-trips.
 
 #### 12.8.1 Session-Scoped Automatic Read-Your-Writes
 
-v0.42 added `wait_for=<FreshnessToken>` as an explicit per-query opt-in.
+v0.46 added `wait_for=<FreshnessToken>` as an explicit per-query opt-in.
 For OLTP patterns — write a row, then read it back — clients must thread the
 token from the write response into the next read. Standard database drivers
 do not do this, so application developers face stale reads unless they add
@@ -3063,7 +3098,7 @@ the only new state is one `Option<FreshnessToken>` per session and the
 | `session_wait_for_satisfied_ms` | Histogram: time from trigger to frontier satisfaction. |
 | `session_wait_for_timeout_total` | Count of queries that exceeded the SLO and fell through to current frontier. |
 
-**Ships**: v0.43 (extends the direct-write surface).
+**Ships**: v0.47 (extends the direct-write surface).
 
 #### 12.8.2 `INSERT ... RETURNING`
 
@@ -3103,11 +3138,11 @@ the response contains the written row as if it were a `SELECT` result.
 | Wait-for timeout | Returns `RS-2012`; partial row may be committed but not readable; client must retry with idempotency key. |
 
 `INSERT ... RETURNING` does **not** extend to `UPDATE ... RETURNING` or
-`DELETE ... RETURNING` in v0.43. Those variants require the gateway to read
-old state before the write, which adds read-modify-write latency. They are
-deferred post-1.0.
+`DELETE ... RETURNING` in v0.47. Those variants require the gateway to read
+old state before the write, which adds read-modify-write latency. They ship
+at v0.46 (Phase 13 — Advanced DML & Scatter Pruning).
 
-**Ships**: v0.43 (extends the direct-write surface).
+**Ships**: v0.47 (extends the direct-write surface).
 
 #### 12.8.3 Session-Scoped Max-Staleness for Analytical Queries
 
@@ -3160,7 +3195,7 @@ attached to the cached cluster frontier.
 | `session_staleness_exceeded_total` | Count of queries where `max_staleness` was exceeded and the session fell through to the stale frontier. |
 | `session_frontier_age_ms` | Histogram: frontier age at `SELECT` time for sessions with `max_staleness` set. |
 
-**Ships**: v0.43 (extends the session ergonomics surface).
+**Ships**: v0.47 (extends the session ergonomics surface).
 
 ---
 
@@ -3469,10 +3504,10 @@ transaction into one of five shapes:
 
 | Shape | Description | Pre-1.0? |
 |---|---|---:|
-| `ShardLocalSerializable` | Planner proves all reads/writes touch one shard; delegates to SlateDB transaction. | v0.51 |
-| `BlindCommutative` | All writes are registered CRDT operands with `read_dependent = false`. | v0.43+ |
-| `OptimisticExactKey` | Non-CRDT exact-key writes validated against per-row versions. | v0.51 |
-| `MixedCrdtAndOptimisticExactKey` | CRDT writes skip validation; non-CRDT exact-key writes validate. | v0.55 experimental |
+| `ShardLocalSerializable` | Planner proves all reads/writes touch one shard; delegates to SlateDB transaction. | v0.41 |
+| `BlindCommutative` | All writes are registered CRDT operands with `read_dependent = false`. | v0.44+ |
+| `OptimisticExactKey` | Non-CRDT exact-key writes validated against per-row versions. | v0.41 |
+| `MixedCrdtAndOptimisticExactKey` | CRDT writes skip validation; non-CRDT exact-key writes validate. | post-1.0 |
 | `Unsupported` | Predicate reads, range reads, cross-shard uniqueness, foreign keys, or any shape requiring general serializability. Returns `RS-2009`. | No |
 
 **Row-version metadata.** Each direct-write base-table row carries a
@@ -4053,7 +4088,7 @@ frontier lag per index.
 | `RS-2015` | `index.frontier_lag` | Index frontier lags base-table frontier by more than `index_max_lag_ms`; query fell back to base-table scan. |
 | `RS-2016` | `index.name_conflict` | `CREATE INDEX` name conflicts with existing table, view, or index name. |
 
-**Ships**: v0.49.
+**Ships**: v0.50.
 
 ---
 
@@ -4423,7 +4458,7 @@ ALTER NAMESPACE reporting PAUSE;
 ALTER NAMESPACE reporting RESUME;
 ```
 
-(In v3.27 and earlier these commands were spelled `ALTER SCHEMA`; the keyword `SCHEMA` is accepted as a deprecated alias for `NAMESPACE` through v0.45 and removed in v0.50.)
+(In v3.27 and earlier these commands were spelled `ALTER SCHEMA`; the keyword `SCHEMA` is accepted as a deprecated alias for `NAMESPACE` through v0.46 and removed in v0.51.)
 
 ### 14.11 Audit Log
 
@@ -4665,8 +4700,8 @@ Backpressure is cooperative credit flow: receivers grant credits to senders;
 senders block on credit exhaustion; this propagates upstream as growing
 `frontier_lag_ms` long before any data loss is possible. No operator blocks
 on a sibling's progress; only on its own credits and its own input
-frontier. This is the structural reason RockStream does not adopt Feldera's
-`DynamicScheduler` ownership model.
+frontier. This is the structural reason RockStream does not adopt a
+single-process `DynamicScheduler` ownership model.
 
 Admission control sits in front of every `CREATE MATERIALIZED VIEW`, every
 `CREATE WORKLOAD`, and every autotuner expansion. It refuses requests that
@@ -4779,43 +4814,44 @@ audit log.
 
 ---
 
-## 15. Comparison to Prior Art
+## 15. Design Positioning
 
-| Aspect | Feldera | Materialize | RisingWave | **RockStream** |
-|---|---|---|---|---|
-| **SQL coverage** | Full ANSI + recursion | Full ANSI + recursion | Full ANSI | Full ANSI + recursion |
-| **Theoretical model** | DBSP | Differential Dataflow | DBSP-like | DBSP + DD frontiers |
-| **State backend** | RocksDB (local NVMe) | LSM in-memory + S3 spill | Hummock (S3-native) | **SlateDB** (S3-native) |
-| **Compute-storage split** | Tight | Tight | Decoupled | **Fully decoupled** |
-| **Single-node baseline** | Excellent | Excellent | Good | Good |
-| **Horizontal scale** | Limited (single-node focus) | Limited | Excellent | **Excellent** |
-| **Object-storage native** | No | Partial | Yes | **Yes (end-to-end)** |
-| **Postgres wire protocol** | No | Yes | Yes | **Yes (§12.6)** |
-| **Direct DML writes** | No | No (CDC only) | No (CDC only) | **Yes (§13.5)** |
-| **SERIALIZABLE isolation** | No | Emulated | Emulated | **No (§1.1)** |
-| **Open source** | Yes | Yes | Yes | Yes |
+RockStream's design point relative to other streaming-SQL and differential-dataflow
+systems in this space:
+
+| Aspect | RockStream |
+|---|---|
+| **SQL coverage** | Full ANSI + recursion |
+| **Theoretical model** | DBSP + DD frontiers |
+| **State backend** | **SlateDB** (S3-native) |
+| **Compute-storage split** | **Fully decoupled** |
+| **Horizontal scale** | **Excellent** |
+| **Object-storage native** | **Yes (end-to-end)** |
+| **Postgres wire protocol** | **Yes (§12.6)** |
+| **Direct DML writes** | **Yes (§13.5)** |
+| **SERIALIZABLE isolation** | **No (§1.1)** |
+| **Open source** | Yes |
 
 The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
 adaptive per-operator parallelism**.
 
-**GA vs. Data Lake GA scope.** The table above describes the system at
-full design scope (v0.55+). At Production Beta / v1.0 (v0.52), the cold-tier
-Iceberg sink, Iceberg REST Catalog server, and DuckDB/Spark/Trino discovery-
-by-name are **not yet shipped** — they are Phase 12 deliverables (v0.53–v0.55).
-The v1.0 positioning therefore rests on: object-storage-native IVM, full SQL,
+**GA vs. Data Lake GA scope.** At v1.0 (v0.54 RC1), the cold-tier
+Iceberg/Delta sink (v0.44) and DuckDB/Spark/Trino table discovery via
+registered external catalogs ship before the RC1 gate. The Iceberg REST
+Catalog server (§13.7) and the DuckLake catalog server (§13.8) remain
+post-1.0. The v1.0 positioning rests on: object-storage-native IVM, full SQL,
 adaptive parallelism, Postgres wire access, direct DML writes, secondary
-indexes, and the connector ecosystem. The "first-class Iceberg table" story
-(§12.7, §13.6, §13.7) is a differentiator at Data Lake GA, not at Production
-Beta. Marketing materials and competitive positioning prior to v0.53 must not
-claim cold-tier or external-catalog features as shipping capabilities.
+indexes, and the connector and cold-tier ecosystem. Marketing materials must
+not claim the Iceberg REST Catalog or DuckLake server as shipping capabilities
+until they are released.
 
 ### 15.1 Explicitly Deferred: Data Quality / Expectations
 
-Systems like Delta Live Tables (Databricks), dbt tests, Dagster asset checks,
-and Soda provide declarative data-quality expectations: row-level assertions,
-column constraints, freshness checks, and anomaly detection integrated into the
-pipeline lifecycle. RockStream does **not** include a data-quality subsystem in
+Declarative data-quality expectations — row-level assertions, column
+constraints, freshness checks, and anomaly detection integrated into the
+pipeline lifecycle — are a well-established pattern in modern data pipeline
+tooling. RockStream does **not** include a data-quality subsystem in
 v1.0.
 
 **Rationale for deferral.** Data-quality expectations are valuable but
@@ -4827,8 +4863,8 @@ a dedicated assertion language, DLQ routing, per-row vs. batch-level
 semantics, and integration with alerting — each of which is a meaningful
 scope addition.
 
-**Planned phase.** Data quality is targeted as a **post-1.0 extension**
-(tentatively v0.55+), designed as a plugin/extension layer:
+**Planned phase.** Data quality is scheduled for **v0.50–v0.51** (Phase 15 —
+Declarative Data Governance), designed as a plugin/extension layer:
 
 - `CREATE EXPECTATION <name> ON <view> AS <predicate>` DDL.
 - Failing rows routed to a configurable DLQ sink with the expectation name
@@ -4861,9 +4897,9 @@ compaction filters (§5.3, §8.5). Manifest and WAL costs are explicit budgets
 
 ### 16.2 Does the runtime model fit a sharded object-store backend?
 
-**Yes, after diverging from Feldera in three places.** RockStream borrows
-Feldera's circuit-of-typed-operators design but (a) schedules operators
-asynchronously per shard rather than via Feldera's synchronous
+**Yes, with three deliberate design choices.** RockStream uses the
+circuit-of-typed-operators design from DBSP but (a) schedules operators
+asynchronously per shard rather than via a synchronous
 `DynamicScheduler`, (b) treats arrangements as SlateDB-backed indexed Z-sets
 rather than in-memory Spines, and (c) makes `Exchange` first-class so
 cross-shard ownership is never an `OwnershipConflict` error.
@@ -5099,23 +5135,23 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    fully exercised in simulation. Mitigation target: add
    `partial_write_probability: f64` to `SimObjectStore`'s fault model by
    v0.37; add a `PartialWriteRecoveryTest` to the law-faults corpus.
-   Status: **[UNMITIGATED]** — blocks cold-tier exactly-once claim at v0.45.
+   Status: **[MITIGATED in v0.43]** — cold-tier exactly-once claim unblocked at v0.44.
 
 2. **Kafka transactional broker timeout** — `SimNetwork` can inject message
    drops but does not model Kafka broker-side transaction timeout (which
    aborts open transactions after `transaction.timeout.ms`). Consequence:
    the `CheckBeforeCommit` recovery path for `KafkaSink` is not exercised in
    simulation. Mitigation: add a `kafka_tx_timeout_probability` fault
-   parameter to the Kafka connector simulator before v0.43.
-   Status: **[UNMITIGATED]** — blocks Kafka exactly-once claim at v0.43.
+   parameter to the Kafka connector simulator before v0.44.
+   Status: **[MITIGATED in v0.43]** — Kafka exactly-once claim unblocked at v0.44.
 
 3. **S3 LIST consistency delays** — `SimObjectStore` returns synchronously
    consistent LIST results; real S3 may return stale LIST responses for
    several seconds after a PUT. Consequence: the CALM epoch manifest
    verifiability property (§8.4) is not tested against LIST staleness.
    Mitigation: add `list_staleness_epochs` fault parameter to
-   `SimObjectStore` by v0.38.
-   Status: **[UNMITIGATED — v0.38 deferred to v0.39]** — informational only;
+   `SimObjectStore` by v0.42 (Simulator Maturity).
+   Status: **[UNMITIGATED — scheduled for v0.42 Simulator Maturity]** — informational only;
    CALM property depends on direct manifest reads, not LIST.
 
 4. **Network packet fragmentation** — TCP segmentation of large shuffle
@@ -5125,7 +5161,7 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    Status: **[DEFERRED]** — low risk in practice; gRPC handles reassembly.
 
 Each `[UNMITIGATED]` gap must be resolved before the corresponding feature
-reaches the Integration Beta gate (v0.45). Gaps are tracked in the
+reaches the Integration Beta gate (v0.46). Gaps are tracked in the
 simulation coverage matrix and the Phase 6 known-gaps list in
 IMPLEMENTATION_PLAN.md.
 

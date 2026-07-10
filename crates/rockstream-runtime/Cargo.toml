@@ -4,26 +4,40 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Worker process, circuit executor, scheduler, and exchange for RockStream"
+description = "Worker process, scheduler, epoch-commit coordinator, and exchange for RockStream"
 
 [dependencies]
-rockstream-types = { workspace = true }
-rockstream-connectors = { workspace = true }
-rockstream-control = { workspace = true }
-rockstream-diff = { workspace = true }
 rockstream-ops = { workspace = true }
-rockstream-plan = { workspace = true }
-rockstream-sim = { workspace = true }
+rockstream-types = { workspace = true }
 rockstream-storage = { workspace = true }
-arrow = { workspace = true }
-async-trait = { workspace = true }
-bytes = { workspace = true }
-object_store = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+parking_lot = { workspace = true }
+object_store = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+arrow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
-tempfile = "3"
+rockstream-control = { workspace = true }
+rockstream-cli = { workspace = true }
 rockstream-sim = { workspace = true }
+tempfile = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["minio"] }
+reqwest = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+async-trait = { workspace = true }
+

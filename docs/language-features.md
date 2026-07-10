@@ -33,7 +33,7 @@ Status legend:
 - Schema and resource introspection: `SHOW RESOURCE USAGE`, `SHOW RESOURCE USAGE FOR WORKLOAD`, `SHOW CLUSTER RESOURCE USAGE`, `SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA`, and `SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW`.
 - DDL coordination: `SET BACKGROUND_DDL = ON`, `WAIT FOR MATERIALIZED VIEW ... TO BE READY TIMEOUT ...`, and `WITHOUT CONFIRMATION` for expensive `CREATE MATERIALIZED VIEW` backfills.
 - Query diagnostics: `EXPLAIN INCREMENTAL`, `EXPLAIN INCREMENTAL ESTIMATE`, `EXPLAIN INCREMENTAL VERBOSE`, `EXPLAIN INCREMENTAL ANALYZE`, `EXPLAIN TRANSACTION`, and `EXPLAIN INDEX`.
-- System catalog SQL: `rockstream_catalog.epochs`, `pipelines`, `shards`, `merge_laws`, `audit_log`, `dead_letter_queue`, `view_resource_usage`, `workload_resource_usage`, plus the read-only `rockstream.*` alias through v0.45.
+- System catalog SQL: `rockstream_catalog.epochs`, `pipelines`, `shards`, `merge_laws`, `audit_log`, `dead_letter_queue`, `view_resource_usage`, `workload_resource_usage`, plus the read-only `rockstream.*` alias through v0.49.
 
 ## Documented / Planned Surface
 

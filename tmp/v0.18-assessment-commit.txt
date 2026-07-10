@@ -1,7 +1,0 @@
-Add post-phase architectural assessment for v0.18 SQL Alpha
-
-Comprehensive review of DESIGN.md, IMPLEMENTATION_PLAN.md, and ROADMAP.md
-covering: plan drift, scaling spectrum, high-performance engineering, and
-operability. Identifies five critical vulnerabilities, proposes concrete
-remediations including design-document split, storage budget gate, Phase 3
-decomposition, direct-write backpressure, and milestone redefinition.

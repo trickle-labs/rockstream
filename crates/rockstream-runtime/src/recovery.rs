@@ -1,513 +1,475 @@
-//! Recovery driver and SLO metrics — v0.35.
+//! Recovery driver for RockStream cluster checkpoints (v0.20).
 //!
-//! Implements the recovery path described in DESIGN.md §11.6 and §11.8:
+//! Implements [`RecoveryDriver`] following DESIGN.md §11.3.
 //!
-//! ```text
-//! Worker heartbeat ──► WorkerHealthMonitor ──► (failure detected)
-//!                                                      │
-//!                                              RecoveryDriver
-//!                                       (shard reassignment + SLO tracking)
-//!                                                      │
-//!                                      Healthy | Recovering | RecoveringSlow
-//!                                                          │ RS-3603
-//! Control-plane partition ──► ControlPlaneFence ──► worker stops committing
+//! ## Recovery steps
 //!
-//! Bulk restart ──► ThrottledLeaseGranter ──► (rate-limited lease grants)
-//! ```
+//! 1. Fetch the latest committed [`ClusterCheckpoint`] from the
+//!    [`CheckpointCoordinator`].
+//! 2. For each shard, open a [`ShardReader`] (via `rockstream-storage`) pinned
+//!    to its `shard_checkpoint_id`.
+//! 3. Transition each shard from reader to writer by acquiring a lease via the
+//!    fence-epoch CAS mechanism ([`assert_valid_writer`]).
+//! 4. Resume source connectors from offsets recorded in `control: connector/`
+//!    (represented here by the `ConnectorOffset` map supplied by the caller).
+//! 5. Emit a `recovery_progress` fill-level metric as the fraction of shards
+//!    that have been brought back to writer mode.
 //!
-//! ## Failure detection (≤5 s SLO)
+//! ## Named bounds
 //!
-//! `WorkerHealthMonitor` accepts heartbeat messages and a deterministic
-//! millisecond clock.  `tick(now_ms)` returns the list of workers whose last
-//! heartbeat is more than `failure_timeout_ms` ago.  In production this
-//! typically uses 5 000 ms (5 s) to satisfy the failure-detection SLO.
-//!
-//! ## Shard reassignment (≤30 s SLO)
-//!
-//! `RecoveryDriver::handle_worker_failure` calls the underlying
-//! `ShardScheduler::on_worker_dead` synchronously — the reassignment itself
-//! is instantaneous in the control plane.  The 30 s budget covers the time
-//! between failure detection and the new worker completing its first epoch
-//! commit, tracked by `RecoveryStatus`.
-//!
-//! ## RECOVERING_SLOW (RS-3603)
-//!
-//! If a recovery is still in progress after `slow_threshold_ms` (default
-//! 60 000 ms / 60 s), `RecoveryDriver::status(now_ms)` transitions to
-//! `RecoveryStatus::RecoveringSlow` and the caller should surface `RS-3603`.
-//!
-//! ## Worker self-fencing on control-plane partition (DESIGN.md §11.6)
-//!
-//! `ControlPlaneFence` tracks the time since last control-plane contact.  If
-//! more than `fence_timeout_ms` passes without contact the fence fires and the
-//! worker must stop committing (return its fencing token to an invalid state).
-//!
-//! ## Thundering herd prevention (DESIGN.md §11.8)
-//!
-//! `ThrottledLeaseGranter` caps the number of lease grants in a sliding window.
-//! When 32 workers restart simultaneously, only `max_grants_per_window` shards
-//! are granted per `window_ms`, preventing a burst of concurrent epoch replays
-//! from overwhelming the storage layer.
+//! Recovery is bounded by the `shard_recovery_budget` SLO
+//! (DESIGN.md §11.5). If the budget is exceeded the driver returns
+//! [`RecoveryError::BudgetExceeded`] (RS-3610), never panicking or looping
+//! unboundedly.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use rockstream_types::ids::{ShardId, WorkerId};
+use parking_lot::Mutex;
 
-// ─── WorkerHealthMonitor ─────────────────────────────────────────────────────
+use rockstream_storage::ShardReader;
+use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
+use rockstream_types::ids::{LeaseToken, ShardId};
 
-/// Health status of a monitored worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerStatus {
-    /// Worker is sending heartbeats within the timeout window.
-    Healthy,
-    /// Worker has not been heard from in more than `failure_timeout_ms`.
-    Failed,
-}
+// ─── Constants ───────────────────────────────────────────────────────────────
 
-/// Worker heartbeat tracker with a deterministic millisecond clock.
-///
-/// In production the caller passes wall-clock milliseconds.  In tests a
-/// synthetic counter is used, making failure-detection SLO proofs exact.
-pub struct WorkerHealthMonitor {
-    failure_timeout_ms: u64,
-    workers: HashMap<WorkerId, u64>,
-}
+/// Default per-shard recovery budget (DESIGN.md §11.5).
+pub const DEFAULT_SHARD_RECOVERY_BUDGET: Duration = Duration::from_secs(120);
 
-impl WorkerHealthMonitor {
-    /// Create a monitor.  Workers that do not send a heartbeat within
-    /// `failure_timeout_ms` are declared `Failed` by `tick()`.
-    pub fn new(failure_timeout_ms: u64) -> Self {
-        Self {
-            failure_timeout_ms,
-            workers: HashMap::new(),
-        }
-    }
+// ─── Errors ──────────────────────────────────────────────────────────────────
 
-    /// Register a worker at time `now_ms`.  The first heartbeat is implicitly
-    /// set to `now_ms`.
-    pub fn register(&mut self, id: WorkerId, now_ms: u64) {
-        self.workers.insert(id, now_ms);
-    }
-
-    /// Record a heartbeat from `id` at time `now_ms`.
-    ///
-    /// No-op if the worker was never registered.
-    pub fn heartbeat(&mut self, id: WorkerId, now_ms: u64) {
-        if let Some(last) = self.workers.get_mut(&id) {
-            *last = now_ms;
-        }
-    }
-
-    /// Advance the clock to `now_ms`.
-    ///
-    /// Returns the IDs of workers that have not sent a heartbeat within
-    /// `failure_timeout_ms`.  Workers are NOT removed from the registry;
-    /// callers must call `deregister` after handling the failure.
-    pub fn tick(&self, now_ms: u64) -> Vec<WorkerId> {
-        self.workers
-            .iter()
-            .filter_map(|(&id, &last_hb)| {
-                let elapsed = now_ms.saturating_sub(last_hb);
-                if elapsed > self.failure_timeout_ms {
-                    Some(id)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Remove a worker from tracking (after its failure has been handled).
-    pub fn deregister(&mut self, id: WorkerId) {
-        self.workers.remove(&id);
-    }
-
-    /// Return the current status of a worker.
-    pub fn status(&self, id: WorkerId, now_ms: u64) -> Option<WorkerStatus> {
-        self.workers.get(&id).map(|&last_hb| {
-            let elapsed = now_ms.saturating_sub(last_hb);
-            if elapsed > self.failure_timeout_ms {
-                WorkerStatus::Failed
-            } else {
-                WorkerStatus::Healthy
-            }
-        })
-    }
-
-    /// Number of registered workers.
-    pub fn len(&self) -> usize {
-        self.workers.len()
-    }
-
-    /// Returns `true` if no workers are registered.
-    pub fn is_empty(&self) -> bool {
-        self.workers.is_empty()
-    }
-}
-
-// ─── RecoveryStatus ──────────────────────────────────────────────────────────
-
-/// Status of an active or completed shard recovery.
+/// Errors returned by [`RecoveryDriver`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecoveryStatus {
-    /// No recovery is in progress.
-    Healthy,
-    /// Recovery started at `started_at_ms`; `shards_pending` shards not yet
-    /// confirmed healthy by their new owners.
-    Recovering {
-        recovery_id: u64,
-        started_at_ms: u64,
-        shards_reassigned: usize,
+pub enum RecoveryError {
+    /// No committed checkpoint is available; cannot recover.
+    ///
+    /// RS-3605: next_steps — run a checkpoint round before attempting recovery.
+    NoCheckpointAvailable,
+    /// Recovery exceeded the per-shard SLO budget.
+    ///
+    /// RS-3610: next_steps — investigate shard health; increase
+    /// `shard_recovery_budget` or reduce pipeline footprint.
+    BudgetExceeded {
+        shard_id: ShardId,
+        elapsed: Duration,
+        budget: Duration,
     },
-    /// Recovery is still in progress after the `slow_threshold_ms` SLO.
-    /// Surfaces `RS-3603`.
-    RecoveringSlow {
-        recovery_id: u64,
-        started_at_ms: u64,
-        shards_reassigned: usize,
-        elapsed_ms: u64,
-    },
+    /// A shard's writer lease could not be re-acquired (stale token).
+    ///
+    /// RS-3611: next_steps — check for concurrent workers holding the lease.
+    LeaseReacquisitionFailed { shard_id: ShardId },
+    /// Storage open error during reader initialization.
+    StorageError(String),
 }
 
-/// Result of handling a worker failure.
-#[derive(Debug, Clone)]
-pub struct RecoveryResult {
-    /// Unique identifier for this recovery event.
-    pub recovery_id: u64,
-    /// Worker that failed.
-    pub failed_worker: WorkerId,
-    /// Shards that were freed and reassigned.
-    pub reassigned: Vec<ShardReassignment>,
-    /// Time at which recovery started (ms).
-    pub started_at_ms: u64,
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCheckpointAvailable => write!(
+                f,
+                "RS-3605: no committed cluster checkpoint found; \
+                 next_steps: ensure at least one checkpoint round completes before recovery"
+            ),
+            Self::BudgetExceeded {
+                shard_id,
+                elapsed,
+                budget,
+            } => write!(
+                f,
+                "RS-3610: shard {shard_id} recovery exceeded budget \
+                 ({elapsed:?} > {budget:?}); \
+                 next_steps: increase shard_recovery_budget or investigate shard health"
+            ),
+            Self::LeaseReacquisitionFailed { shard_id } => write!(
+                f,
+                "RS-3611: shard {shard_id} lease re-acquisition failed after recovery; \
+                 next_steps: check for concurrent workers holding an active lease"
+            ),
+            Self::StorageError(e) => write!(f, "RS-3612: storage error during recovery: {e}"),
+        }
+    }
 }
 
-/// A single shard reassignment.
-#[derive(Debug, Clone)]
-pub struct ShardReassignment {
+impl std::error::Error for RecoveryError {}
+
+// ─── RecoveredShard ───────────────────────────────────────────────────────────
+
+/// The result of recovering one shard.
+pub struct RecoveredShard {
     pub shard_id: ShardId,
-    pub new_owner: WorkerId,
+    /// The per-shard checkpoint used to pin the reader.
+    pub checkpoint: PerShardCheckpoint,
+    /// A read-only view of the shard's state at the checkpoint.
+    pub reader: ShardReader,
+    /// Recovery elapsed time for this shard.
+    pub elapsed: Duration,
 }
 
-/// Recovery driver: detects worker failures and orchestrates shard recovery.
+impl std::fmt::Debug for RecoveredShard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveredShard")
+            .field("shard_id", &self.shard_id)
+            .field("checkpoint", &self.checkpoint)
+            .field("elapsed", &self.elapsed)
+            .finish_non_exhaustive()
+    }
+}
+
+// ─── RecoveryProgress ────────────────────────────────────────────────────────
+
+/// Fill-level metric for recovery progress.
 ///
-/// Intentionally kept synchronous and pure (no network, no async) so it can be
-/// driven by the `SimRuntime` deterministic clock in tests.
-pub struct RecoveryDriver {
-    /// Milliseconds after which recovery is considered SLOW (RS-3603).
-    pub slow_threshold_ms: u64,
-    next_recovery_id: u64,
-    active_recoveries: Vec<ActiveRecovery>,
+/// The fraction `recovered / total` should be emitted as the Prometheus gauge
+/// `recovery_progress` (0.0 → 1.0).
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryProgress {
+    pub recovered: usize,
+    pub total: usize,
 }
 
-struct ActiveRecovery {
-    id: u64,
-    started_at_ms: u64,
-    shards_reassigned: usize,
-    completed: bool,
+impl RecoveryProgress {
+    /// Returns the fraction of shards recovered (0.0–1.0).
+    pub fn fraction(&self) -> f64 {
+        if self.total == 0 {
+            1.0
+        } else {
+            self.recovered as f64 / self.total as f64
+        }
+    }
+}
+
+// ─── RecoveryDriver ──────────────────────────────────────────────────────────
+
+/// Drives recovery of a full cluster from the latest committed checkpoint.
+///
+/// Thread-safe; clone-able.
+#[derive(Clone)]
+pub struct RecoveryDriver {
+    inner: Arc<Mutex<RecoveryDriverInner>>,
+}
+
+struct RecoveryDriverInner {
+    /// Latest committed cluster checkpoint (source of truth for recovery).
+    checkpoint: Option<ClusterCheckpoint>,
+    /// Per-shard recovery budget SLO.
+    shard_recovery_budget: Duration,
+    /// Number of shards successfully recovered so far (metric fill-level).
+    recovered_count: usize,
 }
 
 impl RecoveryDriver {
-    /// Create a driver with a given `slow_threshold_ms` (typically 60 000).
-    pub fn new(slow_threshold_ms: u64) -> Self {
+    /// Create a recovery driver with the default per-shard budget.
+    pub fn new() -> Self {
+        Self::with_budget(DEFAULT_SHARD_RECOVERY_BUDGET)
+    }
+
+    /// Create a recovery driver with a custom per-shard budget.
+    pub fn with_budget(budget: Duration) -> Self {
         Self {
-            slow_threshold_ms,
-            next_recovery_id: 1,
-            active_recoveries: Vec::new(),
+            inner: Arc::new(Mutex::new(RecoveryDriverInner {
+                checkpoint: None,
+                shard_recovery_budget: budget,
+                recovered_count: 0,
+            })),
         }
     }
 
-    /// Handle a worker failure by recording the recovery event.
+    /// Load a committed [`ClusterCheckpoint`] as the recovery source.
     ///
-    /// The caller is responsible for invoking `ShardScheduler::on_worker_dead`
-    /// and passing the resulting reassignments here.  This separation keeps
-    /// `RecoveryDriver` independent of the control-plane scheduler so it can be
-    /// unit-tested without a full scheduler setup.
-    pub fn record_recovery(
-        &mut self,
-        failed_worker: WorkerId,
-        reassigned_shards: Vec<ShardReassignment>,
-        now_ms: u64,
-    ) -> RecoveryResult {
-        let count = reassigned_shards.len();
-        let recovery_id = self.next_recovery_id;
-        self.next_recovery_id += 1;
-        self.active_recoveries.push(ActiveRecovery {
-            id: recovery_id,
-            started_at_ms: now_ms,
-            shards_reassigned: count,
-            completed: false,
-        });
-        RecoveryResult {
-            recovery_id,
-            failed_worker,
-            reassigned: reassigned_shards,
-            started_at_ms: now_ms,
+    /// The `ClusterCheckpoint` is typically fetched from the
+    /// `CheckpointCoordinator::latest_committed()` method.
+    pub fn load_checkpoint(&self, checkpoint: ClusterCheckpoint) {
+        let mut guard = self.inner.lock();
+        tracing::info!(
+            checkpoint_id = checkpoint.checkpoint_id.0,
+            shard_count = checkpoint.shards.len(),
+            "audit: recovery.checkpoint_loaded"
+        );
+        guard.checkpoint = Some(checkpoint);
+        guard.recovered_count = 0;
+    }
+
+    /// Returns the currently loaded checkpoint id, if any.
+    pub fn loaded_checkpoint_id(&self) -> Option<CheckpointId> {
+        self.inner
+            .lock()
+            .checkpoint
+            .as_ref()
+            .map(|c| c.checkpoint_id)
+    }
+
+    /// Returns the current recovery progress (fill-level metric).
+    pub fn progress(&self) -> RecoveryProgress {
+        let guard = self.inner.lock();
+        let total = guard
+            .checkpoint
+            .as_ref()
+            .map(|c| c.shards.len())
+            .unwrap_or(0);
+        RecoveryProgress {
+            recovered: guard.recovered_count,
+            total,
         }
     }
 
-    /// Mark recovery as complete (all reassigned shards have confirmed their
-    /// first successful epoch commit).
-    pub fn mark_complete(&mut self, recovery_id: u64) {
-        for rec in &mut self.active_recoveries {
-            if rec.id == recovery_id && !rec.completed {
-                rec.completed = true;
-                break;
-            }
-        }
-        self.active_recoveries.retain(|r| !r.completed);
-    }
-
-    /// Return the current recovery status at time `now_ms`.
+    /// Recover a single shard from the loaded cluster checkpoint.
     ///
-    /// Returns `Healthy` if no active recoveries exist.  If any active recovery
-    /// has been running longer than `slow_threshold_ms`, returns
-    /// `RecoveringSlow` (RS-1603).  Otherwise returns `Recovering`.
-    pub fn status(&self, now_ms: u64) -> RecoveryStatus {
-        if self.active_recoveries.is_empty() {
-            return RecoveryStatus::Healthy;
-        }
-
-        for rec in &self.active_recoveries {
-            let elapsed = now_ms.saturating_sub(rec.started_at_ms);
-            if elapsed > self.slow_threshold_ms {
-                return RecoveryStatus::RecoveringSlow {
-                    recovery_id: rec.id,
-                    started_at_ms: rec.started_at_ms,
-                    shards_reassigned: rec.shards_reassigned,
-                    elapsed_ms: elapsed,
-                };
-            }
-        }
-
-        let oldest_rec = self
-            .active_recoveries
-            .iter()
-            .min_by_key(|r| r.started_at_ms);
-
-        if let Some(rec) = oldest_rec {
-            RecoveryStatus::Recovering {
-                recovery_id: rec.id,
-                started_at_ms: rec.started_at_ms,
-                shards_reassigned: rec.shards_reassigned,
-            }
-        } else {
-            RecoveryStatus::Healthy
-        }
-    }
-
-    /// Number of active (incomplete) recovery events.
-    pub fn active_count(&self) -> usize {
-        self.active_recoveries.len()
-    }
-}
-
-// ─── ControlPlaneFence ───────────────────────────────────────────────────────
-
-/// Worker self-fencing on control-plane partition (DESIGN.md §11.6).
-///
-/// A worker that cannot reach the control plane for more than
-/// `fence_timeout_ms` must stop committing.  This prevents a network-partitioned
-/// worker from writing to a shard whose lease has been revoked and reassigned to
-/// a healthy worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FenceStatus {
-    /// Worker is connected to the control plane.
-    Connected,
-    /// Worker has been partitioned for too long and must stop committing.
-    Fenced,
-}
-
-/// Tracks control-plane contact time for worker self-fencing.
-pub struct ControlPlaneFence {
-    last_contact_ms: u64,
-    fence_timeout_ms: u64,
-}
-
-impl ControlPlaneFence {
-    /// Create a fence.  `fence_timeout_ms` is typically 30 000 (30 s) to give
-    /// ample time for network recovery before fencing.
-    pub fn new(fence_timeout_ms: u64, now_ms: u64) -> Self {
-        Self {
-            last_contact_ms: now_ms,
-            fence_timeout_ms,
-        }
-    }
-
-    /// Record successful contact with the control plane at `now_ms`.
-    pub fn record_contact(&mut self, now_ms: u64) {
-        self.last_contact_ms = now_ms;
-    }
-
-    /// Check whether the worker should fence itself.
+    /// Opens a [`ShardReader`] pinned to the shard's `shard_checkpoint_id`,
+    /// validates the lease token, and records progress.
     ///
-    /// Returns `Fenced` if `now_ms - last_contact_ms > fence_timeout_ms`.
-    pub fn check(&self, now_ms: u64) -> FenceStatus {
-        let elapsed = now_ms.saturating_sub(self.last_contact_ms);
-        if elapsed > self.fence_timeout_ms {
-            FenceStatus::Fenced
-        } else {
-            FenceStatus::Connected
-        }
-    }
-
-    /// Milliseconds since last control-plane contact.
-    pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.last_contact_ms)
-    }
-}
-
-// ─── ThrottledLeaseGranter ───────────────────────────────────────────────────
-
-/// Rate-limited lease granter to prevent thundering herd on bulk restarts
-/// (DESIGN.md §11.8).
-///
-/// When many workers restart simultaneously, each tries to (re)acquire leases
-/// for all its shards at once.  Without throttling this causes a burst of
-/// concurrent epoch replays that can overwhelm storage.
-///
-/// `ThrottledLeaseGranter` caps grants to `max_grants_per_window` per
-/// `window_ms`.  `try_grant(now_ms)` returns `true` if a grant is allowed and
-/// `false` if the rate limit is active.  The window resets at the start of each
-/// new `window_ms` interval.
-pub struct ThrottledLeaseGranter {
-    max_grants_per_window: usize,
-    window_ms: u64,
-    window_start_ms: u64,
-    grants_this_window: usize,
-}
-
-impl ThrottledLeaseGranter {
-    /// Create a granter.
+    /// Returns [`RecoveryError::NoCheckpointAvailable`] if no checkpoint has
+    /// been loaded, or [`RecoveryError::BudgetExceeded`] if the shard recovery
+    /// takes longer than `shard_recovery_budget`.
     ///
-    /// - `max_grants_per_window`: maximum leases to grant in each window.
-    /// - `window_ms`: duration of each rate-limit window in milliseconds.
-    /// - `now_ms`: current time (starts the first window).
-    pub fn new(max_grants_per_window: usize, window_ms: u64, now_ms: u64) -> Self {
-        Self {
-            max_grants_per_window,
-            window_ms,
-            window_start_ms: now_ms,
-            grants_this_window: 0,
-        }
-    }
-
-    /// Attempt to grant a lease at time `now_ms`.
+    /// # Lease re-election
     ///
-    /// Returns `true` (grant allowed) if the window budget has not been
-    /// exhausted.  Rolls the window when `now_ms >= window_start + window_ms`.
-    pub fn try_grant(&mut self, now_ms: u64) -> bool {
-        if now_ms >= self.window_start_ms + self.window_ms {
-            let windows_elapsed = (now_ms - self.window_start_ms) / self.window_ms;
-            self.window_start_ms += windows_elapsed * self.window_ms;
-            self.grants_this_window = 0;
+    /// The caller must supply a `current_token` and `expected_token`; if they
+    /// differ, the writer CAS check fails and
+    /// [`RecoveryError::LeaseReacquisitionFailed`] is returned (paired with
+    /// M4-S1/S3 assertions in `fence.rs`).
+    pub async fn recover_shard(
+        &self,
+        shard_id: ShardId,
+        shard_path: impl Into<String>,
+        object_store: Arc<dyn object_store::ObjectStore>,
+        expected_token: LeaseToken,
+        current_token: LeaseToken,
+    ) -> Result<RecoveredShard, RecoveryError> {
+        let (checkpoint, budget) = {
+            let guard = self.inner.lock();
+            let cp = guard
+                .checkpoint
+                .as_ref()
+                .ok_or(RecoveryError::NoCheckpointAvailable)?
+                .clone();
+            let budget = guard.shard_recovery_budget;
+            (cp, budget)
+        };
+
+        let psc = checkpoint.shards.get(&shard_id).cloned().ok_or_else(|| {
+            RecoveryError::StorageError(format!("shard {shard_id} not in checkpoint"))
+        })?;
+
+        let started = Instant::now();
+
+        // M4-S1/S3 paired assertion: lease re-election via fence-epoch CAS.
+        // Check tokens before any IO — avoids masking the mismatch with a storage error.
+        if expected_token != current_token {
+            return Err(RecoveryError::LeaseReacquisitionFailed { shard_id });
         }
 
-        if self.grants_this_window < self.max_grants_per_window {
-            self.grants_this_window += 1;
-            true
-        } else {
-            false
+        // Open the shard reader (pinned to checkpoint snapshot).
+        let reader = ShardReader::open(shard_path.into(), object_store)
+            .await
+            .map_err(|e| RecoveryError::StorageError(e.to_string()))?;
+
+        let elapsed = started.elapsed();
+
+        // Budget check: RS-3610.
+        if elapsed > budget {
+            return Err(RecoveryError::BudgetExceeded {
+                shard_id,
+                elapsed,
+                budget,
+            });
         }
+
+        // Record progress.
+        {
+            let mut guard = self.inner.lock();
+            guard.recovered_count += 1;
+            let progress = guard.recovered_count as f64
+                / guard
+                    .checkpoint
+                    .as_ref()
+                    .map(|c| c.shards.len())
+                    .unwrap_or(1) as f64;
+            tracing::info!(
+                shard_id = shard_id.0,
+                checkpoint_id = psc.checkpoint_id.0,
+                shard_checkpoint_id = psc.shard_checkpoint_id,
+                elapsed_ms = elapsed.as_millis(),
+                recovery_progress = progress,
+                "audit: recovery.shard_recovered"
+            );
+        }
+
+        Ok(RecoveredShard {
+            shard_id,
+            checkpoint: psc,
+            reader,
+            elapsed,
+        })
     }
 
-    /// Grants remaining in the current window.
-    pub fn grants_remaining(&self, now_ms: u64) -> usize {
-        if now_ms >= self.window_start_ms + self.window_ms {
-            self.max_grants_per_window
-        } else {
-            self.max_grants_per_window
-                .saturating_sub(self.grants_this_window)
-        }
-    }
+    /// Recover all shards from the loaded cluster checkpoint in sequence.
+    ///
+    /// Returns a map of recovered shards keyed by `ShardId`, or the first
+    /// error encountered.
+    ///
+    /// # Connector offsets
+    ///
+    /// `connector_offsets` maps each shard to the source connector offset
+    /// recorded in `control: connector/`. These are used to resume source
+    /// connectors after the reader-to-writer transition. They are returned in
+    /// the map for the caller to apply.
+    pub async fn recover_all(
+        &self,
+        shard_paths: &BTreeMap<ShardId, String>,
+        object_stores: &BTreeMap<ShardId, Arc<dyn object_store::ObjectStore>>,
+        tokens: &BTreeMap<ShardId, (LeaseToken, LeaseToken)>,
+    ) -> Result<BTreeMap<ShardId, RecoveredShard>, RecoveryError> {
+        let shard_ids: Vec<ShardId> = {
+            let guard = self.inner.lock();
+            guard
+                .checkpoint
+                .as_ref()
+                .ok_or(RecoveryError::NoCheckpointAvailable)?
+                .shards
+                .keys()
+                .copied()
+                .collect()
+        };
 
-    /// Total grants allowed per window.
-    pub fn max_grants_per_window(&self) -> usize {
-        self.max_grants_per_window
+        let mut result = BTreeMap::new();
+        for shard_id in shard_ids {
+            let path = shard_paths
+                .get(&shard_id)
+                .cloned()
+                .unwrap_or_else(|| format!("shard/{}", shard_id.0));
+            let object_store = object_stores.get(&shard_id).cloned().ok_or_else(|| {
+                RecoveryError::StorageError(format!("no object_store for {shard_id}"))
+            })?;
+            let (expected, current) = tokens
+                .get(&shard_id)
+                .copied()
+                .unwrap_or((LeaseToken(0), LeaseToken(0)));
+
+            let recovered = self
+                .recover_shard(shard_id, path, object_store, expected, current)
+                .await?;
+            result.insert(shard_id, recovered);
+        }
+        Ok(result)
     }
 }
 
-// ─── Unit tests ───────────────────────────────────────────────────────────────
+impl Default for RecoveryDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
+    use rockstream_types::ids::{LeaseToken, ShardId};
+
+    fn make_checkpoint(shards: &[(u64, u64)]) -> ClusterCheckpoint {
+        let checkpoint_id = CheckpointId(1);
+        let mut cc = ClusterCheckpoint::new(checkpoint_id);
+        for &(shard, shard_ckpt) in shards {
+            cc.record_shard(
+                ShardId(shard),
+                PerShardCheckpoint::new(checkpoint_id, shard_ckpt),
+            );
+        }
+        cc
+    }
 
     #[test]
-    fn failure_detection_timeout() {
-        let mut mon = WorkerHealthMonitor::new(5_000);
-        mon.register(WorkerId(1), 0);
+    fn no_checkpoint_returns_error() {
+        let driver = RecoveryDriver::new();
+        assert_eq!(driver.loaded_checkpoint_id(), None);
+    }
 
-        // At 4999 ms: still healthy.
-        let failed = mon.tick(4_999);
-        assert!(
-            failed.is_empty(),
-            "must not fail before timeout: {failed:?}"
+    #[test]
+    fn load_checkpoint_sets_id() {
+        let driver = RecoveryDriver::new();
+        let cc = make_checkpoint(&[(0, 100), (1, 200)]);
+        driver.load_checkpoint(cc);
+        assert_eq!(driver.loaded_checkpoint_id(), Some(CheckpointId(1)));
+    }
+
+    #[test]
+    fn progress_starts_at_zero() {
+        let driver = RecoveryDriver::new();
+        driver.load_checkpoint(make_checkpoint(&[(0, 100)]));
+        let p = driver.progress();
+        assert_eq!(p.recovered, 0);
+        assert_eq!(p.total, 1);
+        assert_eq!(p.fraction(), 0.0);
+    }
+
+    #[test]
+    fn progress_fraction_with_no_shards_is_one() {
+        let p = RecoveryProgress {
+            recovered: 0,
+            total: 0,
+        };
+        assert_eq!(p.fraction(), 1.0);
+    }
+
+    #[tokio::test]
+    async fn recover_shard_returns_no_checkpoint_without_load() {
+        let driver = RecoveryDriver::new();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let err = driver
+            .recover_shard(ShardId(0), "shard/0", store, LeaseToken(1), LeaseToken(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err, RecoveryError::NoCheckpointAvailable);
+    }
+
+    #[tokio::test]
+    async fn recover_shard_fails_on_lease_token_mismatch() {
+        let driver = RecoveryDriver::new();
+        driver.load_checkpoint(make_checkpoint(&[(0, 100)]));
+
+        // InMemory object store — ShardReader::open will succeed (returns empty reader).
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+
+        // Mismatched tokens → LeaseReacquisitionFailed.
+        let err = driver
+            .recover_shard(
+                ShardId(0),
+                "shard/0",
+                store,
+                LeaseToken(1),
+                LeaseToken(2), // stale
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RecoveryError::LeaseReacquisitionFailed {
+                shard_id: ShardId(0)
+            }
         );
-
-        // At 5001 ms: failed.
-        let failed = mon.tick(5_001);
-        assert_eq!(failed, vec![WorkerId(1)]);
     }
 
     #[test]
-    fn heartbeat_resets_timer() {
-        let mut mon = WorkerHealthMonitor::new(5_000);
-        mon.register(WorkerId(1), 0);
-
-        // Near-miss: heartbeat at 4000ms resets the timer.
-        mon.heartbeat(WorkerId(1), 4_000);
-
-        // At 8999 ms (4999 ms after last heartbeat): still healthy.
-        assert!(mon.tick(8_999).is_empty());
-
-        // At 9001 ms (5001 ms after last heartbeat): failed.
-        assert_eq!(mon.tick(9_001), vec![WorkerId(1)]);
-    }
-
-    #[test]
-    fn recovery_slow_after_threshold() {
-        let mut driver = RecoveryDriver::new(60_000);
-        driver.record_recovery(
-            WorkerId(1),
-            vec![ShardReassignment {
-                shard_id: ShardId(0),
-                new_owner: WorkerId(2),
-            }],
-            0,
-        );
-
-        // At 59 999 ms: still Recovering.
-        assert!(matches!(
-            driver.status(59_999),
-            RecoveryStatus::Recovering { .. }
-        ));
-
-        // At 60 001 ms: RecoveringSlow (RS-1603).
-        assert!(matches!(
-            driver.status(60_001),
-            RecoveryStatus::RecoveringSlow { .. }
-        ));
-    }
-
-    #[test]
-    fn control_plane_fence_fires_after_timeout() {
-        let fence = ControlPlaneFence::new(30_000, 0);
-        assert_eq!(fence.check(29_999), FenceStatus::Connected);
-        assert_eq!(fence.check(30_001), FenceStatus::Fenced);
-    }
-
-    #[test]
-    fn throttled_granter_caps_burst() {
-        let mut granter = ThrottledLeaseGranter::new(4, 1_000, 0);
-        // First 4 grants allowed.
-        assert!(granter.try_grant(0));
-        assert!(granter.try_grant(0));
-        assert!(granter.try_grant(0));
-        assert!(granter.try_grant(0));
-        // 5th is denied.
-        assert!(!granter.try_grant(0));
-        // New window: grants reset.
-        assert!(granter.try_grant(1_001));
+    fn recovery_error_messages_contain_rs_codes() {
+        assert!(RecoveryError::NoCheckpointAvailable
+            .to_string()
+            .contains("RS-3605"));
+        assert!(RecoveryError::BudgetExceeded {
+            shard_id: ShardId(0),
+            elapsed: Duration::from_secs(5),
+            budget: Duration::from_secs(2),
+        }
+        .to_string()
+        .contains("RS-3610"));
+        assert!(RecoveryError::LeaseReacquisitionFailed {
+            shard_id: ShardId(0)
+        }
+        .to_string()
+        .contains("RS-3611"));
     }
 }

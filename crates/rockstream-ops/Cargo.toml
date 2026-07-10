@@ -6,31 +6,57 @@ rust-version.workspace = true
 license.workspace = true
 description = "Operator trait and per-operator implementations for RockStream"
 
+[[bench]]
+name = "minmax_bench"
+harness = false
+
+[[bench]]
+name = "perf_regression"
+harness = false
+
+[[bench]]
+name = "nexmark"
+harness = false
+
 [dependencies]
-arrow = { workspace = true }
-datafusion = { workspace = true }
-rockstream-sim = { workspace = true }
-rockstream-plan = { workspace = true }
 rockstream-types = { workspace = true }
-async-trait = { workspace = true }
+rockstream-plan = { workspace = true }
+rockstream-storage = { workspace = true }
+arrow = { workspace = true }
 tokio = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
-object_store = { workspace = true, features = ["azure"] }
-rockstream-storage = { workspace = true }
-slatedb = { workspace = true }
+object_store = { workspace = true }
+rockstream-plan = { workspace = true }
+rockstream-gateway = { workspace = true }
+rockstream-sim = { workspace = true }
+tokio-postgres = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
 
-[[bench]]
-name = "operator_throughput"
-harness = false
 
-[[bench]]
-name = "storage_budget"
-harness = false
 
-[[bench]]
-name = "ivm_vs_batch"
-harness = false
+[dev-dependencies.testcontainers]
+workspace = true
+
+[dev-dependencies.testcontainers-modules]
+workspace = true
+
+[dev-dependencies.reqwest]
+workspace = true
+
+[dev-dependencies.sha2]
+workspace = true
+
+[dev-dependencies.hmac]
+workspace = true
+
+[dev-dependencies.hex]
+workspace = true

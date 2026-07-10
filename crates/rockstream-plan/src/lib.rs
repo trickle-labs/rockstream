@@ -9,6 +9,7 @@ pub mod explain;
 
 use rockstream_types::ids::OperatorId;
 use rockstream_types::merge_law::MergeLawId;
+use serde::{Deserialize, Serialize};
 
 /// Re-exported for backward compatibility — `NotMergeSafeReason` is now
 /// defined in `rockstream_types::explain`.
@@ -19,7 +20,7 @@ pub use rockstream_types::explain::NotMergeSafeReason;
 /// The plan IR is a tree of declarative operations that describe *what* to
 /// compute. The `DiffCtx` pass transforms this into a physical `OpNode` graph
 /// that describes *how* to compute it incrementally.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanNode {
     /// Read from a named source.
     Source { name: String },
@@ -41,18 +42,102 @@ pub enum PlanNode {
         group_by: Vec<Expr>,
         aggregates: Vec<AggregateExpr>,
     },
-    /// Inner join on a condition.
+    /// Inner join on a condition (deprecated — use InnerJoin instead).
     Join {
         left: Box<PlanNode>,
         right: Box<PlanNode>,
         condition: Expr,
+    },
+    /// Inner equi-join with pre-computed key columns and dual arrangements (v0.8 — IVM-4).
+    ///
+    /// The join uses two separate arrangements (left_arr_id, right_arr_id) to
+    /// efficiently probe matching rows. The join key is computed from the column
+    /// indices in `left_keys` and `right_keys`.
+    ///
+    /// `semantics` carries metadata for specialized join handling (e.g. semijoins,
+    /// TPC-H specific optimizations).
+    InnerJoin {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        /// Column indices in the left input forming the join key.
+        left_keys: Vec<usize>,
+        /// Column indices in the right input forming the join key.
+        right_keys: Vec<usize>,
+        /// Operator ID for the left arrangement.
+        left_arr_id: OperatorId,
+        /// Operator ID for the right arrangement.
+        right_arr_id: OperatorId,
+        /// Join semantics and metadata.
+        semantics: JoinSemantics,
+    },
+    /// Outer / semi / anti equi-join with dual arrangements and unmatched tracking (v0.9 — IVM-5).
+    ///
+    /// Uses the same dual arrangements as `InnerJoin` plus an `unmatched_arr_id` arrangement
+    /// tracking per-key match counts for correct NULL-padding retractions.
+    ///
+    /// For `Left`, `Full`, `Semi`, `Anti`: tracks right-side match counts per left-key.
+    /// For `Right`, `Full`: also tracks left-side match counts per right-key.
+    OuterJoin {
+        kind: OuterJoinKind,
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_arr_id: OperatorId,
+        right_arr_id: OperatorId,
+        /// Arrangement ID for the unmatched-row tracking state.
+        unmatched_arr_id: OperatorId,
     },
     /// Union of two inputs.
     Union {
         left: Box<PlanNode>,
         right: Box<PlanNode>,
     },
-    /// Window functions (v0.19).
+
+    // ── v0.10 additions (IVM-6) ────────────────────────────────────────────
+    /// Deduplicate rows by full row content — weight-based, zero-crossing (v0.10 — IVM-6).
+    ///
+    /// Maintains a `row_hash → i64` weight arrangement.  Emits `(row, +1)` on
+    /// weight `0 → positive` (zero-crossing up) and `(row, -1)` on weight
+    /// `positive → 0` (zero-crossing down).  Explicit tombstones are written
+    /// for zero-crossing entries; compaction filters clean up obsolete operands.
+    ///
+    /// Bound: bounded by the cardinality of the input relation.  Fill level =
+    /// distinct key count; backpressure = epoch backpressure from scheduler.
+    Distinct {
+        input: Box<PlanNode>,
+        arr_id: OperatorId,
+    },
+    /// Intersection of two input relations — set or bag semantics (v0.10 — IVM-6).
+    ///
+    /// Maintains two distinct-style arrangements (one per side).  Emits deltas
+    /// at `min(left_weight, right_weight)` transitions.
+    /// - `all = false` (set): clamps weights to `{0, 1}` before computing min.
+    /// - `all = true` (bag): uses raw weights, `min(l, r)`.
+    ///
+    /// Bound: bounded by the cardinality of each input relation.
+    Intersect {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        all: bool,
+        left_arr_id: OperatorId,
+        right_arr_id: OperatorId,
+    },
+    /// Difference of two input relations — set or bag semantics (v0.10 — IVM-6).
+    ///
+    /// Emits deltas at `(left_weight − right_weight).max(0)` transitions.
+    /// - `all = false` (set): clamps weights to `{0, 1}` before computing difference.
+    /// - `all = true` (bag): uses raw weights.
+    ///
+    /// Bound: bounded by the cardinality of each input relation.
+    Except {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        all: bool,
+        left_arr_id: OperatorId,
+        right_arr_id: OperatorId,
+    },
+    /// Window functions (v0.11 — IVM-7).
     Window {
         input: Box<PlanNode>,
         window_exprs: Vec<WindowExpr>,
@@ -177,13 +262,100 @@ pub enum PlanNode {
         /// The set-returning function to apply to each input row.
         func: LateralFunc,
     },
+
+    // ── v0.4 additions ─────────────────────────────────────────────────────
+    /// Materialize the input stream into a named view in shard storage (v0.4).
+    ///
+    /// Writes each output Z-set batch into the `view_output` namespace of the
+    /// shard's `ShardDb`.  The `pk` field lists the column indices that form
+    /// the view's primary key for upsert/retract keying.
+    ViewSink {
+        /// Name of the view being materialized.
+        view_name: String,
+        /// Primary-key column indices (used as the row identity key in storage).
+        pk: Vec<usize>,
+        /// Input plan producing the Z-set deltas to materialize.
+        child: Box<PlanNode>,
+    },
+
+    /// Exchange operator stub (v0.4).
+    ///
+    /// In the embedded single-process runtime (v0.4), Exchange is always
+    /// `Loopback`: data passes through without any network call or shuffle
+    /// object.  Full hash/broadcast/range exchange over gRPC + durable
+    /// shuffle objects is implemented in v0.16.
+    Exchange {
+        /// How this exchange partitions data.
+        kind: ExchangeKind,
+        /// The input plan to re-partition.
+        child: Box<PlanNode>,
+    },
+
+    /// Index arrangement operator (v0.32).
+    ///
+    /// Maintains a `(index_key_bytes ++ pk_bytes) → row_bytes` arrangement
+    /// stored under `view_output/__idx_<index_name>/`. Used to implement
+    /// secondary indexes without range deletion.
+    ///
+    /// Bound: bounded by `max_arrangement_rows` config. Fill metric:
+    /// `index_arrange_row_count` gauge. Backpressure: source credit-starved
+    /// if fill exceeds bound.
+    IndexArrange {
+        /// Input plan producing the rows to index.
+        input: Box<PlanNode>,
+        /// Column indices forming the index key.
+        index_cols: Vec<usize>,
+        /// Column indices forming the primary key.
+        pk_cols: Vec<usize>,
+        /// Optional filter predicate (for partial indexes).
+        filter_pred: Option<Expr>,
+    },
+}
+
+/// How an Exchange operator partitions data across shards (v0.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExchangeKind {
+    /// Single-process loopback — no network, no shuffle objects.
+    /// This is the only mode active in v0.4's embedded runtime.
+    Loopback,
+    /// Hash-partition by the plan's declared `partition_key`.
+    Hash,
+    /// Broadcast to every downstream shard.
+    Broadcast,
+    /// Route all data to a single shard (gather).
+    Single,
+    /// Range-partition by the declared `partition_key`.
+    Range,
+}
+
+/// Join kind for outer, semi, and anti joins (v0.9 — IVM-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OuterJoinKind {
+    Left,
+    Right,
+    Full,
+    Semi,
+    Anti,
+}
+
+/// Join semantics metadata for specialized join handling (v0.8 — IVM-4).
+///
+/// Carries metadata used for TPC-H optimizations and semi-join detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct JoinSemantics {
+    /// True if this join is nested inside a semi-join (e.g. TPC-H EC-01).
+    pub inside_semijoin: bool,
+    /// True if this join is a child of another join in the query tree.
+    pub is_join_child: bool,
+    /// True if the right side's old arrangement must be materialized (e.g. TPC-H Q07/Q21).
+    pub r_old_materialize: bool,
 }
 
 /// Policy for late-arriving rows in time-window operators.
 ///
 /// A row is "late" if its event timestamp falls within a window that has
 /// already been closed by the watermark.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LateDataPolicy {
     /// Silently discard the late row. The closed window output is unchanged.
     Drop,
@@ -197,7 +369,7 @@ pub enum LateDataPolicy {
 ///
 /// This is intentionally minimal for v0.5. DataFusion expression integration
 /// comes in Phase 2 (v0.11+).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expr {
     /// A column reference by index.
     Column(usize),
@@ -228,7 +400,7 @@ pub enum Expr {
 }
 
 /// Binary operators for expressions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Eq,
     Ne,
@@ -240,12 +412,13 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Mod,
     And,
     Or,
 }
 
 /// An aggregate function expression.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateExpr {
     /// The aggregate function.
     pub func: AggregateFunc,
@@ -256,7 +429,7 @@ pub struct AggregateExpr {
 }
 
 /// Built-in aggregate functions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggregateFunc {
     Count,
     Sum,
@@ -287,7 +460,7 @@ pub enum AggregateFunc {
 ///
 /// These are the "JSON/unnest/generate_series style" functions from the v0.25
 /// scope.  More SRF variants will be added as the SQL surface grows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LateralFunc {
     /// `UNNEST(col)` — expands a column containing an array-like value
     /// (encoded as a sequence of length-prefixed entries) into one output
@@ -359,7 +532,7 @@ pub enum LateralFunc {
 ///
 /// If no `MergeLawId` is provided, the node is annotated with
 /// `not_merge_safe_reason=unknown_udaf_properties`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UdafSpec {
     /// Registered name of the UDAF (e.g. "my_sum").
     pub name: String,
@@ -374,16 +547,16 @@ pub struct UdafSpec {
     pub description: String,
 }
 
-/// A window function expression (v0.19).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A window function expression (v0.11 — IVM-7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowExpr {
     pub func: WindowFunc,
     pub partition_by: Vec<usize>,
     pub order_by: Vec<usize>,
 }
 
-/// Window functions supported in v0.19.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Window functions supported in v0.11 (IVM-7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowFunc {
     RowNumber,
     Rank,
@@ -395,8 +568,8 @@ pub enum WindowFunc {
     SlidingAvg { frame_rows: usize },
 }
 
-/// Window operator IVM strategy (v0.19).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Window operator IVM strategy (v0.11 — IVM-7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowStrategy {
     PartitionRecompute,
     SlidingAggregate,
@@ -407,7 +580,7 @@ pub enum WindowStrategy {
 /// Each `OpNode` corresponds to a running operator instance with a unique
 /// `OperatorId`, an optional merge-law annotation, and references to its
 /// input(s).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpNode {
     /// Unique operator ID within the pipeline.
     pub id: OperatorId,
@@ -423,7 +596,7 @@ pub struct OpNode {
 }
 
 /// Physical operator kinds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpKind {
     /// Read from source.
     Source { name: String },
@@ -437,11 +610,23 @@ pub enum OpKind {
     Aggregate,
     /// Stateful join with dual arrangements.
     Join,
+    /// Outer / semi / anti equi-join (v0.9 — IVM-5).
+    OuterJoin {
+        kind: OuterJoinKind,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+    },
     /// Stateless union.
     Union,
+    /// Distinct deduplication — weight-based, zero-crossing (v0.10 — IVM-6).
+    Distinct,
+    /// Intersect of two input arrangements — set or bag semantics (v0.10 — IVM-6).
+    Intersect { all: bool },
+    /// Except subtraction of two arrangements — set or bag semantics (v0.10 — IVM-6).
+    Except { all: bool },
     /// Emit to output sink.
     Sink { name: String },
-    /// Window function operator (v0.19).
+    /// Window function operator (v0.11 — IVM-7).
     Window { strategy: WindowStrategy },
     /// Tumbling time-window operator (v0.20).
     ///
@@ -504,6 +689,24 @@ pub enum OpKind {
         /// The set-returning function applied to each input row.
         func: LateralFunc,
     },
+
+    // ── v0.4 additions ─────────────────────────────────────────────────────
+    /// View-sink operator: writes Z-set deltas to shard view_output (v0.4).
+    ViewSink {
+        /// Name of the materialized view.
+        view_name: String,
+        /// Primary-key column indices for row identity in storage.
+        pk: Vec<usize>,
+    },
+
+    /// Exchange operator stub (v0.4).
+    ///
+    /// In v0.4's embedded runtime, always `Loopback` — passes data through
+    /// with zero network calls and zero shuffle objects.
+    Exchange {
+        /// Partitioning strategy for this exchange.
+        kind: ExchangeKind,
+    },
 }
 
 #[cfg(test)]
@@ -559,5 +762,41 @@ mod tests {
             "extremum_requires_rmw"
         );
         assert_eq!(NotMergeSafeReason::ClampNotALaw.as_str(), "clamp_not_a_law");
+    }
+
+    // ── v0.32: IndexArrange ───────────────────────────────────────────────────
+
+    #[test]
+    fn index_arrange_roundtrips_serde() {
+        let node = PlanNode::IndexArrange {
+            input: Box::new(PlanNode::Source {
+                name: "t".to_string(),
+            }),
+            index_cols: vec![1],
+            pk_cols: vec![0],
+            filter_pred: None,
+        };
+        let bytes = serde_json::to_vec(&node).unwrap();
+        let decoded: PlanNode = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, node);
+    }
+
+    #[test]
+    fn index_arrange_with_filter_pred_roundtrips_serde() {
+        let node = PlanNode::IndexArrange {
+            input: Box::new(PlanNode::Source {
+                name: "orders".to_string(),
+            }),
+            index_cols: vec![2, 3],
+            pk_cols: vec![0],
+            filter_pred: Some(Expr::BinaryOp {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column(2)),
+                right: Box::new(Expr::Literal(100i64.to_be_bytes().to_vec())),
+            }),
+        };
+        let bytes = serde_json::to_vec(&node).unwrap();
+        let decoded: PlanNode = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, node);
     }
 }

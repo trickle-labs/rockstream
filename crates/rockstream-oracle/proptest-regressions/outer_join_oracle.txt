@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8743361daea5281e7d55c0e669f3d0feb2a3dd4f93ab200455d751fae40dfc25 # shrinks to left_raw = [[((0, 0), true)]], right_raw = [[((0, 0), true)]]

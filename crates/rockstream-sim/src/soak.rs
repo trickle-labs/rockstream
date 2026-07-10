@@ -241,6 +241,41 @@ pub fn build_initial_corpus() -> SeedCorpus {
         scenario: "law.bloom_union.duplicate: same filter merged twice",
     });
 
+    // AutoTuner/v1 — adaptive control loops: epoch sizing, parallelism, throttle.
+    corpus.add_law_seed(LawSeed {
+        law_id: "AutoTuner/v1",
+        seed: 0xA0_B0_C0_D0_E0_F0_A0_B0,
+        scenario: "auto_tuner.epoch_sizer.10x_spike: epoch-sizing loop under 10× write-rate spike",
+    });
+    corpus.add_law_seed(LawSeed {
+        law_id: "AutoTuner/v1",
+        seed: 0xF0_E0_D0_C0_B0_A0_F0_E0,
+        scenario:
+            "auto_tuner.parallelism.hysteresis: parallelism hysteresis under sustained high P95",
+    });
+    corpus.add_law_seed(LawSeed {
+        law_id: "AutoTuner/v1",
+        seed: 0xA1_B1_C1_D1_E1_F1_A1_B1,
+        scenario: "auto_tuner.throttle.deadlock_prevention: source throttle floor never reaches 0",
+    });
+
+    // RecoverySLO/v1 — recovery SLO validation under Kafka load.
+    corpus.add_law_seed(LawSeed {
+        law_id: "RecoverySLO/v1",
+        seed: 0xE1_E1_E1_E1_E1_E1_E1_E1,
+        scenario: "recovery_slo.network_partition.self_fence",
+    });
+    corpus.add_law_seed(LawSeed {
+        law_id: "RecoverySLO/v1",
+        seed: 0xE2_E2_E2_E2_E2_E2_E2_E2,
+        scenario: "recovery_slo.brownout.kafka_pause_resume",
+    });
+    corpus.add_law_seed(LawSeed {
+        law_id: "RecoverySLO/v1",
+        seed: 0xE3_E3_E3_E3_E3_E3_E3_E3,
+        scenario: "recovery_slo.full_outage.one_tb_state",
+    });
+
     // Regression seeds (boundary values; corpus non-empty per v0.36 exit criterion).
     corpus.add_regression_seed(RegressionSeed {
         seed: 0x0000_0000_0000_0000,
@@ -269,6 +304,8 @@ mod tests {
             "LWWRegister/v1",
             "HyperLogLog/v1",
             "BloomUnion/v1",
+            "AutoTuner/v1",
+            "RecoverySLO/v1",
         ]));
     }
 

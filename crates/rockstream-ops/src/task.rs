@@ -1,256 +1,163 @@
-//! OperatorTask: per-operator tokio task event loop (IVM.md §8.2).
+//! `OperatorTask` — async Tokio task wrapping one operator instance.
 //!
-//! Each operator instance runs as an independent tokio task. Tasks receive
-//! input delta batches via a channel, call `Operator::process_delta`, and
-//! send `EpochOutput` fragments to the shard-level epoch commit coordinator
-//! via an output channel.
+//! Each operator in the pipeline runs as a separate Tokio task.  Data flows
+//! through bounded `mpsc` channels, which provide **credit-based backpressure**:
+//! the channel capacity is the credit window.  When the channel is full, the
+//! upstream task blocks until the downstream consumes a batch, restoring a
+//! credit.
 //!
-//! Credit-based backpressure: the task holds a credit token for each in-flight
-//! input batch. When credits are exhausted, the upstream source is implicitly
-//! paused because the bounded channel fills up.
+//! The task loop:
+//! 1. `recv()` from the input channel (blocks when empty).
+//! 2. Call `op.process_delta(batch)`.
+//! 3. If the output is non-empty, `send()` to the output channel (blocks when
+//!    full = credit exhausted = backpressure applied).
+//! 4. Repeat until the input channel is closed.
 //!
-//! Cooperative scheduling (DESIGN.md §9.3): when a `ProcessDelta` input
-//! contains more rows than `SchedulerConfig::max_rows_per_quantum`, the task
-//! splits the work into chunks and calls `tokio::task::yield_now()` between
-//! each chunk. This prevents a single expensive epoch from starving heartbeat
-//! sends and frontier reports running as separate tokio tasks.
+//! A dropped `OperatorTask` does not panic — the channels simply close and the
+//! upstream task will observe a closed channel on its next `send`.
 
+use std::sync::Arc;
+
+use crate::op::Operator;
+use crate::zset::ArrowZSet;
 use tokio::sync::mpsc;
+use tracing::error;
 
-use rockstream_sim::{Spawner, TokioRuntime};
-use rockstream_types::batch::{ZSet, ZSetBatch};
-use rockstream_types::ids::OperatorId;
-use rockstream_types::timestamp::Epoch;
+/// Maximum number of in-flight batches between two adjacent operators.
+///
+/// This is the credit window. When the downstream channel is full (N batches
+/// queued), the upstream task suspends until at least one is consumed.
+/// Named bound (DESIGN.md constraint: every buffer must have a name).
+pub const OPERATOR_CHANNEL_CAPACITY: usize = 16;
 
-use crate::epoch_output::EpochOutput;
-use crate::operator::Operator;
-use crate::scheduler::{SchedulerConfig, YieldCounter};
-
-/// Command sent to an operator task.
-#[derive(Debug)]
-pub enum OperatorCmd {
-    /// Process a new input delta for the given epoch.
-    ProcessDelta { epoch: Epoch, input: ZSetBatch },
-    /// Notify that an epoch is complete (no more deltas for this epoch).
-    EpochComplete { epoch: Epoch },
-    /// Shut down the task cleanly.
-    Shutdown,
+/// An async Tokio task wrapping one operator instance.
+///
+/// Each `OperatorTask` owns:
+/// - A shared reference to the operator (stateless operators can be `Arc`).
+/// - An input channel (receives batches from upstream or the scheduler).
+/// - An output channel (sends results downstream or to the view sink).
+///
+/// The task is consumed by calling `run()`, which drives it to completion.
+pub struct OperatorTask {
+    /// The operator to invoke for each incoming batch.
+    pub op: Arc<dyn Operator>,
+    /// Receive channel (bounded — provides backpressure).
+    pub input_rx: mpsc::Receiver<ArrowZSet>,
+    /// Send channel (bounded — applies backpressure to this task).
+    pub output_tx: mpsc::Sender<ArrowZSet>,
+    /// Counter: number of gRPC calls this task has issued (must stay 0 in
+    /// the embedded profile). Shared with the embedded runtime monitor.
+    pub grpc_call_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Counter: number of shuffle objects written (must stay 0 in embedded).
+    pub shuffle_write_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Handle to a running operator task.
-///
-/// Dropping this handle does NOT shut down the task; send `Shutdown` first.
-pub struct OperatorTaskHandle {
-    pub operator_id: OperatorId,
-    /// Channel for sending commands to the task.
-    pub tx: mpsc::Sender<OperatorCmd>,
-}
-
-/// Run an operator as a background tokio task.
-///
-/// Returns an `OperatorTaskHandle` for sending commands to the task and a
-/// receiver for collecting `EpochOutput` fragments.
-///
-/// Uses `SchedulerConfig::default()` (quantum = 65536). For custom quantum
-/// sizing or yield-ratio metrics, use `spawn_operator_task_with_config`.
-///
-/// Uses `TokioRuntime` as the spawner. To test with deterministic scheduling
-/// or fault injection, use `spawn_operator_task_with_config` and pass a
-/// `SimRuntime` as the spawner.
-///
-/// # Parameters
-/// - `operator_id`: Unique ID for this operator instance.
-/// - `operator`: The boxed `Operator` implementation.
-/// - `output_tx`: Channel for sending `EpochOutput` fragments to the
-///   shard-level epoch commit coordinator.
-/// - `cmd_buffer`: Number of commands that can be buffered before backpressure
-///   is applied to the sender.
-pub fn spawn_operator_task(
-    operator_id: OperatorId,
-    operator: Box<dyn Operator>,
-    output_tx: mpsc::Sender<EpochOutput>,
-    cmd_buffer: usize,
-) -> OperatorTaskHandle {
-    let spawner = TokioRuntime::new(0);
-    spawn_operator_task_with_config(
-        operator_id,
-        operator,
-        output_tx,
-        cmd_buffer,
-        SchedulerConfig::default(),
-        YieldCounter::new(),
-        &spawner,
-    )
-}
-
-/// Run an operator as a background tokio task with explicit scheduler config.
-///
-/// Identical to `spawn_operator_task` but accepts a `SchedulerConfig` for
-/// quantum sizing, a `YieldCounter` for metric reporting, and a `Spawner`
-/// for task execution.
-///
-/// Pass `&TokioRuntime::new(0)` for production use. Pass `&SimRuntime::new(seed)`
-/// in tests for deterministic scheduling and fault injection via `buggify!()`.
-///
-/// When `input.zset.len() > config.max_rows_per_quantum`, the task splits
-/// the input into chunks of `max_rows_per_quantum` rows, processes each
-/// chunk, calls `tokio::task::yield_now()` between chunks, and records the
-/// yield in `yield_counter`. This is the cooperative scheduling contract
-/// described in DESIGN.md §9.3.
-pub fn spawn_operator_task_with_config(
-    operator_id: OperatorId,
-    mut operator: Box<dyn Operator>,
-    output_tx: mpsc::Sender<EpochOutput>,
-    cmd_buffer: usize,
-    config: SchedulerConfig,
-    yield_counter: YieldCounter,
-    spawner: &dyn Spawner,
-) -> OperatorTaskHandle {
-    let (tx, mut rx) = mpsc::channel::<OperatorCmd>(cmd_buffer);
-
-    spawner.spawn_box(
-        "operator-task",
-        Box::pin(async move {
-            while let Some(cmd) = rx.recv().await {
-                match cmd {
-                    OperatorCmd::ProcessDelta { epoch, input } => {
-                        yield_counter.record_epoch();
-                        let row_count = input.zset.len() as u64;
-                        let quantum = config.max_rows_per_quantum;
-
-                        let delta = if row_count > quantum {
-                            // Quantum-bounded path: split input into chunks, yielding
-                            // between each so other tokio tasks (heartbeats, frontier
-                            // reporters) get scheduling opportunities.
-                            let rows: Vec<_> = input.zset.iter().collect();
-                            let chunk_size = quantum as usize;
-                            let total_chunks = rows.len().div_ceil(chunk_size);
-                            let mut accumulated = ZSet::new();
-                            let mut did_yield = false;
-
-                            for (i, chunk) in rows.chunks(chunk_size).enumerate() {
-                                let mut chunk_zset = ZSet::new();
-                                for row in chunk {
-                                    chunk_zset.insert(
-                                        row.key.clone(),
-                                        row.value.clone(),
-                                        row.weight,
-                                    );
-                                }
-                                let chunk_batch = ZSetBatch {
-                                    zset: chunk_zset,
-                                    epoch,
-                                };
-                                let partial = operator.process_delta(&chunk_batch).await;
-                                accumulated.merge(&partial.zset);
-
-                                // Yield between chunks (not after the last one).
-                                if i + 1 < total_chunks {
-                                    did_yield = true;
-                                    tokio::task::yield_now().await;
-                                }
-                            }
-
-                            if did_yield {
-                                yield_counter.record_yield();
-                            }
-
-                            ZSetBatch {
-                                zset: accumulated,
-                                epoch,
-                            }
-                        } else {
-                            // Fast path: batch fits within one quantum.
-                            operator.process_delta(&input).await
-                        };
-
-                        let output = EpochOutput::new(operator_id, epoch, delta, false);
-                        if output_tx.send(output).await.is_err() {
-                            break;
-                        }
-                    }
-                    OperatorCmd::EpochComplete { epoch } => {
-                        operator.epoch_complete(epoch).await;
-                        // Send final fragment to signal epoch boundary.
-                        let final_out = EpochOutput::new(
-                            operator_id,
-                            epoch,
-                            ZSetBatch {
-                                zset: ZSet::new(),
-                                epoch,
-                            },
-                            true,
-                        );
-                        if output_tx.send(final_out).await.is_err() {
-                            break;
-                        }
-                    }
-                    OperatorCmd::Shutdown => break,
+impl OperatorTask {
+    /// Drive the operator task to completion.
+    ///
+    /// Returns when the input channel is closed and drained.
+    pub async fn run(mut self) {
+        while let Some(batch) = self.input_rx.recv().await {
+            let frontier = batch.frontier.clone();
+            if let Some(ref f) = frontier {
+                if let Err(e) = self.op.push_input_frontier(f.clone()) {
+                    error!(
+                        operator = self.op.name(),
+                        error = %e,
+                        "RS-0001: failed to push input frontier"
+                    );
                 }
             }
-        }),
-    );
 
-    OperatorTaskHandle { operator_id, tx }
+            match self.op.process_delta(batch) {
+                Ok(mut output) => {
+                    if let Some(f) = frontier {
+                        output = output.with_frontier(f);
+                    }
+                    if (!output.is_empty() || output.frontier.is_some())
+                        && self.output_tx.send(output).await.is_err()
+                    {
+                        // Downstream closed; stop processing.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        operator = self.op.name(),
+                        error = %e,
+                        "RS-0001: operator processing error"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::Operator;
-    use async_trait::async_trait;
-    use rockstream_types::batch::{SinkBatch, SourceBatch, ZSet, ZSetBatch};
-    use rockstream_types::merge_law::MergeLawId;
-    use tokio::sync::mpsc;
+    use crate::expr::lit;
+    use crate::filter::FilterOp;
+    use crate::zset::ArrowZSet;
+    use rockstream_plan::{BinaryOp, Expr};
+    use std::sync::atomic::AtomicU64;
 
-    struct PassthroughOp;
-
-    #[async_trait]
-    impl Operator for PassthroughOp {
-        async fn process(&mut self, _input: &SourceBatch) -> SinkBatch {
-            SinkBatch::default()
-        }
-        async fn epoch_complete(&mut self, _epoch: rockstream_types::timestamp::Epoch) {}
-        fn name(&self) -> &str {
-            "passthrough"
-        }
-        fn merge_law(&self) -> Option<MergeLawId> {
-            None
+    fn b_gt_5() -> Expr {
+        Expr::BinaryOp {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Column(1)),
+            right: Box::new(lit(5)),
         }
     }
 
     #[tokio::test]
-    async fn operator_task_processes_delta() {
-        let (output_tx, mut output_rx) = mpsc::channel(16);
-        let handle = spawn_operator_task(OperatorId(0), Box::new(PassthroughOp), output_tx, 8);
-
-        let input = ZSetBatch {
-            zset: ZSet::new(),
-            epoch: 1,
+    async fn task_passes_matching_rows() {
+        let (in_tx, in_rx) = mpsc::channel(16);
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+        let task = OperatorTask {
+            op: Arc::new(FilterOp::new(b_gt_5())),
+            input_rx: in_rx,
+            output_tx: out_tx,
+            grpc_call_count: Arc::new(AtomicU64::new(0)),
+            shuffle_write_count: Arc::new(AtomicU64::new(0)),
         };
-        handle
-            .tx
-            .send(OperatorCmd::ProcessDelta {
-                epoch: 1,
-                input: input.clone(),
-            })
+        let handle = tokio::spawn(task.run());
+
+        // Send one batch: (a=1, b=3) should be filtered out; (a=2, b=7) passes.
+        in_tx
+            .send(ArrowZSet::from_ab_rows(&[(1, 3), (2, 7)], 1))
             .await
             .unwrap();
-        handle
-            .tx
-            .send(OperatorCmd::EpochComplete { epoch: 1 })
+        drop(in_tx); // close input
+
+        handle.await.unwrap();
+
+        let out = out_rx.recv().await.unwrap();
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(out.positive_ab_rows(), vec![(2, 7)]);
+        assert!(out_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_filters_all_out_sends_nothing() {
+        let (in_tx, in_rx) = mpsc::channel(16);
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+        let task = OperatorTask {
+            op: Arc::new(FilterOp::new(b_gt_5())),
+            input_rx: in_rx,
+            output_tx: out_tx,
+            grpc_call_count: Arc::new(AtomicU64::new(0)),
+            shuffle_write_count: Arc::new(AtomicU64::new(0)),
+        };
+        let handle = tokio::spawn(task.run());
+
+        in_tx
+            .send(ArrowZSet::from_ab_rows(&[(1, 1), (2, 2)], 1))
             .await
             .unwrap();
-        handle.tx.send(OperatorCmd::Shutdown).await.unwrap();
+        drop(in_tx);
+        handle.await.unwrap();
 
-        // Receive delta fragment
-        let frag = output_rx.recv().await.unwrap();
-        assert_eq!(frag.epoch, 1);
-        assert!(!frag.is_final);
-
-        // Receive final fragment
-        let final_frag = output_rx.recv().await.unwrap();
-        assert_eq!(final_frag.epoch, 1);
-        assert!(final_frag.is_final);
+        assert!(out_rx.recv().await.is_none());
     }
 }

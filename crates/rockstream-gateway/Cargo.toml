@@ -4,17 +4,48 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Query gateway service for RockStream (pgwire, HTTP)"
+description = "PostgreSQL wire gateway service for RockStream"
+
+[features]
+testcontainers = []
 
 [dependencies]
-rockstream-types = { workspace = true }
-rockstream-storage = { workspace = true }
-rockstream-sql = { workspace = true }
-rockstream-runtime = { workspace = true }
-datafusion = { workspace = true }
-object_store = { workspace = true }
-tokio = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+pgwire.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rockstream-types.workspace = true
+rockstream-storage.workspace = true
+rockstream-sql.workspace = true
+rand.workspace = true
+dashmap.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+base64 = "0.22"
+md5.workspace = true
+rockstream-control.workspace = true
+arrow.workspace = true
+datafusion.workspace = true
+sqlparser.workspace = true
 
+
+[dev-dependencies]
+tokio-postgres.workspace = true
+tempfile.workspace = true
+object_store = { version = "0.12", features = ["aws"] }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+rockstream-oracle = { workspace = true }
+rockstream-ops = { workspace = true }
+datafusion = { workspace = true }
+reqwest = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+proptest.workspace = true
+async-trait.workspace = true

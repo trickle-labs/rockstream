@@ -1,9 +1,0 @@
-Prepare v0.19 sign-off template with storage budget gate
-
-Add v0.19 sign-off template with:
-- Storage Operational Budget Gate checklist (Phase 2 to Phase 3 entry
-  criteria): object-store latency measurements, manifest churn, WAL cache
-  hit ratio, write amplification
-- Window function exit criteria: randomized batch-match tests, partition
-  recomputation cost measurement, sliding-aggregate law annotation
-- Simulation continuity check

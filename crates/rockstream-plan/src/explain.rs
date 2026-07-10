@@ -80,6 +80,23 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
         } => format!("Snapshot[{source_name},batch={batch_size}]"),
         OpKind::ViewRef { view_name } => format!("ViewRef[{view_name}]"),
         OpKind::Lateral { func } => format!("Lateral[{func:?}]"),
+        // v0.4 additions
+        OpKind::ViewSink { view_name, pk } => format!("ViewSink[{view_name},pk={pk:?}]"),
+        OpKind::Exchange { kind } => format!("Exchange[{kind:?}]"),
+        // v0.9 additions
+        OpKind::OuterJoin { kind, .. } => {
+            format!("OuterJoin[{kind:?}]  dual_arrangement+unmatched")
+        }
+        // v0.10 additions
+        OpKind::Distinct => "Distinct  merge_law=WeightAdd/v1  zero_crossing".to_string(),
+        OpKind::Intersect { all } => {
+            let sem = if *all { "ALL" } else { "SET" };
+            format!("Intersect[{sem}]  dual_arrangement  min_weight")
+        }
+        OpKind::Except { all } => {
+            let sem = if *all { "ALL" } else { "SET" };
+            format!("Except[{sem}]  dual_arrangement  subtract_weight")
+        }
     };
 
     let shard_info = match level {

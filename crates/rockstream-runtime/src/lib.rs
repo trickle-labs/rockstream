@@ -1,39 +1,68 @@
-//! Worker process, circuit executor, scheduler, and exchange for RockStream.
+//! RockStream worker runtime.
 //!
-//! Contains the per-worker runtime: operator scheduling, epoch coordination,
-//! and shuffle/exchange paths.
+//! v0.4 re-exports the key runtime primitives from `rockstream-ops`:
+//! the `CreditScheduler`, `EmbeddedRuntime`, and related types.
 //!
-//! v0.32 adds the frontier protocol: per-shard reporters, worker-level
-//! aggregators, cluster frontier publication, shuffle GC, and monotone
-//! partial-progress tokens.
-//!
-//! v0.34 adds the cluster checkpoint protocol: barrier injection, bounded
-//! alignment buffers, per-shard checkpoint creation, atomic cluster checkpoint
-//! commit, and old checkpoint GC.
-//!
-//! v0.38 adds the proactive scaling module: proactive splitter, worker drain
-//! coordinator, skew detector, virtual-bucket hasher, and cluster-pressure gauge.
-//!
-//! v0.39 adds the clone module: pipeline clone, blue/green plan replacement,
-//! compatible/incompatible schema workflows, and law-version upgrade path.
+//! Later versions add the epoch-commit coordinator (v0.5), exchange (v0.16),
+//! and the control-plane service (v0.15).
 
-pub mod auto_tuner;
-pub mod bench;
-pub mod checkpoint;
-pub mod clone;
-pub mod epoch_coordinator;
+pub use rockstream_ops::embedded::{EmbeddedCounters, EmbeddedRuntime};
+pub use rockstream_ops::scheduler::CreditScheduler;
+pub use rockstream_ops::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
+
+pub mod client;
+pub use client::{start_worker_client, ShardState, WorkerClientHandle};
+
 pub mod exchange;
-pub mod explain;
-pub mod frontier;
-pub mod pipeline;
+
+pub mod fence;
+pub use fence::{
+    assert_single_lease_holder, assert_valid_writer, SelfFenceGuard, DEFAULT_SELF_FENCE_DEADLINE,
+};
+
 pub mod recovery;
-pub mod scaling;
-pub mod segment_cache;
-pub mod split;
-pub mod support_bundle;
+pub use recovery::{
+    RecoveryDriver, RecoveryError, RecoveryProgress, DEFAULT_SHARD_RECOVERY_BUDGET,
+};
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn runtime_crate_compiles() {}
+    fn runtime_crate_compiles() {
+        let rt = EmbeddedRuntime::new();
+        assert_eq!(rt.counters.grpc_call_count(), 0);
+        assert_eq!(rt.counters.shuffle_write_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_worker_registration_and_heartbeats() {
+        let catalog = rockstream_control::TopologyCatalog::new();
+        let manager = rockstream_control::ShardManager::new();
+        let svc =
+            rockstream_control::ControlService::new(catalog.clone()).with_shard_manager(manager);
+
+        let handle = svc.start("127.0.0.1:0").await.unwrap();
+        let control_url = handle.addr.to_string();
+
+        let storage_dir = tempfile::tempdir().unwrap();
+
+        let (client, worker_handle) = start_worker_client(42, &control_url, storage_dir.path())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            client.worker_id(),
+            Some(rockstream_types::ids::WorkerId(42))
+        );
+        assert_eq!(catalog.len(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        worker_handle.abort();
+        handle.shutdown();
+    }
 }

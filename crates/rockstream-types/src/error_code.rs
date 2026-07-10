@@ -84,6 +84,10 @@ pub const RS_1009: ErrorCode = ErrorCode::new(1009);
 pub const RS_1010: ErrorCode = ErrorCode::new(1010);
 /// View-on-view DAG contains a cycle; rejected at compile time.
 pub const RS_1011: ErrorCode = ErrorCode::new(1011);
+/// SQL statement could not be parsed (v0.7).
+pub const RS_1012: ErrorCode = ErrorCode::new(1012);
+/// Query contains a feature not supported by the incremental planner (v0.7).
+pub const RS_1013: ErrorCode = ErrorCode::new(1013);
 /// Inner-frontier stall in distributed recursion; per-shard recompute triggered (v0.33).
 pub const RS_1512: ErrorCode = ErrorCode::new(1512);
 /// Distributed recursion max-iteration cap exceeded without convergence (v0.33).
@@ -94,6 +98,20 @@ pub const RS_3601: ErrorCode = ErrorCode::new(3601);
 pub const RS_3602: ErrorCode = ErrorCode::new(3602);
 /// Pipeline freshness recovery is slower than the 60s SLO; RECOVERING_SLOW state (v0.35).
 pub const RS_3603: ErrorCode = ErrorCode::new(3603);
+
+// 1015-1017: Aggregate operators (v0.5 / v0.6)
+/// Group-commit capacity exceeded; operator queue is full and back-pressure is applied.
+/// next_steps: reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards.
+pub const RS_1015: ErrorCode = ErrorCode::new(1015);
+/// Aggregate running sum overflowed i64; epoch rejected.
+/// next_steps: reduce value magnitudes or switch to a wider numeric type.
+pub const RS_1016: ErrorCode = ErrorCode::new(1016);
+/// MIN/MAX multiset retraction underflow: a value was retracted that has no positive weight.
+/// next_steps: ensure every retraction is matched by a prior insertion; check source ordering.
+pub const RS_1017: ErrorCode = ErrorCode::new(1017);
+/// TopK buffer overflow: more unique rows than TOPK_BUFFER_LIMIT arrived in one partition.
+/// next_steps: reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add partition columns.
+pub const RS_1018: ErrorCode = ErrorCode::new(1018);
 
 // 17xx: Lease management
 /// Shard is already leased by a different worker; acquire rejected (v0.29).
@@ -126,10 +144,31 @@ pub const RS_2014: ErrorCode = ErrorCode::new(2014);
 pub const RS_2015: ErrorCode = ErrorCode::new(2015);
 /// Index name conflict.
 pub const RS_2016: ErrorCode = ErrorCode::new(2016);
+/// Shard write buffer full — backpressure (v0.24).
+/// next_steps: "Wait for downstream IVM processing to drain, then retry COMMIT."
+pub const RS_2019: ErrorCode = ErrorCode::new(2019);
+/// RETURNING sub-select shape not supported in this context (v0.24).
+pub const RS_2013: ErrorCode = ErrorCode::new(2013);
+/// Session wait-for deadline exceeded; query proceeded at current frontier (v0.25).
+/// next_steps: "Increase session_wait_for_timeout or reduce write latency."
+pub const RS_2012: ErrorCode = ErrorCode::new(2012);
+/// Subscribe consumer fell behind the change-log retention window (v0.25).
+/// next_steps: "Reconnect with AS OF NOW WITH SNAPSHOT or increase CHANGE_LOG_MAX_ENTRIES."
+pub const RS_2020: ErrorCode = ErrorCode::new(2020);
+
+// 24xx: Auth (v0.26)
+/// Unauthenticated: request missing or carrying invalid credentials.
+pub const RS_2400: ErrorCode = ErrorCode::new(2400);
+/// Permission denied: authenticated principal lacks required RBAC role.
+pub const RS_2401: ErrorCode = ErrorCode::new(2401);
+/// Namespace access denied: cross-namespace access attempt by non-admin principal.
+pub const RS_2402: ErrorCode = ErrorCode::new(2402);
 
 // 3xxx: Merge / arrangement
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
+/// Durable shuffle fallback operation failed.
+pub const RS_3010: ErrorCode = ErrorCode::new(3010);
 /// Pipeline blocked due to object store brownout; local buffer exhausted (v0.36, DESIGN.md §11.7).
 pub const RS_3003: ErrorCode = ErrorCode::new(3003);
 /// Worker drain in progress; new shard assignments rejected (v0.38).
@@ -149,6 +188,17 @@ pub const RS_3609: ErrorCode = ErrorCode::new(3609);
 pub const RS_4001: ErrorCode = ErrorCode::new(4001);
 /// Sink write failed.
 pub const RS_4002: ErrorCode = ErrorCode::new(4002);
+/// Sink 2PC pre-commit failed; epoch not staged.
+pub const RS_4003: ErrorCode = ErrorCode::new(4003);
+/// Sink 2PC commit failed after pre-commit; recovery required.
+pub const RS_4004: ErrorCode = ErrorCode::new(4004);
+/// Sink 2PC duplicate delivery detected and blocked (CheckBeforeCommit check found existing).
+pub const RS_4005: ErrorCode = ErrorCode::new(4005);
+/// Source-epoch registry full; too many uncommitted source epochs in flight.
+pub const RS_4006: ErrorCode = ErrorCode::new(4006);
+/// Self-fencing configuration invalid: self_fence_after must satisfy
+/// dead_after < self_fence_after < 2 × shard_recovery_budget.
+pub const RS_3005: ErrorCode = ErrorCode::new(3005);
 
 // 5xxx: Upgrade / migration
 /// Incompatible storage format.
@@ -166,6 +216,11 @@ pub const RS_5019: ErrorCode = ErrorCode::new(5019);
 /// Incompatible upstream schema evolution detected.
 pub const RS_6001: ErrorCode = ErrorCode::new(6001);
 
+// 8xxx: Frontier aggregation (v0.18)
+/// Frontier aggregator shard registry is full; new shard reports are rejected.
+/// next_steps: scale out aggregators or reduce shard count.
+pub const RS_8001: ErrorCode = ErrorCode::new(8001);
+
 /// Metadata for a registered error code.
 pub struct ErrorCodeMeta {
     /// The error code.
@@ -178,6 +233,16 @@ pub struct ErrorCodeMeta {
     pub next_steps: &'static str,
     /// Documentation URL (relative path within docs site).
     pub doc_url: &'static str,
+}
+
+/// Returns a short slug for a known error code (e.g. "auth.unauthenticated").
+pub fn slug(code: ErrorCode) -> &'static str {
+    match code.0 {
+        2400 => "auth.unauthenticated",
+        2401 => "auth.permission_denied",
+        2402 => "auth.namespace_access_denied",
+        _ => "unknown",
+    }
 }
 
 /// Returns a human-readable description for a known error code.
@@ -197,6 +262,12 @@ pub fn description(code: ErrorCode) -> &'static str {
         1009 => "Non-monotone delta rejected in monotone recursion",
         1010 => "Bootstrap interrupted; connector position lost",
         1011 => "View-on-view DAG contains a cycle",
+        1012 => "SQL statement could not be parsed",
+        1013 => "Query contains a feature not yet supported by the incremental planner",
+        1015 => "Group-commit queue full; back-pressure applied",
+        1016 => "Aggregate running sum overflowed i64",
+        1017 => "MIN/MAX multiset retraction underflow: value has no positive weight",
+        1018 => "TopK buffer overflow: too many unique rows in a single partition",
         1512 => "Inner-frontier stall in distributed recursion; per-shard recompute triggered",
         1513 => "Distributed recursion max-iteration cap exceeded without convergence",
         3601 => "Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded",
@@ -218,6 +289,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         2016 => "Index name conflict",
         3003 => "Pipeline blocked: object store brownout, local buffer exhausted",
         3009 => "Merge operand malformed",
+        3010 => "Durable shuffle fallback operation failed",
         3604 => "Worker drain in progress; new shard assignments rejected",
         3605 => "Shard load factor exceeds skew threshold; adaptive re-sharding scheduled",
         3606 => "Worker drain deadline exceeded; worker self-fenced",
@@ -226,12 +298,24 @@ pub fn description(code: ErrorCode) -> &'static str {
         3609 => "Clone backfill lag exceeded the allowed threshold before flip",
         4001 => "Source connection failed",
         4002 => "Sink write failed",
+        4003 => "Sink 2PC pre-commit failed; epoch not staged",
+        4004 => "Sink 2PC commit failed after pre-commit; recovery required",
+        4005 => "Sink 2PC duplicate delivery detected and suppressed",
+        4006 => "Source-epoch registry full; too many uncommitted epochs in flight",
+        3005 => "Self-fencing configuration invalid: self_fence_after constraint violated",
         5001 => "Incompatible storage format",
         5002 => "Unknown merge law in arrangement header",
         5003 => "Wire protocol version not supported; rolling upgrade version skew",
         5018 => "Resource usage budget warning (80% threshold reached)",
         5019 => "Resource usage budget critical (95% threshold reached)",
         6001 => "Incompatible upstream schema evolution detected",
+        8001 => "Frontier aggregator shard registry is full; new shard reports rejected",
+        2019 => "Shard write buffer full; backpressure applied",
+        2012 => "Session wait-for deadline exceeded; query proceeded at current frontier",
+        2020 => "Subscribe consumer fell behind the change-log retention window",
+        2400 => "Unauthenticated: request missing or carrying invalid credentials",
+        2401 => "Permission denied: authenticated principal lacks required RBAC role",
+        2402 => "Namespace access denied: cross-namespace access attempt by non-admin principal",
         _ => "Unknown error",
     }
 }
@@ -243,6 +327,7 @@ pub fn severity(code: ErrorCode) -> Severity {
         2 => Severity::Error,
         3 => Severity::Error,
         3009 => Severity::Error,
+        3010 => Severity::Error,
         5001 => Severity::Fatal,
         5002 => Severity::Fatal,
         5018 => Severity::Warning,
@@ -269,6 +354,12 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1009 => "Ensure the recursive query is monotone or restructure it; check EXPLAIN for recursion rules.",
         1010 => "Verify connector positions, reset offsets, or perform a full bootstrap rebuild.",
         1011 => "Resolve cycle in view dependencies; view-on-view relations must form a DAG.",
+        1012 => "Check SQL syntax; see docs/language-features.md for the supported SQL subset.",
+        1013 => "Simplify the query or check docs/language-features.md for the supported incremental SQL subset.",
+        1015 => "Reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards.",
+        1016 => "Reduce value magnitudes or switch to a wider numeric type.",
+        1017 => "Ensure every retraction is matched by a prior insertion; check source event ordering and idempotency.",
+        1018 => "Reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add more partition columns.",
         1512 => "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs.",
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
         1701 => "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead.",
@@ -287,6 +378,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2016 => "An index with the same name already exists.",
         3003 => "Reduce input rate or increase local_buffer_max_epochs; check object store availability.",
         3009 => "Inspect the stored arrangement value; possible data corruption or law version mismatch.",
+        3010 => "Verify object store connectivity, credentials, and bucket settings.",
         3601 => "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation.",
         3602 => "Wait for recovery to complete; monitor shard reassignment and frontier progress via SHOW VIEW STATUS.",
         3603 => "Recovery is exceeding SLO; check worker health, storage latency, and frontier progress. Escalate if recovery does not complete within expected bounds.",
@@ -298,12 +390,21 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         3609 => "Reduce write load or check worker resource usage to allow backfill to catch up before flip.",
         4001 => "Verify source connection settings and network connectivity.",
         4002 => "Check sink availability and credentials.",
+        4003 => "Retry the epoch; check sink connector health and connectivity.",
+        4004 => "Trigger manual recovery or restart the connector; check sink idempotency profile.",
+        4005 => "This is informational; the duplicate was suppressed. Check source for duplicate delivery.",
+        4006 => "Reduce source epoch rate or increase max_in_flight_source_epochs.",
+        3005 => "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.",
         5001 => "Run the storage migration tool before upgrading.",
         5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
         5003 => "Ensure N+1 binary is backward compatible with N; check rolling upgrade procedure in DESIGN.md §5.5.",
         5018 => "Examine view resource usage and plan to scale out cluster capacity or adjust memory limits.",
         5019 => "Immediately free unused view resources or scale cluster capacity to prevent pipeline stalls.",
         6001 => "Apply view replacement or run manual migration to match the new upstream schema.",
+        8001 => "Scale out frontier aggregators (add more nodes with --role=frontier) or reduce shard count below the configured limit.",
+        2400 => "Provide valid credentials (Bearer token or mTLS certificate)",
+        2401 => "Request elevated RBAC role from an admin or contact the namespace owner",
+        2402 => "Switch to the correct namespace with SET search_path or request cross-namespace admin role",
         _ => "See documentation for this error code.",
     }
 }
@@ -342,9 +443,12 @@ mod tests {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
             RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007,
-            RS_2008, RS_2014, RS_2015, RS_2016, RS_3003, RS_4001, RS_4002, RS_5001, RS_5002,
-            RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703,
-            RS_5018, RS_5019, RS_6001,
+            RS_2008, RS_2014, RS_2015, RS_2016, RS_3003, RS_3009, RS_3010, RS_4001, RS_4002,
+            RS_5001, RS_5002, RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701,
+            RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017, RS_1012,
+            RS_1013, RS_8001, // v0.21
+            RS_4003, RS_4004, RS_4005, RS_4006, RS_3005, RS_1018, RS_2400, RS_2401,
+            RS_2402, // v0.26 auth
         ];
         for code in codes {
             assert_ne!(
@@ -362,5 +466,21 @@ mod tests {
                 "Code {code} has empty next steps"
             );
         }
+    }
+
+    /// S1 green gate: auth_error_codes_registered
+    #[test]
+    fn auth_error_codes_registered() {
+        assert_eq!(RS_2400.value(), 2400);
+        assert_eq!(RS_2401.value(), 2401);
+        assert_eq!(RS_2402.value(), 2402);
+
+        assert_ne!(description(RS_2400), "Unknown error");
+        assert_ne!(description(RS_2401), "Unknown error");
+        assert_ne!(description(RS_2402), "Unknown error");
+
+        assert_eq!(slug(RS_2400), "auth.unauthenticated");
+        assert_eq!(slug(RS_2401), "auth.permission_denied");
+        assert_eq!(slug(RS_2402), "auth.namespace_access_denied");
     }
 }

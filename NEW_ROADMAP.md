@@ -1,0 +1,365 @@
+# RockStream Focused Roadmap
+
+This roadmap turns [NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md)
+into an ordered, evidence-producing build sequence. It complements:
+
+- [DESIGN.md](DESIGN.md) — what RockStream is and why the architecture works.
+- [IVM.md](IVM.md) — how the incremental view maintenance engine works.
+- [NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) — the focused,
+  two-pillar engineering plan this roadmap implements.
+
+It is deliberately narrow. The only goals are the **cloud-native IVM engine**
+and the **PostgreSQL wire access layer**. Everything outside those two pillars
+is out of scope (see the plan's *Out of Scope* section).
+
+Each version below is sized at about **6 person-weeks** of implementation
+effort. That can mean one person for six weeks, two people for three weeks, or
+any other mix. The version number is a planning unit, not a release-quality
+promise: a version is done only when its proof is done.
+
+Versions are strictly ordered. Each builds on the one before it; nothing in a
+later version may be started until its predecessor's proof is complete.
+
+---
+
+## Roadmap Philosophy
+
+1. **Evidence over dates.** A version ends when its tests, benchmarks,
+   simulations, and docs prove the new capability works.
+2. **Correctness before scale; scale before features.** The single-shard engine
+   is proven correct (through v0.14) before any distribution. The distributed
+   engine is fault-tolerant (through v0.22) before the Postgres layer is built
+   on it.
+3. **Simulation from the beginning.** `SimRuntime` and `buggify!()` are
+   foundation work, established in v0.2 and used by every later version.
+4. **The oracle is the source of truth.** `incremental(q, Δ) == batch(q, accumulated)`
+   is asserted for every operator and query against a DataFusion batch reference.
+5. **One binary, one CLI, one config.** Every role is a flag on the same
+   `rockstream` binary; `main` remains runnable through it at every version.
+6. **Thin vertical slices.** Each version leaves a human able to do something
+   real, or leaves the project with stronger proof that a hard thing is safe.
+7. **Split before rushing.** If a version cannot fit in ~6 person-weeks, split
+   it. The roadmap is allowed to grow.
+
+---
+
+## Testing Conventions (Binding for Every Version)
+
+All automated tests in this roadmap fall into exactly one of three categories.
+No other test infrastructure is permitted.
+
+1. **Unit tests** — pure, in-process `cargo test`. Use the in-memory object
+   store for storage-touching logic that does not need durability semantics.
+2. **SlateDB local-filesystem backend tests** — exercise `ShardDb` and any
+   durability/WAL/checkpoint/compaction path against a real SlateDB instance
+   backed by the **local filesystem** object store. These prove on-disk
+   correctness without a container.
+3. **SlateDB S3 (MinIO) backend tests** — exercise the same paths against a
+   real S3-compatible object store provided by **MinIO**. Required for anything
+   that depends on S3 semantics: list/get/put latency, conditional writes,
+   multipart, retries, brownout, and coalesced shuffle objects.
+
+**Integration tests always use [TestContainers].** Any test that needs a real
+external process — MinIO, Postgres (as a CDC source, a sink, or a pgwire client
+target via `psql`/`tokio-postgres`), or Kafka — provisions it through
+TestContainers. There are no hand-managed external services and no shared test
+infrastructure; every integration test brings up and tears down its own
+containers.
+
+**Per-version rules** (in addition to the Common Definition of Done below):
+
+- Every new operator ships an **oracle property test** (`incremental == batch`)
+  before it is considered complete.
+- Every new durability path (commit, replay, checkpoint, compaction, WAL) ships
+  **both** a local-filesystem-backend test **and** a MinIO-backend test.
+- Every new distributed-coordination path ships at least one seeded `SimRuntime`
+  test; a fault found by simulation is checked in as a permanent regression seed.
+- Every new distributed-coordination *protocol* (from v0.18 onward) ships a green
+  FizzBee model (`formal/*.fizz`) with its safety, liveness, and `exists`-coverage
+  assertions, plus the paired runtime `assert!`, before it is done
+  ([FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.5, §3.6).
+- No code path may depend on SlateDB range deletion; a test asserts this.
+
+**Formal verification (binding from v0.18).** Distributed-coordination protocols
+are model-checked in [FizzBee] **before** their Rust implementation, per
+[FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md). FizzBee is not a fourth test
+backend — it is a design-time correctness oracle that sits one level above
+`SimRuntime`. The contract is explicit: every safety/liveness invariant proved
+in a `.fizz` model becomes a paired runtime `assert!` in the implementation
+([FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6), and every FizzBee
+counterexample is archived in `formal/findings.md` and translated into a
+permanent `SimRuntime` regression seed before the model is fixed. The
+`formal-verify` CI job runs the full spec suite on every PR that touches a
+coordination crate (`rockstream-runtime`, `-control`, `-connectors`,
+`-storage`) or `DESIGN.md`; a red model blocks merge. The full model→version
+mapping is the *Formal Verification Track (FizzBee)* section below.
+
+[FizzBee]: https://fizzbee.io
+[TestContainers]: https://testcontainers.com/
+
+---
+
+## Common Definition of Done
+
+Every version must satisfy this baseline before it can be marked done:
+
+- `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace` pass.
+- New behavior has unit tests plus, depending on risk, an oracle/property test,
+  a local-filesystem-backend test, a MinIO-backend test, or a TestContainers
+  integration test — per the Testing Conventions above.
+- Any user-visible or operator-visible failure has an `RS-XXXX` error code with
+  actionable `next_steps` text.
+- Any control-plane action writes an audit event.
+- Any new performance claim has a `criterion` benchmark or measurement note; CI
+  fails on >10% regression once a baseline exists.
+- Any new public surface (SQL syntax, CLI command, config key, system table) is
+  documented in `docs/`.
+- Any new queue, buffer, or scan window has a named upper bound, a fill-level
+  metric, and a backpressure or error path. Unbounded in-memory accumulation is
+  never acceptable.
+- Any new distributed-coordination path has at least one seeded `SimRuntime`
+  test before it is done.
+- Any change to a distributed-coordination protocol (epoch commit, frontier
+  aggregation, 2PC sink, lease/fencing) has a green FizzBee model and its paired
+  runtime `assert!` ([FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6); from
+  v0.18 onward, `make verify` is part of the gate.
+- `main` remains runnable through the single `rockstream` binary.
+- A sign-off file `sign-offs/vX.Y.md` exists with all checklist items marked.
+
+Long soaks are gates, not loopholes. A version that needs a 24-hour or multi-day
+run still fits the 6-person-week budget, but is not accepted until the soak is
+clean.
+
+---
+
+## Public Milestones
+
+These names orient readers; they are not calendar commitments.
+
+| Milestone | Version | Meaning |
+|---|---:|---|
+| Foundation Ready | v0.3 | Workspace, runtime abstraction, simulation, oracle harness, and the SlateDB determinism gate all pass. |
+| Single-Shard Alpha ✅ Done | v0.6 | A local engine maintains filter/aggregate/MIN-MAX views and survives crash-replay. |
+| SQL Engine (Phase 2 entry) | v0.10 | Plain-SQL views with joins and set operations maintained incrementally on one shard. |
+| IVM Correct (Single-Shard) | v0.14 | TPC-H 22/22 incremental == batch; the engine is feature-complete and correct on one shard. |
+| Distributed Engine | v0.17 | Multi-shard execution with exchange; distributed output bit-identical to single-shard. |
+| Progress-Tracked | v0.19 | Frontier protocol correct across multi-input operators; bounded shuffle storage; FizzBee M2 frontier-aggregation model green. |
+| Fault-Tolerant ✅ Done | v0.22 | Exactly-once end-to-end; 24h chaos with zero loss/duplicates; recovery SLOs met; all four FizzBee models (M1–M4) green. |
+| Postgres Pillar ✅ Done | v0.26 | Read, write, subscribe, and read-your-writes over the Postgres wire protocol. |
+| Soaks Complete ✅ Done | v0.31 | Ingestion connectors live; failure-detection, shard-reassignment, and freshness-recovery SLOs validated under real cloud pressure. |
+| Private Beta Ready ✅ Done | v0.32 | Secondary indexes enable single-digit-ms point lookups on non-primary keys; open for early-adopter onboarding. |
+| Nexmark Correctness Complete | v0.36 | Nexmark q0–q9 and q12–q22 bit-identical to DataFusion batch oracle; retraction/UPDATE correctness proven via Z-set INSERT+UPDATE+DELETE sequences through all Nexmark views. (q10 Parquet sink: Phase 12; q11 session windows: v0.48.) |
+| Wire Protocol Complete | v0.39 | Extended query protocol, full Postgres type OID coverage, ORM driver compatibility (SQLAlchemy, Prisma, Hibernate), PgBouncer transaction-mode pooling, protocol fuzzing, and concurrent-connection stress; any standard Postgres driver works without workarounds. |
+| Wire Protocol End-User Complete | v0.42 | SCRAM-SHA-256/MD5 password auth, driver session bootstrap, full transaction/savepoint state machine, LISTEN/NOTIFY, and a green driver-compatibility matrix (psql, psycopg3, tokio-postgres, pgx, PgJDBC, node-postgres, SQLAlchemy, Prisma); a reference application runs end-to-end over pgwire unmodified, with a ≥90% gateway coverage gate. |
+| v1.0 Release | v0.54 | All v0.1–v0.53 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged. |
+
+---
+
+## Version Roadmap
+
+Each row is about 6 person-weeks. The **Proof** column is the binding part:
+without that proof, the version is not done. The **Backends** column names the
+required test backends beyond plain unit tests (LFS = SlateDB local-filesystem
+backend; MinIO = SlateDB S3 backend via TestContainers; TC = TestContainers
+integration with another process).
+
+### Phase 0 — Foundation
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.1 | Workspace and CI ✅ Done | Cargo workspace with the focused crate set (`rockstream-types`, `-storage`, `-sim`, `-oracle`, `-plan`, `-diff`, `-ops`, `-sql`, `-runtime`, `-control`, `-gateway`, `-connectors`, `-cli`); CI (`fmt`, `clippy -D warnings`, `test`, `deny`, coverage); `rockstream-errors` registry with CI enforcement; hot-path metrics emitter; dev container with SlateDB/MinIO/Postgres. | Clean CI on a no-op binary; `rockstream --help` works; CI fails the build on any returned `Error` or logged `error!` without an `RS-XXXX` code; no hidden local setup step. | Unit |
+| v0.2 | Runtime abstraction, simulation, and oracle ✅ Done | `rockstream-sim`: `Runtime` trait (`now`/`spawn`/`sleep`/`object_store`/`network`), `TokioRuntime`, in-memory seeded `SimRuntime`, `buggify!()` macro, fault-model registry, paired-assertion helper. `rockstream-oracle`: DataFusion batch reference + `proptest` harness asserting `incremental == batch`. | A deterministic test replays the same seed byte-for-byte; a different seed changes event order; production build compiles `buggify!()` as a no-op; the oracle harness confirms equivalence on a trivial no-op pipeline. | Unit |
+| v0.3 | SlateDB storage contract and determinism gate ✅ Done | `rockstream-storage` (`ShardDb`): key encoders with `namespace_id` in all catalog keys; `WriteBatch` builders; `DbReader` snapshot reads; WAL tail reader with listing cache; checkpoint helpers; scan-and-delete cleanup. No range deletion anywhere. `rockstream start --role=all --storage=./data` runs a no-op pipeline. | Storage API validation suite proves only supported SlateDB features are used. **SlateDB determinism gate**: a write-heavy `ShardDb` workload run twice at the same seed produces bit-identical key-value state and WAL sequence; any non-deterministic SlateDB background surface is found and constrained before v0.4. `make e2e` brings up MinIO + 1 worker + 1 control and tears it down. | LFS, MinIO, TC |
+
+### Phase 1 — Single-Shard IVM Core
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.4 | Filter / project / map (IVM-1) ✅ Done | Z-set types `(row, weight: i64)`; `PlanNode` (`Source`/`Filter`/`Project`/`Map`/`ViewSink`/`Exchange` stub); `DiffCtx` linear-operator rules; `Operator` trait + `EpochOutput`; `OperatorTask` event loop; async ownership-free scheduler with credit backpressure; embedded runtime profile (in-process control/worker/gateway, no gRPC, no shuffle objects); built-in `GENERATE ROWS` source and a `Vec<RecordBatch>` delta source. | Oracle property test for `SELECT a, b*2 AS c FROM t WHERE c > 10` over random insert/delete sequences passes ≥100k scenarios; embedded hot path issues zero gRPC calls and creates zero shuffle objects. | Unit, LFS |
+| v0.5 | Algebraic aggregates and epoch commit (IVM-2) ✅ Done | `Aggregate` PlanNode + aggregate arrangement; `diff_aggregate` (group by key, merge `(Δsum, Δcount)`, emit `(old,-1) ⊎ (new,+1)`) for SUM/COUNT/AVG/COUNT(*); shard-level group commit coalescing fragments into one atomic `WriteBatch`; per-shard namespaces (`op_state`/`view_output`/`shard_meta`); persisted frontier. | Oracle property test for `SELECT k, SUM(v), COUNT(*), AVG(v) FROM t GROUP BY k` over random insert/update/delete + group churn; group commit reduces durability events ≥5× vs. one commit per operator (measured on LFS and MinIO). | Unit, LFS, MinIO |
+| v0.6 | MIN / MAX and crash-replay (IVM-3) ✅ Done | Indexed-multiset arrangement + cached extremum; `diff_minmax` (insert merges multiset and updates cache; delete of extremum prefix-scans for the replacement); WAL listing cache validated on the hot path. **Single-Shard Alpha.** | Oracle property test for groups churning across MIN/MAX transitions; cached extremum matches the multiset's true extremum after every batch. **Crash-replay**: `kill -9` injected mid-`WriteBatch`; on restart the shard replays from its persisted frontier to bit-identical output (verified on LFS and MinIO). | Unit, LFS, MinIO |
+
+### Phase 2 — SQL Frontend & Joins
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.7 | SQL frontend and catalog ✅ Done | `rockstream-sql`: DataFusion parse/bind/optimize; custom extension nodes (`IncAggregate`/`IncJoin`/`IncDistinct`); lowering `LogicalPlan → PlanNode`; distribution pass annotating `partition_key` and inserting `Exchange` no-ops; schema-version catalog in `control: schema/` (compatible changes online, breaking → `RS-1002`); `CREATE VIEW`; `EXPLAIN INCREMENTAL` and `EXPLAIN INCREMENTAL ESTIMATE`. | SQL and hard-coded PlanIR produce identical physical plans for the Phase 1 operators; plans round-trip through catalog storage; an incompatible schema change returns `RS-1002`; `EXPLAIN INCREMENTAL ESTIMATE` reports predicted state size and per-operator `epoch_ms` without deploying. | Unit, LFS |
+| v0.8 | Inner equi-join (IVM-4) ✅ Done | `InnerJoin` PlanNode + dual arrangements; stable source-derived `row_id` so replay rewrites the same key; DBSP-native two-arrangement join with correct bilinear expansion (`ΔL⋈R` insert/delete split, `L₀⋈ΔR`, correction term); arrangements reflect epoch `e-1` during processing, updated at commit. | Oracle property test for random 3-way joins; TPC-H Q1/Q3/Q5/Q6 plan-level parity; crash-replay of a join view restores bit-identical arrangement state. | Unit, LFS |
+| v0.9 | Outer / semi / anti joins (IVM-5) ✅ Done | `LeftJoin`/`RightJoin`/`FullJoin`/`SemiJoin`/`AntiJoin`; one extra arrangement per side tracking unmatched rows so transitions emit the right NULL-padding retractions. | TPC-H Q11/Q21 (SemiJoin corner cases) and randomized NULL-heavy join tests match the batch oracle. | Unit, LFS |
+| v0.10 | Distinct / set ops and storage budget gate (IVM-6) ✅ Done | Weight-based distinct arrangement; zero-crossing emission (`0→+n ⇒ +1`, `+n→0 ⇒ −1`); Intersect/Except with set and bag semantics. **Storage Operational Budget gate** (DESIGN.md §5.4): prove PUT/GET/LIST p99 at 1 GB and 5 GB, manifest cadence, WAL listing-cache hit ratio >99%, and write amplification against MinIO. **SQL Engine** milestone. | Oracle property tests on set semantics; `CREATE VIEW v AS SELECT … JOIN … GROUP BY …` compiles, deploys, and maintains incrementally end-to-end; storage budgets hold against MinIO (any budget exceeded by >2× requires a tracked mitigation before v0.11). | Unit, LFS, MinIO |
+
+### Phase 3 — Essential Operators & Single-Shard Correctness Soak
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.11 | Window functions (IVM-7) ✅ Done | `Window` PlanNode + ordered arrangement; partition-based recomputation (re-evaluate a changed partition, diff against previously-emitted output); ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, sliding SUM/AVG; `EXPLAIN INCREMENTAL` flags oversized partitions. | Window-heavy randomized tests match the batch oracle; partition-recompute cost is measured and documented; oversized-partition NOTICE fires in `EXPLAIN`. | Unit, LFS |
+| v0.12 | Tumbling time windows and Top-K (IVM-8, IVM-9) ✅ Done | TUMBLE windows keyed by `window_id` with event-time TTL and a frontier-aware compaction filter that removes state only after event-time expiry (HOP/SESSION deferred); Top-K value-descending arrangement keeping `K+ε` entries with delete-refill and displacement deltas. | Late-data and TTL tests prove no visible state is removed early (verified on LFS and MinIO); Top-K random insert/update/delete tests match batch; delete from the current top-K refills correctly. | Unit, LFS, MinIO |
+| v0.13 | Bootstrap and view-on-view DAG (IVM-10, IVM-11) ✅ Done | Snapshot-mode sources emitting each base-table row once at weight `+1` (single or streamed bootstrap epochs); bootstrap frontier advances only when every chunk is ingested; `ViewRef` PlanNode tailing an upstream view's `view_output/` CDC via `WalReader`; structural diamond consistency; compile-time cycle detection (Kahn). | 100M-row-equivalent snapshot view matches the batch result; a mid-bootstrap connector restart neither duplicates nor skips rows; a 5-level view-on-view DAG and a diamond topology converge under continuous input; a cycle is rejected at compile time. | Unit, LFS, MinIO |
+| v0.14 | Single-shard correctness soak ✅ Done | TPC-H 22/22 (SF=0.01) incremental; random SQL fuzzer over a synthetic schema; DST harness; storage-correctness audit (no range-delete dependency, snapshot-safe compaction filters); performance regression suite in CI. **IVM Correct (Single-Shard)** milestone. | 22/22 TPC-H queries return bit-identical results vs. DataFusion batch; ≥10× speedup vs. batch at a 1% change rate; the fuzzer runs ≥1 hour without divergence; the DST harness passes 100k seeds bit-identically; every cleanup path proven without range deletion. | Unit, LFS, MinIO |
+
+### Phase 4 — Multi-Shard Execution & Exchange
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.15 | Control plane, leasing, and fencing ✅ Done | `rockstream-control` service; worker registration via `--control=<url>`; topology catalog; shard manager (a worker owns N shards, each with its own `Arc<Db>`); lease acquisition; SlateDB fence-epoch enforcement; role flags (`--role=control|worker|gateway|all`). | A two-writer fence test proves only one writer can commit to a shard; killing a worker releases its leases and they are reassigned cleanly; topology changes are audited. | Unit, LFS, TC |
+| v0.16 | Direct exchange ✅ Done | gRPC shuffle service (`proto/shuffle.proto`); path classifier (`elided`/`loopback`/`direct`/`durable`); worker-to-worker stream multiplexing (one stream per peer per traffic class); same-worker loopback over bounded in-process channels with durable outbox/inbox metadata; Arrow serialization; credit-based backpressure. | A 16-shard cluster runs a partitioned TPC-H subset with connection count bounded by worker count, not shard count; the loopback path produces output identical to direct gRPC with zero network calls for co-located exchanges. | Unit, LFS, TC |
+| v0.17 | Durable shuffle fallback and distributed parity ✅ Done | Object-store fallback writer/reader; coalesced durable shuffle objects with an index footer (no LIST on the hot path); rendezvous hashing with virtual nodes and re-balance-minimality property tests; full Phase 1–3 oracle + TPC-H suite re-run against the distributed cluster. **Distributed Engine** milestone. | Distributed results are **bit-identical** to single-shard runs across the entire oracle/TPC-H suite; an injected receiver failure forces durable fallback and the receiver catches up with no duplicates; a 1,000-shard exchange stress test stays within connection and shuffle-object budgets against MinIO. | Unit, LFS, MinIO, TC |
+
+### Phase 5 — Frontier Protocol & Progress Tracking
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.18 | Frontier protocol ✅ Done | `rockstream-types::Frontier` antichain with product-order timestamps and meet/join/advance property tests; per-shard frontier reporter bundled into every epoch commit; control-plane frontier aggregator consuming per-shard summaries and publishing the per-operator cluster frontier; separable `--role=frontier`. **FizzBee toolchain bootstrap** (catch-up from Phase 0, FIZZBEE_TEST_PLAN.md §4.0): `formal/` directory, pinned FizzBee binary, `make verify`, the `formal-verify` CI job, and `formal/conventions.md`. **M1 retro-model** `formal/m1_epoch_commit.fizz` (the epoch-commit/`WriteBatch` protocol already shipped in v0.5/v0.6/v0.15) back-filling its paired assertions. **M2 model** `formal/m2_frontier_agg.fizz`: `Shard`/`FrontierAggregator`/`ObjectStore`/`ControlPlane` roles; per-shard report via the explicit message-set mechanism; publisher lease via `ObjectStore.cas` with a fencing token. | `SimRuntime`: arbitrary frontier-report reorderings converge to the same cluster vector frontier as serial delivery; a frontier-aggregation stress test over thousands of shards × hundreds of operators converges without the control plane subscribing to each shard feed. **FizzBee**: `make verify` is green in CI; M1 safety M1-S1…S5, liveness M1-L1, and coverage COV-M1 pass; M2 safety M2-S1…S4 (meet order-independence, pessimistic staleness, single-publisher, stale-write rejection), liveness M2-L1…L2 (`liveness: nondeterministic`), and coverage COV-M2 pass; each invariant maps to a paired runtime `assert!` in `rockstream-control`. | Unit, LFS, TC |
+| v0.19 | Frontier consumers and exchange GC ✅ Done | Operator frontier consumers using the input frontier to close windows, detect convergence, and release shuffle inbox entries; exchange GC reclaiming outbox/inbox entries via bounded scan-and-delete or snapshot-safe compaction filters; control-plane-derived `min_epoch_ms`/`max_epoch_ms`/initial parallelism from the declared freshness target (simple, bounded). **M2 multi-source antichain variant** (FIZZBEE_TEST_PLAN.md D5.4): a fixed-length integer-vector frontier proving the meet is correct for the vector `FreshnessToken`, not just scalar source-epochs; findings recorded in `formal/findings.md` with paired `SimRuntime` regression seeds. **Progress-Tracked** milestone. | A join over two sources at different ingestion rates produces correct output with no premature emission and no infinite buffering; shuffle storage usage stays bounded under sustained throughput (measured against MinIO). **FizzBee**: the M2 multi-source meet model is green and its `SimRuntime` mirror (arbitrary frontier-report reorderings converge to the same cluster vector frontier) passes; the M2 §3.6 mapping rows are populated. | Unit, LFS, MinIO, TC |
+
+### Phase 6 — Fault Tolerance & Exactly-Once
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.20 | Cluster checkpoints and recovery ✅ Done | Cluster checkpoint coordinator (barrier injection at sources; bounded barrier alignment tied to shuffle credits; one per-shard `Checkpoint` after all local operators commit through the barrier; atomic cluster-checkpoint commit; old-checkpoint GC); recovery driver bringing up every shard via `DbReader` pinned to its per-shard checkpoint, then re-electing writers. **M4 model** `formal/m4_self_fencing.fizz` (modeled before the self-fencing code in v0.21, FIZZBEE_TEST_PLAN.md §4.3, M4 first): `Worker`×2–3/`Shard`/`ControlPlane`/`ObjectStore`; `can_reach_control` flag; failure-detector `mark_dead`; `Shard.fence_epoch` CAS on every commit; `CheckpointCoordinator` role composed with M1's `cluster_committed` predicate. | Checkpointing under slow input and credit exhaustion never grows unbounded and either succeeds or reports `RECOVERING`; recovery from a cluster checkpoint reproduces pre-failure state bit-identically (verified on LFS and MinIO). **FizzBee**: M4 safety M4-S1…S4 (single-writer/no split-brain, self-fence precedence, lease uniqueness, object-store-only block), liveness M4-L1…L2 (`liveness: nondeterministic`), and coverage COV-M4 pass, justifying the recovery driver's writer re-election; paired runtime `assert!`s scheduled in `rockstream-runtime`. | Unit, LFS, MinIO, TC |
+| v0.21 | Exactly-once sinks and resilience ✅ Done | Exactly-once sink protocol (`pre_commit`/`commit`); transactional Kafka sink; object-store sink via `_pending/` → atomic rename; per-connector source-epoch with persisted partition→offset map recorded in the epoch commit; worker self-fencing on control-plane partition (DESIGN.md §11.6); object-store brownout buffering + backpressure (DESIGN.md §11.7). **M3 model** `formal/m3_sink_2pc.fizz`: `SinkConnector`/`ExternalSystem`/`Shard`/`CheckpointCoordinator`/`ControlPlane`/`ObjectStore`; three parameterized sub-models, one per `SinkIdempotencyProfile` (`NativeIdempotent`/`FencingTokenRequired`/`CheckBeforeCommit`); explicit duplicate-delivery injection; crash yield points before/between/during the 2PC steps. **M1 duplication variant** confirming idempotent replay (M1-S5) under explicit message duplication. | `SimRuntime`: 2PC sink crash points (pre-commit/between/commit) all recover idempotently; a network-partitioned worker fences before the new owner commits; a 50-epoch object-store blackout produces zero loss and zero duplicates; the Kafka sink delivers exactly once under injected broker faults. **FizzBee**: M3 safety M3-S1…S4 (no duplicate, no lost, checkpoint-coupled, recovery-dispatch idempotency for all three profiles), liveness M3-L1, and coverage COV-M3 pass; M3-S3 is composed with M1's `cluster_committed` predicate; the partitioned-worker self-fence matches M4-S2; paired runtime `assert!`s land in `rockstream-connectors` and `rockstream-runtime`. | Unit, LFS, MinIO, TC |
+| v0.22 | Chaos and recovery SLO gate ✅ Done | Chaos suite (random process kills, partitions, disk-full, object-store throttling) with output compared against a non-faulty reference; continuous simulation soak CI job running new seeds against `main`; recovery-time instrumentation. **Continuous formal verification** (FIZZBEE_TEST_PLAN.md §4.4): every FizzBee counterexample archived in `formal/findings.md` with its trace and paired `SimRuntime` regression seed; the `formal-verify` path-coupling check fails any coordination-crate or `DESIGN.md` change that lands without a corresponding model touch; a pre-release relaxed-bounds sweep (`NUM_WORKERS=3`, `NUM_SHARDS=3`, `MAX_EPOCH=4`). **Fault-Tolerant** milestone. | A 24-hour chaos run on a 32-shard cluster has zero data loss and zero duplicates with output matching reference; recovery from full outage in <60 s for state <1 TB; at `target_shard_state_bytes` (20 GB): failure detection ≤5 s p99, shard reassignment ≤30 s p99, freshness recovery ≤60 s p99; ≥100k seeded `SimRuntime` runs pass and the soak job has its first regression-seed corpus. **FizzBee**: all four models (M1–M4) are green at CI-fast and at the relaxed pre-release bounds; every archived counterexample replays clean as a permanent regression seed; the `formal-verify` gate is wired to the same merge gate as `cargo test`. **Fault-Tolerant** requires all four models green. | Unit, LFS, MinIO, TC |
+
+### Phase 7 — PostgreSQL Wire Gateway
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.23 | Postgres read gateway (7.1) ✅ Done | `rockstream-gateway`: pgwire startup / simple query / extended query / copy-out / terminate; `ViewReader` trait with `ViewReadStrategy` (`HotOnly` implemented; `TwoTier` reserved); multi-shard `DbReader` reads pinned to one published vector frontier; catalog stubs (`pg_catalog.pg_tables`/`pg_views`/`pg_class`/`pg_attribute`/`pg_namespace`/`pg_type`, `information_schema.tables`/`.columns`, `SHOW`/`SET`); native Postgres type OIDs in row descriptions; isolation levels (`READ COMMITTED`, `REPEATABLE READ`, `SERIALIZABLE` → `RS-2003`); inline views with cycle detection (`RS-1011`). | `psql` connects and `SELECT * FROM my_view LIMIT 10` returns <10 ms p99 for a local cluster; an ORM (e.g. SQLAlchemy via TestContainers) reflects view schemas without error; `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`; `CREATE MATERIALIZED VIEW mv AS SELECT * FROM v` inlines `v` and starts IVM. | Unit, LFS, TC |
+| v0.24 | Direct-write DML (7.2) ✅ Done | Internal direct-write source connector (`INSERT`/`UPDATE`/`DELETE` buffered per connection; `COMMIT` flushes an atomic Z-set delta via `WriteBatch` to a base-table shard and receives the next `source_epoch`; `ROLLBACK` discards); `INSERT … RETURNING` including the multi-row `INSERT … SELECT … RETURNING` form; idempotency enforcement (exactly-once source-epoch envelope or caller key; missing both → `RS-2007`) with a per-shard, time-bounded idempotency-key table. | `psql` runs `INSERT INTO t VALUES (…); COMMIT` and the view reflects it within the freshness target; a non-idempotent write missing both an envelope and a key returns `RS-2007`; idempotent replay of a committed write is a no-op (verified on LFS and MinIO). | Unit, LFS, MinIO, TC |
+| v0.25 | Subscribe and read-your-writes (7.3) ✅ Done | Subscribe endpoint tailing view changes via `WalReader`, gateway-proxied (`mz_timestamp`, `mz_diff`, projected columns; `AS OF NOW WITH SNAPSHOT`, `AS OF EPOCH <n>` within `CHANGE_RETENTION` default 1 h; server-side `WHERE`; column projection); freshness tokens returned on query responses; `wait_for=<token>` read-your-writes with timeout and explicit satisfied/not-satisfied; session-scoped automatic read-your-writes after `COMMIT`. | Read-your-writes demo passes and `wait_for=<token>` resolves within the SLO; a subscribe stream survives a gateway restart with no gaps or duplicates; `SUBSCRIBE orders_mv AS OF NOW WITH SNAPSHOT` delivers current state then live deltas; `WHERE`/projection reduce traffic to matching rows/columns; `AS OF EPOCH` outside retention returns `RS-2005`. | Unit, LFS, TC |
+| v0.26 | Auth, RBAC, and read pushdown (7.4) ✅ Done | OIDC/bearer-token and mTLS auth at the gateway (`--auth=off` for local dev); per-view RBAC (`viewer`/`pipeline_owner`/`admin`) in the control-plane catalog; namespace isolation; cross-shard partial aggregation pushdown (DESIGN.md §12.3.1) so `SELECT agg, key FROM mv GROUP BY key` returns O(distinct groups × shards) rows. **Postgres Pillar** milestone. | An application using a standard Postgres driver creates a view, writes rows, reads them back with read-your-writes, and subscribes to changes end-to-end against the distributed engine; unauthenticated requests are rejected; cross-namespace access is denied; the audit log records `actor` on every control action; `EXPLAIN` names the pushdown effect. | Unit, LFS, TC |
+
+### Phase 8 — Ingestion & The Crucible Soaks
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.27 | Bulk Historical Load (`COPY` Protocol) ✅ Done | Implement the standard Postgres `COPY` protocol via the pgwire layer; enables migration of massive historical datasets into distributed base tables without external streaming pipelines. | Users can execute multi-gigabyte `COPY FROM` commands into distributed base tables without memory exhaustion. | Unit, LFS, MinIO, TC |
+| v0.28 | First-Party Source Connectors ✅ Done | Native, highly optimized Kafka (consumer-group; offsets in the causal frontier) and AWS S3 source connectors for continuous streaming ingestion; the §13.3 connector contract (`discover_schema`/`start_snapshot`/`poll_delta`/`commit_offset`/`prepare`/`commit`/`abort`/`should_flush`). | Kafka offsets and S3 file pointers are correctly tracked within the causal frontier protocol for exactly-once ingestion; a Kafka source closes a tumbling window correctly under deliberate clock skew. | Unit, LFS, MinIO, TC |
+| v0.29 | Object Store Limit Soak ✅ Done | Maximize sustained pressure to validate shard-level group commits, SST/WAL caches, and coalesced durable fallback paths against cloud provider rate limits; native OpenTelemetry/Prometheus metrics (`/metrics`) utilized for monitoring flush latencies. | The cluster maintains high throughput for 72 hours without HTTP 429 (Too Many Requests) throttling errors from the cloud provider. | Unit, LFS, MinIO, TC |
+| v0.30 | Auto-Tuner Chaos Soak ✅ Done | Subject the cluster to extreme step-function traffic spikes to test the default "self-tuning" adaptive control loops (epoch sizing, source throttling, and parallelism); prove control loops do not overcorrect and enter destabilizing oscillation. | Control loops settle to a stable steady-state within 3 epochs of a 10× traffic spike. | Unit, LFS, MinIO, TC |
+| v0.31 | Recovery SLO Validation ✅ Done | Induce hard network partitions and simulated object-store brownouts under continuous Kafka streaming load; instrument recovery timings end-to-end. **Soaks Complete** milestone. | Failure detection ≤5 s p99, shard reassignment ≤30 s p99, freshness recovery <60 s p99 for 1 TB of state. | Unit, LFS, MinIO, TC |
+
+### Phase 9 — Operational HTAP Ergonomics
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.32 | Secondary Indexes ✅ Done | System-managed materialized IVM views acting transparently as secondary indexes for point queries on non-primary keys; eliminates full shard scans for highly concurrent application reads. **Private Beta Ready** milestone. | Point lookups on indexed non-primary columns execute in single-digit milliseconds. | Unit, LFS, MinIO, TC |
+
+### Phase 10 — Nexmark Correctness Suite
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.33 | Nexmark Schemas & Deterministic Event Generator ✅ Done | Define `person`, `auction`, `bid` SQL DDL; implement `NexmarkGenerator` in `rockstream-sim` (seeded, configurable event rates, correct NEXMark distribution: ~46 bids : 3 auctions : 1 person per event); wire the generator through the Postgres wire protocol — events are fed as batched `INSERT` statements via pgwire and base tables are created with standard `CREATE TABLE` DDL. Test scaffold in `rockstream-sql/tests/nexmark/` covers schema creation, ingestion, and basic round-trip reads, all operating end-to-end over the full pgwire + SlateDB stack (LFS and MinIO). | Same seed produces an identical event stream across two runs; generator distribution is within 1% of target ratios; all three tables accept `INSERT` via pgwire and return correct row counts via `SELECT`; schema round-trips through the catalog; verified on LFS and MinIO via TestContainers. | Unit, LFS, MinIO, TC |
+| v0.34 | Nexmark q0–q9: Projections, Filters, Joins & Basic Aggregates ✅ Done | End-to-end implementation of the first ten Nexmark queries as `CREATE VIEW` statements maintained by the IVM engine, all exercising the full stack exclusively via the Postgres wire protocol: q0 (pass-through `SELECT *`), q1 (currency conversion — multiply price), q2 (selection filter — `MOD(auction, 123) = 0`), q3 (local item suggestion — inner join Auction × Person filtered by state and category), q4 (average price per category — windowed join + `AVG`), q5 (hot items — sliding-window bid `COUNT` + top-N), q6 (average selling price by seller — last-10-auctions window), q7 (highest bid — tumbling-window `MAX`), q8 (new-user monitoring — join Person × Auction within event-time window), q9 (winning bids — join Bid at closing price). Views created via `CREATE VIEW`; events fed via `INSERT`; results consumed via `SELECT` and `SUBSCRIBE` — no in-process shortcuts. | Each of q0–q9 produces results **bit-identical** to the DataFusion batch oracle over static Nexmark snapshots; incremental results match batch results after every event batch under randomised generator seeds; `SUBSCRIBE` delivers correct deltas as events arrive; all queries verified end-to-end over pgwire on LFS and MinIO. | Unit, LFS, MinIO, TC |
+| v0.35 | Nexmark q12–q22: Dedup, TOP-N & Complex Analytics ✅ Done | End-to-end implementation of eleven Nexmark queries as `CREATE VIEW` statements, all via the full pgwire + SlateDB stack: q12 (processing-time tumbling windows — wall-clock tumble), q13 (bounded side-input join — stream enriched from a static lookup table), q14 (`CASE WHEN` + `CAST` complex projection), q15 (bidding statistics — multiple `COUNT(DISTINCT …)` with price-tier filters), q16 (channel statistics — multi-key `COUNT(DISTINCT …)`), q17 (auction statistics — unbounded `GROUP BY` date), q18 (find last bid — deduplication via `LAST_VALUE` / retract-and-replace), q19 (auction TOP-10 prices — `TOP-N` descending), q20 (expand bid with auction — filter + equi-join), q21 (add channel ID — `CASE WHEN` + `REGEXP_EXTRACT`), q22 (URL directories — `SPLIT_INDEX`). Note: q10 (Parquet sink) is covered in Phase 12 (v0.43 cold-tier sinks); q11 (session windows) is deferred to v0.47 where the `SESSION` operator is implemented. | q12–q22 results are **bit-identical** to the DataFusion batch oracle on static Nexmark snapshots; q18 deduplication and q19 TOP-N maintain correctness under retraction storms; all eleven queries pass on LFS and MinIO via pgwire. | Unit, LFS, MinIO, TC |
+| v0.36 | Nexmark Retraction & Z-Set Correctness ✅ Done | Exercise all Nexmark views (q0–q9, q12–q22) with INSERT+UPDATE+DELETE event sequences to prove Z-set retraction propagates correctly through every operator combination — the correctness property that append-only benchmarks cannot test. Retraction test harness in `rockstream-oracle/tests/nexmark_retraction.rs`: for each query, generate a random base snapshot, verify `incremental == batch`, then apply a mix of price updates, bid retractions, and auction cancellations and re-verify. Criterion micro-benchmarks in `rockstream-ops/benches/nexmark.rs` measure delta propagation cost (µs/row and delta amplification factor) for each query at 0.1%/1%/10% change rates — descriptive only, no CI throughput gates. **Nexmark Correctness Complete** milestone. | Every Nexmark view (q0–q9, q12–q22) maintains `incremental == batch` after mixed INSERT+UPDATE+DELETE sequences under 100 randomised seeds; delta amplification factor ≤10× for all stateful queries; criterion benchmarks record baseline numbers; all tests pass on LFS and MinIO. | Unit, LFS, MinIO, TC |
+
+### Phase 11 — PostgreSQL Wire Protocol Hardening
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.37 | Extended Query Protocol & Prepared Statements ✅ Done | Replace `NoopQueryParser` in `rockstream-gateway` with a stateful `PreparedStatementCache`: maps statement name → SQL text + inferred parameter types (`$N` OIDs inferred from DataFusion's logical plan; explicit `$N::type` casts honoured). Implement the full Parse/Bind/Describe/Execute/Close/Sync/Flush state machine: `Describe(Statement)` returns `ParameterDescription` + `RowDescription`; `Describe(Portal)` returns `RowDescription`; `Execute` honours `max_rows` and emits `PortalSuspended` when the row limit is reached, resuming on the next `Execute`; `Flush` sends buffered messages without `ReadyForQuery`; `Sync` finishes the pipeline and emits `ReadyForQuery` regardless of prior errors (abort-on-error pipeline semantics). `DEALLOCATE [ALL]` statement handling. Multi-statement simple query (semicolon-separated): each statement produces its own result set in order. `EmptyQueryResponse` for empty/whitespace-only queries. SSL negotiation: respond to `SSLRequest` with `'N'` so TLS-first clients downgrade gracefully. Add `ParameterStatus` startup messages for `server_version` (`"14.9 (RockStream)"`), `integer_datetimes`, `standard_conforming_strings`, `DateStyle`, `IntervalStyle`, `client_encoding`. | `psql -c '\d my_view'` reflects the correct column list without a `protocol error`; `PREPARE p AS SELECT * FROM mv WHERE id = $1; EXECUTE p(1)` returns the correct rows; `tokio-postgres` `.prepare()` + `.query()` with typed parameters returns correct rows (new `gateway_extended_query_tests.rs` TC test with a real psql binary); portal suspension: `Execute(max_rows=10)` on a 1 000-row result returns exactly 10 rows and `PortalSuspended`, subsequent `Execute(max_rows=0)` returns the remaining 990; multi-statement `"SELECT 1; SELECT 2"` emits two `CommandComplete` messages; `SSLRequest` does not cause connection failures from TLS-first clients; all existing `gateway_proof_tests.rs` and `gateway_integration_tests.rs` tests pass. | Unit, TC |
+| v0.38 | Type System Completeness & pg_catalog Depth ✅ Done | Extend `arrow_type_to_pg_oid` and `pg_type_from_name` to cover all SQL types needed for ORM compatibility: INT2 (21), FLOAT4 (700), DATE (1082), TIME (1083), TIMESTAMPTZ (1184), UUID (2950), NUMERIC/DECIMAL (1700), JSON (114), JSONB (3802), VARCHAR/CHAR (1043/1042), INTERVAL (1186); and array variants `_int4` (1007), `_int8` (1016), `_text` (1009), `_float8` (1022), `_bool` (1000), `_uuid` (2951). Binary result format encoding for all numeric types (INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL) — clients requesting binary format receive correct network-order bytes. `pg_catalog` additions: `pg_proc` (built-in aggregate function entries so ORMs do not error on function lookup), `pg_constraint` (PK/FK/UNIQUE/CHECK stubs; initially empty for views), `pg_index` (linked to `CatalogIndexEntry`), `pg_description` (empty rows), `pg_enum` (empty rows), `pg_aggregate` (COUNT/SUM/AVG/MIN/MAX entries), `pg_roles`/`pg_user` stubs (authenticated principal as one row). `information_schema` additions: `key_column_usage`, `table_constraints`, `column_privileges`, `referential_constraints` stubs. Extend `pg_catalog.pg_type` with entries for all new OIDs. ORM compatibility via TestContainers: SQLAlchemy 2.x `inspect(engine).get_columns()`, Prisma `db pull`, jOOQ/Hibernate `DatabaseMetaData.getColumns()`. | `arrow_type_to_pg_oid("Date32")` returns `1082`; binary INT4/INT8/FLOAT8/BOOL format is bit-identical to Postgres 14 wire encoding (compared against a reference Postgres 14 TC instance); SQLAlchemy `inspect(engine).get_columns('my_view')` returns correct column names and Python types without `SAWarning`; `prisma db pull` exits 0 and the resulting `schema.prisma` is parseable; Hibernate `getColumns(null, "public", "my_view", "%")` returns at least one row with correct `COLUMN_NAME` and `DATA_TYPE`; new `type_system_tests.rs` unit tests assert OID round-trips for every new type. | Unit, TC |
+| v0.39 | Wire Protocol Hardening & Connection Pool Compatibility ✅ Done | **CancelRequest**: gateway emits `BackendKeyData` (PID = connection counter, random secret) at session start; a `CancelRequest` on a separate TCP connection aborts the target query within 200 ms with `RS-2050`/SQLSTATE `57014`; the connection accepts new queries after cancellation. **Named cursors**: `DECLARE … CURSOR FOR`, `FETCH [FORWARD] n FROM`, `FETCH ALL FROM`, `MOVE`, `CLOSE`; connection-scoped, cleaned up on `ROLLBACK` or connection close. **Streaming result delivery**: `ViewReader::read_view` gains a row-iterator interface; the gateway pumps rows in batches of 1 000 without collecting a `Vec<Vec<u8>>`; per-connection peak memory bounded at 64 MiB. **Full SQLSTATE mapping**: every `RS-XXXX` error code in `error.rs` maps to a 5-char Postgres SQLSTATE; `ErrorResponse` fields `Detail`, `Hint`, `Position`, and `Where` populated for every query-level error. **PgBouncer compatibility**: correct `ReadyForQuery` transaction-status byte (`'I'`/`'T'`/`'E'`); `DISCARD ALL` and `RESET ALL` clear session state; portal and cursor cleanup on `Sync` outside a transaction; `application_name` tracked per session. **`pg_stat_activity`** virtual table: `pid`, `usename`, `application_name`, `state`, `query`, `query_start`, `client_addr`. **Protocol fuzzer**: `proptest`-driven structured fuzzer generating random well-formed pgwire message sequences; assert no panics, no hangs (bounded by `tokio::time::timeout`), no malformed responses. **Concurrent-connection stress**: 1 000 simultaneous `tokio-postgres` connections × 100 queries with zero connection-level errors and peak RSS < 2 GiB. | PgBouncer 1.21 in transaction-pooling mode fronting the gateway delivers correct results for 10 000 transactions across 50 client connections with zero errors (TC); cancellation test: a slow query is aborted in <200 ms and the connection reused successfully; cursor test: `FETCH 100` / `FETCH ALL` / `CLOSE` lifecycle passes end-to-end; 2 000 000-row streaming query completes with peak heap growth <64 MiB; fuzzer runs 50 000 random sequences without panics or hangs; 1 000-connection stress test completes without any connection error; every `RS-XXXX` code has a unit test asserting its SQLSTATE. | Unit, LFS, TC |
+| v0.40 | Password Authentication & Driver Session Bootstrap ✅ Done | Make any standard Postgres driver able to *connect* the way it does to real Postgres — no `--auth=off` requirement. Add `AuthMode::Scram` and `AuthMode::Md5` to `auth.rs` and implement the SCRAM-SHA-256 server flow (RFC 5802/7677): `AuthenticationSASL` → client `SASLInitialResponse` (client-first) → `AuthenticationSASLContinue` (server-first: server nonce + salt + iteration count) → client `SASLResponse` (client-final) → verify `ClientProof`, send `AuthenticationSASLFinal` + `AuthenticationOk`; plus an `AuthenticationMD5Password` fallback with a per-connection salt. Store password verifiers (SCRAM `StoredKey`/`ServerKey`, or the `md5` hash) in a control-plane `pg_authid`-style role catalog managed by `CREATE ROLE … LOGIN PASSWORD '…'` / `ALTER ROLE … PASSWORD` / `DROP ROLE`, mapped onto the existing `Principal`/RBAC model; `--auth=scram\|md5\|oidc\|mtls\|off`. **Driver session bootstrap**: implement the catalog functions every driver/ORM probes at connect time — `version()`, `current_database()`, `current_schema()`, `current_schemas(bool)`, `current_user`/`session_user`/`user`, `pg_backend_pid()`, `pg_is_in_recovery()`, `current_setting(text[, bool])`, `set_config(text,text,bool)`, `pg_postmaster_start_time()`, `txid_current()` — and a working GUC round-trip so `SET search_path = app` then `SHOW search_path` agree, with `search_path`-aware resolution of unqualified view names; `SHOW ALL`; `client_encoding`/`server_encoding` fixed to `UTF8`. | psql, psycopg3, pgx (Go), PgJDBC, node-postgres, and tokio-postgres each complete a SCRAM-SHA-256 handshake and finish their full startup-probe sequence with zero protocol errors (new `auth_scram_tests.rs` TestContainers driver matrix); a wrong password returns SQLSTATE `28P01`; the MD5 path authenticates a legacy `psql` client; `SELECT version()` returns a libpq-parseable Postgres 14 banner; `SET search_path='app'; SHOW search_path` round-trips and unqualified `SELECT * FROM my_view` resolves through it; every bootstrap function's result shape is compared against a reference Postgres 14 TC instance. | Unit, TC |
+| v0.41 | Transaction State Machine, Savepoints & LISTEN/NOTIFY ✅ Done | Give applications the transactional control surface a real OLTP app expects. Promote `session.rs` to a full wire-level transaction state machine: implicit single-statement transactions, explicit `BEGIN [TRANSACTION]`/`COMMIT`/`END`/`ROLLBACK` blocks, `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` implemented as nested write-buffer checkpoints layered over `write_buffer.rs`, and `SET LOCAL`/`SET TRANSACTION`. **Aborted-transaction semantics**: a query error inside a block flips the `ReadyForQuery` status byte to `'E'` and every subsequent command returns SQLSTATE `25P02` (`in_failed_sql_transaction`) until `ROLLBACK`/`ROLLBACK TO`, after which the session is fully reusable. **LISTEN/NOTIFY**: per-session channel registry bridged to the existing CDC/subscribe layer (`subscribe_handler.rs`/`change_log.rs`) so `NOTIFY chan, 'payload'` and the `pg_notify(text,text)` function deliver `NotificationResponse` (`A`) messages to every listening connection at transaction commit (at-least-once on the issuing connection); `LISTEN`/`UNLISTEN`/`UNLISTEN *` with channel cleanup on `DISCARD ALL` and disconnect. `PREPARE TRANSACTION`/`COMMIT PREPARED` (XA two-phase) are explicitly rejected with `RS-2003`/SQLSTATE `0A000` and documented unsupported. | A transactional workflow `BEGIN; INSERT …; SAVEPOINT s; INSERT …; ROLLBACK TO s; COMMIT` leaves only the pre-savepoint write visible (new `transaction_savepoint_tests.rs`, LFS + TC); an error mid-transaction blocks further commands with `25P02` until `ROLLBACK`, then the connection is reused successfully; `LISTEN events; NOTIFY events, 'hi'` delivers a `NotificationResponse` to a second connection within the freshness SLO, verified with psycopg3 `connection.notifies` (new `listen_notify_tests.rs` TC); the `'I'`/`'T'`/`'E'` transaction-status byte is correct through the entire lifecycle and a psql `\set AUTOCOMMIT off` transcript matches Postgres. | Unit, LFS, TC |
+| v0.42 | Reference Application & Driver-Matrix Certification ✅ Done | Prove — and permanently lock — that an end user can build a *complete* project on the pgwire surface with no RockStream-specific workarounds. Ship a reference OLTP+analytics application under `crates/rockstream-gateway/tests/reference_app/`: schema migrations (`CREATE TABLE`/`CREATE VIEW`/`CREATE MATERIALIZED VIEW`), transactional writes with savepoints, materialized-view reads, `SUBSCRIBE`/`LISTEN` change feeds, prepared statements, and pooled connections — driven entirely through a mainstream ORM/migration toolchain over the wire (Prisma `migrate` + client, plus a SQLAlchemy 2.x / Alembic variant). **Driver-compatibility matrix** in CI (TestContainers): psql 14/16, libpq, psycopg3, tokio-postgres, pgx, PgJDBC, node-postgres, SQLAlchemy, Prisma — each runs the same conformance smoke suite (connect+SCRAM auth, simple + extended query, typed params, transactions + savepoints, named cursors, `COPY`, LISTEN/NOTIFY, CancelRequest). **Golden wire-byte snapshots**: capture exact server→client byte streams for representative exchanges and assert them byte-for-byte against checked-in goldens to catch silent protocol regressions. **Coverage gate**: raise `rockstream-gateway` line coverage to ≥90% (enforced by the existing CI coverage job) and branch coverage on `protocol.rs`/`server.rs`/`session.rs`/`auth.rs` to ≥85%. A `docs/pgwire-conformance.md` corpus enumerates every supported message/statement with a linked proof test. **Wire Protocol End-User Complete** milestone. | The Prisma reference app runs `prisma migrate deploy`, seeds data, reads materialized views, subscribes to changes, and completes a transactional workflow against RockStream unmodified (CI, TC); the same application logic passes on the SQLAlchemy/Alembic variant; all nine drivers in the matrix pass the conformance smoke suite green; golden wire-byte snapshots match exactly; `rockstream-gateway` coverage ≥90% line / ≥85% branch is enforced and fails CI on regression; `docs/pgwire-conformance.md` lists every supported surface with a linked test. | Unit, LFS, MinIO, TC |
+
+### Phase 12 — The Data Lake Bridge & FinOps
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.43 | FizzBee Cold-Tier Protocol Model & Simulator Fidelity | Before any cold-tier sink code is written, model-check the cold-tier exactly-once commit protocol in FizzBee (binding pre-implementation requirement from v0.18); simultaneously close all three UNMITIGATED simulation fidelity gaps from DESIGN.md §17 that block cold-tier and Kafka exactly-once claims. Deliverables: `formal/m5_cold_tier_sink.fizz` with safety invariants (no duplicates, no data loss under partial-write faults, manifest-pointer atomicity) and liveness (`committed_epoch` always advances); paired runtime `assert!`s in `rockstream-connectors`; add `partial_write_probability: f64` to `SimObjectStore` and a `PartialWriteRecoveryTest` to the law-faults corpus (gap 1); add `kafka_tx_timeout_probability` fault parameter to the Kafka connector simulator (gap 2); pull forward `list_staleness_epochs` if not yet landed in v0.42 (gap 3); update DESIGN.md §17 gap statuses to `[MITIGATED]`. | `formal/m5_cold_tier_sink.fizz` is green with all safety and liveness invariants at CI-fast bounds; injecting `partial_write_probability=0.5` triggers truncated bytes and the cold-tier recovery test passes without duplicate output (new `partial_write_recovery_tests.rs`, LFS + MinIO); `kafka_tx_timeout_probability` exercises the `CheckBeforeCommit` recovery path; all three §17 simulation gaps are updated to `[MITIGATED]`; all existing workspace tests pass. | Unit, LFS, MinIO, TC |
+| v0.44 | Cold-Tier Sinks | Iceberg and Delta sinks exporting periodic columnar Parquet snapshots to object storage; bridges RockStream to the Data Lakehouse for external engines (DuckDB, Trino, Databricks). The simulator fidelity foundation from v0.43 backs all crash-recovery paths with proper partial-write fault injection. | External engines can query RockStream-generated Iceberg tables with zero data corruption; `partial_write_probability` fault injection passes without any duplicate or missing rows in the sink output. | Unit, LFS, MinIO, TC |
+| v0.45 | Deep FinOps Optimizations | Route latency-sensitive metadata (`shard_meta/`) to AWS S3 Express One Zone; tier older compacted SSTs to S3 Standard-IA; validate running the stateless worker pool entirely on Spot/preemptible instances. | TCO benchmarks show >50% reduction in steady-state operational costs compared to v0.31. | Unit, LFS, MinIO, TC |
+
+### Phase 13 — Network Efficiency & Advanced DML
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.46 | Advanced DML & Scatter Pruning | `UPDATE … RETURNING` and `DELETE … RETURNING` (read-modify-write semantics); piggyback min/max bounds and Bloom filters onto the frontier summary to prune unneeded shards during multi-shard point lookups. | Multi-shard point reads safely bypass >90% of shards based on frontier summary Bloom filters. | Unit, LFS, MinIO, TC |
+| v0.47 | Zero-Copy IPC & AZ-Aware Shuffle | Upgrade same-host gRPC loopbacks to Apache Arrow Flight Shared Memory; make the hierarchical exchange subsystem aware of physical availability zones (AZs) to eliminate cross-AZ egress during shuffle. | Zero byte-copying observed in CPU profiles for same-host worker exchanges; cross-AZ traffic drops to near zero during shuffle phases. | Unit, LFS, MinIO, TC |
+
+### Phase 14 — Complex Analytics & Compute Tuning
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.48 | Advanced Streaming Analytics | SQL compiler support for recursive CTEs (`WITH RECURSIVE`) for graph algorithms and fixed-point IVM, lateral joins for nested JSON/arrays, and hopping/session windows. | Transitive closures and sessionization queries incrementally maintain state correctly against the correctness oracle. | Unit, LFS, MinIO, TC |
+| v0.49 | Hot-Path Compute Optimizations | WAL elision for derived intermediate operator shards; link `max_rows_per_quantum` directly to network buffer depth to provide tight backpressure coupling. | Throughput on complex DAGs increases by >30% due to reduced intermediate WAL write amplification. | Unit, LFS, MinIO, TC |
+
+### Phase 15 — Declarative Data Governance
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.50 | Inline Expectations & Lineage Diagnostics | `CREATE EXPECTATION` syntax; specialized "Expectation Operator" injected into the DAG to evaluate rows and zero out Z-set weights for failed records before they reach `ViewSink`; hooks into `EXPLAIN INCREMENTAL ANALYZE`. | Malformed records injected into upstream sources never reach downstream `ViewSink` outputs. | Unit, LFS, MinIO, TC |
+| v0.51 | DLQ Routing & State Degradation | Transactionally forward failed rows to an internal base-table shard (canonical Dead Letter Queue); implement state degradation policies (`warn`, `degrade`, `block`); guarantee exactly-once processing for failed rows. | Failed records are durably queryable in `rockstream_catalog.dead_letter_queue` alongside exactly-once commit boundaries. | Unit, LFS, MinIO, TC |
+
+### Phase 16 — Enterprise Validation & 1.0 Finalization
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.52 | Isolation & Validation Hooks | Validate non-CRDT exact-key writes against per-row versions to prevent blind overwrites; support single-shard `SERIALIZABLE LOCAL` isolation via SlateDB transactions for standard ACID transactional workflows. | Concurrent conflicting writes to the same key on a single shard correctly trigger serialization anomalies/aborts. | Unit, LFS, MinIO, TC |
+| v0.53 | Simulator Maturity & Auto-Tuning Lock | Finalize shift from bounded defaults to fully SLO-driven adaptive control loops; close final known testing gap for external-system edge cases. | Simulator accurately reproduces and recovers from all remaining external-system edge-cases. | Unit, LFS, MinIO, TC |
+| v0.54 | v1.0 Release Candidate (RC1) | Activate all features from v0.1 through v0.53 simultaneously; run comprehensive chaos, performance, and scaling soak under maximum cluster pressure within a single cloud region. **v1.0 Release** milestone → tag `v1.0.0`. | No P0 or P1 bugs discovered during a 2-week continuous automated chaos cycle. | Unit, LFS, MinIO, TC |
+
+---
+
+## Formal Verification Track (FizzBee)
+
+[FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) is the authoritative specification
+for design-time formal verification. Because v0.1–v0.17 shipped before the
+FizzBee toolchain existed, its Phase 0 toolchain and the M1 epoch-commit model
+are folded into v0.18 as catch-up; the remaining models are then woven into the
+versions that build each protocol — always **modeled before the Rust code**, so
+the design is verified before the implementation exists.
+
+| Version | FizzBee deliverable | Models / specs | Invariants | Gate |
+|---|---|---|---|---|
+| v0.18 | Toolchain bootstrap (D0.1–D0.4) + M1 retro-model (D1.1–D1.5) + M2 scalar model (D5.1–D5.3) | `formal/conventions.md`, `formal/m1_epoch_commit.fizz`, `formal/m2_frontier_agg.fizz`, `fizz.yaml`, `formal-verify` CI job | M1-S1…S5, M1-L1, COV-M1; M2-S1…S4, M2-L1…L2, COV-M2 | `make verify` green; M1 + M2 models green; paired `assert!`s in `rockstream-storage`, `-runtime`, `-control` |
+| v0.19 | M2 multi-source antichain variant (D5.4–D5.5) | `formal/m2_frontier_agg.fizz` (vector frontier) | M2-S1 over the vector `FreshnessToken` | Multi-source meet model green; §3.6 M2 rows populated; `SimRuntime` reordering mirror passes |
+| v0.20 | M4 self-fencing model (D6.1–D6.2) | `formal/m4_self_fencing.fizz` | M4-S1…S4, M4-L1…L2, COV-M4 | M4 model green (justifies writer re-election); paired `assert!`s in `rockstream-runtime` |
+| v0.21 | M3 sink-2PC model (D6.3–D6.4) + M1 duplication variant (D6.5) | `formal/m3_sink_2pc.fizz` (×3 idempotency profiles), `formal/m1_epoch_commit.fizz` (duplication) | M3-S1…S4, M3-L1, COV-M3; M1-S5 under duplication | M3 model green (M3-S3 composed with M1 `cluster_committed`); paired `assert!`s in `rockstream-connectors`, `-runtime` |
+| v0.22 | Continuous verification + findings (D6.6, DC.1–DC.4) | all `.fizz` specs, `formal/findings.md` | all M1–M4 safety + liveness | All four models green at CI-fast and relaxed bounds; path-coupling check live; counterexamples replayed forever as regression seeds |
+| v0.43 | M5 cold-tier exactly-once model (pre-implementation) | `formal/m5_cold_tier_sink.fizz` | M5-S1 (no duplicates under partial-write fault), M5-S2 (no data loss), M5-S3 (manifest-pointer atomicity), M5-L1 (`committed_epoch` always advances), COV-M5 | M5 model green at CI-fast bounds; all safety and liveness assertions hold; paired `assert!`s added to `rockstream-connectors`; any counterexample archived in `formal/findings.md` and replayed as a permanent `SimRuntime` regression seed |
+| v0.23–v0.54 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M5 | A coordination-protocol change without a model touch fails CI; the v0.54 RC1 gate re-runs the relaxed-bounds sweep |
+
+Every row above maps each FizzBee invariant to a paired runtime `assert!` per
+[FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6; CI cross-checks that every
+mapped invariant has both a green FizzBee assertion and a present runtime
+`assert!`. A FizzBee counterexample for any protocol becomes a named
+`SimRuntime` regression seed before the model is fixed, and is replayed on every
+build thereafter.
+
+---
+
+## How This Roadmap Maps to the Plan
+
+| Plan phase | Roadmap versions | FizzBee model (FIZZBEE_TEST_PLAN.md) |
+|---|---|---|
+| Phase 0 — Foundation | v0.1 – v0.3 | Toolchain folded into v0.18 (catch-up) |
+| Phase 1 — Single-Shard IVM Core | v0.4 – v0.6 | M1 epoch-commit (retro-modeled in v0.18) |
+| Phase 2 — SQL Frontend & Joins | v0.7 – v0.10 | — |
+| Phase 3 — Essential Operators & Soak | v0.11 – v0.14 | — |
+| Phase 4 — Multi-Shard & Exchange | v0.15 – v0.17 | — |
+| Phase 5 — Frontier Protocol | v0.18 – v0.19 | M2 frontier aggregation |
+| Phase 6 — Fault Tolerance & Exactly-Once | v0.20 – v0.22 | M3 sink 2PC, M4 self-fencing |
+| Phase 7 — PostgreSQL Wire Gateway | v0.23 – v0.26 | Continuous verification |
+| Phase 8 — Ingestion & The Crucible Soaks | v0.27 – v0.31 | Continuous verification + relaxed-bounds sweep |
+| Phase 9 — Operational HTAP Ergonomics | v0.32 | Continuous verification |
+| Phase 10 — Nexmark Correctness Suite | v0.33 – v0.36 | Continuous verification |
+| Phase 11 — PostgreSQL Wire Protocol Hardening | v0.37 – v0.42 | Continuous verification |
+| Phase 12 — The Data Lake Bridge & FinOps | v0.43 – v0.45 | Continuous verification |
+| Phase 13 — Network Efficiency & Advanced DML | v0.46 – v0.47 | Continuous verification |
+| Phase 14 — Complex Analytics & Compute Tuning | v0.48 – v0.49 | Continuous verification |
+| Phase 15 — Declarative Data Governance | v0.50 – v0.51 | Continuous verification |
+| Phase 16 — Enterprise Validation & 1.0 Finalization | v0.52 – v0.54 | Continuous verification + relaxed-bounds sweep at RC1 |
+
+Fifty-four versions at ~6 person-weeks each is the full path from an empty
+repository to a production-ready, enterprise-grade 1.0. The order is fixed:
+correctness on one shard is proven before distribution, distribution is made
+fault-tolerant before the Postgres layer depends on it, ingestion connectors
+and crucible soaks validate real-world pressure before HTAP ergonomics, the
+Nexmark suite certifies end-to-end correctness (including retraction/Z-set semantics) on the full stack,
+PostgreSQL wire protocol hardening (v0.37–v0.39) and end-user certification (v0.40–v0.42) ensure any standard driver works without workarounds and that a complete application can be built on the wire protocol alone,
+and the data lake bridge (with its FizzBee pre-model and simulator fidelity foundation at v0.43), network optimizations, complex analytics, and data
+governance layers close out 1.0 through v0.54.

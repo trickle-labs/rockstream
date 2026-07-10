@@ -9,6 +9,7 @@ description = "Deterministic simulation harness for RockStream (SimRuntime, bugg
 [features]
 default = []
 simulation = []
+docker_tests = []
 
 [dependencies]
 rockstream-types = { workspace = true }
@@ -20,3 +21,20 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+rockstream-oracle = { path = "../rockstream-oracle" }
+rockstream-control = { workspace = true }
+rockstream-runtime = { workspace = true }
+tempfile = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["minio"] }
+object_store = { workspace = true }
+arrow = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rockstream-storage = { workspace = true }
+rockstream-ops = { workspace = true }
+rockstream-connectors = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+

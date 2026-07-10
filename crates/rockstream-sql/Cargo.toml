@@ -6,14 +6,39 @@ rust-version.workspace = true
 license.workspace = true
 description = "SQL frontend built on DataFusion for RockStream"
 
+[features]
+# Gate the SF=0.1 (600k lineitem) TPC-H test so CI jobs can opt-in per job
+# without environment variable plumbing.
+# Usage: cargo test -p rockstream-sql --features sf10_tests
+sf10_tests = []
+testcontainers = []
+
 [dependencies]
-datafusion = { workspace = true }
-rockstream-types = { workspace = true }
 rockstream-plan = { workspace = true }
+rockstream-storage = { workspace = true }
+rockstream-types = { workspace = true }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-rockstream-diff = { workspace = true }
-rockstream-runtime = { workspace = true }
-rand = { workspace = true }
+rockstream-ops = { workspace = true }
+rockstream-oracle = { path = "../rockstream-oracle" }
+tempfile = { workspace = true }
+object_store = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+reqwest = { workspace = true }
+rockstream-gateway = { workspace = true }
+rockstream-sim = { workspace = true }
+tokio-postgres = { workspace = true }
+async-trait = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+bytes = { workspace = true }
+

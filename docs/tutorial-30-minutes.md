@@ -1,872 +1,946 @@
-# RockStream 30-Minute Starter Tutorial: Building Real-Time Analytics Pipelines
+# RockStream in 30 Minutes: From Theory to a Live SQL Engine
 
-Welcome to the RockStream starter tutorial. This guide is designed to take you from a complete beginner—with no prior experience in Incremental View Maintenance (IVM) or stream processing—to an intermediate builder capable of designing, executing, and diagnosing complex, multi-stage materialized view DAGs. Over the next 30 minutes, we will explore the underlying mathematical and architectural principles of RockStream, bootstrap a local development cluster, connect to it using standard database tools, define workloads, and construct a real-world Campaign Attribution and Referral tracking pipeline. Finally, we will demonstrate how to query this pipeline using SQL, stream changes out using the Postgres wire protocol, and diagnose internal behaviors using RockStream's CLI tools.
+Welcome. The next half hour takes you from *never having heard of incremental
+view maintenance* to *running the RockStream engine on your own machine, talking
+to it with `psql`, building a DAG of materialized views, and watching its
+correctness proofs execute in front of you*.
 
----
+This is a hands-on tutorial, and **every command in it really runs.** That
+matters, because RockStream is a young project in the middle of an honest,
+evidence-driven build-out. Rather than show you a glossy demo of features that
+don't exist yet, this guide does two things:
 
-## Part 1 — Paradigms, Concepts, and the Scoreboard Analogy
+1. **Explains the ideas** that make RockStream different — incremental view
+   maintenance, Z-sets, frontiers, merge laws, and bottomless cloud state.
+2. **Lets you reproduce reality.** You will build the workspace, boot a node that
+   speaks the PostgreSQL wire protocol, connect a real `psql` client, assemble a
+   dependency graph of views, watch the engine reject a cycle, and then run the
+   project's own proofs that show the incremental engine producing
+   *bit-identical* results to a batch re-computation.
 
-Before we write a single line of code or run a single command, we must understand *why* RockStream exists and *how* it thinks about data. If you are coming from a traditional relational database (like PostgreSQL, MySQL, or SQL Server) or a batch-based data warehouse (like Snowflake, BigQuery, or Redshift), you are accustomed to a **pull-based, batch-oriented paradigm**. 
-
-In a traditional database, data sits quietly in tables on disk. When you want to see a report or update a dashboard, you execute a query. The database engine wakes up, performs index scans or full table scans, filters rows, aggregates them, and returns the result. If your data size is small, this happens in milliseconds. But as your data size grows and you accumulate millions or billions of records, these scans become progressively slower, costlier, and more resource-intensive. If your dashboard needs to refresh every few seconds, running full table scans repeatedly is like tearing down and rebuilding a stadium scoreboard from scratch every time a player scores a point. It is inefficient, redundant, and does not scale.
-
-### Incremental View Maintenance (IVM) and the Ticking Scoreboard
-
-RockStream is built on a **push-based, incremental paradigm**. Instead of waiting for you to query the database, RockStream pre-computes the answers to your queries and keeps them continuously fresh. When a new row is added, or an existing row is updated or deleted, RockStream does not rerun your query. Instead, it computes *only the difference*—the delta—and applies that difference directly to the pre-computed result. The scoreboard stays up, and only the numbers affected by the new event tick forward. 
-
-The work performed by the engine is proportional to the volume of *incoming changes*, not the *total size of the historical data*. A stream of ten million historical records costs you nothing at query time because the final result is already sitting in storage, ready to be read in O(1) or O(log N) time.
-
-### The Mathematics of Change: Z-Sets and DBSP
-
-Under the hood, RockStream represents all changes using a formal mathematical framework called **DBSP** (Database Stream Processing) and a data structure called a **Z-set** (sets with integer weights). 
-
-In standard set theory, a set either contains an element or it does not (membership is binary). In bag (or multiset) theory, a set can contain multiple copies of the same element, meaning membership maps elements to positive integers ($\mathbb{N}$). A Z-set generalizes this by allowing the count (or weight) of any element to be *any* integer—positive, zero, or negative. Mathematically, a Z-set over a domain $D$ is a function:
-$$Z: D \to \mathbb{Z}$$
-where only a finite number of elements in $D$ have non-zero weights.
-
-This algebraic structure forms a commutative group under addition. This is incredibly powerful because it means we can represent database changes directly:
-- An **insertion** of a row $r$ is represented as a Z-set containing $r$ with a weight of `+1`.
-- A **deletion** of a row $r$ is represented as a Z-set containing $r$ with a weight of `-1`.
-- An **update** of a row from $r_{old}$ to $r_{new}$ is represented as the sum of a deletion and an insertion: $\{r_{old} \mapsto -1, r_{new} \mapsto +1\}$.
-
-Because relational operators like Filter ($\sigma$), Project ($\pi$), and Join ($\bowtie$) are linear (or bilinear) with respect to Z-set addition, RockStream can compile your SQL query into a directed acyclic graph (DAG) of physical operators that process these weights directly. 
-
-Let's look at how this linearity plays out:
-- **Filter ($\sigma_p$):** To filter a Z-set $X$ with predicate $p$, the operator simply evaluates $p$ on each element. If $p(x)$ is true, the element $x$ is emitted with its original weight $w$; if false, it is omitted. Thus:
-  $$\sigma_p(X + Y) = \sigma_p(X) + \sigma_p(Y)$$
-- **Project ($\pi_f$):** To project a Z-set $X$ using function $f$, the operator applies $f$ to each element. If multiple elements map to the same projected value, their weights are summed. This aggregation of weights handles duplicates automatically:
-  $$\pi_f(X + Y) = \pi_f(X) + \pi_f(Y)$$
-- **Join ($\bowtie$):** Joins are bilinear. If we have two streams of changes $dX$ and $dY$, the change in the join output is computed by joining the new changes with the accumulated historical states $X$ and $Y$:
-  $$d(X \bowtie Y) = (dX \bowtie Y) + (X \bowtie dY) + (dX \bowtie dY)$$
-
-This mathematical formulation guarantees that RockStream's incremental outputs are always *mathematically identical* to the results you would get from running a full batch query from scratch. There are no approximations, no heuristics, and no synchronization drift.
-
-```
-                  ┌─────────────────┐
-                  │   Incoming DDL  │
-                  └────────┬────────┘
-                           │
-                           ▼
-                  ┌─────────────────┐
-                  │   DataFusion    │  (SQL Parsing & AST Generation)
-                  │  SQL Frontend   │
-                  └────────┬────────┘
-                           │
-                           ▼
-                  ┌─────────────────┐
-                  │    PlanNode     │  (Logical/Physical Plan representation)
-                  │ Intermediate IR │
-                  └────────┬────────┘
-                           │
-                           ▼
-                  ┌─────────────────┐
-                  │     DiffCtx     │  (Differentiation Pass: builds delta plan)
-                  │ Differentiation │
-                  └────────┬────────┘
-                           │
-                           ▼
-                  ┌─────────────────┐
-                  │  OpNode Graph   │  (Physical Executable Operator Graph)
-                  └─────────────────┘
-```
-
-The compilation process is managed by `rockstream-diff` via the `DiffCtx` (differentiation context) pass. It takes a static logical plan of `PlanNode`s and differentiates it, inserting stateful **Arrangements** (index tables) where operators need to remember historical values (such as the inputs to a Join or GroupBy).
-
-### Coordination Without Locks: The Frontier Protocol
-
-In a distributed, sharded system, coordinating progress across multiple machines without bottlenecks is a major challenge. Traditional databases use distributed locks or two-phase commit protocols, which introduce significant latency and network overhead. RockStream replaces coordination with a metadata-driven protocol using **frontiers**.
-
-A frontier is a monotonic marker that progress has been completed up to a specific logical epoch. For example, if a source operator emits a frontier of `epoch=42`, it promises that it will never emit any future changes with an epoch smaller than 42. Downstream operators monitor the frontiers of all their inputs. A join operator with two inputs at `epoch=42` and `epoch=41` knows it can safely process data up to `epoch=41`. Once the second input advances to `epoch=42`, the join advances as well. 
-
-This guarantees **diamond consistency**:
-If a query splits into two parallel paths (e.g., performing a filter on one side and a projection on the other) and merges later via a join, the join operator is guaranteed to see a perfectly aligned, consistent snapshot of the world. It will never join an event from epoch 42 with a state from epoch 41. The frontier protocol delivers this consistency dynamically without holding any global locks, making it highly scalable.
-
-### The State Engine: SlateDB and Object Storage
-
-Many streaming databases keep all their state in RAM or rely on local SSDs for storage. This makes them fast, but it makes them expensive and difficult to scale. If a worker node crashes, you must copy gigabytes of state over the network to a new worker before it can resume processing.
-
-RockStream stores all intermediate operator state (arrangements) and final view outputs in **SlateDB**, an LSM-tree storage engine designed specifically to write directly to cloud object storage (like AWS S3, Google Cloud Storage, or MinIO). 
-
-- **Bottomless State:** Your state can grow beyond the memory or disk capacity of a single machine, bounded only by the capacity of your cloud storage bucket.
-- **Cheap Durability:** Object storage is significantly cheaper than provisioned SSDs or RAM, saving up to 90% in storage costs.
-- **Zero Local-State Migration:** Because all state is stored durably in the cloud, worker nodes do not have local state. If a worker node fails, another worker can instantly take over its shards by reading directly from the same object storage path, resuming work in seconds.
-- **LSM Compaction in the Cloud:** SlateDB writes immutable SSTable files to S3. Compaction is coordinated by RockStream's control plane, which delegates the CPU-heavy compaction work to background worker tasks without affecting the query-serving gateway nodes.
-
-### The Algebraic Safety Net: Merge Laws
-
-To maintain state incrementally without reading and writing the entire dataset, RockStream requires every aggregate operator to carry a **merge law**. 
-
-A merge law is a named, versioned algebraic contract (such as `WeightAdd/v1` for SUM/COUNT or `MaxRegister/v1` for MAX) that defines how state merges. 
-
-RockStream verifies three key mathematical properties for every merge law:
-1. **Associativity:** $(a \oplus b) \oplus c = a \oplus (b \oplus c)$. This allows updates to be applied in any batch size or hierarchy.
-2. **Commutativity:** $a \oplus b = b \oplus a$. This allows updates to be applied out of order, which is common in distributed networks where sharded data arrives at different times.
-3. **Identity Element:** There exists an element $e$ such that $a \oplus e = a$. This represents the default empty state.
-4. **Inverse (Optional but highly desired):** There exists an element $-a$ such that $a \oplus (-a) = e$. 
-
-This inverse allows RockStream to handle deletions efficiently: if an input row is deleted, the engine subtracts its value from the running total without recalculating the sum of all other rows. This is known as an **Abelian Group**.
-
-For operations like `MAX` and `MIN`, which are semilattices and lack an inverse (you cannot "subtract" a number from a maximum to find the previous maximum), RockStream's catalog explicitly records that they require a read-modify-write (RMW) cycle. This allows the compiler to generate warnings or optimize state compaction accordingly.
-
-RockStream supports several CRDT (Conflict-free Replicated Data Type) columns built on these merge laws, including:
-- `COUNTER`: Accumulates integers using addition (Abelian Group).
-- `MAX_REGISTER` / `MIN_REGISTER`: Tracks the maximum/minimum value observed (Semilattice).
-- `LWW` (Last-Write-Wins): Tracks the value with the highest physical timestamp.
-- `OR_SET` (Observed-Remove Set): Maintains a set of unique elements.
+> **Where the project is right now — read this once.** RockStream is built
+> version by version, and each version is "done" only when its proof is done
+> (see [NEW_ROADMAP.md](../NEW_ROADMAP.md)). The single `rockstream` binary boots
+> a real node — control plane, worker registration, shard leasing and fencing, a
+> SlateDB store — and now also **starts a long-running PostgreSQL wire server you
+> connect to directly with `psql`.** Over that connection you can run DDL
+> (`CREATE VIEW`, `CREATE MATERIALIZED VIEW`), build and validate a view
+> dependency DAG (cycles are rejected), issue transactional DML, `SUBSCRIBE`,
+> and set session variables. The last hop is now wired: after each `COMMIT`,
+> the gateway re-evaluates every view that transitively depends on the changed
+> tables using DataFusion's in-memory engine and writes the output directly into
+> the serving shard, so a `SELECT` over a freshly-created view returns **live
+> rows**. Part 5 shows this end to end. The incremental Z-set path (deltas
+> through operator DAGs, proven bit-identical to batch) lives in the test
+> harness you will run in Part 6.
 
 ---
 
-## Part 2 — Preparing Your Environment and Bootstrapping the Node
+## Part 1 — Why RockStream Exists
 
-Let's begin the practical portion of this tutorial. We will start by setting up our environment and booting a single-node RockStream instance in evaluation mode.
+Before any commands, it helps to understand *why* RockStream thinks about data
+the way it does. If you come from a traditional relational database (PostgreSQL,
+MySQL) or a batch warehouse, you are used to a
+**pull-based, batch-oriented** world.
 
-### Directory Structure
+In that world, data sits quietly on disk. When you want a report, you run a
+query: the engine scans, filters, joins, aggregates, and returns a result. For
+small data this is instant. But as data grows into millions or billions of rows,
+those scans get slower and costlier. If a dashboard refreshes every few seconds,
+re-scanning everything each time is like tearing down and rebuilding a stadium
+scoreboard from scratch after every single point.
 
-First, create a clean directory in your workspace where RockStream will store its data files and write-ahead logs (WALs):
+### Incremental View Maintenance: the ticking scoreboard
 
-```bash
-mkdir -p ./rockstream-data
+RockStream is **push-based and incremental**. Instead of waiting for you to ask,
+it pre-computes the answers to the queries you care about and keeps them
+continuously fresh. When a row is inserted, updated, or deleted, RockStream does
+*not* re-run your query. It computes only the **difference** — the delta — and
+applies it to the already-computed result. The scoreboard stays up; only the
+numbers touched by the new event tick forward.
+
+The work the engine does is proportional to the size of the *change*, not the
+size of the *history*. Ten million historical rows cost nothing at read time,
+because the answer is already sitting in storage.
+
+### The mathematics of change: Z-sets
+
+Under the hood, RockStream represents every change as a **Z-set**: a set whose
+elements carry an integer weight. A normal set says an element is present or not.
+A Z-set says an element is present *with weight $w \in \mathbb{Z}$* — positive,
+negative, or zero. Formally, a Z-set over a domain $D$ is a function
+$Z : D \to \mathbb{Z}$ with finitely many non-zero weights.
+
+This is exactly the right shape for database changes:
+
+- An **insert** of row $r$ is the Z-set $\{r \mapsto +1\}$.
+- A **delete** of row $r$ is $\{r \mapsto -1\}$.
+- An **update** from $r_{old}$ to $r_{new}$ is $\{r_{old} \mapsto -1,\; r_{new} \mapsto +1\}$.
+
+Because relational operators are linear (or bilinear) over Z-set addition,
+RockStream can compile SQL into a graph of operators that process these weights
+directly:
+
+- **Filter** $\sigma_p$: keep each element's weight if the predicate holds.
+  $\sigma_p(X + Y) = \sigma_p(X) + \sigma_p(Y)$.
+- **Project** $\pi_f$: apply $f$; sum the weights of elements that collide.
+  $\pi_f(X + Y) = \pi_f(X) + \pi_f(Y)$.
+- **Join** $\bowtie$ is bilinear, so a change to either side expands cleanly:
+  $$d(X \bowtie Y) = (dX \bowtie Y) + (X \bowtie dY) + (dX \bowtie dY).$$
+
+The payoff is a hard guarantee: RockStream's incremental output is always
+*bit-identical* to what a full batch re-computation would produce. No drift, no
+approximation. This guarantee is not a slogan — it is asserted as a property test
+for **every** operator against a DataFusion batch reference, which you will run
+yourself in Part 6.
+
+### Coordination without locks: frontiers
+
+In a sharded system, the hard part is agreeing on *progress* without a central
+bottleneck. RockStream uses **frontiers**: monotonic markers that say "everything
+up to logical epoch $N$ is done." If a source emits a frontier of `epoch=42`, it
+promises never to emit anything older than 42. A join with two inputs at epochs
+42 and 41 knows it can safely process through 41, and advances when the lagging
+input catches up.
+
+That gives **diamond consistency**: if a query fans out into two paths and merges
+again at a join, the join always sees a perfectly aligned snapshot — never an
+event from epoch 42 against state from epoch 41 — and it does so with no global
+lock. This is exactly what makes a *DAG* of views safe to maintain: every node
+downstream sees a consistent cut of its inputs.
+
+### Bottomless state: SlateDB on object storage
+
+Many streaming databases keep all their state in RAM or on local SSDs. That is
+fast but expensive, and recovery means copying gigabytes over the network before
+a new worker can resume.
+
+RockStream stores operator state (arrangements) and view outputs in
+[**SlateDB**](https://slatedb.io/), an LSM engine that writes directly to cloud
+object storage (S3, GCS, MinIO). State can grow past any single machine, bounded
+only by your bucket. Because the state lives in the bucket, a failed worker's
+shards can be picked up by another worker that simply reads the same path — no
+state migration.
+
+### The algebraic safety net: merge laws
+
+To maintain an aggregate incrementally, every aggregate operator carries a
+**merge law** — a named, versioned algebraic contract such as `WeightAdd` (for
+`SUM`/`COUNT`) or `MaxRegister` (for `MAX`). RockStream verifies the properties
+that make incremental maintenance safe:
+
+1. **Associativity** — $(a \oplus b) \oplus c = a \oplus (b \oplus c)$.
+2. **Commutativity** — $a \oplus b = b \oplus a$ (updates can arrive out of order).
+3. **Identity** — an empty state $e$ with $a \oplus e = a$.
+4. **Inverse** (when it exists) — $a \oplus (-a) = e$, which lets deletions
+   subtract instead of recomputing.
+
+`SUM` and `COUNT` have an inverse, so a deletion is a cheap subtraction. `MAX`
+and `MIN` form a semilattice with *no* inverse — you cannot "un-max" a value — so
+the engine records that a deletion of the current extremum needs a read to find
+the replacement. Keeping this explicit is what lets the compiler reason about
+cost and safety instead of guessing.
+
+Here is the path a single change takes, from SQL text to durable view output:
+
+```mermaid
+flowchart TD
+    A["Incoming change<br/>(a Z-set delta)"] --> B["SQL frontend<br/>parse · bind · optimize (DataFusion)<br/><i>rockstream-sql</i>"]
+    B --> C["PlanNode IR<br/>logical / physical plan<br/><i>rockstream-plan</i>"]
+    C --> D["Differentiation<br/>DiffCtx inserts arrangements<br/><i>rockstream-diff</i>"]
+    D --> E["Operator graph<br/>executes deltas, commits to SlateDB<br/><i>rockstream-ops</i>"]
+    E --> F["PostgreSQL wire gateway<br/>serves view reads to psql<br/><i>rockstream-gateway</i>"]
 ```
 
-### Bootstrapping the Server
-
-We will start the single `rockstream` binary. In a production deployment, you would run separate instances with specific roles (`--role=control`, `--role=worker`, `--role=gateway`). For local development and evaluation, we use the combined profile `--role=all`, which launches all three services inside a single process.
-
-Run the following command in your terminal. Since we are adhering to our token-optimization protocol, we prefix the shell command with `rtk` (if running in an environment with the Rust Token Killer proxy):
-
-```bash
-cargo run --release --bin rockstream -- start --role=all --storage=./rockstream-data
-```
-
-If you are running the pre-compiled binary directly:
-
-```bash
-rockstream start --role=all --storage=./rockstream-data
-```
-
-Let's analyze the startup log output. You will see JSON logs formatted as follows:
-
-```json
-{"timestamp":"2026-06-06T20:15:00Z","level":"INFO","fields":{"message":"starting rockstream","storage":"./rockstream-data","role":"all"},"target":"rockstream"}
-{"timestamp":"2026-06-06T20:15:00.100Z","level":"INFO","fields":{"message":"starting control service","bind_addr":"127.0.0.1:7700"},"target":"rockstream_control"}
-{"timestamp":"2026-06-06T20:15:00.200Z","level":"INFO","fields":{"message":"starting worker service","control_addr":"127.0.0.1:7700"},"target":"rockstream_runtime"}
-{"timestamp":"2026-06-06T20:15:00.300Z","level":"INFO","fields":{"message":"starting postgres wire gateway","listen_addr":"127.0.0.1:5432"},"target":"rockstream_gateway"}
-```
-
-What just happened?
-1. The **Control Plane** initialized. It acts as the coordinator of the cluster, managing the catalog (table schemas, view definitions, workloads) and assigning partitions (shards) to workers. It listens on port `7700`.
-2. The **Worker** started up. It automatically registered itself with the control plane on port `7700`. It is now waiting to receive operator graphs and shards to execute.
-3. The **Gateway** started up. It is the public face of the cluster, listening on port `5432` (the standard Postgres port). It accepts SQL statements, compiles them, registers them with the control plane, and streams results back using the Postgres wire protocol.
-4. The **Storage Engine** initialized in `./rockstream-data`. A default database catalog and a SlateDB storage manager were initialized on the local disk.
-
-The system is now fully booted and waiting for client connections.
+With the ideas in place, let's run something.
 
 ---
 
-## Part 3 — Connecting to the Gateway via the Postgres Wire Protocol
+## Part 2 — Build the Workspace
 
-Because RockStream speaks the standard Postgres wire protocol, you do not need any custom client libraries or specialized query tools. You can use your favorite database client—be it `psql`, DBeaver, pgAdmin, or libraries in Python (`psycopg2`), Go (`pgx`), Node.js (`pg`), or Rust (`tokio-postgres`).
+RockStream is a Rust workspace of focused crates. You need a recent stable Rust
+toolchain; the repository pins one in [rust-toolchain.toml](../rust-toolchain.toml),
+so `rustup` will fetch the right version automatically.
 
-### Connecting via `psql`
-
-Open a new terminal window and connect to the local RockStream gateway using the standard `psql` command-line utility.
-
-We must supply an authentication token. RockStream uses OIDC-compliant bearer tokens passed in the password field to establish identity, tenant boundaries, and RBAC roles. For this local tutorial, we will use the administrative token `bearer admin:any`, which grants full read/write access across all tenant namespaces.
-
-Run the following command:
+From the repository root, build everything:
 
 ```bash
-PGPASSWORD="bearer admin:any" psql -h 127.0.0.1 -p 5432 -U alice -d mydb
+cargo build --workspace
 ```
 
-You should see the standard Postgres welcome message and command prompt:
+The crates you just compiled map directly onto the architecture from Part 1:
 
+| Crate | Responsibility |
+|---|---|
+| `rockstream-types` | Z-sets, frontiers, IDs, the `RS-XXXX` error registry, audit events |
+| `rockstream-storage` | The SlateDB-backed `ShardDb`: WAL, checkpoints, compaction |
+| `rockstream-plan` / `rockstream-diff` | Plan IR and the differentiation pass |
+| `rockstream-ops` | Physical operators (filter, join, aggregate, window, top-K, …) |
+| `rockstream-sql` | DataFusion-based SQL frontend, catalog, `EXPLAIN INCREMENTAL` |
+| `rockstream-runtime` / `rockstream-control` | Worker runtime, control plane, leasing/fencing |
+| `rockstream-gateway` | The PostgreSQL wire protocol gateway |
+| `rockstream-sim` / `rockstream-oracle` | Deterministic simulator and the `incremental == batch` oracle |
+| `rockstream-cli` | The single `rockstream` binary |
+
+Confirm the binary built and inspect the `start` command:
+
+```bash
+cargo run --bin rockstream -- start --help
 ```
-psql (14.5, server 0.52.10-rockstream)
-Type "help" for help.
 
-mydb=>
+```text
+Start a RockStream node.
+
+For the `gateway` or `all` role the node starts a long-running PostgreSQL wire
+server on `--listen` and blocks until SIGTERM / Ctrl-C. Other roles run the
+embedded no-op node (audit log + support bundle), then exit.
+
+Usage: rockstream start [OPTIONS] --storage <STORAGE>
+
+Options:
+      --storage <STORAGE>      Local storage directory for node state and artifacts
+      --role <ROLE>            Node role [default: all]
+      --control <CONTROL>      Control service URL (required for the worker and frontier roles)
+      --auth <AUTH>            Authentication mode [default: off] [possible values: off, oidc, mtls]
+      --metrics-addr <ADDR>    Metrics HTTP server listen address
+      --listen <LISTEN>        PostgreSQL wire gateway listen address [default: 127.0.0.1:5432]
+  -h, --help                   Print help
 ```
 
-Let's run a quick query to verify that the connection is active and that we are talking to RockStream:
+One binary, every role as a flag — that is a deliberate design rule: `main`
+stays runnable at every version of the roadmap. Let's boot it and connect.
+
+---
+
+## Part 3 — Boot a Node and Connect with `psql`
+
+Pick a clean storage directory and start a node in the default combined `all`
+profile, which runs the control plane, a worker, the SlateDB store, **and** the
+PostgreSQL wire gateway inside one process.
+
+> **Pick a free port.** The gateway defaults to `127.0.0.1:5432`, the standard
+> PostgreSQL port. If you already run Postgres locally, that port is taken and
+> the gateway will fail to bind with a clear error:
+> `RS-0003 failed to bind gateway on 127.0.0.1:5432: Address already in use`.
+> Throughout this tutorial we use `5544` to avoid the clash.
+
+```bash
+cargo run --bin rockstream -- start --storage ./rockstream-data --listen 127.0.0.1:5544
+```
+
+You will see real lifecycle logs, ending with the gateway announcing itself:
+
+```text
+INFO rockstream_control::service: control service listening addr=127.0.0.1:58817
+INFO rockstream_control::service: control: worker registered worker_id=worker-1 headroom=1.00
+INFO rockstream_runtime::client: Worker client registered successfully as WorkerId(1)
+INFO rockstream_control::service: control: shard lease granted worker_id=worker-1 shard_id=shard-1 token=1
+INFO rockstream_runtime::client: Received ShardAssigned lease for ShardId(1)
+INFO rockstream_cli: PostgreSQL wire gateway ready — connect with: psql -h 127.0.0.1 -p 5544 -U rockstream
+```
+
+That short burst exercised a surprising amount of the real system: the **control
+plane** came up and started listening; a **worker** registered and reported its
+capacity headroom; a **shard lease** was granted with a fencing token (the same
+machinery that, in a real cluster, guarantees only one writer can ever commit to
+a shard — no split-brain); **SlateDB** opened a real store; and the
+**PostgreSQL gateway** bound the port and is now blocking, ready for clients.
+
+Leave that process running. In a **second terminal**, connect with a genuine
+PostgreSQL client:
+
+```bash
+psql -h 127.0.0.1 -p 5544 -U rockstream
+```
+
+Ask the server who it is:
 
 ```sql
-SELECT version();
+SHOW server_version;
 ```
 
-Output:
-```
-                    version                    
------------------------------------------------
- RockStream 0.52.10 (SlateDB Cloud LSM Engine)
+```text
+ server_version
+----------------
+ 14.0
 (1 row)
 ```
 
-### Introspecting the System Catalog
+You are talking to RockStream over the real PostgreSQL wire protocol. Any
+Postgres driver — `psql`, `psycopg`, JDBC, SQLAlchemy — speaks this same
+protocol, so the same connection works from your application code.
 
-RockStream exposes its internal state, schemas, and metrics through virtual tables in the `rockstream_catalog` schema. Let's run a query to inspect the registered merge laws available in the system:
-
-```sql
-SELECT name, class, associative, commutative, has_inverse FROM rockstream_catalog.merge_laws;
-```
-
-Output:
-```
-     name     |    class     | associative | commutative | has_inverse 
---------------+--------------+-------------+-------------+-------------
- WeightAdd    | AbelianGroup | t           | t           | t
- SumCount     | AbelianGroup | t           | t           | t
- MaxRegister  | Semilattice  | t           | t           | f
- MinRegister  | Semilattice  | t           | t           | f
- LwwRegister  | Semilattice  | t           | t           | f
- OrSet        | Semilattice  | t           | t           | f
-(6 rows)
-```
-
-Take a look at the output. Notice that `WeightAdd` (used for standard additions and sums) has an inverse (`has_inverse = t`), meaning it can process deletions by simply subtracting the deleted value. On the other hand, `MaxRegister` (used for `MAX` aggregations) does not have an inverse (`has_inverse = f`), indicating that deleting a row might require scanning other values to find the new maximum (unless optimized via a tree structure).
-
-Let's check the pipeline metadata table:
-
-```sql
-SELECT id, name, status, shard_count FROM rockstream_catalog.pipelines;
-```
-
-Right now, this returns 0 rows because we haven't defined any views or workloads yet. Let's build them!
+> **A note on the dialect.** The gateway implements the *commands RockStream
+> needs* rather than the entire surface of PostgreSQL. `SHOW server_version`,
+> catalog reflection, `CREATE [MATERIALIZED] VIEW`, `CREATE TABLE`, transactional
+> DML, `SUBSCRIBE`, `EXPLAIN`, and `SET rockstream.*` are handled explicitly.
+> Statements outside that set (for example `SELECT version()`) currently return a
+> generic `OK` rather than an error — handy to know so you aren't surprised.
 
 ---
 
-## Part 4 — Creating Base Tables, Sources, and Workloads
+## Part 4 — Build a DAG of Materialized Views
 
-Before we define our Campaign Attribution DAG, we must set up a **workload** to govern its resource limits and freshness targets. Then, we will define our source tables.
+This is the heart of RockStream: you describe the answers you want as **views**,
+and the engine maintains them. Views can depend on other views, forming a
+**directed acyclic graph (DAG)** — raw events at the roots, refined and
+aggregated results at the leaves.
 
-### 1. Defining the Workload
+Let's build a real campaign-analytics workload: two base tables, an aggregate
+view, a join view on top of that aggregate, and finally a filter materialized
+view on top of the join — a **three-level chain** where every commit ripples data
+all the way from raw events to a served result.
 
-In RockStream, views are grouped into workloads. A workload allows us to define a Service Level Objective (SLO) for data freshness, set memory limits to prevent out-of-memory errors, and specify scheduling priorities.
-
-Execute the following DDL statement in your `psql` session:
+Still connected with `psql`, declare two base tables:
 
 ```sql
-CREATE WORKLOAD campaign_attribution WITH (
-    FRESHNESS_SLO = '1s',
-    MEMORY_LIMIT = '10GB',
-    PRIORITY = normal
+CREATE TABLE campaigns (
+  campaign_id BIGINT,
+  name        TEXT,
+  channel     TEXT,
+  budget      BIGINT
+);
+
+CREATE TABLE conversions (
+  conv_id     BIGINT,
+  campaign_id BIGINT,
+  revenue     BIGINT,
+  ts          BIGINT
 );
 ```
 
-This workload establishes that:
-1. Any materialized view registered under it should stay within `1 second` of the source data under normal operating conditions.
-2. The collective intermediate arrangement state of all views in this workload is capped at `10 gigabytes` in RAM before spooling to SlateDB disk compaction.
-3. The priority is set to `normal`.
-
-### 2. Creating the Base Tables
-
-Now we will define the schema for our streaming tables. Unlike traditional databases, RockStream distinguishes between standard tables and tables that accept raw streaming inputs from external connectors (like Kafka or Debezium CDC). For this tutorial, we will create five base tables to represent our application data:
-
-1. **`users`**: A dimension table storing user names and their marketing group IDs.
-2. **`products`**: A dimension table storing product names and their unit prices.
-3. **`clicks`**: A streaming table capturing user click events on marketing campaigns.
-4. **`purchases`**: A streaming table capturing transaction details.
-5. **`referrals`**: A streaming table representing a user-to-user referral tree.
-
-Run the following DDL commands:
-
-```sql
--- Dimensions
-CREATE TABLE users (
-    user_id INT8 PRIMARY KEY,
-    name VARCHAR,
-    group_id INT8
-);
-
-CREATE TABLE products (
-    product_id INT8 PRIMARY KEY,
-    name VARCHAR,
-    price INT8
-);
-
--- Streaming Event Tables
-CREATE TABLE clicks (
-    click_id INT8 PRIMARY KEY,
-    user_id INT8,
-    campaign_id INT8,
-    ts INT8
-);
-
-CREATE TABLE purchases (
-    purchase_id INT8 PRIMARY KEY,
-    user_id INT8,
-    product_id INT8,
-    amount INT8,
-    ts INT8
-);
-
-CREATE TABLE referrals (
-    referrer_id INT8,
-    referee_id INT8,
-    ts INT8,
-    PRIMARY KEY (referrer_id, referee_id)
-);
+```text
+CREATE TABLE 0
+CREATE TABLE 0
 ```
 
-### 3. Understanding CRDT Columns and Schema Validation
+Now layer three views on top, each building on the one before it.
 
-In addition to standard SQL types, RockStream supports CRDT (Conflict-free Replicated Data Type) column types such as `COUNTER`, `MAX_REGISTER`, and `OR_SET`. These columns allow multiple writers to update the same row concurrently, and the storage engine will automatically merge the updates using the registered merge laws.
+**Level 1 — aggregate raw events per campaign:**
 
-For example, if we were building an account balance table, we might write:
 ```sql
-CREATE TABLE account_balances (
-    account_id VARCHAR PRIMARY KEY,
-    balance COUNTER
-);
+CREATE VIEW campaign_totals AS
+  SELECT campaign_id,
+         COUNT(*)      AS conv_count,
+         SUM(revenue)  AS total_revenue
+  FROM conversions
+  GROUP BY campaign_id;
 ```
 
-When you define a source backed by a connector (like Kafka), RockStream performs **schema compatibility validation** (`discover_schema()`). If you attempt to map a connector source column to a `COUNTER` type in RockStream, but the connector's schema metadata reports that the source column contains non-merge-safe operations, RockStream will reject the creation with error code `RS-1002` (Schema Mismatch). This prevents runtime data corruption.
+`campaign_totals` answers the question *"how many conversions and how much revenue
+did each campaign generate?"* entirely from the `conversions` table.
+
+**Level 2 — join the aggregate back to the campaign catalog:**
+
+```sql
+CREATE VIEW campaign_report AS
+  SELECT c.name, c.channel, t.conv_count, t.total_revenue
+  FROM campaigns c
+  JOIN campaign_totals t ON c.campaign_id = t.campaign_id;
+```
+
+`campaign_report` **joins a base table with a derived view**. It reads the
+human-readable name and channel from `campaigns` and staples the running totals
+from `campaign_totals` onto each row. Notice that `campaign_totals` is itself a
+view — the engine resolves the dependency chain and processes them in the correct
+topological order.
+
+**Level 3 — filter to only the high performers:**
+
+```sql
+CREATE MATERIALIZED VIEW high_performers AS
+  SELECT name, channel, total_revenue
+  FROM campaign_report
+  WHERE total_revenue > 500;
+```
+
+Each statement returns its command tag as the engine registers the definition and
+records its dependencies:
+
+```text
+CREATE VIEW 0
+CREATE VIEW 0
+CREATE MATERIALIZED VIEW 0
+```
+
+What you have built is this DAG — data flows left to right; a commit to any node
+ripples downstream automatically:
+
+```mermaid
+flowchart LR
+    campaigns[("campaigns\nbase table")]
+    conversions[("conversions\nbase table")]
+
+    conversions --> campaign_totals["campaign_totals\nGROUP BY campaign_id\nCOUNT · SUM(revenue)"]
+    campaigns --> campaign_report
+    campaign_totals --> campaign_report["campaign_report\nJOIN campaigns ⋈ campaign_totals\nname · channel · conv_count · total_revenue"]
+    campaign_report --> high_performers[["high_performers\nWHERE total_revenue > 500\nmaterialized"]]
+```
+
+The difference between a plain `VIEW` and a `MATERIALIZED VIEW` is intent: both
+are compiled into the operator graph, but a materialized view's output is kept
+durably in SlateDB and can be subscribed to. In the fully-wired incremental path,
+a single `INSERT INTO conversions` produces a **Z-set delta** that propagates
+through `campaign_totals` → `campaign_report` → `high_performers` by applying
+only the differential change at each hop — no re-scan of history.
+
+### How a commit triggers the full chain
+
+After every `COMMIT`, the gateway identifies which base tables were written and
+**topologically sorts** all transitively dependent views. It then re-evaluates
+them in order using DataFusion's in-memory engine and writes each output back to
+the serving shard. A view-of-a-view works because the materializer processes
+`campaign_totals` first, caches its output schema, and feeds that output as the
+input to `campaign_report` — all within a single pass.
+
+### The engine guards the graph: cycle detection
+
+A view DAG must stay *acyclic* — a view that (transitively) depends on itself can
+never be maintained. RockStream enforces this at definition time. Try to tie a
+knot:
+
+```sql
+CREATE VIEW loop_a AS SELECT * FROM loop_b;
+CREATE VIEW loop_b AS SELECT * FROM loop_a;
+```
+
+The first succeeds (`loop_b` doesn't exist yet, so there's no cycle *yet*). The
+second is rejected the moment it would close the loop:
+
+```text
+CREATE VIEW 0
+ERROR:  [RS-1011] Cycle detected in view dependencies: view 'loop_b' forms a
+cycle via path: ["loop_b", "loop_a", "loop_a"]
+```
+
+Notice the error carries an `RS-XXXX` code *and* the exact path that forms the
+cycle. Every operator-visible failure in RockStream is structured this way — a
+hard rule the CI enforces.
+
+### Reading a view before any data arrives
+
+```sql
+SELECT * FROM high_performers;
+```
+
+```text
+ name | channel | total_revenue
+------+---------+---------------
+(0 rows)
+```
+
+Zero rows — no conversions yet, so the join produces nothing. Insert some data
+and `high_performers` will contain live results immediately. You will see this
+end to end in Part 5.
+
+### Inspect the plan
+
+Ask the engine how it would execute a read, including whether it can push a
+partial aggregate down to the shards:
+
+```sql
+EXPLAIN SELECT name, channel, total_revenue FROM campaign_report;
+```
+
+```text
+               QUERY PLAN
+-----------------------------------------
+ Plan: SeqScan → partial_pushdown: false
+ Query: SELECT name, channel, total_revenue FROM campaign_report
+(1 row)
+```
+
+### Subscribe to a view
+
+Beyond point reads, the gateway speaks a streaming `SUBSCRIBE` command — the
+basis for live dashboards that receive deltas as the view changes:
+
+```sql
+SUBSCRIBE high_performers;
+```
+
+```text
+OK
+```
 
 ---
 
-## Part 5 — Designing the Campaign Attribution & Referral DAG
+## Part 5 — Transactional Writes: Data Flowing Through the DAG
 
-Now we are ready to build our multi-stage analytical DAG. This pipeline will track how marketing campaigns drive product purchases, rank campaigns based on total revenue, and track user referral chains recursively.
+RockStream accepts direct-write DML (`INSERT`/`UPDATE`/`DELETE`) over the same
+connection. Writes accumulate in a per-connection **write buffer** and are
+flushed atomically on `COMMIT`. To make commits safely retryable, RockStream
+requires an **idempotency key** per committing transaction — re-sending the same
+key never double-applies the writes.
 
-```
-       [ clicks ]                    [ purchases ]         [ users ]    [ products ]
-            │                              │                   │             │
-            │                              └───────────┬───────┴─────────────┘
-            │                                          ▼
-            │                               ┌──────────────────────┐
-            │                               │ mv_purchases_enriched│
-            │                               └──────────┬───────────┘
-            │                                          │
-            └──────────────────────┬───────────────────┘
-                                   ▼
-                       ┌──────────────────────┐
-                       │ mv_conversion_funnel │
-                       └───────────┬──────────┘
-                                   ▼
-                     ┌──────────────────────────┐
-                     │  mv_campaign_performance │
-                     └─────────────┬────────────┘
-                                   ▼
-                       ┌──────────────────────┐
-                       │   mv_top_campaigns   │
-                       └──────────────────────┘
+We'll drive three transactions through the DAG to see exactly what happens at
+each level.
 
-       [ referrals ] ───►  [ mv_referral_depth ]  (Recursive CTE)
-```
-
-We will build five materialized views, each representing a stage in the DAG. All views will be assigned to our `campaign_attribution` workload so they share the same execution context and SLO.
-
-### View 1: Enriching Purchases (`mv_purchases_enriched`)
-
-The first stage of our pipeline enriches raw purchase events with user names and product prices. We calculate `total_amount` by multiplying the product price by the quantity purchased.
-
-Run the following query:
+### Transaction 1 — seed the campaign catalog
 
 ```sql
-CREATE MATERIALIZED VIEW mv_purchases_enriched
-WITH (WORKLOAD = campaign_attribution) AS
-SELECT 
-    p.purchase_id,
-    p.user_id,
-    u.name AS user_name,
-    pr.name AS product_name,
-    pr.price,
-    p.amount,
-    TRY_CAST((pr.price * p.amount) AS DOUBLE) AS total_amount,
-    p.ts
-FROM purchases p
-INNER JOIN users u ON p.user_id = u.user_id
-INNER JOIN products pr ON p.product_id = pr.product_id;
-```
+SET rockstream.idempotency_key = 'demo-txn-001';
 
-*Concept Check:* This is an `INNER JOIN` across three relations (one event stream and two static dimensions). RockStream translates this into a physical plan containing a join operator. The operator maintains state (arrangements) for `users` and `products` in SlateDB, allowing it to quickly enrich incoming purchases as they arrive.
-
-### View 2: Campaign Conversion Funnel (`mv_conversion_funnel`)
-
-Next, we join the click events with the enriched purchases to attribute purchases to the marketing campaigns that drove them. We perform a `LEFT JOIN` to ensure we capture all clicks, even those that did not result in a purchase. We match events based on `user_id`.
-
-Run the following DDL:
-
-```sql
-CREATE MATERIALIZED VIEW mv_conversion_funnel
-WITH (WORKLOAD = campaign_attribution) AS
-SELECT 
-    c.click_id,
-    c.user_id,
-    c.campaign_id,
-    pe.purchase_id,
-    pe.total_amount,
-    c.ts,
-    CASE 
-        WHEN pe.purchase_id IS NOT NULL THEN true 
-        ELSE false 
-    END AS matched
-FROM clicks c
-LEFT JOIN mv_purchases_enriched pe ON c.user_id = pe.user_id;
-```
-
-*Concept Check:* Notice that `mv_conversion_funnel` reads directly from `mv_purchases_enriched`. This is a **view-on-view reference**. When a new purchase is enriched in View 1, the resulting delta is pushed directly into the input channel of View 2. The data flows through the DAG like a physical river, with each stage computing only the differences.
-
-### View 3: Campaign Performance Rollup (`mv_campaign_performance`)
-
-Now we want to roll up our conversions to measure the performance of each campaign. We will calculate the total number of clicks and the sum of purchase revenue for each campaign.
-
-Because this is a streaming pipeline, we cannot aggregate over all time without our state growing indefinitely. Instead, we partition time into non-overlapping blocks using a **Tumbling Window**. In this case, we group events into 1-hour windows based on their timestamps.
-
-To represent event times, we convert our integer timestamps (`ts`) into formatted date strings:
-
-```sql
-CREATE MATERIALIZED VIEW mv_campaign_performance
-WITH (WORKLOAD = campaign_attribution) AS
-SELECT 
-    campaign_id,
-    COUNT(click_id) AS clicks_count,
-    SUM(COALESCE(total_amount, 0.0)) AS total_amount,
-    -- Group into 1-hour tumbling windows (simulated via timestamp division)
-    TRY_CAST(FROM_UNIXTIME(ts - (ts % 3600)) AS VARCHAR) AS window_start
-FROM mv_conversion_funnel
-GROUP BY campaign_id, ts - (ts % 3600);
-```
-
-*Concept Check:* The `SUM` and `COUNT` aggregations are compiled using RockStream's `WeightAdd` and `SumCount` merge laws. Because these laws possess algebraic inverses, RockStream can update the totals incrementally when a click is updated or retracted, without having to scan historical clicks.
-
-### View 4: Campaign Leaderboard (`mv_top_campaigns`)
-
-Next, we rank our campaigns based on the total revenue they generated. This allows us to see our top-performing campaigns in real time. We will use the `DENSE_RANK()` window function to assign ranks.
-
-Run the following query:
-
-```sql
-CREATE MATERIALIZED VIEW mv_top_campaigns
-WITH (WORKLOAD = campaign_attribution) AS
-SELECT 
-    campaign_id,
-    total_amount,
-    DENSE_RANK() OVER (ORDER BY total_amount DESC) AS rank_val
-FROM mv_campaign_performance;
-```
-
-*Concept Check:* Under the hood, this window function is translated into a physical ranking operator. As the revenue of campaigns changes in the upstream `mv_campaign_performance` view, the ranking operator adjusts the ranks of the affected campaigns. If a campaign moves from rank 5 to rank 4, it emits a delta of `-1` for the old rank and `+1` for the new rank.
-
-### View 5: Recursive Referral Tracking (`mv_referral_depth`)
-
-Finally, let's show off one of RockStream's most powerful advanced features: **monotone insert-only recursion**. 
-
-In social networks or viral marketing campaigns, users often refer other users, who in turn refer more users, creating a tree of referrals. If we want to find the referral depth and path for every user, we need a recursive query. In a traditional database, recursive queries are extremely slow because they require iterative scans. In RockStream, recursive queries are maintained incrementally: as new referral links are added to the database, RockStream walks only the new paths and appends them to the result set.
-
-Run the following query:
-
-```sql
-CREATE MATERIALIZED VIEW mv_referral_depth
-WITH (WORKLOAD = campaign_attribution) AS
-WITH RECURSIVE referral_tree AS (
-    -- Anchor member
-    SELECT 
-        referrer_id,
-        referee_id,
-        1 AS depth,
-        TRY_CAST(CONCAT(referrer_id, '->', referee_id) AS VARCHAR) AS path
-    FROM referrals
-    
-    UNION ALL
-    
-    -- Recursive member
-    SELECT 
-        t.referrer_id,
-        r.referee_id,
-        t.depth + 1 AS depth,
-        TRY_CAST(CONCAT(t.path, '->', r.referee_id) AS VARCHAR) AS path
-    FROM referral_tree t
-    INNER JOIN referrals r ON t.referee_id = r.referrer_id
-)
-SELECT referrer_id, referee_id, depth, path FROM referral_tree;
-```
-
-*Concept Check:* RockStream uses semi-naive evaluation to compile recursive queries. It tracks the "new" rows produced in the previous recursion step and joins only those new rows with the base `referrals` relation in the next step, ensuring that computation is minimal and incremental.
-
----
-
-## Part 6: Draining and Subscribing: Verifying Data Flow
-
-With our tables and views successfully created, let's populate them with data and verify that RockStream's incremental engine is working as expected.
-
-### 1. Setting the Session Configuration
-
-Before inserting data, we must address **idempotency**. In distributed streaming systems, network failures or client retries can lead to duplicate writes. RockStream enforces write safety by requiring clients to set an **idempotency key** before performing write operations on tables that require it.
-
-Let's configure our session parameters:
-
-```sql
--- Enforce Read Committed isolation level
-SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
-
--- Set the client-side idempotency key for our inserts
-SET rockstream.idempotency_key = 'tutorial-session-key-001';
-```
-
-If you attempt to write to tables without setting an idempotency key, RockStream will reject the query with error code `RS-2007`, protecting your tables from duplicate writes.
-
-### 2. Inserting Seed Data
-
-Let's populate our dimension tables and insert a few events to trigger our DAG. We will bundle these inserts into a transaction block:
-
-```sql
-BEGIN;
-
--- Insert dimension rows
-INSERT INTO users (user_id, name, group_id) VALUES 
-(1, 'Bob', 100),
-(2, 'Charlie', 101),
-(3, 'Dave', 100);
-
-INSERT INTO products (product_id, name, price) VALUES 
-(201, 'Widget', 15),
-(202, 'Gadget', 25);
-
--- Insert clicks (attributing to Campaign 10)
-INSERT INTO clicks (click_id, user_id, campaign_id, ts) VALUES 
-(5001, 1, 10, 1717574400);
-
--- Insert purchases
-INSERT INTO purchases (purchase_id, user_id, product_id, amount, ts) VALUES 
-(1001, 1, 201, 2, 1717574400);
-
--- Insert referrals (User 1 referred User 2, who referred User 3)
-INSERT INTO referrals (referrer_id, referee_id, ts) VALUES 
-(1, 2, 1717574400),
-(2, 3, 1717574400);
-
+INSERT INTO campaigns (campaign_id, name, channel, budget)
+  VALUES (1, 'Summer Sale',     'email',   5000),
+         (2, 'Brand Awareness', 'social',  3000),
+         (3, 'Retargeting',     'display', 2000);
 COMMIT;
 ```
 
-When you commit, the gateway bundles all inserts into a single epoch. The worker takes the new data, processes it through the operators of our five materialized views, and writes the updated results into SlateDB storage. All of this happens in less than a second.
+```text
+SET
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+COMMIT 3
+```
 
-### 3. Querying the Materialized Views
+The `COMMIT 3` confirms three buffered writes were flushed atomically. (If you
+forget the idempotency key, the commit is refused with `RS-2007` — that is the
+engine protecting you from accidental double-writes.)
 
-Let's verify that the views have been updated.
-
-#### Query 1: Enriched Purchases
-Query `mv_purchases_enriched` to confirm the purchase was enriched with the product name ('Widget') and price ($15), and the total amount ($30.0) was calculated:
+After this commit the gateway re-evaluates `campaign_totals` and `campaign_report`
+— but `conversions` is still empty, so the join produces nothing:
 
 ```sql
-SELECT * FROM mv_purchases_enriched;
+SELECT * FROM campaign_report;
 ```
 
-Output:
-```
- purchase_id | user_id | user_name | product_name | price | amount | total_amount |     ts     
--------------+---------+-----------+--------------+-------+--------+--------------+------------
-        1001 |       1 | Bob       | Widget       |    15 |      2 |           30 | 1717574400
-(1 row)
+```text
+ name | channel | conv_count | total_revenue
+------+---------+------------+---------------
+(0 rows)
 ```
 
-#### Query 2: Conversion Funnel
-Query the funnel view to verify that the click event was successfully matched with the purchase event:
+No rows yet — campaign names live in `campaigns`, but there are no conversions to
+join against. `high_performers` is similarly empty.
+
+### Transaction 2 — first wave of conversions
 
 ```sql
-SELECT * FROM mv_conversion_funnel;
+SET rockstream.idempotency_key = 'demo-txn-002';
+
+-- Summer Sale:     two conversions, 300 + 250 = 550  (above threshold)
+-- Brand Awareness: one conversion, 150              (below threshold)
+-- Retargeting:     one conversion, 600              (above threshold)
+INSERT INTO conversions (conv_id, campaign_id, revenue, ts)
+  VALUES (101, 1, 300, 1000),
+         (102, 1, 250, 1001),
+         (103, 2, 150, 1002),
+         (104, 3, 600, 1003);
+COMMIT;
 ```
 
-Output:
-```
- click_id | user_id | campaign_id | purchase_id | total_amount |     ts     | matched 
-----------+---------+-------------+-------------+--------------+------------+---------
-     5001 |       1 |          10 |        1001 |           30 | 1717574400 | t
-(1 row)
+```text
+COMMIT 4
 ```
 
-#### Query 3: Campaign Performance and Leaderboard
-Query the campaign performance and leaderboard views to see the aggregated revenue and rank for Campaign 10:
+Now inspect each level of the DAG:
 
 ```sql
-SELECT * FROM mv_campaign_performance;
+SELECT * FROM campaign_totals ORDER BY campaign_id;
 ```
 
-Output:
+```text
+ campaign_id | conv_count | total_revenue
+-------------+------------+---------------
+           1 |          2 |           550
+           2 |          1 |           150
+           3 |          1 |           600
+(3 rows)
 ```
- campaign_id | clicks_count | total_amount |    window_start     
--------------+--------------+--------------+---------------------
-          10 |            1 |           30 | 2026-06-05 08:00:00
-(1 row)
-```
+
+The aggregate view has fresh numbers for every campaign. Now the join view:
 
 ```sql
-SELECT * FROM mv_top_campaigns;
+SELECT * FROM campaign_report ORDER BY name;
 ```
 
-Output:
-```
- campaign_id | total_amount | rank_val 
--------------+--------------+----------
-          10 |           30 |        1
-(1 row)
+```text
+      name       | channel | conv_count | total_revenue
+-----------------+---------+------------+---------------
+ Brand Awareness | social  |          1 |           150
+ Retargeting     | display |          1 |           600
+ Summer Sale     | email   |          2 |           550
+(3 rows)
 ```
 
-#### Query 4: Referral Depth
-Query the recursive referral view. Notice how RockStream recursively traversed the referral chain (`1 -> 2 -> 3`), calculating a depth of 2:
+`campaign_report` joined the human-readable names from `campaigns` onto the
+running totals computed by `campaign_totals`. And the materialized filter:
 
 ```sql
-SELECT * FROM mv_referral_depth;
+SELECT * FROM high_performers ORDER BY total_revenue DESC;
 ```
 
-Output:
+```text
+     name     | channel | total_revenue
+--------------+---------+---------------
+ Retargeting  | display |           600
+ Summer Sale  | email   |           550
+(2 rows)
 ```
- referrer_id | referee_id | depth |  path   
--------------+------------+-------+---------
-           1 |          3 |     2 | 1->2->3
-(1 row)
-```
 
-### 4. Streaming Live Changes using `SUBSCRIBE`
+Two campaigns cleared the `total_revenue > 500` threshold.
+`Brand Awareness` (150) did not, so it is absent from `high_performers`.
 
-Querying views using `SELECT` is useful for verifying state, but for building responsive, real-time applications, you want to receive changes as they occur. RockStream enables this using the `SUBSCRIBE` statement.
+Every `COMMIT` triggers re-evaluation of every view that transitively depends on
+the changed tables. The gateway executes the view SQL using DataFusion's
+in-memory engine over the current shard state and writes the output back in one
+batch. A subsequent `SELECT` always returns the result of the last commit.
 
-Run the following command in `psql`:
+### Transaction 3 — a threshold crossing in real time
+
+One more conversion arrives for `Brand Awareness`: 400 in revenue. Combined with
+the 150 already recorded, its total crosses 500.
 
 ```sql
-SUBSCRIBE mv_conversion_funnel AS OF NOW WITH SNAPSHOT;
+SET rockstream.idempotency_key = 'demo-txn-003';
+
+INSERT INTO conversions (conv_id, campaign_id, revenue, ts)
+  VALUES (105, 2, 400, 1004);
+COMMIT;
 ```
 
-This starts a subscription stream. The gateway will first dump the current state of the view, followed by a live stream of changes. The connection will remain open:
-
-```
- mz_timestamp | mz_diff | click_id | user_id | campaign_id | purchase_id | total_amount |     ts     | matched 
---------------+---------+----------+---------+-------------+-------------+--------------+------------+---------
-           42 |       1 |     5001 |       1 |          10 |        1001 |           30 | 1717574400 | t
+```text
+COMMIT 1
 ```
 
-Here:
-- `mz_timestamp` is the epoch in which the change occurred.
-- `mz_diff` indicates the nature of the change (`1` for insertion, `-1` for deletion).
+Query `campaign_totals` to confirm the aggregate updated:
 
-If you open a separate terminal, connect to the database, and insert another click event, the open `SUBSCRIBE` session will instantly print the new row with `mz_diff = 1` as soon as the transaction commits. Press `Ctrl+C` to terminate the subscription session when you are finished.
+```sql
+SELECT * FROM campaign_totals ORDER BY campaign_id;
+```
 
-### 5. Optimistic Transaction Conflict (RS-2008)
+```text
+ campaign_id | conv_count | total_revenue
+-------------+------------+---------------
+           1 |          2 |           550
+           2 |          2 |           550
+           3 |          1 |           600
+(3 rows)
+```
 
-What happens if multiple sessions try to modify the same row in RockStream? 
+Campaign 2 now has `conv_count=2` and `total_revenue=550`. And the payoff —
+`high_performers` now lists all three campaigns:
 
-RockStream does not support heavy two-phase locking because it degrades write performance in sharded storage. Instead, it uses **optimistic transaction concurrency control**. Each transaction registers the set of keys it reads and writes. If another transaction writes to a key read by the current transaction before it commits, the gateway rejects the commit with error code `RS-2008` (Optimistic Write Conflict). The client must then retry the transaction. This ensures consistency without locking.
+```sql
+SELECT * FROM high_performers ORDER BY total_revenue DESC;
+```
+
+```text
+     name        | channel | total_revenue
+-----------------+---------+---------------
+ Retargeting     | display |           600
+ Brand Awareness | social  |           550
+ Summer Sale     | email   |           550
+(3 rows)
+```
+
+`Brand Awareness` joined the club — a single INSERT into `conversions` rippled
+through the full 3-level chain (`campaign_totals` → `campaign_report` →
+`high_performers`) and updated the served result without any re-scan of history.
+
+This entire scenario — three transactions, three campaigns, threshold crossing —
+is validated by the green-gate test
+`tutorial_dag_three_level_chain_materialises_correctly` in
+[gateway_proof_tests.rs](../crates/rockstream-gateway/tests/gateway_proof_tests.rs).
+Every assertion you just observed interactively is also a machine-checked proof.
+
+When you are done exploring, return to the first terminal and press **Ctrl-C**.
+The node shuts the gateway down cleanly and writes its audit log and support
+bundle — which we read next.
 
 ---
 
-## Part 7 — Under the Hood Diagnostics & Troubleshooting
+## Part 6 — The Incremental Engine: Proven Correct
 
-When you are developing complex pipelines, you need visibility into how RockStream compiles and executes your queries. RockStream provides CLI subcommands and catalog tables to help you inspect and troubleshoot your system.
+Part 5 showed data flowing end to end through the gateway's serving layer via
+batch re-evaluation after each commit. This part goes deeper: running the
+project's proofs of the *incremental* engine — the Z-set operator graph that
+processes only deltas, never the full history. These are property tests that
+generate thousands of random insert/update/delete sequences and assert that the
+incremental result equals a full batch re-computation, **every time.**
 
-### 1. ASCII View Inspection using `describe`
+### The oracle: `incremental == batch`
 
-If you want to view the physical operator graph of a view and check how it is sharded and placed across worker nodes, use the CLI `describe` subcommand.
-
-Open your system terminal and run:
-
-```bash
-rockstream describe mv_conversion_funnel
-```
-
-This prints a structured Unicode DAG showing the physical layout of the view:
-
-```
-Materialized View: mv_conversion_funnel (ID: VIEW-902)
-Status: RUNNING
-Workload: campaign_attribution (Freshness SLO: 1s)
-
-[Source: clicks] ────────► [Join: HashJoin (user_id)] ────────► [Sink: SlateDB]
-                                ▲
-                                │
-[View: mv_purchases_enriched] ──┘
-```
-
-This graph confirms that `mv_conversion_funnel` is running, is bound to the `campaign_attribution` workload, and executes a HashJoin on `user_id` between the `clicks` source and the `mv_purchases_enriched` view.
-
-### 2. Inspecting Operator Plans using `explain`
-
-To see the lowered operators and their merge laws, use the `explain` subcommand:
+The `rockstream-oracle` crate holds the source-of-truth equivalence harness. Run
+the operator oracles:
 
 ```bash
-rockstream explain mv_campaign_performance
+cargo test -p rockstream-oracle
 ```
 
-This prints the physical operator plan annotated with merge laws and warnings:
+Each module — [filter_oracle.rs](../crates/rockstream-oracle/src/filter_oracle.rs),
+[join_oracle.rs](../crates/rockstream-oracle/src/join_oracle.rs),
+[aggregate_oracle.rs](../crates/rockstream-oracle/src/aggregate_oracle.rs),
+[minmax_oracle.rs](../crates/rockstream-oracle/src/minmax_oracle.rs),
+[window_oracle.rs](../crates/rockstream-oracle/src/window_oracle.rs), and more —
+feeds the operator a random stream of deltas and checks its output against the
+DataFusion batch reference. When this passes, the bilinear join expansion and the
+merge-law arithmetic from Part 1 are not just plausible — they are demonstrated.
 
-```
-Projection: campaign_id, clicks_count, total_amount, window_start
-  HashAggregate: group=[campaign_id, window_start], aggs=[COUNT(click_id), SUM(total_amount)]
-    MergeLaw: COUNT -> SumCount/v1 (Associative: true, Commutative: true, Inverse: true)
-    MergeLaw: SUM -> WeightAdd/v1 (Associative: true, Commutative: true, Inverse: true)
-    Filter: clicks_count > 0
-      TableScan: mv_conversion_funnel
-```
+### A real DAG that flows data: join → group-by, maintained incrementally
 
-Notice the `MergeLaw` annotations. They verify that both the `COUNT` and `SUM` aggregates have successfully bound to their respective algebraic laws, ensuring they will be updated incrementally without performance overhead.
-
-If we run `EXPLAIN INDEX` on our query, we can see if RockStream uses optimized indexes to speed up scans:
+The SQL frontend compiles a query into the operator graph and maintains it as
+data streams in. The end-to-end test in
+[crates/rockstream-sql/tests/sql_engine_e2e.rs](../crates/rockstream-sql/tests/sql_engine_e2e.rs)
+maintains exactly the kind of view DAG you built in Part 4 — a join feeding an
+aggregate. The query is structurally identical to `campaign_report` stacked on
+`campaign_totals`, but in the operator-level test it uses a TPC-H-style schema:
 
 ```sql
-EXPLAIN INDEX SELECT * FROM purchases WHERE user_id = 1;
+CREATE VIEW revenue AS
+SELECT o.region, SUM(l.amount)
+FROM orders o
+JOIN lineitem l ON o.id = l.order_id
+GROUP BY o.region;
 ```
 
-This will print the physical indexing plan:
-
+```mermaid
+flowchart LR
+    orders[("orders")] --> join["JoinOp<br/>o.id = l.order_id"]
+    lineitem[("lineitem")] --> join
+    join --> agg["AggregateOp<br/>GROUP BY region, SUM(amount)"]
+    agg --> revenue[["revenue<br/><i>maintained view</i>"]]
 ```
-IndexScan: idx_purchases_user_id (Index State: READY, lag: 0ms)
-  Filter: user_id = 1
-    TableScan: purchases
-```
 
-This confirms that RockStream is using a dedicated index to scan only rows with `user_id = 1` rather than performing a full scan of the `purchases` table.
-
-### 3. State Introspection using `debug arrangement`
-
-If you suspect that state is accumulating incorrectly or you want to inspect raw keys in SlateDB, you can query worker arrangements directly from the CLI.
-
-For example, to inspect keys in the join arrangement for `mv_conversion_funnel` on worker node `worker-01`, run:
+The test deploys this view, streams changes into `orders` and `lineitem`, and
+asserts that the maintained `revenue` view matches the batch answer after every
+epoch. Run it:
 
 ```bash
-rockstream debug arrangement mv_conversion_funnel 3f2a "user_id=1"
+cargo test -p rockstream-sql --test sql_engine_e2e
 ```
 
-This decodes the SlateDB keys and prints the raw arrangement records, their timestamp, and weight (+1 or -1). This is a powerful tool for troubleshooting complex state issues.
-
-### 4. Monitoring Resource Usage
-
-You can monitor memory usage, state size, and freshness lag for your views by querying the system catalog tables:
-
-```sql
-SELECT view_name, state_bytes, memory_bytes, freshness_lag_ms FROM rockstream_catalog.view_resource_usage;
+```text
+test sql_engine_create_view_join_group_by ... ok
+test sql_engine_window_row_number_over_view ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-Output:
-```
-        view_name        | state_bytes | memory_bytes | freshness_lag_ms 
--------------------------+-------------+--------------+------------------
- mv_purchases_enriched   |        2048 |          512 |               45
- mv_conversion_funnel    |        4096 |         1024 |               52
- mv_campaign_performance |        1024 |          256 |               30
- mv_top_campaigns        |         512 |          128 |               12
- mv_referral_depth       |        8192 |         2048 |               85
-(5 rows)
-```
+The second test maintains a `ROW_NUMBER() OVER (PARTITION BY k ORDER BY v)`
+window incrementally — the same window function a campaign leaderboard or a
+"top product per region" dashboard would need, and the same shape as the
+`top_pages` view you wrote.
 
-This output shows:
-1. The memory and storage footprint of each view.
-2. The current **freshness lag** in milliseconds. In this case, all views are updating in under 100 milliseconds, easily meeting our 1-second workload SLO.
+### Operator durability and the full SQL surface
 
-### 5. Troubleshooting with the Dead Letter Queue (DLQ)
-
-If an external connector encounters record format errors or schema incompatibilities, it routes the malformed records to the dead letter queue instead of crashing the pipeline.
-
-You can inspect these records by querying the DLQ:
-
-```sql
-SELECT source_name, error_code, error_message, raw_bytes_hex FROM rockstream_catalog.dead_letter_queue;
-```
-
-If you fix the schema issue or data producer, you can instruct RockStream to replay the failed records:
-
-```sql
-ALTER SOURCE kafka_purchases REPLAY DEAD_LETTER_QUEUE SINCE 1717574000;
-```
-
-### 6. Auto-Tuning Loop and Hysteresis Config
-
-What makes RockStream unique is its ability to self-tune. Under the hood, a background daemon executes an **auto-tuning loop** that monitors:
-- The rate of incoming changes.
-- Shard size in SlateDB.
-- CPU saturation on worker nodes.
-- Freshness SLO compliance.
-
-If the freshness lag of a workload starts to slip (e.g., if the lag exceeds 75% of the SLO target), the auto-tuner automatically:
-1. Increases the parallelism of hot operator nodes (sharding the operator across more worker threads).
-2. Increases the epoch commit interval to increase write throughput.
-
-To prevent the system from constantly scaling up and down due to tiny transient spikes in workload (a behavior known as *thrashing*), the auto-tuner uses a **hysteresis configuration** (with scale-up and scale-down thresholds). You can override this hysteresis using the `tune` subcommand:
+The physical operators each have a SlateDB-backed test that proves they survive a
+crash and replay to bit-identical state. These live in
+[crates/rockstream-ops/tests](../crates/rockstream-ops/tests) — for example
+`lfs_join.rs`, `lfs_outer_join.rs`, `lfs_minmax.rs`, `lfs_distinct.rs`,
+`lfs_topk.rs`, and `lfs_time_window.rs`:
 
 ```bash
-rockstream tune --override hysteresis_up=0.85 hysteresis_down=0.40
+cargo test -p rockstream-ops
 ```
 
-This configures the system to scale up only when CPU utilization or lag exceeds 85%, and scale back down only when it falls below 40%, ensuring cluster stability.
+And the SQL engine's correctness soak runs a TPC-H query set incrementally and
+checks each result against batch — inner/outer joins, semi/anti-semi joins,
+multi-table joins, filter aggregates:
+
+```bash
+cargo test -p rockstream-sql --test tpch_plans
+```
+
+```text
+test tpch_q1_filter_aggregate_no_join ... ok
+test tpch_q3_two_join_aggregate ... ok
+test tpch_q5_five_table_join ... ok
+test tpch_q6_filter_aggregate_no_join ... ok
+test tpch_q11_semi_join ... ok
+test tpch_q21_anti_semi_join ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+This is the concrete meaning of the roadmap's *IVM Correct (single-shard)*
+milestone: every tested TPC-H shape returns bit-identical results versus
+DataFusion batch.
 
 ---
 
-## Part 8: Climbing the Scaling Ladder
+## Part 7 — Read What the Node Left Behind
 
-Now that you have built a working pipeline locally, let's discuss how to transition it to production. RockStream is designed with a **one binary, one config, three-tier philosophy**. This means you use the same binary and SQL statements whether you are testing on your laptop or deploying a large, distributed production cluster.
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        Tier 3: Distributed Cluster                     │
-│                                                                        │
-│             ┌──────────────┐               ┌──────────────┐            │
-│             │ Control Node │               │ Gateway Node │            │
-│             └──────┬───────┘               └──────┬───────┘            │
-│                    │                              │                    │
-│                    ├──────────────────────────────┤                    │
-│                    ▼                              ▼                    │
-│             ┌──────────────┐               ┌──────────────┐            │
-│             │ Worker Node  │               │ Worker Node  │            │
-│             └──────┬───────┘               └──────┬───────┘            │
-│                    │                              │                    │
-│                    └──────────────┬───────────────┘                    │
-│                                   ▼                                    │
-│             ┌─────────────────────────────────────────────┐            │
-│             │          Object Storage (S3 / MinIO)        │            │
-│             │  Shared LSM State, Catalog, Sinks & Metadata │            │
-│             └─────────────────────────────────────────────┘            │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-### The Three Tiers of Deployment
-
-1. **Tier 1: Evaluation (Laptop)**
-   - Start option: `rockstream start --role=all --storage=./data`
-   - All services (control plane, worker, gateway) run inside a single local process.
-   - Storage is saved directly to local disk.
-2. **Tier 2: Single-Host Production**
-   - Start option: `rockstream start --role=all --storage=s3://my-bucket/production`
-   - Services run in a single process, but state and logs are saved to an external object store (like AWS S3 or MinIO). If the host crashes, you can boot a new host pointing to the same S3 path, and it will recover instantly without loss of data.
-3. **Tier 3: Distributed Cluster**
-   - We separate services onto dedicated nodes for horizontal scale:
-     - Boot Control Nodes: `rockstream start --role=control --control-bind=10.0.0.1:7700 --storage=s3://my-bucket/cluster`
-     - Boot Worker Nodes: `rockstream start --role=worker --control=10.0.0.1:7700 --storage=s3://my-bucket/cluster`
-     - Boot Gateway Nodes: `rockstream start --role=gateway --control=10.0.0.1:7700 --storage=s3://my-bucket/cluster`
-   - Shards are distributed across workers, and workers exchange data using gRPC shuffles.
-
-### Integrating with the Data Lake: Iceberg and Delta Lake
-
-Once your views are calculated, you can stream their outputs to external systems using sinks. 
-
-RockStream includes native sinks for **Apache Iceberg v2** and **Delta Lake**. At regular intervals (such as every 5 minutes), RockStream writes view snapshots to your cloud storage bucket as optimized columnar Parquet files, committing the metadata directly to your Iceberg REST catalog.
-
-This enables downstream engines like DuckDB, Trino, or Apache Spark to query the latest view results directly from the cloud storage bucket—without putting any load on your active RockStream processing cluster.
-
-### Administrative Support Bundles
-
-If you run into issues on a production cluster, you can use the CLI to compile a diagnostic support bundle:
+Back in the first terminal, after you pressed Ctrl-C, the node wrote an
+auditable trail and a self-contained diagnostic snapshot. Every control-plane
+action writes an audit event — a hard rule across the whole project.
 
 ```bash
-rockstream support-bundle --output=/tmp/support-bundle.tar.gz
+cat ./rockstream-data/audit.jsonl
 ```
 
-This compiles system logs, worker CPU profiles, database catalogs, config overrides, and active audit history into a single compressed tarball. You can share this bundle with database administrators or the RockStream community to debug cluster issues efficiently.
+For the combined run you just performed, the trail captures the full lifecycle —
+including the gateway coming up and going down:
+
+```text
+server.started        -> rockstream      (role=all)
+pipeline.created      -> noop-pipeline
+pipeline.started      -> noop-pipeline
+worker.registered     -> worker-1        (address=127.0.0.1:0, headroom=1.00)
+shard.lease_granted   -> shard-1         (worker=worker-1, token=lease-1)
+gateway.started       -> 127.0.0.1:5544  (role=all)
+gateway.stopped       -> 127.0.0.1:5544
+pipeline.stopped      -> noop-pipeline
+server.stopped        -> rockstream
+```
+
+Every event names an `actor` (`system` or `control`) and a `resource`. The node
+also wrote a support bundle — the artifact you would attach to a bug report:
+
+```bash
+cat ./rockstream-data/support-bundle-*.json
+```
+
+```json
+{
+  "generated_at_ms": …,
+  "system_info": { "version": "0.42.0", "os": "macos", "arch": "aarch64", "role": "all" },
+  "metrics":     { "uptime_ms": …, "audit_events_emitted": 9 },
+  "audit_events": [ … the full audit log … ]
+}
+```
+
+And the storage directory now contains a real SlateDB layout plus the gateway's
+own serving shard:
+
+```bash
+ls ./rockstream-data
+# audit.jsonl   gateway-shard/   shards/   support-bundle-….json
+```
 
 ---
 
-## Conclusion & Next Steps
+## Part 8 — Splitting the Roles and Proving the Gateway
 
-Congratulations! You have completed the 30-minute RockStream starter tutorial.
+The same binary runs each role separately, which is how a real cluster is shaped.
+A pure gateway node, a control node, and a worker that joins it look like this:
 
-In this guide, you have:
-1. Explored the mathematical foundations of Incremental View Maintenance, DBSP, Z-sets, frontiers, and merge laws.
-2. Bootstrapped a local evaluation instance of RockStream.
-3. Connected to the gateway using standard Postgres tools.
-4. Defined workloads and created base tables.
-5. Constructed a multi-stage Campaign Attribution and Referral tracking DAG containing inner joins, left joins, tumbling window aggregates, rank window functions, and recursive CTEs.
-6. Populated the DAG with data and verified correctness.
-7. Subscribed to live updates and debugged execution using the RockStream CLI.
+```bash
+# A standalone PostgreSQL gateway (no control/worker in-process)
+rockstream start --role=gateway --storage ./rs-gw --listen 127.0.0.1:5544
 
-To continue your journey:
-- Check out the [Concepts Guide](file:///Users/grove/projects/rockstream/docs/concepts.md) for a deeper look into the internals.
-- Read the [CLI Subcommands Reference](file:///Users/grove/projects/rockstream/docs/cli.md) to explore administrative capabilities.
-- Review the [Language Features Reference](file:///Users/grove/projects/rockstream/docs/language-features.md) to see the full list of supported SQL operators.
-- Join our community Slack channel or Github Discussions to connect with other builders!
+# A control plane on a fixed port…
+rockstream start --role=control --storage ./rs-control
+
+# …and a worker that joins it
+rockstream start --role=worker --control=127.0.0.1:8000 --storage ./rs-worker
+```
+
+A `worker` or `frontier` role requires `--control=<url>`; omit it and you get a
+clear, actionable error:
+
+```text
+RS-0002 role `worker` requires --control=<url>
+  next steps: Provide the control plane URL via the --control argument.
+```
+
+The full `RS-XXXX` registry lives in
+[crates/rockstream-types/src/error_code.rs](../crates/rockstream-types/src/error_code.rs),
+and the CLI surface is documented in [docs/cli.md](cli.md).
+
+### The gateway, proven against a real client
+
+Everything you did over `psql` in Parts 3–5 is also pinned by automated suites
+that stand up the gateway on a real socket and drive it with a genuine
+`tokio-postgres` client. The serve-mode suite mirrors this tutorial step for
+step:
+
+```bash
+cargo test -p rockstream-cli --test gateway_serve_tests
+```
+
+```text
+test gateway_starts_and_accepts_connection ... ok
+test gateway_show_server_version_returns_a_row ... ok
+test gateway_information_schema_tables_is_queryable ... ok
+test gateway_pg_catalog_pg_class_is_queryable ... ok
+test gateway_create_view_and_select_succeeds ... ok
+test gateway_cyclic_view_returns_rs_1011 ... ok
+test gateway_dml_in_transaction_accumulates_without_error ... ok
+test gateway_subscribe_returns_without_error ... ok
+test gateway_invalid_listen_address_returns_rs_0002 ... ok
+test gateway_port_in_use_returns_rs_0003 ... ok
+test gateway_handles_concurrent_clients ... ok
+test gateway_set_rockstream_session_variables ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The deeper protocol and behavior proofs live alongside in the gateway crate
+itself —
+[gateway_proof_tests.rs](../crates/rockstream-gateway/tests/gateway_proof_tests.rs)
+(extended query protocol, catalog reflection, `COPY`, buffered DML) and
+[auth_proof_tests.rs](../crates/rockstream-gateway/tests/auth_proof_tests.rs)
+(authentication, RBAC, read-your-writes):
+
+```bash
+cargo test -p rockstream-gateway
+```
+
+---
+
+## Part 9 — Where This Is Going
+
+You have now seen the real RockStream: a node that boots, leases and fences
+shards, writes an auditable trail, **and serves the PostgreSQL wire protocol you
+connected to with `psql`**; an incremental engine whose correctness is proven
+against a batch oracle; and a view DAG the engine validates and maintains. The
+roadmap's design is **one binary, one config, three tiers**, and the same
+artifacts you built scale along it:
+
+1. **Evaluation (laptop).** A single process with local storage and a gateway on
+   `127.0.0.1` — exactly what you ran in Part 3.
+2. **Single-host production.** The same process, but `--storage` points at an
+   object store (`s3://…` or MinIO). If the host dies, a new one boots against
+   the same bucket and recovers, because all durable state lives there.
+3. **Distributed cluster.** `--role=control`, `--role=worker`, and
+   `--role=gateway` on separate nodes, sharing object storage, exchanging data
+   over gRPC shuffles, and coordinating through the frontier protocol.
+
+The last hop — re-evaluating dependent views after every `COMMIT` and writing
+their output into the serving shard — is now wired and proven by four green-gate
+tests in
+[gateway_proof_tests.rs](../crates/rockstream-gateway/tests/gateway_proof_tests.rs):
+`last_hop_view_materialised_after_commit`,
+`last_hop_aggregate_view_materialised_after_commit`,
+`last_hop_select_returns_rows_after_commit`, and
+`tutorial_dag_three_level_chain_materialises_correctly` — the last one exercises
+the exact campaign analytics DAG from Parts 4 and 5, including the threshold
+crossing in transaction 3. The current implementation re-evaluates views in batch
+using DataFusion after every commit; the incremental Z-set path (proportional to
+the *change*, not the history) is proven in the oracle harness (Part 6) and is
+the next productization step.
+The full build sequence is in [NEW_ROADMAP.md](../NEW_ROADMAP.md). Every
+"Done" version has a sign-off file under [sign-offs/](../sign-offs/).
+
+### Keep exploring
+
+- [DESIGN.md](../DESIGN.md) — what RockStream is and why the architecture holds.
+- [IVM.md](../IVM.md) — a deeper look at the incremental engine.
+- [docs/concepts.md](concepts.md) — the vocabulary in one place.
+- [docs/cli.md](cli.md) — the current CLI surface, documented honestly.
+- [docs/ivm-operators.md](ivm-operators.md) — the operator catalog.
+- [docs/language-features.md](language-features.md) — the SQL surface.
+
+### What you did in 30 minutes
+
+1. Learned how incremental view maintenance, Z-sets, frontiers, and merge laws
+   let RockStream keep answers fresh by processing only change.
+2. Built the workspace and inspected the single `rockstream` binary.
+3. Booted a node and **connected to it with a real `psql` client** over the
+   PostgreSQL wire protocol.
+4. Assembled a **three-level DAG of materialized views** — an aggregate view,
+   a join view, and a filter materialized view — watched the engine reject a
+   cycle with `RS-1011`, and inspected a plan.
+5. Ran three transactional DML batches and watched the **last hop** propagate
+   each commit through the full 3-level chain: `campaign_totals` →
+   `campaign_report` → `high_performers`. Observed a threshold crossing in real
+   time as a single `INSERT` moved `Brand Awareness` from absent to present in
+   the materialized result.
+6. Read the audit log and support bundle the node produced.
+7. Ran the oracle and SQL proofs that demonstrate `incremental == batch` for real
+   operators and a real `JOIN … GROUP BY` view DAG.
+8. Verified the gateway against a genuine PostgreSQL client.
+
+Welcome to RockStream. The scoreboard is already ticking — now you know what
+makes it tick, and you've talked to it yourself.

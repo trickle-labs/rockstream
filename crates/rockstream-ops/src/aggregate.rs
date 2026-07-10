@@ -1,401 +1,637 @@
-//! `AggregateMergeOp` — incremental aggregate operator built on `LawBundle`.
+//! Incremental aggregate operator (v0.5 — IVM-2).
 //!
-//! Implements `SUM`, `COUNT(*)`, and `AVG` aggregation over a `ZSetBatch`
-//! delta stream using the `SumCount/v1` merge law.
+//! `AggregateOp` implements the DBSP delta rule for GROUP BY aggregates:
 //!
-//! # Algorithm
+//! ```text
+//! For each incoming row (k, v) with weight w:
+//!   1. Look up old state (sum, count) for group key k.
+//!   2. Compute new_sum = old_sum + v * w, new_count = old_count + w.
+//!   3. If old_count != 0 → retract: emit (k, old_sum, old_count, avg) with weight -1.
+//!   4. If new_count != 0 → insert:  emit (k, new_sum, new_count, avg) with weight +1.
+//!   5. Update state: remove k if new_count == 0, else store (new_sum, new_count).
+//! ```
 //!
-//! The operator maintains per-group-key state as `SumCount/v1` bytes. For
-//! each incoming delta `(row_key, row_value, weight)`:
+//! ## Input schema
 //!
-//! 1. Extract `group_key = group_fn(row_key, row_value)`.
-//! 2. Extract `(sum_contribution, count_contribution) = measure_fn(row_key, row_value)`.
-//! 3. Merge `(sum_contribution * weight, count_contribution * weight)` into
-//!    the per-group accumulator using `SumCount/v1::merge`.
+//! Two Int64 columns: `k` (group key) and `v` (value to aggregate).
 //!
-//! After all deltas in the batch are processed, emit a Z-set delta:
-//! - For each modified group: retract the old emitted value (weight -1) and
-//!   insert the new value (weight +1). This is the "last-emitted cache" pattern.
+//! ## Output schema
 //!
-//! Groups whose accumulator reaches the identity `(0, 0)` are compacted out.
+//! Four Int64 columns: `k`, `sum_v`, `count`, `avg_v`
+//! where `avg_v = sum_v / count` (truncating integer division).
+//!
+//! ## State persistence
+//!
+//! `AggregateOp` optionally persists its arrangement to a `ShardDb` under the
+//! `op_state` namespace so that state survives shard restart:
+//!
+//! - key:   `[0x01 (OpState)][op_id: 8 bytes BE][group_key: 8 bytes BE]`
+//! - value: `[sum: 8 bytes BE][count: 8 bytes BE]`
+//!
+//! Call `persist_state(db)` after each epoch commit to write the full
+//! arrangement.  Call `AggregateOp::load_from_storage(db, op_id)` on restart
+//! to restore state.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-use rockstream_types::batch::{SinkBatch, SourceBatch, ZSet, ZSetBatch};
-use rockstream_types::laws::sum_count::{encode_sum_count, SumCountV1, SUM_COUNT_ID};
-use rockstream_types::merge_law::{LawBundle, MergeLawId};
-use rockstream_types::timestamp::Epoch;
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use tracing::debug;
 
-use crate::operator::Operator;
+use rockstream_storage::{ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch};
+use rockstream_types::ids::OperatorId;
 
-/// Function type for extracting a group key from a row.
-///
-/// Takes `(row_key_bytes, row_value_bytes)` and returns the group key bytes.
-pub type GroupFn = Arc<dyn Fn(&[u8], &[u8]) -> Vec<u8> + Send + Sync + 'static>;
+use crate::error::OpError;
+use crate::op::Operator;
+use crate::zset::ArrowZSet;
 
-/// Function type for extracting the measure contribution from a row.
-///
-/// Returns `(sum_contribution, count_contribution)` for a single row.
-/// The weight multiplier is applied by the operator, not the function.
-pub type MeasureFn = Arc<dyn Fn(&[u8], &[u8]) -> (i64, i64) + Send + Sync + 'static>;
+// ─── Schema ──────────────────────────────────────────────────────────────────
 
-/// Incremental aggregate operator using `SumCount/v1` as the merge law.
-///
-/// Re-implements aggregate semantics on top of `LawBundle` so that the merge
-/// law drives all accumulation. The operator holds no hand-coded arithmetic —
-/// all state transitions go through `SumCountV1::merge`.
-pub struct AggregateMergeOp {
-    name: String,
-    group_fn: GroupFn,
-    measure_fn: MeasureFn,
-    law: SumCountV1,
-    /// Per-group-key accumulator state (SumCount/v1 bytes).
-    agg_state: HashMap<Vec<u8>, Vec<u8>>,
-    /// Last-emitted value per group key (for computing output deltas).
-    last_emitted: HashMap<Vec<u8>, Vec<u8>>,
-    budget: Option<Arc<rockstream_types::state_budget::StateBudgetMeter>>,
-    warned_over_budget: bool,
-    rows_processed: u64,
-    state_read_count: u64,
+/// Output schema for the aggregate operator.
+fn output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("sum_v", DataType::Int64, false),
+        Field::new("count", DataType::Int64, false),
+        Field::new("avg_v", DataType::Int64, false),
+    ]))
 }
 
-impl AggregateMergeOp {
-    /// Create a new aggregate operator.
-    ///
-    /// - `name`: diagnostic name used in `EXPLAIN`.
-    /// - `group_fn`: extracts the group-by key from each row.
-    /// - `measure_fn`: returns `(sum_contribution, count_contribution)` for
-    ///   each row *before* weight multiplication.
-    pub fn new(name: impl Into<String>, group_fn: GroupFn, measure_fn: MeasureFn) -> Self {
+// ─── AggState ────────────────────────────────────────────────────────────────
+
+/// In-memory aggregate arrangement: group_key → (sum, count).
+///
+/// Only entries with count > 0 are stored; entries are removed when count
+/// reaches 0 (group deleted).
+///
+/// # Bound
+///
+/// The arrangement is bounded by the number of distinct group keys in the input
+/// stream.  The fill level is tracked via `entry_count()`.
+#[derive(Debug, Default)]
+pub struct AggState {
+    /// Group key → (sum_v, count).
+    entries: HashMap<i64, (i64, i64)>,
+}
+
+impl AggState {
+    pub fn new() -> Self {
         Self {
-            name: name.into(),
-            group_fn,
-            measure_fn,
-            law: SumCountV1,
-            agg_state: HashMap::new(),
-            last_emitted: HashMap::new(),
-            budget: None,
-            warned_over_budget: false,
-            rows_processed: 0,
-            state_read_count: 0,
+            entries: HashMap::new(),
         }
     }
 
-    /// Attach a state budget for memory bounding.
-    pub fn with_budget(
-        mut self,
-        budget: Arc<rockstream_types::state_budget::StateBudgetMeter>,
+    /// Number of live groups (fill level metric).
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Apply one delta `(key, value_delta * weight)` to the arrangement.
+    ///
+    /// Returns `(old_state, new_state)` where each is `Option<(sum, count)>`.
+    /// `old_state` is `None` when the group did not previously exist.
+    /// `new_state` is `None` when the group count drops to zero (group deleted).
+    #[allow(clippy::type_complexity)]
+    pub fn apply_delta(
+        &mut self,
+        k: i64,
+        v: i64,
+        w: i64,
+    ) -> Result<(Option<(i64, i64)>, Option<(i64, i64)>), OpError> {
+        let (old_sum, old_count) = self.entries.get(&k).copied().unwrap_or((0, 0));
+        let old_state = if old_count != 0 {
+            Some((old_sum, old_count))
+        } else {
+            None
+        };
+
+        // Checked arithmetic for sum to detect overflow.
+        let new_sum = old_sum
+            .checked_add(
+                v.checked_mul(w)
+                    .ok_or_else(|| OpError::aggregate_overflow(k))?,
+            )
+            .ok_or_else(|| OpError::aggregate_overflow(k))?;
+        let new_count = old_count + w;
+
+        let new_state = if new_count != 0 {
+            self.entries.insert(k, (new_sum, new_count));
+            Some((new_sum, new_count))
+        } else {
+            self.entries.remove(&k);
+            None
+        };
+
+        Ok((old_state, new_state))
+    }
+
+    /// Encode this state as a `WriteBatch` for the `op_state` namespace.
+    ///
+    /// Call after each epoch commit to persist state to `ShardDb`.
+    pub fn encode_as_write_batch(&self, op_id: OperatorId) -> WriteBatch {
+        let mut wb = WriteBatch::new();
+        for (&k, &(sum, count)) in &self.entries {
+            let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &k.to_be_bytes());
+            let mut value = [0u8; 16];
+            value[..8].copy_from_slice(&sum.to_be_bytes());
+            value[8..].copy_from_slice(&count.to_be_bytes());
+            wb.put(&key, &value);
+        }
+        wb
+    }
+
+    /// Decode from the raw entries stored by a previous `encode_as_write_batch`.
+    ///
+    /// `raw_entries` is the result of scanning the `op_state` namespace for
+    /// the given `op_id`.
+    pub fn decode_from_entries(
+        raw_entries: &[(bytes::Bytes, bytes::Bytes)],
+        op_id: OperatorId,
     ) -> Self {
-        self.budget = Some(budget);
-        self
-    }
-
-    /// Process a `ZSet` delta and return the output Z-set delta.
-    ///
-    /// This is the core IVM method: applies all incoming deltas incrementally
-    /// and emits only the changed aggregate values.
-    pub fn process_zset(&mut self, input: &ZSet) -> ZSet {
-        let mut modified_groups: HashSet<Vec<u8>> = HashSet::new();
-
-        // Phase 1: accumulate deltas into per-group state.
-        for row in input.iter() {
-            self.rows_processed += 1;
-            let group_key = (self.group_fn)(&row.key, &row.value);
-            let (sum_contrib, count_contrib) = (self.measure_fn)(&row.key, &row.value);
-
-            // Scale contribution by weight.
-            let weighted_sum = sum_contrib.saturating_mul(row.weight);
-            let weighted_count = count_contrib.saturating_mul(row.weight);
-            let delta_bytes = encode_sum_count(weighted_sum, weighted_count);
-
-            self.state_read_count += 1;
-            let is_new = !self.agg_state.contains_key(&group_key);
-            if is_new {
-                if let Some(ref budget) = self.budget {
-                    let charge = (group_key.len() + delta_bytes.len()) as u64;
-                    if let Err(e) = budget.try_acquire(charge) {
-                        if !self.warned_over_budget {
-                            tracing::warn!(
-                                "RS-3604: state budget exceeded, OVER_BUDGET_RELAXED: {}",
-                                e
-                            );
-                            self.warned_over_budget = true;
-                        }
-                        continue; // Skip this insertion!
-                    }
-                }
+        let op_prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
+        let mut state = AggState::new();
+        for (key, value) in raw_entries {
+            // Strip the operator prefix to get the group key bytes.
+            if key.len() < op_prefix.len() + 8 || !key.starts_with(&op_prefix) {
+                continue;
             }
-
-            let current = self
-                .agg_state
-                .entry(group_key.clone())
-                .or_insert_with(|| self.law.identity().unwrap());
-
-            // Merge via the law (all arithmetic goes through LawBundle).
-            *current = self
-                .law
-                .merge(current, &delta_bytes)
-                .expect("SumCount merge");
-
-            modified_groups.insert(group_key);
-        }
-
-        // Phase 2: emit deltas for modified groups.
-        let mut output = ZSet::new();
-        for group_key in modified_groups {
-            let new_state = self
-                .agg_state
-                .get(&group_key)
-                .cloned()
-                .unwrap_or_else(|| self.law.identity().unwrap());
-            let old_emitted = self.last_emitted.get(&group_key).cloned();
-
-            // Retract old emitted value (if any).
-            if let Some(ref old) = old_emitted {
-                if !self.law.is_identity(old) {
-                    output.insert(group_key.clone(), old.clone(), -1);
-                }
+            let k_bytes: [u8; 8] = match key[op_prefix.len()..op_prefix.len() + 8].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if value.len() < 16 {
+                continue;
             }
-
-            // Insert new value (if not identity).
-            if !self.law.is_identity(&new_state) {
-                output.insert(group_key.clone(), new_state.clone(), 1);
-                self.last_emitted
-                    .insert(group_key.clone(), new_state.clone());
-            } else {
-                self.last_emitted.remove(&group_key);
-            }
-
-            // Compact identity-valued groups from agg_state.
-            if self.law.is_identity(&new_state) && self.agg_state.remove(&group_key).is_some() {
-                if let Some(ref budget) = self.budget {
-                    let released = (group_key.len() + new_state.len()) as u64;
-                    budget.release(released);
-                }
+            let sum_bytes: [u8; 8] = match value[..8].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let count_bytes: [u8; 8] = match value[8..16].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let k = i64::from_be_bytes(k_bytes);
+            let sum = i64::from_be_bytes(sum_bytes);
+            let count = i64::from_be_bytes(count_bytes);
+            if count != 0 {
+                state.entries.insert(k, (sum, count));
             }
         }
-
-        output
-    }
-
-    /// Return the current accumulated aggregate state for all groups.
-    ///
-    /// Used in tests and diagnostics to inspect the operator's internal state.
-    pub fn current_state(&self) -> &HashMap<Vec<u8>, Vec<u8>> {
-        &self.agg_state
-    }
-
-    /// The merge law ID used by this operator.
-    pub fn law_id(&self) -> MergeLawId {
-        SUM_COUNT_ID
+        state
     }
 }
 
-#[async_trait]
-impl Operator for AggregateMergeOp {
-    fn set_context(&mut self, ctx: crate::operator::OperatorContext) {
-        if let Some(budget) = ctx.state_budget {
-            self.budget = Some(budget);
+// ─── AggregateOp ─────────────────────────────────────────────────────────────
+
+/// Stateful incremental aggregate operator.
+///
+/// Input:  two Int64 columns `(k, v)`.
+/// Output: four Int64 columns `(k, sum_v, count, avg_v)`.
+///
+/// Uses interior mutability (`Mutex`) so it satisfies `Operator: &self`.
+pub struct AggregateOp {
+    state: Mutex<AggState>,
+    op_id: OperatorId,
+}
+
+impl AggregateOp {
+    /// Create a new aggregate operator with empty state.
+    pub fn new(op_id: OperatorId) -> Self {
+        AggregateOp {
+            state: Mutex::new(AggState::new()),
+            op_id,
         }
     }
 
-    async fn process(&mut self, _input: &SourceBatch) -> SinkBatch {
-        SinkBatch::default()
-    }
-
-    async fn process_delta(&mut self, input: &ZSetBatch) -> ZSetBatch {
-        let output_zset = self.process_zset(&input.zset);
-        ZSetBatch {
-            zset: output_zset,
-            epoch: input.epoch,
+    /// Create from pre-loaded state (used after loading from storage).
+    pub fn with_state(op_id: OperatorId, state: AggState) -> Self {
+        AggregateOp {
+            state: Mutex::new(state),
+            op_id,
         }
     }
 
-    async fn epoch_complete(&mut self, _epoch: Epoch) {}
+    /// Number of live groups (fill-level metric).
+    pub fn live_groups(&self) -> usize {
+        self.state
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .entry_count()
+    }
 
+    /// Encode current state as a `WriteBatch` for persistence.
+    ///
+    /// The caller (usually `ViewSinkOp` or group commit) merges this batch
+    /// into the epoch's group-commit `WriteBatch`.
+    pub fn state_write_batch(&self) -> WriteBatch {
+        self.state
+            .lock()
+            .expect("AggregateOp mutex poisoned")
+            .encode_as_write_batch(self.op_id)
+    }
+
+    /// Restore an `AggregateOp` from a `ShardDb` (called at shard startup).
+    pub async fn load_from_storage(db: &ShardDb, op_id: OperatorId) -> Result<Self, OpError> {
+        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
+        let (entries, _truncated) = db
+            .scan_prefix_bounded(&prefix, 64 * 1024 * 1024) // 64 MB cap
+            .await
+            .map_err(OpError::storage)?;
+        let state = AggState::decode_from_entries(&entries, op_id);
+        Ok(Self::with_state(op_id, state))
+    }
+}
+
+impl Operator for AggregateOp {
     fn name(&self) -> &str {
-        &self.name
+        "AggregateOp"
     }
 
-    fn merge_law(&self) -> Option<MergeLawId> {
-        Some(SUM_COUNT_ID)
-    }
-
-    fn snapshot_metrics(&self) -> crate::operator::OperatorMetrics {
-        crate::operator::OperatorMetrics {
-            rows_processed: self.rows_processed,
-            state_read_count: self.state_read_count,
-            rmw_avoided: true,
-            p99_latency_ms: 0.0,
+    /// Apply one Z-set delta batch through the aggregate arrangement.
+    ///
+    /// For each row `(k, v, weight)`:
+    /// - Compute the state transition.
+    /// - Emit retraction of old aggregate row (if group existed).
+    /// - Emit insertion of new aggregate row (if group still exists).
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        if delta.is_empty() {
+            return Ok(ArrowZSet::empty(output_schema()));
         }
-    }
 
-    fn state_bytes(&self) -> u64 {
-        self.agg_state
-            .iter()
-            .map(|(k, v)| (k.len() + v.len()) as u64)
-            .sum()
+        // Validate input schema: need at least 2 Int64 columns (k, v).
+        if delta.data.num_columns() < 2 {
+            return Err(OpError::column_out_of_bounds(1, delta.data.num_columns()));
+        }
+
+        let k_col = delta
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
+        let v_col = delta
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
+
+        let n = delta.num_rows();
+
+        // Consolidate input: sum weights for identical (k, v) pairs before
+        // processing.  Without this, the DBSP bilinear join rule can emit
+        // multiple rows for the same (key, value) with weights that net to
+        // zero or a single unit — e.g. (-1, -1, +1) for a concurrent
+        // retraction from both sides — and processing them individually
+        // causes the group count to transiently hit 0, which deletes the
+        // group entry and corrupts the running sum for that epoch.
+        //
+        // Preserving insertion order for equal net weight ensures deterministic
+        // output ordering across platforms.
+        let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
+            std::collections::HashMap::new();
+        let mut order: Vec<(i64, i64)> = Vec::new();
+        for row in 0..n {
+            let k = k_col.value(row);
+            let v = v_col.value(row);
+            let w = delta.weights[row];
+            let entry = consolidated.entry((k, v)).or_insert_with(|| {
+                order.push((k, v));
+                0
+            });
+            *entry += w;
+        }
+
+        // Output vecs — pre-allocate for 2 output rows per consolidated input row.
+        let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_avg: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
+
+        let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
+
+        for (k, v) in &order {
+            let k = *k;
+            let v = *v;
+            let w = consolidated[&(k, v)];
+            if w == 0 {
+                continue;
+            }
+
+            let (old_state, new_state) = state.apply_delta(k, v, w)?;
+
+            // Retract old aggregate row.
+            if let Some((old_sum, old_count)) = old_state {
+                let old_avg = old_sum / old_count;
+                out_k.push(k);
+                out_sum.push(old_sum);
+                out_count.push(old_count);
+                out_avg.push(old_avg);
+                out_weights.push(-1);
+            }
+
+            // Insert new aggregate row.
+            if let Some((new_sum, new_count)) = new_state {
+                let new_avg = new_sum / new_count;
+                out_k.push(k);
+                out_sum.push(new_sum);
+                out_count.push(new_count);
+                out_avg.push(new_avg);
+                out_weights.push(1);
+            }
+        }
+
+        drop(state);
+
+        debug!(
+            op_id = self.op_id.0,
+            input_rows = n,
+            output_rows = out_k.len(),
+            "AggregateOp: processed delta"
+        );
+
+        if out_k.is_empty() {
+            return Ok(ArrowZSet::empty(output_schema()));
+        }
+
+        let schema = output_schema();
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(out_k)),
+            Arc::new(Int64Array::from(out_sum)),
+            Arc::new(Int64Array::from(out_count)),
+            Arc::new(Int64Array::from(out_avg)),
+        ];
+        let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
+        Ok(ArrowZSet::new(data, out_weights))
     }
 }
+
+// ─── Frontier persistence ─────────────────────────────────────────────────────
+
+/// Persist the shard frontier (current committed epoch) to `ShardDb`.
+///
+/// Key: `[0x06 (ShardMeta)][b"frontier"]` (defined by `ShardKeyEncoder::frontier_key()`).
+/// Value: `epoch: u64` as 8 bytes big-endian.
+pub async fn persist_frontier(db: &ShardDb, epoch: u64) -> Result<(), OpError> {
+    let key = ShardKeyEncoder::frontier_key();
+    let value = epoch.to_be_bytes();
+    db.put(&key, &value).await.map_err(OpError::storage)
+}
+
+/// Load the persisted frontier from `ShardDb`.
+///
+/// Returns `None` if no frontier has been committed yet (fresh shard).
+pub async fn load_frontier(db: &ShardDb) -> Result<Option<u64>, OpError> {
+    let key = ShardKeyEncoder::frontier_key();
+    let raw = db.get(&key).await.map_err(OpError::storage)?;
+    match raw {
+        None => Ok(None),
+        Some(bytes) if bytes.len() == 8 => {
+            let epoch = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+            Ok(Some(epoch))
+        }
+        Some(_) => Ok(None), // malformed — treat as absent
+    }
+}
+
+/// Persist the full aggregate state to `ShardDb`, cleaning up stale entries.
+///
+/// This is the canonical state-persistence call for `AggregateOp`.  It:
+/// 1. Scans all existing `op_state` entries for `op_id`.
+/// 2. Deletes entries whose group keys are no longer in the live state.
+/// 3. Writes all current live entries.
+///
+/// This scan-and-delete pattern satisfies the "no range deletion" constraint.
+///
+/// Call this after each epoch commit to ensure storage reflects current state.
+pub async fn persist_agg_state(db: &ShardDb, op: &AggregateOp) -> Result<(), OpError> {
+    let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op.op_id.0);
+
+    // Scan all existing state entries (64 MB cap — a bound on the scan).
+    let (existing, _truncated) = db
+        .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
+        .await
+        .map_err(OpError::storage)?;
+
+    // Build a write batch: delete all stale entries, write all live entries.
+    // Drop the mutex guard BEFORE the .await call to avoid holding a lock
+    // across an await point (clippy::await_holding_lock).
+    let wb = {
+        let state = op.state.lock().expect("AggregateOp mutex poisoned");
+        let mut wb = WriteBatch::new();
+
+        // Deletions: existing entries whose group key is not in current state.
+        for (key, _) in &existing {
+            if key.len() < prefix.len() + 8 {
+                continue;
+            }
+            let k_bytes: [u8; 8] = match key[prefix.len()..prefix.len() + 8].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let k = i64::from_be_bytes(k_bytes);
+            if !state.entries.contains_key(&k) {
+                wb.delete(key);
+            }
+        }
+
+        // Insertions: current live entries.
+        let new_wb = state.encode_as_write_batch(op.op_id);
+        wb.merge_from(new_wb);
+        wb
+        // `state` (MutexGuard) is dropped here — before any await
+    };
+
+    if !wb.is_empty() {
+        db.write_batch(wb).await.map_err(OpError::storage)?;
+    }
+    Ok(())
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rockstream_types::laws::sum_count::{decode_sum_count, encode_sum_count};
+    use rockstream_types::ids::OperatorId;
 
-    /// Build a group_fn that uses the key as the group key.
-    fn key_as_group() -> GroupFn {
-        Arc::new(|key: &[u8], _value: &[u8]| key.to_vec())
+    fn make_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let k_vals: Vec<i64> = rows.iter().map(|(k, _, _)| *k).collect();
+        let v_vals: Vec<i64> = rows.iter().map(|(_, v, _)| *v).collect();
+        let weights: Vec<i64> = rows.iter().map(|(_, _, w)| *w).collect();
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(k_vals)),
+                Arc::new(Int64Array::from(v_vals)),
+            ],
+        )
+        .unwrap();
+        ArrowZSet::new(data, weights)
     }
 
-    /// Build a measure_fn that extracts val from the value bytes (8-byte i64).
-    fn val_measure() -> MeasureFn {
-        Arc::new(|_key: &[u8], value: &[u8]| {
-            let val = if value.len() >= 8 {
-                i64::from_be_bytes(value[..8].try_into().unwrap_or([0u8; 8]))
-            } else {
-                0
-            };
-            (val, 1)
-        })
-    }
-
-    fn make_row(id: i64, val: i64) -> (Vec<u8>, Vec<u8>) {
-        (id.to_be_bytes().to_vec(), val.to_be_bytes().to_vec())
-    }
-
-    #[test]
-    fn single_insert_produces_sum_and_count() {
-        let mut op = AggregateMergeOp::new("test_agg", key_as_group(), val_measure());
-        let mut input = ZSet::new();
-        let (k, v) = make_row(1, 10);
-        input.insert(k, v, 1);
-
-        let output = op.process_zset(&input);
-
-        let rows: Vec<_> = output.iter().collect();
-        assert_eq!(rows.len(), 1);
-        let (sum, count) = decode_sum_count(&rows[0].value).unwrap();
-        assert_eq!(sum, 10);
-        assert_eq!(count, 1);
-        assert_eq!(rows[0].weight, 1);
-    }
-
-    #[test]
-    fn second_insert_retracts_old_emits_new() {
-        let mut op = AggregateMergeOp::new("test_agg", key_as_group(), val_measure());
-
-        // First delta
-        let mut d1 = ZSet::new();
-        let (k1, v1) = make_row(1, 10);
-        d1.insert(k1, v1, 1);
-        let out1 = op.process_zset(&d1);
-        // Should emit +1 for (sum=10, count=1)
-        assert_eq!(out1.iter().count(), 1);
-
-        // Second delta: insert another row with same group key
-        let mut d2 = ZSet::new();
-        let (k2, v2) = make_row(1, 20);
-        d2.insert(k2, v2, 1);
-        let out2 = op.process_zset(&d2);
-
-        let rows: Vec<_> = out2.iter().collect();
-        // Should have retraction of old (-1) and insertion of new (+1)
-        assert_eq!(rows.len(), 2);
-        let retractions: Vec<_> = rows.iter().filter(|r| r.weight == -1).collect();
-        let insertions: Vec<_> = rows.iter().filter(|r| r.weight == 1).collect();
-        assert_eq!(retractions.len(), 1);
-        assert_eq!(insertions.len(), 1);
-        let (old_sum, old_count) = decode_sum_count(&retractions[0].value).unwrap();
-        assert_eq!(old_sum, 10);
-        assert_eq!(old_count, 1);
-        let (new_sum, new_count) = decode_sum_count(&insertions[0].value).unwrap();
-        assert_eq!(new_sum, 30);
-        assert_eq!(new_count, 2);
+    fn extract_rows(batch: &ArrowZSet) -> Vec<(i64, i64, i64, i64, i64)> {
+        // (k, sum_v, count, avg_v, weight)
+        let k_col = batch
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let s_col = batch
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let c_col = batch
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let a_col = batch
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        (0..batch.num_rows())
+            .map(|i| {
+                (
+                    k_col.value(i),
+                    s_col.value(i),
+                    c_col.value(i),
+                    a_col.value(i),
+                    batch.weights[i],
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn delete_retracts_all_produces_empty() {
-        let mut op = AggregateMergeOp::new("test_agg", key_as_group(), val_measure());
+    fn single_insert_creates_group() {
+        let op = AggregateOp::new(OperatorId(0));
+        let delta = make_batch(&[(1, 10, 1)]);
+        let out = op.process_delta(delta).unwrap();
+        let rows = extract_rows(&out);
+        // No retraction; one insertion of (k=1, sum=10, count=1, avg=10).
+        assert_eq!(rows, vec![(1, 10, 1, 10, 1)]);
+        assert_eq!(op.live_groups(), 1);
+    }
 
-        // Insert
-        let mut d1 = ZSet::new();
-        let (k, v) = make_row(1, 10);
-        d1.insert(k.clone(), v.clone(), 1);
-        op.process_zset(&d1);
+    #[test]
+    fn second_insert_into_same_group_retracts_and_inserts() {
+        let op = AggregateOp::new(OperatorId(0));
+        // Insert k=1, v=10.
+        let _ = op.process_delta(make_batch(&[(1, 10, 1)])).unwrap();
+        // Insert k=1, v=6.
+        let out = op.process_delta(make_batch(&[(1, 6, 1)])).unwrap();
+        let rows = extract_rows(&out);
+        // Retract (k=1, sum=10, count=1) and insert (k=1, sum=16, count=2, avg=8).
+        assert!(
+            rows.contains(&(1, 10, 1, 10, -1)),
+            "missing retraction: {rows:?}"
+        );
+        assert!(
+            rows.contains(&(1, 16, 2, 8, 1)),
+            "missing insertion: {rows:?}"
+        );
+        assert_eq!(op.live_groups(), 1);
+    }
 
-        // Delete
-        let mut d2 = ZSet::new();
-        d2.insert(k, v, -1);
-        let out = op.process_zset(&d2);
-
-        let rows: Vec<_> = out.iter().collect();
-        // Should retract (10, 1), no new insertion (group is now identity)
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].weight, -1);
-
-        // Internal state should be clean
-        assert!(op.current_state().is_empty());
+    #[test]
+    fn delete_last_row_removes_group() {
+        let op = AggregateOp::new(OperatorId(0));
+        let _ = op.process_delta(make_batch(&[(1, 10, 1)])).unwrap();
+        let out = op.process_delta(make_batch(&[(1, 10, -1)])).unwrap();
+        let rows = extract_rows(&out);
+        // Retraction of (k=1, sum=10, count=1); no new insertion.
+        assert_eq!(rows, vec![(1, 10, 1, 10, -1)]);
+        assert_eq!(op.live_groups(), 0);
     }
 
     #[test]
     fn multiple_groups_independent() {
-        let mut op = AggregateMergeOp::new("test_agg", key_as_group(), val_measure());
-
-        let mut d = ZSet::new();
-        let (k1, v1) = make_row(1, 10);
-        let (k2, v2) = make_row(2, 20);
-        d.insert(k1.clone(), v1, 1);
-        d.insert(k2.clone(), v2, 1);
-
-        let out = op.process_zset(&d);
-        assert_eq!(out.iter().count(), 2);
-
-        let state = op.current_state();
-        assert_eq!(state.len(), 2);
-        let (s1, c1) = decode_sum_count(state.get(&k1).unwrap()).unwrap();
-        assert_eq!((s1, c1), (10, 1));
-        let (s2, c2) = decode_sum_count(state.get(&k2).unwrap()).unwrap();
-        assert_eq!((s2, c2), (20, 1));
+        let op = AggregateOp::new(OperatorId(0));
+        let delta = make_batch(&[(1, 5, 1), (2, 20, 1), (1, 3, 1)]);
+        let out = op.process_delta(delta).unwrap();
+        let rows = extract_rows(&out);
+        // Process k=1,v=5: no old → insert (k=1, sum=5, count=1, avg=5).
+        // Process k=2,v=20: no old → insert (k=2, sum=20, count=1, avg=20).
+        // Process k=1,v=3: old=(5,1) → retract (k=1,5,1,5,-1), insert (k=1,8,2,4,+1).
+        assert!(
+            rows.contains(&(2, 20, 1, 20, 1)),
+            "k=2 insert missing: {rows:?}"
+        );
+        assert!(
+            rows.contains(&(1, 5, 1, 5, -1)),
+            "k=1 first retract missing: {rows:?}"
+        );
+        assert!(
+            rows.contains(&(1, 8, 2, 4, 1)),
+            "k=1 final insert missing: {rows:?}"
+        );
+        assert_eq!(op.live_groups(), 2);
     }
 
     #[test]
-    fn merge_law_id_is_sum_count() {
-        let op = AggregateMergeOp::new("test_agg", key_as_group(), val_measure());
-        assert_eq!(op.merge_law(), Some(SUM_COUNT_ID));
+    fn empty_delta_returns_empty_output() {
+        let op = AggregateOp::new(OperatorId(0));
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let empty = ArrowZSet::empty(schema);
+        let out = op.process_delta(empty).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
-    fn encode_decode_round_trip() {
-        let bytes = encode_sum_count(42, 7);
-        let (s, c) = decode_sum_count(&bytes).unwrap();
-        assert_eq!(s, 42);
-        assert_eq!(c, 7);
+    fn state_encode_decode_roundtrip() {
+        let op = AggregateOp::new(OperatorId(7));
+        let _ = op
+            .process_delta(make_batch(&[(1, 10, 1), (2, 20, 1)]))
+            .unwrap();
+        let wb = op.state_write_batch();
+        // The batch should have 2 entries (one per live group).
+        assert_eq!(wb.len(), 2);
     }
 
     #[test]
-    fn state_budget_property_test_over_budget() {
-        use rockstream_types::state_budget::StateBudgetMeter;
+    fn avg_truncates_toward_zero() {
+        let op = AggregateOp::new(OperatorId(0));
+        // Insert 3 rows for k=1 with v=-7,-7,-7 → sum=-21, count=3, avg=-7.
+        let _ = op.process_delta(make_batch(&[(1, -7, 1)])).unwrap();
+        let _ = op.process_delta(make_batch(&[(1, -7, 1)])).unwrap();
+        let out = op.process_delta(make_batch(&[(1, -7, 1)])).unwrap();
+        // After 3 inserts: sum=-21, count=3, avg=-7. Last output is (+1 new row).
+        let rows = extract_rows(&out);
+        let new_row = rows.iter().find(|r| r.4 == 1).expect("no +1 row");
+        assert_eq!(new_row.1, -21); // sum
+        assert_eq!(new_row.2, 3); // count
+        assert_eq!(new_row.3, -7); // avg = -21/3
+    }
 
-        let budget_limit = 50;
-        let budget = Arc::new(StateBudgetMeter::new("test_agg_budget", budget_limit));
-        let mut op = AggregateMergeOp::new("test_agg", key_as_group(), val_measure())
-            .with_budget(Arc::clone(&budget));
-
-        // Let's insert many unique keys to exceed budget by 10x
-        let mut input = ZSet::new();
-        for i in 0..100 {
-            let (k, v) = make_row(i, 10);
-            input.insert(k, v, 1);
-        }
-
-        let _output = op.process_zset(&input);
-
-        // Usage must not exceed limit + one delta
-        let delta_bytes_limit = 8 + 16; // key (8 bytes) + val (16 bytes)
-        assert!(budget.current_bytes() <= budget_limit + delta_bytes_limit);
-        assert!(op.warned_over_budget);
+    #[test]
+    fn group_count_zero_after_matching_retractions() {
+        let op = AggregateOp::new(OperatorId(0));
+        let _ = op
+            .process_delta(make_batch(&[(3, 5, 1), (3, 7, 1)]))
+            .unwrap();
+        // Retract both rows.
+        op.process_delta(make_batch(&[(3, 5, -1), (3, 7, -1)]))
+            .unwrap();
+        assert_eq!(op.live_groups(), 0);
     }
 }

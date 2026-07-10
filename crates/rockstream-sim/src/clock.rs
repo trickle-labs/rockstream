@@ -41,18 +41,20 @@ impl Clock for TokioClock {
     }
 }
 
+use std::sync::Arc;
+
 /// Simulation clock with manually advanceable time.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SimClock {
     epoch: Instant,
-    offset: parking_lot::Mutex<Duration>,
+    offset: Arc<parking_lot::Mutex<Duration>>,
 }
 
 impl SimClock {
     pub fn new() -> Self {
         Self {
             epoch: Instant::now(),
-            offset: parking_lot::Mutex::new(Duration::ZERO),
+            offset: Arc::new(parking_lot::Mutex::new(Duration::ZERO)),
         }
     }
 

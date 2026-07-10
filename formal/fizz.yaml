@@ -1,0 +1,5 @@
+# FizzBee Configuration File
+options:
+  max_actions: 30
+  crash_on_yield: false
+deadlock_detection: false

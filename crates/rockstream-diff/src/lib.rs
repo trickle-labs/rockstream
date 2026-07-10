@@ -1,365 +1,384 @@
 //! DiffCtx differentiation pass for RockStream IVM.
 //!
-//! Implements the differentiation rules that transform logical `PlanNode`s
-//! into physical `OpNode` execution graphs. Each logical node is mapped to
-//! one or more physical operators with merge-law annotations attached by
-//! the differentiator.
+//! Transforms a `PlanNode` logical plan into a `PhysicalPlan` — a flat list of
+//! `OpNode` physical operators with input-output edges.
+//!
+//! ## v0.4 scope
+//!
+//! - Linear-operator rules for `Filter`, `Project`, `Map`, `Source`,
+//!   `ViewSink`, and `Exchange` (stub).
+//!
+//! ## v0.5 scope
+//!
+//! - Stateful aggregate rule for `Aggregate` (SUM/COUNT/AVG).
+//!
+//! ## DBSP linear-operator rule
+//!
+//! For any linear function `F`, `ΔF(Δx) = F(Δx)`.
+//! Filter, Project, and Map are all linear: they are applied unchanged to
+//! every incoming delta batch. The differentiation pass therefore emits a
+//! physical plan identical in structure to the logical plan for these nodes.
+//!
+//! ## DBSP aggregate-operator rule
+//!
+//! `Aggregate` is not linear. Its differentiation requires an arrangement
+//! (the `AggState`): for each input delta `(k, v, w)`, the rule is:
+//! `Δagg(k) = (new_agg(k), +1) ⊎ (old_agg(k), -1)` when the state changes.
 
-use rockstream_plan::{
-    AggregateFunc, NotMergeSafeReason, OpKind, OpNode, PlanNode, WindowFunc, WindowStrategy,
-};
-use rockstream_types::ids::OperatorId;
-use rockstream_types::laws::bloom_union::BLOOM_UNION_ID;
-use rockstream_types::laws::hyper_log_log::HLL_ID;
-use rockstream_types::laws::max_register::MAX_REGISTER_ID;
-use rockstream_types::laws::min_register::MIN_REGISTER_ID;
-use rockstream_types::laws::sum_count::SUM_COUNT_ID;
-use rockstream_types::laws::weight_add::WEIGHT_ADD_ID;
-use rockstream_types::merge_law::MergeLawId;
+use rockstream_plan::{OpKind, OpNode, PlanNode, WindowFunc, WindowStrategy};
+use rockstream_types::{explain::NotMergeSafeReason, ids::OperatorId};
 
-/// The differentiation context: transforms a logical plan into a physical
-/// operator graph with merge-law annotations.
+/// Error returned by the differentiation pass.
+#[derive(Debug, thiserror::Error)]
+pub enum DiffError {
+    /// A plan node that is not yet implemented in this version.
+    #[error(
+        "RS-1014: unsupported plan node '{0}' in v0.5 — this operator arrives in a later version"
+    )]
+    UnsupportedNode(String),
+}
+
+/// The output of the differentiation pass.
+#[derive(Debug, Default)]
+pub struct PhysicalPlan {
+    /// Operators in topological order (sources first, sinks last).
+    pub ops: Vec<OpNode>,
+}
+
+impl PhysicalPlan {
+    /// Return the ID of the last operator in the plan (typically the sink).
+    pub fn output_op_id(&self) -> Option<OperatorId> {
+        self.ops.last().map(|op| op.id)
+    }
+}
+
+/// The differentiation pass context.
+///
+/// Walk a `PlanNode` tree, assign `OperatorId`s, and emit `OpNode`s.
 pub struct DiffCtx {
     next_id: u64,
 }
 
 impl DiffCtx {
-    /// Create a new differentiation context.
+    /// Create a new context, starting operator IDs at 0.
     pub fn new() -> Self {
-        Self { next_id: 0 }
+        DiffCtx { next_id: 0 }
     }
 
-    /// Differentiate a logical plan into a physical operator graph.
-    ///
-    /// Returns a topologically-sorted list of `OpNode`s (sources first,
-    /// sinks last).
-    pub fn differentiate(&mut self, plan: &PlanNode) -> Vec<OpNode> {
-        let mut nodes = Vec::new();
-        self.diff_node(plan, &mut nodes);
-        nodes
-    }
-
-    fn alloc_id(&mut self) -> OperatorId {
-        let id = OperatorId(self.next_id);
+    fn next_op_id(&mut self) -> OperatorId {
+        let id = self.next_id;
         self.next_id += 1;
-        id
+        OperatorId(id)
     }
 
-    fn diff_node(&mut self, plan: &PlanNode, nodes: &mut Vec<OpNode>) -> OperatorId {
-        match plan {
+    /// Differentiate a `PlanNode` tree, returning the `PhysicalPlan`.
+    pub fn differentiate(&mut self, plan: &PlanNode) -> Result<PhysicalPlan, DiffError> {
+        let mut ops = Vec::new();
+        self.diff_node(plan, &mut ops)?;
+        Ok(PhysicalPlan { ops })
+    }
+
+    /// Recursively differentiate one node and push its `OpNode` to `ops`.
+    /// Returns the `OperatorId` of the emitted operator.
+    fn diff_node(
+        &mut self,
+        node: &PlanNode,
+        ops: &mut Vec<OpNode>,
+    ) -> Result<OperatorId, DiffError> {
+        match node {
+            // ── Source ────────────────────────────────────────────────────
             PlanNode::Source { name } => {
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
                     kind: OpKind::Source { name: name.clone() },
                     merge_law: None,
-                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    not_merge_safe_reason: None,
                     inputs: vec![],
                 });
-                id
+                Ok(id)
             }
+
+            // ── Filter (linear) ───────────────────────────────────────────
+            // DBSP rule: ΔFilter(Δx) = Filter(Δx)
             PlanNode::Filter { input, .. } => {
-                let input_id = self.diff_node(input, nodes);
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
                     kind: OpKind::Filter,
                     merge_law: None,
-                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    not_merge_safe_reason: None,
                     inputs: vec![input_id],
                 });
-                id
+                Ok(id)
             }
+
+            // ── Project (linear) ──────────────────────────────────────────
+            // DBSP rule: ΔProject(Δx) = Project(Δx)
             PlanNode::Project { input, .. } => {
-                let input_id = self.diff_node(input, nodes);
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
                     kind: OpKind::Project,
                     merge_law: None,
-                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    not_merge_safe_reason: None,
                     inputs: vec![input_id],
                 });
-                id
+                Ok(id)
             }
+
+            // ── Map (linear) ──────────────────────────────────────────────
+            // DBSP rule: ΔMap(Δx) = Map(Δx)
             PlanNode::Map { input, .. } => {
-                let input_id = self.diff_node(input, nodes);
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
                     kind: OpKind::Map,
                     merge_law: None,
-                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    not_merge_safe_reason: None,
                     inputs: vec![input_id],
                 });
-                id
+                Ok(id)
             }
-            PlanNode::Aggregate {
-                input, aggregates, ..
+
+            // ── ViewSink ──────────────────────────────────────────────────
+            PlanNode::ViewSink {
+                view_name,
+                pk,
+                child,
             } => {
-                let input_id = self.diff_node(input, nodes);
-                let id = self.alloc_id();
-                let (law, reason) = self.law_for_aggregate(aggregates);
-                nodes.push(OpNode {
+                let input_id = self.diff_node(child, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::ViewSink {
+                        view_name: view_name.clone(),
+                        pk: pk.clone(),
+                    },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
+            // ── Exchange stub ─────────────────────────────────────────────
+            // In v0.4, Exchange is always Loopback: data passes through.
+            PlanNode::Exchange { kind, child } => {
+                let input_id = self.diff_node(child, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Exchange { kind: *kind },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
+            // ── Aggregate (v0.5) ──────────────────────────────────────────
+            // DBSP stateful rule: for each (k, v, w) delta, compute
+            // Δagg(k) = (new_state(k), +1) ⊎ (old_state(k), -1) via
+            // the AggState arrangement in `AggregateOp`.
+            PlanNode::Aggregate { input, .. } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
                     kind: OpKind::Aggregate,
-                    merge_law: law,
-                    not_merge_safe_reason: reason,
+                    merge_law: None,
+                    not_merge_safe_reason: None,
                     inputs: vec![input_id],
                 });
-                id
+                Ok(id)
             }
-            PlanNode::Join { left, right, .. } => {
-                let left_id = self.diff_node(left, nodes);
-                let right_id = self.diff_node(right, nodes);
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+
+            // ── OuterJoin (v0.9 — IVM-5) ─────────────────────────────────
+            PlanNode::OuterJoin {
+                left,
+                right,
+                kind,
+                left_keys,
+                right_keys,
+                ..
+            } => {
+                let left_id = self.diff_node(left, ops)?;
+                let right_id = self.diff_node(right, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
-                    kind: OpKind::Join,
-                    merge_law: Some(WEIGHT_ADD_ID),
+                    kind: OpKind::OuterJoin {
+                        kind: *kind,
+                        left_keys: left_keys.clone(),
+                        right_keys: right_keys.clone(),
+                    },
+                    merge_law: None,
                     not_merge_safe_reason: None,
                     inputs: vec![left_id, right_id],
                 });
-                id
+                Ok(id)
             }
-            PlanNode::Union { left, right } => {
-                let left_id = self.diff_node(left, nodes);
-                let right_id = self.diff_node(right, nodes);
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+
+            // ── Distinct (v0.10 — IVM-6) ─────────────────────────────────
+            PlanNode::Distinct { input, .. } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
-                    kind: OpKind::Union,
+                    kind: OpKind::Distinct,
                     merge_law: None,
-                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
+            // ── Intersect (v0.10 — IVM-6) ────────────────────────────────
+            PlanNode::Intersect {
+                left, right, all, ..
+            } => {
+                let left_id = self.diff_node(left, ops)?;
+                let right_id = self.diff_node(right, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Intersect { all: *all },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
                     inputs: vec![left_id, right_id],
                 });
-                id
+                Ok(id)
             }
+
+            // ── Except (v0.10 — IVM-6) ───────────────────────────────────
+            PlanNode::Except {
+                left, right, all, ..
+            } => {
+                let left_id = self.diff_node(left, ops)?;
+                let right_id = self.diff_node(right, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Except { all: *all },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![left_id, right_id],
+                });
+                Ok(id)
+            }
+
+            // ── Window (v0.11 — IVM-7) ────────────────────────────────────────
             PlanNode::Window {
                 input,
                 window_exprs,
             } => {
-                let input_id = self.diff_node(input, nodes);
-                let id = self.alloc_id();
-                let has_sliding = window_exprs.iter().any(|we| {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                let strategy = if window_exprs.iter().any(|e| {
                     matches!(
-                        we.func,
+                        e.func,
                         WindowFunc::SlidingSum { .. } | WindowFunc::SlidingAvg { .. }
                     )
-                });
-                let (strategy, law, reason) = if has_sliding {
-                    (WindowStrategy::SlidingAggregate, Some(SUM_COUNT_ID), None)
+                }) {
+                    WindowStrategy::SlidingAggregate
                 } else {
-                    (
-                        WindowStrategy::PartitionRecompute,
-                        None,
-                        Some(NotMergeSafeReason::PartitionRecomputation),
-                    )
+                    WindowStrategy::PartitionRecompute
                 };
-                nodes.push(OpNode {
+                ops.push(OpNode {
                     id,
                     kind: OpKind::Window { strategy },
-                    merge_law: law,
-                    not_merge_safe_reason: reason,
+                    merge_law: None,
+                    not_merge_safe_reason: Some(NotMergeSafeReason::PartitionRecomputation),
                     inputs: vec![input_id],
                 });
-                id
+                Ok(id)
             }
+
+            // ── TumbleWindow (v0.12 — IVM-8) ─────────────────────────────
             PlanNode::TumbleWindow {
                 input,
-                time_col: _,
                 window_size_ms,
                 late_data_policy,
+                ..
             } => {
-                let input_id = self.diff_node(input, nodes);
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
                     kind: OpKind::TumbleWindow {
                         window_size_ms: *window_size_ms,
                         late_data_policy: late_data_policy.clone(),
                     },
-                    // Watermark state uses MaxRegister/v1 (semilattice,
-                    // idempotent).
-                    merge_law: Some(MAX_REGISTER_ID),
+                    merge_law: None,
                     not_merge_safe_reason: None,
                     inputs: vec![input_id],
                 });
-                id
+                Ok(id)
             }
+
+            // ── TopK (v0.12 — IVM-9) ─────────────────────────────────────
             PlanNode::TopK {
                 input,
                 k,
                 rank_col,
                 partition_by,
             } => {
-                let input_id = self.diff_node(input, nodes);
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
                     kind: OpKind::TopK {
                         k: *k,
                         rank_col: *rank_col,
                         partition_by: partition_by.clone(),
                     },
-                    // Row weight state uses WeightAdd/v1 (abelian group).
-                    merge_law: Some(WEIGHT_ADD_ID),
+                    merge_law: None,
                     not_merge_safe_reason: None,
                     inputs: vec![input_id],
                 });
-                id
+                Ok(id)
             }
+
+            // ── Snapshot (v0.13) ──────────────────────────────────────────
             PlanNode::Snapshot {
                 source_name,
                 batch_size,
             } => {
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
                     kind: OpKind::Snapshot {
                         source_name: source_name.clone(),
                         batch_size: *batch_size,
                     },
-                    // Snapshot is a stateless insert-only source: rows are
-                    // emitted as positive-weight Z-set entries with no
-                    // arrangement.  WeightAdd/v1 governs the downstream
-                    // accumulation of snapshot rows.
                     merge_law: None,
-                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    not_merge_safe_reason: None,
                     inputs: vec![],
                 });
-                id
+                Ok(id)
             }
+
+            // ── ViewRef (v0.13) ───────────────────────────────────────────
             PlanNode::ViewRef { view_name } => {
-                let id = self.alloc_id();
-                nodes.push(OpNode {
+                let id = self.next_op_id();
+                ops.push(OpNode {
                     id,
                     kind: OpKind::ViewRef {
                         view_name: view_name.clone(),
                     },
-                    // ViewRef is structurally a source at the physical level:
-                    // it reads CDC deltas from an upstream materialized view.
-                    // No local arrangement; cadence inheritance and frontier
-                    // meet are handled by the scheduler.
                     merge_law: None,
-                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    not_merge_safe_reason: None,
                     inputs: vec![],
                 });
-                id
+                Ok(id)
             }
-            PlanNode::Lateral { input, func } => {
-                let input_id = self.diff_node(input, nodes);
-                let id = self.alloc_id();
-                nodes.push(OpNode {
-                    id,
-                    kind: OpKind::Lateral { func: func.clone() },
-                    // Lateral/SRF is stateless: it maps each input row to
-                    // zero or more output rows with no arrangement.  A
-                    // retracted input row retracts exactly its output rows.
-                    merge_law: None,
-                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
-                    inputs: vec![input_id],
-                });
-                id
-            }
-            PlanNode::Recursion {
-                base,
-                step,
-                max_iterations,
-                monotone,
-            } => {
-                let base_id = self.diff_node(base, nodes);
-                let step_id = self.diff_node(step, nodes);
-                let id = self.alloc_id();
-                // Monotone recursion: WeightAdd/v1 (abelian group, insert-only
-                // terms).  complete_through is published once converged.
-                // Non-monotone: DRed escape hatch — still WeightAdd/v1 for the
-                // arrangement, but flagged with RecursionDredRequired because
-                // retractions require read-modify-write and are rejected at
-                // runtime with RS-1509.
-                let reason = if *monotone {
-                    None
-                } else {
-                    Some(NotMergeSafeReason::RecursionDredRequired)
-                };
-                nodes.push(OpNode {
-                    id,
-                    kind: OpKind::Recursion {
-                        max_iterations: *max_iterations,
-                        monotone: *monotone,
-                    },
-                    merge_law: Some(WEIGHT_ADD_ID),
-                    not_merge_safe_reason: reason,
-                    inputs: vec![base_id, step_id],
-                });
-                id
-            }
-        }
-    }
 
-    /// Determine the merge law for an aggregate node based on its functions.
-    ///
-    /// For SUM/COUNT/AVG, the `WeightAdd/v1` abelian-group law applies.
-    ///
-    /// For MIN/MAX, the operator uses an indexed multiset (BTreeMap) for
-    /// retraction-aware correctness, but reports the cached-slot law for
-    /// `EXPLAIN INCREMENTAL`:
-    /// - MAX → `MaxRegister/v1` (semilattice: `merge = max`)
-    /// - MIN → `MinRegister/v1` (semilattice: `merge = min`)
-    ///
-    /// Both extremum variants also carry `ExtremumRequiresRmw` because
-    /// `get_merged()` on the storage arrangement alone is insufficient after
-    /// retractions — the operator's prefix-scan rescan is required.
-    ///
-    /// For APPROX_COUNT_DISTINCT, `HyperLogLog/v1` is used (semilattice,
-    /// non-invertible).  Retraction-aware correctness requires a full sketch
-    /// rescan; `ExtremumRequiresRmw` is reported.
-    ///
-    /// For APPROX_MEMBERSHIP, `BloomUnion/v1` is used (semilattice,
-    /// non-invertible).  Same `ExtremumRequiresRmw` requirement.
-    fn law_for_aggregate(
-        &self,
-        aggregates: &[rockstream_plan::AggregateExpr],
-    ) -> (Option<MergeLawId>, Option<NotMergeSafeReason>) {
-        let has_max = aggregates
-            .iter()
-            .any(|a| matches!(a.func, AggregateFunc::Max));
-        let has_min = aggregates
-            .iter()
-            .any(|a| matches!(a.func, AggregateFunc::Min));
-        let has_approx_distinct = aggregates
-            .iter()
-            .any(|a| matches!(a.func, AggregateFunc::ApproxCountDistinct));
-        let has_approx_membership = aggregates
-            .iter()
-            .any(|a| matches!(a.func, AggregateFunc::ApproxMembership));
-
-        if has_max {
-            // MAX aggregate: cached slot uses MaxRegister/v1.
-            (
-                Some(MAX_REGISTER_ID),
-                Some(NotMergeSafeReason::ExtremumRequiresRmw),
-            )
-        } else if has_min {
-            // MIN aggregate: cached slot uses MinRegister/v1.
-            (
-                Some(MIN_REGISTER_ID),
-                Some(NotMergeSafeReason::ExtremumRequiresRmw),
-            )
-        } else if has_approx_distinct {
-            // APPROX_COUNT_DISTINCT: HyperLogLog/v1 (semilattice).
-            // Non-invertible; retraction requires sketch rescan.
-            (Some(HLL_ID), Some(NotMergeSafeReason::ExtremumRequiresRmw))
-        } else if has_approx_membership {
-            // APPROX_MEMBERSHIP: BloomUnion/v1 (semilattice).
-            // Non-invertible; retraction requires full filter rescan.
-            (
-                Some(BLOOM_UNION_ID),
-                Some(NotMergeSafeReason::ExtremumRequiresRmw),
-            )
-        } else {
-            // SUM / COUNT / AVG: fully invertible via WeightAdd/v1.
-            (Some(WEIGHT_ADD_ID), None)
+            // ── Not yet implemented in v0.5 ───────────────────────────────
+            other => Err(DiffError::UnsupportedNode(format!("{other:?}"))),
         }
     }
 }
@@ -373,36 +392,87 @@ impl Default for DiffCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rockstream_plan::{AggregateExpr, AggregateFunc, Expr};
+    use rockstream_plan::{BinaryOp, ExchangeKind, Expr, PlanNode};
 
-    #[test]
-    fn diff_source_filter_project() {
-        let plan = PlanNode::Project {
-            input: Box::new(PlanNode::Filter {
-                input: Box::new(PlanNode::Source {
-                    name: "orders".into(),
+    fn lit(v: i64) -> Expr {
+        Expr::Literal(v.to_be_bytes().to_vec())
+    }
+
+    /// Build: Source("t") → Filter(b*2>10) → Project(a, b*2 AS c) → ViewSink("v")
+    fn make_plan() -> PlanNode {
+        let src = PlanNode::Source { name: "t".into() };
+        let filtered = PlanNode::Filter {
+            input: Box::new(src),
+            predicate: Expr::BinaryOp {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::BinaryOp {
+                    op: BinaryOp::Mul,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(lit(2)),
                 }),
-                predicate: Expr::Column(0),
-            }),
-            columns: vec![Expr::Column(0)],
+                right: Box::new(lit(10)),
+            },
         };
-
-        let mut ctx = DiffCtx::new();
-        let nodes = ctx.differentiate(&plan);
-        assert_eq!(nodes.len(), 3);
-        assert!(matches!(nodes[0].kind, OpKind::Source { .. }));
-        assert!(matches!(nodes[1].kind, OpKind::Filter));
-        assert!(matches!(nodes[2].kind, OpKind::Project));
-        // All stateless — no merge law
-        assert!(nodes.iter().all(|n| n.merge_law.is_none()));
+        let projected = PlanNode::Project {
+            input: Box::new(filtered),
+            columns: vec![
+                Expr::Column(0),
+                Expr::BinaryOp {
+                    op: BinaryOp::Mul,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(lit(2)),
+                },
+            ],
+        };
+        PlanNode::ViewSink {
+            view_name: "v".into(),
+            pk: vec![0],
+            child: Box::new(projected),
+        }
     }
 
     #[test]
-    fn diff_sum_aggregate_gets_weight_add() {
-        let plan = PlanNode::Aggregate {
-            input: Box::new(PlanNode::Source {
-                name: "sales".into(),
-            }),
+    fn diff_filter_project_view_sink() {
+        let plan = make_plan();
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        // Source(op0) → Filter(op1) → Project(op2) → ViewSink(op3)
+        assert_eq!(physical.ops.len(), 4);
+        assert!(matches!(physical.ops[0].kind, OpKind::Source { .. }));
+        assert!(matches!(physical.ops[1].kind, OpKind::Filter));
+        assert!(matches!(physical.ops[2].kind, OpKind::Project));
+        assert!(matches!(physical.ops[3].kind, OpKind::ViewSink { .. }));
+        // Check input edges
+        assert_eq!(physical.ops[1].inputs, vec![OperatorId(0)]);
+        assert_eq!(physical.ops[2].inputs, vec![OperatorId(1)]);
+        assert_eq!(physical.ops[3].inputs, vec![OperatorId(2)]);
+    }
+
+    #[test]
+    fn diff_exchange_stub_loopback() {
+        let src = PlanNode::Source { name: "t".into() };
+        let exchange = PlanNode::Exchange {
+            kind: ExchangeKind::Loopback,
+            child: Box::new(src),
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&exchange).unwrap();
+        assert_eq!(physical.ops.len(), 2);
+        assert!(matches!(
+            physical.ops[1].kind,
+            OpKind::Exchange {
+                kind: ExchangeKind::Loopback
+            }
+        ));
+    }
+
+    #[test]
+    fn diff_aggregate_emits_aggregate_op() {
+        // v0.5: Aggregate is now supported — DiffCtx must emit OpKind::Aggregate.
+        use rockstream_plan::AggregateExpr;
+        use rockstream_plan::AggregateFunc;
+        let aggregate = PlanNode::Aggregate {
+            input: Box::new(PlanNode::Source { name: "t".into() }),
             group_by: vec![Expr::Column(0)],
             aggregates: vec![AggregateExpr {
                 func: AggregateFunc::Sum,
@@ -410,91 +480,159 @@ mod tests {
                 distinct: false,
             }],
         };
-
         let mut ctx = DiffCtx::new();
-        let nodes = ctx.differentiate(&plan);
-        let agg = nodes
-            .iter()
-            .find(|n| matches!(n.kind, OpKind::Aggregate))
-            .unwrap();
-        assert_eq!(agg.merge_law, Some(WEIGHT_ADD_ID));
-        assert!(agg.not_merge_safe_reason.is_none());
+        let physical = ctx.differentiate(&aggregate).unwrap();
+        // Source(op0) → Aggregate(op1)
+        assert_eq!(physical.ops.len(), 2);
+        assert!(matches!(physical.ops[0].kind, OpKind::Source { .. }));
+        assert!(matches!(physical.ops[1].kind, OpKind::Aggregate));
+        assert_eq!(physical.ops[1].inputs, vec![OperatorId(0)]);
     }
 
     #[test]
-    fn diff_min_aggregate_not_merge_safe() {
-        use rockstream_types::laws::min_register::MIN_REGISTER_ID;
-
-        let plan = PlanNode::Aggregate {
-            input: Box::new(PlanNode::Source {
-                name: "temps".into(),
-            }),
-            group_by: vec![Expr::Column(0)],
-            aggregates: vec![AggregateExpr {
-                func: AggregateFunc::Min,
-                input: Expr::Column(1),
-                distinct: false,
-            }],
+    fn diff_tumble_window_emits_tumble_window_op() {
+        use rockstream_plan::LateDataPolicy;
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::TumbleWindow {
+            input: Box::new(src),
+            time_col: 0,
+            window_size_ms: 1000,
+            late_data_policy: LateDataPolicy::Drop,
         };
-
         let mut ctx = DiffCtx::new();
-        let nodes = ctx.differentiate(&plan);
-        let agg = nodes
+        let physical = ctx.differentiate(&plan).unwrap();
+        assert_eq!(physical.ops.len(), 2);
+        let tw_op = physical
+            .ops
             .iter()
-            .find(|n| matches!(n.kind, OpKind::Aggregate))
-            .unwrap();
-        // v0.8: MIN uses MinRegister/v1 as the cached-slot law (EXPLAIN INCREMENTAL).
-        assert_eq!(agg.merge_law, Some(MIN_REGISTER_ID));
-        assert_eq!(
-            agg.not_merge_safe_reason,
-            Some(NotMergeSafeReason::ExtremumRequiresRmw)
-        );
+            .find(|op| matches!(op.kind, OpKind::TumbleWindow { .. }));
+        assert!(tw_op.is_some(), "must contain exactly one TumbleWindow op");
+        if let OpKind::TumbleWindow { window_size_ms, .. } = &tw_op.unwrap().kind {
+            assert_eq!(*window_size_ms, 1000);
+        }
     }
 
     #[test]
-    fn diff_max_aggregate_uses_max_register() {
-        use rockstream_types::laws::max_register::MAX_REGISTER_ID;
-
-        let plan = PlanNode::Aggregate {
-            input: Box::new(PlanNode::Source {
-                name: "prices".into(),
-            }),
-            group_by: vec![Expr::Column(0)],
-            aggregates: vec![AggregateExpr {
-                func: AggregateFunc::Max,
-                input: Expr::Column(1),
-                distinct: false,
-            }],
+    fn diff_topk_emits_topk_op() {
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::TopK {
+            input: Box::new(src),
+            k: 5,
+            rank_col: 1,
+            partition_by: vec![0],
         };
-
         let mut ctx = DiffCtx::new();
-        let nodes = ctx.differentiate(&plan);
-        let agg = nodes
+        let physical = ctx.differentiate(&plan).unwrap();
+        assert_eq!(physical.ops.len(), 2);
+        let tk_op = physical
+            .ops
             .iter()
-            .find(|n| matches!(n.kind, OpKind::Aggregate))
-            .unwrap();
-        // v0.8: MAX uses MaxRegister/v1 as the cached-slot law (EXPLAIN INCREMENTAL).
-        assert_eq!(agg.merge_law, Some(MAX_REGISTER_ID));
-        assert_eq!(
-            agg.not_merge_safe_reason,
-            Some(NotMergeSafeReason::ExtremumRequiresRmw)
-        );
+            .find(|op| matches!(op.kind, OpKind::TopK { .. }));
+        assert!(tk_op.is_some(), "must contain exactly one TopK op");
+        if let OpKind::TopK {
+            k,
+            rank_col,
+            partition_by,
+        } = &tk_op.unwrap().kind
+        {
+            assert_eq!(*k, 5);
+            assert_eq!(*rank_col, 1);
+            assert_eq!(*partition_by, vec![0]);
+        }
     }
 
     #[test]
-    fn diff_join_uses_weight_add() {
-        let plan = PlanNode::Join {
+    fn diff_unsupported_node_returns_error() {
+        // v0.5: Use a node that is not yet supported (Join).
+        let join = PlanNode::Join {
             left: Box::new(PlanNode::Source { name: "a".into() }),
             right: Box::new(PlanNode::Source { name: "b".into() }),
             condition: Expr::Column(0),
         };
-
         let mut ctx = DiffCtx::new();
-        let nodes = ctx.differentiate(&plan);
-        let join = nodes
+        let result = ctx.differentiate(&join);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn diff_window_emits_op_with_partition_recompute_reason() {
+        use rockstream_plan::{WindowExpr, WindowFunc, WindowStrategy};
+        use rockstream_types::explain::NotMergeSafeReason;
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::Window {
+            input: Box::new(src),
+            window_exprs: vec![WindowExpr {
+                func: WindowFunc::RowNumber,
+                partition_by: vec![0],
+                order_by: vec![1],
+            }],
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        let window_op = physical
+            .ops
             .iter()
-            .find(|n| matches!(n.kind, OpKind::Join))
-            .unwrap();
-        assert_eq!(join.merge_law, Some(WEIGHT_ADD_ID));
+            .find(|op| matches!(op.kind, OpKind::Window { .. }))
+            .expect("Window op must be present");
+        assert_eq!(
+            window_op.kind,
+            OpKind::Window {
+                strategy: WindowStrategy::PartitionRecompute
+            }
+        );
+        assert_eq!(
+            window_op.not_merge_safe_reason,
+            Some(NotMergeSafeReason::PartitionRecomputation)
+        );
+    }
+
+    #[test]
+    fn diff_window_sliding_emits_sliding_aggregate_strategy() {
+        use rockstream_plan::{WindowExpr, WindowFunc, WindowStrategy};
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::Window {
+            input: Box::new(src),
+            window_exprs: vec![WindowExpr {
+                func: WindowFunc::SlidingSum { frame_rows: 3 },
+                partition_by: vec![0],
+                order_by: vec![1],
+            }],
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        let window_op = physical
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::Window { .. }))
+            .expect("Window op must be present");
+        assert_eq!(
+            window_op.kind,
+            OpKind::Window {
+                strategy: WindowStrategy::SlidingAggregate
+            }
+        );
+    }
+
+    #[test]
+    fn linear_rule_filter_is_identity_diff() {
+        // For a linear operator F, ΔF(Δx) = F(Δx).
+        // Verify: the diff of Filter produces exactly one Filter OpNode.
+        let src = PlanNode::Source { name: "t".into() };
+        let filter = PlanNode::Filter {
+            input: Box::new(src),
+            predicate: Expr::BinaryOp {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column(0)),
+                right: Box::new(lit(0)),
+            },
+        };
+        let mut ctx = DiffCtx::new();
+        let plan = ctx.differentiate(&filter).unwrap();
+        let filter_ops: Vec<_> = plan
+            .ops
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::Filter))
+            .collect();
+        assert_eq!(filter_ops.len(), 1);
     }
 }

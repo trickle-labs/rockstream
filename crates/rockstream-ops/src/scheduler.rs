@@ -1,157 +1,174 @@
-//! Cooperative scheduler configuration and yield-ratio metric (DESIGN.md §9.3).
+//! Credit-based scheduler for the operator pipeline.
 //!
-//! Workers run operator tasks as tokio async tasks on a shared thread pool. A
-//! large recomputation can hold the tokio executor long enough to starve
-//! heartbeat sends. To prevent this, every operator loop is bounded by a
-//! **records-per-quantum** limit. When an operator has more work remaining
-//! after consuming its quantum, it yields via `tokio::task::yield_now()`.
+//! The `CreditScheduler` wires a chain of operators together using bounded
+//! Tokio `mpsc` channels.  Each channel's capacity is the credit window
+//! (see `OPERATOR_CHANNEL_CAPACITY`).  When a downstream channel is full,
+//! the upstream task suspends — this is credit-based backpressure.
 //!
-//! The `scheduler_yield_ratio` metric (fraction of epochs that hit the quantum
-//! limit) is the observable proof that cooperative scheduling is active.
+//! In v0.4 the scheduler handles linear chains only (Source → Op* → Sink).
+//! Multi-input operators and Exchange routing arrive in later versions.
+//!
+//! # Named bounds
+//! Every inter-operator channel has capacity `OPERATOR_CHANNEL_CAPACITY`
+//! (= 16 batches).  This is the "fill-level upper bound" required by the
+//! design's "unbounded accumulation is never acceptable" rule.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
-/// Per-pipeline configuration for the cooperative scheduler.
+use tokio::sync::mpsc::{self, Sender};
+
+use crate::op::Operator;
+use crate::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
+use crate::zset::ArrowZSet;
+
+/// A linear-chain scheduler.
 ///
-/// All values have sensible defaults so callers that don't care can use
-/// `SchedulerConfig::default()`.
-#[derive(Debug, Clone)]
-pub struct SchedulerConfig {
-    /// Maximum number of rows an operator processes per tokio poll quantum.
-    ///
-    /// When an input epoch contains more rows than this limit, the operator
-    /// task processes `max_rows_per_quantum` rows, emits a partial output,
-    /// calls `tokio::task::yield_now()`, and is re-scheduled. This prevents
-    /// one expensive epoch from starving heartbeat sends and frontier reports.
-    ///
-    /// Default: 65536 (per DESIGN.md §9.3).
-    pub max_rows_per_quantum: u64,
+/// Call `push_op` for each operator in pipeline order, then call `build` to
+/// obtain the input sender (to inject source batches) and the output receiver
+/// (to collect sink results).
+pub struct CreditScheduler {
+    /// Operators queued in pipeline order.
+    ops: Vec<Arc<dyn Operator>>,
+    /// Shared gRPC call counter (must stay 0 in embedded mode).
+    grpc_call_count: Arc<AtomicU64>,
+    /// Shared shuffle-write counter (must stay 0 in embedded mode).
+    shuffle_write_count: Arc<AtomicU64>,
 }
 
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            max_rows_per_quantum: 65_536,
+impl CreditScheduler {
+    /// Create a new empty scheduler.
+    pub fn new(grpc_call_count: Arc<AtomicU64>, shuffle_write_count: Arc<AtomicU64>) -> Self {
+        CreditScheduler {
+            ops: Vec::new(),
+            grpc_call_count,
+            shuffle_write_count,
         }
     }
-}
 
-/// Shared counters for the `scheduler_yield_ratio` metric.
-///
-/// Cloning is cheap (Arc-backed). The same `YieldCounter` can be shared
-/// between the operator task and any monitoring path.
-#[derive(Debug, Default, Clone)]
-pub struct YieldCounter {
-    inner: Arc<YieldCounterInner>,
-}
-
-#[derive(Debug, Default)]
-struct YieldCounterInner {
-    /// Total number of epochs for which a ProcessDelta was dispatched.
-    epoch_count: AtomicU64,
-    /// Number of those epochs where the quantum limit was hit (yield occurred).
-    yield_epoch_count: AtomicU64,
-}
-
-impl YieldCounter {
-    /// Create a new counter starting at zero.
-    pub fn new() -> Self {
-        Self::default()
+    /// Append an operator at the end of the pipeline chain.
+    pub fn push_op(&mut self, op: Arc<dyn Operator>) {
+        self.ops.push(op);
     }
 
-    /// Record that one epoch was processed.
-    pub fn record_epoch(&self) {
-        self.inner.epoch_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record that this epoch hit the quantum limit and caused a yield.
+    /// Build the pipeline: spawn all operator tasks and return the
+    /// (source sender, sink receiver) pair.
     ///
-    /// Call this at most once per epoch (multiple yields within a single
-    /// epoch still count as one yield-epoch in the ratio).
-    pub fn record_yield(&self) {
-        self.inner.yield_epoch_count.fetch_add(1, Ordering::Relaxed);
-    }
+    /// Must be called inside a Tokio runtime.
+    pub fn build(self) -> (Sender<ArrowZSet>, mpsc::Receiver<ArrowZSet>) {
+        let n = self.ops.len();
+        assert!(n > 0, "CreditScheduler: at least one operator required");
 
-    /// `scheduler_yield_ratio`: fraction of epochs that hit the quantum limit.
-    ///
-    /// Returns 0.0 if no epochs have been processed yet.
-    /// Returns 1.0 if every epoch caused at least one yield.
-    pub fn yield_ratio(&self) -> f64 {
-        let total = self.inner.epoch_count.load(Ordering::Relaxed);
-        if total == 0 {
-            return 0.0;
+        // Create one channel between each pair of adjacent operators plus
+        // the source inlet and the sink outlet.
+        let (source_tx, mut prev_rx) = mpsc::channel::<ArrowZSet>(OPERATOR_CHANNEL_CAPACITY);
+        let (final_tx, final_rx) = mpsc::channel::<ArrowZSet>(OPERATOR_CHANNEL_CAPACITY);
+
+        for (i, op) in self.ops.into_iter().enumerate() {
+            let (next_tx, next_rx) = if i + 1 < n {
+                mpsc::channel::<ArrowZSet>(OPERATOR_CHANNEL_CAPACITY)
+            } else {
+                (final_tx.clone(), {
+                    // dummy — not used; we'll use final_rx below
+                    mpsc::channel::<ArrowZSet>(1).1
+                })
+            };
+
+            // For the last operator, use the final_tx.
+            let out_tx = if i + 1 < n { next_tx } else { final_tx.clone() };
+            let in_rx = prev_rx;
+
+            let task = OperatorTask {
+                op,
+                input_rx: in_rx,
+                output_tx: out_tx,
+                grpc_call_count: self.grpc_call_count.clone(),
+                shuffle_write_count: self.shuffle_write_count.clone(),
+            };
+            tokio::spawn(task.run());
+
+            prev_rx = if i + 1 < n {
+                next_rx
+            } else {
+                // unused for last op; create a dummy
+                mpsc::channel::<ArrowZSet>(1).1
+            };
         }
-        let yields = self.inner.yield_epoch_count.load(Ordering::Relaxed);
-        yields as f64 / total as f64
-    }
 
-    /// Total epoch count seen by this counter.
-    pub fn epoch_count(&self) -> u64 {
-        self.inner.epoch_count.load(Ordering::Relaxed)
-    }
-
-    /// Number of epochs that caused at least one yield.
-    pub fn yield_epoch_count(&self) -> u64 {
-        self.inner.yield_epoch_count.load(Ordering::Relaxed)
+        (source_tx, final_rx)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::lit;
+    use crate::filter::FilterOp;
+    use crate::project::{NamedExpr, ProjectOp};
+    use crate::zset::ArrowZSet;
+    use rockstream_plan::{BinaryOp, Expr};
+    use std::sync::atomic::AtomicU64;
 
-    #[test]
-    fn default_quantum_is_65536() {
-        let cfg = SchedulerConfig::default();
-        assert_eq!(cfg.max_rows_per_quantum, 65_536);
+    /// Build: Filter(b*2 > 10) → Project(a, b*2 AS c)
+    fn make_pipeline() -> CreditScheduler {
+        let grpc = Arc::new(AtomicU64::new(0));
+        let shuf = Arc::new(AtomicU64::new(0));
+        let mut sched = CreditScheduler::new(grpc, shuf);
+
+        let predicate = Expr::BinaryOp {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::BinaryOp {
+                op: BinaryOp::Mul,
+                left: Box::new(Expr::Column(1)),
+                right: Box::new(lit(2)),
+            }),
+            right: Box::new(lit(10)),
+        };
+        sched.push_op(Arc::new(FilterOp::new(predicate)));
+
+        let project = ProjectOp::new(vec![
+            NamedExpr::new("a", Expr::Column(0)),
+            NamedExpr::new(
+                "c",
+                Expr::BinaryOp {
+                    op: BinaryOp::Mul,
+                    left: Box::new(Expr::Column(1)),
+                    right: Box::new(lit(2)),
+                },
+            ),
+        ]);
+        sched.push_op(Arc::new(project));
+        sched
     }
 
-    #[test]
-    fn yield_ratio_zero_before_any_epoch() {
-        let counter = YieldCounter::new();
-        assert_eq!(counter.yield_ratio(), 0.0);
-    }
+    #[tokio::test]
+    async fn scheduler_end_to_end() {
+        let sched = make_pipeline();
+        let (source_tx, mut sink_rx) = sched.build();
 
-    #[test]
-    fn yield_ratio_zero_when_no_yields() {
-        let counter = YieldCounter::new();
-        counter.record_epoch();
-        counter.record_epoch();
-        assert_eq!(counter.yield_ratio(), 0.0);
-        assert_eq!(counter.epoch_count(), 2);
-        assert_eq!(counter.yield_epoch_count(), 0);
-    }
+        // b=3 → b*2=6 ≤ 10 → filtered out
+        // b=6 → b*2=12 > 10 → passes, c=12
+        source_tx
+            .send(ArrowZSet::from_ab_rows(&[(1, 3), (2, 6)], 1))
+            .await
+            .unwrap();
+        drop(source_tx);
 
-    #[test]
-    fn yield_ratio_one_when_all_epochs_yield() {
-        let counter = YieldCounter::new();
-        counter.record_epoch();
-        counter.record_yield();
-        counter.record_epoch();
-        counter.record_yield();
-        assert_eq!(counter.yield_ratio(), 1.0);
-    }
-
-    #[test]
-    fn yield_ratio_half_when_half_epochs_yield() {
-        let counter = YieldCounter::new();
-        counter.record_epoch();
-        counter.record_yield();
-        counter.record_epoch(); // no yield
-        assert!((counter.yield_ratio() - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn yield_counter_clone_shares_state() {
-        let c1 = YieldCounter::new();
-        let c2 = c1.clone();
-        c1.record_epoch();
-        c1.record_yield();
-        // c2 shares the same Arc
-        assert_eq!(c2.epoch_count(), 1);
-        assert_eq!(c2.yield_epoch_count(), 1);
+        let out = sink_rx.recv().await.unwrap();
+        assert_eq!(out.num_rows(), 1);
+        let a_col = out
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let c_col = out
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(a_col.value(0), 2);
+        assert_eq!(c_col.value(0), 12);
     }
 }

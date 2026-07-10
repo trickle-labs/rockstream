@@ -1,8 +1,0 @@
-Fix storage_budget gate benchmark log spam and apparent hang
-
-The dummy Criterion benchmark inside gate_probes was calling
-run_wal_cache_gate() on every sample iteration, which produced hundreds of
-repeated GATE PASS lines and made runs look hung.
-
-Replace the dummy benchmark body with a strict no-op so gate probes execute
-once while Criterion still has a non-empty group.

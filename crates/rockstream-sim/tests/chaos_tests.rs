@@ -1,6 +1,6 @@
-//! CI proof tests for the v0.36 exit criteria.
+//! CI proof tests for the v0.22 exit criteria (Chaos and Recovery SLO Gate).
 //!
-//! ## Proof obligations (ROADMAP v0.36)
+//! ## Proof obligations (ROADMAP v0.22)
 //!
 //! Exit criteria:
 //! - **≥100 000 simulation seeds pass**: All seeds complete without panic.
@@ -9,7 +9,12 @@
 //!   `DegradedState`.
 //! - **60-second object-store blackout recovers cleanly**: No data loss, no
 //!   duplicates after the blackout ends.
-//! - **32-shard 24-hour chaos: zero data loss, zero duplicates** (deterministic).
+//! - **32-shard 24-hour chaos: zero data loss, zero duplicates, output matches
+//!   reference** (deterministic).
+//! - **Recovery SLOs met**: failure detection ≤ 5 s p99, shard reassignment
+//!   ≤ 30 s p99, freshness recovery ≤ 60 s p99.
+//! - **Full-outage recovery < 60 s**: After all workers are killed, the cluster
+//!   recovers within the freshness budget.
 //! - **Continuous soak CI job**: `.github/workflows/simulation-soak.yml` exists
 //!   and the corpus includes ≥1 seed per registered law.
 //!
@@ -56,12 +61,24 @@
 //!
 //! 12. **`proof_regression_seeds_replay_deterministically`** — Every regression
 //!     seed in the corpus produces the same `ChaosResult` on two independent runs.
+//!
+//! 13. **`proof_chaos_output_matches_reference_run`** — The 32-shard 24-hour chaos
+//!     run commits the same total epochs and rows as a non-faulty reference run,
+//!     proving zero data loss under fault injection.
+//!
+//! 14. **`proof_recovery_slos_all_met`** — Under a 32-shard 24-hour chaos run,
+//!     the p99 recovery timings satisfy: failure detection ≤ 5 000 ms, shard
+//!     reassignment ≤ 30 000 ms, freshness recovery ≤ 60 000 ms.
+//!
+//! 15. **`proof_recovery_from_full_outage_within_60s`** — After all workers are
+//!     killed (fault_probability = 1.0 for a short burst), freshness-recovery
+//!     p99 remains ≤ 60 000 ms.
 
 use rockstream_sim::{
-    build_initial_corpus, negotiate_version, run_chaos_scenario, BrownoutStatus, ChaosConfig,
-    DegradedState, LivenessChecker, LivenessStatus, NegotiationResult, ObjectStoreBrownoutGuard,
-    ProtocolVersion, Runtime, SeedOutcome, SimRuntime, SoakRunner, SupportedVersionRange,
-    TwoPcPhase, TwoPcSinkState, LOCAL_BUFFER_MAX_EPOCHS,
+    build_initial_corpus, negotiate_version, run_chaos_reference, run_chaos_scenario,
+    BrownoutStatus, ChaosConfig, DegradedState, LivenessChecker, LivenessStatus, NegotiationResult,
+    ObjectStoreBrownoutGuard, ProtocolVersion, RecoveryTimings, Runtime, SeedOutcome, SimRuntime,
+    SoakRunner, SupportedVersionRange, TwoPcPhase, TwoPcSinkState, LOCAL_BUFFER_MAX_EPOCHS,
 };
 
 // ─── Test 1: 100k seeds all pass ─────────────────────────────────────────────
@@ -313,6 +330,8 @@ fn proof_seed_corpus_covers_all_registered_laws() {
         "LWWRegister/v1",
         "HyperLogLog/v1",
         "BloomUnion/v1",
+        "AutoTuner/v1",
+        "RecoverySLO/v1",
     ];
 
     assert!(
@@ -395,4 +414,126 @@ fn proof_regression_seeds_replay_deterministically() {
             reg_seed.seed, reg_seed.description
         );
     }
+}
+
+// ─── Test 13: Chaos output matches non-faulty reference run (P1) ─────────────
+
+#[test]
+fn proof_chaos_output_matches_reference_run() {
+    // A chaos run must commit the same total epochs and rows as a fault-free
+    // reference run from the same seed. This proves zero data loss: every
+    // epoch staged is eventually committed despite injected faults.
+    let config = ChaosConfig::thirty_two_shard_24h();
+
+    let chaos = run_chaos_scenario(&SimRuntime::new(0xDEAD_BEEF_CAFE_1234), &config);
+    let reference = run_chaos_reference(&SimRuntime::new(0xDEAD_BEEF_CAFE_1234), &config);
+
+    assert!(
+        chaos.is_clean(),
+        "chaos run must have zero data loss and zero duplicates: {chaos:?}"
+    );
+    assert!(
+        chaos.output_matches(&reference),
+        "chaos run epoch count must match non-faulty reference (proves zero dropped epochs): \
+         chaos epochs={}; reference epochs={}",
+        chaos.epochs_committed,
+        reference.epochs_committed,
+    );
+}
+
+// ─── Test 14: Recovery SLO budgets all met (P3) ───────────────────────────────
+
+#[test]
+fn proof_recovery_slos_all_met() {
+    // Run a 32-shard 24-hour scenario with enough faults to produce a
+    // statistically meaningful p99 for each recovery-time SLO budget.
+    // Budgets (DESIGN.md §11.5):
+    //   failure detection  ≤ 5 000 ms p99
+    //   shard reassignment ≤ 30 000 ms p99
+    //   freshness recovery ≤ 60 000 ms p99
+    let config = ChaosConfig {
+        num_shards: 32,
+        duration_ms: 24 * 60 * 60 * 1_000,
+        fault_probability: 0.005,
+        brownout_probability: 0.001,
+    };
+    let rt = SimRuntime::new(0xFEED_CAFE_DEAD_BEEF);
+    let result = run_chaos_scenario(&rt, &config);
+
+    let t = &result.recovery_timings;
+
+    assert!(
+        result.faults_injected > 0,
+        "must have injected at least one fault to produce recovery timing samples"
+    );
+    assert!(
+        !t.failure_detection_ms.is_empty(),
+        "must have failure-detection timing samples"
+    );
+
+    let fd_p99 = RecoveryTimings::p99(&t.failure_detection_ms);
+    let sa_p99 = RecoveryTimings::p99(&t.shard_reassignment_ms);
+    let fr_p99 = RecoveryTimings::p99(&t.freshness_recovery_ms);
+
+    assert!(
+        fd_p99 <= 5_000,
+        "failure-detection p99 must be ≤ 5 000 ms (DESIGN.md §11.5); got {fd_p99} ms"
+    );
+    assert!(
+        sa_p99 <= 30_000,
+        "shard-reassignment p99 must be ≤ 30 000 ms (DESIGN.md §11.5); got {sa_p99} ms"
+    );
+    assert!(
+        fr_p99 <= 60_000,
+        "freshness-recovery p99 must be ≤ 60 000 ms (DESIGN.md §11.5); got {fr_p99} ms"
+    );
+}
+
+// ─── Test 15: Full-outage recovery within 60 s (P2) ──────────────────────────
+
+#[test]
+fn proof_recovery_from_full_outage_within_60s() {
+    // Simulate a burst of simultaneous worker faults (all shards at once)
+    // by using fault_probability = 1.0 for a very short window. The recovery
+    // timings for each shard must still fit within the 60 s freshness budget.
+    //
+    // Also verifies that LivenessChecker correctly surfaces `RecoveringSlow`
+    // only when recovery actually exceeds 60 000 ms — confirming the SLO
+    // threshold is correctly wired.
+    let config = ChaosConfig {
+        num_shards: 32,
+        fault_probability: 1.0,
+        brownout_probability: 0.0,
+        duration_ms: 5_000,
+    };
+    let rt = SimRuntime::new(0xCAFE_BABE_0000_0001);
+    let result = run_chaos_scenario(&rt, &config);
+
+    assert!(
+        result.is_clean(),
+        "full-outage scenario must still produce zero data loss and zero duplicates: {result:?}"
+    );
+
+    let t = &result.recovery_timings;
+    if !t.freshness_recovery_ms.is_empty() {
+        let fr_p99 = RecoveryTimings::p99(&t.freshness_recovery_ms);
+        assert!(
+            fr_p99 <= 60_000,
+            "freshness-recovery p99 after full outage must be ≤ 60 000 ms; got {fr_p99} ms"
+        );
+    }
+
+    // Verify LivenessChecker boundary: recovery active for exactly 60 000 ms
+    // must be Healthy; 60 001 ms must be RecoveringSlow.
+    let checker = LivenessChecker::new(60_000, 30_000);
+    assert_eq!(
+        checker.check(Some(60_000), false, None),
+        LivenessStatus::Healthy,
+        "recovery at exactly the 60 s threshold must still be Healthy"
+    );
+    assert_eq!(
+        checker.check(Some(60_001), false, None),
+        LivenessStatus::Degraded(DegradedState::RecoveringSlow { elapsed_ms: 60_001 }),
+        "recovery exceeding 60 s must surface RecoveringSlow"
+    );
 }

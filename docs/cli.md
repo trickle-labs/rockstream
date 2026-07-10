@@ -1,78 +1,78 @@
-# RockStream CLI Subcommands Reference
+# RockStream CLI Reference
 
-This document covers all CLI subcommands, options, and structured JSON logging options.
+RockStream ships as a **single binary** named `rockstream`. Every node role is a
+flag on this one binary — there is no separate server, worker, or gateway
+executable. `main` is always runnable through it.
 
-## Subcommand Reference
+At **v0.1** the binary runs an **embedded no-op node**: it brings the node up,
+runs a no-op pipeline to completion, writes an audit log and a support bundle,
+and exits cleanly. Real operators, durability, SQL, and the distributed roles
+are added in later versions; this page documents only what exists today.
+
+## Synopsis
+
+```bash
+rockstream --help
+rockstream --version
+rockstream start --storage <dir> [--role <role>]
+```
+
+## Commands
 
 ### `rockstream start`
-Starts a RockStream node (control, worker, or gateway role).
 
-**Options:**
-- `--storage <path>`: Local storage directory for data and WALs (default: `./data`).
-- `--role <role>`: Selects services to run (`all`, `worker`, `control`, `gateway`, `frontier`).
-- `--control <addr>`: Address of control node to register with when running as `worker` or `gateway`.
-- `--control-bind <addr>`: Address to listen on when running `control` role (default: `127.0.0.1:7700`).
-- `--tls-cert <path>`, `--tls-key <path>`, `--tls-ca-cert <path>`: Supply all three to enable mTLS.
-- `--allow-law-operand-fallback`: Permits fallback to raw bytes on law operand corruption (emergency recovery).
+Starts a RockStream node. At v0.1 this runs the embedded no-op node, which:
 
-### `rockstream bootstrap`
-Bootstraps a cluster by connecting to a running control service.
+1. validates the requested role,
+2. creates the storage directory if it does not exist,
+3. writes an audit log recording the node and no-op pipeline lifecycle,
+4. writes a support bundle, and
+5. exits with status `0`.
 
-**Options:**
-- `--control <addr>`: Address of the control-plane node (default: `127.0.0.1:7700`).
+**Options**
 
-### `rockstream explain`
-Prints the operator graph with merge-law annotations for a view.
+| Option | Required | Default | Description |
+|---|---|---|---|
+| `--storage <dir>` | yes | — | Local storage directory for node state and artifacts. Created if missing. |
+| `--role <role>` | no | `all` | Node role. One of `all`, `control`, `worker`, `gateway`. v0.1 runs the embedded `all` profile regardless of the value; an unrecognised role is rejected with `RS-0002`. |
 
-**Usage:**
+**Example**
+
 ```bash
-rockstream explain sales_by_product
+rockstream start --storage ./data
 ```
 
-### `rockstream sql`
-Runs a SQL query and outputs the planned IVM operator graph.
+**Artifacts written under `<storage>`**
 
-**Usage:**
+- `audit.jsonl` — one JSON object per line, one per control-plane action. v0.1
+  emits `server.started`, `pipeline.created`, `pipeline.started`,
+  `pipeline.stopped`, and `server.stopped`.
+- `support-bundle-<timestamp>.json` — a snapshot bundle containing
+  `system_info` (version, OS, arch, role), a `metrics` snapshot (run duration
+  and audit-event count), and the full `audit_events` list.
+
+## Exit codes
+
+| Exit code | Meaning |
+|---|---|
+| `0` | The node ran the no-op pipeline to completion and wrote its artifacts. |
+| non-zero | A failure occurred; the error is printed to stderr with its `RS-XXXX` code and actionable next steps. |
+
+## Error codes
+
+Operator-visible failures carry an `RS-XXXX` code (see the registry in
+`crates/rockstream-types/src/error_code.rs`). The `start` command can return:
+
+| Code | Meaning | Next steps |
+|---|---|---|
+| `RS-0002` | Unknown node role passed to `--role`. | Pass `--role` with one of: `all`, `control`, `worker`, `gateway`. |
+| `RS-0003` | Could not create the storage directory or write an artifact. | Check that the parent path exists, is writable, and the disk is not full. |
+
+## Logging
+
+Logs are emitted through `tracing`. Set the verbosity with the standard
+`RUST_LOG` environment variable, e.g. `RUST_LOG=debug`:
+
 ```bash
-rockstream sql "SELECT region, SUM(amount) FROM orders GROUP BY region"
-```
-
-### `rockstream describe`
-Describes the status of a specific pipeline.
-
-**Usage:**
-```bash
-rockstream describe orders_pipeline
-```
-
-### `rockstream debug arrangement`
-Connects to the worker hosting the shard, decodes arrangement law headers, and prints the raw/parsed operand and tombstone density.
-
-**Usage:**
-```bash
-rockstream debug arrangement orders_mv 3f2a "product_id=42"
-```
-
-### `rockstream support-bundle`
-Generates a tarball containing system logs, catalog metrics, configuration details, and audit history.
-
-**Options:**
-- `--output <path>`: Output file path (default: `./support-bundle.tar.gz`).
-
-## JSON Logging Options
-
-Supply the environment variable `RUST_LOG=info` and the standard `--json` flag (if available) to format output as structured JSON.
-
-Example JSON output structure:
-```json
-{
-  "timestamp": "2026-06-03T07:53:20Z",
-  "level": "INFO",
-  "fields": {
-    "message": "starting rockstream",
-    "storage": "./data",
-    "role": "all"
-  },
-  "target": "rockstream"
-}
+RUST_LOG=info rockstream start --storage ./data
 ```

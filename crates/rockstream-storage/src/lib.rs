@@ -21,11 +21,15 @@ pub mod wal;
 pub mod wal_cache;
 
 pub use error::StorageError;
-pub use keys::{CatalogKeyEncoder, ShardKeyEncoder, ShardPrefix};
+pub use keys::{
+    minmax_sort_key, minmax_sort_key_decode, CatalogKeyEncoder, JoinSide, ShardKeyEncoder,
+    ShardPrefix, DISTINCT_DISCRIMINATOR, MINMAX_DISCRIMINATOR,
+};
 pub use merge_registry::{MergeOperatorRegistry, SumCountMergeOperator};
 pub use reader::ShardReader;
 pub use shard_db::{
-    is_allow_law_operand_fallback, set_allow_law_operand_fallback, ShardDb, WriteBatch,
+    is_allow_law_operand_fallback, set_allow_law_operand_fallback, BatchOp, CheckpointHandle,
+    PartialAggSpec, ShardDb, WriteBatch,
 };
 pub use wal_cache::WalListingCache;
 

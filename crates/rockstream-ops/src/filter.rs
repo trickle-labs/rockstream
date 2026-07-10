@@ -1,124 +1,135 @@
-//! Filter operator for RockStream IVM.
+//! Filter operator: stateless Z-set filter.
 //!
-//! Applies a predicate to each row in a `ZSetBatch`, keeping rows whose
-//! (key, value) bytes satisfy the predicate. Weights are preserved unchanged.
+//! `FilterOp` applies a boolean predicate to each row of an `ArrowZSet`.
+//! Rows where the predicate is `false` are dropped; all others pass through
+//! with their original weights unchanged.
 //!
-//! Filter is a **linear** (stateless) operator in the IVM sense: it applies
-//! independently to each (key, value, weight) triple. The output delta can be
-//! directly accumulated downstream without any per-epoch state.
-//!
-//! # DataFusion expression evaluation
-//!
-//! `FilterOperator::with_datafusion_expr` accepts a DataFusion `PhysicalExpr`
-//! plus a `RowCodec` that bridges between raw `ZSetRow` bytes and Arrow
-//! `RecordBatch`. The predicate is evaluated via DataFusion's vectorised
-//! expression engine on the full batch, rather than row-by-row.
+//! DBSP linear-operator rule: for a filter function `F`,
+//! `ΔF(Δx) = F(Δx)`. The filter is already incremental — just apply it to
+//! each incoming delta batch.
 
-use std::sync::Arc;
+use rockstream_plan::Expr;
 
-use rockstream_types::batch::{ZSetBatch, ZSetRow};
-use rockstream_types::merge_law::MergeLawId;
-use rockstream_types::timestamp::Epoch;
+use crate::error::OpError;
+use crate::expr::eval_bool;
+use crate::op::Operator;
+use crate::zset::ArrowZSet;
 
-use crate::operator::Operator;
-use crate::row_codec::RowCodec;
-
-/// Predicate function type for row-level filtering.
-pub type FilterFn = Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync + 'static>;
-
-/// IVM filter operator: keeps rows satisfying `predicate`.
-pub struct FilterOperator {
-    predicate: FilterFn,
-    name: String,
+/// A stateless filter operator.
+pub struct FilterOp {
+    /// The boolean predicate to evaluate against each row.
+    predicate: Expr,
 }
 
-impl FilterOperator {
-    /// Create a `FilterOperator` from a plain Rust closure.
-    ///
-    /// The closure receives `(key: &[u8], value: &[u8])` and returns `true` to
-    /// keep the row, `false` to discard it.
-    pub fn new(name: impl Into<String>, predicate: FilterFn) -> Self {
-        Self {
-            predicate,
-            name: name.into(),
-        }
+impl FilterOp {
+    /// Create a new filter operator with the given predicate.
+    pub fn new(predicate: Expr) -> Self {
+        FilterOp { predicate }
     }
 
-    /// Create a `FilterOperator` backed by a DataFusion `PhysicalExpr`.
-    ///
-    /// The expression is evaluated on Arrow `RecordBatch`es produced by
-    /// `codec`. This is the primary entry-point for DataFusion expression
-    /// evaluation at the IVM operator level.
-    ///
-    /// # Panics
-    /// Panics at predicate evaluation time if `codec.encode_batch` or the
-    /// DataFusion expression returns an error (operator-level errors are fatal
-    /// and indicate a plan/schema mismatch).
-    pub fn with_datafusion_expr(
-        name: impl Into<String>,
-        expr: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-        codec: Arc<dyn RowCodec>,
-    ) -> Self {
-        let codec_clone = codec.clone();
-        let predicate: FilterFn = Arc::new(move |key: &[u8], value: &[u8]| {
-            // Build a single-row batch and evaluate the expression.
-            let row = ZSetRow {
-                key: key.to_vec(),
-                value: value.to_vec(),
-                weight: 1,
-            };
-            let batch = codec_clone.encode_batch(&[row]);
-            let result = expr
-                .evaluate(&batch)
-                .expect("DataFusion expression evaluation failed");
-            let array = result
-                .into_array(1)
-                .expect("DataFusion expression returned empty array");
-            let bools = array
-                .as_any()
-                .downcast_ref::<arrow::array::BooleanArray>()
-                .expect("filter expression must return Boolean");
-            bools.value(0)
-        });
-        Self {
-            predicate,
-            name: name.into(),
+    /// Apply the filter to a single delta batch.
+    pub fn apply(&self, input: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        if input.is_empty() {
+            return Ok(input);
         }
+        let mask = eval_bool(&self.predicate, &input.data)?;
+        let indices: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b)
+            .map(|(i, _)| i)
+            .collect();
+        if indices.len() == input.num_rows() {
+            // All rows pass — return unchanged.
+            return Ok(input);
+        }
+        input.select_rows(&indices)
     }
 }
 
-#[async_trait::async_trait]
-impl Operator for FilterOperator {
-    async fn process(
-        &mut self,
-        input: &rockstream_types::batch::SourceBatch,
-    ) -> rockstream_types::batch::SinkBatch {
-        rockstream_types::batch::SinkBatch {
-            record_count: input.record_count,
-            epoch: input.epoch,
-        }
+impl Operator for FilterOp {
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.apply(delta)
     }
-
-    async fn process_delta(&mut self, input: &ZSetBatch) -> ZSetBatch {
-        let mut out = rockstream_types::batch::ZSet::new();
-        for row in input.zset.iter() {
-            if (self.predicate)(&row.key, &row.value) {
-                out.insert(row.key.clone(), row.value.clone(), row.weight);
-            }
-        }
-        ZSetBatch {
-            zset: out,
-            epoch: input.epoch,
-        }
-    }
-
-    async fn epoch_complete(&mut self, _epoch: Epoch) {}
 
     fn name(&self) -> &str {
-        &self.name
+        "FilterOp"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::lit;
+    use rockstream_plan::{BinaryOp, Expr};
+
+    /// `b * 2 > 10` predicate.
+    fn b_times_2_gt_10() -> Expr {
+        Expr::BinaryOp {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::BinaryOp {
+                op: BinaryOp::Mul,
+                left: Box::new(Expr::Column(1)),
+                right: Box::new(lit(2)),
+            }),
+            right: Box::new(lit(10)),
+        }
     }
 
-    fn merge_law(&self) -> Option<MergeLawId> {
-        None
+    #[test]
+    fn filter_keeps_passing_rows() {
+        // b*2 > 10 means b > 5
+        let input = ArrowZSet::from_ab_rows(&[(1, 3), (2, 6), (3, 8)], 1);
+        let op = FilterOp::new(b_times_2_gt_10());
+        let out = op.apply(input).unwrap();
+        assert_eq!(out.num_rows(), 2);
+        let rows = out.positive_ab_rows();
+        assert!(rows.contains(&(2, 6)));
+        assert!(rows.contains(&(3, 8)));
+    }
+
+    #[test]
+    fn filter_drops_all_rows() {
+        let input = ArrowZSet::from_ab_rows(&[(1, 1), (2, 2)], 1);
+        let op = FilterOp::new(b_times_2_gt_10());
+        let out = op.apply(input).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filter_passes_all_rows() {
+        let input = ArrowZSet::from_ab_rows(&[(1, 6), (2, 7)], 1);
+        let op = FilterOp::new(b_times_2_gt_10());
+        let out = op.apply(input).unwrap();
+        assert_eq!(out.num_rows(), 2);
+    }
+
+    #[test]
+    fn filter_preserves_weights() {
+        let mut zs = ArrowZSet::from_ab_rows(&[(1, 6), (2, 3)], 1);
+        zs.weights = vec![2, -1];
+        let op = FilterOp::new(b_times_2_gt_10());
+        let out = op.apply(zs).unwrap();
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(out.weights[0], 2);
+    }
+
+    #[test]
+    fn filter_empty_input() {
+        let input = ArrowZSet::from_ab_rows(&[], 1);
+        let op = FilterOp::new(b_times_2_gt_10());
+        let out = op.apply(input).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filter_processes_delete_deltas() {
+        // Deletions (weight -1) must also pass through the filter.
+        let mut zs = ArrowZSet::from_ab_rows(&[(1, 6), (2, 3)], -1);
+        zs.weights = vec![-1, -1];
+        let op = FilterOp::new(b_times_2_gt_10());
+        let out = op.apply(zs).unwrap();
+        assert_eq!(out.num_rows(), 1); // only row (1,6) passes b*2>10
+        assert_eq!(out.weights[0], -1);
     }
 }

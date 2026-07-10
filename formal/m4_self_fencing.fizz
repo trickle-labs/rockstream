@@ -1,0 +1,303 @@
+# formal/m4_self_fencing.fizz
+# M4 — Worker Self-Fencing & Lease Transitions Under Partition
+#
+# Models the self-fencing protocol for RockStream workers when they lose
+# contact with the control plane. A partitioned-but-alive worker must fence
+# itself before the new lease holder's first commit to prevent split-brain.
+#
+# References: DESIGN.md §11.5–§11.7, FIZZBEE_TEST_PLAN.md §3.4, §4.3
+
+# ─── Constants ──────────────────────────────────────────────────────────────
+
+NUM_WORKERS = 3
+NUM_SHARDS = 2
+
+# A worker that cannot reach the control plane for this many steps must
+# self-fence. This is the logical ordering: dead_after < self_fence_after.
+SELF_FENCE_AFTER = 3
+
+# Maximum epoch to bound the state space.
+MAX_EPOCH = 2
+
+# Maximum checkpoint index to bound the state space.
+MAX_CHECKPOINT = 2
+
+# ─── State ──────────────────────────────────────────────────────────────────
+
+action Init:
+    # Ghost variable: set of (worker_id, shard_id) pairs that have committed
+    # at the same epoch — used to check single-writer invariant.
+    committed_this_epoch = {}
+
+    # Ghost variable: monotone max committed checkpoint index.
+    max_cluster_checkpoint = 0
+
+    # Coverage ghost variables.
+    fence_rejection_observed = False
+    fencing_occurred = False
+    crash_occurred = False
+
+# ControlPlane: authoritative lease map and failure detector state.
+role ControlPlane:
+    action Init:
+        # leases: shard_id -> worker_id (-1 = no lease holder)
+        self.leases = [-1, -1]
+        # dead_workers: set of worker ids declared dead by failure detector
+        self.dead_workers = set()
+        # checkpoint_index: last committed cluster checkpoint id
+        self.checkpoint_index = 0
+        # fence_epoch: per-shard monotone fencing counter (CAS target)
+        self.fence_epoch = [0, 0]
+
+# Shard: durable per-shard state.
+role Shard:
+    action Init:
+        self.committed_epoch = 0
+        # fence_epoch mirrors ControlPlane for write CAS; always durable.
+        self.fence_epoch = 0
+
+# Worker: ephemeral process state.
+@state(ephemeral=["isolation_steps", "held_lease_epoch", "can_reach_control", "can_reach_object_store", "status"])
+role Worker:
+    action Init:
+        # How many consecutive steps this worker has been unable to reach CP.
+        self.isolation_steps = 0
+        # The fence epoch this worker holds for each shard (-1 = no lease).
+        self.held_lease_epoch = [-1, -1]
+        # Connectivity flags (ephemeral; reset on crash).
+        self.can_reach_control = True
+        self.can_reach_object_store = True
+        # Status: "active" | "blocked" | "terminated"
+        self.status = "active"
+
+# ─── Actions ────────────────────────────────────────────────────────────────
+
+# Grant a lease to a worker for a shard (control plane action).
+# Only grants if the shard has no current lease or the holder is dead.
+atomic fair action GrantLease:
+    worker_id = oneof range(NUM_WORKERS)
+    shard_id = oneof range(NUM_SHARDS)
+
+    w = workers[worker_id]
+    cp = controlplane
+
+    require w.status == "active"
+    require cp.leases[shard_id] == -1 or cp.leases[shard_id] in cp.dead_workers
+
+    # Advance fence epoch (CAS — strictly higher token).
+    cp.fence_epoch[shard_id] = cp.fence_epoch[shard_id] + 1
+    cp.leases[shard_id] = worker_id
+
+    # Tell worker its new lease epoch for that shard.
+    w.held_lease_epoch[shard_id] = cp.fence_epoch[shard_id]
+
+# Worker commits an epoch on a shard (CAS on fence_epoch).
+atomic fair action WorkerCommit:
+    worker_id = oneof range(NUM_WORKERS)
+    shard_id = oneof range(NUM_SHARDS)
+
+    w = workers[worker_id]
+    cp = controlplane
+    s = shards[shard_id]
+
+    require w.status == "active"
+    require w.can_reach_object_store
+    require w.held_lease_epoch[shard_id] >= 0
+    require s.committed_epoch < MAX_EPOCH
+
+    # CAS: commit only if worker's held lease epoch matches shard's fence epoch.
+    if w.held_lease_epoch[shard_id] == s.fence_epoch:
+        # Successful commit.
+        s.committed_epoch = s.committed_epoch + 1
+        s.fence_epoch = s.fence_epoch  # unchanged on commit
+        committed_this_epoch.add((worker_id, shard_id))
+    else:
+        # CAS rejected — stale write. Worker must back off.
+        fence_rejection_observed = True
+
+# Worker loses contact with the control plane (network partition).
+atomic action LoseControlContact:
+    worker_id = oneof range(NUM_WORKERS)
+    w = workers[worker_id]
+
+    require w.status == "active"
+    require w.can_reach_control
+
+    w.can_reach_control = False
+
+# Worker recovers contact with the control plane.
+atomic fair action RecoverControlContact:
+    worker_id = oneof range(NUM_WORKERS)
+    w = workers[worker_id]
+
+    require w.status == "active"
+    require not w.can_reach_control
+
+    w.can_reach_control = True
+    w.isolation_steps = 0
+
+# Worker loses contact with the object store (brownout).
+atomic action LoseObjectStoreContact:
+    worker_id = oneof range(NUM_WORKERS)
+    w = workers[worker_id]
+
+    require w.status == "active"
+    require w.can_reach_object_store
+
+    w.can_reach_object_store = False
+    w.status = "blocked"
+
+# Object store contact recovers (brownout clears).
+atomic fair action RecoverObjectStoreContact:
+    worker_id = oneof range(NUM_WORKERS)
+    w = workers[worker_id]
+
+    require w.status == "blocked"
+    require not w.can_reach_object_store
+
+    w.can_reach_object_store = True
+    w.status = "active"
+
+# Heartbeat tick: advance isolation_steps counter for partitioned workers.
+atomic fair action HeartbeatTick:
+    worker_id = oneof range(NUM_WORKERS)
+    w = workers[worker_id]
+
+    require w.status == "active"
+    require not w.can_reach_control
+
+    w.isolation_steps = w.isolation_steps + 1
+
+# Self-fence: a worker that has been isolated for SELF_FENCE_AFTER steps
+# must terminate and relinquish all its leases.
+atomic fair action SelfFence:
+    worker_id = oneof range(NUM_WORKERS)
+    w = workers[worker_id]
+    cp = controlplane
+
+    require w.status == "active"
+    require not w.can_reach_control
+    require w.isolation_steps >= SELF_FENCE_AFTER
+
+    # Worker transitions to terminated — no further commits possible.
+    w.status = "terminated"
+    w.held_lease_epoch = [-1, -1]
+    fencing_occurred = True
+
+    # Release leases on the control plane.
+    for shard_id in range(NUM_SHARDS):
+        if cp.leases[shard_id] == worker_id:
+            cp.leases[shard_id] = -1
+
+# Failure detector marks a worker dead (e.g. missed heartbeats).
+atomic action MarkDead:
+    worker_id = oneof range(NUM_WORKERS)
+    cp = controlplane
+    w = workers[worker_id]
+
+    require worker_id not in cp.dead_workers
+    require not w.can_reach_control
+
+    cp.dead_workers.add(worker_id)
+    crash_occurred = True
+
+    # Revoke leases.
+    for shard_id in range(NUM_SHARDS):
+        if cp.leases[shard_id] == worker_id:
+            cp.leases[shard_id] = -1
+
+# CheckpointCoordinator: atomically commit a cluster checkpoint after all
+# shards have confirmed their per-shard checkpoint.
+# Composed with M1's cluster_committed predicate: a shard's checkpoint is
+# committed only after ControlPlane.checkpoint_index records it.
+atomic fair action CommitClusterCheckpoint:
+    cp = controlplane
+
+    require cp.checkpoint_index < MAX_CHECKPOINT
+    # All shards must have at least one committed epoch.
+    all_ready = True
+    for shard_id in range(NUM_SHARDS):
+        if shards[shard_id].committed_epoch == 0:
+            all_ready = False
+    require all_ready
+
+    cp.checkpoint_index = cp.checkpoint_index + 1
+    if cp.checkpoint_index > max_cluster_checkpoint:
+        max_cluster_checkpoint = cp.checkpoint_index
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+# M4-S1: Single-writer — no two distinct workers both hold a live lease
+# for the same shard with the same fence epoch.
+always assertion M4_S1_SingleWriter:
+    for shard_id in range(NUM_SHARDS):
+        holders = []
+        for worker_id in range(NUM_WORKERS):
+            w = workers[worker_id]
+            if (w.status == "active" and
+                    w.held_lease_epoch[shard_id] >= 0 and
+                    w.held_lease_epoch[shard_id] == shards[shard_id].fence_epoch):
+                holders.append(worker_id)
+        if len(holders) > 1:
+            return False
+    return True
+
+# M4-S2: Self-fence precedence — a worker that has been isolated for
+# SELF_FENCE_AFTER steps must be terminated (cannot commit).
+# We encode this by checking that no active worker has isolation_steps >= SELF_FENCE_AFTER.
+always assertion M4_S2_SelfFencePrecedence:
+    for worker_id in range(NUM_WORKERS):
+        w = workers[worker_id]
+        if w.status == "active" and not w.can_reach_control:
+            if w.isolation_steps >= SELF_FENCE_AFTER:
+                return False
+    return True
+
+# M4-S3: Lease uniqueness — each shard has at most one worker in
+# ControlPlane.leases at any state.
+always assertion M4_S3_LeaseUniqueness:
+    for shard_id in range(NUM_SHARDS):
+        holders = 0
+        for worker_id in range(NUM_WORKERS):
+            if controlplane.leases[shard_id] == worker_id:
+                holders = holders + 1
+        if holders > 1:
+            return False
+    return True
+
+# M4-S4: Object-store-only partition blocks, not fences — a worker that
+# can reach the control plane but not the object store is BLOCKED (not dead).
+always assertion M4_S4_ObjectStoreOnlyPartitionBlocks:
+    for worker_id in range(NUM_WORKERS):
+        w = workers[worker_id]
+        # A worker that can reach control but not object store must be blocked, not terminated.
+        if w.can_reach_control and not w.can_reach_object_store:
+            if w.status == "terminated":
+                return False
+    return True
+
+# M4-L1: Recovery progress — after a crash/partition, every orphaned shard
+# is eventually re-leased to a live worker.
+always eventually assertion M4_L1_RecoveryProgress:
+    # All shards have an active lease holder.
+    for shard_id in range(NUM_SHARDS):
+        holder = controlplane.leases[shard_id]
+        if holder == -1:
+            return False
+        if workers[holder].status != "active":
+            return False
+    return True
+
+# M4-L2: No permanent block under transient outage — once the object-store
+# outage clears, all non-terminated workers eventually resume active status.
+eventually always assertion M4_L2_NoPermanentBlock:
+    for worker_id in range(NUM_WORKERS):
+        w = workers[worker_id]
+        if w.status == "blocked":
+            return False
+    return True
+
+# COV-M4: Coverage — a partitioned-but-alive worker attempts a commit
+# and is rejected by the fence epoch.
+exists assertion COV_M4:
+    return fence_rejection_observed

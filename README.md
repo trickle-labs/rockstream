@@ -118,7 +118,7 @@ You can also **insert, update, and delete rows directly** into RockStream tables
 no separate database or Kafka topic is required to get data in. The change feeds your
 views automatically, the same way an external source would. RockStream is not aiming
 to replace Postgres for high-concurrency transactional workloads; it sits in the same
-tier as streaming-SQL systems like Materialize and RisingWave, with the convenience
+tier as streaming-SQL systems, with the convenience
 of being reachable through standard Postgres tooling.
 
 SQL also supports standard `CREATE VIEW` — a **inline view** stored as a reusable
@@ -136,7 +136,7 @@ commutativity — or an explicit machine-readable reason why it cannot.
 
 When a merge law is in effect, RockStream can apply partial aggregates directly in
 storage without a read-modify-write cycle, push combining steps to the producer
-side of a network shuffle, and prune compaction safely. Starting at v0.43, you can
+side of a network shuffle, and prune compaction safely. Starting at v0.47, you can
 define your own **CRDT column types** — counters, sets, last-write-wins registers —
 that merge correctly across concurrent writes by construction.
 
@@ -193,10 +193,9 @@ RockStream is inspired by production systems and implementation research:
 
 | System | What it does |
 |---|---|
-| **[Feldera](https://feldera.com/)** | Uses mathematical theory (DBSP) to guarantee that incremental results are always identical to what a full re-computation would produce |
+| **[DBSP](https://github.com/vmware-research/database-stream-processor)** | Mathematical theory that guarantees incremental results are always identical to what a full re-computation would produce |
 | **[pg_trickle](https://github.com/trickle-labs/pg-trickle)** | Shows how to turn SQL views into practical per-operator delta rules, with many hard correctness cases worked through in PostgreSQL |
 | **[SlateDB](https://slatedb.io/)** | Provides the cloud-native object-storage-backed LSM that RockStream uses as its durable shard and arrangement store |
-| **[RisingWave](https://risingwave.com/)** | A streaming database that maintains materialized views in real time |
 
 RockStream brings these ideas to an open, cloud-native storage foundation.
 
@@ -238,10 +237,10 @@ Each roadmap version is sized at roughly **10 person-weeks** of implementation e
 | SQL Alpha | v0.18 | Core SQL views, joins, set ops, and `EXPLAIN` work on one shard |
 | Single-Shard Beta | v0.27 | Advanced IVM feature-complete for serious single-node testing |
 | Distributed Alpha | v0.36 | Multi-shard execution, frontier protocol, recovery, and exactly-once basics work |
-| Integration Beta | v0.45 | Postgres gateway, direct writes, and major external connectors work end to end |
-| Production Beta | v0.52 | Observability, auth, upgrades, security review, and long soaks ready for a pilot |
-| Data Lake GA | v0.55 | Cold-tier Iceberg/Delta sinks, native Iceberg REST catalog, external tool consumption proven |
-| 1.0 | post-v0.55 | Tagged only after a real production workload succeeds without design exceptions |
+| Integration Beta | v0.42 | Postgres gateway, direct writes, and major external connectors work end to end |
+| Production Beta | v0.53 | Observability, auth, upgrades, security review, and long soaks ready for a pilot |
+| Data Lake GA | v0.44 | Cold-tier Iceberg/Delta sinks, native Iceberg REST catalog, external tool consumption proven |
+| 1.0 | post-v0.54 | Tagged only after a real production workload succeeds without design exceptions |
 
 ### Phase Summary
 

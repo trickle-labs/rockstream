@@ -65,6 +65,16 @@ define_id!(
     WorkerId, u64, "worker"
 );
 
+define_id!(
+    /// Identifies a source connector/ingestion point.
+    SourceId, u64, "src"
+);
+
+define_id!(
+    /// Identifies a connector (source or sink) instance.
+    ConnectorId, u64, "connector"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

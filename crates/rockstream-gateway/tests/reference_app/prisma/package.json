@@ -1,0 +1,13 @@
+{
+  "name": "rockstream-prisma-ref",
+  "version": "0.42.0",
+  "description": "RockStream v0.42 Prisma reference application",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "seed": "node seed.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.3"
+  }
+}

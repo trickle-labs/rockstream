@@ -1,0 +1,11 @@
+# formal/smoke.fizz
+# A simple clock spec
+
+clock = 0
+
+action Tick:
+    require clock < 3
+    clock = clock + 1
+
+always assertion ClockLessThanFour:
+    return clock < 4

@@ -4,9 +4,11 @@
 //! timestamps, frontiers, Z-set rows, schema definitions, identity types,
 //! batch types, merge-law descriptors, law implementations, and audit events.
 
+pub mod acl;
 pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
+pub mod checkpoint;
 pub mod config;
 pub mod connector;
 pub mod dlq;
@@ -19,8 +21,10 @@ pub mod laws;
 pub mod lease;
 pub mod merge_law;
 pub mod metrics;
+pub mod rendezvous;
 pub mod schema_evolution;
 pub mod secret;
+pub mod sink;
 pub mod state_budget;
 pub mod topology;
 pub mod view_lifecycle;

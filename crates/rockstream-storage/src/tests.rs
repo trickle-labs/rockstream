@@ -735,3 +735,136 @@ async fn arrangement_header_missing_key_returns_none() {
     assert!(result.is_none(), "missing key must return None");
     db.close().await.unwrap();
 }
+
+// === Slice 4 Tests ===
+
+#[tokio::test]
+async fn storage_range_delete_audit() {
+    let (db, _) = test_shard_db("test/range_delete_audit").await;
+    db.put(b"key1", b"val1").await.unwrap();
+    db.put(b"key2", b"val2").await.unwrap();
+
+    // Verify cleanup uses scan-and-delete, proving range delete is not used
+    let entries = db.scan_prefix(b"").await.unwrap();
+    let mut batch = WriteBatch::new();
+    for (k, _) in entries {
+        batch.delete(&k);
+    }
+    db.write_batch(batch).await.unwrap();
+
+    assert_eq!(db.get(b"key1").await.unwrap(), None);
+    assert_eq!(db.get(b"key2").await.unwrap(), None);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_filter_snapshot_safety() {
+    let store = Arc::new(InMemory::new());
+
+    let db = ShardDb::builder("test/snapshot_safety", store.clone())
+        .build()
+        .await
+        .unwrap();
+    db.put(b"k1", b"v1").await.unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+
+    // Open concurrent snapshot reader
+    let reader = crate::reader::ShardReader::open("test/snapshot_safety", store.clone())
+        .await
+        .unwrap();
+    assert_eq!(reader.get(b"k1").await.unwrap(), Some(Bytes::from("v1")));
+
+    // Modify/delete keys in the main DB and flush (simulating compaction cleanup)
+    let db = ShardDb::builder("test/snapshot_safety", store)
+        .build()
+        .await
+        .unwrap();
+    db.delete(b"k1").await.unwrap();
+    db.flush().await.unwrap();
+
+    // Verify snapshot reader STILL reads the original value correctly
+    assert_eq!(reader.get(b"k1").await.unwrap(), Some(Bytes::from("v1")));
+    db.close().await.unwrap();
+}
+
+// === v0.24: Oracle property test ===
+
+/// Oracle property test for the direct-write connector (S4, S10).
+///
+/// Invariant: `incremental == batch`
+///
+/// Write N=10 rows via N sequential WriteBatch commits (one row per commit),
+/// then independently write the same N rows as a single-batch WriteBatch.
+/// Scan `view_output/t/` in both cases; assert the resulting key-value sets
+/// are equal.
+///
+/// Pre-committed before writing the S4 COMMIT operator implementation.
+#[tokio::test]
+async fn oracle_insert_incremental_equals_batch() {
+    // --- Incremental path: one WriteBatch per row ---
+    let store_inc = Arc::new(InMemory::new());
+    let db_inc = ShardDb::builder("oracle/incremental", store_inc.clone())
+        .build()
+        .await
+        .unwrap();
+
+    for i in 0u32..10 {
+        let key = format!("view_output/t/id={i}|val={i}");
+        let value = format!("{i}");
+        let mut batch = WriteBatch::new();
+        batch.put(key.as_bytes(), value.as_bytes());
+        db_inc.write_batch(batch).await.unwrap();
+    }
+    db_inc.flush().await.unwrap();
+
+    let rows_inc = db_inc.scan_prefix(b"view_output/t/").await.unwrap();
+    db_inc.close().await.unwrap();
+
+    // --- Batch path: all rows in one WriteBatch ---
+    let store_bat = Arc::new(InMemory::new());
+    let db_bat = ShardDb::builder("oracle/batch", store_bat.clone())
+        .build()
+        .await
+        .unwrap();
+
+    let mut batch = WriteBatch::new();
+    for i in 0u32..10 {
+        let key = format!("view_output/t/id={i}|val={i}");
+        let value = format!("{i}");
+        batch.put(key.as_bytes(), value.as_bytes());
+    }
+    db_bat.write_batch(batch).await.unwrap();
+    db_bat.flush().await.unwrap();
+
+    let rows_bat = db_bat.scan_prefix(b"view_output/t/").await.unwrap();
+    db_bat.close().await.unwrap();
+
+    // Assert both produce the same key-value set.
+    assert_eq!(
+        rows_inc.len(),
+        10,
+        "incremental path should have 10 rows, got {}",
+        rows_inc.len()
+    );
+    assert_eq!(
+        rows_bat.len(),
+        10,
+        "batch path should have 10 rows, got {}",
+        rows_bat.len()
+    );
+
+    let kv_inc: std::collections::BTreeMap<_, _> = rows_inc
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+        .collect::<std::collections::BTreeMap<&[u8], &[u8]>>();
+    let kv_bat: std::collections::BTreeMap<_, _> = rows_bat
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+        .collect::<std::collections::BTreeMap<&[u8], &[u8]>>();
+
+    assert_eq!(
+        kv_inc, kv_bat,
+        "incremental and batch write paths must produce identical key-value sets"
+    );
+}

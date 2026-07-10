@@ -1,12 +1,12 @@
 name: Simulation Soak
 
 # Runs a continuous stream of seeded SimRuntime executions against main.
-# Introduced in v0.36 as part of the exactly-once chaos alpha.
+# Introduced in v0.22 as part of the Chaos and Recovery SLO Gate milestone.
 #
 # Schedule: every 6 hours on main.
 # On push to main: triggered immediately (keeps the corpus fresh).
 #
-# Exit criteria (v0.36):
+# Exit criteria (v0.22):
 #   - ≥100 000 simulation seeds pass per run.
 #   - Corpus includes ≥1 seed per registered merge law.
 #   - Failing seeds are stored as regression seeds and block release.

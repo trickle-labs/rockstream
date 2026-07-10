@@ -38,9 +38,10 @@ them fresh by computing only what changed.
 What makes RockStream different from the other systems in this space is the
 combination it picks. PostgreSQL has materialized views, but you have to
 refresh them manually or pay the cost of triggers; it doesn't scale beyond
-one machine. Materialize and RisingWave are streaming systems built around
+one machine. Other streaming systems are built around
 this idea, but they hold a lot of state in memory and have their own runtime
-to manage. Snowflake dynamic tables get you a similar feel but live inside a
+to manage. Declarative incremental-view features in cloud data warehouses
+get you a similar feel but live inside a
 warehouse with its own pricing model. Pg-trickle adds incremental views to
 PostgreSQL itself, which is wonderful for a single-database deployment but
 inherits PostgreSQL's single-machine ceiling. RockStream sits at a particular
@@ -1939,7 +1940,7 @@ authoritative description of the system, its principles, and the
 trade-offs behind each design decision.
 
 For the incremental view maintenance specifics, see
-[IVM.md](../IVM.md) — how RockStream borrows from Feldera/DBSP, what it
+[IVM.md](../IVM.md) — how RockStream's IVM is based on DBSP, what it
 takes from pg-trickle as a correctness oracle, and the per-operator
 differentiation rules.
 
@@ -1960,12 +1961,219 @@ For the underlying ideas, the foundational papers are:
 - **The CALM theorem** (Hellerstein, Alvaro): the formal basis for the
   monotone-frontier commit invariant.
 
-The other systems worth reading for comparison are **Materialize**
-(streaming SQL, single-node memory-resident state), **RisingWave**
-(streaming SQL, distributed, similar problem space to RockStream),
-**Feldera** (DBSP-native, single-node), **pg-trickle** (incremental
-maintenance inside PostgreSQL), and **Snowflake dynamic tables**
-(declarative incremental maintenance in a warehouse).
+The other systems worth reading for comparison are streaming SQL systems with
+single-node memory-resident state, and
+**pg-trickle** (incremental
+maintenance inside PostgreSQL), and declarative incremental-maintenance
+features in cloud data warehouses.
+
+---
+
+## v0.5 Implementation Reference — Algebraic Aggregates and Group Commit
+
+### Algebraic Aggregates (IVM-2)
+
+Starting from v0.5, RockStream maintains `SUM`, `COUNT(*)`, and `AVG` views
+incrementally using the DBSP aggregate delta rule.
+
+**Operator**: `AggregateOp`
+- **Input schema**: `(k: Int64, v: Int64)` — group key and value to aggregate.
+- **Output schema**: `(k: Int64, sum_v: Int64, count: Int64, avg_v: Int64)`
+  where `avg_v = sum_v / count` (truncating integer division).
+- **State**: an in-memory `HashMap<k, (sum, count)>` persisted to the `op_state`
+  namespace of `ShardDb` after each epoch commit.
+
+**DBSP delta rule**:
+```
+for each input delta (k, v, weight):
+  old = state[k]   -- (sum, count), or (0,0) if k is new
+  new_sum   = old.sum   + v * weight
+  new_count = old.count + weight
+  if old.count != 0 → emit (k, old.sum, old.count, avg(old)) with weight -1
+  if new_count != 0 → emit (k, new_sum, new_count, avg(new)) with weight +1
+  state[k] = (new_sum, new_count)  if new_count != 0, else remove k
+```
+
+This rule is proven correct by the oracle property test
+`oracle_aggregate_100k` (≥100k random insert/delete/group-churn scenarios).
+
+**Error codes**:
+- `RS-1015`: Group-commit queue full (capacity = `GROUP_COMMIT_MAX_BATCHES = 64`).
+  Back-pressure applied; reduce epoch rate or increase shard count.
+- `RS-1016`: Aggregate running sum overflowed `i64`.  Reduce value magnitudes
+  or switch to a wider numeric type.
+
+### Group Commit (shard-level epoch coalescing)
+
+Each epoch, all operator write-batch fragments are coalesced by `GroupCommit`
+into a single atomic `Db::write()` call:
+
+- **Named bound**: `GROUP_COMMIT_MAX_BATCHES = 64` pending batches.
+- **Fill-level metric**: `GroupCommit::fill_level()` — monitor to detect
+  back-pressure episodes.
+- **Durability events**: `GroupCommit::commit_count()` — total `Db::write()`
+  calls issued.  For N ≥ 5 operators per epoch, group commit reduces durability
+  events by a factor of N (proven ≥5× in `lfs_group_commit_reduces_durability_events`
+  and `minio_group_commit_reduces_durability_events`).
+
+### Persisted Frontier
+
+After each epoch commit, the shard writes its current epoch number to the
+`shard_meta` namespace (key `frontier`).  On restart, `load_frontier(db)`
+reads this value so the operator can resume from the correct epoch without
+re-processing already-committed data.
+
+---
+
+## SQL Frontend (v0.7)
+
+RockStream v0.7 adds a full SQL frontend built on [DataFusion](https://datafusion.apache.org/).
+You can now write views in standard SQL rather than constructing `PlanNode` trees by hand.
+
+### CREATE VIEW
+
+Register a named incremental view backed by storage:
+
+```sql
+CREATE VIEW orders_summary AS
+  SELECT region, SUM(amount) AS total, COUNT(*) AS n
+  FROM orders
+  GROUP BY region;
+```
+
+The SQL frontend:
+1. Parses the query using DataFusion's SQL parser.
+2. Lowers the DataFusion `LogicalPlan` to a RockStream `PlanNode` tree.
+3. Applies the distribution pass (inserts `Exchange[Loopback]` no-ops for
+   single-shard mode).
+4. Stores the plan and output schema in the `SchemaCatalog` (backed by
+   `ShardDb` under `CatalogType::View` keys).
+
+### Supported SQL (Phase 1 operator set)
+
+| SQL construct | PlanNode |
+|---|---|
+| `SELECT cols FROM t` | `Source` + `Project` |
+| `WHERE predicate` | `Filter` |
+| `GROUP BY k, SUM(v)` | `Aggregate[WeightAdd/v1]` |
+| `GROUP BY k, COUNT(*), AVG(v)` | `Aggregate[WeightAdd/v1]` |
+| `GROUP BY k, MIN(v), MAX(v)` | `Aggregate[IndexedMultiset/v1]` |
+
+Expressions supported in predicates and projections: column references,
+integer/boolean/string literals, `+`, `-`, `*`, `/`, `>`, `<`, `>=`, `<=`,
+`=`, `<>`, `AND`, `OR`.
+
+### Schema Evolution
+
+When you re-register a view with a new column list:
+
+- **Compatible** (accepted in-place, schema version increments):
+  - Same schema as before
+  - New nullable columns appended at the end
+- **Incompatible** (returns `RS-1002`):
+  - Any existing column renamed, removed, or reordered
+  - Any existing column type changed
+
+### EXPLAIN INCREMENTAL
+
+Show the annotated plan tree for a query without deploying it:
+
+```
+EXPLAIN INCREMENTAL
+──────────────────────────────────────────────────────
+✓ Aggregate  merge_law=WeightAdd/v1
+    Exchange[Loopback]  loopback (single-shard)
+      ⚠ Source[orders]  stateless
+```
+
+Stateless operators show `⚠` (no arrangement state).  Stateful algebraic
+aggregates show `✓ merge_law=WeightAdd/v1`.  Non-invertible aggregates (MIN/MAX)
+show `✗ extremum_requires_rmw`.
+
+### EXPLAIN INCREMENTAL ESTIMATE
+
+Produce a static cost estimate **without deploying any operators** or accessing
+storage.  Useful for capacity planning before creating a view:
+
+```
+EXPLAIN INCREMENTAL ESTIMATE
+───────────────────────────────────────────────────
+Operator                        state_bytes   epoch_ms
+───────────────────────────────────────────────────
+Source[orders]                            0       0.00
+Exchange[Loopback]                        0       0.00
+Aggregate                             24000      10.00
+───────────────────────────────────────────────────
+(estimates only; no operators deployed)
+```
+
+The estimate uses throughput floors from the Phase 1 exit criteria:
+
+| Operator | Throughput (in-memory) | State per group |
+|---|---|---|
+| Filter / Project | 5 M rows/s | 0 B |
+| Aggregate SUM/COUNT/AVG | 1 M rows/s | 24 B |
+| Aggregate MIN/MAX | 100 k rows/s | 32 B |
+
+### Custom Extension Nodes
+
+The frontend registers three DataFusion extension nodes for incremental
+operators.  In v0.7 these nodes are transparent (they lower to the same
+`PlanNode` as their standard DataFusion equivalents); in later versions they
+carry dual-arrangement markers, bilinear-join cost hints, and other
+incremental-specific metadata.
+
+| Extension node | Purpose |
+|---|---|
+| `IncAggregate` | GROUP BY maintained via DBSP arrangement |
+| `IncJoin` | Equi-join with dual arrangements (v0.8) |
+| `IncDistinct` | DISTINCT / set operations (v0.10) |
+
+### Outer, Semi, and Anti Joins (v0.9 — IVM-5)
+
+RockStream v0.9 adds full incremental support for five additional join types
+beyond the inner equi-join introduced in v0.8:
+
+| Join type | SQL syntax | Semantics |
+|---|---|---|
+| **Left outer** | `LEFT JOIN … ON …` | All left rows; NULL-pad right columns when unmatched |
+| **Right outer** | `RIGHT JOIN … ON …` | All right rows; NULL-pad left columns when unmatched |
+| **Full outer** | `FULL OUTER JOIN … ON …` | All rows from both sides; NULL-pad where unmatched |
+| **Semi** | `WHERE col IN (SELECT …)` or `WHERE EXISTS (SELECT …)` | Left rows that have at least one matching right row (right columns not emitted) |
+| **Anti** | `WHERE col NOT IN (SELECT …)` or `WHERE NOT EXISTS (SELECT …)` | Left rows that have no matching right row |
+
+#### NULL encoding
+
+Unmatched columns in outer-join output are encoded as `0i64` in the Arrow
+Int64 output schema.  The operator distinguishes NULL-pad rows from real zero
+values by tracking per-key match counts in the `right_key_weight` (and
+`left_key_weight` for RIGHT/FULL) maps.
+
+#### Incremental algorithm
+
+Each outer join variant extends the inner-join bilinear rule with match-count
+tracking:
+
+- **RIGHT_KEY_WEIGHT[k]** — net Z-set weight of all right rows for key `k`.
+  When this transitions from 0 to non-zero (a key gains its first right match),
+  any previously NULL-padded left rows for that key are retracted.  When it
+  transitions from non-zero to 0 (key loses its last right match), NULL-pad
+  rows are re-emitted.
+- **LEFT_KEY_WEIGHT[k]** — symmetric for RIGHT and FULL joins.
+
+The state persistence format uses the same arrangement key encoding as inner
+join (`[0x01][0x4A4C/0x4A52][op_id:8][key][row_id:16]`), plus two new prefixes
+for match-count state (`[0x01][0x4F52]` for right weights, `[0x01][0x4F4C]`
+for left weights).  All persistence uses only point puts — no range deletion.
+
+### Error Codes
+
+- `RS-1002`: Incompatible schema change — rename, drop, or retype an existing
+  column.  Use a new view name or follow the blue/green procedure.
+- `RS-1012`: SQL parse error — check syntax against the supported SQL subset.
+- `RS-1013`: Unsupported plan node — the query uses a feature not yet supported
+  by the incremental planner (e.g. `RightSemi`/`RightAnti` joins, correlated
+  subqueries with non-equi conditions, window functions with `GROUPS` framing).
 
 ---
 
