@@ -97,9 +97,7 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: |
-          cargo llvm-cov --package rockstream-gateway \
-            --include-files 'protocol.rs,server.rs,session.rs,auth.rs' \
-            --fail-under-branches 70
+          cargo llvm-cov --package rockstream-gateway --fail-under-branches 70
       - name: upload coverage artifact
         uses: actions/upload-artifact@v4
         with:

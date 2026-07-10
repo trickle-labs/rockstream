@@ -48,7 +48,7 @@ dashmap = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 sha2 = "0.10"
 md5 = "0.7"
-antichain = { git = "https://github.com/trickle-labs/antichain", tag = "v0.3.1", features = ["serde"] }
+antichain = { version = "0.3.1", features = ["serde"] }
 slatedb = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

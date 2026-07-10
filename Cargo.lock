@@ -137,7 +137,8 @@ dependencies = [
 [[package]]
 name = "antichain"
 version = "0.3.1"
-source = "git+https://github.com/trickle-labs/antichain?tag=v0.3.1#641187be7c1ef3075532b5ea132953ee000e8745"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e738e3d69e27fd79a8ad865f1a518ef1053f46f7f91e026e003dce2831bd361"
 dependencies = [
  "serde",
 ]
@@ -1170,9 +1171,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
