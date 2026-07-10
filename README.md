@@ -230,7 +230,7 @@ distributed frontier/fault-tolerance protocols, and the PostgreSQL wire
 gateway (auth, transactions/savepoints, LISTEN/NOTIFY, and a certified
 driver-compatibility matrix) are all done and proven. Work is proceeding
 through Phase 12 onward (the cold-tier data-lake bridge) toward the v1.0
-release candidate at v0.54. Four documents describe the system in
+release candidate at v0.57. Four documents describe the system in
 progressively more detail:
 
 | Document | Audience | What it covers |
@@ -265,7 +265,8 @@ evidence behind every completed version.
 | Nexmark Correctness Complete ✅ Done | v0.36 | Nexmark q0–q9 and q12–q22 bit-identical to the DataFusion batch oracle |
 | Wire Protocol Complete ✅ Done | v0.39 | Extended query protocol, full Postgres type OID coverage, ORM driver compatibility, PgBouncer pooling, protocol fuzzing |
 | Wire Protocol End-User Complete ✅ Done | v0.42 | SCRAM/MD5 auth, full transaction/savepoint state machine, LISTEN/NOTIFY, a certified driver-compatibility matrix, and an unmodified reference app running end to end over pgwire |
-| 1.0 Release | v0.54 | All v0.1–v0.53 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
+| Operationally Complete | v0.55 | Full operator CLI + arrangement debugger, internal mTLS, secrets management, an independent security review, and a proven rolling-upgrade/disaster-recovery path |
+| 1.0 Release | v0.57 | All v0.1–v0.56 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
 
 ### Phase Summary
 
@@ -287,7 +288,7 @@ evidence behind every completed version.
 | 13 | Network efficiency and advanced DML: scatter pruning, zero-copy IPC, AZ-aware shuffle |
 | 14 | Complex analytics and compute tuning: recursive CTEs, lateral joins, hopping/session windows, hot-path optimizations |
 | 15 | Declarative data governance: inline expectations, lineage diagnostics, dead-letter-queue routing |
-| 16 | Enterprise validation and 1.0 finalization: isolation/validation hooks, simulator maturity, the v1.0 release candidate |
+| 16 | Enterprise validation and 1.0 finalization: isolation/validation hooks, the operator CLI + arrangement debugger, mTLS/secrets/security review, rolling-upgrade + disaster-recovery proof, simulator maturity, the v1.0 release candidate |
 
 ## Crate Architecture
 

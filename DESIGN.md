@@ -1172,7 +1172,7 @@ not overlap the shards' stored version, preventing silent data corruption.
 where shard A runs binary version N+1 and shard B runs version N. They may
 exchange shuffle frames and gRPC messages over the same pipeline. Each gRPC
 service announces a `protocol_version` header; the receiving side rejects
-requests with a higher protocol version than it supports (returns `RS-5002
+requests with a higher protocol version than it supports (returns `RS-5021
 protocol.version_not_supported`). The upgrade contract is therefore:
 
 - The N+1 binary must be able to *send* messages that N can parse (backward
@@ -4587,6 +4587,7 @@ RS-5002  merge.unknown_law
 RS-5018  resource.budget_warning_80pct
 RS-5019  resource.budget_critical_95pct
 RS-5020  merge.law_version_mismatch            (was RS-5002 overload)
+RS-5021  protocol.version_not_supported        (was RS-5002 informal reuse)
 RS-6001  schema.incompatible_evolution
 RS-6002  schema.evolution_not_applied          (was RS-6001 overload)
 ```
@@ -4605,6 +4606,11 @@ range and the prior occupant retained for its original meaning:
 - `RS-6001` previously denoted both `schema.incompatible_evolution` (a
   NOTICE) and a separate `evolution_not_applied` error. The latter moves
   to `RS-6002`.
+- `RS-5002` was also used informally by §5.5's wire-protocol-version-skew
+  text for `protocol.version_not_supported`, even though the canonical table
+  above already reserved `RS-5002` for `merge.unknown_law` — found during the
+  <=v0.42.3 roadmap review (2026-07-11). `protocol.version_not_supported`
+  moves to `RS-5021`, implemented and tested at `NEW_ROADMAP.md` v0.55.
 
 **`next_steps` requirement.** Every `RS-XXXX` error must include a
 `next_steps` field containing actionable remediation guidance. This is
