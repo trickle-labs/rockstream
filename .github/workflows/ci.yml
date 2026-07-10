@@ -65,6 +65,8 @@ jobs:
           fi
       - name: Install FizzBee
         if: steps.filter.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # v0.42.1 fix: the previous URL (fizzbee-linux-amd64.tar.gz under
@@ -73,7 +75,15 @@ jobs:
           # (e.g. fizzbee-v0.5.2-linux_x86.tar.gz), which the GitHub
           # "latest/download/<fixed-name>" convention cannot address. Resolve
           # the real asset URL from the Releases API instead.
-          url=$(curl -fsSL https://api.github.com/repos/fizzbee-io/fizzbee/releases/latest \
+          #
+          # v0.42.3 fix: the first real run of this hard-gated job (after M4
+          # was folded in, removing `continue-on-error`) failed with
+          # `curl: (22) ... 403` on this API call — GitHub's unauthenticated
+          # API rate limit (60 req/hour per source IP) is easily exhausted on
+          # shared GitHub-hosted runner IPs. Authenticate with the job's own
+          # `GITHUB_TOKEN` (5,000 req/hour) to make this reliable.
+          url=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/fizzbee-io/fizzbee/releases/latest \
             | grep -oE '"browser_download_url": *"[^"]*linux_x86\.tar\.gz"' \
             | grep -oE 'https://[^"]+' | head -1)
           if [ -z "$url" ]; then

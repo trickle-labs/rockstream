@@ -500,3 +500,18 @@ casing for M4 is removed, closing the v0.18 binding contract
 ("`make verify` genuinely green for all five specs in CI... with
 `continue-on-error` removed") for the last of the five specs.
 
+### 4. CI robustness gap found and fixed (2026-07-10, same day)
+
+The first real CI run of the M4 hard-gate fold-in (push `7b9a233`) failed
+before ever reaching `fizz` — the `Install FizzBee` step's
+`curl https://api.github.com/repos/fizzbee-io/fizzbee/releases/latest` call
+returned `curl: (22) ... 403`. This is GitHub's **unauthenticated** REST API
+rate limit (60 requests/hour per source IP), which is easily exhausted on a
+shared GitHub-hosted-runner IP pool and is unrelated to the M4 spec/CI-gate
+changes above. Because M4 no longer has `continue-on-error`, this pre-existing
+fragility (present since the URL was first fixed in v0.42.1) now surfaces as a
+hard-gate failure instead of a silently-ignored one. **Fix**: authenticate the
+Releases-API `curl` call with the job's own `GITHUB_TOKEN` via an
+`Authorization: Bearer` header, raising the limit to 5,000 requests/hour.
+
+
