@@ -131,14 +131,18 @@ MATERIALIZED VIEW`.
 
 RockStream treats aggregation as an algebraic contract. Every operator node in a
 query plan carries either a registered **merge law** — a named, versioned algebraic
-rule (SUM, COUNT, AVG, or a user-defined CRDT) verified for associativity and
-commutativity — or an explicit machine-readable reason why it cannot.
+rule (SUM, COUNT, AVG, MIN/MAX, or a similar internal CRDT-style rule) verified for
+associativity and commutativity — or an explicit machine-readable reason why it
+cannot.
 
 When a merge law is in effect, RockStream can apply partial aggregates directly in
 storage without a read-modify-write cycle, push combining steps to the producer
-side of a network shuffle, and prune compaction safely. Starting at v0.47, you can
-define your own **CRDT column types** — counters, sets, last-write-wins registers —
-that merge correctly across concurrent writes by construction.
+side of a network shuffle, and prune compaction safely. User-visible **CRDT column
+types** — counters, sets, last-write-wins registers you declare directly in
+`CREATE TABLE` — and a general `CREATE MERGE LAW` facility for your own laws are
+on the design docs as a **post-1.0** goal, once the internal law contract has
+proven itself; they are intentionally out of scope for the current roadmap (see
+[NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md)).
 
 `EXPLAIN INCREMENTAL` always shows the law name, or the exact reason it is absent,
 for every node in your plan.
@@ -147,12 +151,14 @@ for every node in your plan.
 
 RockStream keeps itself in good shape without operator intervention:
 
-- **Shards split before they get too big.** When a slice of your data approaches the
-  configured size limit, RockStream quietly splits it into two smaller slices in the
-  background. You never see a "shard is too large" page.
+- **Shards split before they get too big** *(planned; not yet implemented)*.
+  When a slice of your data approaches the configured size limit, RockStream
+  will quietly split it into two smaller slices in the background, so you
+  never see a "shard is too large" page.
 - **Workers recover in seconds, not minutes.** If a worker process dies, another one
   takes over its slice in under 30 seconds, and your dashboards are back to fresh
-  within a minute. These targets are tested on every release, not aspirational.
+  within a minute. These targets are validated by the v0.31 Recovery SLO soak
+  (see [sign-offs/v0.31.md](sign-offs/v0.31.md)) — tested on every release, not aspirational.
 - **Quiet by default.** If everything is meeting its freshness target, you hear
   nothing. If something slips, you get a named reason — not a wall of metrics.
 
@@ -173,7 +179,7 @@ The practical result: when you put RockStream into production, the kinds of
 distributed-systems surprises that usually fill a runbook have already been
 discovered — and fixed — on a developer's laptop.
 
-### Feeds the Data Lake
+### Feeds the Data Lake *(planned — Phase 12 / v0.44, not yet implemented)*
 
 RockStream can act as a **freshness layer that feeds columnar analytics tools**.
 At any cadence you specify, it writes view snapshots to object storage as
@@ -215,51 +221,73 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 
 ## Status
 
-This project is in the **design phase** (current revision: **v3.24**). Four
-documents describe the system in progressively more detail:
+This project is under active, evidence-driven implementation — every roadmap
+version ships only once its tests, benchmarks, and (for coordination
+protocols) FizzBee models prove the new capability works. The current
+released version is **v0.42** ("Wire Protocol End-User Complete" — see
+[sign-offs/v0.42.md](sign-offs/v0.42.md)): the single-shard IVM engine, the
+distributed frontier/fault-tolerance protocols, and the PostgreSQL wire
+gateway (auth, transactions/savepoints, LISTEN/NOTIFY, and a certified
+driver-compatibility matrix) are all done and proven. Work is proceeding
+through Phase 12 onward (the cold-tier data-lake bridge) toward the v1.0
+release candidate at v0.54. Four documents describe the system in
+progressively more detail:
 
 | Document | Audience | What it covers |
 |---|---|---|
 | [DESIGN.md](DESIGN.md) | Engineers / architects | Full system architecture: storage layout, operator state, worker coordination, fault tolerance, scaling model, deployment ladder, operational guide |
 | [IVM.md](IVM.md) | IVM specialists | How the incremental-view-maintenance engine itself works — DBSP-native operators, the differentiation pass, the circuit runtime, arrangements on SlateDB, and pg_trickle as a correctness oracle |
-| [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Implementers | Phase-by-phase build plan from empty repo to GA, including corrected IVM milestones and validation gates |
-| [ROADMAP.md](ROADMAP.md) | Builders / planners | Version-by-version delivery roadmap, with each roadmap version sized at about 10 person-weeks and tied to concrete proof |
+| [NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) | Implementers | The focused, two-pillar engineering plan (cloud-native IVM engine + PostgreSQL wire access layer) this roadmap implements |
+| [NEW_ROADMAP.md](NEW_ROADMAP.md) | Builders / planners | Version-by-version delivery roadmap, with each roadmap version sized at about 6 person-weeks and tied to concrete proof |
+
 ## Roadmap
 
 RockStream is built in phases, each delivering a working, testable increment.
-Each roadmap version is sized at roughly **10 person-weeks** of implementation effort.
+Each roadmap version is sized at roughly **6 person-weeks** of implementation
+effort. See [NEW_ROADMAP.md](NEW_ROADMAP.md) for the full version-by-version
+breakdown and proof obligations, and [sign-offs/](sign-offs/) for the
+evidence behind every completed version.
 
 ### Public Milestones
 
 | Milestone | Version | What it means |
 |---|---:|---|
-| Developer Alpha | v0.10 | Local single-shard engine maintains simple views and survives crash/replay |
-| SQL Alpha | v0.18 | Core SQL views, joins, set ops, and `EXPLAIN` work on one shard |
-| Single-Shard Beta | v0.27 | Advanced IVM feature-complete for serious single-node testing |
-| Distributed Alpha | v0.36 | Multi-shard execution, frontier protocol, recovery, and exactly-once basics work |
-| Integration Beta | v0.42 | Postgres gateway, direct writes, and major external connectors work end to end |
-| Production Beta | v0.53 | Observability, auth, upgrades, security review, and long soaks ready for a pilot |
-| Data Lake GA | v0.44 | Cold-tier Iceberg/Delta sinks, native Iceberg REST catalog, external tool consumption proven |
-| 1.0 | post-v0.54 | Tagged only after a real production workload succeeds without design exceptions |
+| Foundation Ready | v0.3 | Workspace, runtime abstraction, simulation, oracle harness, and the SlateDB determinism gate all pass |
+| Single-Shard Alpha ✅ Done | v0.6 | A local engine maintains filter/aggregate/MIN-MAX views and survives crash-replay |
+| SQL Engine (Phase 2 entry) ✅ Done | v0.10 | Plain-SQL views with joins and set operations maintained incrementally on one shard |
+| IVM Correct (Single-Shard) ✅ Done | v0.14 | TPC-H 22/22 incremental == batch; the engine is feature-complete and correct on one shard |
+| Distributed Engine ✅ Done | v0.17 | Multi-shard execution with exchange; distributed output bit-identical to single-shard |
+| Progress-Tracked ✅ Done | v0.19 | Frontier protocol correct across multi-input operators; bounded shuffle storage |
+| Fault-Tolerant ✅ Done | v0.22 | Exactly-once end-to-end; 24h chaos with zero loss/duplicates; recovery SLOs met |
+| Postgres Pillar ✅ Done | v0.26 | Read, write, subscribe, and read-your-writes over the Postgres wire protocol |
+| Soaks Complete ✅ Done | v0.31 | Ingestion connectors live; failure-detection, shard-reassignment, and freshness-recovery SLOs validated under real cloud pressure |
+| Private Beta Ready ✅ Done | v0.32 | Secondary indexes enable single-digit-ms point lookups on non-primary keys; open for early-adopter onboarding |
+| Nexmark Correctness Complete ✅ Done | v0.36 | Nexmark q0–q9 and q12–q22 bit-identical to the DataFusion batch oracle |
+| Wire Protocol Complete ✅ Done | v0.39 | Extended query protocol, full Postgres type OID coverage, ORM driver compatibility, PgBouncer pooling, protocol fuzzing |
+| Wire Protocol End-User Complete ✅ Done | v0.42 | SCRAM/MD5 auth, full transaction/savepoint state machine, LISTEN/NOTIFY, a certified driver-compatibility matrix, and an unmodified reference app running end to end over pgwire |
+| 1.0 Release | v0.54 | All v0.1–v0.53 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
 
 ### Phase Summary
 
 | Phase | Focus |
 |---|---|
 | 0 | Repository, deterministic simulator (`SimRuntime` + `buggify!()`), SlateDB storage contract, no-op pipeline |
-| 1 | Single-shard IVM core: filter, project, map, algebraic aggregates (SUM/COUNT/AVG), MIN/MAX; foundational `MergeLaw` / `LawBundle` contract |
-| 2 | DataFusion SQL frontend, inner and outer joins, set operations, `EXPLAIN INCREMENTAL` |
-| 3 | Advanced operators: window functions, time windows with event-time frontiers, recursion, view-on-view DAG |
-| 3.5 | IVM correctness soak: TPC-H 22/22, Nexmark subset, query fuzzer |
-| 4 | Multi-shard execution, gRPC shuffle, durable shuffle fallback |
-| 5 | Frontier protocol, frontier aggregator, shuffle GC |
-| 6 | Fault tolerance, exactly-once end-to-end, cluster checkpoints, chaos testing, continuous simulation soak |
-| 7 | Elasticity: online split/merge, worker drain, proactive scaling, hot-key virtual buckets |
-| 8 | Postgres wire protocol gateway, inline views, freshness tokens, subscribe API, `AS OF EPOCH` historical queries, HTAP session controls (max-staleness, shard column statistics) |
-| 9 | External connectors: Kafka, Postgres CDC, S3, Iceberg/Delta source; internal direct-write connector |
-| 10 | Auth (OIDC/mTLS/RBAC), secrets management, observability (Prometheus/OTEL), rolling upgrades |
-| 11 | 30-day 64-shard production soak and production beta handoff |
-| 12 | Cold-tier Iceberg v2 and Delta Lake sinks, native Iceberg REST catalog, Data Lake GA |
+| 1 | Single-shard IVM core: filter, project, map, algebraic aggregates (SUM/COUNT/AVG), MIN/MAX; crash-replay |
+| 2 | DataFusion SQL frontend, inner/outer/semi/anti joins, distinct and set operations, storage budget gate |
+| 3 | Advanced operators: window functions, tumbling time windows, Top-K, bootstrap and view-on-view DAGs; single-shard correctness soak (TPC-H 22/22, fuzzer, DST harness) |
+| 4 | Multi-shard execution, gRPC shuffle, durable shuffle fallback, hot-key virtual buckets |
+| 5 | Frontier protocol, frontier aggregator, bounded shuffle storage, progress tracking |
+| 6 | Fault tolerance, exactly-once end-to-end, cluster checkpoints, chaos testing, all four FizzBee models (M1–M4) green |
+| 7 | PostgreSQL wire gateway: read/write/subscribe, inline views, freshness tokens, read-your-writes |
+| 8 | External connectors (Kafka, Postgres CDC, S3) and "the crucible" cloud-pressure soaks: failure-detection, shard-reassignment, and freshness-recovery SLOs |
+| 9 | Operational HTAP ergonomics: secondary indexes, session controls, private-beta readiness |
+| 10 | Nexmark correctness suite: q0–q9, q12–q22 bit-identical to batch under mixed INSERT/UPDATE/DELETE |
+| 11 | PostgreSQL wire protocol hardening: extended query protocol, full type/OID and `pg_catalog` coverage, SCRAM/MD5 auth, transactions/savepoints, LISTEN/NOTIFY, reference-app and driver-matrix certification |
+| 12 | The data lake bridge: FizzBee cold-tier protocol model, Iceberg/Delta sinks, deep FinOps optimizations |
+| 13 | Network efficiency and advanced DML: scatter pruning, zero-copy IPC, AZ-aware shuffle |
+| 14 | Complex analytics and compute tuning: recursive CTEs, lateral joins, hopping/session windows, hot-path optimizations |
+| 15 | Declarative data governance: inline expectations, lineage diagnostics, dead-letter-queue routing |
+| 16 | Enterprise validation and 1.0 finalization: isolation/validation hooks, simulator maturity, the v1.0 release candidate |
 
 ## Crate Architecture
 
@@ -275,8 +303,8 @@ The project is a Cargo workspace of purpose-built crates:
 | `rockstream-sql` | SQL frontend built on DataFusion |
 | `rockstream-runtime` | Worker process, circuit executor, async scheduler, exchange subsystem |
 | `rockstream-control` | Control-plane service (topology, shard leasing, placement) |
-| `rockstream-gateway` | Postgres wire protocol gateway and Iceberg REST catalog endpoint |
-| `rockstream-connectors` | Connector implementations: Kafka, Postgres CDC, S3, Iceberg, Delta Lake |
+| `rockstream-gateway` | Postgres wire protocol gateway (Iceberg REST catalog endpoint planned, Phase 12) |
+| `rockstream-connectors` | Connector implementations: Kafka source/sink and S3 source are done; a generic exactly-once object-store sink is done; Postgres CDC source and Iceberg/Delta Lake sinks are planned (Phase 12) |
 | `rockstream-oracle` | Batch reference engine and property-test harness (DBSP soundness tests) |
 | `rockstream-sim` | Deterministic simulation harness: `SimRuntime`, `buggify!()`, fault model |
 | `rockstream-cli` | Operator CLI (`rockstream start`, `explain`, `audit`, `support bundle`) |

@@ -198,13 +198,34 @@ embedded no-op node (audit log + support bundle), then exit.
 Usage: rockstream start [OPTIONS] --storage <STORAGE>
 
 Options:
-      --storage <STORAGE>      Local storage directory for node state and artifacts
-      --role <ROLE>            Node role [default: all]
-      --control <CONTROL>      Control service URL (required for the worker and frontier roles)
-      --auth <AUTH>            Authentication mode [default: off] [possible values: off, oidc, mtls]
-      --metrics-addr <ADDR>    Metrics HTTP server listen address
-      --listen <LISTEN>        PostgreSQL wire gateway listen address [default: 127.0.0.1:5432]
-  -h, --help                   Print help
+      --storage <STORAGE>
+          Local storage directory for node state and artifacts
+
+      --role <ROLE>
+          Node role
+          
+          [default: all]
+
+      --control <CONTROL>
+          Control service URL (required for the worker and frontier roles)
+
+      --auth <AUTH>
+          Authentication mode
+          
+          [default: off]
+          [possible values: off, oidc, mtls]
+
+      --metrics-addr <METRICS_ADDR>
+          Metrics HTTP server listen address
+
+      --listen <LISTEN>
+          PostgreSQL wire gateway listen address. Activates the live gateway
+          server for the `gateway` and `all` roles
+          
+          [default: 127.0.0.1:5432]
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 One binary, every role as a flag — that is a deliberate design rule: `main`
@@ -232,19 +253,26 @@ You will see real lifecycle logs, ending with the gateway announcing itself:
 
 ```text
 INFO rockstream_control::service: control service listening addr=127.0.0.1:58817
-INFO rockstream_control::service: control: worker registered worker_id=worker-1 headroom=1.00
+INFO rockstream_control::service: control: worker registered worker_id=worker-1 address=127.0.0.1:0 headroom=1.00
 INFO rockstream_runtime::client: Worker client registered successfully as WorkerId(1)
 INFO rockstream_control::service: control: shard lease granted worker_id=worker-1 shard_id=shard-1 token=1
 INFO rockstream_runtime::client: Received ShardAssigned lease for ShardId(1)
-INFO rockstream_cli: PostgreSQL wire gateway ready — connect with: psql -h 127.0.0.1 -p 5544 -U rockstream
+INFO slatedb::db::builder: opening SlateDB database [path=db, settings={...}]
+INFO slatedb::db::builder: opening SlateDB database [path=gateway, settings={...}]
+INFO rockstream_cli: PostgreSQL wire gateway ready — connect with: psql -h 127.0.0.1 -p 5544 -U rockstream addr=127.0.0.1:5544
 ```
+
+> The two `slatedb::db::builder` lines are each followed by a verbose one-line
+> dump of the store's tuning settings (flush interval, compactor options,
+> cache sizes, …) — real SlateDB startup diagnostics, elided here for brevity.
 
 That short burst exercised a surprising amount of the real system: the **control
 plane** came up and started listening; a **worker** registered and reported its
-capacity headroom; a **shard lease** was granted with a fencing token (the same
-machinery that, in a real cluster, guarantees only one writer can ever commit to
-a shard — no split-brain); **SlateDB** opened a real store; and the
-**PostgreSQL gateway** bound the port and is now blocking, ready for clients.
+address and capacity headroom; a **shard lease** was granted with a fencing token
+(the same machinery that, in a real cluster, guarantees only one writer can ever
+commit to a shard — no split-brain); **SlateDB** opened two real stores (the
+shard store and the gateway's own serving store); and the **PostgreSQL gateway**
+bound the port and is now blocking, ready for clients.
 
 Leave that process running. In a **second terminal**, connect with a genuine
 PostgreSQL client:
@@ -478,13 +506,17 @@ each level.
 
 ### Transaction 1 — seed the campaign catalog
 
+> **One row per `INSERT`.** The gateway's DML parser currently accepts a
+> single-row `VALUES (...)` tuple per `INSERT` statement — a multi-row
+> `VALUES (...), (...), (...)` list is not yet supported. Send one `INSERT`
+> per row instead; they buffer and commit together just the same.
+
 ```sql
 SET rockstream.idempotency_key = 'demo-txn-001';
 
-INSERT INTO campaigns (campaign_id, name, channel, budget)
-  VALUES (1, 'Summer Sale',     'email',   5000),
-         (2, 'Brand Awareness', 'social',  3000),
-         (3, 'Retargeting',     'display', 2000);
+INSERT INTO campaigns (campaign_id, name, channel, budget) VALUES (1, 'Summer Sale', 'email', 5000);
+INSERT INTO campaigns (campaign_id, name, channel, budget) VALUES (2, 'Brand Awareness', 'social', 3000);
+INSERT INTO campaigns (campaign_id, name, channel, budget) VALUES (3, 'Retargeting', 'display', 2000);
 COMMIT;
 ```
 
@@ -524,11 +556,10 @@ SET rockstream.idempotency_key = 'demo-txn-002';
 -- Summer Sale:     two conversions, 300 + 250 = 550  (above threshold)
 -- Brand Awareness: one conversion, 150              (below threshold)
 -- Retargeting:     one conversion, 600              (above threshold)
-INSERT INTO conversions (conv_id, campaign_id, revenue, ts)
-  VALUES (101, 1, 300, 1000),
-         (102, 1, 250, 1001),
-         (103, 2, 150, 1002),
-         (104, 3, 600, 1003);
+INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (101, 1, 300, 1000);
+INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (102, 1, 250, 1001);
+INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (103, 2, 150, 1002);
+INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (104, 3, 600, 1003);
 COMMIT;
 ```
 
