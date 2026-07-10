@@ -389,4 +389,18 @@ was found or implied by this — it was a spec-assertion scoping defect only.
    `continue-on-error: true` in CI and is reported as a warning, not a hard
    gate. This is tracked as follow-up work; see `NEW_ROADMAP.md` v0.42.1's
    notes and its "not yet fully closed" status.
+4. **CI robustness gap found and fixed (2026-07-10, same day):** the first
+   real CI run of the fixed pipeline (push `2a98157`) showed the M4 step
+   itself get a **`cancelled`** conclusion (consistent with the runner's OOM
+   killer acting on an exploding process, per finding 1 above), which flipped
+   the whole `formal-verify` job's conclusion to `failure` — `cancelled` is
+   not suppressed by `continue-on-error` (which only suppresses `failure`).
+   So the intended "M4 is non-blocking" contract was not actually true in a
+   real run. Fixed by running M4 under a per-subshell `ulimit -v` cap plus a
+   wall-clock `timeout`, and swallowing its exit code into a step output
+   instead of relying on the step's own outcome, so the job can never fail
+   because of M4 regardless of whether it errors, times out, or gets killed
+   within its own memory cap. This is a CI-harness fix only; it does not
+   change any of the open M4 state-space/liveness issues above and is not a
+   substitute for v0.42.3.
 

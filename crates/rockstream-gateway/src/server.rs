@@ -3534,14 +3534,19 @@ impl GatewayHandler {
     // ── End Slice 3 ───────────────────────────────────────────────────────────
 
     /// INSERT handler: accumulate rows in the write buffer.
+    ///
+    /// Supports multi-row `VALUES (v1, v2), (v3, v4), ...` lists (v0.42.2):
+    /// each row tuple becomes its own buffered `DmlOp::Insert`, reusing the
+    /// existing single-row semantics per row. A malformed tuple (wrong value
+    /// count) is a hard parse error (`RS-2056`), not silent corruption.
     async fn handle_insert(
         &self,
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        // Parse INSERT INTO <table> [(cols)] VALUES (v1, v2, ...) [RETURNING ...]
+        // Parse INSERT INTO <table> [(cols)] VALUES (v1, v2, ...)[, (v1, v2, ...)]* [RETURNING ...]
         let returning = q.to_lowercase().contains(" returning ");
-        let (table, cols, values) = match parse_insert(q) {
+        let (table, cols, rows) = match parse_insert(q) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
@@ -3550,28 +3555,33 @@ impl GatewayHandler {
             }
         };
 
-        // Build row_key: deterministic from col=val pairs
-        let row_key = build_row_key(&cols, &values);
-        let values_tsv = values.join("\t");
+        let mut returning_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+        for values in &rows {
+            // Build row_key: deterministic from col=val pairs
+            let row_key = build_row_key(&cols, values);
+            let values_tsv = values.join("\t");
 
-        let op = DmlOp::Insert {
-            table: table.clone(),
-            cols: cols.clone(),
-            values_tsv: values_tsv.clone(),
-            row_key: row_key.clone(),
-        };
+            let op = DmlOp::Insert {
+                table: table.clone(),
+                cols: cols.clone(),
+                values_tsv,
+                row_key,
+            };
 
-        if let Some(id) = conn_id {
-            let mut entry = self.write_buffers.entry(id.to_string()).or_default();
-            if let Err(e) = entry.push(op) {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
-                )))]);
+            if let Some(id) = conn_id {
+                let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+                if let Err(e) = entry.push(op) {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
+                    )))]);
+                }
             }
+            returning_rows.push(values.clone());
         }
 
         if returning {
-            // Auto-commit single INSERT … RETURNING outside explicit transaction
+            // Auto-commit INSERT … RETURNING outside explicit transaction;
+            // every inserted row (one per VALUES tuple) is returned.
             let schema_fields = if let Some(ct) = self.catalog.get_table(&table) {
                 ct.columns
                     .iter()
@@ -3593,23 +3603,23 @@ impl GatewayHandler {
             };
             let schema = Arc::new(schema_fields);
             let schema_ref = schema.clone();
-            let row_values: Vec<Option<String>> = values.iter().map(|v| Some(v.clone())).collect();
-            let stream = Box::pin(stream::once(async move {
+            let data_stream = stream::iter(returning_rows).map(move |values| {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
-                for v in &row_values {
+                for v in &values {
                     encoder
-                        .encode_field(v)
+                        .encode_field(&Some(v.clone()))
                         .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
                 }
                 encoder.finish()
-            }));
+            });
+            let stream = Box::pin(data_stream);
             return Ok(vec![promote_response(Response::Query(QueryResponse::new(
                 schema, stream,
             )))]);
         }
 
         Ok(vec![promote_response(Response::Execution(
-            Tag::new("INSERT").with_oid(0u32).with_rows(1),
+            Tag::new("INSERT").with_oid(0u32).with_rows(rows.len()),
         ))])
     }
 
@@ -6020,7 +6030,14 @@ fn build_row_key(cols: &[String], vals: &[String]) -> String {
 /// Parse `INSERT INTO <table> [(cols)] VALUES (v1, v2, ...)`.
 ///
 /// Returns `(table_name, col_names, values)`.
-fn parse_insert(q: &str) -> Result<(String, Vec<String>, Vec<String>), String> {
+/// Parse `INSERT INTO <table> [(cols)] VALUES (v1, v2, ...)[, (v1, v2, ...)]*`.
+///
+/// Returns `(table, cols, rows)` where `rows` has one entry per parenthesized
+/// VALUES tuple (v0.42.2: multi-row `VALUES` lists are supported — each row
+/// becomes its own entry instead of being silently mis-split). A malformed
+/// row (wrong value count relative to the declared column list, or relative
+/// to the first row when no column list is given) is a hard parse error.
+fn parse_insert(q: &str) -> Result<(String, Vec<String>, Vec<Vec<String>>), String> {
     let ql = q.to_lowercase();
     let start = ql.find("insert into ").ok_or("not an INSERT")?;
     let after_lower = ql[start + 12..].trim_start().to_string();
@@ -6048,33 +6065,148 @@ fn parse_insert(q: &str) -> Result<(String, Vec<String>, Vec<String>), String> {
 
     // Optional column list is everything before VALUES
     let before_values_lower = rest_lower[..values_pos_lower].trim();
-    let (cols, _) = if before_values_lower.starts_with('(') {
+    let cols: Vec<String> = if before_values_lower.starts_with('(') {
         let close = before_values_lower
             .rfind(')')
             .ok_or("missing ) in column list")?;
         let col_str = &before_values_lower[1..close];
-        let cols: Vec<String> = col_str.split(',').map(|c| c.trim().to_string()).collect();
-        (cols, ())
+        col_str.split(',').map(|c| c.trim().to_string()).collect()
     } else {
-        (vec![], ())
+        vec![]
     };
 
-    // Values list: content between outer parentheses after VALUES
-    let after_values = rest_orig[values_pos_orig + 6..].trim_start();
-    if !after_values.starts_with('(') {
-        return Err("missing ( after VALUES".to_string());
-    }
-    let paren_end = after_values.rfind(')').ok_or("missing ) in VALUES")?;
-    let vals_str = &after_values[1..paren_end];
-    let values: Vec<String> = parse_value_list(vals_str);
-
-    // Strip trailing semicolon if present from last value
-    let values: Vec<String> = values
-        .into_iter()
-        .map(|v| v.trim_end_matches(';').trim().to_string())
+    // Values list: one or more parenthesized row tuples after VALUES, e.g.
+    // `VALUES (1, 'a'), (2, 'b'), (3, 'c')`. Each tuple's boundaries are
+    // found by tracking paren depth and quote state so commas/parens inside
+    // string literals never get mistaken for row/column separators. A
+    // trailing ` RETURNING ...` clause is not part of the VALUES list, so it
+    // is truncated off before splitting tuples.
+    let after_values_full = rest_orig[values_pos_orig + 6..].trim_start();
+    let after_values_full_lower = after_values_full.to_lowercase();
+    let values_clause_end = after_values_full_lower
+        .find(" returning ")
+        .unwrap_or(after_values_full.len());
+    let after_values = after_values_full[..values_clause_end].trim_end();
+    let row_tuples = split_value_tuples(after_values)?;
+    let rows: Vec<Vec<String>> = row_tuples
+        .iter()
+        .map(|tuple_str| parse_value_list(tuple_str))
         .collect();
 
-    Ok((table, cols, values))
+    if !cols.is_empty() {
+        for (i, row) in rows.iter().enumerate() {
+            if row.len() != cols.len() {
+                return Err(format!(
+                    "[RS-2056] write.malformed_values_list: VALUES row {} has {} value(s) but {} column(s) were declared. next_steps: Check that every VALUES tuple has the same number of items as the column list.",
+                    i + 1,
+                    row.len(),
+                    cols.len()
+                ));
+            }
+        }
+    } else if let Some(first_len) = rows.first().map(Vec::len) {
+        for (i, row) in rows.iter().enumerate().skip(1) {
+            if row.len() != first_len {
+                return Err(format!(
+                    "[RS-2056] write.malformed_values_list: VALUES row 1 has {} value(s) but row {} has {} value(s). next_steps: Every VALUES tuple in a multi-row INSERT must have the same number of items.",
+                    first_len,
+                    i + 1,
+                    row.len()
+                ));
+            }
+        }
+    }
+
+    Ok((table, cols, rows))
+}
+
+/// Split a `VALUES (...), (...), ...` clause (the text strictly after the
+/// `VALUES` keyword) into the raw inner contents of each parenthesized row
+/// tuple. Tracks paren depth and single-quote state so commas/parens inside
+/// string literals never get mistaken for row separators, and returns a hard
+/// parse error (rather than silently mis-splitting) on any malformed tuple —
+/// fixing the v0.42.2 multi-row VALUES corruption bug.
+fn split_value_tuples(s: &str) -> Result<Vec<String>, String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let mut tuples = Vec::new();
+
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+
+    loop {
+        if i >= chars.len() || chars[i] != '(' {
+            return Err("[RS-2056] write.malformed_values_list: expected '(' to start a VALUES row tuple. next_steps: Ensure every VALUES row is wrapped in parentheses, e.g. VALUES (1, 'a'), (2, 'b').".to_string());
+        }
+        i += 1; // consume '('
+        let tuple_start = i;
+        let mut in_quote = false;
+        let mut depth: u32 = 1;
+        while i < chars.len() && depth > 0 {
+            match chars[i] {
+                '\'' if !in_quote => {
+                    in_quote = true;
+                    i += 1;
+                }
+                '\'' if in_quote => {
+                    if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                        i += 2;
+                    } else {
+                        in_quote = false;
+                        i += 1;
+                    }
+                }
+                '(' if !in_quote => {
+                    depth += 1;
+                    i += 1;
+                }
+                ')' if !in_quote => {
+                    depth -= 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        if depth != 0 {
+            return Err("[RS-2056] write.malformed_values_list: unterminated VALUES row tuple (missing closing ')'). next_steps: Check that every VALUES tuple's parentheses are balanced.".to_string());
+        }
+        let inner: String = chars[tuple_start..i - 1].iter().collect();
+        tuples.push(inner);
+
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        if chars[i] == ';' {
+            i += 1;
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i < chars.len() {
+                let trailing: String = chars[i..].iter().collect();
+                return Err(format!(
+                    "[RS-2056] write.malformed_values_list: unexpected content after VALUES list: '{trailing}'. next_steps: Remove any text after the final ';' in the statement."
+                ));
+            }
+            break;
+        }
+        if chars[i] == ',' {
+            i += 1;
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        let trailing: String = chars[i..].iter().collect();
+        return Err(format!(
+            "[RS-2056] write.malformed_values_list: unexpected character after VALUES row tuple: '{trailing}'. next_steps: Separate multiple VALUES rows with a comma, e.g. VALUES (1, 'a'), (2, 'b')."
+        ));
+    }
+
+    Ok(tuples)
 }
 
 /// Parse `UPDATE <table> SET col = val [, ...] WHERE col = val`.
@@ -6429,6 +6561,117 @@ mod s4_tests {
             events.iter().any(|e| e.actor == "system"),
             "expected system actor in audit log, got: {:?}",
             events.iter().map(|e| &e.actor).collect::<Vec<_>>()
+        );
+    }
+}
+
+// ── v0.42.2: multi-row VALUES parsing ───────────────────────────────────────
+
+#[cfg(test)]
+mod parse_insert_tests {
+    use super::*;
+
+    /// v0.42.2 green gate: a multi-row `VALUES (...), (...), (...)` list is
+    /// split into exactly one row per tuple, with no cross-row corruption.
+    #[test]
+    fn parse_insert_multi_row_values() {
+        let (table, cols, rows) =
+            parse_insert("INSERT INTO t (id, name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+        assert_eq!(table, "t");
+        assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+                vec!["3".to_string(), "c".to_string()],
+            ]
+        );
+    }
+
+    /// Multi-row VALUES with a trailing semicolon and internal whitespace.
+    #[test]
+    fn parse_insert_multi_row_values_with_spacing_and_semicolon() {
+        let (_, _, rows) =
+            parse_insert("INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b') ;").unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+            ]
+        );
+    }
+
+    /// A comma inside a quoted string literal must not be mistaken for a row
+    /// separator, and a literal `)` inside a string must not end the tuple
+    /// early.
+    #[test]
+    fn parse_insert_multi_row_values_with_commas_and_parens_in_strings() {
+        let (_, _, rows) =
+            parse_insert("INSERT INTO t (id, name) VALUES (1, 'a, b (c)'), (2, 'd''e')").unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "a, b (c)".to_string()],
+                vec!["2".to_string(), "d'e".to_string()],
+            ]
+        );
+    }
+
+    /// A single-row VALUES list (the pre-v0.42.2 supported case) still works.
+    #[test]
+    fn parse_insert_single_row_values_unchanged() {
+        let (table, cols, rows) =
+            parse_insert("INSERT INTO t (id, val) VALUES (1, 'hello')").unwrap();
+        assert_eq!(table, "t");
+        assert_eq!(cols, vec!["id".to_string(), "val".to_string()]);
+        assert_eq!(rows, vec![vec!["1".to_string(), "hello".to_string()]]);
+    }
+
+    /// v0.42.2 green gate: a malformed multi-row VALUES list (wrong value
+    /// count in one row against the declared column list) is a hard
+    /// `RS-2056` parse error, not silent corruption.
+    #[test]
+    fn parse_insert_malformed_row_returns_rs2056() {
+        let err =
+            parse_insert("INSERT INTO t (id, name) VALUES (1,'a'),(2,'b','extra')").unwrap_err();
+        assert!(
+            err.contains("RS-2056"),
+            "expected RS-2056 error, got: {err}"
+        );
+    }
+
+    /// Same malformed-row check when no column list is given: every row must
+    /// match the first row's arity.
+    #[test]
+    fn parse_insert_malformed_row_without_column_list_returns_rs2056() {
+        let err = parse_insert("INSERT INTO t VALUES (1,'a'),(2)").unwrap_err();
+        assert!(
+            err.contains("RS-2056"),
+            "expected RS-2056 error, got: {err}"
+        );
+    }
+
+    /// A row missing its opening `(` is a hard parse error, not a panic or
+    /// silent misparse.
+    #[test]
+    fn parse_insert_missing_open_paren_is_error() {
+        let err = parse_insert("INSERT INTO t (id) VALUES 1, (2)").unwrap_err();
+        assert!(
+            err.contains("RS-2056"),
+            "expected RS-2056 error, got: {err}"
+        );
+    }
+
+    /// Unterminated VALUES tuple (missing closing paren) is a hard parse
+    /// error.
+    #[test]
+    fn parse_insert_unterminated_tuple_is_error() {
+        let err = parse_insert("INSERT INTO t (id) VALUES (1").unwrap_err();
+        assert!(
+            err.contains("RS-2056"),
+            "expected RS-2056 error, got: {err}"
         );
     }
 }

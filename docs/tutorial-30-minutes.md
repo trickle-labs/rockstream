@@ -506,10 +506,9 @@ each level.
 
 ### Transaction 1 — seed the campaign catalog
 
-> **One row per `INSERT`.** The gateway's DML parser currently accepts a
-> single-row `VALUES (...)` tuple per `INSERT` statement — a multi-row
-> `VALUES (...), (...), (...)` list is not yet supported. Send one `INSERT`
-> per row instead; they buffer and commit together just the same.
+Multi-row `VALUES (...), (...), (...)` lists are supported (v0.42.2) in
+addition to one `INSERT` per row — both forms buffer and commit together the
+same way.
 
 ```sql
 SET rockstream.idempotency_key = 'demo-txn-001';

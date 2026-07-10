@@ -135,6 +135,7 @@ in the test corpus.
 |---|---|
 | `SELECT` | `gateway_integration_tests.rs::server_starts_and_accepts_connection` |
 | `INSERT` | `gateway_proof_tests.rs::insert_accumulates_in_write_buffer` |
+| `INSERT ... VALUES (...), (...), ...` (multi-row) | `gateway_proof_tests.rs::multi_row_insert_values_writes_all_rows_correctly` |
 | `UPDATE` | `gateway_dml_tests.rs::test_update_accumulates_in_write_buffer` |
 | `DELETE` | `gateway_proof_tests.rs::delete_accumulates_in_write_buffer` |
 | `CREATE TABLE` | `gateway_proof_tests.rs::create_table_registers_in_catalog` |

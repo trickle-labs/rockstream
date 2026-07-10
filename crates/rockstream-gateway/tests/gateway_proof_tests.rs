@@ -1065,6 +1065,141 @@ async fn insert_select_returning_multi_row() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// v0.42.2: multi-row VALUES INSERT
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// v0.42.2 green gate: a real `INSERT ... VALUES (...), (...), (...)` list
+/// (a single statement, not per-row workaround INSERTs) writes all three rows
+/// correctly end-to-end, including a value containing a comma inside quotes
+/// (which the old first-`(`-to-last-`)` splitter would have corrupted).
+#[tokio::test]
+async fn multi_row_insert_values_writes_all_rows_correctly() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v0422-multi-row-insert").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v0422-multi-row-key'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, name) VALUES (1, 'a, with comma'), (2, 'b'), (3, 'c')")
+        .await
+        .expect("multi-row INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    shard_db.flush().await.unwrap();
+    let msgs = client
+        .simple_query("SELECT * FROM t ORDER BY id")
+        .await
+        .expect("SELECT t failed");
+    let data_rows = data_rows_from(&msgs);
+    assert_eq!(
+        data_rows.len(),
+        3,
+        "expected 3 rows from multi-row INSERT, got {}",
+        data_rows.len()
+    );
+    assert_eq!(data_rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(
+        data_rows[0].get("name").unwrap_or(""),
+        "a, with comma",
+        "value with embedded comma must not be corrupted or dropped"
+    );
+    assert_eq!(data_rows[1].get("id").unwrap_or(""), "2");
+    assert_eq!(data_rows[1].get("name").unwrap_or(""), "b");
+    assert_eq!(data_rows[2].get("id").unwrap_or(""), "3");
+    assert_eq!(data_rows[2].get("name").unwrap_or(""), "c");
+}
+
+/// v0.42.2 green gate: `INSERT ... VALUES (...), (...) RETURNING *` returns
+/// every written row (not just the first), all from a single statement.
+#[tokio::test]
+async fn multi_row_insert_values_returning_returns_all_rows() {
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "items".to_string(),
+        columns: vec![
+            rockstream_gateway::catalog_stubs::CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+            },
+            rockstream_gateway::catalog_stubs::CatalogColumn {
+                name: "name".to_string(),
+                data_type: "Utf8".to_string(),
+            },
+        ],
+    });
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_catalog(addr, catalog.clone(), Arc::new(NoopViewReader));
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    let rows = client
+        .simple_query(
+            "INSERT INTO items (id, name) VALUES (1, 'Alpha'), (2, 'Beta'), (3, 'Gamma') RETURNING *",
+        )
+        .await
+        .expect("multi-row INSERT RETURNING failed");
+    let data_rows: Vec<_> = rows
+        .iter()
+        .filter_map(|m| {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+                Some(r)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        data_rows.len(),
+        3,
+        "expected 3 rows from multi-row INSERT RETURNING, got {}",
+        data_rows.len()
+    );
+    assert_eq!(data_rows[0].get("id"), Some("1"));
+    assert_eq!(data_rows[0].get("name"), Some("Alpha"));
+    assert_eq!(data_rows[1].get("id"), Some("2"));
+    assert_eq!(data_rows[1].get("name"), Some("Beta"));
+    assert_eq!(data_rows[2].get("id"), Some("3"));
+    assert_eq!(data_rows[2].get("name"), Some("Gamma"));
+}
+
+/// v0.42.2 green gate: a malformed multi-row VALUES list (a row with the
+/// wrong number of values) returns a hard `RS-2056` parse error instead of
+/// silently corrupting or dropping data.
+#[tokio::test]
+async fn multi_row_insert_malformed_row_returns_rs2056_not_silent_corruption() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("v0422-malformed-row").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    let result = client
+        .simple_query("INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b', 'extra')")
+        .await;
+    let got_rs2056 = match &result {
+        Err(e) => {
+            e.as_db_error()
+                .map(|d| d.message().contains("RS-2056"))
+                .unwrap_or(false)
+                || e.to_string().contains("RS-2056")
+        }
+        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("RS-2056")),
+    };
+    assert!(
+        got_rs2056,
+        "expected RS-2056 error for malformed multi-row VALUES, got {result:?}"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // v0.24 S6 idempotency tests
 // ══════════════════════════════════════════════════════════════════════════════
 

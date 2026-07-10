@@ -111,16 +111,31 @@ jobs:
       # formal/findings.md). Until the state space is made tractable
       # (symmetry reduction or tighter bounds) or confirmed to terminate,
       # M4 is reported but does not block merge.
+      #
+      # v0.42.1 fix: running this unbounded on a real runner let an exploding
+      # M4 get OOM-killed by the *runner*, which GitHub Actions reports as a
+      # "cancelled" step conclusion — a status `continue-on-error` does NOT
+      # suppress (it only suppresses "failure"), so an exploding M4 was
+      # silently turning the whole hard-gate job red despite the intent for
+      # it to be non-blocking. Cap the subshell's virtual memory so fizz
+      # fails *within itself* (an ordinary non-zero exit) well before the
+      # runner-level OOM killer would act, and bound wall-clock time as a
+      # second safety net; both are swallowed here so the step's own outcome
+      # never depends on M4 actually finishing.
       - name: Formal verify — M4 (non-blocking pending state-space fix)
         if: steps.filter.outputs.run == 'true'
-        run: fizz formal/m4_self_fencing.fizz
-        continue-on-error: true
         id: formal_verify_m4
-      - name: Report M4 status
-        if: steps.filter.outputs.run == 'true' && steps.formal_verify_m4.outcome == 'failure'
         run: |
-          echo "::warning::M4 (self-fencing) formal verification did not complete/pass within this job's bounds."
-          echo "See formal/findings.md and NEW_ROADMAP.md v0.42.1 for the tracked state-space tractability issue."
+          set +e
+          ( ulimit -v 6291456; timeout 1200 fizz formal/m4_self_fencing.fizz )
+          m4_exit=$?
+          echo "exit_code=$m4_exit" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Report M4 status
+        if: steps.filter.outputs.run == 'true' && steps.formal_verify_m4.outputs.exit_code != '0'
+        run: |
+          echo "::warning::M4 (self-fencing) formal verification did not complete/pass within this job's bounds (exit code ${{ steps.formal_verify_m4.outputs.exit_code }})."
+          echo "See formal/findings.md and NEW_ROADMAP.md v0.42.1/v0.42.3 for the tracked state-space tractability issue."
           echo "See formal/findings.md and FIZZBEE_TEST_PLAN.md for model status."
 
   coverage:
