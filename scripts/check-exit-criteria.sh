@@ -18,8 +18,15 @@ ERRORS=0
 #   | v0.1 | Workspace and CI ✅ Done | ... |
 # We only extract the version from the first column to avoid false matches
 # on version numbers mentioned inside the row description text.
-done_versions=$(grep -E '^\| v[0-9]+\.[0-9]+ \|.*✅ Done' "$ROADMAP" \
-  | sed 's/^| \(v[0-9]*\.[0-9]*\) |.*/\1/' || true)
+#
+# The version number may have two OR three dot-separated components
+# (e.g. `v0.42` or `v0.42.1` for a remediation sub-version) — a two-part-only
+# pattern silently skips every three-part row and its sign-off requirement,
+# which is exactly the bug found by the <=v0.42.3 implementation review
+# (2026-07-10): v0.42.1/v0.42.2/v0.42.3 were marked Done with no sign-off
+# file and this check never noticed.
+done_versions=$(grep -E '^\| v[0-9]+\.[0-9]+(\.[0-9]+)? \|.*✅ Done' "$ROADMAP" \
+  | sed 's/^| \(v[0-9]*\.[0-9]*\(\.[0-9]*\)*\) |.*/\1/' || true)
 
 if [ -z "$done_versions" ]; then
   echo "No versions marked Done in NEW_ROADMAP.md."

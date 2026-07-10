@@ -5135,7 +5135,9 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    fully exercised in simulation. Mitigation target: add
    `partial_write_probability: f64` to `SimObjectStore`'s fault model by
    v0.37; add a `PartialWriteRecoveryTest` to the law-faults corpus.
-   Status: **[MITIGATED in v0.43]** — cold-tier exactly-once claim unblocked at v0.44.
+   Status: **[UNMITIGATED — scheduled for v0.43]** — cold-tier exactly-once
+   claim unblocked at v0.44 once v0.43 lands; not yet implemented as of
+   v0.42.3 (see `NEW_ROADMAP.md` Phase 12, v0.43).
 
 2. **Kafka transactional broker timeout** — `SimNetwork` can inject message
    drops but does not model Kafka broker-side transaction timeout (which
@@ -5143,15 +5145,20 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    the `CheckBeforeCommit` recovery path for `KafkaSink` is not exercised in
    simulation. Mitigation: add a `kafka_tx_timeout_probability` fault
    parameter to the Kafka connector simulator before v0.44.
-   Status: **[MITIGATED in v0.43]** — Kafka exactly-once claim unblocked at v0.44.
+   Status: **[UNMITIGATED — scheduled for v0.43]** — Kafka exactly-once claim
+   unblocked at v0.44 once v0.43 lands; not yet implemented as of v0.42.3
+   (see `NEW_ROADMAP.md` Phase 12, v0.43).
 
 3. **S3 LIST consistency delays** — `SimObjectStore` returns synchronously
    consistent LIST results; real S3 may return stale LIST responses for
    several seconds after a PUT. Consequence: the CALM epoch manifest
    verifiability property (§8.4) is not tested against LIST staleness.
    Mitigation: add `list_staleness_epochs` fault parameter to
-   `SimObjectStore` by v0.42 (Simulator Maturity).
-   Status: **[UNMITIGATED — scheduled for v0.42 Simulator Maturity]** — informational only;
+   `SimObjectStore` by v0.43 (pulled forward from a stale "v0.42 Simulator
+   Maturity" reference — that milestone is now v0.53 in the current roadmap
+   numbering; `NEW_ROADMAP.md`'s v0.43 scope explicitly says "pull forward
+   `list_staleness_epochs` if not yet landed").
+   Status: **[UNMITIGATED — scheduled for v0.43]** — informational only;
    CALM property depends on direct manifest reads, not LIST.
 
 4. **Network packet fragmentation** — TCP segmentation of large shuffle

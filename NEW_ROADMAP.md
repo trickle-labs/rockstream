@@ -278,6 +278,35 @@ known SQL-parsing bug. v0.42.1 fixed the CI toolchain and made smoke/M1/M2/M3
 a genuine, verified hard gate; v0.42.2 fixed the gateway multi-row `INSERT`
 gap and reconciled the coverage-gate documentation; v0.42.3 closed the one
 remaining item (M4's state-space size and a real liveness bug it uncovered).
+
+**Follow-up <=v0.42.3 implementation review (2026-07-10, same day) found and
+fixed two process gaps** in how the Common Definition of Done's sign-off
+requirement is enforced, on top of confirming the v0.42.1–v0.42.3 functional
+claims above are genuinely true against running code: (1)
+`scripts/check-exit-criteria.sh`'s version-extraction regex only matched
+two-component version numbers (`v0.42`), so it silently never checked
+three-component remediation sub-versions (`v0.42.1`/`v0.42.2`/`v0.42.3`) at
+all — not "missing", just never evaluated — which is how those three
+versions were marked `✅ Done` in this roadmap with no `sign-offs/vX.Y.Z.md`
+file for weeks without CI ever flagging it. Fixed by extending the regex to
+accept an optional third dot-separated component. (2) `DESIGN.md` §17's
+known-simulation-fidelity-gaps table had two gaps marked
+`Status: [MITIGATED in v0.43]` — a future version that had not been
+implemented yet — and a third gap's mitigation target referenced a stale
+"v0.42 Simulator Maturity" milestone name/number left over from an earlier
+roadmap revision (that milestone is v0.53 in the current numbering). Fixed by
+correcting all three to `[UNMITIGATED — scheduled for v0.43]`, consistent
+with `NEW_ROADMAP.md`'s own v0.43 scope text. (3) `formal/README.md`'s spec
+index never listed `m3_sink_2pc.fizz`/`m4_self_fencing.fizz` (added in
+v0.20/v0.21) and its links pointed at a stale, non-existent absolute path
+(`file:///Users/grove/projects/rockstream/formal/...`) instead of the actual
+repository. **Done**:
+`scripts/check-exit-criteria.sh` fixed and re-run clean;
+`sign-offs/v0.42.1.md`, `sign-offs/v0.42.2.md`, `sign-offs/v0.42.3.md`
+created with full proof-claim verification against `formal/findings.md` and
+the actual gateway/CI code; `DESIGN.md` §17 gap statuses corrected;
+`formal/README.md`'s spec index now lists all five specs with working
+relative links.
 All three versions are now closed, unblocking Phase 12, since v0.43 explicitly
 requires a *working* `make verify` gate for its new M5 model.
 
