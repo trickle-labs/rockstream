@@ -196,3 +196,77 @@ permanent CI gate through DC.1–DC.4.
 | P1 — chaos output matches non-faulty reference | `proof_chaos_output_matches_reference_run` | `chaos_tests.rs` |
 | P2 — full-outage recovery < 60 s | `proof_recovery_from_full_outage_within_60s` | `chaos_tests.rs` |
 | P3 — failure detection ≤ 5 s, shard reassignment ≤ 30 s, freshness recovery ≤ 60 s p99 | `proof_recovery_slos_all_met` | `chaos_tests.rs` |
+
+---
+
+## Post-v0.42 Review — FizzBee Toolchain Actually Executed for the First Time (2026-07-10)
+
+**Context**: the <=v0.42 roadmap review obtained a real `fizzbee` v0.5.2 binary
+(macOS arm64 release asset) and ran `make verify`'s five specs directly for
+the first time since v0.18. Every prior status in this file above
+("DEFINED ✅", "WRITTEN — pending `make verify`", "no counterexamples found
+during manual review/construction") was recorded **without ever having run the
+model checker** — `.github/workflows/ci.yml`'s `formal-verify` job has never
+successfully installed `fizzbee` (see below) and carries
+`continue-on-error: true`, so no red result has ever blocked a merge. This
+section corrects the record with real execution evidence. Tracked for
+remediation as **v0.42.1** in `NEW_ROADMAP.md`.
+
+### Real results, this run
+
+| Spec | Result | Evidence |
+|---|---|---|
+| `formal/smoke.fizz` | ✅ PASSED | 2 nodes, 1 unique state, live |
+| `formal/m2_frontier_agg.fizz` | ✅ PASSED | 251,889 nodes explored, 48,298 unique states, liveness checked — matches the M2 section above |
+| `formal/m1_epoch_commit.fizz` | ❌ **FAILED** | `Invariant: M1_S5_IdempotentReplay` — concrete counterexample below |
+| `formal/m3_sink_2pc.fizz` | 💥 **CRASHED** | Go panic: `m3_sink_2pc.fizz:207:11: undefined: externalsystem` — the spec has never completed a single run |
+| `formal/m4_self_fencing.fizz` | 💥 **CRASHED** | Go panic: `m4_self_fencing.fizz:236:17: undefined: workers` — the spec has never completed a single run |
+
+### M1_S5_IdempotentReplay counterexample (reproducible)
+
+```
+Init                    persisted_epoch_0=0, duplicate_commit_delivered=false
+CommitEpoch0            persisted_epoch_0=1
+DuplicateCommit0        snapshot_epoch_0_before_dup=1, duplicate_commit_delivered=true
+CommitEpoch0            persisted_epoch_0=2   <-- state advanced *after* a duplicate was
+                                                   recorded as delivered, violating the
+                                                   snapshot-equality assertion
+```
+
+The model allows a legitimate new `CommitEpoch0` action to fire after
+`DuplicateCommit0`, which the `M1_S5` assertion (comparing current state to
+the pre-duplicate snapshot) treats as a violation. This may be a spec defect
+(the assertion should only apply immediately after the duplicate, not for all
+time afterward) rather than a real protocol bug in
+`crates/rockstream-storage`/`rockstream-runtime` — but this has not been
+root-caused, only observed. It must not be re-marked "PASSED" without either
+fixing the assertion's scoping or confirming/fixing a real idempotency gap.
+
+### Additional CI-pipeline defects found (independent of the spec bugs above)
+
+1. **Broken download URL.** `ci.yml` downloads
+   `fizzbee-linux-amd64.tar.gz` from `.../releases/latest/download/...`. The
+   real release assets (checked against the GitHub Releases API for
+   `fizzbee-io/fizzbee`) are versioned filenames — e.g.
+   `fizzbee-v0.5.2-linux_x86.tar.gz` — so this URL 404s on every run.
+2. **Wrapper/binary mismatch.** `Makefile`'s `verify`/`verify-relaxed` targets
+   invoke `fizz <spec>.fizz`, but `fizz` is a bash wrapper script that expects
+   sibling files (`fizz.env`, `parser/`, `mbt_gen.zip`) alongside the
+   `fizzbee` binary. The CI step only extracts the single `fizzbee` file to
+   `/usr/local/bin`, so `fizz` would be "command not found" even if the
+   download succeeded.
+3. **Invalid PR trigger condition.** The job's `if:` guard reads
+   `contains(github.event.pull_request.changed_files, 'formal/')`, but the
+   GitHub `pull_request` webhook payload's `changed_files` field is an
+   **integer count**, not a file list — `contains()` against a number never
+   matches a path substring. In practice `formal-verify` only ever runs on
+   `push` (i.e. after merge to `main`), never as a pre-merge PR gate.
+4. **`continue-on-error: true`** on the whole job means even a correctly
+   installed, correctly triggered, genuinely red model would not block a
+   merge — contradicting the binding v0.18 contract ("a red model blocks
+   merge") and the DC.1 claim above ("wired to the same merge gate as
+   `cargo test`").
+
+None of these four defects touch the Rust implementation; they are entirely
+in `.github/workflows/ci.yml` / `Makefile` / the `.fizz` spec files. See
+`NEW_ROADMAP.md` v0.42.1 for the remediation plan.
