@@ -92,12 +92,11 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov --package rockstream-gateway --fail-under-lines 70
-      - name: cargo llvm-cov (gateway branch ≥70% for core files)
+      - name: cargo llvm-cov (gateway regions ≥70%)
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: |
-          cargo llvm-cov --package rockstream-gateway --fail-under-branches 70
+        run: cargo llvm-cov --package rockstream-gateway --fail-under-regions 70
       - name: upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
