@@ -270,3 +270,123 @@ fixing the assertion's scoping or confirming/fixing a real idempotency gap.
 None of these four defects touch the Rust implementation; they are entirely
 in `.github/workflows/ci.yml` / `Makefile` / the `.fizz` spec files. See
 `NEW_ROADMAP.md` v0.42.1 for the remediation plan.
+
+---
+
+## Post-v0.42.1 Remediation Results (2026-07-10)
+
+Fixes applied for every defect found in the review above, re-verified against
+the real `fizzbee` v0.5.2 binary.
+
+### CI-pipeline fixes
+
+1. **Download URL** — `.github/workflows/ci.yml` now resolves the real
+   per-OS/arch asset from the GitHub Releases API instead of guessing a fixed
+   filename.
+2. **Wrapper/binary mismatch** — the whole extracted release directory
+   (containing `fizz`, `fizzbee`, `fizz.env`, `parser/`, `mbt_gen.zip`) is
+   added to `$GITHUB_PATH`, not just the bare `fizzbee` binary.
+3. **PR trigger condition** — replaced the invalid
+   `contains(github.event.pull_request.changed_files, 'formal/')` guard with
+   an actual `git diff --name-only` against the PR's merge-base, so the job
+   now correctly runs pre-merge on PRs that touch a coordination crate,
+   `DESIGN.md`, or `formal/`.
+4. **Hard gate for smoke/M1/M2/M3** — `continue-on-error` was removed for
+   these four specs; a red result now blocks merge, per the v0.18 contract.
+   M4 remains `continue-on-error: true` (see below) until its state-space
+   size is resolved.
+
+### Spec fixes — real, re-verified results
+
+| Spec | Result | Evidence |
+|---|---|---|
+| `formal/smoke.fizz` | ✅ PASSED | 2 nodes, 1 unique state, live |
+| `formal/m1_epoch_commit.fizz` | ✅ **PASSED** (fixed) | 72 nodes, 72 unique states, liveness holds |
+| `formal/m2_frontier_agg.fizz` | ✅ PASSED (unchanged) | 251,889 nodes explored, 48,298 unique states, liveness checked |
+| `formal/m3_sink_2pc.fizz` | ✅ **PASSED** (fixed) | 1,168 nodes, 1,168 unique states, all safety invariants + `M3_L1_DeliveryProgress` liveness hold |
+| `formal/m4_self_fencing.fizz` | ⚠️ **Still open** — see below | Undefined-variable crash and a real self-fence race are fixed; exhaustive verification is not yet confirmed to terminate |
+
+**M1 fix**: `M1_S5_IdempotentReplay` compared the post-duplicate state against
+a one-time snapshot **forever after**, so any legitimate subsequent
+`CommitEpoch0`/`CommitEpoch1` was flagged as a violation of "idempotent
+replay" even though it was ordinary progress unrelated to the duplicate. Fix:
+`CommitEpoch0`/`CommitEpoch1` now clear `duplicate_commit_delivered` when they
+fire, scoping the check to the single state immediately after the duplicate,
+which is what "the duplicate had no effect" actually means. No Rust-side bug
+was found or implied by this — it was a spec-assertion scoping defect only.
+
+**M3 fixes**:
+- Added explicit role instantiation (`shard = Shard()`, etc.) in the top-level
+  `Init` action — bare lowercase role names are only resolvable in
+  action/assertion bodies if a global binding of that name exists.
+- Replaced the Python-style set literal `ext.delivered_epochs | {target_epoch}`
+  (invalid in FizzBee's Starlark dialect, which has no set-literal syntax)
+  with `ext.delivered_epochs.add(target_epoch)`.
+- `SinkFinalize` now also clears `s.sink_pending_epoch`, not just
+  `sk.staged_epoch`/`sk.phase`/`s.sink_state`. Leaving the stale pointer set
+  made `M3_S1_NoDuplicateDelivery` spuriously fail on the normal post-finalize
+  Idle state (a previously-delivered epoch's pointer still matched
+  `sink_pending_epoch`, and the assertion misread that as "delivered without
+  staging").
+- Added a `MAX_CRASHES` bound on `CrashBeforePreCommit`/
+  `CrashBetweenPreCommitAndCommit`. Without it, the unfair crash-injection
+  actions could preempt the fair `SinkCommit` on every single epoch forever,
+  making `M3_L1_DeliveryProgress` fail for a reason that has nothing to do
+  with protocol correctness (an unbounded, permanently-adversarial scheduler
+  choice, not a real liveness bug).
+
+**M4 fixes applied**:
+- Explicit role instantiation (`controlplane = ControlPlane()`,
+  `shards = [Shard(id=i) for ...]`, `workers = [Worker(id=i) for ...]`) —
+  same class of bug as M3.
+- **Self-fence race**: `HeartbeatTick` and `SelfFence` were separate atomic
+  actions, so a state existed where `isolation_steps == SELF_FENCE_AFTER` and
+  `status == "active"` simultaneously (the increment landed one step before
+  the fair `SelfFence` got to run), which made `M4_S2_SelfFencePrecedence`
+  fail even though `SelfFence` was guaranteed to fire next. Fixed by folding
+  the self-fence transition into the same atomic step as the threshold-
+  crossing increment; the standalone `SelfFence` action was removed as
+  redundant.
+- **Added `RestartWorker`**: the original spec had no transition out of
+  `status == "terminated"`, so if every worker eventually self-fenced
+  (nothing bounded how many times a given worker could be isolated), no shard
+  could ever regain a lease holder again, making
+  `M4_L1_RecoveryProgress` unprovable regardless of protocol correctness. This
+  models the real operational behavior (the control plane replaces/restarts a
+  dead worker process).
+- **Added `MAX_OUTAGES` bound** on `LoseControlContact`/
+  `LoseObjectStoreContact`, mirroring the M3 `MAX_CRASHES` fix, after
+  bounded-simulation testing suggested (but could not conclusively confirm —
+  see below) that unbounded outage/recovery toggling could starve
+  `HeartbeatTick` indefinitely.
+
+**M4 remaining open issue — not resolved by this pass**:
+1. **Exhaustive (BFS) verification does not terminate in reasonable time at
+   the committed bounds.** `NUM_WORKERS=3, NUM_SHARDS=2, MAX_EPOCH=2,
+   MAX_CHECKPOINT=2, SELF_FENCE_AFTER=3` was still growing past 800,000
+   explored nodes and 10+ GB RSS after several minutes even at a *reduced*
+   `NUM_WORKERS=2` in local testing; the process was killed rather than let
+   run unbounded. This is a state-space-size problem, separate from spec
+   correctness, and needs either FizzBee's symmetry-reduction features (the
+   toolchain ships a `16-05-nominal-symmetry` example suggesting this exists)
+   or materially tighter bounds before exhaustive CI-fast verification is
+   tractable.
+2. **Simulation-mode liveness results for M4 are not trustworthy evidence.**
+   Bounded random simulation (`fizz --simulation --max_runs N`) reported
+   `M4_L2_NoPermanentBlock` as failed on a trace that contained **zero**
+   occurrences of any worker ever being `"blocked"` — i.e. the reported
+   failure could not have been a real counterexample to "no worker stays
+   blocked forever"; it is far more likely an artifact of `--simulation`
+   mode being unable to positively confirm an "eventually always" (or
+   "always eventually") property without observing an actual infinite
+   behavior/cycle, which a bounded random walk cannot provide. Both
+   `M4_L1_RecoveryProgress` and `M4_L2_NoPermanentBlock` therefore remain
+   **unverified** (neither confirmed nor conclusively falsified) after this
+   pass. `M4-S1` through `M4-S4` (safety) did pass every bounded-simulation
+   run attempted, which is weaker evidence than exhaustive BFS but is not
+   nothing.
+3. Until (1) and (2) are resolved, `formal-verify`'s M4 step stays
+   `continue-on-error: true` in CI and is reported as a warning, not a hard
+   gate. This is tracked as follow-up work; see `NEW_ROADMAP.md` v0.42.1's
+   notes and its "not yet fully closed" status.
+

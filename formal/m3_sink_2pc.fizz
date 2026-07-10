@@ -17,6 +17,15 @@
 
 MAX_EPOCH = 3
 
+# Crash injections are deliberately unfair (a crash can happen or not), but
+# without a bound the checker can choose an infinite trace that crashes on
+# every single epoch forever, which would make M3_L1_DeliveryProgress
+# unprovable regardless of protocol correctness. Bounding total crashes
+# (matching the single-crash pattern in formal/m1_epoch_commit.fizz) still
+# exercises every crash yield point while leaving room for the fair actions
+# (SinkCommit, RecoverFromCrash) to make progress afterward.
+MAX_CRASHES = 1
+
 # SinkIdempotencyProfile variants (modelled as integer constants):
 #   0 = NativeIdempotent
 #   1 = FencingTokenRequired
@@ -30,6 +39,19 @@ action Init:
     crash_between_precommit_commit_observed = False
     duplicate_delivery_attempted = False
     delivery_progress_reached = False
+    crash_count = 0
+
+    # Explicit role instantiation (v0.42.1 fix): bare lowercase role names
+    # (shard, controlplane, sinkconnector, externalsystem,
+    # checkpointcoordinator) are only resolvable inside action/assertion
+    # bodies if a global binding of that exact name is created here. Without
+    # this, the model checker panics with "undefined: <name>" the moment an
+    # assertion or action references it.
+    shard = Shard()
+    controlplane = ControlPlane()
+    sinkconnector = SinkConnector()
+    externalsystem = ExternalSystem()
+    checkpointcoordinator = CheckpointCoordinator()
 
 # ControlPlane: tracks the cluster-committed epoch (from M1).
 role ControlPlane:
@@ -106,6 +128,8 @@ atomic fair action SinkPreCommit:
 atomic action CrashBeforePreCommit:
     sk = sinkconnector
     require sk.phase == 0   # only crash when idle (epoch not yet staged)
+    require crash_count < MAX_CRASHES
+    crash_count = crash_count + 1
     # Crash resets ephemeral state; durable sink_state is unchanged.
     sk.phase = 0
     sk.staged_epoch = 0
@@ -115,6 +139,8 @@ atomic action CrashBeforePreCommit:
 atomic action CrashBetweenPreCommitAndCommit:
     sk = sinkconnector
     require sk.phase == 1   # PreCommitted
+    require crash_count < MAX_CRASHES
+    crash_count = crash_count + 1
     # Record coverage.
     crash_between_precommit_commit_observed = True
     # Ephemeral state is lost; durable sink_state/ remains PreCommitted.
@@ -149,15 +175,15 @@ atomic fair action SinkCommit:
     # Profile-specific commit.
     if SINK_PROFILE == 0:
         # NativeIdempotent: re-commit is safe.
-        ext.delivered_epochs = ext.delivered_epochs | {target_epoch}
+        ext.delivered_epochs.add(target_epoch)
     elif SINK_PROFILE == 1:
         # FencingTokenRequired: use fencing token to prevent duplicate.
-        ext.delivered_epochs = ext.delivered_epochs | {target_epoch}
+        ext.delivered_epochs.add(target_epoch)
         ext.tx_status[target_epoch] = 2   # committed
     else:
         # CheckBeforeCommit: check then commit.
         if target_epoch not in ext.delivered_epochs:
-            ext.delivered_epochs = ext.delivered_epochs | {target_epoch}
+            ext.delivered_epochs.add(target_epoch)
         ext.tx_status[target_epoch] = 2
 
     # Update durable sink_state/ to Committed.
@@ -175,6 +201,13 @@ atomic fair action SinkFinalize:
     sk.phase = 0
     sk.staged_epoch = 0
     s.sink_state = 0         # reset for next epoch
+    # v0.42.1 fix: sink_pending_epoch must also be cleared on finalize.
+    # Leaving it set to the just-finalized epoch made M3_S1_NoDuplicateDelivery
+    # spuriously fail: the invariant reads "sink_pending_epoch == epoch (already
+    # in delivered_epochs) AND sink_state == Idle" as an anomaly, but that is
+    # exactly the normal, correct post-finalize state before the next epoch is
+    # staged. Clearing the pointer removes the stale match.
+    s.sink_pending_epoch = 0
 
 # --- Explicit duplicate-delivery injection (M1-S5 / COV-M3 coverage) ---
 

@@ -22,6 +22,17 @@ MAX_EPOCH = 2
 # Maximum checkpoint index to bound the state space.
 MAX_CHECKPOINT = 2
 
+# Bound on total network-outage injections (LoseControlContact +
+# LoseObjectStoreContact) across the whole run. Both `Lose*`/`Recover*` pairs
+# can otherwise alternate forever (each transition is individually fair, but
+# an adversarial schedule can keep re-disabling HeartbeatTick right before its
+# turn), which is an unbounded livelock, not a real recovery failure. Bounding
+# total outages the same way formal/m3_sink_2pc.fizz bounds total crashes lets
+# every worker still reach isolation/self-fence at least once (enough for
+# COV-M4 and the self-fencing safety properties) while guaranteeing the
+# outage-injection actions eventually stop competing with real progress.
+MAX_OUTAGES = 2
+
 # ─── State ──────────────────────────────────────────────────────────────────
 
 action Init:
@@ -36,6 +47,21 @@ action Init:
     fence_rejection_observed = False
     fencing_occurred = False
     crash_occurred = False
+    outage_count = 0
+
+    # Explicit role instantiation (v0.42.1 fix): bare lowercase/plural role
+    # names (controlplane, shards[...], workers[...]) are only resolvable
+    # inside action/assertion bodies if a global binding of that exact name
+    # is created here. Without this, the model checker panics with
+    # "undefined: workers"/"undefined: shards" the moment an assertion or
+    # action references it.
+    controlplane = ControlPlane()
+    shards = []
+    for i in range(NUM_SHARDS):
+        shards.append(Shard(id=i))
+    workers = []
+    for i in range(NUM_WORKERS):
+        workers.append(Worker(id=i))
 
 # ControlPlane: authoritative lease map and failure detector state.
 role ControlPlane:
@@ -122,7 +148,9 @@ atomic action LoseControlContact:
 
     require w.status == "active"
     require w.can_reach_control
+    require outage_count < MAX_OUTAGES
 
+    outage_count = outage_count + 1
     w.can_reach_control = False
 
 # Worker recovers contact with the control plane.
@@ -143,7 +171,9 @@ atomic action LoseObjectStoreContact:
 
     require w.status == "active"
     require w.can_reach_object_store
+    require outage_count < MAX_OUTAGES
 
+    outage_count = outage_count + 1
     w.can_reach_object_store = False
     w.status = "blocked"
 
@@ -159,35 +189,34 @@ atomic fair action RecoverObjectStoreContact:
     w.status = "active"
 
 # Heartbeat tick: advance isolation_steps counter for partitioned workers.
+# v0.42.1 fix: self-fencing is folded into this same atomic step. The
+# previous version incremented isolation_steps here and self-fenced in a
+# separate `SelfFence` action; that left an observable intermediate state
+# (isolation_steps == SELF_FENCE_AFTER, status still "active") between the
+# two actions, which made M4_S2_SelfFencePrecedence spuriously fail even
+# though `SelfFence` was guaranteed (by fairness) to fire next. Self-fencing
+# must be atomic with crossing the threshold so no such state is ever
+# observable.
 atomic fair action HeartbeatTick:
-    worker_id = oneof range(NUM_WORKERS)
-    w = workers[worker_id]
-
-    require w.status == "active"
-    require not w.can_reach_control
-
-    w.isolation_steps = w.isolation_steps + 1
-
-# Self-fence: a worker that has been isolated for SELF_FENCE_AFTER steps
-# must terminate and relinquish all its leases.
-atomic fair action SelfFence:
     worker_id = oneof range(NUM_WORKERS)
     w = workers[worker_id]
     cp = controlplane
 
     require w.status == "active"
     require not w.can_reach_control
-    require w.isolation_steps >= SELF_FENCE_AFTER
 
-    # Worker transitions to terminated — no further commits possible.
-    w.status = "terminated"
-    w.held_lease_epoch = [-1, -1]
-    fencing_occurred = True
+    w.isolation_steps = w.isolation_steps + 1
 
-    # Release leases on the control plane.
-    for shard_id in range(NUM_SHARDS):
-        if cp.leases[shard_id] == worker_id:
-            cp.leases[shard_id] = -1
+    if w.isolation_steps >= SELF_FENCE_AFTER:
+        # Worker self-fences: terminated, no further commits possible.
+        w.status = "terminated"
+        w.held_lease_epoch = [-1, -1]
+        fencing_occurred = True
+
+        # Release leases on the control plane.
+        for shard_id in range(NUM_SHARDS):
+            if cp.leases[shard_id] == worker_id:
+                cp.leases[shard_id] = -1
 
 # Failure detector marks a worker dead (e.g. missed heartbeats).
 atomic action MarkDead:
@@ -205,6 +234,27 @@ atomic action MarkDead:
     for shard_id in range(NUM_SHARDS):
         if cp.leases[shard_id] == worker_id:
             cp.leases[shard_id] = -1
+
+# Restart a terminated worker (operational reality: the control plane
+# replaces/restarts a dead worker process). Without this, a worker that
+# self-fences is stuck in "terminated" forever with no outgoing transition,
+# and if every worker eventually self-fences (nothing bounds how many times
+# LoseControlContact/HeartbeatTick can isolate a given worker), no shard
+# could ever regain a live lease holder again — making M4_L1_RecoveryProgress
+# unprovable regardless of protocol correctness. v0.42.1 fix.
+atomic fair action RestartWorker:
+    worker_id = oneof range(NUM_WORKERS)
+    w = workers[worker_id]
+    cp = controlplane
+
+    require w.status == "terminated"
+
+    w.status = "active"
+    w.isolation_steps = 0
+    w.held_lease_epoch = [-1, -1]
+    w.can_reach_control = True
+    w.can_reach_object_store = True
+    cp.dead_workers.discard(worker_id)
 
 # CheckpointCoordinator: atomically commit a cluster checkpoint after all
 # shards have confirmed their per-shard checkpoint.

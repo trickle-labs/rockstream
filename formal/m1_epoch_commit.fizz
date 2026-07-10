@@ -29,6 +29,13 @@ action Init:
 # Actions
 atomic fair action CommitEpoch0:
     require persisted_epoch_0 < MAX_EPOCH
+    # v0.42.1 fix: a legitimate new commit ends the post-duplicate check window
+    # (see M1_S5_IdempotentReplay / DuplicateCommit0-1 below). Without this,
+    # the sticky duplicate_commit_delivered flag made M1_S5 compare *all*
+    # future states against the one-time pre-duplicate snapshot, spuriously
+    # failing on ordinary subsequent progress that has nothing to do with the
+    # duplicate.
+    duplicate_commit_delivered = False
     next_epoch = persisted_epoch_0 + 1
     if next_epoch >= worker_last_epoch_0:
         persisted_epoch_0 = next_epoch
@@ -43,6 +50,8 @@ atomic fair action CommitEpoch0:
 
 atomic fair action CommitEpoch1:
     require persisted_epoch_1 < MAX_EPOCH
+    # v0.42.1 fix: see CommitEpoch0 above.
+    duplicate_commit_delivered = False
     next_epoch = persisted_epoch_1 + 1
     if next_epoch >= worker_last_epoch_1:
         persisted_epoch_1 = next_epoch

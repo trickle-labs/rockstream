@@ -6,18 +6,18 @@
       "column": 1
     },
     "end": {
-      "line": 280
+      "line": 313
     }
   },
   "invariants": [
     {
       "sourceInfo": {
         "start": {
-          "line": 206,
+          "line": 239,
           "column": 1
         },
         "end": {
-          "line": 221
+          "line": 254
         }
       },
       "name": "M3_S1_NoDuplicateDelivery",
@@ -27,11 +27,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 207,
+            "line": 240,
             "column": 5
           },
           "end": {
-            "line": 221
+            "line": 254
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -39,22 +39,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 207,
+                "line": 240,
                 "column": 5
               },
               "end": {
-                "line": 208,
+                "line": 241,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 207,
+                  "line": 240,
                   "column": 5
                 },
                 "end": {
-                  "line": 207,
+                  "line": 240,
                   "column": 24
                 }
               },
@@ -64,22 +64,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 208,
+                "line": 241,
                 "column": 5
               },
               "end": {
-                "line": 210,
+                "line": 243,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 208,
+                  "line": 241,
                   "column": 5
                 },
                 "end": {
-                  "line": 208,
+                  "line": 241,
                   "column": 13
                 }
               },
@@ -89,22 +89,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 210,
+                "line": 243,
                 "column": 5
               },
               "end": {
-                "line": 214,
+                "line": 247,
                 "column": 4
               }
             },
             "forStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 210,
+                  "line": 243,
                   "column": 5
                 },
                 "end": {
-                  "line": 214,
+                  "line": 247,
                   "column": 4
                 }
               },
@@ -115,11 +115,11 @@
               "block": {
                 "sourceInfo": {
                   "start": {
-                    "line": 211,
+                    "line": 244,
                     "column": 9
                   },
                   "end": {
-                    "line": 214,
+                    "line": 247,
                     "column": 4
                   }
                 },
@@ -127,22 +127,22 @@
                   {
                     "sourceInfo": {
                       "start": {
-                        "line": 211,
+                        "line": 244,
                         "column": 9
                       },
                       "end": {
-                        "line": 214,
+                        "line": 247,
                         "column": 4
                       }
                     },
                     "ifStmt": {
                       "sourceInfo": {
                         "start": {
-                          "line": 211,
+                          "line": 244,
                           "column": 9
                         },
                         "end": {
-                          "line": 214,
+                          "line": 247,
                           "column": 4
                         }
                       },
@@ -150,11 +150,11 @@
                         {
                           "sourceInfo": {
                             "start": {
-                              "line": 211,
+                              "line": 244,
                               "column": 12
                             },
                             "end": {
-                              "line": 214,
+                              "line": 247,
                               "column": 4
                             }
                           },
@@ -162,11 +162,11 @@
                           "block": {
                             "sourceInfo": {
                               "start": {
-                                "line": 212,
+                                "line": 245,
                                 "column": 13
                               },
                               "end": {
-                                "line": 214,
+                                "line": 247,
                                 "column": 4
                               }
                             },
@@ -174,22 +174,22 @@
                               {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 212,
+                                    "line": 245,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 214,
+                                    "line": 247,
                                     "column": 4
                                   }
                                 },
                                 "ifStmt": {
                                   "sourceInfo": {
                                     "start": {
-                                      "line": 212,
+                                      "line": 245,
                                       "column": 13
                                     },
                                     "end": {
-                                      "line": 214,
+                                      "line": 247,
                                       "column": 4
                                     }
                                   },
@@ -197,11 +197,11 @@
                                     {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 212,
+                                          "line": 245,
                                           "column": 16
                                         },
                                         "end": {
-                                          "line": 214,
+                                          "line": 247,
                                           "column": 4
                                         }
                                       },
@@ -209,11 +209,11 @@
                                       "block": {
                                         "sourceInfo": {
                                           "start": {
-                                            "line": 213,
+                                            "line": 246,
                                             "column": 17
                                           },
                                           "end": {
-                                            "line": 214,
+                                            "line": 247,
                                             "column": 4
                                           }
                                         },
@@ -221,22 +221,22 @@
                                           {
                                             "sourceInfo": {
                                               "start": {
-                                                "line": 213,
+                                                "line": 246,
                                                 "column": 17
                                               },
                                               "end": {
-                                                "line": 214,
+                                                "line": 247,
                                                 "column": 4
                                               }
                                             },
                                             "returnStmt": {
                                               "sourceInfo": {
                                                 "start": {
-                                                  "line": 213,
+                                                  "line": 246,
                                                   "column": 17
                                                 },
                                                 "end": {
-                                                  "line": 213,
+                                                  "line": 246,
                                                   "column": 28
                                                 }
                                               },
@@ -244,11 +244,11 @@
                                               "expr": {
                                                 "sourceInfo": {
                                                   "start": {
-                                                    "line": 213,
+                                                    "line": 246,
                                                     "column": 24
                                                   },
                                                   "end": {
-                                                    "line": 213,
+                                                    "line": 246,
                                                     "column": 28
                                                   }
                                                 },
@@ -261,11 +261,11 @@
                                       "conditionExpr": {
                                         "sourceInfo": {
                                           "start": {
-                                            "line": 212,
+                                            "line": 245,
                                             "column": 16
                                           },
                                           "end": {
-                                            "line": 212,
+                                            "line": 245,
                                             "column": 32
                                           }
                                         },
@@ -280,11 +280,11 @@
                           "conditionExpr": {
                             "sourceInfo": {
                               "start": {
-                                "line": 211,
+                                "line": 244,
                                 "column": 12
                               },
                               "end": {
-                                "line": 211,
+                                "line": 244,
                                 "column": 40
                               }
                             },
@@ -299,11 +299,11 @@
               "iterExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 210,
+                    "line": 243,
                     "column": 18
                   },
                   "end": {
-                    "line": 210,
+                    "line": 243,
                     "column": 37
                   }
                 },
@@ -314,21 +314,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 214,
+                "line": 247,
                 "column": 5
               },
               "end": {
-                "line": 221
+                "line": 254
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 214,
+                  "line": 247,
                   "column": 5
                 },
                 "end": {
-                  "line": 214,
+                  "line": 247,
                   "column": 15
                 }
               },
@@ -336,11 +336,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 214,
+                    "line": 247,
                     "column": 12
                   },
                   "end": {
-                    "line": 214,
+                    "line": 247,
                     "column": 15
                   }
                 },
@@ -355,11 +355,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 221,
+          "line": 254,
           "column": 1
         },
         "end": {
-          "line": 238
+          "line": 271
         }
       },
       "name": "M3_S2_NoLostDelivery",
@@ -369,11 +369,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 222,
+            "line": 255,
             "column": 5
           },
           "end": {
-            "line": 238
+            "line": 271
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -381,22 +381,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 222,
+                "line": 255,
                 "column": 5
               },
               "end": {
-                "line": 223,
+                "line": 256,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 222,
+                  "line": 255,
                   "column": 5
                 },
                 "end": {
-                  "line": 222,
+                  "line": 255,
                   "column": 22
                 }
               },
@@ -406,22 +406,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 223,
+                "line": 256,
                 "column": 5
               },
               "end": {
-                "line": 224,
+                "line": 257,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 223,
+                  "line": 256,
                   "column": 5
                 },
                 "end": {
-                  "line": 223,
+                  "line": 256,
                   "column": 24
                 }
               },
@@ -431,22 +431,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 224,
+                "line": 257,
                 "column": 5
               },
               "end": {
-                "line": 226,
+                "line": 259,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 224,
+                  "line": 257,
                   "column": 5
                 },
                 "end": {
-                  "line": 224,
+                  "line": 257,
                   "column": 13
                 }
               },
@@ -456,22 +456,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 226,
+                "line": 259,
                 "column": 5
               },
               "end": {
-                "line": 229,
+                "line": 262,
                 "column": 4
               }
             },
             "ifStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 226,
+                  "line": 259,
                   "column": 5
                 },
                 "end": {
-                  "line": 229,
+                  "line": 262,
                   "column": 4
                 }
               },
@@ -479,11 +479,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 226,
+                      "line": 259,
                       "column": 8
                     },
                     "end": {
-                      "line": 229,
+                      "line": 262,
                       "column": 4
                     }
                   },
@@ -491,11 +491,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 227,
+                        "line": 260,
                         "column": 9
                       },
                       "end": {
-                        "line": 229,
+                        "line": 262,
                         "column": 4
                       }
                     },
@@ -503,22 +503,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 227,
+                            "line": 260,
                             "column": 9
                           },
                           "end": {
-                            "line": 229,
+                            "line": 262,
                             "column": 4
                           }
                         },
                         "ifStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 227,
+                              "line": 260,
                               "column": 9
                             },
                             "end": {
-                              "line": 229,
+                              "line": 262,
                               "column": 4
                             }
                           },
@@ -526,11 +526,11 @@
                             {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 227,
+                                  "line": 260,
                                   "column": 12
                                 },
                                 "end": {
-                                  "line": 229,
+                                  "line": 262,
                                   "column": 4
                                 }
                               },
@@ -538,11 +538,11 @@
                               "block": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 228,
+                                    "line": 261,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 229,
+                                    "line": 262,
                                     "column": 4
                                   }
                                 },
@@ -550,22 +550,22 @@
                                   {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 228,
+                                        "line": 261,
                                         "column": 13
                                       },
                                       "end": {
-                                        "line": 229,
+                                        "line": 262,
                                         "column": 4
                                       }
                                     },
                                     "returnStmt": {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 228,
+                                          "line": 261,
                                           "column": 13
                                         },
                                         "end": {
-                                          "line": 228,
+                                          "line": 261,
                                           "column": 24
                                         }
                                       },
@@ -573,11 +573,11 @@
                                       "expr": {
                                         "sourceInfo": {
                                           "start": {
-                                            "line": 228,
+                                            "line": 261,
                                             "column": 20
                                           },
                                           "end": {
-                                            "line": 228,
+                                            "line": 261,
                                             "column": 24
                                           }
                                         },
@@ -590,11 +590,11 @@
                               "conditionExpr": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 227,
+                                    "line": 260,
                                     "column": 12
                                   },
                                   "end": {
-                                    "line": 227,
+                                    "line": 260,
                                     "column": 54
                                   }
                                 },
@@ -609,11 +609,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 226,
+                        "line": 259,
                         "column": 8
                       },
                       "end": {
-                        "line": 226,
+                        "line": 259,
                         "column": 20
                       }
                     },
@@ -626,22 +626,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 229,
+                "line": 262,
                 "column": 5
               },
               "end": {
-                "line": 233,
+                "line": 266,
                 "column": 4
               }
             },
             "ifStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 229,
+                  "line": 262,
                   "column": 5
                 },
                 "end": {
-                  "line": 233,
+                  "line": 266,
                   "column": 4
                 }
               },
@@ -649,11 +649,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 229,
+                      "line": 262,
                       "column": 8
                     },
                     "end": {
-                      "line": 233,
+                      "line": 266,
                       "column": 4
                     }
                   },
@@ -661,11 +661,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 231,
+                        "line": 264,
                         "column": 9
                       },
                       "end": {
-                        "line": 233,
+                        "line": 266,
                         "column": 4
                       }
                     },
@@ -673,22 +673,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 231,
+                            "line": 264,
                             "column": 9
                           },
                           "end": {
-                            "line": 233,
+                            "line": 266,
                             "column": 4
                           }
                         },
                         "ifStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 231,
+                              "line": 264,
                               "column": 9
                             },
                             "end": {
-                              "line": 233,
+                              "line": 266,
                               "column": 4
                             }
                           },
@@ -696,11 +696,11 @@
                             {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 231,
+                                  "line": 264,
                                   "column": 12
                                 },
                                 "end": {
-                                  "line": 233,
+                                  "line": 266,
                                   "column": 4
                                 }
                               },
@@ -708,11 +708,11 @@
                               "block": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 232,
+                                    "line": 265,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 233,
+                                    "line": 266,
                                     "column": 4
                                   }
                                 },
@@ -720,22 +720,22 @@
                                   {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 232,
+                                        "line": 265,
                                         "column": 13
                                       },
                                       "end": {
-                                        "line": 233,
+                                        "line": 266,
                                         "column": 4
                                       }
                                     },
                                     "returnStmt": {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 232,
+                                          "line": 265,
                                           "column": 13
                                         },
                                         "end": {
-                                          "line": 232,
+                                          "line": 265,
                                           "column": 24
                                         }
                                       },
@@ -743,11 +743,11 @@
                                       "expr": {
                                         "sourceInfo": {
                                           "start": {
-                                            "line": 232,
+                                            "line": 265,
                                             "column": 20
                                           },
                                           "end": {
-                                            "line": 232,
+                                            "line": 265,
                                             "column": 24
                                           }
                                         },
@@ -760,11 +760,11 @@
                               "conditionExpr": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 231,
+                                    "line": 264,
                                     "column": 12
                                   },
                                   "end": {
-                                    "line": 231,
+                                    "line": 264,
                                     "column": 88
                                   }
                                 },
@@ -779,11 +779,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 229,
+                        "line": 262,
                         "column": 8
                       },
                       "end": {
-                        "line": 229,
+                        "line": 262,
                         "column": 24
                       }
                     },
@@ -796,21 +796,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 233,
+                "line": 266,
                 "column": 5
               },
               "end": {
-                "line": 238
+                "line": 271
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 233,
+                  "line": 266,
                   "column": 5
                 },
                 "end": {
-                  "line": 233,
+                  "line": 266,
                   "column": 15
                 }
               },
@@ -818,11 +818,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 233,
+                    "line": 266,
                     "column": 12
                   },
                   "end": {
-                    "line": 233,
+                    "line": 266,
                     "column": 15
                   }
                 },
@@ -837,11 +837,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 238,
+          "line": 271,
           "column": 1
         },
         "end": {
-          "line": 257
+          "line": 290
         }
       },
       "name": "M3_S3_CheckpointCoupledCommit",
@@ -851,11 +851,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 239,
+            "line": 272,
             "column": 5
           },
           "end": {
-            "line": 257
+            "line": 290
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -863,22 +863,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 239,
+                "line": 272,
                 "column": 5
               },
               "end": {
-                "line": 240,
+                "line": 273,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 239,
+                  "line": 272,
                   "column": 5
                 },
                 "end": {
-                  "line": 239,
+                  "line": 272,
                   "column": 22
                 }
               },
@@ -888,22 +888,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 240,
+                "line": 273,
                 "column": 5
               },
               "end": {
-                "line": 242,
+                "line": 275,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 240,
+                  "line": 273,
                   "column": 5
                 },
                 "end": {
-                  "line": 240,
+                  "line": 273,
                   "column": 21
                 }
               },
@@ -913,22 +913,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 242,
+                "line": 275,
                 "column": 5
               },
               "end": {
-                "line": 246,
+                "line": 279,
                 "column": 4
               }
             },
             "ifStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 242,
+                  "line": 275,
                   "column": 5
                 },
                 "end": {
-                  "line": 246,
+                  "line": 279,
                   "column": 4
                 }
               },
@@ -936,11 +936,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 242,
+                      "line": 275,
                       "column": 8
                     },
                     "end": {
-                      "line": 246,
+                      "line": 279,
                       "column": 4
                     }
                   },
@@ -948,11 +948,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 243,
+                        "line": 276,
                         "column": 9
                       },
                       "end": {
-                        "line": 246,
+                        "line": 279,
                         "column": 4
                       }
                     },
@@ -960,22 +960,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 243,
+                            "line": 276,
                             "column": 9
                           },
                           "end": {
-                            "line": 246,
+                            "line": 279,
                             "column": 4
                           }
                         },
                         "ifStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 243,
+                              "line": 276,
                               "column": 9
                             },
                             "end": {
-                              "line": 246,
+                              "line": 279,
                               "column": 4
                             }
                           },
@@ -983,11 +983,11 @@
                             {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 243,
+                                  "line": 276,
                                   "column": 12
                                 },
                                 "end": {
-                                  "line": 246,
+                                  "line": 279,
                                   "column": 4
                                 }
                               },
@@ -995,11 +995,11 @@
                               "block": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 244,
+                                    "line": 277,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 246,
+                                    "line": 279,
                                     "column": 4
                                   }
                                 },
@@ -1007,22 +1007,22 @@
                                   {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 244,
+                                        "line": 277,
                                         "column": 13
                                       },
                                       "end": {
-                                        "line": 246,
+                                        "line": 279,
                                         "column": 4
                                       }
                                     },
                                     "returnStmt": {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 244,
+                                          "line": 277,
                                           "column": 13
                                         },
                                         "end": {
-                                          "line": 244,
+                                          "line": 277,
                                           "column": 24
                                         }
                                       },
@@ -1030,11 +1030,11 @@
                                       "expr": {
                                         "sourceInfo": {
                                           "start": {
-                                            "line": 244,
+                                            "line": 277,
                                             "column": 20
                                           },
                                           "end": {
-                                            "line": 244,
+                                            "line": 277,
                                             "column": 24
                                           }
                                         },
@@ -1047,11 +1047,11 @@
                               "conditionExpr": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 243,
+                                    "line": 276,
                                     "column": 12
                                   },
                                   "end": {
-                                    "line": 243,
+                                    "line": 276,
                                     "column": 49
                                   }
                                 },
@@ -1066,11 +1066,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 242,
+                        "line": 275,
                         "column": 8
                       },
                       "end": {
-                        "line": 242,
+                        "line": 275,
                         "column": 20
                       }
                     },
@@ -1083,22 +1083,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 246,
+                "line": 279,
                 "column": 5
               },
               "end": {
-                "line": 247,
+                "line": 280,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 246,
+                  "line": 279,
                   "column": 5
                 },
                 "end": {
-                  "line": 246,
+                  "line": 279,
                   "column": 13
                 }
               },
@@ -1108,22 +1108,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 247,
+                "line": 280,
                 "column": 5
               },
               "end": {
-                "line": 250,
+                "line": 283,
                 "column": 4
               }
             },
             "ifStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 247,
+                  "line": 280,
                   "column": 5
                 },
                 "end": {
-                  "line": 250,
+                  "line": 283,
                   "column": 4
                 }
               },
@@ -1131,11 +1131,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 247,
+                      "line": 280,
                       "column": 8
                     },
                     "end": {
-                      "line": 250,
+                      "line": 283,
                       "column": 4
                     }
                   },
@@ -1143,11 +1143,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 248,
+                        "line": 281,
                         "column": 9
                       },
                       "end": {
-                        "line": 250,
+                        "line": 283,
                         "column": 4
                       }
                     },
@@ -1155,22 +1155,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 248,
+                            "line": 281,
                             "column": 9
                           },
                           "end": {
-                            "line": 250,
+                            "line": 283,
                             "column": 4
                           }
                         },
                         "ifStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 248,
+                              "line": 281,
                               "column": 9
                             },
                             "end": {
-                              "line": 250,
+                              "line": 283,
                               "column": 4
                             }
                           },
@@ -1178,11 +1178,11 @@
                             {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 248,
+                                  "line": 281,
                                   "column": 12
                                 },
                                 "end": {
-                                  "line": 250,
+                                  "line": 283,
                                   "column": 4
                                 }
                               },
@@ -1190,11 +1190,11 @@
                               "block": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 249,
+                                    "line": 282,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 250,
+                                    "line": 283,
                                     "column": 4
                                   }
                                 },
@@ -1202,22 +1202,22 @@
                                   {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 249,
+                                        "line": 282,
                                         "column": 13
                                       },
                                       "end": {
-                                        "line": 250,
+                                        "line": 283,
                                         "column": 4
                                       }
                                     },
                                     "returnStmt": {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 249,
+                                          "line": 282,
                                           "column": 13
                                         },
                                         "end": {
-                                          "line": 249,
+                                          "line": 282,
                                           "column": 24
                                         }
                                       },
@@ -1225,11 +1225,11 @@
                                       "expr": {
                                         "sourceInfo": {
                                           "start": {
-                                            "line": 249,
+                                            "line": 282,
                                             "column": 20
                                           },
                                           "end": {
-                                            "line": 249,
+                                            "line": 282,
                                             "column": 24
                                           }
                                         },
@@ -1242,11 +1242,11 @@
                               "conditionExpr": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 248,
+                                    "line": 281,
                                     "column": 12
                                   },
                                   "end": {
-                                    "line": 248,
+                                    "line": 281,
                                     "column": 83
                                   }
                                 },
@@ -1261,11 +1261,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 247,
+                        "line": 280,
                         "column": 8
                       },
                       "end": {
-                        "line": 247,
+                        "line": 280,
                         "column": 24
                       }
                     },
@@ -1278,21 +1278,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 250,
+                "line": 283,
                 "column": 5
               },
               "end": {
-                "line": 257
+                "line": 290
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 250,
+                  "line": 283,
                   "column": 5
                 },
                 "end": {
-                  "line": 250,
+                  "line": 283,
                   "column": 15
                 }
               },
@@ -1300,11 +1300,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 250,
+                    "line": 283,
                     "column": 12
                   },
                   "end": {
-                    "line": 250,
+                    "line": 283,
                     "column": 15
                   }
                 },
@@ -1319,11 +1319,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 257,
+          "line": 290,
           "column": 1
         },
         "end": {
-          "line": 272
+          "line": 305
         }
       },
       "name": "M3_S4_RecoveryDispatchIdempotency",
@@ -1333,11 +1333,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 258,
+            "line": 291,
             "column": 5
           },
           "end": {
-            "line": 272
+            "line": 305
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1345,22 +1345,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 258,
+                "line": 291,
                 "column": 5
               },
               "end": {
-                "line": 259,
+                "line": 292,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 258,
+                  "line": 291,
                   "column": 5
                 },
                 "end": {
-                  "line": 258,
+                  "line": 291,
                   "column": 22
                 }
               },
@@ -1370,22 +1370,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 259,
+                "line": 292,
                 "column": 5
               },
               "end": {
-                "line": 264,
+                "line": 297,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 259,
+                  "line": 292,
                   "column": 5
                 },
                 "end": {
-                  "line": 259,
+                  "line": 292,
                   "column": 13
                 }
               },
@@ -1395,22 +1395,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 264,
+                "line": 297,
                 "column": 5
               },
               "end": {
-                "line": 267,
+                "line": 300,
                 "column": 4
               }
             },
             "ifStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 264,
+                  "line": 297,
                   "column": 5
                 },
                 "end": {
-                  "line": 267,
+                  "line": 300,
                   "column": 4
                 }
               },
@@ -1418,11 +1418,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 264,
+                      "line": 297,
                       "column": 8
                     },
                     "end": {
-                      "line": 267,
+                      "line": 300,
                       "column": 4
                     }
                   },
@@ -1430,11 +1430,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 266,
+                        "line": 299,
                         "column": 9
                       },
                       "end": {
-                        "line": 267,
+                        "line": 300,
                         "column": 4
                       }
                     },
@@ -1442,22 +1442,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 266,
+                            "line": 299,
                             "column": 9
                           },
                           "end": {
-                            "line": 267,
+                            "line": 300,
                             "column": 4
                           }
                         },
                         "returnStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 266,
+                              "line": 299,
                               "column": 9
                             },
                             "end": {
-                              "line": 266,
+                              "line": 299,
                               "column": 20
                             }
                           },
@@ -1465,11 +1465,11 @@
                           "expr": {
                             "sourceInfo": {
                               "start": {
-                                "line": 266,
+                                "line": 299,
                                 "column": 16
                               },
                               "end": {
-                                "line": 266,
+                                "line": 299,
                                 "column": 20
                               }
                             },
@@ -1482,11 +1482,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 264,
+                        "line": 297,
                         "column": 8
                       },
                       "end": {
-                        "line": 264,
+                        "line": 297,
                         "column": 42
                       }
                     },
@@ -1499,21 +1499,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 267,
+                "line": 300,
                 "column": 5
               },
               "end": {
-                "line": 272
+                "line": 305
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 267,
+                  "line": 300,
                   "column": 5
                 },
                 "end": {
-                  "line": 267,
+                  "line": 300,
                   "column": 15
                 }
               },
@@ -1521,11 +1521,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 267,
+                    "line": 300,
                     "column": 12
                   },
                   "end": {
-                    "line": 267,
+                    "line": 300,
                     "column": 15
                   }
                 },
@@ -1540,11 +1540,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 272,
+          "line": 305,
           "column": 1
         },
         "end": {
-          "line": 278
+          "line": 311
         }
       },
       "name": "M3_L1_DeliveryProgress",
@@ -1555,11 +1555,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 273,
+            "line": 306,
             "column": 5
           },
           "end": {
-            "line": 278
+            "line": 311
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1567,21 +1567,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 273,
+                "line": 306,
                 "column": 5
               },
               "end": {
-                "line": 278
+                "line": 311
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 273,
+                  "line": 306,
                   "column": 5
                 },
                 "end": {
-                  "line": 273,
+                  "line": 306,
                   "column": 36
                 }
               },
@@ -1589,11 +1589,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 273,
+                    "line": 306,
                     "column": 12
                   },
                   "end": {
-                    "line": 273,
+                    "line": 306,
                     "column": 36
                   }
                 },
@@ -1608,11 +1608,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 278,
+          "line": 311,
           "column": 1
         },
         "end": {
-          "line": 280
+          "line": 313
         }
       },
       "name": "COV_M3",
@@ -1622,11 +1622,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 279,
+            "line": 312,
             "column": 5
           },
           "end": {
-            "line": 280
+            "line": 313
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1634,21 +1634,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 279,
+                "line": 312,
                 "column": 5
               },
               "end": {
-                "line": 280
+                "line": 313
               }
             },
             "returnStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 279,
+                  "line": 312,
                   "column": 5
                 },
                 "end": {
-                  "line": 279,
+                  "line": 312,
                   "column": 50
                 }
               },
@@ -1656,11 +1656,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 279,
+                    "line": 312,
                     "column": 12
                   },
                   "end": {
-                    "line": 279,
+                    "line": 312,
                     "column": 50
                   }
                 },
@@ -1677,11 +1677,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 28,
+          "line": 37,
           "column": 1
         },
         "end": {
-          "line": 35
+          "line": 57
         }
       },
       "name": "Init",
@@ -1692,11 +1692,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 30,
+            "line": 39,
             "column": 5
           },
           "end": {
-            "line": 35
+            "line": 57
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1704,22 +1704,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 30,
+                "line": 39,
                 "column": 5
               },
               "end": {
-                "line": 31,
+                "line": 40,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 30,
+                  "line": 39,
                   "column": 5
                 },
                 "end": {
-                  "line": 30,
+                  "line": 39,
                   "column": 51
                 }
               },
@@ -1729,22 +1729,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 31,
+                "line": 40,
                 "column": 5
               },
               "end": {
-                "line": 32,
+                "line": 41,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 31,
+                  "line": 40,
                   "column": 5
                 },
                 "end": {
-                  "line": 31,
+                  "line": 40,
                   "column": 40
                 }
               },
@@ -1754,25 +1754,190 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 32,
+                "line": 41,
                 "column": 5
               },
               "end": {
-                "line": 35
+                "line": 42,
+                "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 32,
+                  "line": 41,
                   "column": 5
                 },
                 "end": {
-                  "line": 32,
+                  "line": 41,
                   "column": 37
                 }
               },
               "code": "delivery_progress_reached = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 42,
+                "column": 5
+              },
+              "end": {
+                "line": 50,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 42,
+                  "column": 5
+                },
+                "end": {
+                  "line": 42,
+                  "column": 19
+                }
+              },
+              "code": "crash_count = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 50,
+                "column": 5
+              },
+              "end": {
+                "line": 51,
+                "column": 4
+              }
+            },
+            "callStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 50,
+                  "column": 5
+                },
+                "end": {
+                  "line": 50,
+                  "column": 19
+                }
+              },
+              "vars": [
+                "shard"
+              ],
+              "name": "Shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 51,
+                "column": 5
+              },
+              "end": {
+                "line": 52,
+                "column": 4
+              }
+            },
+            "callStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 51,
+                  "column": 5
+                },
+                "end": {
+                  "line": 51,
+                  "column": 33
+                }
+              },
+              "vars": [
+                "controlplane"
+              ],
+              "name": "ControlPlane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 52,
+                "column": 5
+              },
+              "end": {
+                "line": 53,
+                "column": 4
+              }
+            },
+            "callStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 52,
+                  "column": 5
+                },
+                "end": {
+                  "line": 52,
+                  "column": 35
+                }
+              },
+              "vars": [
+                "sinkconnector"
+              ],
+              "name": "SinkConnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 53,
+                "column": 5
+              },
+              "end": {
+                "line": 54,
+                "column": 4
+              }
+            },
+            "callStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 53,
+                  "column": 5
+                },
+                "end": {
+                  "line": 53,
+                  "column": 37
+                }
+              },
+              "vars": [
+                "externalsystem"
+              ],
+              "name": "ExternalSystem"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 54,
+                "column": 5
+              },
+              "end": {
+                "line": 57
+              }
+            },
+            "callStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 54,
+                  "column": 5
+                },
+                "end": {
+                  "line": 54,
+                  "column": 51
+                }
+              },
+              "vars": [
+                "checkpointcoordinator"
+              ],
+              "name": "CheckpointCoordinator"
             }
           }
         ]
@@ -1781,11 +1946,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 77,
+          "line": 99,
           "column": 1
         },
         "end": {
-          "line": 87
+          "line": 109
         }
       },
       "name": "AdvanceShardEpoch",
@@ -1793,11 +1958,11 @@
       "fairness": {
         "sourceInfo": {
           "start": {
-            "line": 77,
+            "line": 99,
             "column": 8
           },
           "end": {
-            "line": 77,
+            "line": 99,
             "column": 11
           }
         },
@@ -1806,11 +1971,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 78,
+            "line": 100,
             "column": 5
           },
           "end": {
-            "line": 87
+            "line": 109
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1818,22 +1983,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 78,
+                "line": 100,
                 "column": 5
               },
               "end": {
-                "line": 79,
+                "line": 101,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 78,
+                  "line": 100,
                   "column": 5
                 },
                 "end": {
-                  "line": 78,
+                  "line": 100,
                   "column": 13
                 }
               },
@@ -1843,22 +2008,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 79,
+                "line": 101,
                 "column": 5
               },
               "end": {
-                "line": 80,
+                "line": 102,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 79,
+                  "line": 101,
                   "column": 5
                 },
                 "end": {
-                  "line": 79,
+                  "line": 101,
                   "column": 21
                 }
               },
@@ -1868,22 +2033,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 80,
+                "line": 102,
                 "column": 5
               },
               "end": {
-                "line": 81,
+                "line": 103,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 80,
+                  "line": 102,
                   "column": 5
                 },
                 "end": {
-                  "line": 80,
+                  "line": 102,
                   "column": 41
                 }
               },
@@ -1891,11 +2056,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 80,
+                    "line": 102,
                     "column": 13
                   },
                   "end": {
-                    "line": 80,
+                    "line": 102,
                     "column": 41
                   }
                 },
@@ -1906,22 +2071,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 81,
+                "line": 103,
                 "column": 5
               },
               "end": {
-                "line": 83,
+                "line": 105,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 81,
+                  "line": 103,
                   "column": 5
                 },
                 "end": {
-                  "line": 81,
+                  "line": 103,
                   "column": 45
                 }
               },
@@ -1931,21 +2096,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 83,
+                "line": 105,
                 "column": 5
               },
               "end": {
-                "line": 87
+                "line": 109
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 83,
+                  "line": 105,
                   "column": 5
                 },
                 "end": {
-                  "line": 83,
+                  "line": 105,
                   "column": 44
                 }
               },
@@ -1958,11 +2123,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 87,
+          "line": 109,
           "column": 1
         },
         "end": {
-          "line": 106
+          "line": 128
         }
       },
       "name": "SinkPreCommit",
@@ -1970,11 +2135,11 @@
       "fairness": {
         "sourceInfo": {
           "start": {
-            "line": 87,
+            "line": 109,
             "column": 8
           },
           "end": {
-            "line": 87,
+            "line": 109,
             "column": 11
           }
         },
@@ -1983,11 +2148,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 88,
+            "line": 110,
             "column": 5
           },
           "end": {
-            "line": 106
+            "line": 128
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -1995,22 +2160,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 88,
+                "line": 110,
                 "column": 5
               },
               "end": {
-                "line": 89,
+                "line": 111,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 88,
+                  "line": 110,
                   "column": 5
                 },
                 "end": {
-                  "line": 88,
+                  "line": 110,
                   "column": 22
                 }
               },
@@ -2020,22 +2185,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 89,
+                "line": 111,
                 "column": 5
               },
               "end": {
-                "line": 90,
+                "line": 112,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 89,
+                  "line": 111,
                   "column": 5
                 },
                 "end": {
-                  "line": 89,
+                  "line": 111,
                   "column": 13
                 }
               },
@@ -2045,22 +2210,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 90,
+                "line": 112,
                 "column": 5
               },
               "end": {
-                "line": 91,
+                "line": 113,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 90,
+                  "line": 112,
                   "column": 5
                 },
                 "end": {
-                  "line": 90,
+                  "line": 112,
                   "column": 25
                 }
               },
@@ -2068,11 +2233,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 90,
+                    "line": 112,
                     "column": 13
                   },
                   "end": {
-                    "line": 90,
+                    "line": 112,
                     "column": 25
                   }
                 },
@@ -2083,22 +2248,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 91,
+                "line": 113,
                 "column": 5
               },
               "end": {
-                "line": 92,
+                "line": 114,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 91,
+                  "line": 113,
                   "column": 5
                 },
                 "end": {
-                  "line": 91,
+                  "line": 113,
                   "column": 47
                 }
               },
@@ -2106,11 +2271,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 91,
+                    "line": 113,
                     "column": 13
                   },
                   "end": {
-                    "line": 91,
+                    "line": 113,
                     "column": 47
                   }
                 },
@@ -2121,411 +2286,28 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 92,
+                "line": 114,
                 "column": 5
               },
               "end": {
-                "line": 94,
+                "line": 116,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 92,
+                  "line": 114,
                   "column": 5
                 },
                 "end": {
-                  "line": 92,
+                  "line": 114,
                   "column": 36
                 }
               },
               "code": "target_epoch = s.committed_epoch"
             }
           },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 94,
-                "column": 5
-              },
-              "end": {
-                "line": 95,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 94,
-                  "column": 5
-                },
-                "end": {
-                  "line": 94,
-                  "column": 20
-                }
-              },
-              "code": "s.sink_state = 1"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 95,
-                "column": 5
-              },
-              "end": {
-                "line": 96,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 95,
-                  "column": 5
-                },
-                "end": {
-                  "line": 95,
-                  "column": 39
-                }
-              },
-              "code": "s.sink_pending_epoch = target_epoch"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 96,
-                "column": 5
-              },
-              "end": {
-                "line": 97,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 96,
-                  "column": 5
-                },
-                "end": {
-                  "line": 96,
-                  "column": 16
-                }
-              },
-              "code": "sk.phase = 1"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 97,
-                "column": 5
-              },
-              "end": {
-                "line": 100,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 97,
-                  "column": 5
-                },
-                "end": {
-                  "line": 97,
-                  "column": 34
-                }
-              },
-              "code": "sk.staged_epoch = target_epoch"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 100,
-                "column": 5
-              },
-              "end": {
-                "line": 106
-              }
-            },
-            "ifStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 100,
-                  "column": 5
-                },
-                "end": {
-                  "line": 106
-                }
-              },
-              "branches": [
-                {
-                  "sourceInfo": {
-                    "start": {
-                      "line": 100,
-                      "column": 8
-                    },
-                    "end": {
-                      "line": 106
-                    }
-                  },
-                  "condition": "SINK_PROFILE == 1",
-                  "block": {
-                    "sourceInfo": {
-                      "start": {
-                        "line": 101,
-                        "column": 9
-                      },
-                      "end": {
-                        "line": 106
-                      }
-                    },
-                    "stmts": [
-                      {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 101,
-                            "column": 9
-                          },
-                          "end": {
-                            "line": 102,
-                            "column": 8
-                          }
-                        },
-                        "pyStmt": {
-                          "sourceInfo": {
-                            "start": {
-                              "line": 101,
-                              "column": 9
-                            },
-                            "end": {
-                              "line": 101,
-                              "column": 28
-                            }
-                          },
-                          "code": "ext = externalsystem"
-                        }
-                      },
-                      {
-                        "sourceInfo": {
-                          "start": {
-                            "line": 102,
-                            "column": 9
-                          },
-                          "end": {
-                            "line": 106
-                          }
-                        },
-                        "pyStmt": {
-                          "sourceInfo": {
-                            "start": {
-                              "line": 102,
-                              "column": 9
-                            },
-                            "end": {
-                              "line": 102,
-                              "column": 49
-                            }
-                          },
-                          "code": "ext.fencing_token = ext.fencing_token + 1"
-                        }
-                      }
-                    ]
-                  },
-                  "conditionExpr": {
-                    "sourceInfo": {
-                      "start": {
-                        "line": 100,
-                        "column": 8
-                      },
-                      "end": {
-                        "line": 100,
-                        "column": 24
-                      }
-                    },
-                    "pyExpr": "SINK_PROFILE == 1"
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
-      "sourceInfo": {
-        "start": {
-          "line": 106,
-          "column": 1
-        },
-        "end": {
-          "line": 115
-        }
-      },
-      "name": "CrashBeforePreCommit",
-      "flow": "FLOW_ATOMIC",
-      "fairness": {
-        "level": "FAIRNESS_LEVEL_UNFAIR"
-      },
-      "block": {
-        "sourceInfo": {
-          "start": {
-            "line": 107,
-            "column": 5
-          },
-          "end": {
-            "line": 115
-          }
-        },
-        "flow": "FLOW_ATOMIC",
-        "stmts": [
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 107,
-                "column": 5
-              },
-              "end": {
-                "line": 108,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 107,
-                  "column": 5
-                },
-                "end": {
-                  "line": 107,
-                  "column": 22
-                }
-              },
-              "code": "sk = sinkconnector"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 108,
-                "column": 5
-              },
-              "end": {
-                "line": 110,
-                "column": 4
-              }
-            },
-            "requireStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 108,
-                  "column": 5
-                },
-                "end": {
-                  "line": 108,
-                  "column": 25
-                }
-              },
-              "condition": "sk.phase == 0",
-              "conditionExpr": {
-                "sourceInfo": {
-                  "start": {
-                    "line": 108,
-                    "column": 13
-                  },
-                  "end": {
-                    "line": 108,
-                    "column": 25
-                  }
-                },
-                "pyExpr": "sk.phase == 0"
-              }
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 110,
-                "column": 5
-              },
-              "end": {
-                "line": 111,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 110,
-                  "column": 5
-                },
-                "end": {
-                  "line": 110,
-                  "column": 16
-                }
-              },
-              "code": "sk.phase = 0"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 111,
-                "column": 5
-              },
-              "end": {
-                "line": 115
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 111,
-                  "column": 5
-                },
-                "end": {
-                  "line": 111,
-                  "column": 23
-                }
-              },
-              "code": "sk.staged_epoch = 0"
-            }
-          }
-        ]
-      }
-    },
-    {
-      "sourceInfo": {
-        "start": {
-          "line": 115,
-          "column": 1
-        },
-        "end": {
-          "line": 126
-        }
-      },
-      "name": "CrashBetweenPreCommitAndCommit",
-      "flow": "FLOW_ATOMIC",
-      "fairness": {
-        "level": "FAIRNESS_LEVEL_UNFAIR"
-      },
-      "block": {
-        "sourceInfo": {
-          "start": {
-            "line": 116,
-            "column": 5
-          },
-          "end": {
-            "line": 126
-          }
-        },
-        "flow": "FLOW_ATOMIC",
-        "stmts": [
           {
             "sourceInfo": {
               "start": {
@@ -2545,10 +2327,10 @@
                 },
                 "end": {
                   "line": 116,
-                  "column": 22
+                  "column": 20
                 }
               },
-              "code": "sk = sinkconnector"
+              "code": "s.sink_state = 1"
             }
           },
           {
@@ -2558,11 +2340,11 @@
                 "column": 5
               },
               "end": {
-                "line": 119,
+                "line": 118,
                 "column": 4
               }
             },
-            "requireStmt": {
+            "pyStmt": {
               "sourceInfo": {
                 "start": {
                   "line": 117,
@@ -2570,73 +2352,60 @@
                 },
                 "end": {
                   "line": 117,
-                  "column": 25
+                  "column": 39
                 }
               },
-              "condition": "sk.phase == 1",
-              "conditionExpr": {
-                "sourceInfo": {
-                  "start": {
-                    "line": 117,
-                    "column": 13
-                  },
-                  "end": {
-                    "line": 117,
-                    "column": 25
-                  }
-                },
-                "pyExpr": "sk.phase == 1"
-              }
+              "code": "s.sink_pending_epoch = target_epoch"
             }
           },
           {
             "sourceInfo": {
               "start": {
+                "line": 118,
+                "column": 5
+              },
+              "end": {
                 "line": 119,
-                "column": 5
-              },
-              "end": {
-                "line": 121,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 119,
+                  "line": 118,
                   "column": 5
                 },
                 "end": {
-                  "line": 119,
-                  "column": 50
-                }
-              },
-              "code": "crash_between_precommit_commit_observed = True"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 121,
-                "column": 5
-              },
-              "end": {
-                "line": 122,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 121,
-                  "column": 5
-                },
-                "end": {
-                  "line": 121,
+                  "line": 118,
                   "column": 16
                 }
               },
-              "code": "sk.phase = 0"
+              "code": "sk.phase = 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 122,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 119,
+                  "column": 5
+                },
+                "end": {
+                  "line": 119,
+                  "column": 34
+                }
+              },
+              "code": "sk.staged_epoch = target_epoch"
             }
           },
           {
@@ -2646,21 +2415,108 @@
                 "column": 5
               },
               "end": {
-                "line": 126
+                "line": 128
               }
             },
-            "pyStmt": {
+            "ifStmt": {
               "sourceInfo": {
                 "start": {
                   "line": 122,
                   "column": 5
                 },
                 "end": {
-                  "line": 122,
-                  "column": 23
+                  "line": 128
                 }
               },
-              "code": "sk.staged_epoch = 0"
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 122,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 128
+                    }
+                  },
+                  "condition": "SINK_PROFILE == 1",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 123,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 128
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 123,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 124,
+                            "column": 8
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 123,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 123,
+                              "column": 28
+                            }
+                          },
+                          "code": "ext = externalsystem"
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 124,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 128
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 124,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 124,
+                              "column": 49
+                            }
+                          },
+                          "code": "ext.fencing_token = ext.fencing_token + 1"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 122,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 122,
+                        "column": 24
+                      }
+                    },
+                    "pyExpr": "SINK_PROFILE == 1"
+                  }
+                }
+              ]
             }
           }
         ]
@@ -2669,32 +2525,22 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 126,
+          "line": 128,
           "column": 1
         },
         "end": {
           "line": 139
         }
       },
-      "name": "RecoverFromCrash",
+      "name": "CrashBeforePreCommit",
       "flow": "FLOW_ATOMIC",
       "fairness": {
-        "sourceInfo": {
-          "start": {
-            "line": 126,
-            "column": 8
-          },
-          "end": {
-            "line": 126,
-            "column": 11
-          }
-        },
-        "level": "FAIRNESS_LEVEL_WEAK"
+        "level": "FAIRNESS_LEVEL_UNFAIR"
       },
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 127,
+            "line": 129,
             "column": 5
           },
           "end": {
@@ -2703,56 +2549,6 @@
         },
         "flow": "FLOW_ATOMIC",
         "stmts": [
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 127,
-                "column": 5
-              },
-              "end": {
-                "line": 128,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 127,
-                  "column": 5
-                },
-                "end": {
-                  "line": 127,
-                  "column": 22
-                }
-              },
-              "code": "sk = sinkconnector"
-            }
-          },
-          {
-            "sourceInfo": {
-              "start": {
-                "line": 128,
-                "column": 5
-              },
-              "end": {
-                "line": 129,
-                "column": 4
-              }
-            },
-            "pyStmt": {
-              "sourceInfo": {
-                "start": {
-                  "line": 128,
-                  "column": 5
-                },
-                "end": {
-                  "line": 128,
-                  "column": 13
-                }
-              },
-              "code": "s = shard"
-            }
-          },
           {
             "sourceInfo": {
               "start": {
@@ -2772,10 +2568,10 @@
                 },
                 "end": {
                   "line": 129,
-                  "column": 21
+                  "column": 22
                 }
               },
-              "code": "cp = controlplane"
+              "code": "sk = sinkconnector"
             }
           },
           {
@@ -2835,10 +2631,10 @@
                 },
                 "end": {
                   "line": 131,
-                  "column": 29
+                  "column": 37
                 }
               },
-              "condition": "s.sink_state == 1",
+              "condition": "crash_count < MAX_CRASHES",
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
@@ -2847,10 +2643,10 @@
                   },
                   "end": {
                     "line": 131,
-                    "column": 29
+                    "column": 37
                   }
                 },
-                "pyExpr": "s.sink_state == 1"
+                "pyExpr": "crash_count < MAX_CRASHES"
               }
             }
           },
@@ -2873,10 +2669,10 @@
                 },
                 "end": {
                   "line": 132,
-                  "column": 39
+                  "column": 33
                 }
               },
-              "code": "target_epoch = s.sink_pending_epoch"
+              "code": "crash_count = crash_count + 1"
             }
           },
           {
@@ -2898,10 +2694,10 @@
                 },
                 "end": {
                   "line": 134,
-                  "column": 34
+                  "column": 16
                 }
               },
-              "code": "sk.staged_epoch = target_epoch"
+              "code": "sk.phase = 0"
             }
           },
           {
@@ -2922,10 +2718,10 @@
                 },
                 "end": {
                   "line": 135,
-                  "column": 16
+                  "column": 23
                 }
               },
-              "code": "sk.phase = 1"
+              "code": "sk.staged_epoch = 0"
             }
           }
         ]
@@ -2938,23 +2734,13 @@
           "column": 1
         },
         "end": {
-          "line": 171
+          "line": 152
         }
       },
-      "name": "SinkCommit",
+      "name": "CrashBetweenPreCommitAndCommit",
       "flow": "FLOW_ATOMIC",
       "fairness": {
-        "sourceInfo": {
-          "start": {
-            "line": 139,
-            "column": 8
-          },
-          "end": {
-            "line": 139,
-            "column": 11
-          }
-        },
-        "level": "FAIRNESS_LEVEL_WEAK"
+        "level": "FAIRNESS_LEVEL_UNFAIR"
       },
       "block": {
         "sourceInfo": {
@@ -2963,7 +2749,7 @@
             "column": 5
           },
           "end": {
-            "line": 171
+            "line": 152
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -3004,7 +2790,7 @@
                 "column": 4
               }
             },
-            "pyStmt": {
+            "requireStmt": {
               "sourceInfo": {
                 "start": {
                   "line": 141,
@@ -3012,10 +2798,23 @@
                 },
                 "end": {
                   "line": 141,
-                  "column": 13
+                  "column": 25
                 }
               },
-              "code": "s = shard"
+              "condition": "sk.phase == 1",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 141,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 141,
+                    "column": 25
+                  }
+                },
+                "pyExpr": "sk.phase == 1"
+              }
             }
           },
           {
@@ -3029,7 +2828,7 @@
                 "column": 4
               }
             },
-            "pyStmt": {
+            "requireStmt": {
               "sourceInfo": {
                 "start": {
                   "line": 142,
@@ -3037,10 +2836,23 @@
                 },
                 "end": {
                   "line": 142,
-                  "column": 21
+                  "column": 37
                 }
               },
-              "code": "cp = controlplane"
+              "condition": "crash_count < MAX_CRASHES",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 142,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 142,
+                    "column": 37
+                  }
+                },
+                "pyExpr": "crash_count < MAX_CRASHES"
+              }
             }
           },
           {
@@ -3050,7 +2862,7 @@
                 "column": 5
               },
               "end": {
-                "line": 144,
+                "line": 145,
                 "column": 4
               }
             },
@@ -3062,6 +2874,485 @@
                 },
                 "end": {
                   "line": 143,
+                  "column": 33
+                }
+              },
+              "code": "crash_count = crash_count + 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 145,
+                "column": 5
+              },
+              "end": {
+                "line": 147,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 145,
+                  "column": 5
+                },
+                "end": {
+                  "line": 145,
+                  "column": 50
+                }
+              },
+              "code": "crash_between_precommit_commit_observed = True"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 147,
+                "column": 5
+              },
+              "end": {
+                "line": 148,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 147,
+                  "column": 5
+                },
+                "end": {
+                  "line": 147,
+                  "column": 16
+                }
+              },
+              "code": "sk.phase = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 148,
+                "column": 5
+              },
+              "end": {
+                "line": 152
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 148,
+                  "column": 5
+                },
+                "end": {
+                  "line": 148,
+                  "column": 23
+                }
+              },
+              "code": "sk.staged_epoch = 0"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 152,
+          "column": 1
+        },
+        "end": {
+          "line": 165
+        }
+      },
+      "name": "RecoverFromCrash",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 152,
+            "column": 8
+          },
+          "end": {
+            "line": 152,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 153,
+            "column": 5
+          },
+          "end": {
+            "line": 165
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 153,
+                "column": 5
+              },
+              "end": {
+                "line": 154,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 153,
+                  "column": 5
+                },
+                "end": {
+                  "line": 153,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 154,
+                "column": 5
+              },
+              "end": {
+                "line": 155,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 154,
+                  "column": 5
+                },
+                "end": {
+                  "line": 154,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 155,
+                "column": 5
+              },
+              "end": {
+                "line": 156,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 155,
+                  "column": 5
+                },
+                "end": {
+                  "line": 155,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 156,
+                "column": 5
+              },
+              "end": {
+                "line": 157,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 156,
+                  "column": 5
+                },
+                "end": {
+                  "line": 156,
+                  "column": 25
+                }
+              },
+              "condition": "sk.phase == 0",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 156,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 156,
+                    "column": 25
+                  }
+                },
+                "pyExpr": "sk.phase == 0"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 157,
+                "column": 5
+              },
+              "end": {
+                "line": 158,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 157,
+                  "column": 5
+                },
+                "end": {
+                  "line": 157,
+                  "column": 29
+                }
+              },
+              "condition": "s.sink_state == 1",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 157,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 157,
+                    "column": 29
+                  }
+                },
+                "pyExpr": "s.sink_state == 1"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 158,
+                "column": 5
+              },
+              "end": {
+                "line": 160,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 158,
+                  "column": 5
+                },
+                "end": {
+                  "line": 158,
+                  "column": 39
+                }
+              },
+              "code": "target_epoch = s.sink_pending_epoch"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 160,
+                "column": 5
+              },
+              "end": {
+                "line": 161,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 160,
+                  "column": 5
+                },
+                "end": {
+                  "line": 160,
+                  "column": 34
+                }
+              },
+              "code": "sk.staged_epoch = target_epoch"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 161,
+                "column": 5
+              },
+              "end": {
+                "line": 165
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 161,
+                  "column": 5
+                },
+                "end": {
+                  "line": 161,
+                  "column": 16
+                }
+              },
+              "code": "sk.phase = 1"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 165,
+          "column": 1
+        },
+        "end": {
+          "line": 197
+        }
+      },
+      "name": "SinkCommit",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 165,
+            "column": 8
+          },
+          "end": {
+            "line": 165,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 166,
+            "column": 5
+          },
+          "end": {
+            "line": 197
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 166,
+                "column": 5
+              },
+              "end": {
+                "line": 167,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 166,
+                  "column": 5
+                },
+                "end": {
+                  "line": 166,
+                  "column": 22
+                }
+              },
+              "code": "sk = sinkconnector"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 167,
+                "column": 5
+              },
+              "end": {
+                "line": 168,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 167,
+                  "column": 5
+                },
+                "end": {
+                  "line": 167,
+                  "column": 13
+                }
+              },
+              "code": "s = shard"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 168,
+                "column": 5
+              },
+              "end": {
+                "line": 169,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 168,
+                  "column": 5
+                },
+                "end": {
+                  "line": 168,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 169,
+                "column": 5
+              },
+              "end": {
+                "line": 170,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 169,
+                  "column": 5
+                },
+                "end": {
+                  "line": 169,
                   "column": 24
                 }
               },
@@ -3071,22 +3362,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 144,
+                "line": 170,
                 "column": 5
               },
               "end": {
-                "line": 145,
+                "line": 171,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 144,
+                  "line": 170,
                   "column": 5
                 },
                 "end": {
-                  "line": 144,
+                  "line": 170,
                   "column": 25
                 }
               },
@@ -3094,11 +3385,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 144,
+                    "line": 170,
                     "column": 13
                   },
                   "end": {
-                    "line": 144,
+                    "line": 170,
                     "column": 25
                   }
                 },
@@ -3109,22 +3400,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 145,
+                "line": 171,
                 "column": 5
               },
               "end": {
-                "line": 147,
+                "line": 173,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 145,
+                  "line": 171,
                   "column": 5
                 },
                 "end": {
-                  "line": 145,
+                  "line": 171,
                   "column": 51
                 }
               },
@@ -3132,11 +3423,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 145,
+                    "line": 171,
                     "column": 13
                   },
                   "end": {
-                    "line": 145,
+                    "line": 171,
                     "column": 51
                   }
                 },
@@ -3147,22 +3438,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 147,
+                "line": 173,
                 "column": 5
               },
               "end": {
-                "line": 150,
+                "line": 176,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 147,
+                  "line": 173,
                   "column": 5
                 },
                 "end": {
-                  "line": 147,
+                  "line": 173,
                   "column": 34
                 }
               },
@@ -3172,22 +3463,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 150,
+                "line": 176,
                 "column": 5
               },
               "end": {
-                "line": 164,
+                "line": 190,
                 "column": 4
               }
             },
             "ifStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 150,
+                  "line": 176,
                   "column": 5
                 },
                 "end": {
-                  "line": 164,
+                  "line": 190,
                   "column": 4
                 }
               },
@@ -3195,11 +3486,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 150,
+                      "line": 176,
                       "column": 8
                     },
                     "end": {
-                      "line": 153,
+                      "line": 179,
                       "column": 4
                     }
                   },
@@ -3207,11 +3498,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 152,
+                        "line": 178,
                         "column": 9
                       },
                       "end": {
-                        "line": 153,
+                        "line": 179,
                         "column": 4
                       }
                     },
@@ -3219,26 +3510,26 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 152,
+                            "line": 178,
                             "column": 9
                           },
                           "end": {
-                            "line": 153,
+                            "line": 179,
                             "column": 4
                           }
                         },
                         "pyStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 152,
+                              "line": 178,
                               "column": 9
                             },
                             "end": {
-                              "line": 152,
-                              "column": 68
+                              "line": 178,
+                              "column": 46
                             }
                           },
-                          "code": "ext.delivered_epochs = ext.delivered_epochs | {target_epoch}"
+                          "code": "ext.delivered_epochs.add(target_epoch)"
                         }
                       }
                     ]
@@ -3246,11 +3537,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 150,
+                        "line": 176,
                         "column": 8
                       },
                       "end": {
-                        "line": 150,
+                        "line": 176,
                         "column": 24
                       }
                     },
@@ -3260,11 +3551,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 153,
+                      "line": 179,
                       "column": 5
                     },
                     "end": {
-                      "line": 157,
+                      "line": 183,
                       "column": 4
                     }
                   },
@@ -3272,11 +3563,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 155,
+                        "line": 181,
                         "column": 9
                       },
                       "end": {
-                        "line": 157,
+                        "line": 183,
                         "column": 4
                       }
                     },
@@ -3284,47 +3575,47 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 155,
+                            "line": 181,
                             "column": 9
                           },
                           "end": {
-                            "line": 156,
+                            "line": 182,
                             "column": 8
                           }
                         },
                         "pyStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 155,
+                              "line": 181,
                               "column": 9
                             },
                             "end": {
-                              "line": 155,
-                              "column": 68
+                              "line": 181,
+                              "column": 46
                             }
                           },
-                          "code": "ext.delivered_epochs = ext.delivered_epochs | {target_epoch}"
+                          "code": "ext.delivered_epochs.add(target_epoch)"
                         }
                       },
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 156,
+                            "line": 182,
                             "column": 9
                           },
                           "end": {
-                            "line": 157,
+                            "line": 183,
                             "column": 4
                           }
                         },
                         "pyStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 156,
+                              "line": 182,
                               "column": 9
                             },
                             "end": {
-                              "line": 156,
+                              "line": 182,
                               "column": 39
                             }
                           },
@@ -3336,11 +3627,11 @@
                   "conditionExpr": {
                     "sourceInfo": {
                       "start": {
-                        "line": 153,
+                        "line": 179,
                         "column": 10
                       },
                       "end": {
-                        "line": 153,
+                        "line": 179,
                         "column": 26
                       }
                     },
@@ -3350,11 +3641,11 @@
                 {
                   "sourceInfo": {
                     "start": {
-                      "line": 157,
+                      "line": 183,
                       "column": 5
                     },
                     "end": {
-                      "line": 164,
+                      "line": 190,
                       "column": 4
                     }
                   },
@@ -3362,11 +3653,11 @@
                   "block": {
                     "sourceInfo": {
                       "start": {
-                        "line": 159,
+                        "line": 185,
                         "column": 9
                       },
                       "end": {
-                        "line": 164,
+                        "line": 190,
                         "column": 4
                       }
                     },
@@ -3374,22 +3665,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 159,
+                            "line": 185,
                             "column": 9
                           },
                           "end": {
-                            "line": 161,
+                            "line": 187,
                             "column": 8
                           }
                         },
                         "ifStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 159,
+                              "line": 185,
                               "column": 9
                             },
                             "end": {
-                              "line": 161,
+                              "line": 187,
                               "column": 8
                             }
                           },
@@ -3397,11 +3688,11 @@
                             {
                               "sourceInfo": {
                                 "start": {
-                                  "line": 159,
+                                  "line": 185,
                                   "column": 12
                                 },
                                 "end": {
-                                  "line": 161,
+                                  "line": 187,
                                   "column": 8
                                 }
                               },
@@ -3409,11 +3700,11 @@
                               "block": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 160,
+                                    "line": 186,
                                     "column": 13
                                   },
                                   "end": {
-                                    "line": 161,
+                                    "line": 187,
                                     "column": 8
                                   }
                                 },
@@ -3421,26 +3712,26 @@
                                   {
                                     "sourceInfo": {
                                       "start": {
-                                        "line": 160,
+                                        "line": 186,
                                         "column": 13
                                       },
                                       "end": {
-                                        "line": 161,
+                                        "line": 187,
                                         "column": 8
                                       }
                                     },
                                     "pyStmt": {
                                       "sourceInfo": {
                                         "start": {
-                                          "line": 160,
+                                          "line": 186,
                                           "column": 13
                                         },
                                         "end": {
-                                          "line": 160,
-                                          "column": 72
+                                          "line": 186,
+                                          "column": 50
                                         }
                                       },
-                                      "code": "ext.delivered_epochs = ext.delivered_epochs | {target_epoch}"
+                                      "code": "ext.delivered_epochs.add(target_epoch)"
                                     }
                                   }
                                 ]
@@ -3448,11 +3739,11 @@
                               "conditionExpr": {
                                 "sourceInfo": {
                                   "start": {
-                                    "line": 159,
+                                    "line": 185,
                                     "column": 12
                                   },
                                   "end": {
-                                    "line": 159,
+                                    "line": 185,
                                     "column": 51
                                   }
                                 },
@@ -3465,22 +3756,22 @@
                       {
                         "sourceInfo": {
                           "start": {
-                            "line": 161,
+                            "line": 187,
                             "column": 9
                           },
                           "end": {
-                            "line": 164,
+                            "line": 190,
                             "column": 4
                           }
                         },
                         "pyStmt": {
                           "sourceInfo": {
                             "start": {
-                              "line": 161,
+                              "line": 187,
                               "column": 9
                             },
                             "end": {
-                              "line": 161,
+                              "line": 187,
                               "column": 39
                             }
                           },
@@ -3499,22 +3790,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 164,
+                "line": 190,
                 "column": 5
               },
               "end": {
-                "line": 165,
+                "line": 191,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 164,
+                  "line": 190,
                   "column": 5
                 },
                 "end": {
-                  "line": 164,
+                  "line": 190,
                   "column": 20
                 }
               },
@@ -3524,22 +3815,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 165,
+                "line": 191,
                 "column": 5
               },
               "end": {
-                "line": 167,
+                "line": 193,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 165,
+                  "line": 191,
                   "column": 5
                 },
                 "end": {
-                  "line": 165,
+                  "line": 191,
                   "column": 16
                 }
               },
@@ -3549,21 +3840,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 167,
+                "line": 193,
                 "column": 5
               },
               "end": {
-                "line": 171
+                "line": 197
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 167,
+                  "line": 193,
                   "column": 5
                 },
                 "end": {
-                  "line": 167,
+                  "line": 193,
                   "column": 36
                 }
               },
@@ -3576,11 +3867,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 171,
+          "line": 197,
           "column": 1
         },
         "end": {
-          "line": 181
+          "line": 214
         }
       },
       "name": "SinkFinalize",
@@ -3588,11 +3879,11 @@
       "fairness": {
         "sourceInfo": {
           "start": {
-            "line": 171,
+            "line": 197,
             "column": 8
           },
           "end": {
-            "line": 171,
+            "line": 197,
             "column": 11
           }
         },
@@ -3601,11 +3892,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 172,
+            "line": 198,
             "column": 5
           },
           "end": {
-            "line": 181
+            "line": 214
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -3613,22 +3904,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 172,
+                "line": 198,
                 "column": 5
               },
               "end": {
-                "line": 173,
+                "line": 199,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 172,
+                  "line": 198,
                   "column": 5
                 },
                 "end": {
-                  "line": 172,
+                  "line": 198,
                   "column": 22
                 }
               },
@@ -3638,22 +3929,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 173,
+                "line": 199,
                 "column": 5
               },
               "end": {
-                "line": 174,
+                "line": 200,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 173,
+                  "line": 199,
                   "column": 5
                 },
                 "end": {
-                  "line": 173,
+                  "line": 199,
                   "column": 13
                 }
               },
@@ -3663,22 +3954,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 174,
+                "line": 200,
                 "column": 5
               },
               "end": {
-                "line": 175,
+                "line": 201,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 174,
+                  "line": 200,
                   "column": 5
                 },
                 "end": {
-                  "line": 174,
+                  "line": 200,
                   "column": 25
                 }
               },
@@ -3686,11 +3977,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 174,
+                    "line": 200,
                     "column": 13
                   },
                   "end": {
-                    "line": 174,
+                    "line": 200,
                     "column": 25
                   }
                 },
@@ -3701,22 +3992,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 175,
+                "line": 201,
                 "column": 5
               },
               "end": {
-                "line": 176,
+                "line": 202,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 175,
+                  "line": 201,
                   "column": 5
                 },
                 "end": {
-                  "line": 175,
+                  "line": 201,
                   "column": 16
                 }
               },
@@ -3726,22 +4017,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 176,
+                "line": 202,
                 "column": 5
               },
               "end": {
-                "line": 177,
+                "line": 203,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 176,
+                  "line": 202,
                   "column": 5
                 },
                 "end": {
-                  "line": 176,
+                  "line": 202,
                   "column": 23
                 }
               },
@@ -3751,25 +4042,50 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 177,
+                "line": 203,
                 "column": 5
               },
               "end": {
-                "line": 181
+                "line": 210,
+                "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 177,
+                  "line": 203,
                   "column": 5
                 },
                 "end": {
-                  "line": 177,
+                  "line": 203,
                   "column": 20
                 }
               },
               "code": "s.sink_state = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 210,
+                "column": 5
+              },
+              "end": {
+                "line": 214
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 210,
+                  "column": 5
+                },
+                "end": {
+                  "line": 210,
+                  "column": 28
+                }
+              },
+              "code": "s.sink_pending_epoch = 0"
             }
           }
         ]
@@ -3778,11 +4094,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 181,
+          "line": 214,
           "column": 1
         },
         "end": {
-          "line": 195
+          "line": 228
         }
       },
       "name": "InjectDuplicateDelivery",
@@ -3793,11 +4109,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 182,
+            "line": 215,
             "column": 5
           },
           "end": {
-            "line": 195
+            "line": 228
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -3805,22 +4121,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 182,
+                "line": 215,
                 "column": 5
               },
               "end": {
-                "line": 183,
+                "line": 216,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 182,
+                  "line": 215,
                   "column": 5
                 },
                 "end": {
-                  "line": 182,
+                  "line": 215,
                   "column": 22
                 }
               },
@@ -3830,22 +4146,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 183,
+                "line": 216,
                 "column": 5
               },
               "end": {
-                "line": 184,
+                "line": 217,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 183,
+                  "line": 216,
                   "column": 5
                 },
                 "end": {
-                  "line": 183,
+                  "line": 216,
                   "column": 24
                 }
               },
@@ -3855,22 +4171,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 184,
+                "line": 217,
                 "column": 5
               },
               "end": {
-                "line": 185,
+                "line": 218,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 184,
+                  "line": 217,
                   "column": 5
                 },
                 "end": {
-                  "line": 184,
+                  "line": 217,
                   "column": 13
                 }
               },
@@ -3880,22 +4196,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 185,
+                "line": 218,
                 "column": 5
               },
               "end": {
-                "line": 186,
+                "line": 219,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 185,
+                  "line": 218,
                   "column": 5
                 },
                 "end": {
-                  "line": 185,
+                  "line": 218,
                   "column": 25
                 }
               },
@@ -3903,11 +4219,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 185,
+                    "line": 218,
                     "column": 13
                   },
                   "end": {
-                    "line": 185,
+                    "line": 218,
                     "column": 25
                   }
                 },
@@ -3918,22 +4234,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 186,
+                "line": 219,
                 "column": 5
               },
               "end": {
-                "line": 187,
+                "line": 220,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 186,
+                  "line": 219,
                   "column": 5
                 },
                 "end": {
-                  "line": 186,
+                  "line": 219,
                   "column": 56
                 }
               },
@@ -3941,11 +4257,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 186,
+                    "line": 219,
                     "column": 13
                   },
                   "end": {
-                    "line": 186,
+                    "line": 219,
                     "column": 56
                   }
                 },
@@ -3956,21 +4272,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 187,
+                "line": 220,
                 "column": 5
               },
               "end": {
-                "line": 195
+                "line": 228
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 187,
+                  "line": 220,
                   "column": 5
                 },
                 "end": {
-                  "line": 187,
+                  "line": 220,
                   "column": 39
                 }
               },
@@ -3983,11 +4299,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 195,
+          "line": 228,
           "column": 1
         },
         "end": {
-          "line": 206
+          "line": 239
         }
       },
       "name": "CommitClusterCheckpoint",
@@ -3995,11 +4311,11 @@
       "fairness": {
         "sourceInfo": {
           "start": {
-            "line": 195,
+            "line": 228,
             "column": 8
           },
           "end": {
-            "line": 195,
+            "line": 228,
             "column": 11
           }
         },
@@ -4008,11 +4324,11 @@
       "block": {
         "sourceInfo": {
           "start": {
-            "line": 196,
+            "line": 229,
             "column": 5
           },
           "end": {
-            "line": 206
+            "line": 239
           }
         },
         "flow": "FLOW_ATOMIC",
@@ -4020,22 +4336,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 196,
+                "line": 229,
                 "column": 5
               },
               "end": {
-                "line": 197,
+                "line": 230,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 196,
+                  "line": 229,
                   "column": 5
                 },
                 "end": {
-                  "line": 196,
+                  "line": 229,
                   "column": 30
                 }
               },
@@ -4045,22 +4361,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 197,
+                "line": 230,
                 "column": 5
               },
               "end": {
-                "line": 198,
+                "line": 231,
                 "column": 4
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 197,
+                  "line": 230,
                   "column": 5
                 },
                 "end": {
-                  "line": 197,
+                  "line": 230,
                   "column": 21
                 }
               },
@@ -4070,22 +4386,22 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 198,
+                "line": 231,
                 "column": 5
               },
               "end": {
-                "line": 199,
+                "line": 232,
                 "column": 4
               }
             },
             "requireStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 198,
+                  "line": 231,
                   "column": 5
                 },
                 "end": {
-                  "line": 198,
+                  "line": 231,
                   "column": 32
                 }
               },
@@ -4093,11 +4409,11 @@
               "conditionExpr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 198,
+                    "line": 231,
                     "column": 13
                   },
                   "end": {
-                    "line": 198,
+                    "line": 231,
                     "column": 32
                   }
                 },
@@ -4108,21 +4424,21 @@
           {
             "sourceInfo": {
               "start": {
-                "line": 199,
+                "line": 232,
                 "column": 5
               },
               "end": {
-                "line": 206
+                "line": 239
               }
             },
             "pyStmt": {
               "sourceInfo": {
                 "start": {
-                  "line": 199,
+                  "line": 232,
                   "column": 5
                 },
                 "end": {
-                  "line": 199,
+                  "line": 232,
                   "column": 27
                 }
               },
@@ -4141,7 +4457,7 @@
           "column": 1
         },
         "end": {
-          "line": 24
+          "line": 27
         }
       },
       "pyStmt": {
@@ -4161,21 +4477,45 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 24,
+          "line": 27,
           "column": 1
         },
         "end": {
-          "line": 28
+          "line": 33
         }
       },
       "pyStmt": {
         "sourceInfo": {
           "start": {
-            "line": 24,
+            "line": 27,
             "column": 1
           },
           "end": {
-            "line": 24,
+            "line": 27,
+            "column": 15
+          }
+        },
+        "code": "MAX_CRASHES = 1"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 33,
+          "column": 1
+        },
+        "end": {
+          "line": 37
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 33,
+            "column": 1
+          },
+          "end": {
+            "line": 33,
             "column": 16
           }
         },
@@ -4187,11 +4527,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 35,
+          "line": 57,
           "column": 1
         },
         "end": {
-          "line": 44
+          "line": 66
         }
       },
       "name": "ControlPlane",
@@ -4199,11 +4539,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 36,
+              "line": 58,
               "column": 5
             },
             "end": {
-              "line": 44
+              "line": 66
             }
           },
           "name": "Init",
@@ -4214,11 +4554,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 39,
+                "line": 61,
                 "column": 9
               },
               "end": {
-                "line": 44
+                "line": 66
               }
             },
             "flow": "FLOW_ATOMIC",
@@ -4226,22 +4566,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 39,
+                    "line": 61,
                     "column": 9
                   },
                   "end": {
-                    "line": 40,
+                    "line": 62,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 39,
+                      "line": 61,
                       "column": 9
                     },
                     "end": {
-                      "line": 39,
+                      "line": 61,
                       "column": 34
                     }
                   },
@@ -4251,21 +4591,21 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 40,
+                    "line": 62,
                     "column": 9
                   },
                   "end": {
-                    "line": 44
+                    "line": 66
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 40,
+                      "line": 62,
                       "column": 9
                     },
                     "end": {
-                      "line": 40,
+                      "line": 62,
                       "column": 33
                     }
                   },
@@ -4280,11 +4620,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 44,
+          "line": 66,
           "column": 1
         },
         "end": {
-          "line": 52
+          "line": 74
         }
       },
       "name": "Shard",
@@ -4292,11 +4632,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 45,
+              "line": 67,
               "column": 5
             },
             "end": {
-              "line": 52
+              "line": 74
             }
           },
           "name": "Init",
@@ -4307,11 +4647,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 46,
+                "line": 68,
                 "column": 9
               },
               "end": {
-                "line": 52
+                "line": 74
               }
             },
             "flow": "FLOW_ATOMIC",
@@ -4319,22 +4659,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 46,
+                    "line": 68,
                     "column": 9
                   },
                   "end": {
-                    "line": 48,
+                    "line": 70,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 46,
+                      "line": 68,
                       "column": 9
                     },
                     "end": {
-                      "line": 46,
+                      "line": 68,
                       "column": 32
                     }
                   },
@@ -4344,22 +4684,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 48,
+                    "line": 70,
                     "column": 9
                   },
                   "end": {
-                    "line": 49,
+                    "line": 71,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 48,
+                      "line": 70,
                       "column": 9
                     },
                     "end": {
-                      "line": 48,
+                      "line": 70,
                       "column": 27
                     }
                   },
@@ -4369,21 +4709,21 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 49,
+                    "line": 71,
                     "column": 9
                   },
                   "end": {
-                    "line": 52
+                    "line": 74
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 49,
+                      "line": 71,
                       "column": 9
                     },
                     "end": {
-                      "line": 49,
+                      "line": 71,
                       "column": 35
                     }
                   },
@@ -4398,11 +4738,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 53,
+          "line": 75,
           "column": 1
         },
         "end": {
-          "line": 59
+          "line": 81
         }
       },
       "name": "SinkConnector",
@@ -4410,11 +4750,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 54,
+              "line": 76,
               "column": 5
             },
             "end": {
-              "line": 59
+              "line": 81
             }
           },
           "name": "Init",
@@ -4425,11 +4765,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 55,
+                "line": 77,
                 "column": 9
               },
               "end": {
-                "line": 59
+                "line": 81
               }
             },
             "flow": "FLOW_ATOMIC",
@@ -4437,22 +4777,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 55,
+                    "line": 77,
                     "column": 9
                   },
                   "end": {
-                    "line": 56,
+                    "line": 78,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 55,
+                      "line": 77,
                       "column": 9
                     },
                     "end": {
-                      "line": 55,
+                      "line": 77,
                       "column": 22
                     }
                   },
@@ -4462,21 +4802,21 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 56,
+                    "line": 78,
                     "column": 9
                   },
                   "end": {
-                    "line": 59
+                    "line": 81
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 56,
+                      "line": 78,
                       "column": 9
                     },
                     "end": {
-                      "line": 56,
+                      "line": 78,
                       "column": 29
                     }
                   },
@@ -4491,11 +4831,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 52,
+              "line": 74,
               "column": 1
             },
             "end": {
-              "line": 53
+              "line": 75
             }
           },
           "name": "state",
@@ -4503,11 +4843,11 @@
             {
               "sourceInfo": {
                 "start": {
-                  "line": 52,
+                  "line": 74,
                   "column": 8
                 },
                 "end": {
-                  "line": 52,
+                  "line": 74,
                   "column": 42
                 }
               },
@@ -4515,11 +4855,11 @@
               "expr": {
                 "sourceInfo": {
                   "start": {
-                    "line": 52,
+                    "line": 74,
                     "column": 8
                   },
                   "end": {
-                    "line": 52,
+                    "line": 74,
                     "column": 42
                   }
                 },
@@ -4533,11 +4873,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 59,
+          "line": 81,
           "column": 1
         },
         "end": {
-          "line": 69
+          "line": 91
         }
       },
       "name": "ExternalSystem",
@@ -4545,11 +4885,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 60,
+              "line": 82,
               "column": 5
             },
             "end": {
-              "line": 69
+              "line": 91
             }
           },
           "name": "Init",
@@ -4560,11 +4900,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 62,
+                "line": 84,
                 "column": 9
               },
               "end": {
-                "line": 69
+                "line": 91
               }
             },
             "flow": "FLOW_ATOMIC",
@@ -4572,22 +4912,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 62,
+                    "line": 84,
                     "column": 9
                   },
                   "end": {
-                    "line": 64,
+                    "line": 86,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 62,
+                      "line": 84,
                       "column": 9
                     },
                     "end": {
-                      "line": 62,
+                      "line": 84,
                       "column": 37
                     }
                   },
@@ -4597,22 +4937,22 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 64,
+                    "line": 86,
                     "column": 9
                   },
                   "end": {
-                    "line": 66,
+                    "line": 88,
                     "column": 8
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 64,
+                      "line": 86,
                       "column": 9
                     },
                     "end": {
-                      "line": 64,
+                      "line": 86,
                       "column": 30
                     }
                   },
@@ -4622,21 +4962,21 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 66,
+                    "line": 88,
                     "column": 9
                   },
                   "end": {
-                    "line": 69
+                    "line": 91
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 66,
+                      "line": 88,
                       "column": 9
                     },
                     "end": {
-                      "line": 66,
+                      "line": 88,
                       "column": 27
                     }
                   },
@@ -4651,11 +4991,11 @@
     {
       "sourceInfo": {
         "start": {
-          "line": 69,
+          "line": 91,
           "column": 1
         },
         "end": {
-          "line": 77
+          "line": 99
         }
       },
       "name": "CheckpointCoordinator",
@@ -4663,11 +5003,11 @@
         {
           "sourceInfo": {
             "start": {
-              "line": 70,
+              "line": 92,
               "column": 5
             },
             "end": {
-              "line": 77
+              "line": 99
             }
           },
           "name": "Init",
@@ -4678,11 +5018,11 @@
           "block": {
             "sourceInfo": {
               "start": {
-                "line": 71,
+                "line": 93,
                 "column": 9
               },
               "end": {
-                "line": 77
+                "line": 99
               }
             },
             "flow": "FLOW_ATOMIC",
@@ -4690,21 +5030,21 @@
               {
                 "sourceInfo": {
                   "start": {
-                    "line": 71,
+                    "line": 93,
                     "column": 9
                   },
                   "end": {
-                    "line": 77
+                    "line": 99
                   }
                 },
                 "pyStmt": {
                   "sourceInfo": {
                     "start": {
-                      "line": 71,
+                      "line": 93,
                       "column": 9
                     },
                     "end": {
-                      "line": 71,
+                      "line": 93,
                       "column": 22
                     }
                   },

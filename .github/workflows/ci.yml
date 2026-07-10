@@ -42,32 +42,85 @@ jobs:
   formal-verify:
     name: Formal verify (M1–M4)
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'push' ||
-      (github.event_name == 'pull_request' && (
-        contains(github.event.pull_request.changed_files, 'formal/') ||
-        contains(toJSON(github.event.pull_request), '"DESIGN.md"') ||
-        contains(toJSON(github.event.pull_request), '"rockstream-runtime"') ||
-        contains(toJSON(github.event.pull_request), '"rockstream-control"') ||
-        contains(toJSON(github.event.pull_request), '"rockstream-connectors"') ||
-        contains(toJSON(github.event.pull_request), '"rockstream-storage"')
-      ))
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Determine whether formal verification applies
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=50
+            base_sha=$(git merge-base "origin/${{ github.event.pull_request.base.ref }}" HEAD)
+            changed=$(git diff --name-only "$base_sha"...HEAD)
+            if echo "$changed" | grep -qE '^(formal/|DESIGN\.md|crates/rockstream-(runtime|control|connectors|storage)/)'; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # push to main / tags always runs the full formal-verify suite.
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Install FizzBee
+        if: steps.filter.outputs.run == 'true'
         run: |
-          curl -fsSL https://github.com/fizzbee-io/fizzbee/releases/latest/download/fizzbee-linux-amd64.tar.gz \
-            | tar -xz -C /usr/local/bin fizzbee
-          fizzbee --version || true
-      - name: Run formal verification (make verify)
-        run: make verify
+          set -euo pipefail
+          # v0.42.1 fix: the previous URL (fizzbee-linux-amd64.tar.gz under
+          # .../releases/latest/download/...) never matched a real asset —
+          # fizzbee-io/fizzbee publishes versioned filenames
+          # (e.g. fizzbee-v0.5.2-linux_x86.tar.gz), which the GitHub
+          # "latest/download/<fixed-name>" convention cannot address. Resolve
+          # the real asset URL from the Releases API instead.
+          url=$(curl -fsSL https://api.github.com/repos/fizzbee-io/fizzbee/releases/latest \
+            | grep -oE '"browser_download_url": *"[^"]*linux_x86\.tar\.gz"' \
+            | grep -oE 'https://[^"]+' | head -1)
+          if [ -z "$url" ]; then
+            echo "::error::Could not resolve a fizzbee linux_x86 release asset from the GitHub API."
+            exit 1
+          fi
+          echo "Resolved fizzbee asset: $url"
+          curl -fsSL -o /tmp/fizzbee.tar.gz "$url"
+          mkdir -p /tmp/fizzbee-install
+          tar -xzf /tmp/fizzbee.tar.gz -C /tmp/fizzbee-install
+          # v0.42.1 fix: `make verify` invokes the `fizz` wrapper script, not
+          # the bare `fizzbee` binary. The wrapper needs its sibling files
+          # (fizz.env, parser/, mbt_gen.zip) alongside it, so the whole
+          # extracted directory — not just one file — must be on PATH.
+          install_dir=$(find /tmp/fizzbee-install -mindepth 1 -maxdepth 1 -type d | head -1)
+          echo "$install_dir" >> "$GITHUB_PATH"
+          "$install_dir/fizzbee" --version || true
+      # M1 (smoke + epoch-commit), M2 (frontier aggregation), and M3 (sink 2PC)
+      # are genuinely green (safety + liveness) as of the v0.42.1 fix — see
+      # formal/findings.md "Post-v0.42.1 Remediation". They are a hard gate:
+      # a red result here blocks merge, per the binding v0.18 contract.
+      - name: Formal verify — smoke, M1, M2, M3 (hard gate)
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          fizz formal/smoke.fizz
+          fizz formal/m1_epoch_commit.fizz
+          fizz formal/m2_frontier_agg.fizz
+          fizz formal/m3_sink_2pc.fizz
+      # M4's safety invariants hold under bounded simulation, but exhaustive
+      # BFS verification at the committed NUM_WORKERS=3 bound has not been
+      # confirmed to terminate in reasonable time/memory (observed >800k
+      # explored nodes and still growing at NUM_WORKERS=2 in local testing),
+      # and simulation-mode liveness checks produced results that could not
+      # be distinguished from bounded-exploration artifacts (see
+      # formal/findings.md). Until the state space is made tractable
+      # (symmetry reduction or tighter bounds) or confirmed to terminate,
+      # M4 is reported but does not block merge.
+      - name: Formal verify — M4 (non-blocking pending state-space fix)
+        if: steps.filter.outputs.run == 'true'
+        run: fizz formal/m4_self_fencing.fizz
         continue-on-error: true
-        id: formal_verify
-      - name: Report formal verification status
-        if: steps.formal_verify.outcome == 'failure'
+        id: formal_verify_m4
+      - name: Report M4 status
+        if: steps.filter.outputs.run == 'true' && steps.formal_verify_m4.outcome == 'failure'
         run: |
-          echo "::warning::FizzBee model checking failed or fizz toolchain unavailable."
-          echo "Models are structurally complete; CI-fast verification requires the fizzbee binary."
+          echo "::warning::M4 (self-fencing) formal verification did not complete/pass within this job's bounds."
+          echo "See formal/findings.md and NEW_ROADMAP.md v0.42.1 for the tracked state-space tractability issue."
           echo "See formal/findings.md and FIZZBEE_TEST_PLAN.md for model status."
 
   coverage:
