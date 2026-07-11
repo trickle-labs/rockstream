@@ -53,6 +53,27 @@ impl SimObjectStoreHandle {
         self.inner.set_rate_limit(ops_per_sec);
     }
 
+    /// Set the probability that a subsequent `put` truncates its bytes
+    /// mid-write (`object_store.partial_write` fault, DESIGN.md §17.8 gap 1).
+    pub fn set_partial_write_probability(&self, probability: f64) {
+        self.inner.set_partial_write_probability(probability);
+    }
+
+    /// Set how many epochs a `put` is hidden from `list()` results, simulating
+    /// S3-style LIST eventual consistency (`object_store.list_staleness`
+    /// fault, DESIGN.md §17.8 gap 3). Direct-key `get`/`exists` are always
+    /// immediately consistent regardless of this setting.
+    pub fn set_list_staleness_epochs(&self, epochs: u64) {
+        self.inner.set_list_staleness_epochs(epochs);
+    }
+
+    /// Advance the store's logical epoch counter, used together with
+    /// `list_staleness_epochs` to simulate LIST results lagging behind
+    /// recent writes by a bounded number of epochs.
+    pub fn advance_epoch(&self) -> u64 {
+        self.inner.advance_epoch()
+    }
+
     pub fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectStoreError> {
         self.inner.put(key, value)
     }
@@ -92,6 +113,20 @@ pub struct SimObjectStore {
     rate_limit: Mutex<Option<f64>>,
     request_times: Mutex<Vec<Duration>>,
     clock: Mutex<Option<SimClock>>,
+    /// Probability (0.0–1.0) that a `put` truncates its bytes mid-write,
+    /// simulating a crashed/interrupted multi-part upload leaving a
+    /// truncated object visible (DESIGN.md §17.8 gap 1, v0.43).
+    partial_write_probability: Mutex<f64>,
+    /// Logical epoch counter, advanced by `advance_epoch()`. Used to
+    /// simulate LIST eventual consistency (DESIGN.md §17.8 gap 3, v0.43).
+    current_epoch: Mutex<u64>,
+    /// Number of epochs a `put` remains hidden from `list()` results after
+    /// it lands, mirroring real S3/GCS LIST eventual consistency. 0 (the
+    /// default) means `list()` is always immediately consistent.
+    list_staleness_epochs: Mutex<u64>,
+    /// The epoch each key was last written at, used by `list()` to decide
+    /// visibility when `list_staleness_epochs > 0`.
+    key_epochs: Mutex<BTreeMap<String, u64>>,
 }
 
 impl SimObjectStore {
@@ -101,6 +136,10 @@ impl SimObjectStore {
             rate_limit: Mutex::new(None),
             request_times: Mutex::new(Vec::new()),
             clock: Mutex::new(None),
+            partial_write_probability: Mutex::new(0.0),
+            current_epoch: Mutex::new(0),
+            list_staleness_epochs: Mutex::new(0),
+            key_epochs: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -112,6 +151,27 @@ impl SimObjectStore {
     pub fn set_rate_limit(&self, ops_per_sec: Option<f64>) {
         let mut limit = self.rate_limit.lock();
         *limit = ops_per_sec;
+    }
+
+    /// Set the probability that a subsequent `put` truncates its bytes
+    /// mid-write (`object_store.partial_write` fault, DESIGN.md §17.8 gap 1).
+    pub fn set_partial_write_probability(&self, probability: f64) {
+        let mut p = self.partial_write_probability.lock();
+        *p = probability.clamp(0.0, 1.0);
+    }
+
+    /// Set how many epochs a `put` is hidden from `list()` results
+    /// (`object_store.list_staleness` fault, DESIGN.md §17.8 gap 3).
+    pub fn set_list_staleness_epochs(&self, epochs: u64) {
+        let mut s = self.list_staleness_epochs.lock();
+        *s = epochs;
+    }
+
+    /// Advance the logical epoch counter and return the new value.
+    pub fn advance_epoch(&self) -> u64 {
+        let mut e = self.current_epoch.lock();
+        *e += 1;
+        *e
     }
 
     fn check_rate_limit(&self) -> Result<(), ObjectStoreError> {
@@ -143,8 +203,22 @@ impl SimObjectStore {
 
     pub fn put(&self, key: &str, value: Bytes) -> Result<(), ObjectStoreError> {
         self.check_rate_limit()?;
+        let probability = *self.partial_write_probability.lock();
+        let value =
+            if probability > 0.0 && crate::buggify!("object_store.partial_write", probability) {
+                // Truncate to simulate a crashed/interrupted multi-part upload:
+                // the object becomes visible with fewer bytes than intended.
+                // Half the payload (rounded down) is retained; an empty payload
+                // stays empty (nothing to truncate).
+                let truncated_len = value.len() / 2;
+                value.slice(0..truncated_len)
+            } else {
+                value
+            };
         let mut objects = self.objects.lock();
         objects.insert(key.to_string(), value);
+        let epoch = *self.current_epoch.lock();
+        self.key_epochs.lock().insert(key.to_string(), epoch);
         Ok(())
     }
 
@@ -163,6 +237,7 @@ impl SimObjectStore {
         if objects.remove(key).is_none() {
             return Err(ObjectStoreError::NotFound(key.to_string()));
         }
+        self.key_epochs.lock().remove(key);
         Ok(())
     }
 
@@ -171,9 +246,23 @@ impl SimObjectStore {
             return vec![];
         }
         let objects = self.objects.lock();
+        let staleness = *self.list_staleness_epochs.lock();
+        if staleness == 0 {
+            return objects
+                .range(prefix.to_string()..)
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+        }
+        // Simulate LIST eventual consistency: keys written within the last
+        // `staleness` epochs are hidden from LIST results, even though a
+        // direct `get`/`exists` on the same key is always consistent.
+        let visible_epoch = self.current_epoch.lock().saturating_sub(staleness);
+        let key_epochs = self.key_epochs.lock();
         objects
             .range(prefix.to_string()..)
             .take_while(|(k, _)| k.starts_with(prefix))
+            .filter(|(k, _)| key_epochs.get(*k).copied().unwrap_or(0) <= visible_epoch)
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -279,5 +368,71 @@ mod tests {
         // Third operation in the same second fails with 429
         let err = store.put("key3", Bytes::from("v3")).unwrap_err();
         assert!(matches!(err, ObjectStoreError::Io(ref msg) if msg.contains("429")));
+    }
+
+    // DESIGN.md §17.8 gap 3, v0.43: `list_staleness_epochs` simulates real
+    // S3 LIST eventual consistency. `list()` must hide recently-written keys
+    // for the configured number of epochs, while direct `get`/`exists` reads
+    // remain immediately consistent regardless.
+    #[test]
+    fn list_staleness_hides_recent_puts_but_direct_reads_are_consistent() {
+        let store = SimObjectStoreHandle::new();
+        store.set_list_staleness_epochs(2);
+
+        // epoch 0
+        store.put("data/a", Bytes::from("1")).unwrap();
+        store.advance_epoch(); // epoch 1
+        store.put("data/b", Bytes::from("2")).unwrap();
+
+        // At epoch 1 with staleness 2, visible_epoch = 1.saturating_sub(2) = 0,
+        // so only the epoch-0 key is LIST-visible.
+        assert_eq!(store.list("data/"), vec!["data/a"]);
+        // Direct-key reads are never affected by LIST staleness.
+        assert_eq!(store.get("data/b").unwrap(), Bytes::from("2"));
+        assert!(store.exists("data/b"));
+
+        store.advance_epoch(); // epoch 2
+        store.advance_epoch(); // epoch 3, visible_epoch = 3 - 2 = 1
+        assert_eq!(store.list("data/"), vec!["data/a", "data/b"]);
+    }
+
+    #[test]
+    fn list_staleness_zero_is_immediately_consistent() {
+        let store = SimObjectStoreHandle::new();
+        store.put("data/a", Bytes::from("1")).unwrap();
+        assert_eq!(store.list("data/"), vec!["data/a"]);
+    }
+
+    // Regression seed proving the `object_store.list_staleness` fault never
+    // trips any `assert_*` correctness invariant in
+    // `rockstream-connectors::sink_connector` (DESIGN.md §17.8 gap 3 is
+    // informational only: CALM epoch manifest reads are direct-key reads,
+    // never LIST-based, so LIST staleness cannot affect commit correctness).
+    #[test]
+    fn list_staleness_does_not_affect_sink_connector_asserts() {
+        use rockstream_connectors::assert_commit_pointer_atomic;
+        use rockstream_types::ids::ConnectorId;
+
+        let store = SimObjectStoreHandle::new();
+        store.set_list_staleness_epochs(5);
+
+        let connector_id = ConnectorId(1);
+        let epoch = 3;
+        let final_key = "final/000003";
+        let payload = Bytes::from("committed-payload");
+        // Advance the epoch clock first so the upcoming `put` lands at a
+        // recent epoch that staleness=5 will keep hidden from LIST.
+        for _ in 0..3 {
+            store.advance_epoch();
+        }
+        store.put(final_key, payload.clone()).unwrap();
+
+        // LIST does not yet observe the just-written key (current epoch=3,
+        // staleness=5 -> visible_epoch=0), but the sink's commit-path
+        // invariant is checked against a direct read, which is always
+        // immediately consistent regardless of LIST staleness.
+        assert!(store.list("final/").is_empty());
+        let observed = store.get(final_key).unwrap();
+        assert_commit_pointer_atomic(connector_id, epoch, observed.len(), payload.len());
     }
 }

@@ -1,0 +1,303 @@
+# formal/m5_cold_tier_sink.fizz
+# M5 — Cold-Tier Exactly-Once Sink Commit Protocol
+#
+# Models the existing `object_store_sink.rs` 2PC protocol (v0.21, NativeIdempotent
+# profile) with a real-object-store crash-yield point during the commit rename:
+# `SinkConnector` stages rows at `_pending/{epoch}/` during pre_commit, then
+# performs an atomic rename to the final prefix after the cluster checkpoint
+# succeeds. Unlike M3 (which treats the external commit as a single atomic
+# step), M5 splits the rename into two visible steps — BeginRename (a partial/
+# truncated object briefly exists at the final prefix, mirroring an
+# interrupted multi-part upload) and FinishRename (the final prefix becomes
+# complete) — so a crash between them can be explored and must be provably
+# recoverable via scan-and-delete cleanup, never SlateDB-style range deletion.
+#
+# This is the binding v0.18 FizzBee model-check gate for the cold-tier
+# exactly-once commit protocol, required before v0.44's Iceberg/Delta-specific
+# sinks reuse the same protocol.
+#
+# References: DESIGN.md §11.4, §17.8 gap 1, FIZZBEE_TEST_PLAN.md §3.5, v0.18
+
+# ─── Constants ──────────────────────────────────────────────────────────────
+
+MAX_EPOCH = 3
+
+# Bounded total crashes across every yield point (pre-commit, between
+# pre-commit/commit, and mid-rename), matching the MAX_CRASHES pattern in
+# formal/m1_epoch_commit.fizz and formal/m3_sink_2pc.fizz. Without a bound the
+# checker could pick an infinite trace that crashes forever, making
+# M5_L1_CommittedEpochAdvances unprovable regardless of protocol correctness.
+MAX_CRASHES = 1
+
+# ─── State ──────────────────────────────────────────────────────────────────
+
+action Init:
+    # Ghost variables for coverage tracking.
+    crash_between_precommit_commit_observed = False
+    crash_during_rename_observed = False
+    partial_write_cleanup_performed = False
+    delivery_progress_reached = False
+    crash_count = 0
+
+    # Explicit role instantiation (mirrors the v0.42.1 fix in m3_sink_2pc.fizz):
+    # bare lowercase role names are only resolvable inside action/assertion
+    # bodies if a global binding of that exact name is created here.
+    shard = Shard()
+    controlplane = ControlPlane()
+    sinkconnector = SinkConnector()
+    externalobjectstore = ExternalObjectStore()
+    checkpointcoordinator = CheckpointCoordinator()
+
+# ControlPlane: tracks the cluster-committed epoch (from M1).
+role ControlPlane:
+    action Init:
+        self.cluster_committed = 0
+
+# Shard: per-shard state including sink_state persistence.
+# sink_state values: 0=Idle, 1=PreCommitted, 2=Committed
+role Shard:
+    action Init:
+        self.committed_epoch = 0
+        self.sink_state = 0          # 0=Idle
+        self.sink_pending_epoch = 0  # epoch for which sink_state is valid
+
+# SinkConnector: drives the 2PC protocol against the object-store target.
+@state(ephemeral=["phase", "staged_epoch"])
+role SinkConnector:
+    action Init:
+        self.phase = 0          # 0=Idle, 1=PreCommitted, 2=Committed
+        self.staged_epoch = 0
+
+# ExternalObjectStore: the real object-store target (S3 / MinIO / GCS).
+# `pending`: `_pending/{epoch}/` staged objects.
+# `final_partial`: the final-prefix pointer has a truncated/incomplete object
+#                  during an in-progress rename (crash-yield point).
+# `orphaned`: a `final_partial` object whose writer crashed mid-rename — it
+#             must be scan-and-delete cleaned up by the next recovery attempt
+#             before a fresh rename can begin. Only crashes create orphans;
+#             an uninterrupted BeginRename -> FinishRename pair never does
+#             (this is what makes M5-L1 provable under weak fairness — a
+#             live, uncrashed rename in flight is not a race with cleanup).
+# `final`: the final-prefix pointer is complete (rename finished).
+role ExternalObjectStore:
+    action Init:
+        self.pending = set()
+        self.final_partial = set()
+        self.orphaned = set()
+        self.final = set()
+
+# CheckpointCoordinator: commits cluster checkpoints.
+role CheckpointCoordinator:
+    action Init:
+        self.round = 0
+
+# ─── Actions ────────────────────────────────────────────────────────────────
+
+# --- Epoch progression (driven by ControlPlane) ---
+
+atomic fair action AdvanceShardEpoch:
+    s = shard
+    cp = controlplane
+    require s.committed_epoch < MAX_EPOCH
+    s.committed_epoch = s.committed_epoch + 1
+    cp.cluster_committed = s.committed_epoch
+
+# --- Pre-commit: sink stages rows at _pending/{epoch}/ ---
+
+atomic fair action SinkPreCommit:
+    sk = sinkconnector
+    s = shard
+    ext = externalobjectstore
+    require sk.phase == 0        # Idle
+    require s.committed_epoch > sk.staged_epoch
+    target_epoch = s.committed_epoch
+    s.sink_state = 1             # PreCommitted
+    s.sink_pending_epoch = target_epoch
+    sk.phase = 1                 # PreCommitted
+    sk.staged_epoch = target_epoch
+    ext.pending.add(target_epoch)
+
+# --- Crash before pre-commit ---
+
+atomic action CrashBeforePreCommit:
+    sk = sinkconnector
+    require sk.phase == 0
+    require crash_count < MAX_CRASHES
+    crash_count = crash_count + 1
+    sk.phase = 0
+    sk.staged_epoch = 0
+
+# --- Crash between pre-commit and commit ---
+
+atomic action CrashBetweenPreCommitAndCommit:
+    sk = sinkconnector
+    require sk.phase == 1   # PreCommitted
+    require crash_count < MAX_CRASHES
+    crash_count = crash_count + 1
+    crash_between_precommit_commit_observed = True
+    # Ephemeral state is lost; durable sink_state/ and _pending/ remain.
+    sk.phase = 0
+    sk.staged_epoch = 0
+
+# --- Recovery: re-read sink_state/ and resume from durable state ---
+
+atomic fair action RecoverFromCrash:
+    sk = sinkconnector
+    s = shard
+    require sk.phase == 0       # crashed; ephemeral state lost
+    require s.sink_state == 1   # durable PreCommitted remains
+    target_epoch = s.sink_pending_epoch
+    sk.staged_epoch = target_epoch
+    sk.phase = 1                # back to PreCommitted
+
+# --- Commit: begin the atomic rename (_pending/{epoch}/ -> final prefix) ---
+#
+# This is the crash-yield point the real `object_store_sink.rs` commit path
+# exercises against S3/MinIO: the rename is not a single atomic operation at
+# the storage layer (copy-then-delete), so a crash mid-rename can leave a
+# truncated object visible at the final prefix (DESIGN.md §17.8 gap 1).
+
+atomic fair action SinkCommitBeginRename:
+    sk = sinkconnector
+    s = shard
+    cp = controlplane
+    ext = externalobjectstore
+    require sk.phase == 1                             # PreCommitted
+    require cp.cluster_committed >= sk.staged_epoch    # M5-S3-precondition: checkpoint-coupled
+    require sk.staged_epoch not in ext.final_partial
+    require sk.staged_epoch not in ext.final
+    target_epoch = sk.staged_epoch
+    # Copy step of the rename begins: a partial/truncated object becomes
+    # briefly visible at the final prefix.
+    ext.final_partial.add(target_epoch)
+
+# --- Crash during the rename (partial-write crash-yield point) ---
+
+atomic action CrashDuringRename:
+    sk = sinkconnector
+    ext = externalobjectstore
+    require sk.phase == 1
+    require sk.staged_epoch in ext.final_partial
+    require sk.staged_epoch not in ext.final
+    require crash_count < MAX_CRASHES
+    crash_count = crash_count + 1
+    crash_during_rename_observed = True
+    # Ephemeral sink state is lost; the truncated object remains at the final
+    # prefix, now orphaned (durable sink_state/ is still PreCommitted).
+    ext.orphaned.add(sk.staged_epoch)
+    sk.phase = 0
+    sk.staged_epoch = 0
+
+# --- Cleanup: scan-and-delete the orphaned partial object before retrying ---
+#
+# Ground-rule compliance: cleanup after a partial-write crash is scan-and-
+# delete, never SlateDB range deletion. Gated on `orphaned` (only ever
+# populated by CrashDuringRename) rather than bare `final_partial` membership
+# so that an uninterrupted BeginRename -> FinishRename pair is never forced
+# to race against this action — that would make M5-L1 unprovable under weak
+# fairness (both actions would be simultaneously enabled every time,
+# allowing an adversarial-but-fair scheduler to always pick Cleanup).
+atomic fair action CleanupPartialObject:
+    sk = sinkconnector
+    ext = externalobjectstore
+    require sk.phase == 1                     # recovered back to PreCommitted
+    require sk.staged_epoch in ext.orphaned
+    require sk.staged_epoch not in ext.final
+    partial_write_cleanup_performed = True
+    ext.final_partial.remove(sk.staged_epoch)
+    ext.orphaned.remove(sk.staged_epoch)
+
+# --- Commit: finish the rename (final prefix becomes complete) ---
+
+atomic fair action SinkCommitFinishRename:
+    sk = sinkconnector
+    s = shard
+    ext = externalobjectstore
+    require sk.phase == 1
+    require sk.staged_epoch in ext.final_partial
+    require sk.staged_epoch not in ext.final
+    target_epoch = sk.staged_epoch
+    # Delete step of the rename completes: the partial object is replaced by
+    # the complete one at the same key (NativeIdempotent conditional PUT).
+    ext.final_partial.remove(target_epoch)
+    ext.final.add(target_epoch)
+    ext.pending.discard(target_epoch)
+    s.sink_state = 2       # Committed
+    sk.phase = 2           # Committed
+    delivery_progress_reached = True
+
+# --- Finalize: return to Idle after committed ---
+
+atomic fair action SinkFinalize:
+    sk = sinkconnector
+    s = shard
+    require sk.phase == 2   # Committed
+    sk.phase = 0
+    sk.staged_epoch = 0
+    s.sink_state = 0
+    s.sink_pending_epoch = 0
+
+# --- Cluster checkpoint progression ---
+
+atomic fair action CommitClusterCheckpoint:
+    cc = checkpointcoordinator
+    require cc.round < MAX_EPOCH
+    cc.round = cc.round + 1
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+# M5-S1: No duplicate final output.
+# For every epoch, the final prefix is populated at most once (set semantics
+# guarantee at-most-once), and a Committed durable sink_state always agrees
+# with the object store's `final` set for that epoch.
+always assertion M5_S1_NoDuplicateFinalOutput:
+    ext = externalobjectstore
+    s = shard
+    if s.sink_state == 2:
+        if s.sink_pending_epoch > 0 and s.sink_pending_epoch not in ext.final:
+            return False
+    return True
+
+# M5-S2: No data loss — every committed row survives.
+# If the sink's ephemeral phase reports Committed, the final prefix for that
+# epoch must actually exist in the object store (the commit was not lost).
+always assertion M5_S2_NoDataLoss:
+    sk = sinkconnector
+    ext = externalobjectstore
+    if sk.phase == 2:
+        if sk.staged_epoch not in ext.final:
+            return False
+    return True
+
+# M5-S3: Manifest-pointer atomicity.
+# The final-prefix pointer is never observed in a partially-written state by
+# anything relying on it as "committed": an epoch cannot be simultaneously
+# `final_partial` and `final`, and the durable/ephemeral Committed state must
+# never point at an epoch that is still `final_partial`.
+always assertion M5_S3_ManifestPointerAtomicity:
+    ext = externalobjectstore
+    s = shard
+    sk = sinkconnector
+    for epoch in ext.final:
+        if epoch in ext.final_partial:
+            return False
+    if s.sink_state == 2 and s.sink_pending_epoch in ext.final_partial:
+        return False
+    if sk.phase == 2 and sk.staged_epoch in ext.final_partial:
+        return False
+    return True
+
+# M5-L1: committed_epoch always advances.
+# Under fair commit/recovery/cleanup actions, every epoch that reaches
+# cluster_committed is eventually finalized (mirrors M3-L1's delivery
+# progress pattern, extended with the mid-rename crash/cleanup cycle).
+always eventually assertion M5_L1_CommittedEpochAdvances:
+    return delivery_progress_reached
+
+# ─── Coverage ────────────────────────────────────────────────────────────────
+
+# COV-M5: a state exists where the sink crashes mid-rename (a partial object
+# is briefly visible at the final prefix) and recovery cleans it up via
+# scan-and-delete before completing the commit.
+exists assertion COV_M5:
+    return crash_during_rename_observed and partial_write_cleanup_performed

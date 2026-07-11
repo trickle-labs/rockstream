@@ -17,9 +17,9 @@ pub use kafka_source::KafkaSource;
 pub use object_store_sink::ObjectStoreSink;
 pub use s3_source::S3Source;
 pub use sink_connector::{
-    assert_epoch_committed_only_after_cluster_checkpoint, assert_no_duplicate_delivery,
-    assert_no_lost_delivery_after_checkpoint, assert_recovery_dispatch_idempotent, SinkConnector,
-    SinkError,
+    assert_commit_pointer_atomic, assert_epoch_committed_only_after_cluster_checkpoint,
+    assert_no_duplicate_delivery, assert_no_lost_delivery_after_checkpoint,
+    assert_recovery_dispatch_idempotent, SinkConnector, SinkError,
 };
 pub use source_connector::{
     PollDeltaResult, SnapshotStream, SourceConnector, SourceError, WatermarkCapability,

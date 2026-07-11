@@ -196,7 +196,7 @@ keeps the state space tractable (Section 2.3).
    duplication is in scope (it directly tests M3 exactly-once and M1
    idempotency).
 4. **Every FizzBee invariant maps to a Rust assertion.** The mapping table in
-   Section 3.6 is a delivery artifact, not documentation.
+   Section 3.7 is a delivery artifact, not documentation.
 5. **A failing seed is a permanent regression.** A FizzBee counterexample for a
    protocol is translated into a named `SimRuntime` regression seed
    ([DESIGN.md §17.6](DESIGN.md)) before the model is fixed.
@@ -536,7 +536,49 @@ The naming convention is `<Model>-<S|L><n>`: `S` = safety, `L` = liveness.
   resumes and remains able to commit (stability). Encodes
   [DESIGN.md §11.7](DESIGN.md) brownout recovery.
 
-### 3.5 Cross-Cutting Coverage Assertions
+### 3.5 M5 — Cold-Tier Exactly-Once Sink
+
+**Safety**
+
+- **M5-S1 — No duplicate final output.** `always`: for every epoch, the
+  `ExternalObjectStore.final` set contains that epoch at most once (set
+  semantics), and a durable `Committed` sink state always agrees with the
+  object store's `final` membership for that epoch.
+
+- **M5-S2 — No data loss.** `always`: if the sink's ephemeral phase reports
+  `Committed` for an epoch, the final prefix for that epoch must actually
+  exist in the object store — the commit was not lost between the rename
+  finishing and the durable state being observed.
+
+- **M5-S3 — Manifest-pointer atomicity.** `always`: the final-prefix pointer
+  is never observed in a partially-written state by anything relying on it as
+  committed. An epoch cannot be simultaneously `final_partial` (truncated,
+  mid-rename) and `final` (complete), and neither the durable nor ephemeral
+  `Committed` sink state may ever point at an epoch that is still
+  `final_partial`. Models the real S3/MinIO rename-is-not-atomic hazard
+  ([DESIGN.md §17.8 gap 1](DESIGN.md)).
+
+**Liveness**
+
+- **M5-L1 — Committed-epoch progress.** `always eventually`: under `fair`
+  commit, recovery, and cleanup actions, every epoch that reaches
+  `cluster_committed` is eventually finalized at the object store's final
+  prefix, even after a crash mid-rename leaves an orphaned partial object
+  that must be scan-and-delete cleaned up (never SlateDB range deletion)
+  before the rename can be retried.
+
+**Coverage**
+
+- **COV-M5**: `exists` a state where the sink crashes mid-rename (a partial
+  object is briefly visible at the final prefix) and recovery cleans it up
+  via scan-and-delete before completing the commit.
+
+Spec: [`formal/m5_cold_tier_sink.fizz`](formal/m5_cold_tier_sink.fizz). This is
+the binding v0.18 FizzBee model-check gate for the cold-tier exactly-once
+commit protocol, required before v0.44's Iceberg/Delta-specific sinks reuse
+the same protocol.
+
+### 3.6 Cross-Cutting Coverage Assertions
 
 To guard against vacuously-passing models (a model that never reaches the
 interesting state trivially satisfies every `always`), each spec includes
@@ -551,11 +593,15 @@ interesting state trivially satisfies every `always`), each spec includes
   `commit` for each idempotency profile.
 - **COV-M4**: `exists` a state where a partitioned-but-alive worker attempts a
   commit and is rejected by the fence epoch.
+- **COV-M5**: `exists` a state where the sink crashes mid-rename between
+  `pre_commit` and `commit`, leaving a partial object at the final prefix,
+  and recovery cleans it up via scan-and-delete before completing the commit
+  (see §3.5 above).
 
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
 
-### 3.6 Invariant → Runtime Assertion Mapping (Delivery Artifact)
+### 3.7 Invariant → Runtime Assertion Mapping (Delivery Artifact)
 
 Per the TigerBeetle assertion discipline ([DESIGN.md §17.3](DESIGN.md)), every
 FizzBee invariant has a corresponding Rust paired assertion. This table is a
@@ -576,6 +622,10 @@ every row has both a green FizzBee assertion and a present runtime `assert!`.
 | M4-L1 (liveness) | `RecoveryDriver::progress().fraction()` in `crates/rockstream-runtime/src/recovery.rs` is the `recovery_progress` metric; after any single-worker failure, a new worker eventually calls `recover_shard` and the fraction reaches 1.0. Verified by `test_recovery_bit_identical_lfs` and `test_recovery_bit_identical_minio`. Spec: `formal/m4_self_fencing.fizz` M4-L1 (`liveness: nondeterministic`). | `rockstream-runtime` |
 | M4-L2 (liveness) | Under transient object-store brownout, `ObjectStoreBrownoutGuard::try_commit_epoch` returns `BrownoutStatus::Blocked` (not permanent error); once the brownout ends, commits resume. Verified by `proof_brownout_backpressure_bounded_at_limit` and `proof_object_store_blackout_60s_recovers_cleanly`. Spec: `formal/m4_self_fencing.fizz` M4-L2. | `rockstream-sim` |
 | COV-M4 | `test_self_fence_on_partition` in `crates/rockstream-sim/tests/checkpoint_recovery.rs` uses `buggify!("control.partition", 1.0)` to force the partition scenario, then calls `assert_valid_writer(shard_id, w1_token, w2_token, …)` and asserts it panics — directly observing the fence-rejection path that COV-M4 requires to be reachable. Spec: `formal/m4_self_fencing.fizz` COV-M4. | `rockstream-sim` |
+| M5-S1, M5-S3 | `assert_commit_pointer_atomic(connector_id, epoch, observed_len, expected_len)` in `crates/rockstream-connectors/src/sink_connector.rs`, called from `object_store_sink.rs`'s commit path — panics if the final-prefix object is ever observed truncated relative to its expected byte length. Spec: `formal/m5_cold_tier_sink.fizz` M5-S1, M5-S3. | `rockstream-connectors` |
+| M5-S2 | `assert_no_lost_delivery_after_checkpoint` (reused from M3-S2 — no data loss is the same invariant across the sink protocol family). Spec: `formal/m5_cold_tier_sink.fizz` M5-S2. | `rockstream-connectors` |
+| M5-L1 (liveness) | `test_partial_write_recovery_lfs` / `test_partial_write_recovery_minio_tc` in `crates/rockstream-connectors/tests/partial_write_recovery_tests.rs` drive `ObjectStoreSink` through `partial_write_probability=0.5`-injected crashes and assert the commit protocol always reaches a fully committed, non-duplicate terminal state. Spec: `formal/m5_cold_tier_sink.fizz` M5-L1. | `rockstream-connectors`, `rockstream-sim` |
+| COV-M5 | Seeded `SimRuntime` test in `crates/rockstream-connectors/tests/partial_write_recovery_tests.rs` uses `buggify!("object_store.partial_write", p)` to force a mid-rename truncation, then asserts `assert_commit_pointer_atomic` holds across seeds while the sink recovers. Spec: `formal/m5_cold_tier_sink.fizz` COV-M5. | `rockstream-connectors`, `rockstream-sim` |
 
 ---
 
@@ -627,7 +677,7 @@ Deliverables:
 - **D1.4** — For any counterexample found, record it in `formal/findings.md`
   and translate it into a named `SimRuntime` regression seed stub
   ([DESIGN.md §17.6](DESIGN.md)) before fixing the model.
-- **D1.5** — Populate the Section 3.6 mapping rows for M1 and confirm the
+- **D1.5** — Populate the Section 3.7 mapping rows for M1 and confirm the
   matching Rust `assert!` sites are scheduled in the Phase 1 crash-replay exit
   criterion ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 1).
 
@@ -653,7 +703,7 @@ Deliverables:
 - **D5.4** — Add a multi-source antichain variant (fixed-length integer-vector
   frontier) proving the meet is correct for the vector `FreshnessToken`
   ([DESIGN.md §12.4](DESIGN.md)), not just scalar source-epochs.
-- **D5.5** — Record findings; populate Section 3.6 M2 rows; align the runtime
+- **D5.5** — Record findings; populate Section 3.7 M2 rows; align the runtime
   assertions with the Phase 5 frontier-aggregation stress test
   ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 5: "arbitrary
   frontier-report reorderings converge to the same cluster vector frontier").
@@ -692,7 +742,7 @@ correct single-writer guarantee:
 - **D6.5** — Add a duplication-fault variant to the M1 model
   (`formal/m1_epoch_commit.fizz`) to confirm idempotent replay (M1-S5) holds
   under explicit message duplication, since duplication is not auto-injected.
-- **D6.6** — Record findings; populate Section 3.6 M3/M4 rows; map each
+- **D6.6** — Record findings; populate Section 3.7 M3/M4 rows; map each
   counterexample to a `BUGGIFY` site and a `SimRuntime` regression seed
   ([DESIGN.md §17.2](DESIGN.md), [§17.6](DESIGN.md)).
 
@@ -748,6 +798,7 @@ gate:
 | `formal/m2_frontier_agg.fizz` | M2 | `Shard`, `FrontierAggregator`, `ObjectStore`, `ControlPlane` | M2-S1…S4, M2-L1…L2 | §3.2, §8.3–§8.6 |
 | `formal/m3_sink_2pc.fizz` | M3 | `SinkConnector`, `ExternalSystem`, `Shard`, `CheckpointCoordinator`, `ControlPlane`, `ObjectStore` | M3-S1…S4, M3-L1 | §11.2, §11.4 |
 | `formal/m4_self_fencing.fizz` | M4 | `Worker`, `Shard`, `ControlPlane`, `ObjectStore` | M4-S1…S4, M4-L1…L2 | §10.4, §11.5, §11.6, §11.7 |
+| `formal/m5_cold_tier_sink.fizz` | M5 | `SinkConnector`, `ExternalObjectStore`, `Shard`, `ControlPlane`, `CheckpointCoordinator` | M5-S1…S3, M5-L1 | §11.4, §17.8 gap 1 |
 | `formal/conventions.md` | — | — | role/durability/bounds conventions | §2 of this doc |
 | `formal/findings.md` | — | — | counterexample log + regression-seed map | §17.6 |
 

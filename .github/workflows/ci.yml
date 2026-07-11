@@ -40,7 +40,7 @@ jobs:
         run: bash scripts/check-path-coupling.sh
 
   formal-verify:
-    name: Formal verify (M1–M4)
+    name: Formal verify (M1–M5)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -102,16 +102,20 @@ jobs:
           echo "$install_dir" >> "$GITHUB_PATH"
           "$install_dir/fizzbee" --version || true
       # M1 (smoke + epoch-commit), M2 (frontier aggregation), M3 (sink 2PC),
-      # and M4 (self-fencing) are all genuinely green (safety + liveness) as
-      # of the v0.42.3 fix — see formal/findings.md "Post-v0.42.3
-      # Remediation". All five specs are a hard gate: a red result here
-      # blocks merge, per the binding v0.18 contract. M4's exhaustive BFS
-      # completes in ~6s / ~31,000 nodes at MAX_OUTAGES lowered from 2 to 1
-      # (every other bound unchanged from its original committed value —
-      # see formal/m4_self_fencing.fizz and findings.md for the full
-      # state-space analysis); its former `continue-on-error`/non-blocking
-      # special-casing and per-subshell memory/wall-clock caps are removed.
-      - name: Formal verify — smoke, M1, M2, M3, M4 (hard gate)
+      # M4 (self-fencing), and M5 (cold-tier exactly-once sink, v0.43) are all
+      # genuinely green (safety + liveness) — see formal/findings.md
+      # "Post-v0.42.3 Remediation". All six specs are a hard gate: a red
+      # result here blocks merge, per the binding v0.18 contract. M4's
+      # exhaustive BFS completes in ~6s / ~31,000 nodes at MAX_OUTAGES
+      # lowered from 2 to 1 (every other bound unchanged from its original
+      # committed value — see formal/m4_self_fencing.fizz and findings.md
+      # for the full state-space analysis); its former
+      # `continue-on-error`/non-blocking special-casing and per-subshell
+      # memory/wall-clock caps are removed. M5 formalizes the existing
+      # `object_store_sink.rs` 2PC protocol with an explicit mid-rename
+      # crash-yield point (DESIGN.md §17.8 gap 1) ahead of v0.44's
+      # Iceberg/Delta sinks reusing the same protocol.
+      - name: Formal verify — smoke, M1, M2, M3, M4, M5 (hard gate)
         if: steps.filter.outputs.run == 'true'
         run: |
           fizz formal/smoke.fizz
@@ -119,6 +123,7 @@ jobs:
           fizz formal/m2_frontier_agg.fizz
           fizz formal/m3_sink_2pc.fizz
           fizz formal/m4_self_fencing.fizz
+          fizz formal/m5_cold_tier_sink.fizz
 
   coverage:
     name: Coverage

@@ -4573,6 +4573,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "object_store 0.12.5",
+ "rand 0.8.6",
  "reqwest",
  "rockstream-ops",
  "rockstream-plan",

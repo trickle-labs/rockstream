@@ -94,6 +94,51 @@ pub fn register_law_faults(model: &mut FaultModel) {
                        Idempotency of bit-OR ensures no additional false positives.",
         category: FaultCategory::Network,
     });
+
+    // PartialWriteRecoveryTest (v0.43, DESIGN.md §17.8 gap 1) — cold-tier
+    // sink partial object writes during the commit-time atomic rename.
+    model.register(FaultEntry {
+        id: "object_store.partial_write",
+        description: "PartialWriteRecoveryTest: SimObjectStore truncates the bytes of an \
+                       in-progress `put` mid-write, mirroring a real S3/GCS crashed or \
+                       interrupted multi-part upload leaving a truncated object visible at \
+                       the final prefix. The cold-tier sink's 2PC commit protocol \
+                       (`object_store_sink.rs`) must detect the truncation via \
+                       `assert_commit_pointer_atomic` and recover by scan-and-delete cleanup \
+                       followed by a retried rename, never treating a truncated object as a \
+                       successful commit.",
+        category: FaultCategory::Io,
+    });
+
+    // KafkaTxTimeoutRecoveryTest (v0.43, DESIGN.md §17.8 gap 2) — Kafka
+    // transactional producer's open transaction times out and is
+    // broker-side force-aborted before the sink can commit it.
+    model.register(FaultEntry {
+        id: "kafka.tx_timeout",
+        description: "KafkaTxTimeoutRecoveryTest: the Kafka broker force-aborts an open \
+                       producer transaction when it exceeds `transaction.timeout.ms`, \
+                       mirroring a real broker-side transactional timeout. The Kafka sink's \
+                       2PC commit protocol (`kafka_sink.rs`) must not treat the aborted \
+                       transaction as committed, and recovery's `CheckBeforeCommit` path \
+                       (query topic → absent → re-commit in a fresh transaction) must \
+                       deliver the epoch exactly once.",
+        category: FaultCategory::Network,
+    });
+
+    // ListStalenessRegressionTest (v0.43, DESIGN.md §17.8 gap 3, informational) —
+    // simulated S3-style eventual-consistency delay on LIST results.
+    model.register(FaultEntry {
+        id: "object_store.list_staleness",
+        description: "ListStalenessRegressionTest: SimObjectStore's `list()` omits keys \
+                       written within the last `list_staleness_epochs` epochs, mirroring \
+                       real S3 LIST eventual consistency. Direct-key `get`/`exists` reads \
+                       remain immediately consistent. This is informational only: no \
+                       RockStream correctness property may depend on LIST — CALM epoch \
+                       manifest reads are always direct-key reads, never LIST-based — so \
+                       this fault must never trigger a regression in any `assert_*` in \
+                       `sink_connector.rs`.",
+        category: FaultCategory::Io,
+    });
 }
 
 /// Fault-model entries registered by `register_law_faults`.
@@ -109,6 +154,9 @@ pub const LAW_FAULT_IDS: &[&str] = &[
     "law.hyper_log_log.crash_replay",
     "law.bloom_union.reorder",
     "law.bloom_union.duplicate",
+    "object_store.partial_write",
+    "kafka.tx_timeout",
+    "object_store.list_staleness",
 ];
 
 #[cfg(test)]
@@ -160,6 +208,18 @@ mod tests {
         assert_eq!(
             model.get("law.bloom_union.duplicate").unwrap().category,
             FaultCategory::Network
+        );
+        assert_eq!(
+            model.get("object_store.partial_write").unwrap().category,
+            FaultCategory::Io
+        );
+        assert_eq!(
+            model.get("kafka.tx_timeout").unwrap().category,
+            FaultCategory::Network
+        );
+        assert_eq!(
+            model.get("object_store.list_staleness").unwrap().category,
+            FaultCategory::Io
         );
     }
 }

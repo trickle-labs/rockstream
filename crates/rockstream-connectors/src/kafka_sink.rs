@@ -19,6 +19,7 @@
 
 use std::collections::BTreeSet;
 
+use rockstream_sim::buggify;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::sink::{RecoveryAction, SinkIdempotencyProfile, SinkState};
 use rockstream_types::timestamp::Epoch;
@@ -48,6 +49,11 @@ pub struct KafkaSink {
     staged_epochs_count: usize,
     /// Simulated Kafka cluster_committed horizon (for checkpoint-coupling assertion).
     cluster_committed: Epoch,
+    /// Probability that the broker force-aborts the open producer
+    /// transaction before commit, mirroring a real `transaction.timeout.ms`
+    /// expiry (`kafka.tx_timeout` fault, v0.43, DESIGN.md §17.8 gap 2). Zero
+    /// by default (production/no simulation).
+    kafka_tx_timeout_probability: f64,
 }
 
 impl KafkaSink {
@@ -59,6 +65,7 @@ impl KafkaSink {
             max_staged_epochs: KAFKA_SINK_MAX_STAGED_EPOCHS,
             staged_epochs_count: 0,
             cluster_committed: 0,
+            kafka_tx_timeout_probability: 0.0,
         }
     }
 
@@ -66,6 +73,15 @@ impl KafkaSink {
     /// after a cluster checkpoint succeeds).
     pub fn set_cluster_committed(&mut self, epoch: Epoch) {
         self.cluster_committed = epoch;
+    }
+
+    /// Set the probability that the next open transaction is force-aborted
+    /// by the broker before it can commit, simulating a `transaction.timeout.ms`
+    /// expiry (`kafka.tx_timeout` fault). Gated by `buggify!()`: a no-op
+    /// unless the `simulation` feature is enabled and `buggify_init` has
+    /// been called on the current thread.
+    pub fn set_kafka_tx_timeout_probability(&mut self, probability: f64) {
+        self.kafka_tx_timeout_probability = probability.clamp(0.0, 1.0);
     }
 
     /// Fill-level metric: current count of staged (pre-committed) epochs.
@@ -126,6 +142,23 @@ impl SinkConnector for KafkaSink {
 
         match state {
             SinkState::PreCommitted { .. } | SinkState::Committed => {
+                if self.kafka_tx_timeout_probability > 0.0
+                    && buggify!("kafka.tx_timeout", self.kafka_tx_timeout_probability)
+                {
+                    // The broker force-aborted the open transaction before it
+                    // could commit (`transaction.timeout.ms` exceeded, M5/S3
+                    // gap 2). The epoch was never delivered; the caller must
+                    // retry via `recover()`'s `CheckBeforeCommit` path, which
+                    // will find the topic absent and re-commit in a fresh
+                    // transaction, delivering exactly once.
+                    return Err(SinkError::CommitFailed {
+                        epoch,
+                        reason: "kafka transactional broker timeout — open transaction \
+                                 force-aborted before commit (transaction.timeout.ms \
+                                 exceeded); retry via CheckBeforeCommit recovery"
+                            .to_string(),
+                    });
+                }
                 // Finalize: mark as delivered in Kafka.
                 self.delivered_epochs.insert(epoch);
                 self.staged_epochs.remove(&epoch);
@@ -161,6 +194,11 @@ impl SinkConnector for KafkaSink {
                 // CheckBeforeCommit: check the Kafka topic first.
                 if self.check_epoch_delivered(epoch) {
                     // Already delivered; mark as committed (idempotent no-op).
+                    // The epoch is resolved: clear any stale staged-epoch
+                    // bookkeeping so `backpressure_active()` reflects reality.
+                    if self.staged_epochs.remove(&epoch) && self.staged_epochs_count > 0 {
+                        self.staged_epochs_count -= 1;
+                    }
                     let final_state = SinkState::Committed;
                     assert_recovery_dispatch_idempotent(self.connector_id, &action, &final_state);
                     return Ok(());
@@ -173,6 +211,9 @@ impl SinkConnector for KafkaSink {
                 // Recovery commit does not check cluster_committed (the
                 // checkpoint already succeeded before recovery).
                 self.delivered_epochs.insert(epoch);
+                if self.staged_epochs.remove(&epoch) && self.staged_epochs_count > 0 {
+                    self.staged_epochs_count -= 1;
+                }
                 let final_state = SinkState::Committed;
                 assert_recovery_dispatch_idempotent(self.connector_id, &action, &final_state);
                 Ok(())
@@ -276,6 +317,67 @@ mod tests {
         assert!(sink.check_epoch_delivered(3));
     }
 
+    // ── Kafka broker transaction timeout (S3, DESIGN.md §17.8 gap 2) ──────────
+    // (`kafka.tx_timeout` fault / CheckBeforeCommit recovery path). The
+    // fault itself is exercised end-to-end (with `buggify!` actually firing)
+    // by the `#[cfg(feature = "simulation")]`-gated seeded test below; these
+    // two tests prove the setter wiring and the recovery contract that the
+    // fault relies on without requiring the `simulation` feature.
+
+    #[test]
+    fn set_kafka_tx_timeout_probability_clamps_and_stores() {
+        let mut sink = make_sink();
+        sink.set_kafka_tx_timeout_probability(1.5);
+        assert_eq!(sink.kafka_tx_timeout_probability, 1.0);
+        sink.set_kafka_tx_timeout_probability(-0.5);
+        assert_eq!(sink.kafka_tx_timeout_probability, 0.0);
+        sink.set_kafka_tx_timeout_probability(0.5);
+        assert_eq!(sink.kafka_tx_timeout_probability, 0.5);
+    }
+
+    #[test]
+    fn tx_timeout_then_recovery_delivers_exactly_once() {
+        let mut sink = make_sink();
+        let state = sink.pre_commit(6, 7).unwrap();
+        // Simulate the broker force-aborting the open transaction: the
+        // commit call never marks the epoch delivered (as `commit()` does
+        // when `kafka.tx_timeout` fires — see `commit_fails_when_forced_via_direct_buggify_check`
+        // below for the exact panic-free error path), leaving `staged_epochs`
+        // set but `delivered_epochs` empty — exactly the state after a
+        // `SinkError::CommitFailed` from a forced abort.
+        assert!(!sink.check_epoch_delivered(6));
+        let handle = match &state {
+            SinkState::PreCommitted { pending_handle, .. } => pending_handle.clone(),
+            _ => panic!("expected PreCommitted"),
+        };
+        // Recovery: CheckBeforeCommit — topic query finds the epoch absent
+        // (transaction was aborted, never delivered) → re-commit in a fresh
+        // transaction.
+        let action = RecoveryAction::RerunCommit {
+            epoch: 6,
+            profile: SinkIdempotencyProfile::CheckBeforeCommit,
+            pending_handle: handle,
+        };
+        sink.recover(action).unwrap();
+        assert!(sink.check_epoch_delivered(6));
+        assert_eq!(sink.delivered_count_for_test(), 1);
+    }
+
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn commit_fails_when_forced_via_direct_buggify_check() {
+        use rockstream_sim::buggify::{buggify_disable, buggify_init};
+        buggify_init(999);
+        let mut sink = make_sink();
+        sink.set_kafka_tx_timeout_probability(1.0);
+        let state = sink.pre_commit(8, 3).unwrap();
+        // probability=1.0 with simulation enabled: the fault always fires.
+        let err = sink.commit(8, &state);
+        assert!(err.is_err(), "expected forced tx-timeout abort");
+        assert!(!sink.check_epoch_delivered(8));
+        buggify_disable();
+    }
+
     // ── Backpressure ──────────────────────────────────────────────────────────
 
     #[test]
@@ -287,6 +389,7 @@ mod tests {
             max_staged_epochs: 2,
             staged_epochs_count: 0,
             cluster_committed: 100,
+            kafka_tx_timeout_probability: 0.0,
         };
         sink.pre_commit(1, 10).unwrap();
         sink.pre_commit(2, 10).unwrap();

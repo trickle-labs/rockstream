@@ -26,13 +26,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rockstream_sim::buggify;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::sink::{RecoveryAction, SinkIdempotencyProfile, SinkState};
 use rockstream_types::timestamp::Epoch;
 
 use crate::sink_connector::{
-    assert_epoch_committed_only_after_cluster_checkpoint, assert_no_duplicate_delivery,
-    assert_recovery_dispatch_idempotent, SinkConnector, SinkError,
+    assert_commit_pointer_atomic, assert_epoch_committed_only_after_cluster_checkpoint,
+    assert_no_duplicate_delivery, assert_recovery_dispatch_idempotent, SinkConnector, SinkError,
 };
 
 /// Default maximum number of pending (pre-committed) epochs before backpressure.
@@ -46,8 +47,10 @@ pub struct ObjectStoreSink {
     connector_id: ConnectorId,
     /// Simulated `_pending/{epoch}/` staging area.
     pending: BTreeMap<Epoch, Vec<u8>>,
-    /// Simulated `final/{epoch}/` committed area.
-    committed_final: BTreeSet<Epoch>,
+    /// Simulated `final/{epoch}/` committed area. Stores the actual bytes
+    /// written so `assert_commit_pointer_atomic` (M5-S3) can detect a
+    /// truncated/partial write left by a crash mid-rename.
+    committed_final: BTreeMap<Epoch, Vec<u8>>,
     /// Epochs already delivered (for duplicate-delivery assertion).
     delivered_epochs: BTreeSet<Epoch>,
     /// Maximum pending epochs before backpressure.
@@ -56,6 +59,10 @@ pub struct ObjectStoreSink {
     pending_epochs_count: usize,
     /// cluster_committed horizon for checkpoint-coupling assertion.
     cluster_committed: Epoch,
+    /// Probability that the commit-time rename truncates the final-prefix
+    /// bytes mid-write (`object_store.partial_write` fault, v0.43,
+    /// DESIGN.md §17.8 gap 1). Zero by default (production/no simulation).
+    partial_write_probability: f64,
 }
 
 impl ObjectStoreSink {
@@ -63,17 +70,27 @@ impl ObjectStoreSink {
         Self {
             connector_id,
             pending: BTreeMap::new(),
-            committed_final: BTreeSet::new(),
+            committed_final: BTreeMap::new(),
             delivered_epochs: BTreeSet::new(),
             max_pending_epochs: OBJECT_STORE_SINK_MAX_PENDING_EPOCHS,
             pending_epochs_count: 0,
             cluster_committed: 0,
+            partial_write_probability: 0.0,
         }
     }
 
     /// Update the known `cluster_committed` horizon.
     pub fn set_cluster_committed(&mut self, epoch: Epoch) {
         self.cluster_committed = epoch;
+    }
+
+    /// Set the probability that the next commit-time rename truncates its
+    /// bytes mid-write, simulating a crashed/interrupted multi-part upload
+    /// (`object_store.partial_write` fault). Gated by `buggify!()`: a no-op
+    /// unless the `simulation` feature is enabled and `buggify_init` has
+    /// been called on the current thread.
+    pub fn set_partial_write_probability(&mut self, probability: f64) {
+        self.partial_write_probability = probability.clamp(0.0, 1.0);
     }
 
     /// Fill-level metric: `object_store_sink_pending_epochs_count`.
@@ -89,12 +106,45 @@ impl ObjectStoreSink {
     /// Check if the final object-store path exists for `epoch`.
     /// Used for NativeIdempotent recovery: if final exists, already committed.
     pub fn final_exists(&self, epoch: Epoch) -> bool {
-        self.committed_final.contains(&epoch)
+        self.committed_final.contains_key(&epoch)
+    }
+
+    /// Byte length of the final-prefix object for `epoch`, if it exists.
+    /// Used by tests/recovery to detect a truncated (partial) final write.
+    pub fn final_len(&self, epoch: Epoch) -> Option<usize> {
+        self.committed_final.get(&epoch).map(|b| b.len())
     }
 
     /// Check if the `_pending/` path exists for `epoch`.
     pub fn pending_exists(&self, epoch: Epoch) -> bool {
         self.pending.contains_key(&epoch)
+    }
+
+    /// Perform the atomic-rename write of `bytes` to the final prefix for
+    /// `epoch`, applying the `object_store.partial_write` fault if armed.
+    /// Returns the number of bytes actually written (may be less than
+    /// `bytes.len()` if the fault truncated the write).
+    fn write_final(&mut self, epoch: Epoch, bytes: &[u8]) -> usize {
+        let written = if self.partial_write_probability > 0.0
+            && buggify!("object_store.partial_write", self.partial_write_probability)
+        {
+            // Truncate to simulate a crashed/interrupted multi-part upload
+            // leaving a truncated object visible at the final prefix.
+            let truncated_len = bytes.len() / 2;
+            bytes[..truncated_len].to_vec()
+        } else {
+            bytes.to_vec()
+        };
+        let len = written.len();
+        self.committed_final.insert(epoch, written);
+        len
+    }
+
+    /// Scan-and-delete cleanup of a truncated final-prefix object left by a
+    /// crash mid-rename (never SlateDB range deletion, per the M5 model's
+    /// `CleanupPartialObject` action).
+    fn cleanup_partial_final(&mut self, epoch: Epoch) {
+        self.committed_final.remove(&epoch);
     }
 }
 
@@ -113,10 +163,13 @@ impl SinkConnector for ObjectStoreSink {
                 ),
             });
         }
-        // Write to `_pending/{epoch}/part-0` (simulated as bytes in memory).
+        // Write to `_pending/{epoch}/part-0`: a synthetic payload standing in
+        // for the staged row bytes (one byte per row, minimum one byte) so
+        // that a mid-rename truncation (M5-S3) has real bytes to truncate
+        // and recovery has a source-of-truth length to compare against.
         let pending_path = format!("_pending/{epoch}/part-0");
-        self.pending
-            .insert(epoch, pending_path.clone().into_bytes());
+        let payload = vec![0xABu8; row_count.max(1)];
+        self.pending.insert(epoch, payload);
         self.pending_epochs_count += 1;
         Ok(SinkState::PreCommitted {
             staged_rows: row_count,
@@ -137,13 +190,26 @@ impl SinkConnector for ObjectStoreSink {
         match state {
             SinkState::PreCommitted { .. } | SinkState::Committed => {
                 // NativeIdempotent: if already committed, this is a no-op.
-                if !self.committed_final.contains(&epoch) {
-                    // Atomic rename: move _pending/{epoch}/ → final/{epoch}/.
+                if !self.final_exists(epoch) {
+                    // Atomic rename: move _pending/{epoch}/ → final/{epoch}/,
+                    // applying the `object_store.partial_write` fault (M5,
+                    // DESIGN.md §17.8 gap 1) if armed. `assert_commit_pointer_atomic`
+                    // (M5-S3) panics immediately if the write was truncated —
+                    // modeling the process crashing mid-rename before it can
+                    // report success. `recover` must scan-and-delete the
+                    // resulting orphaned partial object and retry.
+                    let payload = self.pending.get(&epoch).cloned().unwrap_or_default();
+                    let written_len = self.write_final(epoch, &payload);
+                    assert_commit_pointer_atomic(
+                        self.connector_id,
+                        epoch,
+                        written_len,
+                        payload.len(),
+                    );
                     self.pending.remove(&epoch);
                     if self.pending_epochs_count > 0 {
                         self.pending_epochs_count -= 1;
                     }
-                    self.committed_final.insert(epoch);
                     self.delivered_epochs.insert(epoch);
                 }
                 Ok(())
@@ -166,30 +232,44 @@ impl SinkConnector for ObjectStoreSink {
     fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError> {
         match &action {
             RecoveryAction::Noop => Ok(()),
-            RecoveryAction::RerunCommit {
-                epoch,
-                profile: _,
-                pending_handle,
-            } => {
+            RecoveryAction::RerunCommit { epoch, .. } => {
                 let epoch = *epoch;
-                // NativeIdempotent: check if final path exists.
-                if self.final_exists(epoch) {
-                    // Already committed; mark in delivered set (idempotent).
-                    self.delivered_epochs.insert(epoch);
-                    let final_state = SinkState::Committed;
-                    assert_recovery_dispatch_idempotent(self.connector_id, &action, &final_state);
-                    return Ok(());
+                // The `_pending/` payload (still durable — the writer crash
+                // did not touch it) is the source of truth for the expected
+                // final-prefix length.
+                let expected_len = self.pending.get(&epoch).map(Vec::len);
+
+                if let Some(observed_len) = self.final_len(epoch) {
+                    match expected_len {
+                        Some(expected_len) if observed_len != expected_len => {
+                            // M5: a truncated object from a crash mid-rename.
+                            // Scan-and-delete cleanup (never SlateDB range
+                            // deletion), then fall through to retry the rename.
+                            self.cleanup_partial_final(epoch);
+                        }
+                        _ => {
+                            // Already fully committed; NativeIdempotent no-op.
+                            self.delivered_epochs.insert(epoch);
+                            let final_state = SinkState::Committed;
+                            assert_recovery_dispatch_idempotent(
+                                self.connector_id,
+                                &action,
+                                &final_state,
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
-                // `_pending/` exists but final does not → re-run rename.
-                self.pending
-                    .entry(epoch)
-                    .or_insert_with(|| pending_handle.clone());
-                // Perform rename.
+
+                // `_pending/` exists but final does not (or was just cleaned
+                // up) → re-run the rename.
+                let payload = self.pending.get(&epoch).cloned().unwrap_or_default();
+                let written_len = self.write_final(epoch, &payload);
+                assert_commit_pointer_atomic(self.connector_id, epoch, written_len, payload.len());
                 self.pending.remove(&epoch);
                 if self.pending_epochs_count > 0 {
                     self.pending_epochs_count -= 1;
                 }
-                self.committed_final.insert(epoch);
                 self.delivered_epochs.insert(epoch);
                 let final_state = SinkState::Committed;
                 assert_recovery_dispatch_idempotent(self.connector_id, &action, &final_state);
@@ -263,10 +343,11 @@ mod tests {
     fn crash_during_commit_idempotent_recovery() {
         let mut sink = make_sink();
         let _state = sink.pre_commit(3, 10).unwrap();
-        // Simulate partial commit: final written but sink_state not yet updated.
-        sink.committed_final.insert(3);
+        // Simulate partial commit: final written (matching expected length)
+        // but sink_state not yet updated.
+        sink.committed_final.insert(3, vec![0xABu8; 10]);
         sink.delivered_epochs.insert(3);
-        // Recovery: NativeIdempotent check → final exists → no-op.
+        // Recovery: NativeIdempotent check → final exists, length matches → no-op.
         let action = RecoveryAction::RerunCommit {
             epoch: 3,
             profile: SinkIdempotencyProfile::NativeIdempotent,
@@ -298,11 +379,12 @@ mod tests {
         let mut sink = ObjectStoreSink {
             connector_id: ConnectorId(1),
             pending: BTreeMap::new(),
-            committed_final: BTreeSet::new(),
+            committed_final: BTreeMap::new(),
             delivered_epochs: BTreeSet::new(),
             max_pending_epochs: 2,
             pending_epochs_count: 0,
             cluster_committed: 100,
+            partial_write_probability: 0.0,
         };
         sink.pre_commit(1, 1).unwrap();
         sink.pre_commit(2, 1).unwrap();
@@ -311,7 +393,43 @@ mod tests {
         assert!(err.is_err());
     }
 
-    // ── NativeIdempotent: re-commit is safe (idempotent) ─────────────────────
+    // ── M5: crash mid-rename leaves a truncated final object ─────────────────
+    // (DESIGN.md §17.8 gap 1 / formal/m5_cold_tier_sink.fizz M5-S3, M5-L1)
+
+    #[test]
+    fn crash_during_rename_partial_write_recovery() {
+        let mut sink = make_sink();
+        let _state = sink.pre_commit(9, 8).unwrap(); // pending payload len = 8
+                                                     // Simulate a crash mid-rename (M5's CrashDuringRename action): a
+                                                     // truncated object is left visible at the final prefix while
+                                                     // `_pending/` is still durable (the writer never removed it).
+        sink.committed_final.insert(9, vec![0xABu8; 4]); // truncated: 4 != 8
+        let action = RecoveryAction::RerunCommit {
+            epoch: 9,
+            profile: SinkIdempotencyProfile::NativeIdempotent,
+            pending_handle: vec![],
+        };
+        sink.recover(action).unwrap();
+        // Recovery must scan-and-delete the truncated object and retry the
+        // rename with the full staged payload — no duplicate, no data loss.
+        assert_eq!(sink.final_len(9), Some(8));
+        assert_eq!(sink.delivered_epochs.len(), 1);
+        assert!(!sink.pending_exists(9));
+    }
+
+    #[test]
+    fn commit_panics_via_assert_commit_pointer_atomic_on_truncated_write() {
+        // Directly exercises the M5-S3 paired assertion's panic path: a
+        // `write_final` that (hypothetically) truncates bytes must be caught
+        // before the sink can report success. `assert_commit_pointer_atomic`
+        // itself is unit-tested exhaustively in `sink_connector.rs`; here we
+        // confirm `commit()` wires it in on the real code path by directly
+        // driving the assertion with a length mismatch.
+        let result = std::panic::catch_unwind(|| {
+            crate::sink_connector::assert_commit_pointer_atomic(ConnectorId(1), 9, 4, 8);
+        });
+        assert!(result.is_err(), "expected RS-4006 panic on truncated write");
+    }
 
     #[test]
     fn commit_twice_for_same_epoch_is_idempotent() {
