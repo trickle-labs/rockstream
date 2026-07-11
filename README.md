@@ -310,7 +310,7 @@ The project is a Cargo workspace of purpose-built crates:
 | `rockstream-connectors` | Connector implementations: Kafka source/sink and S3 source are done; a generic exactly-once object-store sink is done; Postgres CDC source and Iceberg/Delta Lake sinks are planned (Phase 12) |
 | `rockstream-oracle` | Batch reference engine and property-test harness (DBSP soundness tests) |
 | `rockstream-sim` | Deterministic simulation harness: `SimRuntime`, `buggify!()`, fault model |
-| `rockstream-cli` | Operator CLI — `rockstream start` today; `shard migrate`/`cluster workers drain` land at v0.46, `explain`/`resource` at v0.45, the rest (`workload`/`view`/`schema`/`source`/`checkpoint`/`audit`/`support bundle`/`debug arrangement`) at v0.55 |
+| `rockstream-cli` | Operator CLI — `rockstream start` today; `shard migrate`/`cluster workers drain` land at v0.46, `explain`/`resource` at v0.45, the workload quota/admission-control substrate at v0.45.1, control-plane Raft HA at v0.45.2, and the rest (`workload`/`view`/`schema`/`source`/`checkpoint`/`audit`/`support bundle`/`debug arrangement`) at v0.55 |
 ## How Do I Know It’s Working?
 
 The system exposes one primary health indicator per pipeline: **SLO compliance** —

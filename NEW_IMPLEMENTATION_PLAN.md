@@ -899,7 +899,10 @@ tag v1.0.0.
 2. **Arrangement state format**: Arrow IPC per value vs. Arrow Row for
    point-access arrangements; benchmark in Phase 3.
 3. **Control-plane HA**: a 3/5-node Raft group elects one control-SlateDB writer
-   lease; followers serve catalog reads via `DbReader`. Hardened in Phase 8.
+   lease; followers serve catalog reads via `DbReader`. Originally promised as
+   "Hardened in Phase 8" here — Phase 8 (v0.27–v0.31) shipped without it and
+   no roadmap version scheduled it until the 2026-07-11 control-plane/
+   multi-tenancy review added **NEW_ROADMAP.md v0.45.2**.
 4. **Frontier-aggregator staleness budget**: async with `frontier_agg_interval`;
    pick a default and confirm it meets window-close, shuffle-GC, and freshness
    SLOs in Phase 5.

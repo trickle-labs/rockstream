@@ -1921,7 +1921,11 @@ subsequent checkpoint.
 | `scatter_shards_pruned_total` | Shards skipped by column statistics. |
 | `shard_bloom_false_positive_total` | Shards included by Bloom that returned no matching rows. |
 
-**Ships**: v0.54 (Phase 16), after secondary indexes land at v0.53.
+**Ships**: v0.48 (Phase 14 — Advanced DML & Scatter Pruning). Secondary
+indexes — noted above as a source of high-quality stats — already shipped at
+v0.32, so that dependency is already satisfied. (Corrected 2026-07-11: this
+line previously cited a version-numbering scheme that predates this
+roadmap's Phase 13 insertion.)
 
 ---
 
@@ -3042,7 +3046,7 @@ read round-trips.
 
 #### 12.8.1 Session-Scoped Automatic Read-Your-Writes
 
-v0.46 added `wait_for=<FreshnessToken>` as an explicit per-query opt-in.
+v0.25 added `wait_for=<FreshnessToken>` as an explicit per-query opt-in.
 For OLTP patterns — write a row, then read it back — clients must thread the
 token from the write response into the next read. Standard database drivers
 do not do this, so application developers face stale reads unless they add
@@ -3111,7 +3115,10 @@ the only new state is one `Option<FreshnessToken>` per session and the
 | `session_wait_for_satisfied_ms` | Histogram: time from trigger to frontier satisfaction. |
 | `session_wait_for_timeout_total` | Count of queries that exceeded the SLO and fell through to current frontier. |
 
-**Ships**: v0.47 (extends the direct-write surface).
+**Shipped**: at v0.26 (the Postgres Pillar milestone), ahead of the version
+this section originally cited — see `SessionState::last_written_epoch` and
+the `SESSION_WAIT_FOR_*` counters in `rockstream-gateway/src/session.rs` /
+`server.rs`. (Corrected 2026-07-11.)
 
 #### 12.8.2 `INSERT ... RETURNING`
 
@@ -3151,11 +3158,20 @@ the response contains the written row as if it were a `SELECT` result.
 | Wait-for timeout | Returns `RS-2012`; partial row may be committed but not readable; client must retry with idempotency key. |
 
 `INSERT ... RETURNING` does **not** extend to `UPDATE ... RETURNING` or
-`DELETE ... RETURNING` in v0.47. Those variants require the gateway to read
-old state before the write, which adds read-modify-write latency. They ship
-at v0.46 (Phase 13 — Advanced DML & Scatter Pruning).
+`DELETE ... RETURNING`. Those variants require the gateway to read old state
+before the write, which adds read-modify-write latency. They ship at v0.48
+(Phase 14 — Advanced DML & Scatter Pruning; corrected 2026-07-11 — this line
+previously cited a version-numbering scheme that predates this roadmap's
+Phase 13 insertion).
 
-**Ships**: v0.47 (extends the direct-write surface).
+**Shipped** (literal-echo form): at v0.24, for client-supplied literal
+`VALUES` — see `returning_rows` in `rockstream-gateway/src/server.rs`.
+**Not yet shipped** (this subsection's actual new content: reflecting back a
+*server-assigned* key, e.g. a default UUID or sequence, via the
+point-read-back flow described above): `parse_insert` today only echoes the
+client's literal values, so a caller cannot retrieve a server-generated key.
+**Ships**: v0.45 (found unscheduled by the 2026-07-11 control-plane/
+multi-tenancy review; see NEW_ROADMAP.md).
 
 #### 12.8.3 Session-Scoped Max-Staleness for Analytical Queries
 
@@ -3208,7 +3224,10 @@ attached to the cached cluster frontier.
 | `session_staleness_exceeded_total` | Count of queries where `max_staleness` was exceeded and the session fell through to the stale frontier. |
 | `session_frontier_age_ms` | Histogram: frontier age at `SELECT` time for sessions with `max_staleness` set. |
 
-**Ships**: v0.47 (extends the session ergonomics surface).
+**Ships**: v0.45 (corrected 2026-07-11 — this line previously cited a
+version-numbering scheme that predates this roadmap's Phase 13 insertion;
+found unscheduled by the 2026-07-11 control-plane/multi-tenancy review,
+since `max_staleness` has zero references anywhere in `crates/` today).
 
 ---
 
@@ -4531,6 +4550,12 @@ Resource policies are declared in `CREATE WORKLOAD` and can be altered with
 `ALTER WORKLOAD ... SET (...)`. They are visible in `SHOW WORKLOAD STATUS`
 and in the audit log when changed.
 
+**Ships**: v0.45.1. Until then, only the single cluster-wide `state_budget_gb`
+floor (§5.6, `OVER_BUDGET_RELAXED`) exists; `rockstream-types::workload`
+carries the `WorkloadPriority`/`FreshnessSlo`/`MemoryLimit` data model but no
+control-plane catalog, SQL parser, or gateway code reads or writes it yet
+(found by the 2026-07-11 control-plane/multi-tenancy review).
+
 ### 14.14 Error Code Taxonomy
 
 Every error returned to a user, written to a log, or recorded as a
@@ -4980,7 +5005,11 @@ implementation plan's Phase 3.5 and Phase 4 acceptance criteria:
 - **Control-plane HA**. A single SlateDB writer with hot readers is good
   enough for Tier 1/2; production uses a Raft-elected writer lease over the
   control SlateDB (§3). The remaining risk is implementation complexity, not an
-  architectural gap.
+  architectural gap. **Scheduled**: v0.45.2 (NEW_ROADMAP.md Phase 12.5) —
+  found unscheduled by the 2026-07-11 control-plane/multi-tenancy review;
+  `crates/rockstream-control` has zero `raft`/`Raft` references today, and
+  Phase 8 shipped without the Raft hardening `NEW_IMPLEMENTATION_PLAN.md`
+  originally promised for it.
 - **Schema evolution and blue/green plan replacement**. Compatible changes are
   straightforward; breaking changes require clone/backfill/flip and must prove
   they preserve exactly-once source offsets.
