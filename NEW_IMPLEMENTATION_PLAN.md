@@ -596,7 +596,17 @@ shuffle storage.
 ## Phase 7 — PostgreSQL Wire Gateway
 
 **Goal**: Serve and write materialized views over the Postgres wire protocol.
-This is the second pillar, built on the now-correct, fault-tolerant engine.
+This is the second pillar, built on the now-correct, fault-tolerant *data*
+engine. **Caveat (2026-07-11 architecture review)**: "fault-tolerant" here
+covers the shard/worker data plane proven through Phase 6 (v0.20–v0.22) only.
+The control plane itself remains a single, non-replicated process with no
+failover until `NEW_ROADMAP.md` v0.45.2 (Raft-elected writer lease, Open
+question #3 below) — every version from v0.23 (this phase) through v0.45.1,
+including the Postgres Pillar (v0.26), Soaks Complete (v0.31), and Private
+Beta Ready (v0.32) milestones, ships on top of a control plane that is a
+single point of failure for shard leasing, frontier publication, and RBAC/
+catalog admission. This is a real, currently-open dependency-integrity gap,
+not merely a stale doc claim; it is tracked, not yet closed.
 
 **Design constraint**: the gateway's `ViewReader` trait is defined with a
 `ViewReadStrategy` enum (`HotOnly` | future `TwoTier`), but only `HotOnly` is

@@ -984,6 +984,26 @@ Rust-side counterpart at all: `M2-S3`. A FizzBee counterexample for any
 protocol becomes a named `SimRuntime` regression seed before the model is
 fixed, and is replayed on every build thereafter.
 
+**Scheduling-risk note (2026-07-11 architecture review): M6/M7 collapse
+model-then-code into one version, unlike M1–M5.** Every prior model (M1–M5)
+either got its own dedicated pre-implementation version (M5: modeled at v0.43,
+implemented at v0.44 — a full version apart) or was modeled in a version that
+precedes the version implementing the protocol it gates (M4: modeled v0.20,
+self-fencing code v0.21). M6 (shard migration) and M7 (control-plane HA)
+instead schedule "model-check in FizzBee" *and* "implement the [10-state
+migration state machine / 3–5-node Raft group]" as scope within the *same*
+single ~6-person-week version (v0.46 and v0.45.2 respectively). Given M4's own
+history — its exhaustive state space did not terminate at committed bounds and
+took three follow-up sub-versions (v0.42.1–v0.42.3) to close — a new model of
+comparable or greater complexity (M6 models a 10-state machine; M7 models
+multi-node leader election) sharing a version with its own Rust implementation
+risks either the model-checking step being rushed to protect the
+implementation schedule, or the version silently overrunning its budget the
+way M4 did. Recommend splitting v0.46 into a model-only version followed by an
+implementation version (and likewise for v0.45.2) if either model's state
+space does not terminate quickly at CI-fast bounds, rather than compressing
+both into one version under schedule pressure.
+
 ---
 
 ## How This Roadmap Maps to the Plan
