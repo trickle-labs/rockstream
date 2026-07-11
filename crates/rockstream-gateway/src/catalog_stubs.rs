@@ -178,6 +178,29 @@ pub struct CatalogIndexEntry {
     pub op_id: Option<u64>,
 }
 
+/// A sink entry registered via `CREATE SINK` through the pgwire layer.
+#[derive(Debug, Clone)]
+pub struct CatalogSinkEntry {
+    pub name: String,
+    pub view: String,
+    pub format: String,
+    pub path: String,
+    pub snapshot_interval_epochs: Option<u64>,
+    pub snapshot_interval_ms: Option<u64>,
+    pub parquet_row_group_bytes: Option<u64>,
+    pub format_version: Option<u64>,
+    pub partition_by: Vec<String>,
+    pub catalog: String,
+    /// Last epoch whose snapshot was committed through this sink (v0.44
+    /// slice 10, `EXPLAIN` annotation). `None` until the first snapshot
+    /// commits.
+    pub last_snapshot_epoch: Option<u64>,
+    /// `"OK"` normally; set to `"CATALOG_WARN"` when the pluggable catalog
+    /// registrar (glue/hive/rest/ducklake) failed to register the latest
+    /// snapshot without failing the sink's commit (DESIGN.md §13.6.5).
+    pub state: String,
+}
+
 /// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
 #[derive(Debug, Default)]
 struct CatalogStubsInner {
@@ -190,6 +213,8 @@ struct CatalogStubsInner {
     deps: HashMap<String, Vec<String>>,
     /// Keyed by index name (from CREATE INDEX). v0.32.
     indexes: HashMap<String, CatalogIndexEntry>,
+    /// Keyed by sink name (from CREATE SINK). v0.44.
+    sinks: HashMap<String, CatalogSinkEntry>,
 }
 
 /// In-memory catalog of views exposed to Postgres clients.
@@ -400,6 +425,39 @@ impl CatalogStubs {
         let mut idxs: Vec<CatalogIndexEntry> = inner.indexes.values().cloned().collect();
         idxs.sort_by(|a, b| a.name.cmp(&b.name));
         idxs
+    }
+
+    /// Register a new sink. Returns `false` if a sink with the same name and a
+    /// different view already exists.
+    pub fn add_sink(&self, entry: CatalogSinkEntry) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(existing) = inner.sinks.get(&entry.name) {
+            if existing.view != entry.view {
+                return false;
+            }
+        }
+        inner.sinks.insert(entry.name.clone(), entry);
+        true
+    }
+
+    /// Look up a sink by name.
+    pub fn get_sink(&self, name: &str) -> Option<CatalogSinkEntry> {
+        let inner = self.inner.read().unwrap();
+        inner.sinks.get(name).cloned()
+    }
+
+    /// Remove a sink entry (DROP SINK in a later slice).
+    pub fn remove_sink(&self, name: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.sinks.remove(name);
+    }
+
+    /// List all registered sinks.
+    pub fn list_sinks(&self) -> Vec<CatalogSinkEntry> {
+        let inner = self.inner.read().unwrap();
+        let mut sinks: Vec<CatalogSinkEntry> = inner.sinks.values().cloned().collect();
+        sinks.sort_by(|a, b| a.name.cmp(&b.name));
+        sinks
     }
 
     /// Dispatch a query string to a catalog handler. Returns `Some(rows)` if

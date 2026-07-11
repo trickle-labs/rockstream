@@ -53,7 +53,8 @@ use crate::auth::{
     JwtVerifier, Principal,
 };
 use crate::catalog_stubs::{
-    arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogStubs, CatalogTable,
+    arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogStubs,
+    CatalogTable,
 };
 use crate::copy_state::{
     CopyState, COPY_IN_BUFFER_ROWS, COPY_IN_FLUSH_BYTES, MAX_COPY_IN_BATCH_ROWS,
@@ -1099,6 +1100,11 @@ impl GatewayHandler {
             return Some(self.handle_create_table(q));
         }
 
+        // CREATE SINK — v0.44 pgwire DDL wiring
+        if ql.starts_with("create sink ") {
+            return Some(self.handle_create_sink(q));
+        }
+
         // CREATE INDEX / DROP INDEX / REBUILD INDEX / MARK INDEX READY — v0.32 pgwire DDL wiring
         if ql.starts_with("create index ") {
             return Some(self.handle_create_index(q));
@@ -1477,8 +1483,39 @@ impl GatewayHandler {
                 note
             };
 
-            let plan_text =
-                format!("Plan: SeqScan → {pushdown_note}{index_note}\nQuery: {inner_sql}");
+            // Surface sink registration on EXPLAIN (v0.44 slice 10, P4): if
+            // the queried view has a `CREATE SINK` registered against it,
+            // append the sink's target/format/state so operators can see at
+            // a glance where a view's incremental output is landing. This
+            // is intentionally just an annotation — wiring the full
+            // `EXPLAIN INCREMENTAL` plan library stays v0.45 scope.
+            let sink_note = {
+                let inner_upper = inner_sql.to_uppercase();
+                let mut note = String::new();
+                for entry in self.catalog.list_sinks() {
+                    let view_upper = entry.view.to_uppercase();
+                    if inner_upper.contains(&view_upper) {
+                        let last_snapshot_epoch = entry
+                            .last_snapshot_epoch
+                            .map(|epoch| epoch.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        note = format!(
+                            "\nsink_target: name='{}' format={} path='{}' last_snapshot_epoch={} state={}",
+                            entry.name,
+                            entry.format.to_uppercase(),
+                            entry.path,
+                            last_snapshot_epoch,
+                            entry.state
+                        );
+                        break;
+                    }
+                }
+                note
+            };
+
+            let plan_text = format!(
+                "Plan: SeqScan → {pushdown_note}{index_note}{sink_note}\nQuery: {inner_sql}"
+            );
             let schema = Arc::new(vec![FieldInfo::new(
                 "QUERY PLAN".to_string(),
                 None,
@@ -2619,6 +2656,60 @@ impl GatewayHandler {
 
         Ok(vec![Response::Execution(
             Tag::new("CREATE TABLE").with_rows(0),
+        )])
+    }
+
+    /// Handle `CREATE SINK <name> FOR VIEW <view> TO ICEBERG|DELTA '<path>' WITH (...)` — v0.44.
+    fn handle_create_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let parsed = match parse_create_sink_ddl(q) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(vec![create_sink_error_response(message)]),
+        };
+
+        if self.catalog.get_view(&parsed.view).is_none() {
+            return Ok(vec![create_sink_error_response(format!(
+                "CREATE SINK references unknown view '{}'",
+                parsed.view
+            ))]);
+        }
+
+        if !matches!(
+            parsed.catalog.as_str(),
+            "filesystem" | "glue" | "rest" | "hive" | "ducklake"
+        ) {
+            return Ok(vec![create_sink_error_response(format!(
+                "CREATE SINK catalog '{}' is invalid; expected filesystem|glue|rest|hive|ducklake",
+                parsed.catalog
+            ))]);
+        }
+
+        let entry = CatalogSinkEntry {
+            name: parsed.name.clone(),
+            view: parsed.view.clone(),
+            format: parsed.format,
+            path: parsed.path,
+            snapshot_interval_epochs: parsed.snapshot_interval_epochs,
+            snapshot_interval_ms: parsed.snapshot_interval_ms,
+            parquet_row_group_bytes: parsed.parquet_row_group_bytes,
+            format_version: parsed.format_version,
+            partition_by: parsed.partition_by,
+            catalog: parsed.catalog,
+            last_snapshot_epoch: None,
+            state: "OK".to_string(),
+        };
+
+        let _ = self.catalog.add_sink(entry);
+
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "create_sink",
+                &parsed.name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("CREATE SINK").with_rows(0),
         )])
     }
 
@@ -5812,6 +5903,304 @@ fn infer_select_columns(sql: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCreateSink {
+    name: String,
+    view: String,
+    format: String,
+    path: String,
+    snapshot_interval_epochs: Option<u64>,
+    snapshot_interval_ms: Option<u64>,
+    parquet_row_group_bytes: Option<u64>,
+    format_version: Option<u64>,
+    partition_by: Vec<String>,
+    catalog: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CreateSinkOptionValue {
+    Number(u64),
+    String(String),
+    Array(Vec<String>),
+}
+
+fn create_sink_error_response(message: String) -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "42601".to_owned(),
+        format!(
+            "[RS-4007] {message}. Next steps: check CREATE SINK syntax, referenced view, and WITH option types."
+        ),
+    )))
+}
+
+fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
+    let trimmed = q.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("create sink ") {
+        return Err("CREATE SINK statement must start with CREATE SINK".to_string());
+    }
+
+    let after_create = &trimmed["CREATE SINK".len()..].trim();
+    let after_create_lower = after_create.to_lowercase();
+    let for_view_pos = after_create_lower
+        .find(" for view ")
+        .ok_or_else(|| "CREATE SINK requires FOR VIEW clause".to_string())?;
+    let name = after_create[..for_view_pos]
+        .trim()
+        .trim_matches('"')
+        .to_lowercase();
+    if name.is_empty() {
+        return Err("CREATE SINK requires a sink name".to_string());
+    }
+
+    let after_for_view = after_create[for_view_pos + " for view ".len()..].trim();
+    let after_for_view_lower = after_for_view.to_lowercase();
+    let to_pos = after_for_view_lower
+        .find(" to ")
+        .ok_or_else(|| "CREATE SINK requires TO clause".to_string())?;
+    let view = after_for_view[..to_pos]
+        .trim()
+        .trim_matches('"')
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    if view.is_empty() {
+        return Err("CREATE SINK requires a referenced view name".to_string());
+    }
+
+    let after_to = after_for_view[to_pos + " to ".len()..].trim();
+    let format_end = after_to
+        .find(char::is_whitespace)
+        .ok_or_else(|| "CREATE SINK requires a quoted sink path".to_string())?;
+    let format = after_to[..format_end].trim().to_uppercase();
+    if !matches!(format.as_str(), "ICEBERG" | "DELTA") {
+        return Err("CREATE SINK format must be ICEBERG or DELTA".to_string());
+    }
+
+    let after_format = after_to[format_end..].trim();
+    let (path, consumed) = parse_sql_single_quoted_string(after_format)?;
+    let after_path = after_format[consumed..].trim();
+    if !after_path.to_lowercase().starts_with("with") {
+        return Err("CREATE SINK requires WITH (...) options".to_string());
+    }
+    let with_body = after_path["with".len()..].trim();
+    let option_map = parse_create_sink_options(with_body)?;
+
+    let snapshot_interval_epochs =
+        parse_optional_u64_option(&option_map, "snapshot_interval_epochs")?;
+    let snapshot_interval_ms = parse_optional_u64_option(&option_map, "snapshot_interval_ms")?;
+    let parquet_row_group_bytes =
+        parse_optional_u64_option(&option_map, "parquet_row_group_bytes")?;
+    let format_version = parse_optional_u64_option(&option_map, "format_version")?;
+    let partition_by = match option_map.get("partition_by") {
+        Some(CreateSinkOptionValue::Array(values)) => values.clone(),
+        Some(_) => return Err("CREATE SINK option partition_by must be ARRAY[...]".to_string()),
+        None => Vec::new(),
+    };
+    let catalog = match option_map.get("catalog") {
+        Some(CreateSinkOptionValue::String(value)) => value.to_lowercase(),
+        Some(_) => {
+            return Err("CREATE SINK option catalog must be an identifier or string".to_string())
+        }
+        None => "filesystem".to_string(),
+    };
+
+    Ok(ParsedCreateSink {
+        name,
+        view,
+        format,
+        path,
+        snapshot_interval_epochs,
+        snapshot_interval_ms,
+        parquet_row_group_bytes,
+        format_version,
+        partition_by,
+        catalog,
+    })
+}
+
+fn parse_create_sink_options(
+    raw_with: &str,
+) -> Result<std::collections::HashMap<String, CreateSinkOptionValue>, String> {
+    let raw = raw_with.trim();
+    if !raw.starts_with('(') || !raw.ends_with(')') {
+        return Err("CREATE SINK WITH clause must be parenthesized".to_string());
+    }
+    let inner = &raw[1..raw.len() - 1];
+    let mut options = std::collections::HashMap::new();
+    for part in split_top_level_comma_list(inner)? {
+        if part.trim().is_empty() {
+            continue;
+        }
+        let eq_idx = find_top_level_equals(&part)
+            .ok_or_else(|| format!("CREATE SINK option '{part}' must use key=value syntax"))?;
+        let key = part[..eq_idx].trim().to_lowercase();
+        let raw_value = part[eq_idx + 1..].trim();
+        if key.is_empty() || raw_value.is_empty() {
+            return Err(format!("CREATE SINK option '{part}' is malformed"));
+        }
+        let value = parse_create_sink_option_value(raw_value)?;
+        options.insert(key, value);
+    }
+    Ok(options)
+}
+
+fn parse_create_sink_option_value(raw: &str) -> Result<CreateSinkOptionValue, String> {
+    let trimmed = raw.trim();
+    if trimmed.to_uppercase().starts_with("ARRAY[") {
+        if !trimmed.ends_with(']') {
+            return Err(format!("malformed ARRAY value '{trimmed}'"));
+        }
+        let inner = &trimmed[6..trimmed.len() - 1];
+        let mut values = Vec::new();
+        for item in split_top_level_comma_list(inner)? {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if item.starts_with('\'') {
+                let (value, consumed) = parse_sql_single_quoted_string(item)?;
+                if item[consumed..].trim().is_empty() {
+                    values.push(value);
+                    continue;
+                }
+                return Err(format!("malformed ARRAY item '{item}'"));
+            }
+            values.push(item.trim_matches('"').to_string());
+        }
+        return Ok(CreateSinkOptionValue::Array(values));
+    }
+
+    if trimmed.starts_with('\'') {
+        let (value, consumed) = parse_sql_single_quoted_string(trimmed)?;
+        if !trimmed[consumed..].trim().is_empty() {
+            return Err(format!("malformed string literal '{trimmed}'"));
+        }
+        return Ok(CreateSinkOptionValue::String(value));
+    }
+
+    if let Ok(value) = trimmed.parse::<u64>() {
+        return Ok(CreateSinkOptionValue::Number(value));
+    }
+
+    Ok(CreateSinkOptionValue::String(
+        trimmed.trim_matches('"').to_string(),
+    ))
+}
+
+fn parse_optional_u64_option(
+    options: &std::collections::HashMap<String, CreateSinkOptionValue>,
+    key: &str,
+) -> Result<Option<u64>, String> {
+    match options.get(key) {
+        Some(CreateSinkOptionValue::Number(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("CREATE SINK option {key} must be a number")),
+        None => Ok(None),
+    }
+}
+
+fn parse_sql_single_quoted_string(input: &str) -> Result<(String, usize), String> {
+    let bytes = input.as_bytes();
+    if bytes.first().copied() != Some(b'\'') {
+        return Err("expected single-quoted string literal".to_string());
+    }
+    let mut idx = 1usize;
+    let mut value = String::new();
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'\'' => {
+                if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                    value.push('\'');
+                    idx += 2;
+                    continue;
+                }
+                return Ok((value, idx + 1));
+            }
+            byte => {
+                value.push(byte as char);
+                idx += 1;
+            }
+        }
+    }
+    Err("unterminated string literal".to_string())
+}
+
+fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut bracket_depth = 0usize;
+    let mut in_string = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                current.push(ch);
+                if in_string {
+                    if chars.peek() == Some(&'\'') {
+                        current.push(chars.next().unwrap());
+                    } else {
+                        in_string = false;
+                    }
+                } else {
+                    in_string = true;
+                }
+            }
+            '[' if !in_string => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' if !in_string => {
+                if bracket_depth == 0 {
+                    return Err("unbalanced ] in WITH clause".to_string());
+                }
+                bracket_depth -= 1;
+                current.push(ch);
+            }
+            ',' if !in_string && bracket_depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if in_string {
+        return Err("unterminated string literal in WITH clause".to_string());
+    }
+    if bracket_depth != 0 {
+        return Err("unbalanced ARRAY[...] in WITH clause".to_string());
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    Ok(parts)
+}
+
+fn find_top_level_equals(input: &str) -> Option<usize> {
+    let mut bracket_depth = 0usize;
+    let mut in_string = false;
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\'' => {
+                if in_string && chars.peek().map(|(_, c)| *c) == Some('\'') {
+                    chars.next();
+                } else {
+                    in_string = !in_string;
+                }
+            }
+            '[' if !in_string => bracket_depth += 1,
+            ']' if !in_string && bracket_depth > 0 => bracket_depth -= 1,
+            '=' if !in_string && bracket_depth == 0 => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_create_view_name(q: &str) -> Option<String> {
     let ql = q.trim().to_lowercase();
     let after: &str = if ql.starts_with("create or replace materialized view ") {
@@ -6561,6 +6950,121 @@ mod s4_tests {
             events.iter().any(|e| e.actor == "system"),
             "expected system actor in audit log, got: {:?}",
             events.iter().map(|e| &e.actor).collect::<Vec<_>>()
+        );
+    }
+
+    fn create_sink_error_message(responses: Vec<Response<'_>>) -> String {
+        responses
+            .into_iter()
+            .find_map(|response| match response {
+                Response::Error(error) => Some(error.message),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn create_sink_registers_catalog_entry() {
+        let handler = make_handler();
+        handler.catalog.add_view_in_namespace(CatalogView {
+            name: "orders_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![CatalogColumn {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+            }],
+            namespace: "public".to_string(),
+        });
+
+        let responses = handler
+            .handle_create_sink("CREATE SINK daily_sink FOR VIEW orders_view TO ICEBERG 'file:///warehouse/orders' WITH (snapshot_interval_epochs=3, snapshot_interval_ms=500, parquet_row_group_bytes=1024, format_version=2, partition_by=ARRAY['region','day'], catalog=filesystem)")
+            .unwrap();
+
+        assert!(matches!(responses.as_slice(), [Response::Execution(_)]));
+
+        let sink = handler
+            .catalog
+            .get_sink("daily_sink")
+            .expect("sink registered");
+        assert_eq!(sink.view, "orders_view");
+        assert_eq!(sink.format, "ICEBERG");
+        assert_eq!(sink.path, "file:///warehouse/orders");
+        assert_eq!(sink.snapshot_interval_epochs, Some(3));
+        assert_eq!(sink.snapshot_interval_ms, Some(500));
+        assert_eq!(sink.parquet_row_group_bytes, Some(1024));
+        assert_eq!(sink.format_version, Some(2));
+        assert_eq!(
+            sink.partition_by,
+            vec!["region".to_string(), "day".to_string()]
+        );
+        assert_eq!(sink.catalog, "filesystem");
+    }
+
+    #[test]
+    fn create_sink_unknown_view_returns_rs4007() {
+        let handler = make_handler();
+        let message = create_sink_error_message(
+            handler
+                .handle_create_sink("CREATE SINK missing_view_sink FOR VIEW missing_view TO ICEBERG 'file:///warehouse/orders' WITH (snapshot_interval_epochs=3, catalog=filesystem)")
+                .unwrap(),
+        );
+        assert!(
+            message.contains("RS-4007"),
+            "expected RS-4007, got: {message}"
+        );
+        assert!(
+            message.contains("unknown view"),
+            "expected unknown view message, got: {message}"
+        );
+    }
+
+    #[test]
+    fn create_sink_bad_catalog_returns_rs4007() {
+        let handler = make_handler();
+        handler.catalog.add_view_in_namespace(CatalogView {
+            name: "orders_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![],
+            namespace: "public".to_string(),
+        });
+
+        let message = create_sink_error_message(
+            handler
+                .handle_create_sink("CREATE SINK bad_catalog_sink FOR VIEW orders_view TO DELTA 'file:///warehouse/orders' WITH (snapshot_interval_epochs=3, catalog=bogus)")
+                .unwrap(),
+        );
+        assert!(
+            message.contains("RS-4007"),
+            "expected RS-4007, got: {message}"
+        );
+        assert!(
+            message.contains("catalog"),
+            "expected catalog message, got: {message}"
+        );
+    }
+
+    #[test]
+    fn create_sink_malformed_with_clause_returns_rs4007() {
+        let handler = make_handler();
+        handler.catalog.add_view_in_namespace(CatalogView {
+            name: "orders_view".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![],
+            namespace: "public".to_string(),
+        });
+
+        let message = create_sink_error_message(
+            handler
+                .handle_create_sink("CREATE SINK malformed_sink FOR VIEW orders_view TO ICEBERG 'file:///warehouse/orders' WITH (snapshot_interval_epochs='three', catalog=filesystem)")
+                .unwrap(),
+        );
+        assert!(
+            message.contains("RS-4007"),
+            "expected RS-4007, got: {message}"
+        );
+        assert!(
+            message.contains("snapshot_interval_epochs"),
+            "expected option type message, got: {message}"
         );
     }
 }

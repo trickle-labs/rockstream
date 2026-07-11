@@ -196,6 +196,8 @@ pub const RS_4004: ErrorCode = ErrorCode::new(4004);
 pub const RS_4005: ErrorCode = ErrorCode::new(4005);
 /// Source-epoch registry full; too many uncommitted source epochs in flight.
 pub const RS_4006: ErrorCode = ErrorCode::new(4006);
+/// CREATE SINK DDL parse or validation failed.
+pub const RS_4007: ErrorCode = ErrorCode::new(4007);
 /// Self-fencing configuration invalid: self_fence_after must satisfy
 /// dead_after < self_fence_after < 2 × shard_recovery_budget.
 pub const RS_3005: ErrorCode = ErrorCode::new(3005);
@@ -302,6 +304,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         4004 => "Sink 2PC commit failed after pre-commit; recovery required",
         4005 => "Sink 2PC duplicate delivery detected and suppressed",
         4006 => "Source-epoch registry full; too many uncommitted epochs in flight",
+        4007 => "CREATE SINK DDL parse or validation failed",
         3005 => "Self-fencing configuration invalid: self_fence_after constraint violated",
         5001 => "Incompatible storage format",
         5002 => "Unknown merge law in arrangement header",
@@ -394,6 +397,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         4004 => "Trigger manual recovery or restart the connector; check sink idempotency profile.",
         4005 => "This is informational; the duplicate was suppressed. Check source for duplicate delivery.",
         4006 => "Reduce source epoch rate or increase max_in_flight_source_epochs.",
+        4007 => "Check CREATE SINK syntax, referenced view name, and WITH option types; use catalog=filesystem|glue|rest|hive|ducklake.",
         3005 => "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.",
         5001 => "Run the storage migration tool before upgrading.",
         5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
@@ -447,7 +451,7 @@ mod tests {
             RS_5001, RS_5002, RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701,
             RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017, RS_1012,
             RS_1013, RS_8001, // v0.21
-            RS_4003, RS_4004, RS_4005, RS_4006, RS_3005, RS_1018, RS_2400, RS_2401,
+            RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_3005, RS_1018, RS_2400, RS_2401,
             RS_2402, // v0.26 auth
         ];
         for code in codes {

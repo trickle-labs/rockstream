@@ -38,6 +38,14 @@ pub trait SinkConnector: Send + Sync {
     /// Returns the idempotency profile for this connector.
     fn idempotency_profile(&self) -> SinkIdempotencyProfile;
 
+    /// Return whether the connector should flush its currently buffered rows.
+    ///
+    /// The default implementation preserves the existing behavior of sinks that
+    /// flush every epoch.
+    fn should_flush(&self, _bytes_buffered: u64, _epochs_buffered: u64) -> bool {
+        true
+    }
+
     /// Stage rows for the given epoch (pre-commit phase).
     ///
     /// Implementations must:
