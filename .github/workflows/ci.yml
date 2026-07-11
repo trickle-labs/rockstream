@@ -176,3 +176,24 @@ jobs:
             exit 1
           fi
           echo "OK: versions match"
+
+  docker-build:
+    name: Docker image (release binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard against shipping a debug binary
+        run: |
+          # Found by the 2026-07-11 network-efficiency/cost-visibility review:
+          # the Dockerfile used to build with plain `cargo build` and copy
+          # `target/debug/rockstream` into the runtime image. Debug builds
+          # carry none of the optimizations every published latency/throughput
+          # number assumes, and no CI job ever ran `docker build`, so this
+          # shipped silently. This step and the one below make sure both the
+          # content and the build itself are checked on every push/PR.
+          grep -q -- '--release' Dockerfile
+          grep -q 'target/release/rockstream' Dockerfile
+      - name: docker build
+        run: docker build -t rockstream:ci .
+      - name: smoke-test the built image
+        run: docker run --rm --entrypoint rockstream rockstream:ci --help

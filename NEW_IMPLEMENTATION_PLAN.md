@@ -779,11 +779,21 @@ surface to full read-modify-write semantics.
   collocated workers.
 - **AZ-aware shuffle**: make the hierarchical exchange subsystem availability-
   zone-aware to confine high-bandwidth shuffle traffic within the same AZ.
+- **Shuffle-payload compression** (DESIGN.md §7.3; found missing from this
+  plan and from every roadmap version by the 2026-07-11 network-efficiency
+  review — §7.3 has documented shuffle payloads as compressed since an
+  earlier DESIGN.md revision without any implementation or scheduled
+  version ever backing that claim): pluggable codec selection on the
+  exchange path classifier — LZ4 on the latency-sensitive direct/loopback
+  gRPC path, ZSTD on the durable object-store shuffle path and cluster
+  checkpoints.
 
 **Exit criteria**:
 - Multi-shard point reads bypass >90% of shards via Bloom filter pruning.
 - CPU profiles show zero byte-copying for same-host worker exchanges.
 - Cross-AZ traffic drops to near zero during shuffle phases.
+- Shuffle-payload compression reduces measured cross-worker network bytes by
+  ≥40% on a representative wide-shuffle workload with zero oracle divergence.
 
 ---
 

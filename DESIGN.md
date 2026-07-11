@@ -1649,15 +1649,22 @@ selection is re-evaluated per batch at runtime.
 ```
 shuffle_outbox/ key:
   0x05 exchange_id(16) target_shard(4) epoch(8 BE) seq(8 BE)
-  value: Arrow IPC batch (compressed)
+  value: Arrow IPC batch (compressed: LZ4 on the direct/loopback path,
+         ZSTD on the durable path)
 
 shuffle_inbox/ key:
   0x04 exchange_id(16) src_shard(4) epoch(8 BE) seq(8 BE)
-  value: Arrow IPC batch (compressed)
+  value: Arrow IPC batch (compressed: LZ4 on the direct/loopback path,
+         ZSTD on the durable path)
 ```
 
 Entries are deleted only after the consuming operator's frontier advances past
 the epoch (see §8).
+
+**Ships**: v0.49 (NEW_ROADMAP.md Phase 14). Until then, outbox/inbox values
+are uncompressed Arrow IPC — found unimplemented and unscheduled anywhere by
+the 2026-07-11 network-efficiency review, despite this section documenting
+compression as already decided.
 
 ### 7.4 Why Arrow
 
@@ -4728,11 +4735,25 @@ follows:
 
 | Label | Max distinct values | Notes |
 |---|---:|---|
-| `pipeline_id` | 256 | Hard limit; reject pipeline creation beyond this. |
+| `pipeline_id` | 256 *(full breakdown; see note below)* | Bounds how many pipelines receive a full per-pipeline metric breakdown at once — does not bound how many pipelines the cluster may host. |
 | `op_id` | 512 per pipeline | Each operator emits O(1) series. |
 | `shard_id` | 1024 per exchange | Bounded by cluster size. |
 | `migration_id` | 64 concurrent | Active migrations only; closed → dropped. |
 | `connector_id` | 128 | Bounded at connector registration. |
+
+**This is a metrics-emission bound, not a capacity limit.** An earlier
+revision of this table stated the `pipeline_id` row as a hard rejection of
+pipeline creation beyond 256 — read literally, the cluster could never host
+a 257th materialized-view pipeline, directly contradicting this project's
+own "bottomless capacity"/"massively parallel" positioning (`README.md`).
+Found and corrected by the 2026-07-11 network-efficiency/metrics-scalability
+review: the control-plane catalog has no pipeline-count ceiling; only the
+metrics exporter's per-label cardinality does. **Fix (scheduled v0.45,
+NEW_ROADMAP.md Phase 12)**: the metrics exporter maintains a full
+per-pipeline label breakdown only for an LRU/recent-traffic working set of
+up to 256 pipelines, and rolls every pipeline outside that working set into
+one aggregate `pipeline_id="other"` series rather than refusing to create it
+or silently dropping its metrics.
 
 Custom labels (e.g., user-defined pipeline tags) are limited to 8 additional
 labels with ≤ 64 distinct values each. Labels violating these limits are
@@ -4847,6 +4868,18 @@ SHOW CLUSTER RESOURCE USAGE;
   rows, SLO compliance, degraded reason.
 - `rockstream_catalog.workload_resource_usage` — per-workload aggregate with
   budget utilisation percentage.
+- Both tables also carry an `estimated_cost_per_hour` column, computed by
+  applying a small operator-supplied cloud-pricing table to metrics the
+  system already collects (object-store request/storage/egress rates from
+  `object_store_request_duration_seconds` and transferred bytes, worker
+  compute-hours, and the Spot-vs-on-demand mix). The pricing table is
+  declared once, cluster-wide, via a `[pricing]` block in `rockstream.toml`
+  (unit costs only — no cloud-billing API integration); omitting it leaves
+  `estimated_cost_per_hour` null rather than guessing. **Ships**: v0.45
+  (found missing by the 2026-07-11 network-efficiency/metrics-scalability/
+  cost-visibility review — until then, cost visibility is a one-time TCO
+  benchmark comparison, not a live per-workload figure an operator can read
+  off a running cluster).
 
 **Proactive alerting thresholds:**
 
