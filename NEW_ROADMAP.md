@@ -674,6 +674,91 @@ that no version from v0.46 onward changes meaning.
 | v0.45.3 | Coverage-Gate Expansion, Lint-Suppression Cleanup & Scheduled Dependency Audit | Extend the `coverage` CI job's fail-under gate (starting floor set from each crate's own current measured baseline, never below 70%, ratcheting upward release over release — never loosened) to `rockstream-diff`, `rockstream-ops`, `rockstream-storage`, and `rockstream-runtime` first (the hot path between a SQL plan and a durable write), then the remaining crates; fix `Makefile`'s `coverage-gate` target to match the real, CI-enforced flags (`--fail-under-lines 70`/`--fail-under-regions 70`) and add a `conformance_doc_tests`-style lock (mirroring the existing gateway one) so the `Makefile` and `ci.yml` numbers can never silently drift apart again; remove `rockstream-gateway/src/lib.rs`'s crate-wide `#![allow(clippy::all, unused_variables, dead_code)]`, replacing it only with narrow, individually-commented `#[allow(...)]`s where a real false positive exists; add a scheduled (cron, mirroring `simulation-soak.yml`'s pattern) `cargo deny check` workflow independent of PR activity, plus a real `.github/dependabot.yml` (cargo ecosystem, weekly) so `DEPENDENCY_POLICY.md`'s claim becomes true instead of aspirational. | `cargo llvm-cov` fails CI if `rockstream-diff`/`-ops`/`-storage`/`-runtime` coverage drops below their newly-set floors; `make coverage-gate`'s output matches `ci.yml`'s actual enforced thresholds exactly, asserted by a new test analogous to `test_coverage_gate_config_is_present`; `cargo clippy --workspace --all-targets -- -D warnings` passes with the gateway's blanket suppression removed and every remaining suppression individually justified; a scheduled workflow run (not just a PR) fails within 24h of a newly-published advisory against an unchanged `Cargo.lock` (simulated by temporarily un-ignoring a resolved advisory in CI); `dependabot.yml` opens a real version-bump PR in a fork smoke-test. | Unit |
 | v0.45.4 | Performance-Regression CI Gate & Benchmark Coverage Expansion | Add a `benchmark` CI job that runs the existing `rockstream-ops` criterion suite plus new benches for the three subsystems DESIGN.md §16.6 and this roadmap repeatedly flag as throughput-critical but never benchmark today — SlateDB read/write/merge-operator latency (`rockstream-storage`), exchange/shuffle serialization and credit-flow throughput (`rockstream-runtime`), and control-plane frontier-aggregation throughput at simulated shard/operator counts (`rockstream-control`) — against a checked-in baseline (`critcmp`-compatible JSON, refreshed only via an explicit, code-reviewed `make bench-baseline-update` step), failing the build on a >10% regression per the Common Definition of Done's own long-standing and, until now, entirely unenforced rule. | A deliberately-introduced 15% slowdown in each of the four newly-benchmarked subsystems fails the `benchmark` CI job; an intentional, reviewed improvement updates the baseline via `make bench-baseline-update` and the next run passes; the job completes within a documented, bounded wall-clock budget suitable for per-PR execution. | Unit |
 
+**Usability review: user-facing documentation accuracy (2026-07-11, round 2).**
+Round 1 above audited internal CI/test/coverage machinery. This pass audits a
+different surface entirely — the `docs/` folder a real evaluator or operator
+reads to decide what RockStream can do today — against the same "verify
+against real code, don't trust prose" standard this document has applied to
+`DESIGN.md` throughout. The result is more serious than round 1's findings:
+several docs don't just lag reality, one of them actively overstates it.
+
+- **`docs/language-features.md`'s "Implemented Today" section listed multiple
+  SQL statements that do not exist anywhere in `rockstream-sql` or
+  `rockstream-gateway`.** Confirmed by grepping the actual parser/lowering
+  crate (zero matches for each): `CREATE WORKLOAD`/`WITH (WORKLOAD = ...)`
+  (real target: v0.45.1, unstarted), `CREATE SECRET`/envelope
+  encryption/KEK config (real target: v0.56, unstarted), user-visible CRDT
+  column types (`CREATE TABLE ... (amount COUNTER)`, `MAX_REGISTER`,
+  `MIN_REGISTER`, `LWW`, `OR_SET`, `MV_REGISTER` — these directly contradict
+  `README.md`'s own explicit "post-1.0 goal... intentionally out of scope for
+  the current roadmap" framing and `NEW_IMPLEMENTATION_PLAN.md`'s "Out of
+  Scope" list), `WITH RECURSIVE`/semi-naive/DRed recursion (real target:
+  v0.50, unstarted), `SHOW RESOURCE USAGE` and its variants plus the
+  `rockstream_catalog.view_resource_usage`/`workload_resource_usage` tables
+  they read from (real target: v0.45, currently being wired, per this same
+  roadmap's own v0.45 row above), and optimistic-conflict detection /
+  `RS-2008` (real target: v0.54, unstarted). Not everything in the document
+  was wrong — `REBUILD INDEX`, for example, is genuinely implemented,
+  confirmed by real parser code and a passing unit test — which is precisely
+  what makes a document that mixes verified and fabricated claims worse than
+  one that is uniformly stale: a reader has no way to tell which bullet to
+  trust without doing the same grep this review just did. **Fixed directly in
+  this review**: every claim confirmed false above is moved out of
+  "Implemented Today" and into "Documented / Planned Surface" with its real
+  target version named, since this is a prose correction (not new
+  engineering), following the same precedent as this roadmap's own direct
+  `DESIGN.md` §17/§8.7/§12.8 corrections.
+- **`docs/cli.md` documents only the v0.1 no-op CLI** — `--storage`/`--role`
+  with only two error codes (`RS-0002`/`RS-0003`) — and never mentions
+  `--control`, `--auth`, `--metrics-addr`, or `--listen`, nor that the
+  `gateway`/`all` roles start a real, long-running PostgreSQL wire server
+  (all confirmed present and real in `crates/rockstream-cli/src/main.rs` and
+  demonstrated working in `docs/tutorial-30-minutes.md`). This is the
+  opposite failure mode from `language-features.md` — understating current
+  capability rather than overstating it — but the same root cause: nobody
+  re-generates or re-checks `docs/cli.md` against the real `clap` `Command`
+  enum as the CLI grows.
+- **`docs/configuration.md` contradicts the actual shipped `rockstream.toml`
+  and the real `RockstreamConfig` schema** (`crates/rockstream-types/src/
+  config.rs`). It invents a `[memory]` section and a
+  `checkpoint_retention_duration_sec` key that do not exist in the real
+  `ClusterConfig` struct, omits real fields that do exist
+  (`dlq_retention_days`, `autotuner`, `index_prefer_selectivity_threshold`,
+  `index_max_lag_ms`), and lists defaults that do not match the repository's
+  own reference `rockstream.toml` (`min_epoch_ms` 100 vs. the real file's 10;
+  `state_budget_gb` 8 vs. 10; `segment_cache_bytes` 1 GB vs. 512 MB;
+  `max_rows_per_quantum` 10000 vs. 1000). An operator who configures a
+  deployment by copying this doc's example would get a file that doesn't
+  parse the way they expect. (Incidentally, `rockstream.toml`'s own header
+  comment self-labels it "(v0.50)" and `config.rs`'s self-labels "(v0.49)" —
+  neither matches the other, let alone the project's real current version;
+  harmless on its own, but a small extra symptom of the same drift.)
+- **`docs/sre-operations.md` documents a CLI command that does not exist.**
+  It says "the support bundle is generated via `rockstream support-bundle`"
+  as a `tar.gz` containing separate `audit.jsonl`/`config.toml`/`metrics.json`
+  files. In reality (confirmed directly in `crates/rockstream-cli/src/
+  main.rs`, whose only subcommand today is `start`, and in `lib.rs`'s
+  `write_support_bundle`): there is no `support-bundle` subcommand at all
+  (it is roadmapped as `rockstream support bundle` at v0.55); the bundle is
+  written automatically as a side effect of `rockstream start`, as a single
+  `support-bundle-<timestamp>.json` file containing `audit_events` and
+  `system_info` fields directly — not a tarball, not three separate files.
+  This is the exact document an on-call engineer reaches for mid-incident, so
+  the mismatch is an operational risk, not just an inaccuracy.
+
+None of this requires new engineering — it requires the same discipline this
+roadmap already applies to its own internal documents (`DESIGN.md`,
+`NEW_ROADMAP.md`) applied to `docs/`, plus (per the pattern round 1 already
+established for coverage numbers) an automated check so it cannot silently
+re-drift. Added as a new **Phase 12.7 — User-Facing Documentation Accuracy &
+Drift Prevention** (v0.45.5), directly after Phase 12.6 and before Phase 13.
+
+### Phase 12.7 — User-Facing Documentation Accuracy & Drift Prevention
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.45.5 | Documentation-Reality Reconciliation & Conformance Locks | Complete the line-by-line audit `docs/language-features.md`'s accuracy note (added this review) commits to, plus the same treatment for `docs/cli.md` and `docs/configuration.md`: every remaining "Implemented Today" / reference-table claim across all three documents is individually re-verified against `rockstream-sql`, `rockstream-gateway`, `rockstream-cli`, and `rockstream-types::config`, and corrected in place. Regenerate `docs/cli.md` from the real `clap` `Command` definition (or generate it, so it cannot drift again) covering every flag (`--control`, `--auth`, `--metrics-addr`, `--listen`) and the real error-code surface; regenerate `docs/configuration.md`'s reference table directly from `RockstreamConfig`'s real field list and `Default` impl (not hand-copied); fix `docs/sre-operations.md`'s support-bundle section to match the real, already-shipped `support-bundle-<timestamp>.json` artifact and remove the nonexistent `rockstream support-bundle` command reference (correct to the roadmapped v0.55 `rockstream support bundle` name, with a note that it is not yet available). Then add the automated lock this review found missing: a `docs_conformance_tests.rs`-style test (mirroring the existing `conformance_doc_tests.rs`/`docs/pgwire-conformance.md` linked-proof-test pattern already proven at v0.42) that parses `docs/language-features.md`'s "Implemented Today" bullets for backtick-quoted SQL keywords and asserts each one is recognized by `rockstream-sql`'s parser, and a second test that diffs `docs/configuration.md`'s documented keys/defaults against `RockstreamConfig::default()` at compile time. | The new conformance tests fail if a future PR adds a keyword to "Implemented Today" that `rockstream-sql` does not parse, or lets `docs/configuration.md` drift from `RockstreamConfig`'s real fields/defaults; `docs/cli.md` and `docs/configuration.md` match `crates/rockstream-cli`/`rockstream-types::config` exactly, verified by a human diff read at sign-off; `docs/sre-operations.md`'s support-bundle section matches the real JSON artifact format byte-for-byte in a worked example. | Unit |
+
 ### Phase 13 — Elastic Scaling & Skew Handling
 
 | Version | Focus | Scope | Proof | Backends |
@@ -767,6 +852,7 @@ build thereafter.
 | Phase 12 — The Data Lake Bridge & FinOps | v0.43 – v0.45 | Continuous verification |
 | Phase 12.5 — Control-Plane Hardening & Multi-Tenancy | v0.45.1 – v0.45.2 | M7 control-plane HA |
 | Phase 12.6 — Testing, Coverage & Performance-Verification Hardening | v0.45.3 – v0.45.4 | — (CI/tooling hardening; no new coordination protocol) |
+| Phase 12.7 — User-Facing Documentation Accuracy & Drift Prevention | v0.45.5 | — (documentation reconciliation; no new coordination protocol) |
 | Phase 13 — Elastic Scaling & Skew Handling | v0.46 – v0.47 | M6 shard migration |
 | Phase 14 — Network Efficiency & Advanced DML | v0.48 – v0.49 | Continuous verification |
 | Phase 15 — Complex Analytics & Compute Tuning | v0.50 – v0.51 | Continuous verification |
