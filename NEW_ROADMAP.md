@@ -753,11 +753,36 @@ established for coverage numbers) an automated check so it cannot silently
 re-drift. Added as a new **Phase 12.7 — User-Facing Documentation Accuracy &
 Drift Prevention** (v0.45.5), directly after Phase 12.6 and before Phase 13.
 
+**Follow-up spot-check (2026-07-11, round 3).** A third pass re-examined
+operator-facing docs and a few internal engineering conventions, hunting for
+issues in the same shape as rounds 1–2 plus some new angles (per-operator
+state locking, formal-spec index currency, error-code-enforcement tooling).
+Most came back clean, which is useful signal in its own right:
+`formal/README.md`'s spec index is accurate and correctly cross-referenced;
+`docs/pgwire-conformance.md` already has its own automated conformance-lock
+test (`test_conformance_doc_has_linked_tests`), confirming that the fix
+pattern proposed for v0.45.5 above is already proven, low-risk, and merely
+needs to be replicated rather than invented; `docs/ivm-operators.md`,
+`scripts/check-error-codes.sh`, and `rust-toolchain.toml`'s version pin
+(matches `ci.yml`'s `toolchain: "1.88"` exactly) all check out; and
+`AggregateOp`'s per-operator-instance `Mutex<AggState>` is a correct,
+non-bottlenecking design (each operator's epoch processing is already
+inherently sequential, and the mutex never spans shards or operators), not a
+scalability risk. One small extension of round 2's finding did turn up:
+`docs/concepts.md` §32 ("Resource Visibility and Alerts") presents
+`SHOW CLUSTER RESOURCE USAGE` and `SELECT * FROM
+rockstream_catalog.view_resource_usage`/`.workload_resource_usage` as working
+SQL examples with no planned/future caveat — the same not-yet-implemented
+v0.45 surface round 2 already found and fixed in `docs/language-features.md`,
+now confirmed in a fourth location. Folded into v0.45.5's scope below rather
+than opened as its own version, since it is the same fix applied to one more
+file.
+
 ### Phase 12.7 — User-Facing Documentation Accuracy & Drift Prevention
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.45.5 | Documentation-Reality Reconciliation & Conformance Locks | Complete the line-by-line audit `docs/language-features.md`'s accuracy note (added this review) commits to, plus the same treatment for `docs/cli.md` and `docs/configuration.md`: every remaining "Implemented Today" / reference-table claim across all three documents is individually re-verified against `rockstream-sql`, `rockstream-gateway`, `rockstream-cli`, and `rockstream-types::config`, and corrected in place. Regenerate `docs/cli.md` from the real `clap` `Command` definition (or generate it, so it cannot drift again) covering every flag (`--control`, `--auth`, `--metrics-addr`, `--listen`) and the real error-code surface; regenerate `docs/configuration.md`'s reference table directly from `RockstreamConfig`'s real field list and `Default` impl (not hand-copied); fix `docs/sre-operations.md`'s support-bundle section to match the real, already-shipped `support-bundle-<timestamp>.json` artifact and remove the nonexistent `rockstream support-bundle` command reference (correct to the roadmapped v0.55 `rockstream support bundle` name, with a note that it is not yet available). Then add the automated lock this review found missing: a `docs_conformance_tests.rs`-style test (mirroring the existing `conformance_doc_tests.rs`/`docs/pgwire-conformance.md` linked-proof-test pattern already proven at v0.42) that parses `docs/language-features.md`'s "Implemented Today" bullets for backtick-quoted SQL keywords and asserts each one is recognized by `rockstream-sql`'s parser, and a second test that diffs `docs/configuration.md`'s documented keys/defaults against `RockstreamConfig::default()` at compile time. | The new conformance tests fail if a future PR adds a keyword to "Implemented Today" that `rockstream-sql` does not parse, or lets `docs/configuration.md` drift from `RockstreamConfig`'s real fields/defaults; `docs/cli.md` and `docs/configuration.md` match `crates/rockstream-cli`/`rockstream-types::config` exactly, verified by a human diff read at sign-off; `docs/sre-operations.md`'s support-bundle section matches the real JSON artifact format byte-for-byte in a worked example. | Unit |
+| v0.45.5 | Documentation-Reality Reconciliation & Conformance Locks | Complete the line-by-line audit `docs/language-features.md`'s accuracy note (added this review) commits to, plus the same treatment for `docs/cli.md`, `docs/configuration.md`, and `docs/concepts.md` (§32's `SHOW CLUSTER RESOURCE USAGE`/`view_resource_usage`/`workload_resource_usage` example, found by the round-3 follow-up spot-check, needs the same not-yet-implemented caveat): every remaining "Implemented Today" / reference-table / worked-example claim across all four documents is individually re-verified against `rockstream-sql`, `rockstream-gateway`, `rockstream-cli`, and `rockstream-types::config`, and corrected in place. Regenerate `docs/cli.md` from the real `clap` `Command` definition (or generate it, so it cannot drift again) covering every flag (`--control`, `--auth`, `--metrics-addr`, `--listen`) and the real error-code surface; regenerate `docs/configuration.md`'s reference table directly from `RockstreamConfig`'s real field list and `Default` impl (not hand-copied); fix `docs/sre-operations.md`'s support-bundle section to match the real, already-shipped `support-bundle-<timestamp>.json` artifact and remove the nonexistent `rockstream support-bundle` command reference (correct to the roadmapped v0.55 `rockstream support bundle` name, with a note that it is not yet available). Then add the automated lock this review found missing: a `docs_conformance_tests.rs`-style test (mirroring the existing `conformance_doc_tests.rs`/`docs/pgwire-conformance.md` linked-proof-test pattern already proven at v0.42) that parses `docs/language-features.md`'s "Implemented Today" bullets for backtick-quoted SQL keywords and asserts each one is recognized by `rockstream-sql`'s parser, and a second test that diffs `docs/configuration.md`'s documented keys/defaults against `RockstreamConfig::default()` at compile time. | The new conformance tests fail if a future PR adds a keyword to "Implemented Today" that `rockstream-sql` does not parse, or lets `docs/configuration.md` drift from `RockstreamConfig`'s real fields/defaults; `docs/cli.md` and `docs/configuration.md` match `crates/rockstream-cli`/`rockstream-types::config` exactly, verified by a human diff read at sign-off; `docs/sre-operations.md`'s support-bundle section matches the real JSON artifact format byte-for-byte in a worked example. | Unit |
 
 ### Phase 13 — Elastic Scaling & Skew Handling
 

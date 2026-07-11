@@ -1411,8 +1411,11 @@ enough" is fine and you don't want to block on frontier advancement.
 
 ### 32. Resource Visibility and Alerts
 
-You can always see what your cluster's resources are doing. The system
-exposes resource usage through standard SQL:
+You can always see what your cluster's resources are doing. Once
+`NEW_ROADMAP.md` v0.45 (wiring `SHOW RESOURCE USAGE` into the gateway) and
+v0.45.5 ship, the system will expose resource usage through standard SQL
+(found not yet reachable via SQL by the 2026-07-11 usability review — the
+statements below are the target shape, not runnable today):
 
 ```sql
 -- Cluster-wide summary
