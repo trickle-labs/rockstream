@@ -778,7 +778,38 @@ gate:
   CI-fast minimums, mirroring the "scale to millions of seeds pre-release"
   discipline ([NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) Phase 8).
 
-### 4.5 Roadmap Summary
+### 4.5 Gate: M5 — Cold-Tier Exactly-Once Sink (Phase 12)
+
+**Found stale by the 2026-07-11 formal-verification review**: this section
+(§4) was never extended past Phase 6 even though M5 subsequently shipped
+(`formal/m5_cold_tier_sink.fizz`, v0.43, ✅ Done) with full §3.5/§3.7/Appendix A
+coverage — the narrative gate description below is added now to close that
+gap.
+
+M5 was modeled *before* any cold-tier sink code was written
+([NEW_ROADMAP.md](NEW_ROADMAP.md) v0.43, per the binding v0.18 rule), alongside
+closing DESIGN.md §17's three then-`UNMITIGATED` simulation fidelity gaps that
+block cold-tier and Kafka exactly-once claims. Deliverables:
+`formal/m5_cold_tier_sink.fizz` (safety M5-S1…S3, liveness M5-L1, COV-M5);
+`partial_write_probability` added to `SimObjectStore`; paired runtime
+`assert!`s in `rockstream-connectors` (§3.7 above). **Gate**: M5 spec green was
+a precondition for v0.43's exit criteria (partial-write fault injection
+recovers without duplicates); v0.44's cold-tier sink implementation depends on
+this proof.
+
+### 4.6 Gates: M7 — Control-Plane HA (Phase 12.5) and M6 — Shard Migration (Phase 13) — Pending
+
+M7 (`formal/m7_control_plane_ha.fizz`, [NEW_ROADMAP.md](NEW_ROADMAP.md) v0.45.2)
+and M6 (`formal/m6_shard_migration.fizz`, v0.46) are scheduled,
+pre-implementation models — neither version is `✅ Done` yet, so unlike M1–M5
+above, this document does not yet carry their detailed role/action write-ups
+or §3.7 mapping rows; those are a required deliverable of v0.45.2 and v0.46
+respectively (the same D-numbered deliverable pattern as §4.1–4.3), not
+optional follow-up. Until each model is authored here and turns green, no
+self-fencing-composed shard-lease code (M7) or migration-state-machine code
+(M6) may be written, per the binding v0.18 "modeled before Rust code" rule.
+
+### 4.7 Roadmap Summary
 
 | RockStream phase | FizzBee deliverable | Models | Gate |
 |---|---|---|---|
@@ -787,6 +818,9 @@ gate:
 | Phase 5 | `m2_frontier_agg.fizz` | M2 | Precondition for Phase 5 reordering/multi-rate exit |
 | Phase 6 | `m4_self_fencing.fizz`, `m3_sink_2pc.fizz`, M1 duplication variant | M3, M4 | Precondition for Phase 6 chaos/exactly-once exit |
 | Phase 6→8 | Continuous `formal-verify` + path-coupling | all | Pre-release relaxed-bounds sweep |
+| Phase 12 | `m5_cold_tier_sink.fizz` (✅ Done, v0.43) | M5 | Precondition for v0.43/v0.44 cold-tier exactly-once exit |
+| Phase 12.5 | `m7_control_plane_ha.fizz` (pending, v0.45.2) | M7 | Precondition for v0.45.2 control-plane HA exit |
+| Phase 13 | `m6_shard_migration.fizz` (pending, v0.46) | M6 | Precondition for v0.46 shard-migration exit |
 
 ---
 

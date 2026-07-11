@@ -27,7 +27,7 @@ how far the shard has advanced.
 
 The cluster frontier is the **meet** (minimum) of all shard frontiers for a
 given pipeline. A query result is consistent at epoch `E` only after all shards
-have reached epoch ≥ E. The `WorkerAggregator` collects per-worker frontier
+have reached epoch ≥ E. The `FrontierAggregator` collects per-worker frontier
 reports and computes the cluster-wide minimum.
 
 ### 1.3 Frontier Stall Detection
@@ -57,7 +57,7 @@ and acknowledged the barrier.
 
 Each shard's `AlignmentBuffer` accumulates rows received before the barrier
 has propagated from all upstream shards. The buffer is bounded by
-`alignment_buffer_max_rows` (default 1 000 000). Overflow surfaces `RS-1601`
+`alignment_buffer_max_rows` (default 1 000 000). Overflow surfaces `RS-3601`
 and the checkpoint is aborted.
 
 ### 2.3 Atomic Commit
