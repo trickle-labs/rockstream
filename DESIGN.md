@@ -2027,6 +2027,19 @@ limit); if above 0.8, it halves the quantum.
 
 ## 10. Elasticity: Adding, Removing, and Rebalancing Shards
 
+> **Implementation status (2026-07-11 usability/scalability review):** this
+> entire section was, until this review, fully designed but not scheduled on
+> any roadmap version and not present anywhere in `crates/` (verified by
+> grepping for the state names below and for `hot_key`/`shard_split`/
+> `cluster_worker_pressure`). §10.1–§10.4 (the migration state machine) and
+> §10.7 (worker drain) now ship at **NEW_ROADMAP.md v0.46**; §10.5–§10.6
+> (hot-key virtual buckets, proactive splitting) and §10.8 (the autoscaling
+> pressure signal) now ship at **v0.47**. Until those versions land, none of
+> this section's mechanisms exist in the running system — shards are placed
+> once at pipeline creation and rebalanced only via capacity-aware placement
+> of existing shards (the `capacity_headroom` signal below, which IS
+> implemented).
+
 ### 10.1 The Shard Map
 
 The control plane holds a versioned **shard map** for each exchange:
@@ -4204,9 +4217,13 @@ by operator and shard.
 
 ### 14.5 Self-Tuning by Default
 
-Five control loops run continuously in the control plane. All five are on
-by default and can be disabled per view (`autotune.* = off`) for audited
-manual control.
+Five control loops are designed to run continuously in the control plane,
+each independently disableable per view (`autotune.* = off`) for audited
+manual control. **Implementation status (2026-07-11 review): the first four
+rows ship today; "adaptive skew splitting" is design-only until
+NEW_ROADMAP.md v0.47** — it was previously described here as already on by
+default, which was not true (verified: no `hot_key`/`skew_buckets` code
+exists as of v0.42.3). See §10.5–§10.6 for the underlying mechanism.
 
 | Loop | Adjusts | Trigger | Bounds |
 |---|---|---|---|
@@ -5126,9 +5143,9 @@ tests against a real endpoint (MinIO minimum) at the Phase 4 and Phase 6 gates.
 |----------|----------------------|--------|
 | Latency distribution | Uniform random (configurable) | Long-tailed, prefix-dependent |
 | Conditional writes (If-Match) | Yes (in-memory CAS) | Yes (S3 conditional writes) |
-| LIST consistency after PUT | Immediate | Strong (since Dec 2020 for S3; varies for other providers) |
+| LIST consistency after PUT | Configurable staleness via `list_staleness_epochs` (v0.43) | Strong (since Dec 2020 for S3; varies for other providers) |
 | Rate limiting (HTTP 429) | Via `buggify!()` injection | Provider-specific, prefix-scoped |
-| Partial object writes | Not modeled | Can occur on large PUTs |
+| Partial object writes | Yes, via `partial_write_probability` (v0.43) | Can occur on large PUTs |
 
 Behaviors not modeled by `SimRuntime` must be covered by integration tests
 against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
@@ -5141,9 +5158,14 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    fully exercised in simulation. Mitigation target: add
    `partial_write_probability: f64` to `SimObjectStore`'s fault model by
    v0.37; add a `PartialWriteRecoveryTest` to the law-faults corpus.
-   Status: **[UNMITIGATED — scheduled for v0.43]** — cold-tier exactly-once
-   claim unblocked at v0.44 once v0.43 lands; not yet implemented as of
-   v0.42.3 (see `NEW_ROADMAP.md` Phase 12, v0.43).
+   Status: **[MITIGATED — v0.43]** — `partial_write_probability: f64` added
+   to `SimObjectStore` (`crates/rockstream-sim/src/object_store.rs`),
+   `object_store.partial_write` registered in the law-faults corpus
+   (`PartialWriteRecoveryTest`, `crates/rockstream-sim/src/law_faults.rs`),
+   and formalized in `formal/m5_cold_tier_sink.fizz` (M5-S1/S2/S3, M5-L1).
+   Evidence: `crates/rockstream-connectors/tests/partial_write_recovery_tests.rs`
+   (`test_partial_write_recovery_lfs`, `test_partial_write_recovery_minio_tc`),
+   `assert_commit_pointer_atomic` in `sink_connector.rs`.
 
 2. **Kafka transactional broker timeout** — `SimNetwork` can inject message
    drops but does not model Kafka broker-side transaction timeout (which
@@ -5151,9 +5173,13 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    the `CheckBeforeCommit` recovery path for `KafkaSink` is not exercised in
    simulation. Mitigation: add a `kafka_tx_timeout_probability` fault
    parameter to the Kafka connector simulator before v0.44.
-   Status: **[UNMITIGATED — scheduled for v0.43]** — Kafka exactly-once claim
-   unblocked at v0.44 once v0.43 lands; not yet implemented as of v0.42.3
-   (see `NEW_ROADMAP.md` Phase 12, v0.43).
+   Status: **[MITIGATED — v0.43]** — `kafka_tx_timeout_probability` fault
+   parameter added to `KafkaSink` (`crates/rockstream-connectors/src/kafka_sink.rs`),
+   `kafka.tx_timeout` registered in the law-faults corpus
+   (`KafkaTxTimeoutRecoveryTest`, `crates/rockstream-sim/src/law_faults.rs`).
+   Evidence: `crates/rockstream-connectors/tests/kafka_tx_timeout_tests.rs`
+   asserts the `CheckBeforeCommit` recovery path delivers exactly once after
+   a forced tx-timeout.
 
 3. **S3 LIST consistency delays** — `SimObjectStore` returns synchronously
    consistent LIST results; real S3 may return stale LIST responses for
@@ -5164,8 +5190,14 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    Maturity" reference — that milestone is now v0.53 in the current roadmap
    numbering; `NEW_ROADMAP.md`'s v0.43 scope explicitly says "pull forward
    `list_staleness_epochs` if not yet landed").
-   Status: **[UNMITIGATED — scheduled for v0.43]** — informational only;
-   CALM property depends on direct manifest reads, not LIST.
+   Status: **[MITIGATED — v0.43]** — `list_staleness_epochs` fault parameter
+   added to `SimObjectStore` (`crates/rockstream-sim/src/object_store.rs`),
+   `object_store.list_staleness` registered in the law-faults corpus
+   (`ListStalenessRegressionTest`, `crates/rockstream-sim/src/law_faults.rs`).
+   Informational only, confirmed by
+   `list_staleness_does_not_affect_sink_connector_asserts` in
+   `object_store.rs`'s unit tests: no `assert_*` in `sink_connector.rs`
+   depends on LIST — CALM epoch manifest reads are always direct-key reads.
 
 4. **Network packet fragmentation** — TCP segmentation of large shuffle
    frames is not exercised in simulation. Consequence: the `wire_version`

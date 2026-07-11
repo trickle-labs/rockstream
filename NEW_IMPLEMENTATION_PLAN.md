@@ -121,10 +121,11 @@ must satisfy the relevant rungs before it exits.
 | 8 | Both | Ingestion connectors & crucible soaks | 72h object-store soak; recovery SLOs under real load |
 | 9 | Both | Operational HTAP ergonomics | Secondary indexes; single-digit-ms point lookups |
 | 10 | Both | Data lake bridge & FinOps | External engines query Iceberg snapshots; >50% TCO reduction |
-| 11 | Both | Network efficiency & advanced DML | Zero-copy IPC; >90% shard pruning on Bloom filters |
-| 12 | IVM | Complex analytics & compute tuning | Recursive CTEs correct against oracle; +30% DAG throughput |
-| 13 | Both | Declarative data governance | Malformed records never reach ViewSink; DLQ durable |
-| 14 | Both | Enterprise validation & v1.0 finalization | 2-week chaos; zero P0/P1; `v1.0.0` tagged |
+| 11 | Both | Elastic scaling & skew handling | Online shard migration proven (FizzBee M6 model); a synthetic hot key is detected and split into virtual buckets without manual intervention; a real k8s HPA/KEDA scale-out/scale-in driven by the cluster's own autoscaling-pressure signal |
+| 12 | Both | Network efficiency & advanced DML | Zero-copy IPC; >90% shard pruning on Bloom filters |
+| 13 | IVM | Complex analytics & compute tuning | Recursive CTEs correct against oracle; +30% DAG throughput |
+| 14 | Both | Declarative data governance | Malformed records never reach ViewSink; DLQ durable |
+| 15 | Both | Enterprise validation & v1.0 finalization | 2-week chaos; zero P0/P1; `v1.0.0` tagged |
 
 Distribution (Phases 4–6) deliberately precedes the Postgres layer (Phase 7):
 the gateway must serve a correct, fault-tolerant, distributed engine, not a
@@ -551,8 +552,12 @@ shuffle storage.
 
 > A minimal elasticity slice (online shard split at a size threshold and a
 > worker-drain protocol) may be implemented here if needed for the soak, but is
-> otherwise deferred. Full elasticity (merge, clone/blue-green, skew rebalancing)
-> is out of scope for this plan.
+> otherwise deferred to Phase 11 (Elastic Scaling & Skew Handling;
+> NEW_ROADMAP.md v0.46–v0.47), which covers the full online shard-migration
+> state machine, hot-key virtual buckets, proactive splitting, and skew
+> rebalancing. This was found fully designed in DESIGN.md §10 but scheduled in
+> no phase of this plan during the 2026-07-11 usability/scalability review, and
+> is no longer treated as permanently out of scope.
 
 ---
 

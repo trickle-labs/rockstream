@@ -230,7 +230,7 @@ distributed frontier/fault-tolerance protocols, and the PostgreSQL wire
 gateway (auth, transactions/savepoints, LISTEN/NOTIFY, and a certified
 driver-compatibility matrix) are all done and proven. Work is proceeding
 through Phase 12 onward (the cold-tier data-lake bridge) toward the v1.0
-release candidate at v0.57. Four documents describe the system in
+release candidate at v0.59. Four documents describe the system in
 progressively more detail:
 
 | Document | Audience | What it covers |
@@ -265,8 +265,9 @@ evidence behind every completed version.
 | Nexmark Correctness Complete ✅ Done | v0.36 | Nexmark q0–q9 and q12–q22 bit-identical to the DataFusion batch oracle |
 | Wire Protocol Complete ✅ Done | v0.39 | Extended query protocol, full Postgres type OID coverage, ORM driver compatibility, PgBouncer pooling, protocol fuzzing |
 | Wire Protocol End-User Complete ✅ Done | v0.42 | SCRAM/MD5 auth, full transaction/savepoint state machine, LISTEN/NOTIFY, a certified driver-compatibility matrix, and an unmodified reference app running end to end over pgwire |
-| Operationally Complete | v0.55 | Full operator CLI + arrangement debugger, internal mTLS, secrets management, an independent security review, and a proven rolling-upgrade/disaster-recovery path |
-| 1.0 Release | v0.57 | All v0.1–v0.56 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
+| Elastically Scalable | v0.47 | Hot keys split into virtual buckets and shards split before they get too big, entirely in the background; the cluster exports autoscaling signals a standard Kubernetes HPA/KEDA can act on — no manual re-sharding |
+| Operationally Complete | v0.57 | Full operator CLI + arrangement debugger, internal mTLS, secrets management, an independent security review, and a proven rolling-upgrade/disaster-recovery path |
+| 1.0 Release | v0.59 | All v0.1–v0.58 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
 
 ### Phase Summary
 
@@ -276,7 +277,7 @@ evidence behind every completed version.
 | 1 | Single-shard IVM core: filter, project, map, algebraic aggregates (SUM/COUNT/AVG), MIN/MAX; crash-replay |
 | 2 | DataFusion SQL frontend, inner/outer/semi/anti joins, distinct and set operations, storage budget gate |
 | 3 | Advanced operators: window functions, tumbling time windows, Top-K, bootstrap and view-on-view DAGs; single-shard correctness soak (TPC-H 22/22, fuzzer, DST harness) |
-| 4 | Multi-shard execution, gRPC shuffle, durable shuffle fallback, hot-key virtual buckets |
+| 4 | Multi-shard execution, gRPC shuffle, durable shuffle fallback, rendezvous hashing with virtual nodes |
 | 5 | Frontier protocol, frontier aggregator, bounded shuffle storage, progress tracking |
 | 6 | Fault tolerance, exactly-once end-to-end, cluster checkpoints, chaos testing, all four FizzBee models (M1–M4) green |
 | 7 | PostgreSQL wire gateway: read/write/subscribe, inline views, freshness tokens, read-your-writes |
@@ -285,10 +286,11 @@ evidence behind every completed version.
 | 10 | Nexmark correctness suite: q0–q9, q12–q22 bit-identical to batch under mixed INSERT/UPDATE/DELETE |
 | 11 | PostgreSQL wire protocol hardening: extended query protocol, full type/OID and `pg_catalog` coverage, SCRAM/MD5 auth, transactions/savepoints, LISTEN/NOTIFY, reference-app and driver-matrix certification |
 | 12 | The data lake bridge: FizzBee cold-tier protocol model, Iceberg/Delta sinks, deep FinOps optimizations |
-| 13 | Network efficiency and advanced DML: scatter pruning, zero-copy IPC, AZ-aware shuffle |
-| 14 | Complex analytics and compute tuning: recursive CTEs, lateral joins, hopping/session windows, hot-path optimizations |
-| 15 | Declarative data governance: inline expectations, lineage diagnostics, dead-letter-queue routing |
-| 16 | Enterprise validation and 1.0 finalization: isolation/validation hooks, the operator CLI + arrangement debugger, mTLS/secrets/security review, rolling-upgrade + disaster-recovery proof, simulator maturity, the v1.0 release candidate |
+| 13 | Elastic scaling and skew handling: online shard migration, hot-key virtual buckets, proactive shard splitting, cluster autoscaling signals |
+| 14 | Network efficiency and advanced DML: scatter pruning, zero-copy IPC, AZ-aware shuffle |
+| 15 | Complex analytics and compute tuning: recursive CTEs, lateral joins, hopping/session windows, hot-path optimizations |
+| 16 | Declarative data governance: inline expectations, lineage diagnostics, dead-letter-queue routing |
+| 17 | Enterprise validation and 1.0 finalization: isolation/validation hooks, the operator CLI + arrangement debugger, mTLS/secrets/security review, rolling-upgrade + disaster-recovery proof, simulator maturity, the v1.0 release candidate |
 
 ## Crate Architecture
 
@@ -308,7 +310,7 @@ The project is a Cargo workspace of purpose-built crates:
 | `rockstream-connectors` | Connector implementations: Kafka source/sink and S3 source are done; a generic exactly-once object-store sink is done; Postgres CDC source and Iceberg/Delta Lake sinks are planned (Phase 12) |
 | `rockstream-oracle` | Batch reference engine and property-test harness (DBSP soundness tests) |
 | `rockstream-sim` | Deterministic simulation harness: `SimRuntime`, `buggify!()`, fault model |
-| `rockstream-cli` | Operator CLI (`rockstream start`, `explain`, `audit`, `support bundle`) |
+| `rockstream-cli` | Operator CLI — `rockstream start` today; `shard migrate`/`cluster workers drain` land at v0.46, `explain`/`resource` at v0.45, the rest (`workload`/`view`/`schema`/`source`/`checkpoint`/`audit`/`support bundle`/`debug arrangement`) at v0.55 |
 ## How Do I Know It’s Working?
 
 The system exposes one primary health indicator per pipeline: **SLO compliance** —
