@@ -104,6 +104,20 @@ must satisfy the relevant rungs before it exits.
 - No code path may depend on SlateDB range deletion; cleanup is scan-and-delete
   or snapshot-safe compaction filters, and a test asserts this.
 
+**Testing-infrastructure gap found by the 2026-07-11 testing-quality review.**
+The "Benchmark" rung and the coverage expectations implicit across every phase
+above were, in practice, honored for only one crate (`rockstream-gateway`) and
+never wired into CI as an automated regression gate for benchmarks at all —
+despite this table's own "CI fails on >10% regression" promise existing since
+Phase 0. Closed by **NEW_ROADMAP.md v0.45.3–v0.45.4** (a new Phase 12.6,
+inserted between the roadmap's Phase 12.5 and Phase 13): coverage gating
+extended to the hot-path crates, the stale `Makefile` coverage target fixed,
+the gateway's blanket clippy suppression removed, a scheduled dependency-
+advisory workflow added, and a real benchmark CI job with a checked-in
+baseline added for storage, exchange, and frontier-aggregation throughput.
+This plan's Phase Map table above is otherwise unaffected, since this closes a
+verification-tooling gap rather than adding a new pillar or phase.
+
 ---
 
 ## Phase Map

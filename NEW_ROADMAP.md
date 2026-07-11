@@ -593,6 +593,87 @@ cost-visibility gap that is new in kind rather than in shape.
 | v0.45.1 | Workload Quotas, Priority Admission Control & Multi-Tenancy | Wire the existing-but-unused `rockstream-types::workload` data model into a real control-plane workload catalog and the gateway: `CREATE WORKLOAD <name> WITH (MEMORY_LIMIT=..., MAX_PARALLELISM=..., PRIORITY=..., FRESHNESS_SLO=...)`, `ALTER WORKLOAD ... SET (...)`, `DROP WORKLOAD`, `SHOW WORKLOAD STATUS` (DESIGN.md §14.13); per-workload `MEMORY_LIMIT` transitions over-budget views to `OVER_BUDGET_RELAXED` independently of (and nested inside) the existing global `state_budget_gb` floor, which remains as the cluster-wide backstop; `MAX_PARALLELISM` caps the existing per-operator auto-tuner (v0.30) on a per-workload basis; `PRIORITY`-driven admission control (§14.16) pauses or defers lower-priority workloads' views under contention instead of degrading every pipeline on the cluster equally. This is the control-plane substrate the v0.55 admin CLI's `workload {list,show,create,alter,drop}` and `cluster {status,workers,quotas}` commands assume already exists. | Two workloads (`PRIORITY=HIGH`, `PRIORITY=LOW`) sharing one deliberately under-provisioned cluster: under sustained contention the low-priority workload's views transition to `PAUSED`/`OVER_BUDGET_RELAXED` while the high-priority workload keeps meeting its `FRESHNESS_SLO`; a view that exceeds its own workload's `MEMORY_LIMIT` (but not the global budget) transitions to `OVER_BUDGET_RELAXED` and is visible in `SHOW WORKLOAD STATUS`; every quota decision and admission-control pause is audited (§14.11). | Unit, LFS, TC |
 | v0.45.2 | Control-Plane High Availability (Raft-Elected Writer Lease) | Before any consensus code is written, model-check the control-plane leader-election/fencing integration in FizzBee (binding pre-implementation rule from v0.18): **M7 model** `formal/m7_control_plane_ha.fizz` — `ControlNode` ×3–5 / `ObjectStore` roles, composed with M4's shard-fencing predicate, proving a leadership change never lets two control nodes simultaneously grant the same shard lease, admit a workload write, or publish conflicting frontiers. Implement the 3/5-node Raft group over the control SlateDB using an existing, well-tested Raft crate rather than hand-rolled consensus, closing `NEW_IMPLEMENTATION_PLAN.md`'s "Open questions #3" and DESIGN.md §16.6's "Control-plane HA" risk: the Raft leader holds the control-SlateDB writer lease; followers serve cached catalog/topology/workload reads via `DbReader`; the existing §3.2 frontier-aggregator lease election is explicitly composed on top of (not duplicating) Raft leadership. Ships the `--role=control --bootstrap` / multi-node join flow §3 already documents as if it were runnable code. | `formal/m7_control_plane_ha.fizz` is green at CI-fast bounds (no dual-leader window; no lease, workload-catalog write, or shard assignment accepted from a non-leader); a real 3-node control-plane cluster (TC) survives a leader kill with shard leasing and frontier publication resuming within the existing §11.5 recovery-time budgets and zero split-brain shard grants, verified by both a `SimRuntime` scenario and the TestContainers drill; a one-at-a-time rolling restart of all three control nodes never drops a worker's lease or a workload's quota state. | Unit, LFS, MinIO, TC |
 
+**Testing-quality & code-quality review (2026-07-11).** Every review pass
+above hunted for scalability/latency/cost capabilities that DESIGN.md
+describes as real but `crates/` does not implement. This pass asks a
+different question of the testing and quality *machinery* the Common
+Definition of Done and this roadmap repeatedly promise ("CI fails on >10%
+regression once a baseline exists", coverage gates, "`cargo clippy -D
+warnings` must pass") — is it actually running, and running on the code that
+most needs it? Five gaps were found, all confirmed directly against the real
+CI config, `Makefile`, and source, none previously scheduled anywhere:
+
+1. **No performance-regression gate has ever existed, for anything.** The
+   Common Definition of Done requires "a `criterion` benchmark or measurement
+   note; CI fails on >10% regression once a baseline exists", and versions
+   v0.14, v0.36, and v0.45 (above) all repeat variants of this promise. In
+   reality: only `crates/rockstream-ops/benches/` contains any benchmark code
+   at all (`minmax_bench.rs`, `perf_regression.rs`, `nexmark.rs` — confirmed
+   by grepping every crate's `Cargo.toml` for `[[bench]]`); `.github/
+   workflows/ci.yml` never invokes `cargo bench`; and no baseline-storage
+   mechanism (a checked-in `critcmp`/criterion snapshot or otherwise) exists
+   anywhere in the repository. Every throughput number this roadmap has ever
+   published — "≥10× speedup vs. batch" (v0.14), "throughput increases by
+   >30%" (v0.51) — has shipped with zero automated protection against silent
+   regression, and DESIGN.md §16.6's own explicitly-flagged open risk
+   ("frontier-aggregator throughput... must be CPU- and memory-bounded, never
+   blocking") has no benchmark measuring it at all, nor does the exchange/
+   shuffle subsystem that Phase 14 is entirely about making cheaper.
+2. **Code coverage is gated for exactly one of thirteen crates.** `ci.yml`'s
+   `coverage` job produces a workspace-wide `lcov.info` but only ever passes
+   `--fail-under-lines`/`--fail-under-regions` to `--package
+   rockstream-gateway`. `rockstream-diff` — the crate ARCHITECTURE.md itself
+   calls "precisely the place where incremental correctness is won or lost" —
+   has no coverage floor at all, and neither do `rockstream-ops`,
+   `rockstream-storage`, `rockstream-runtime`, `rockstream-control`,
+   `rockstream-connectors`, or `rockstream-sql`.
+3. **`Makefile`'s own `coverage-gate` target is broken and stale.** It still
+   hard-codes `--fail-under-lines 90` and `--fail-under-branches 85` — the
+   exact numbers `sign-offs/v0.42.2.md` already proved false and corrected
+   everywhere else in this repository to the real 70%/70% line/region gate —
+   and `--fail-under-branches` is not a flag `cargo-llvm-cov` has ever
+   supported (the same v0.42.2 finding, which fixed `ci.yml` and the sign-offs
+   but never touched this fourth copy of the same numbers because it sits in
+   tooling rather than prose). Because no CI job calls `make coverage-gate`
+   (CI invokes `cargo llvm-cov` directly with the correct flags), a
+   contributor running the one documented, human-friendly local command would
+   either get a confusing CLI argument error (the branch flag does not exist)
+   or, once fixed, numbers that still would not match CI unless corrected.
+4. **The gateway silently exempts itself from the workspace clippy gate.**
+   `CONTRIBUTING.md` and the `Makefile` both state
+   `cargo clippy --workspace --all-targets -- -D warnings` must pass, and CI
+   runs exactly that command — but `crates/rockstream-gateway/src/lib.rs`
+   opens with `#![allow(clippy::all, unused_variables, dead_code)]`. The
+   workspace-wide command still exits 0, but only because clippy was told not
+   to look at the gateway at all, not because its protocol/session/query code
+   is actually clean — the one crate parsing arbitrary client-supplied SQL
+   text and wire-protocol bytes directly off the network is the one crate
+   clippy silently never checks.
+5. **Dependency-advisory scanning only ever runs when a PR happens to touch
+   the repo.** `DEPENDENCY_POLICY.md` states "Dependabot or Renovate keeps
+   dependencies current" as settled fact, but there is no
+   `.github/dependabot.yml`, no `renovate.json`, and `cargo deny check` (the
+   only advisory check that exists) has no `schedule:` trigger in `ci.yml` —
+   it runs only on `push`/`pull_request`. A CVE disclosed against an
+   already-merged, otherwise-untouched dependency generates no signal at all
+   until the next unrelated PR happens to run CI. `DEPENDENCY_POLICY.md` is
+   corrected in place (this review) to say so plainly; the mechanism itself is
+   scheduled below.
+
+None of these five are new capabilities to design — they are gaps in the
+verification machinery this roadmap already commits to elsewhere. Added as a
+new **Phase 12.6 — Testing, Coverage & Performance-Verification Hardening**
+(v0.45.3–v0.45.4) directly after Phase 12.5 and before Phase 13, using the
+same decimal sub-version mechanism as v0.42.1–v0.42.3 and v0.45.1–v0.45.2 so
+that no version from v0.46 onward changes meaning.
+
+### Phase 12.6 — Testing, Coverage & Performance-Verification Hardening
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.45.3 | Coverage-Gate Expansion, Lint-Suppression Cleanup & Scheduled Dependency Audit | Extend the `coverage` CI job's fail-under gate (starting floor set from each crate's own current measured baseline, never below 70%, ratcheting upward release over release — never loosened) to `rockstream-diff`, `rockstream-ops`, `rockstream-storage`, and `rockstream-runtime` first (the hot path between a SQL plan and a durable write), then the remaining crates; fix `Makefile`'s `coverage-gate` target to match the real, CI-enforced flags (`--fail-under-lines 70`/`--fail-under-regions 70`) and add a `conformance_doc_tests`-style lock (mirroring the existing gateway one) so the `Makefile` and `ci.yml` numbers can never silently drift apart again; remove `rockstream-gateway/src/lib.rs`'s crate-wide `#![allow(clippy::all, unused_variables, dead_code)]`, replacing it only with narrow, individually-commented `#[allow(...)]`s where a real false positive exists; add a scheduled (cron, mirroring `simulation-soak.yml`'s pattern) `cargo deny check` workflow independent of PR activity, plus a real `.github/dependabot.yml` (cargo ecosystem, weekly) so `DEPENDENCY_POLICY.md`'s claim becomes true instead of aspirational. | `cargo llvm-cov` fails CI if `rockstream-diff`/`-ops`/`-storage`/`-runtime` coverage drops below their newly-set floors; `make coverage-gate`'s output matches `ci.yml`'s actual enforced thresholds exactly, asserted by a new test analogous to `test_coverage_gate_config_is_present`; `cargo clippy --workspace --all-targets -- -D warnings` passes with the gateway's blanket suppression removed and every remaining suppression individually justified; a scheduled workflow run (not just a PR) fails within 24h of a newly-published advisory against an unchanged `Cargo.lock` (simulated by temporarily un-ignoring a resolved advisory in CI); `dependabot.yml` opens a real version-bump PR in a fork smoke-test. | Unit |
+| v0.45.4 | Performance-Regression CI Gate & Benchmark Coverage Expansion | Add a `benchmark` CI job that runs the existing `rockstream-ops` criterion suite plus new benches for the three subsystems DESIGN.md §16.6 and this roadmap repeatedly flag as throughput-critical but never benchmark today — SlateDB read/write/merge-operator latency (`rockstream-storage`), exchange/shuffle serialization and credit-flow throughput (`rockstream-runtime`), and control-plane frontier-aggregation throughput at simulated shard/operator counts (`rockstream-control`) — against a checked-in baseline (`critcmp`-compatible JSON, refreshed only via an explicit, code-reviewed `make bench-baseline-update` step), failing the build on a >10% regression per the Common Definition of Done's own long-standing and, until now, entirely unenforced rule. | A deliberately-introduced 15% slowdown in each of the four newly-benchmarked subsystems fails the `benchmark` CI job; an intentional, reviewed improvement updates the baseline via `make bench-baseline-update` and the next run passes; the job completes within a documented, bounded wall-clock budget suitable for per-PR execution. | Unit |
+
 ### Phase 13 — Elastic Scaling & Skew Handling
 
 | Version | Focus | Scope | Proof | Backends |
@@ -685,6 +766,7 @@ build thereafter.
 | Phase 11.5 — Post-v0.42 Remediation | v0.42.1 – v0.42.3 | Toolchain remediation (v0.42.1); M4 state-space & liveness closure (v0.42.3) |
 | Phase 12 — The Data Lake Bridge & FinOps | v0.43 – v0.45 | Continuous verification |
 | Phase 12.5 — Control-Plane Hardening & Multi-Tenancy | v0.45.1 – v0.45.2 | M7 control-plane HA |
+| Phase 12.6 — Testing, Coverage & Performance-Verification Hardening | v0.45.3 – v0.45.4 | — (CI/tooling hardening; no new coordination protocol) |
 | Phase 13 — Elastic Scaling & Skew Handling | v0.46 – v0.47 | M6 shard migration |
 | Phase 14 — Network Efficiency & Advanced DML | v0.48 – v0.49 | Continuous verification |
 | Phase 15 — Complex Analytics & Compute Tuning | v0.50 – v0.51 | Continuous verification |
