@@ -118,6 +118,22 @@ baseline added for storage, exchange, and frontier-aggregation throughput.
 This plan's Phase Map table above is otherwise unaffected, since this closes a
 verification-tooling gap rather than adding a new pillar or phase.
 
+**Invariant-mapping and error-code compliance gaps found by the 2026-07-11
+four-area audit.** The Testing rung table above promises every coordination
+code path "carries `buggify!()` annotations and is exercised by `SimRuntime`"
+and this plan's own Phase 0 (below) promises every error carries an
+`RS-XXXX` code enforced by CI — in practice, `M2-S3` (single-publisher/
+fencing-token safety, already modeled and passing in
+`formal/m2_frontier_agg.fizz`) has never had a paired Rust assertion, and the
+CI enforcement only ever checked `error!()` log call sites, never `Err(...)`
+construction (concrete gaps found in `rockstream-gateway`'s COPY/`CREATE
+SINK` parsing and `rockstream-runtime`'s durable-shuffle code). Closed by
+**NEW_ROADMAP.md v0.45.6–v0.45.7** (a new Phase 12.8, inserted between the
+roadmap's Phase 12.7 and Phase 13). This plan's Phase Map table above is
+otherwise unaffected, for the same reason Phase 12.6 was: this closes
+verification/enforcement-tooling gaps rather than adding a new pillar or
+phase.
+
 ---
 
 ## Phase Map
@@ -180,8 +196,10 @@ exist and work before any operator is written.
   - `rockstream-cli` — the `rockstream` binary.
 - CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`,
   `cargo deny`, coverage.
-- `rockstream-errors`: every error is an `RS-XXXX` code; CI fails on any
-  returned `Error` or logged `error!` without a code.
+- `rockstream-types::error_code`: every error is an `RS-XXXX` code; CI fails on any
+  returned `Error` or logged `error!` without a code (a 2026-07-11 audit found
+  today's CI check only covers `error!()` call sites, not `Err(...)`
+  construction — see NEW_ROADMAP.md Phase 12.8 / v0.45.7).
 - Hot-path metrics emitter from day one (object-store latency, SST count,
   WAL replay bytes, frontier lag) so "why is it slow?" is answerable on a laptop.
 - Dev container with SlateDB, MinIO, and Postgres preinstalled.

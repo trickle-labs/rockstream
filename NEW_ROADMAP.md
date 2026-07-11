@@ -173,7 +173,7 @@ integration with another process).
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
-| v0.1 | Workspace and CI ✅ Done | Cargo workspace with the focused crate set (`rockstream-types`, `-storage`, `-sim`, `-oracle`, `-plan`, `-diff`, `-ops`, `-sql`, `-runtime`, `-control`, `-gateway`, `-connectors`, `-cli`); CI (`fmt`, `clippy -D warnings`, `test`, `deny`, coverage); `rockstream-errors` registry with CI enforcement; hot-path metrics emitter; dev container with SlateDB/MinIO/Postgres. | Clean CI on a no-op binary; `rockstream --help` works; CI fails the build on any returned `Error` or logged `error!` without an `RS-XXXX` code; no hidden local setup step. | Unit |
+| v0.1 | Workspace and CI ✅ Done | Cargo workspace with the focused crate set (`rockstream-types`, `-storage`, `-sim`, `-oracle`, `-plan`, `-diff`, `-ops`, `-sql`, `-runtime`, `-control`, `-gateway`, `-connectors`, `-cli`); CI (`fmt`, `clippy -D warnings`, `test`, `deny`, coverage); `rockstream-types::error_code` registry with CI enforcement; hot-path metrics emitter; dev container with SlateDB/MinIO/Postgres. | Clean CI on a no-op binary; `rockstream --help` works; CI fails the build on any returned `Error` or logged `error!` without an `RS-XXXX` code; no hidden local setup step. | Unit |
 | v0.2 | Runtime abstraction, simulation, and oracle ✅ Done | `rockstream-sim`: `Runtime` trait (`now`/`spawn`/`sleep`/`object_store`/`network`), `TokioRuntime`, in-memory seeded `SimRuntime`, `buggify!()` macro, fault-model registry, paired-assertion helper. `rockstream-oracle`: DataFusion batch reference + `proptest` harness asserting `incremental == batch`. | A deterministic test replays the same seed byte-for-byte; a different seed changes event order; production build compiles `buggify!()` as a no-op; the oracle harness confirms equivalence on a trivial no-op pipeline. | Unit |
 | v0.3 | SlateDB storage contract and determinism gate ✅ Done | `rockstream-storage` (`ShardDb`): key encoders with `namespace_id` in all catalog keys; `WriteBatch` builders; `DbReader` snapshot reads; WAL tail reader with listing cache; checkpoint helpers; scan-and-delete cleanup. No range deletion anywhere. `rockstream start --role=all --storage=./data` runs a no-op pipeline. | Storage API validation suite proves only supported SlateDB features are used. **SlateDB determinism gate**: a write-heavy `ShardDb` workload run twice at the same seed produces bit-identical key-value state and WAL sequence; any non-deterministic SlateDB background surface is found and constrained before v0.4. `make e2e` brings up MinIO + 1 worker + 1 control and tears it down. | LFS, MinIO, TC |
 
@@ -784,12 +784,103 @@ file.
 |---|---|---|---|---|
 | v0.45.5 | Documentation-Reality Reconciliation & Conformance Locks | Complete the line-by-line audit `docs/language-features.md`'s accuracy note (added this review) commits to, plus the same treatment for `docs/cli.md`, `docs/configuration.md`, and `docs/concepts.md` (§32's `SHOW CLUSTER RESOURCE USAGE`/`view_resource_usage`/`workload_resource_usage` example, found by the round-3 follow-up spot-check, needs the same not-yet-implemented caveat): every remaining "Implemented Today" / reference-table / worked-example claim across all four documents is individually re-verified against `rockstream-sql`, `rockstream-gateway`, `rockstream-cli`, and `rockstream-types::config`, and corrected in place. Regenerate `docs/cli.md` from the real `clap` `Command` definition (or generate it, so it cannot drift again) covering every flag (`--control`, `--auth`, `--metrics-addr`, `--listen`) and the real error-code surface; regenerate `docs/configuration.md`'s reference table directly from `RockstreamConfig`'s real field list and `Default` impl (not hand-copied); fix `docs/sre-operations.md`'s support-bundle section to match the real, already-shipped `support-bundle-<timestamp>.json` artifact and remove the nonexistent `rockstream support-bundle` command reference (correct to the roadmapped v0.55 `rockstream support bundle` name, with a note that it is not yet available). Then add the automated lock this review found missing: a `docs_conformance_tests.rs`-style test (mirroring the existing `conformance_doc_tests.rs`/`docs/pgwire-conformance.md` linked-proof-test pattern already proven at v0.42) that parses `docs/language-features.md`'s "Implemented Today" bullets for backtick-quoted SQL keywords and asserts each one is recognized by `rockstream-sql`'s parser, and a second test that diffs `docs/configuration.md`'s documented keys/defaults against `RockstreamConfig::default()` at compile time. | The new conformance tests fail if a future PR adds a keyword to "Implemented Today" that `rockstream-sql` does not parse, or lets `docs/configuration.md` drift from `RockstreamConfig`'s real fields/defaults; `docs/cli.md` and `docs/configuration.md` match `crates/rockstream-cli`/`rockstream-types::config` exactly, verified by a human diff read at sign-off; `docs/sre-operations.md`'s support-bundle section matches the real JSON artifact format byte-for-byte in a worked example. | Unit |
 
+**Formal-verification & error-code compliance review (2026-07-11, fourth
+pass).** A fourth review pass — a structured four-area audit (FizzBee
+invariant-to-runtime-assertion mapping, error-code registry compliance,
+dependency-graph cycle risk for Phase 13's not-yet-built virtual-bucket
+routing, and metrics-registry cardinality feasibility for v0.45's own LRU
+proposal above) rather than the five-dimension scalability/latency/
+throughput/usability/cost lens the three passes above used — found two
+compliance gaps serious enough to schedule immediately, one small
+doc/reality naming mismatch fixed directly, and one scope clarification each
+for v0.45 (above) and v0.47 (below).
+
+1. **The Formal Verification Track table's own CI claim (below) was false.**
+   It stated "CI cross-checks that every mapped invariant has both a green
+   FizzBee assertion and a present runtime `assert!`." In reality, neither
+   `scripts/check-exit-criteria.sh` (verifies a version's sign-off checklist
+   is complete, nothing about invariants) nor `scripts/check-path-coupling.sh`
+   (verifies only that *some* file under `formal/` changed alongside a
+   `rockstream-{runtime,control,connectors,storage}`/DESIGN.md change — a
+   path-coupling gate, not an invariant-coverage gate) parses a single
+   invariant ID or checks for a paired Rust assertion. Corrected in place
+   below — same "fix the false claim directly, schedule the real fix"
+   precedent as the §8.7/§12.8 stale `Ships:` corrections and the v0.42.2
+   coverage-gate correction.
+2. **`M2-S3` (`M2_S3_SinglePublisherSafety` — at most one frontier-aggregator
+   publisher acts as leader-writer via its fencing token) has no runtime
+   assertion anywhere in `crates/`**, confirmed workspace-wide, not just in
+   `rockstream-control`. This is not a new model to write — `formal/
+   m2_frontier_agg.fizz` already models and passes it, and
+   [FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.7's own delivery-artifact
+   table already prescribes exactly what to build ("assert single CAS-holder
+   of `frontier/leader`; assert `sync:true` flush before lease-handoff
+   read") — it was simply never implemented, unlike `M2-S1`/`S2`/`S4`, which
+   `crates/rockstream-control/src/frontier.rs` does enforce (`M2-S4` with a
+   literal defensive `assert!`; `M2-S1`/`S2` structurally, by only ever
+   publishing a frontier that cannot exceed the true meet of registered
+   shard epochs). `M1-S1`/`S3`/`S4`/`S5`, `M4-S4`, and `M5-S1` also have zero
+   code-level reference anywhere in the workspace; `M2-S3` is the only one of
+   these paired with both a passing FizzBee model and an already-prescribed
+   Rust-side design, which is why it is scheduled as concrete new code below
+   rather than left to the new audit script's own triage pass.
+3. **Naming/reality mismatch, fixed directly (no version needed)**: this
+   document's own v0.1 row and `NEW_IMPLEMENTATION_PLAN.md`'s Phase 0 section
+   both described a `rockstream-errors` registry crate. No such crate has
+   ever existed — the real, working registry is
+   `crates/rockstream-types/src/error_code.rs` (an `ErrorCode` newtype plus
+   ~100 registered `RS-XXXX` constants, exactly as `scripts/
+   check-error-codes.sh`'s own comments already correctly describe). Both
+   references are corrected in place.
+4. **`scripts/check-error-codes.sh` only checks `error!()` log call sites,
+   never `Err(...)` construction.** Every structured `tracing::error!()` call
+   in the workspace does carry a code (the script genuinely enforces this,
+   and genuinely passes) — but `Result`-returning parse/validation errors
+   built as ad hoc strings are entirely invisible to it. Confirmed concrete
+   instances: `crates/rockstream-gateway/src/copy_state.rs`'s
+   `parse_copy_from_stmt` and `server.rs`'s `CREATE SINK` option parsing
+   return bare `format!("...")` strings with no `RS-XXXX` code at all;
+   separately, `crates/rockstream-runtime/src/exchange/durable.rs` reuses the
+   single code `RS_3010` across at least six distinct failure modes
+   (rate-limit exhaustion, generic object-store failure, buffer-capacity
+   exceeded, serialization failure, undersized footer, invalid footer
+   length) — every one carries *a* code, just not a distinguishing one, and
+   being `Err(format!(...))` rather than `error!()`, today's script would not
+   catch a regression here either way.
+
+Both compliance gaps get their own version below — **Phase 12.8 — Invariant
+& Error-Code Compliance Hardening** (v0.45.6–v0.45.7), using the same
+decimal-sub-version mechanism as Phases 12.5–12.7, so nothing from v0.46
+onward is renumbered. Two scope clarifications land on existing rows instead
+of new versions: **v0.45's own metrics-cardinality LRU proposal above
+(`pipeline_id="other"` rollup) is a structural rewrite of `MetricRegistry`
+(`crates/rockstream-types/src/metrics.rs`), not a config change** — its
+per-label maps are plain `HashMap<String, Counter>` with no ordering,
+recency-tracking, or eviction API today (the only removal path is a full,
+test-only `reset_all()`); an LRU cap needs an ordered/bounded structure
+(e.g. promoting the already-transitively-present `lru` crate, pulled in
+today via `slatedb`, to a direct dependency) plus a rollup accumulator on
+every per-pipeline write path and the Prometheus exporter — noted directly
+in v0.45's scope above so the version is not under-estimated as a pure
+config toggle. And **v0.47 below (Hot-Key Virtual Buckets) gets an explicit
+architecture constraint**: the adaptive hot-key-detection/re-splitting logic
+it schedules must be implemented in `rockstream-control`, never in
+`rockstream-plan`, to avoid an unbuildable dependency cycle with
+`rockstream-ops` — see the constraint noted directly in that row.
+
+### Phase 12.8 — Invariant & Error-Code Compliance Hardening
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.45.6 | Formal-Verification Invariant Coverage & Real CI Cross-Check | Add the missing `M2-S3` runtime assertion to `crates/rockstream-control` (fencing-token CAS check on the frontier-aggregator's publisher role, plus a `sync:true`-flush-before-lease-handoff-read assertion, per FIZZBEE_TEST_PLAN.md §3.7's already-prescribed design — no new FizzBee model needed, `formal/m2_frontier_agg.fizz` already models and passes `M2_S3_SinglePublisherSafety`). Build the real CI cross-check the Formal Verification Track table has always claimed exists: a new `scripts/check-invariant-pairs.sh` that parses every named invariant out of `formal/*.fizz`, greps `crates/` for a comment referencing that exact invariant ID, and fails if any invariant modeled in a currently-green `.fizz` file has no Rust-side reference — with a structured escape hatch (a `// INVARIANT-BY-CONSTRUCTION: <ID> — <reason>` comment, for cases like `M2-S1`/`S2` where the guarantee is structural rather than a redundant runtime `assert!`) so the script does not force pointless defensive asserts onto code that is already correct by construction. Run the new script once against the current tree and triage every invariant it flags among `M1-S1`/`S3`/`S4`/`S5`, `M4-S4`, `M5-S1`: each gets either a real `assert!`/`debug_assert!` or a justified `INVARIANT-BY-CONSTRUCTION` comment — none may be left with neither. | `scripts/check-invariant-pairs.sh` runs in CI and fails on a deliberately-reverted `M2-S3`/`M4-S1` assertion-removal test case; it passes on the real tree only after every one of `M1-S1`/`S3`/`S4`/`S5`/`M2-S3`/`M4-S4`/`M5-S1` carries either a runtime check or a reviewed `INVARIANT-BY-CONSTRUCTION` comment; the Formal Verification Track table's CI claim is true, not aspirational; a real 3-aggregator `SimRuntime` scenario proves a stale-fenced publisher can never re-publish a frontier after a new leader's token supersedes it. | Unit |
+| v0.45.7 | Error-Code Registry Enforcement Hardening | Fix `crates/rockstream-gateway/src/copy_state.rs`'s `parse_copy_from_stmt` and `server.rs`'s `CREATE SINK` option-parsing errors to return a registered `RS-XXXX` code instead of a bare string (new codes as needed); split `crates/rockstream-runtime/src/exchange/durable.rs`'s single overloaded `RS_3010` into distinct codes per failure mode (rate-limit exhaustion, object-store I/O failure, buffer-capacity exceeded, serialization failure, corrupt/undersized footer) so operators can distinguish them without reading source. Extend `scripts/check-error-codes.sh` (or add a companion script invoked alongside it in CI) to also flag `Err(format!(...))`/`Err(String::from(...))`/bare-string `Result` construction sites lacking an `RS-XXXX` reference — propagated (`?`-operator) errors and errors already wrapping a coded type remain exempt; only newly constructed ad hoc errors are in scope. | The extended `check-error-codes.sh` (or its companion) fails CI on a deliberately-reintroduced bare `Err(format!("boom"))` anywhere in `crates/`; `copy_state.rs` and the `CREATE SINK` option parser's error paths each carry a distinct, registered code with actionable `next_steps` text (new `copy_error_code_tests.rs`); `durable.rs`'s six previously-`RS_3010`-only failure modes are independently distinguishable in logs/responses (new `durable_shuffle_error_code_tests.rs`). | Unit |
+
 ### Phase 13 — Elastic Scaling & Skew Handling
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
 | v0.46 | Online Shard Migration & Elasticity | Before any splitting/rebalancing code is written, model-check the shard-migration protocol in FizzBee (binding pre-implementation requirement from v0.18): **M6 model** `formal/m6_shard_migration.fizz` with safety invariants (no dual-writer window — a bucket is authoritative on exactly one shard at any committed epoch; no lost writes across `DUAL_WRITING`→`CUTOVER`; `GC_ELIGIBLE` never fires before the migration's consumer frontier passes cutover) and liveness (`migration_state` always eventually reaches `DONE` or `ABORTED`, never stuck). Implement DESIGN.md §10.1–§10.4's full migration state machine (`PLANNED → SNAPSHOTTING → COPYING → DUAL_WRITING → CATCHING_UP → FENCING_OLD → CUTOVER → VERIFYING → GC_ELIGIBLE → DONE`, with per-state timeout budgets and `ABORTED` rollback through `VERIFYING`) for online shard add/remove, and the §10.7 worker-drain protocol (`DRAINING` → `DECOMMISSIONED`). This is the prerequisite substrate the (already-drafted) v0.55 admin CLI's `shard {list,migrate}` and `cluster workers drain` commands assume exists — until this version, they would have been thin wrappers over nothing. Also closes the Phase 4 exit-criteria waiver: the original real ≥4-host network throughput test (waived at Phase 4 with a `SimNetwork`-only proof and "a commitment to run the real-network test before Phase 8") is executed here for the first time against a live shard migration, since no prior sign-off records it having been run. | `formal/m6_shard_migration.fizz` is green at CI-fast bounds (all safety and liveness invariants hold; any counterexample archived in `formal/findings.md` and replayed as a permanent `SimRuntime` regression seed); a real ≥4-host cluster (TC, real network) migrates a bucket range from a donor to a recipient shard with zero reads or writes lost, verified by a scan comparing donor/recipient state at cutover; killing the donor mid-`DUAL_WRITING` and mid-`CUTOVER` both recover correctly (`ABORTED` rollback or completed `DONE`, never a stuck or split-brained bucket); `rockstream cluster workers drain <id>` (added as a CLI stub here, ahead of the rest of the admin CLI at v0.55) completes a full worker drain with zero shard downtime; the previously-waived Phase 4 real-network commitment is marked closed in this sign-off. | Unit, LFS, MinIO, TC |
-| v0.47 | Hot-Key Virtual Buckets, Proactive Shard Splitting & Autoscaling Signals | Implement DESIGN.md §10.5's hot-key detection (per-key CPU/bytes/state-write tracking against `hot_key_factor`) and virtual-bucket salting with the final unsalted combiner, including the non-composable-law exception (`SKEW_BOUND_NON_COMPOSABLE` routing to a single spill shard for laws like `WeightAdd/v1`/DISTINCT); §10.6's proactive shard splitting at `1.5 × target_shard_state_bytes` (built on v0.46's migration machinery) and its reverse (cold-shard merge at the `min_shard_state_bytes` floor); the "adaptive skew splitting" control loop from §14.5, which DESIGN.md currently (incorrectly) documents as already on by default; and §10.8's `cluster_worker_pressure`/`demanded_shard_count`/`placed_shard_count` Prometheus export with a real Kubernetes HPA (or KEDA) integration test proving an actual scale-out and scale-in happen from these signals, not just that the metrics exist. | A synthetic hot key at 50× the median shard's load is detected and split into virtual buckets within `hot_key_factor` breach + 30s, with output remaining bit-identical to the non-split oracle; a shard crossing `1.5 × target_shard_state_bytes` splits in the background with zero operator action and zero pipeline downtime; a non-composable aggregate (DISTINCT) on a hot key correctly routes to a single spill shard and never double-emits under bucket salting (oracle property test); a real k8s cluster with HPA configured against the exported `cluster_worker_pressure` metric adds a worker within 2 minutes of a sustained 10× shard-demand spike and removes it within 10 minutes of the spike ending. | Unit, LFS, MinIO, TC |
+| v0.47 | Hot-Key Virtual Buckets, Proactive Shard Splitting & Autoscaling Signals | Implement DESIGN.md §10.5's hot-key detection (per-key CPU/bytes/state-write tracking against `hot_key_factor`) and virtual-bucket salting with the final unsalted combiner, including the non-composable-law exception (`SKEW_BOUND_NON_COMPOSABLE` routing to a single spill shard for laws like `WeightAdd/v1`/DISTINCT); §10.6's proactive shard splitting at `1.5 × target_shard_state_bytes` (built on v0.46's migration machinery) and its reverse (cold-shard merge at the `min_shard_state_bytes` floor); the "adaptive skew splitting" control loop from §14.5, which DESIGN.md currently (incorrectly) documents as already on by default; and §10.8's `cluster_worker_pressure`/`demanded_shard_count`/`placed_shard_count` Prometheus export with a real Kubernetes HPA (or KEDA) integration test proving an actual scale-out and scale-in happen from these signals, not just that the metrics exist. **Architecture constraint (2026-07-11 compliance audit)**: the adaptive hot-key-detection and re-splitting decision logic above must be implemented in `rockstream-control` — DESIGN.md §10.5 already names the control plane as the decision-maker — and never in `rockstream-plan`; `rockstream-ops`/`rockstream-sql`/`rockstream-diff` already depend on `rockstream-plan` for its `PlanNode`/`OpNode` IR, so a `rockstream-plan → rockstream-ops` edge (e.g. to read live per-operator skew statistics) would close an unbuildable cycle. `rockstream-plan` is limited to the deterministic virtual-bucket `OpNode` variants and the pure rendezvous-hash routing function; `rockstream-control` takes a new, verified-safe dependency on `rockstream-plan` to emit/mutate them. | A synthetic hot key at 50× the median shard's load is detected and split into virtual buckets within `hot_key_factor` breach + 30s, with output remaining bit-identical to the non-split oracle; a shard crossing `1.5 × target_shard_state_bytes` splits in the background with zero operator action and zero pipeline downtime; a non-composable aggregate (DISTINCT) on a hot key correctly routes to a single spill shard and never double-emits under bucket salting (oracle property test); a real k8s cluster with HPA configured against the exported `cluster_worker_pressure` metric adds a worker within 2 minutes of a sustained 10× shard-demand spike and removes it within 10 minutes of the spike ending. | Unit, LFS, MinIO, TC |
 
 ### Phase 14 — Network Efficiency & Advanced DML
 
@@ -849,11 +940,18 @@ the design is verified before the implementation exists.
 | v0.23–v0.59 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M7 | A coordination-protocol change without a model touch fails CI; the v0.59 RC1 gate re-runs the relaxed-bounds sweep |
 
 Every row above maps each FizzBee invariant to a paired runtime `assert!` per
-[FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6; CI cross-checks that every
-mapped invariant has both a green FizzBee assertion and a present runtime
-`assert!`. A FizzBee counterexample for any protocol becomes a named
-`SimRuntime` regression seed before the model is fixed, and is replayed on every
-build thereafter.
+[FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.6. **Correction (2026-07-11
+compliance audit)**: the sentence that used to stand here claimed "CI
+cross-checks that every mapped invariant has both a green FizzBee assertion
+and a present runtime `assert!`" — that has never been true; neither
+`scripts/check-exit-criteria.sh` nor `scripts/check-path-coupling.sh` parses
+invariant IDs or verifies a paired assertion (path-coupling only checks that
+*some* `formal/` file changed alongside a coordination-protocol change). The
+real cross-check is built at **v0.45.6** (Phase 12.8 below), which also
+closes the one invariant this audit found with a passing FizzBee model but no
+Rust-side counterpart at all: `M2-S3`. A FizzBee counterexample for any
+protocol becomes a named `SimRuntime` regression seed before the model is
+fixed, and is replayed on every build thereafter.
 
 ---
 
@@ -878,6 +976,7 @@ build thereafter.
 | Phase 12.5 — Control-Plane Hardening & Multi-Tenancy | v0.45.1 – v0.45.2 | M7 control-plane HA |
 | Phase 12.6 — Testing, Coverage & Performance-Verification Hardening | v0.45.3 – v0.45.4 | — (CI/tooling hardening; no new coordination protocol) |
 | Phase 12.7 — User-Facing Documentation Accuracy & Drift Prevention | v0.45.5 | — (documentation reconciliation; no new coordination protocol) |
+| Phase 12.8 — Invariant & Error-Code Compliance Hardening | v0.45.6 – v0.45.7 | M2-S3 (already modeled in `formal/m2_frontier_agg.fizz`; no new model) |
 | Phase 13 — Elastic Scaling & Skew Handling | v0.46 – v0.47 | M6 shard migration |
 | Phase 14 — Network Efficiency & Advanced DML | v0.48 – v0.49 | Continuous verification |
 | Phase 15 — Complex Analytics & Compute Tuning | v0.50 – v0.51 | Continuous verification |
@@ -891,5 +990,5 @@ fault-tolerant before the Postgres layer depends on it, ingestion connectors
 and crucible soaks validate real-world pressure before HTAP ergonomics, the
 Nexmark suite certifies end-to-end correctness (including retraction/Z-set semantics) on the full stack,
 PostgreSQL wire protocol hardening (v0.37–v0.39) and end-user certification (v0.40–v0.42) ensure any standard driver works without workarounds and that a complete application can be built on the wire protocol alone,
-and the data lake bridge (with its FizzBee pre-model and simulator fidelity foundation at v0.43), control-plane hardening and multi-tenancy (v0.45.1–v0.45.2), elastic shard migration and hot-key/skew handling (v0.46–v0.47), network optimizations, complex analytics, and data
+and the data lake bridge (with its FizzBee pre-model and simulator fidelity foundation at v0.43), control-plane hardening and multi-tenancy (v0.45.1–v0.45.2), invariant and error-code compliance hardening (v0.45.6–v0.45.7), elastic shard migration and hot-key/skew handling (v0.46–v0.47), network optimizations, complex analytics, and data
 governance layers, an operator-grade CLI and arrangement debugger, internal mTLS and secrets management, and a proven rolling-upgrade/disaster-recovery story close out 1.0 through v0.59.

@@ -2049,7 +2049,14 @@ limit); if above 0.8, it halves the quantum.
 > this section's mechanisms exist in the running system — shards are placed
 > once at pipeline creation and rebalanced only via capacity-aware placement
 > of existing shards (the `capacity_headroom` signal below, which IS
-> implemented).
+> implemented). **Architecture constraint added by the 2026-07-11 four-area
+> compliance audit**: the adaptive parts of §10.5 below (hot-key detection
+> and the re-splitting decision, points 1–2) must be implemented in
+> `rockstream-control`, never in `rockstream-plan` — `rockstream-ops`/
+> `rockstream-sql`/`rockstream-diff` already depend on `rockstream-plan` for
+> its `PlanNode`/`OpNode` IR, so a `rockstream-plan → rockstream-ops` edge
+> would close an unbuildable cycle. See NEW_ROADMAP.md's v0.47 row for the
+> full reasoning.
 
 ### 10.1 The Shard Map
 
@@ -4753,7 +4760,13 @@ NEW_ROADMAP.md Phase 12)**: the metrics exporter maintains a full
 per-pipeline label breakdown only for an LRU/recent-traffic working set of
 up to 256 pipelines, and rolls every pipeline outside that working set into
 one aggregate `pipeline_id="other"` series rather than refusing to create it
-or silently dropping its metrics.
+or silently dropping its metrics. **Implementation note (2026-07-11
+audit)**: today's `MetricRegistry` (`crates/rockstream-types/src/metrics.rs`)
+stores each per-label map as a plain, unordered `HashMap` with no
+recency-tracking or eviction API (only a full, test-only `reset_all()`
+exists) — this is a structural change (e.g. promoting the
+already-transitively-available `lru` crate to a direct dependency), not a
+config-only toggle.
 
 Custom labels (e.g., user-defined pipeline tags) are limited to 8 additional
 labels with ≤ 64 distinct values each. Labels violating these limits are
