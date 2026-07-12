@@ -17,6 +17,13 @@ use rockstream_gateway::{
     GatewayError, GatewayServer,
 };
 use rockstream_storage::{ShardDb, ShardReader};
+use rockstream_types::{
+    cost::set_active_pricing_config,
+    metrics::{
+        reset_all, set_freshness_lag, set_pipeline_state_bytes, set_state_budget,
+        set_workload_memory,
+    },
+};
 use tokio::io::AsyncWriteExt;
 use tokio_postgres::NoTls;
 
@@ -54,6 +61,34 @@ async fn connect_port(port: u16) -> tokio_postgres::Client {
     client
 }
 
+async fn connect_with_notices(
+    port: u16,
+) -> (
+    tokio_postgres::Client,
+    tokio::sync::mpsc::UnboundedReceiver<tokio_postgres::error::DbError>,
+) {
+    let (client, mut conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=test dbname=test"),
+        NoTls,
+    )
+    .await
+    .expect("connect failed");
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let msg = futures::future::poll_fn(|cx| conn.poll_message(cx)).await;
+            match msg {
+                Some(Ok(tokio_postgres::AsyncMessage::Notice(n))) => {
+                    let _ = tx.send(n);
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
+            }
+        }
+    });
+    (client, rx)
+}
+
 /// Extract `SimpleQueryMessage::Row` entries from a simple_query result.
 fn data_rows_from(
     msgs: &[tokio_postgres::SimpleQueryMessage],
@@ -64,6 +99,22 @@ fn data_rows_from(
             _ => None,
         })
         .collect()
+}
+
+fn is_uuid_v4ish(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    let expected = [8, 4, 4, 4, 12];
+    if parts
+        .iter()
+        .zip(expected)
+        .any(|(part, len)| part.len() != len || !part.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return false;
+    }
+    parts[2].starts_with('4')
 }
 
 async fn start_gateway_noop(catalog: CatalogStubs) -> (u16, tokio::task::JoinHandle<()>) {
@@ -1168,6 +1219,108 @@ async fn multi_row_insert_values_returning_returns_all_rows() {
     assert_eq!(data_rows[2].get("name"), Some("Gamma"));
 }
 
+#[tokio::test]
+async fn insert_returning_generates_uuid_default_and_persists_it() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("v045-returning-uuid").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE widgets (id UUID DEFAULT gen_random_uuid(), email TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v045-returning-uuid-key'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    let rows = client
+        .simple_query("INSERT INTO widgets (email) VALUES ('a@example.com') RETURNING *")
+        .await
+        .expect("INSERT RETURNING failed");
+    let data_rows = data_rows_from(&rows);
+    assert_eq!(data_rows.len(), 1, "expected one RETURNING row");
+
+    let generated_id = data_rows[0].get("id").expect("missing generated id");
+    assert!(
+        is_uuid_v4ish(generated_id),
+        "expected UUID-looking id, got {generated_id}"
+    );
+    assert_eq!(data_rows[0].get("email"), Some("a@example.com"));
+
+    let selected = client
+        .simple_query("SELECT * FROM widgets")
+        .await
+        .expect("SELECT widgets failed");
+    let selected_rows = data_rows_from(&selected);
+    assert_eq!(selected_rows.len(), 1, "expected one persisted row");
+    assert_eq!(selected_rows[0].get("id"), Some(generated_id));
+    assert_eq!(selected_rows[0].get("email"), Some("a@example.com"));
+}
+
+#[tokio::test]
+async fn insert_returning_generates_identity_values_sequentially() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("v045-returning-identity").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE seq_items (id BIGINT GENERATED ALWAYS AS IDENTITY, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v045-returning-identity-1'")
+        .await
+        .expect("SET idempotency_key failed");
+    let first = client
+        .simple_query("INSERT INTO seq_items (name) VALUES ('alpha') RETURNING *")
+        .await
+        .expect("first INSERT RETURNING failed");
+    let first_rows = data_rows_from(&first);
+    assert_eq!(first_rows[0].get("id"), Some("1"));
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v045-returning-identity-2'")
+        .await
+        .expect("SET idempotency_key failed");
+    let second = client
+        .simple_query("INSERT INTO seq_items (name) VALUES ('beta') RETURNING *")
+        .await
+        .expect("second INSERT RETURNING failed");
+    let second_rows = data_rows_from(&second);
+    assert_eq!(second_rows[0].get("id"), Some("2"));
+}
+
+#[tokio::test]
+async fn multi_row_insert_returning_generates_distinct_identity_values_in_order() {
+    let (port, _handle, _shard_db) =
+        start_gateway_with_shard("v045-returning-identity-multi").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE seq_batch (id BIGINT GENERATED ALWAYS AS IDENTITY, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v045-returning-identity-multi-key'")
+        .await
+        .expect("SET idempotency_key failed");
+
+    let rows = client
+        .simple_query(
+            "INSERT INTO seq_batch (name) VALUES ('alpha'), ('beta'), ('gamma') RETURNING *",
+        )
+        .await
+        .expect("multi-row INSERT RETURNING failed");
+    let data_rows = data_rows_from(&rows);
+    assert_eq!(data_rows.len(), 3, "expected three RETURNING rows");
+    assert_eq!(data_rows[0].get("id"), Some("1"));
+    assert_eq!(data_rows[1].get("id"), Some("2"));
+    assert_eq!(data_rows[2].get("id"), Some("3"));
+    assert_eq!(data_rows[0].get("name"), Some("alpha"));
+    assert_eq!(data_rows[1].get("name"), Some("beta"));
+    assert_eq!(data_rows[2].get("name"), Some("gamma"));
+}
+
 /// v0.42.2 green gate: a malformed multi-row VALUES list (a row with the
 /// wrong number of values) returns a hard `RS-2056` parse error instead of
 /// silently corrupting or dropping data.
@@ -1904,6 +2057,173 @@ async fn session_ryw_opt_out() {
     );
 }
 
+#[tokio::test]
+async fn session_max_staleness_notice_emits_and_query_still_returns() {
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("v045-max-staleness", store)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server =
+        GatewayServer::with_shard_db(addr, catalog, Arc::new(NoopViewReader), shard_db.clone());
+    let handler = server.handler().clone();
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let (client, mut notice_rx) = connect_with_notices(local_addr.port()).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v045-max-staleness-key'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    let stale_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - 20_000;
+    handler.set_frontier_published_at_ms_for_test(stale_ms);
+
+    client
+        .simple_query("SET rockstream.max_staleness = '10s'")
+        .await
+        .expect("SET max_staleness failed");
+    let rows = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT t failed");
+    let data_rows = data_rows_from(&rows);
+    assert_eq!(data_rows.len(), 1, "query must still return the stale row");
+
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(2), notice_rx.recv())
+        .await
+        .expect("timed out waiting for notice")
+        .expect("notice channel closed");
+    assert!(
+        notice.message().contains("session.staleness_exceeded"),
+        "expected RS-2018 staleness notice, got {}",
+        notice.message()
+    );
+    assert_eq!(notice.code().code(), "01000");
+
+    let frontier_age = client
+        .simple_query("SHOW frontier_age_ms")
+        .await
+        .expect("SHOW frontier_age_ms failed");
+    let age_rows = data_rows_from(&frontier_age);
+    let age_ms: u64 = age_rows[0]
+        .get("frontier_age_ms")
+        .expect("missing frontier_age_ms")
+        .parse()
+        .expect("frontier_age_ms must be numeric");
+    assert!(
+        age_ms >= 10_000,
+        "frontier age should be stale, got {age_ms}ms"
+    );
+}
+
+#[tokio::test]
+async fn session_mode_tracks_mutual_exclusion_between_wait_for_and_max_staleness() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("v045-session-mode").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query(r#"SET rockstream.wait_for = '{"table_name":"t","source_epoch":9}'"#)
+        .await
+        .expect("SET wait_for failed");
+    let initial = client
+        .simple_query("SHOW rockstream.session_mode")
+        .await
+        .expect("SHOW session_mode failed");
+    assert_eq!(
+        data_rows_from(&initial)[0].get("rockstream.session_mode"),
+        Some("wait_for")
+    );
+
+    client
+        .simple_query("SET rockstream.max_staleness = '10s'")
+        .await
+        .expect("SET max_staleness failed");
+    let after_max = client
+        .simple_query("SHOW rockstream.session_mode")
+        .await
+        .expect("SHOW session_mode failed");
+    assert_eq!(
+        data_rows_from(&after_max)[0].get("rockstream.session_mode"),
+        Some("max_staleness")
+    );
+
+    client
+        .simple_query("SET rockstream.session_wait_for = 'on'")
+        .await
+        .expect("SET session_wait_for failed");
+    let after_wait = client
+        .simple_query("SHOW rockstream.session_mode")
+        .await
+        .expect("SHOW session_mode failed");
+    assert_eq!(
+        data_rows_from(&after_wait)[0].get("rockstream.session_mode"),
+        Some("wait_for")
+    );
+}
+
+#[tokio::test]
+async fn write_fence_token_can_be_used_by_another_session_via_after_fence() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("v045-write-fence").await;
+    let writer = connect_port(port).await;
+    let reader = connect_port(port).await;
+
+    writer
+        .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    writer
+        .simple_query("SET rockstream.idempotency_key = 'v045-write-fence-key'")
+        .await
+        .expect("SET idempotency_key failed");
+    writer
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'visible')")
+        .await
+        .expect("INSERT failed");
+    writer.simple_query("COMMIT").await.expect("COMMIT failed");
+
+    let fence_rows = writer
+        .simple_query("SELECT rockstream.write_fence() AS fence")
+        .await
+        .expect("write_fence failed");
+    let fence = data_rows_from(&fence_rows)[0]
+        .get("fence")
+        .expect("missing fence token");
+
+    let t0 = Instant::now();
+    let selected = reader
+        .simple_query(&format!(
+            "SELECT * FROM t WHERE rockstream.after_fence('{fence}')"
+        ))
+        .await
+        .expect("after_fence SELECT failed");
+    let elapsed_ms = t0.elapsed().as_millis();
+    let rows = data_rows_from(&selected);
+    assert_eq!(rows.len(), 1, "expected the fenced row to be visible");
+    assert_eq!(rows[0].get("id"), Some("1"));
+    assert_eq!(rows[0].get("val"), Some("visible"));
+    assert!(
+        elapsed_ms < 200,
+        "after_fence should reuse bounded wait_for path, took {elapsed_ms}ms"
+    );
+}
+
 // ── v0.26 S8: explain_names_pushdown_effect ──────────────────────────────────
 
 /// EXPLAIN SELECT k, COUNT(*) FROM mv GROUP BY k → output contains "partial_pushdown: true".
@@ -1964,6 +2284,141 @@ async fn explain_no_pushdown_for_full_scan() {
         !plan_text.contains("partial_pushdown: true"),
         "EXPLAIN SELECT * must NOT contain 'partial_pushdown: true', got: {plan_text}"
     );
+}
+
+#[tokio::test]
+async fn explain_incremental_matches_frontend_byte_for_byte() {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogView};
+    use rockstream_sql::SqlFrontend;
+    use rockstream_types::explain::ExplainLevel;
+
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_view(CatalogView {
+        name: "inc_mv".to_string(),
+        sql: "SELECT id FROM base".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+        namespace: "public".to_string(),
+    });
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    let msgs = client
+        .simple_query("EXPLAIN INCREMENTAL inc_mv")
+        .await
+        .expect("EXPLAIN INCREMENTAL failed");
+    let gateway_output = data_rows_from(&msgs)
+        .iter()
+        .filter_map(|row| row.get(0).map(|s| s.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let frontend = SqlFrontend::new();
+    frontend
+        .register_table(
+            "inc_mv",
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+        )
+        .unwrap();
+    let direct = frontend
+        .explain_incremental_for_sql("SELECT * FROM inc_mv", ExplainLevel::Default, &[])
+        .await
+        .unwrap();
+
+    assert_eq!(gateway_output, direct);
+}
+
+#[tokio::test]
+async fn explain_incremental_analyze_reflects_live_view_traffic() {
+    use rockstream_gateway::catalog_stubs::{CatalogColumn, CatalogView};
+    use rockstream_gateway::view_reader::ViewReadStrategy;
+    use rockstream_types::ids::OperatorId;
+    use std::time::{Duration, SystemTime};
+
+    struct InstrumentedViewReader;
+
+    #[async_trait::async_trait]
+    impl ViewReader for InstrumentedViewReader {
+        async fn read_view(
+            &self,
+            _view_name: &str,
+            _limit: Option<usize>,
+            _strategy: ViewReadStrategy,
+        ) -> Result<Vec<Vec<u8>>, GatewayError> {
+            rockstream_types::metrics::record_operator_runtime_sample_at(
+                OperatorId(1),
+                120,
+                18,
+                Duration::from_millis(9),
+                2,
+                SystemTime::now(),
+            );
+            Ok(vec![b"1".to_vec(), b"2".to_vec()])
+        }
+
+        fn published_frontier(&self) -> Option<u64> {
+            Some(77)
+        }
+    }
+
+    rockstream_types::metrics::reset_all();
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_view(CatalogView {
+        name: "analyze_mv".to_string(),
+        sql: "SELECT id FROM base".to_string(),
+        columns: vec![CatalogColumn {
+            name: "id".to_string(),
+            data_type: "Int64".to_string(),
+        }],
+        namespace: "public".to_string(),
+    });
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(InstrumentedViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    client
+        .simple_query("SELECT * FROM analyze_mv")
+        .await
+        .expect("SELECT failed");
+
+    let msgs = client
+        .simple_query("EXPLAIN INCREMENTAL ANALYZE analyze_mv")
+        .await
+        .expect("EXPLAIN INCREMENTAL ANALYZE failed");
+    let plan_output = data_rows_from(&msgs)
+        .iter()
+        .filter_map(|row| row.get(0).map(|s| s.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plan_output.contains("rows/s=2"), "output: {plan_output}");
+    assert!(
+        plan_output.contains("state_reads=18"),
+        "output: {plan_output}"
+    );
+    assert!(plan_output.contains("p99=9.0ms"), "output: {plan_output}");
+    assert!(
+        plan_output.contains("dlq_entries=2"),
+        "output: {plan_output}"
+    );
+    assert!(
+        !plan_output.contains("rows/s=12500"),
+        "output: {plan_output}"
+    );
+
+    rockstream_types::metrics::reset_all();
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2757,6 +3212,125 @@ async fn last_hop_select_returns_rows_after_commit() {
         amount_val, "200",
         "expected amount=200 in high_value row; got {amount_val}"
     );
+}
+
+#[tokio::test]
+async fn resource_usage_show_matches_catalog_table() {
+    reset_all();
+    set_active_pricing_config(None);
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("resource-usage-shard", store)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db);
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query(
+            "CREATE WORKLOAD fast_lane WITH (MEMORY_LIMIT = 8192, FRESHNESS_SLO_MS = 500)",
+        )
+        .await
+        .expect("CREATE WORKLOAD fast_lane");
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE orders");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW big_orders WITH WORKLOAD = fast_lane AS SELECT id, amount FROM orders WHERE amount > 50",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW big_orders");
+
+    set_workload_memory("fast_lane", 4096);
+    set_pipeline_state_bytes("big_orders", 2048);
+    set_state_budget(8192);
+    set_freshness_lag("big_orders", 250);
+
+    let show_msgs = client
+        .simple_query("SHOW RESOURCE USAGE")
+        .await
+        .expect("SHOW RESOURCE USAGE");
+    let show_rows = data_rows_from(&show_msgs);
+    assert_eq!(show_rows.len(), 1);
+
+    let table_msgs = client
+        .simple_query("SELECT * FROM rockstream_catalog.view_resource_usage")
+        .await
+        .expect("SELECT view_resource_usage");
+    let table_rows = data_rows_from(&table_msgs);
+    assert_eq!(table_rows.len(), 1);
+    let workload_msgs = client
+        .simple_query("SHOW RESOURCE USAGE FOR WORKLOAD fast_lane")
+        .await
+        .expect("SHOW RESOURCE USAGE FOR WORKLOAD fast_lane");
+    let workload_rows = data_rows_from(&workload_msgs);
+    assert_eq!(workload_rows.len(), 1);
+    let workload_table_msgs = client
+        .simple_query("SELECT * FROM rockstream_catalog.workload_resource_usage")
+        .await
+        .expect("SELECT workload_resource_usage");
+    let workload_table_rows = data_rows_from(&workload_table_msgs);
+    assert_eq!(workload_table_rows.len(), 1);
+    let cluster_msgs = client
+        .simple_query("SHOW CLUSTER RESOURCE USAGE")
+        .await
+        .expect("SHOW CLUSTER RESOURCE USAGE");
+    let cluster_rows = data_rows_from(&cluster_msgs);
+    assert_eq!(cluster_rows.len(), 1);
+
+    for col in [
+        "view_name",
+        "workload_name",
+        "state_bytes",
+        "memory_bytes",
+        "memory_limit_bytes",
+        "state_budget_bytes",
+        "freshness_slo_ms",
+        "freshness_lag_ms",
+        "slo_compliant",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            show_rows[0].get(col.0),
+            table_rows[0].get(col.1),
+            "column {} differed",
+            col.1
+        );
+    }
+    assert_eq!(show_rows[0].get(0).unwrap_or(""), "big_orders");
+    assert_eq!(show_rows[0].get(1).unwrap_or(""), "fast_lane");
+    assert_eq!(show_rows[0].get(2).unwrap_or(""), "2048");
+    assert_eq!(show_rows[0].get(3).unwrap_or(""), "4096");
+    assert_eq!(show_rows[0].get(6).unwrap_or(""), "500");
+    assert_eq!(show_rows[0].get(7).unwrap_or(""), "250");
+    assert_eq!(show_rows[0].get(8).unwrap_or(""), "true");
+    assert!(show_rows[0].get(10).is_none());
+    assert_eq!(workload_rows[0].get(0).unwrap_or(""), "fast_lane");
+    assert_eq!(workload_rows[0].get(1).unwrap_or(""), "1");
+    assert_eq!(workload_rows[0].get(2).unwrap_or(""), "2048");
+    assert_eq!(workload_rows[0].get(3).unwrap_or(""), "4096");
+    assert_eq!(workload_rows[0].get(6).unwrap_or(""), "500");
+    assert_eq!(workload_rows[0].get(7).unwrap_or(""), "250");
+    assert_eq!(workload_rows[0].get(8).unwrap_or(""), "true");
+    assert_eq!(
+        workload_rows[0].get(0),
+        workload_table_rows[0].get("workload_name")
+    );
+    assert_eq!(cluster_rows[0].get(0).unwrap_or(""), "cluster");
+    assert_eq!(cluster_rows[0].get(1).unwrap_or(""), "1");
+    assert_eq!(cluster_rows[0].get(2).unwrap_or(""), "2048");
+    assert_eq!(cluster_rows[0].get(3).unwrap_or(""), "4096");
 }
 
 // ── Tutorial DAG: 3-level view chain (aggregate → join → filter) ─────────────

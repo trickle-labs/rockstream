@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -256,6 +257,7 @@ impl Operator for AggregateOp {
     /// - Emit retraction of old aggregate row (if group existed).
     /// - Emit insertion of new aggregate row (if group still exists).
     fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        let started_at = Instant::now();
         if delta.is_empty() {
             return Ok(ArrowZSet::empty(output_schema()));
         }
@@ -351,6 +353,22 @@ impl Operator for AggregateOp {
             input_rows = n,
             output_rows = out_k.len(),
             "AggregateOp: processed delta"
+        );
+        let metric_key = rockstream_types::metrics::LawMetricKey {
+            law_id: rockstream_types::laws::weight_add::WEIGHT_ADD_ID,
+            law_name: "WeightAdd",
+            law_version: 1,
+            operator_id: Some(self.op_id),
+        };
+        for _ in 0..n {
+            rockstream_types::metrics::inc_rmw_avoided(&metric_key);
+        }
+        rockstream_types::metrics::record_operator_runtime_sample(
+            self.op_id,
+            n as u64,
+            n as u64,
+            started_at.elapsed(),
+            0,
         );
 
         if out_k.is_empty() {

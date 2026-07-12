@@ -4,9 +4,11 @@
 //! pgwire library. The same handler implements both simple and extended query
 //! protocols.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -40,13 +42,16 @@ use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Parse, ParseComplete, PortalSuspended,
     TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
 };
-use pgwire::messages::response::{CommandComplete, EmptyQueryResponse};
-use pgwire::messages::startup::BackendKeyData;
+use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, NoticeResponse};
+use pgwire::messages::startup::{BackendKeyData, ParameterStatus};
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
+use rockstream_sql::SqlFrontend;
+use rockstream_types::explain::ExplainLevel;
+use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef};
 
 use crate::auth::{
     scram_server_key, scram_server_signature, scram_stored_key, verify_client_proof, AuthMode,
@@ -61,7 +66,7 @@ use crate::copy_state::{
 };
 use crate::notify_registry::NotifyRegistry;
 use crate::role_catalog::RoleCatalog;
-use crate::session::{FreshnessToken, ScramAuthState, SessionState};
+use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
 use crate::GatewayError;
@@ -475,6 +480,15 @@ fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType 
     }
 }
 
+fn catalog_columns_to_schema(columns: &[CatalogColumn]) -> Arc<Schema> {
+    Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|col| Field::new(&col.name, string_to_arrow_datatype(&col.data_type), true))
+            .collect::<Vec<_>>(),
+    ))
+}
+
 fn pg_type_from_arrow_datatype(dt: &datafusion::arrow::datatypes::DataType) -> Type {
     use datafusion::arrow::datatypes::DataType;
     let oid = match dt {
@@ -707,6 +721,25 @@ enum WaitResult {
     NoStorage,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GeneratedColumnKind {
+    RandomUuid,
+    Identity,
+}
+
+#[derive(Debug)]
+struct TableInsertMetadata {
+    generated_columns: HashMap<String, GeneratedColumnKind>,
+    identity_sequences: HashMap<String, Arc<AtomicU64>>,
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 // ── Postgres Type from OID helper ─────────────────────────────────────────────
 
 fn pg_type_from_oid(oid: i32) -> Type {
@@ -789,6 +822,10 @@ pub struct GatewayHandler {
     pub notify_registry: Arc<NotifyRegistry>,
     /// Transactional NOTIFYs buffered until COMMIT. Bound: MAX_OUTBOX_PER_CONNECTION.
     pending_notifies: Arc<DashMap<String, Vec<(String, String)>>>,
+    /// CREATE TABLE-side metadata needed for server-assigned INSERT values.
+    table_insert_metadata: Arc<DashMap<String, Arc<TableInsertMetadata>>>,
+    /// Wall-clock publish timestamp of the most recently advanced shard frontier.
+    frontier_published_at_ms: Arc<AtomicU64>,
 }
 
 impl GatewayHandler {
@@ -813,6 +850,8 @@ impl GatewayHandler {
             cancellation_registry: Arc::new(DashMap::new()),
             notify_registry: Arc::new(NotifyRegistry::new()),
             pending_notifies: Arc::new(DashMap::new()),
+            table_insert_metadata: Arc::new(DashMap::new()),
+            frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
         }
     }
 
@@ -841,7 +880,98 @@ impl GatewayHandler {
             cancellation_registry: Arc::new(DashMap::new()),
             notify_registry: Arc::new(NotifyRegistry::new()),
             pending_notifies: Arc::new(DashMap::new()),
+            table_insert_metadata: Arc::new(DashMap::new()),
+            frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn set_frontier_published_at_ms_for_test(&self, timestamp_ms: u64) {
+        self.frontier_published_at_ms
+            .store(timestamp_ms, Ordering::SeqCst);
+    }
+
+    fn build_explain_frontend(&self) -> Result<SqlFrontend, PgWireError> {
+        let frontend = SqlFrontend::new();
+        for view in self.catalog.list_views() {
+            frontend
+                .register_table(&view.name, catalog_columns_to_schema(&view.columns))
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        }
+        for table in self.catalog.list_tables() {
+            frontend
+                .register_table(&table.name, catalog_columns_to_schema(&table.columns))
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        }
+        Ok(frontend)
+    }
+
+    fn published_frontier_age_ms(&self) -> Option<u64> {
+        let published_at = self.frontier_published_at_ms.load(Ordering::SeqCst);
+        if published_at == 0 {
+            return None;
+        }
+        Some(current_time_ms().saturating_sub(published_at))
+    }
+
+    fn capture_max_staleness_metadata(&self, conn_id: &str) {
+        let age_ms = self.published_frontier_age_ms();
+        let mut session = self
+            .sessions
+            .entry(conn_id.to_string())
+            .or_insert_with(SessionState::new);
+        session.pending_notice = None;
+        if let Some(max_staleness) = session.max_staleness {
+            let age_ms = age_ms.unwrap_or(0);
+            session.frontier_age_ms = Some(age_ms);
+            session
+                .guc_params
+                .insert("frontier_age_ms".to_string(), age_ms.to_string());
+            rockstream_types::metrics::set_session_frontier_age_ms("max_staleness", age_ms);
+            if age_ms > max_staleness.as_millis() as u64 {
+                rockstream_types::metrics::inc_session_staleness_exceeded("max_staleness");
+                session.pending_notice = Some(SessionNotice {
+                    severity: "NOTICE".to_string(),
+                    sqlstate: "01000".to_string(),
+                    message: format!(
+                        "[RS-2018] session.staleness_exceeded: published frontier age {age_ms}ms exceeded rockstream.max_staleness={}ms. next_steps: Increase rockstream.max_staleness, reduce publish lag, or switch back to session_wait_for mode.",
+                        max_staleness.as_millis()
+                    ),
+                });
+            }
+        } else {
+            session.frontier_age_ms = None;
+            session.guc_params.remove("frontier_age_ms");
+        }
+    }
+
+    async fn emit_session_annotations<C>(&self, client: &mut C, conn_id: &str) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let (notice, frontier_age_ms) = if let Some(mut session) = self.sessions.get_mut(conn_id) {
+            (session.pending_notice.take(), session.frontier_age_ms)
+        } else {
+            (None, None)
+        };
+        if let Some(notice) = notice {
+            client
+                .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                    ErrorInfo::new(notice.severity, notice.sqlstate, notice.message),
+                )))
+                .await?;
+        }
+        if let Some(age_ms) = frontier_age_ms {
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                    "frontier_age_ms".to_string(),
+                    age_ms.to_string(),
+                )))
+                .await?;
+        }
+        Ok(())
     }
 
     async fn do_query_single<'a, 'b: 'a, C>(
@@ -940,7 +1070,9 @@ impl GatewayHandler {
             return Ok(vec![Response::Execution(Tag::new("DEALLOCATE"))]);
         }
 
-        self.dispatch_async_with_conn(query, Some(conn_id)).await
+        let responses = self.dispatch_async_with_conn(query, Some(conn_id)).await?;
+        self.emit_session_annotations(client, conn_id).await?;
+        Ok(responses)
     }
 
     pub fn with_audit_log(mut self, log: Arc<rockstream_control::audit::FileAuditLog>) -> Self {
@@ -1088,6 +1220,10 @@ impl GatewayHandler {
             || ql.starts_with("create or replace view ")
         {
             return Some(self.handle_create_view(q));
+        }
+
+        if ql.starts_with("create workload ") {
+            return Some(self.handle_create_workload(q));
         }
 
         // REFRESH MATERIALIZED VIEW
@@ -1438,6 +1574,68 @@ impl GatewayHandler {
             ))]);
         }
 
+        if ql.starts_with("explain incremental ") {
+            let explain_args = q["explain incremental ".len()..]
+                .trim()
+                .trim_end_matches(';');
+            let (level, target_sql) = if let Some(rest) = explain_args.strip_prefix("VERBOSE ") {
+                (ExplainLevel::Verbose, rest.trim())
+            } else if let Some(rest) = explain_args.strip_prefix("ANALYZE ") {
+                (ExplainLevel::Analyze, rest.trim())
+            } else if let Some(rest) = explain_args.strip_prefix("ESTIMATE ") {
+                (ExplainLevel::Default, rest.trim())
+            } else {
+                (ExplainLevel::Default, explain_args)
+            };
+
+            let normalized_sql = if target_sql.to_ascii_lowercase().starts_with("select ")
+                || target_sql.to_ascii_lowercase().starts_with("with ")
+            {
+                target_sql.to_string()
+            } else {
+                format!("SELECT * FROM {}", target_sql.trim())
+            };
+
+            let frontend = self.build_explain_frontend()?;
+            let explain_text = if explain_args.starts_with("ESTIMATE ") {
+                frontend
+                    .explain_incremental_estimate_text(&normalized_sql, 1_000, 10_000)
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            } else {
+                let stats = if level == ExplainLevel::Analyze {
+                    rockstream_control::ControlService::new(
+                        rockstream_control::TopologyCatalog::new(),
+                    )
+                    .collect_operator_stats(0)
+                } else {
+                    Vec::new()
+                };
+                frontend
+                    .explain_incremental_for_sql(&normalized_sql, level, &stats)
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            };
+
+            let schema = Arc::new(vec![FieldInfo::new(
+                "QUERY PLAN".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )]);
+            let schema_ref = schema.clone();
+            let data_stream = stream::iter(vec![explain_text]).map(move |line| {
+                let mut encoder = DataRowEncoder::new(schema_ref.clone());
+                encoder.encode_field(&Some(line.as_str()))?;
+                encoder.finish()
+            });
+            return Ok(vec![promote_response(Response::Query(QueryResponse::new(
+                schema,
+                data_stream,
+            )))]);
+        }
+
         // EXPLAIN <query> — return plan annotation with pushdown info and index state.
         if ql.starts_with("explain ") {
             let inner_sql = q["explain ".len()..].trim();
@@ -1618,6 +1816,58 @@ impl GatewayHandler {
         }
 
         // S8: SHOW <key> — return from session GUC params or session fields.
+        if ql.trim_end_matches(';') == "show resource usage" {
+            return Ok(vec![catalog_resp_to_response(
+                self.catalog.view_resource_usage(&[]),
+            )]);
+        }
+        if ql.starts_with("show resource usage for workload ") {
+            let workload_name = q["show resource usage for workload ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            if self.catalog.get_workload(workload_name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-1005] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before assigning views to it.",
+                        workload_name, workload_name
+                    ),
+                ))))]);
+            }
+            let response = if let CatalogResponse::Rows { columns: _, rows } =
+                self.catalog.workload_resource_usage(&[])
+            {
+                let matching = rows
+                    .into_iter()
+                    .filter(|row| {
+                        row.first().and_then(|value| value.as_deref()) == Some(workload_name)
+                    })
+                    .collect();
+                CatalogResponse::Rows {
+                    columns: crate::catalog_stubs::workload_resource_usage_columns(),
+                    rows: matching,
+                }
+            } else {
+                CatalogResponse::Rows {
+                    columns: crate::catalog_stubs::workload_resource_usage_columns(),
+                    rows: Vec::new(),
+                }
+            };
+            return Ok(vec![catalog_resp_to_response(response)]);
+        }
+        if ql.trim_end_matches(';') == "show cluster resource usage" {
+            let columns = crate::catalog_stubs::workload_resource_usage_columns();
+            let row = crate::catalog_stubs::project_workload_resource_usage(
+                &columns,
+                &self.catalog.cluster_resource_usage_entry(),
+            );
+            return Ok(vec![catalog_resp_to_response(CatalogResponse::Rows {
+                columns,
+                rows: vec![row],
+            })]);
+        }
         if ql.starts_with("show ") {
             let key_raw = ql["show ".len()..].trim().trim_end_matches(';').to_string();
             let session_val: Option<String> = if let Some(id) = conn_id {
@@ -1627,6 +1877,7 @@ impl GatewayHandler {
                         return v.to_owned();
                     }
                     match key_raw.as_str() {
+                        "rockstream.session_mode" => s.session_mode().to_string(),
                         "search_path" => s.search_path.clone(),
                         "client_encoding" | "server_encoding" => "UTF8".to_string(),
                         "timezone" => "UTC".to_string(),
@@ -1797,13 +2048,15 @@ impl GatewayHandler {
         // Apply explicit wait_for or session RYW before reading (S8/S9).
         if ql.contains("from ") {
             if let Some(id) = conn_id {
+                let query_after_fence = extract_after_fence_token(q);
+                self.capture_max_staleness_metadata(id);
                 let (wait_token, timeout_ms) = {
                     let mut session = self
                         .sessions
                         .entry(id.to_string())
                         .or_insert_with(SessionState::new);
                     // Explicit wait_for takes priority; fall back to session RYW.
-                    let explicit = session.wait_for_token.take();
+                    let explicit = query_after_fence.or_else(|| session.wait_for_token.take());
                     let auto = if session.session_wait_for_enabled {
                         session.last_written_epoch.clone()
                     } else {
@@ -1910,6 +2163,29 @@ impl GatewayHandler {
         // DataFusion execution path for literal SELECT queries (no recognized FROM clause).
         // Handles queries like `SELECT 42`, `SELECT 42 AS n`, `SELECT now()`, etc.
         if ql.starts_with("select ") {
+            if ql.contains("rockstream.write_fence()") && !ql.contains(" from ") {
+                let fence = conn_id
+                    .and_then(|id| self.sessions.get(id))
+                    .and_then(|s| s.last_written_epoch.clone())
+                    .map(|t| serde_json::to_string(&t).unwrap_or_default());
+                let schema = Arc::new(vec![FieldInfo::new(
+                    "fence".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                )]);
+                let schema_ref = schema.clone();
+                let data_stream = stream::iter(vec![fence]).map(move |value| {
+                    let mut encoder = DataRowEncoder::new(schema_ref.clone());
+                    encoder.encode_field(&value.as_deref())?;
+                    encoder.finish()
+                });
+                return Ok(vec![promote_response(Response::Query(QueryResponse::new(
+                    schema,
+                    data_stream,
+                )))]);
+            }
             if let Some(responses) = self.try_datafusion_select(q).await {
                 return Ok(responses);
             }
@@ -2512,6 +2788,7 @@ impl GatewayHandler {
         // Extract view name and query SQL for cycle detection.
         if let Some(view_name) = parse_create_view_name(q) {
             let select_sql = parse_create_view_query(q).unwrap_or_default();
+            let workload_name = parse_create_view_workload(q);
             let deps = extract_sql_refs(&select_sql);
 
             // Cycle detection: returns RS-1011 if a cycle would be introduced.
@@ -2527,6 +2804,19 @@ impl GatewayHandler {
                     "42P17".to_owned(),
                     msg,
                 )))]);
+            }
+
+            if let Some(workload_name) = workload_name.as_deref() {
+                if self.catalog.get_workload(workload_name).is_none() {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42704".to_owned(),
+                        format!(
+                            "[RS-1005] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before assigning the view.",
+                            workload_name, workload_name
+                        ),
+                    )))]);
+                }
             }
 
             // Register view in the catalog.
@@ -2555,6 +2845,10 @@ impl GatewayHandler {
                 },
                 deps,
             );
+            if let Some(workload_name) = workload_name {
+                self.catalog
+                    .assign_view_workload(&view_name, &workload_name);
+            }
             if let Some(log) = &self.audit_log {
                 let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                     "system",
@@ -2565,6 +2859,36 @@ impl GatewayHandler {
         }
 
         Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))])
+    }
+
+    fn handle_create_workload<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let Some(parsed) = parse_create_workload(q) else {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "[RS-1006] workload.invalid_definition: CREATE WORKLOAD requires a name and optional WITH (...) settings. Next steps: use CREATE WORKLOAD fast WITH (MEMORY_LIMIT = 1048576, FRESHNESS_SLO_MS = 500).".to_owned(),
+            )))]);
+        };
+        if !self.catalog.add_workload(parsed.clone()) {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42710".to_owned(),
+                format!(
+                    "[RS-1006] workload.already_exists: workload '{}' already exists. Next steps: choose a different workload name or drop the existing workload first.",
+                    parsed.name
+                ),
+            )))]);
+        }
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "create_workload",
+                &parsed.name,
+            ));
+        }
+        Ok(vec![Response::Execution(
+            Tag::new("CREATE WORKLOAD").with_rows(0),
+        )])
     }
 
     fn handle_refresh_materialized_view(&self, q: &str) -> Vec<Response<'static>> {
@@ -2647,12 +2971,32 @@ impl GatewayHandler {
         }
 
         // Parse column list: content between outermost parentheses.
-        let cols = parse_create_table_columns(after);
+        let parsed = parse_create_table_columns(after);
 
         self.catalog.add_table(CatalogTable {
             name: table_name.clone(),
-            columns: cols,
+            columns: parsed.columns,
         });
+        if !parsed.generated_columns.is_empty() {
+            let identity_sequences = parsed
+                .generated_columns
+                .iter()
+                .filter_map(|(name, kind)| {
+                    if *kind == GeneratedColumnKind::Identity {
+                        Some((name.clone(), Arc::new(AtomicU64::new(0))))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            self.table_insert_metadata.insert(
+                table_name.clone(),
+                Arc::new(TableInsertMetadata {
+                    generated_columns: parsed.generated_columns,
+                    identity_sequences,
+                }),
+            );
+        }
 
         Ok(vec![Response::Execution(
             Tag::new("CREATE TABLE").with_rows(0),
@@ -2956,14 +3300,31 @@ impl GatewayHandler {
                 let json_str = val_raw.trim_matches('\'');
                 if let Ok(token) = serde_json::from_str::<FreshnessToken>(json_str) {
                     session.wait_for_token = Some(token);
+                    session.max_staleness = None;
                 }
             }
             "session_wait_for" => {
                 session.session_wait_for_enabled = val_raw.trim_matches('\'') != "off";
+                if session.session_wait_for_enabled {
+                    session.max_staleness = None;
+                }
             }
             "session_wait_for_timeout_ms" => {
                 if let Ok(n) = val_raw.trim_matches('\'').parse::<u64>() {
                     session.session_wait_for_timeout_ms = n;
+                }
+            }
+            "max_staleness" => {
+                let parsed = parse_duration_literal(val_raw.trim_matches('\''));
+                session.max_staleness = parsed;
+                session.frontier_age_ms = None;
+                session.pending_notice = None;
+                if parsed.is_some() {
+                    session.wait_for_token = None;
+                    session.session_wait_for_enabled = false;
+                }
+                if parsed.is_none() {
+                    session.guc_params.remove("frontier_age_ms");
                 }
             }
             _ => {}
@@ -3106,6 +3467,8 @@ impl GatewayHandler {
             .write_batch(batch)
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+        self.frontier_published_at_ms
+            .store(current_time_ms(), Ordering::SeqCst);
 
         // ── Last hop: materialise dependent views ─────────────────────────────
         // Collect the unique tables touched by this commit, then re-evaluate
@@ -3213,6 +3576,9 @@ impl GatewayHandler {
                 session.source_epoch_envelope = None;
                 session.wait_for_token = None;
                 session.last_written_epoch = None;
+                session.max_staleness = None;
+                session.frontier_age_ms = None;
+                session.pending_notice = None;
                 session.pinned_frontier = None;
                 session.tx_status = crate::session::TxStatus::Idle;
                 session.search_path = "public".to_string();
@@ -3220,6 +3586,7 @@ impl GatewayHandler {
                 session.isolation_level = crate::session::IsolationLevel::ReadCommitted;
                 session.session_wait_for_timeout_ms = 5_000;
                 session.session_wait_for_enabled = true;
+                session.guc_params.remove("frontier_age_ms");
             }
             // Unsubscribe from all LISTEN channels and discard pending NOTIFYs.
             self.notify_registry.unsubscribe_all(id);
@@ -3240,6 +3607,10 @@ impl GatewayHandler {
                 session.isolation_level = crate::session::IsolationLevel::ReadCommitted;
                 session.session_wait_for_timeout_ms = 5_000;
                 session.session_wait_for_enabled = true;
+                session.max_staleness = None;
+                session.frontier_age_ms = None;
+                session.pending_notice = None;
+                session.guc_params.remove("frontier_age_ms");
                 // Note: cursors, prepared statements, portals are NOT cleared by RESET ALL
             }
         }
@@ -3646,17 +4017,56 @@ impl GatewayHandler {
             }
         };
 
+        let table_columns: Vec<String> = self
+            .catalog
+            .get_table(&table)
+            .map(|ct| ct.columns.into_iter().map(|c| c.name).collect())
+            .unwrap_or_else(|| cols.clone());
+        let metadata = self
+            .table_insert_metadata
+            .get(&table)
+            .map(|entry| entry.value().clone());
+
         let mut returning_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+        let mut row_keys = Vec::with_capacity(rows.len());
         for values in &rows {
-            // Build row_key: deterministic from col=val pairs
-            let row_key = build_row_key(&cols, values);
-            let values_tsv = values.join("\t");
+            let mut value_map: HashMap<String, String> =
+                cols.iter().cloned().zip(values.iter().cloned()).collect();
+            if let Some(metadata) = &metadata {
+                for (column, kind) in &metadata.generated_columns {
+                    if value_map.contains_key(column) {
+                        continue;
+                    }
+                    let generated = match kind {
+                        GeneratedColumnKind::RandomUuid => generate_uuid_v4_string(),
+                        GeneratedColumnKind::Identity => metadata
+                            .identity_sequences
+                            .get(column)
+                            .map(|seq| seq.fetch_add(1, Ordering::SeqCst) + 1)
+                            .unwrap_or(1)
+                            .to_string(),
+                    };
+                    value_map.insert(column.clone(), generated);
+                }
+            }
+
+            let stored_cols = if table_columns.is_empty() {
+                cols.clone()
+            } else {
+                table_columns.clone()
+            };
+            let stored_values: Vec<String> = stored_cols
+                .iter()
+                .map(|col| value_map.get(col).cloned().unwrap_or_default())
+                .collect();
+            let row_key = build_row_key(&stored_cols, &stored_values);
+            let values_tsv = stored_values.join("\t");
 
             let op = DmlOp::Insert {
                 table: table.clone(),
-                cols: cols.clone(),
+                cols: stored_cols.clone(),
                 values_tsv,
-                row_key,
+                row_key: row_key.clone(),
             };
 
             if let Some(id) = conn_id {
@@ -3667,12 +4077,71 @@ impl GatewayHandler {
                     )))]);
                 }
             }
-            returning_rows.push(values.clone());
+            row_keys.push(row_key);
+            returning_rows.push(stored_values);
         }
 
         if returning {
-            // Auto-commit INSERT … RETURNING outside explicit transaction;
-            // every inserted row (one per VALUES tuple) is returned.
+            let in_explicit_block = conn_id
+                .and_then(|id| self.sessions.get(id))
+                .map(|s| s.in_explicit_block)
+                .unwrap_or(false);
+            let needs_read_back = metadata
+                .as_ref()
+                .is_some_and(|m| !m.generated_columns.is_empty());
+            if !in_explicit_block {
+                let commit_responses = self.handle_commit(conn_id).await?;
+                if commit_responses
+                    .iter()
+                    .any(|response| matches!(response, Response::Error(_)))
+                {
+                    return Ok(commit_responses);
+                }
+                if needs_read_back {
+                    if let Some(id) = conn_id {
+                        let timeout_ms = self
+                            .sessions
+                            .get(id)
+                            .map(|s| s.session_wait_for_timeout_ms)
+                            .unwrap_or(5_000);
+                        if let Some(token) = self
+                            .sessions
+                            .get(id)
+                            .and_then(|s| s.last_written_epoch.clone())
+                        {
+                            let _ = self.wait_for_epoch(token.source_epoch, timeout_ms).await;
+                        }
+                    }
+                    if let Some(shard_db) = &self.shard_db {
+                        let cols_for_read = if table_columns.is_empty() {
+                            cols.clone()
+                        } else {
+                            table_columns.clone()
+                        };
+                        let mut read_back_rows = Vec::with_capacity(row_keys.len());
+                        for row_key in &row_keys {
+                            let key = format!("view_output/{table}/{row_key}");
+                            if let Some(raw) = shard_db.get(key.as_bytes()).await.map_err(|e| {
+                                PgWireError::ApiError(Box::new(
+                                    crate::error::GatewayError::Storage(e),
+                                ))
+                            })? {
+                                let fields: Vec<String> = String::from_utf8_lossy(&raw)
+                                    .split('\t')
+                                    .map(|s| s.to_string())
+                                    .collect();
+                                let mut row = fields;
+                                row.resize(cols_for_read.len(), String::new());
+                                read_back_rows.push(row);
+                            }
+                        }
+                        if !read_back_rows.is_empty() {
+                            returning_rows = read_back_rows;
+                        }
+                    }
+                }
+            }
+
             let schema_fields = if let Some(ct) = self.catalog.get_table(&table) {
                 ct.columns
                     .iter()
@@ -3947,6 +4416,8 @@ impl GatewayHandler {
             .write_batch(batch)
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+        self.frontier_published_at_ms
+            .store(current_time_ms(), Ordering::SeqCst);
 
         // Audit: log the flush.
         if let Some(log) = &self.audit_log {
@@ -5015,6 +5486,7 @@ impl ExtendedQueryHandler for GatewayHandler {
         let responses = self
             .dispatch_async_with_conn(dispatch_query, Some(&conn_id))
             .await?;
+        self.emit_session_annotations(client, &conn_id).await?;
         Ok(responses
             .into_iter()
             .next()
@@ -5602,6 +6074,43 @@ fn promote_response(r: Response<'_>) -> Response<'static> {
     // This is the standard pattern in pgwire examples that need to escape the
     // `'a` lifetime from `do_query`.
     unsafe { std::mem::transmute(r) }
+}
+
+fn parse_duration_literal(raw: &str) -> Option<Duration> {
+    let value = raw.trim().to_lowercase();
+    if value.is_empty() || value == "0" || value == "none" {
+        return None;
+    }
+    if let Some(ms) = value.strip_suffix("ms") {
+        return ms.parse::<u64>().ok().map(Duration::from_millis);
+    }
+    if let Some(sec) = value.strip_suffix('s') {
+        return sec.parse::<u64>().ok().map(Duration::from_secs);
+    }
+    None
+}
+
+fn generate_uuid_v4_string() -> String {
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+fn extract_after_fence_token(q: &str) -> Option<FreshnessToken> {
+    let ql = q.to_lowercase();
+    let start = ql.find("rockstream.after_fence(")?;
+    let after = &q[start + "rockstream.after_fence(".len()..];
+    let quoted = after.strip_prefix('\'')?;
+    let end = quoted.find('\'')?;
+    serde_json::from_str::<FreshnessToken>(&quoted[..end]).ok()
 }
 
 /// Extract the view name from a simple `SELECT … FROM <name> [LIMIT n]` query.
@@ -6216,12 +6725,52 @@ fn parse_create_view_name(q: &str) -> Option<String> {
     };
     // Take up to " AS" followed by any whitespace (handles AS\n, AS\t, AS )
     let as_pos = find_as_separator(&after.to_lowercase())?;
-    let raw = after[..as_pos].trim().trim_matches('"');
+    let raw = after[..as_pos]
+        .split_once(" WITH WORKLOAD ")
+        .map(|(before, _)| before)
+        .or_else(|| {
+            after[..as_pos]
+                .split_once(" with workload ")
+                .map(|(before, _)| before)
+        })
+        .unwrap_or(&after[..as_pos])
+        .trim()
+        .trim_matches('"');
     let name = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"');
     if name.is_empty() {
         None
     } else {
         Some(name.to_string())
+    }
+}
+
+fn parse_create_view_workload(q: &str) -> Option<String> {
+    let ql = q.trim().to_lowercase();
+    let name_start: usize = if ql.starts_with("create or replace materialized view ") {
+        36
+    } else if ql.starts_with("create materialized view ") {
+        25
+    } else if ql.starts_with("create or replace view ") {
+        23
+    } else if ql.starts_with("create view ") {
+        12
+    } else {
+        return None;
+    };
+    let after_lower = &ql[name_start..];
+    let as_pos_in_after = find_as_separator(after_lower)?;
+    let before_as = q[name_start..name_start + as_pos_in_after].trim();
+    let lower_before_as = before_as.to_lowercase();
+    let marker = " with workload = ";
+    let marker_pos = lower_before_as.find(marker)?;
+    let workload = before_as[marker_pos + marker.len()..]
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'');
+    if workload.is_empty() {
+        None
+    } else {
+        Some(workload.to_string())
     }
 }
 
@@ -6249,6 +6798,47 @@ fn parse_create_view_query(q: &str) -> Option<String> {
     let as_pos_in_after = find_as_separator(after_lower)?;
     // Skip the leading space (1) + "as" (2) = 3 bytes, then trim surrounding whitespace.
     Some(q[name_start + as_pos_in_after + 3..].trim().to_string())
+}
+
+fn parse_create_workload(q: &str) -> Option<WorkloadDef> {
+    let after = q
+        .trim()
+        .strip_prefix("CREATE WORKLOAD ")
+        .or_else(|| q.trim().strip_prefix("create workload "))?
+        .trim()
+        .trim_end_matches(';');
+    let (name_part, options_part) = if let Some((name, rest)) = after.split_once(" WITH ") {
+        (name.trim(), Some(rest.trim()))
+    } else if let Some((name, rest)) = after.split_once(" with ") {
+        (name.trim(), Some(rest.trim()))
+    } else {
+        (after.trim(), None)
+    };
+    let name = name_part.trim_matches('"');
+    if name.is_empty() {
+        return None;
+    }
+    let mut workload = WorkloadDef::new(name);
+    if let Some(options_part) = options_part {
+        let body = options_part.strip_prefix('(')?.strip_suffix(')')?.trim();
+        for assignment in body.split(',') {
+            let (key, value) = assignment.split_once('=')?;
+            let key = key.trim().to_lowercase();
+            let value = value.trim().trim_matches('\'').trim_matches('"');
+            match key.as_str() {
+                "memory_limit" => {
+                    let bytes = value.parse().ok()?;
+                    workload = workload.with_memory_limit(MemoryLimit::new(bytes));
+                }
+                "freshness_slo_ms" => {
+                    let ms = value.parse().ok()?;
+                    workload = workload.with_freshness_slo(FreshnessSlo::new(ms));
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(workload)
 }
 
 /// Extract table/view names referenced in FROM and JOIN clauses.
@@ -6335,23 +6925,37 @@ fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
 
 // ── DML parsers ───────────────────────────────────────────────────────────────
 
+struct ParsedCreateTableColumns {
+    columns: Vec<CatalogColumn>,
+    generated_columns: HashMap<String, GeneratedColumnKind>,
+}
+
 /// Parse `CREATE TABLE <name> (col type, ...)` column list.
-///
-/// Extracts the content between the first `(` and the matching `)` and splits
-/// on commas to produce `(col_name, arrow_type)` pairs.
-fn parse_create_table_columns(after_table_name: &str) -> Vec<CatalogColumn> {
+fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumns {
     let start = match after_table_name.find('(') {
         Some(i) => i + 1,
-        None => return vec![],
+        None => {
+            return ParsedCreateTableColumns {
+                columns: vec![],
+                generated_columns: HashMap::new(),
+            }
+        }
     };
     let end = match after_table_name.rfind(')') {
         Some(i) => i,
-        None => return vec![],
+        None => {
+            return ParsedCreateTableColumns {
+                columns: vec![],
+                generated_columns: HashMap::new(),
+            }
+        }
     };
     let cols_str = &after_table_name[start..end];
-    cols_str
-        .split(',')
-        .filter_map(|part| {
+    let mut columns = Vec::new();
+    let mut generated_columns = HashMap::new();
+    for part in cols_str.split(',') {
+        let part = part.trim();
+        if let Some((column, generated_kind)) = (|| {
             let part = part.trim();
             let mut tokens = part.split_whitespace();
             let col_name = tokens.next()?.to_lowercase();
@@ -6368,12 +6972,31 @@ fn parse_create_table_columns(after_table_name: &str) -> Vec<CatalogColumn> {
                 pg_type
             };
             let arrow_type = pg_type_to_arrow(&full_type);
-            Some(CatalogColumn {
-                name: col_name,
-                data_type: arrow_type.to_string(),
-            })
-        })
-        .collect()
+            let generated_kind = if part.to_lowercase().contains("default gen_random_uuid()") {
+                Some(GeneratedColumnKind::RandomUuid)
+            } else if part.to_lowercase().contains("generated always as identity") {
+                Some(GeneratedColumnKind::Identity)
+            } else {
+                None
+            };
+            Some((
+                CatalogColumn {
+                    name: col_name,
+                    data_type: arrow_type.to_string(),
+                },
+                generated_kind,
+            ))
+        })() {
+            if let Some(kind) = generated_kind {
+                generated_columns.insert(column.name.clone(), kind);
+            }
+            columns.push(column);
+        }
+    }
+    ParsedCreateTableColumns {
+        columns,
+        generated_columns,
+    }
 }
 
 /// Map a Postgres type keyword to an Arrow data type name.
@@ -6388,6 +7011,7 @@ fn pg_type_to_arrow(pg_type: &str) -> &'static str {
         "BOOL" | "BOOLEAN" => "Boolean",
         "BYTEA" => "Binary",
         "TIMESTAMP" => "Timestamp",
+        "UUID" => "UUID",
         _ => "Utf8",
     }
 }

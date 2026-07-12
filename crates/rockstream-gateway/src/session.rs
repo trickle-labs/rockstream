@@ -1,6 +1,7 @@
 //! Per-connection session state: isolation level, frontier pinning, freshness tokens, cursors.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// Maximum GUC parameters stored per connection.
 /// Fill-level metric: `guc_params.len()`.
@@ -106,6 +107,14 @@ pub struct CursorState {
     pub position: usize,
 }
 
+/// Session-scoped NOTICE queued for the next query response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionNotice {
+    pub severity: String,
+    pub sqlstate: String,
+    pub message: String,
+}
+
 /// Per-connection session state.
 ///
 /// Tracks isolation level and the pinned frontier epoch (set at `BEGIN` for
@@ -134,6 +143,12 @@ pub struct SessionState {
     pub session_wait_for_timeout_ms: u64,
     /// Whether automatic session-scoped RYW is enabled. Default: `true`.
     pub session_wait_for_enabled: bool,
+    /// Optional analytical staleness bound for SELECTs (v0.45 A1).
+    pub max_staleness: Option<Duration>,
+    /// Per-query response metadata: published frontier age in milliseconds.
+    pub frontier_age_ms: Option<u64>,
+    /// Pending NOTICE to emit with the next response.
+    pub pending_notice: Option<SessionNotice>,
     /// The namespace this session is currently operating in (v0.26).
     pub current_namespace: String,
     /// Authenticated principal for this session (v0.26).
@@ -183,6 +198,9 @@ impl SessionState {
             wait_for_token: None,
             session_wait_for_timeout_ms: 5_000,
             session_wait_for_enabled: true,
+            max_staleness: None,
+            frontier_age_ms: None,
+            pending_notice: None,
             current_namespace: "public".to_string(),
             principal: crate::auth::Principal::System,
             backend_pid: rng.gen(),
@@ -245,6 +263,16 @@ impl SessionState {
     /// otherwise the `current_frontier` parameter (READ COMMITTED per-statement pin).
     pub fn effective_frontier(&self, current_frontier: Option<u64>) -> Option<u64> {
         self.pinned_frontier.or(current_frontier)
+    }
+
+    pub fn session_mode(&self) -> &'static str {
+        if self.max_staleness.is_some() {
+            "max_staleness"
+        } else if self.session_wait_for_enabled || self.wait_for_token.is_some() {
+            "wait_for"
+        } else {
+            "none"
+        }
     }
 }
 
@@ -320,5 +348,9 @@ mod tests {
         assert!(s.session_wait_for_enabled);
         assert_eq!(s.session_wait_for_timeout_ms, 5_000);
         assert!(s.wait_for_token.is_none());
+        assert!(s.max_staleness.is_none());
+        assert!(s.frontier_age_ms.is_none());
+        assert!(s.pending_notice.is_none());
+        assert_eq!(s.session_mode(), "wait_for");
     }
 }

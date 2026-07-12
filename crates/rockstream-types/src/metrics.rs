@@ -14,10 +14,19 @@
 //!   manifest churn budget gate (≤ 1 manifest write per epoch, DESIGN.md §5.4).
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use lru::LruCache;
+
+use crate::ids::OperatorId;
 use crate::merge_law::MergeLawId;
+
+const PIPELINE_STATE_BYTES_CAPACITY: usize = 256;
+pub const OPERATOR_STATS_WINDOW_SECS: u64 = 60;
+pub const OPERATOR_LATENCY_SAMPLES_PER_BUCKET: usize = 16;
 
 /// Key for a per-law metric bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -41,12 +50,120 @@ impl Counter {
     }
 
     fn inc(&self) {
-        self.value.fetch_add(1, Ordering::Relaxed);
+        self.add(1);
+    }
+
+    fn add(&self, value: u64) {
+        self.value.fetch_add(value, Ordering::Relaxed);
     }
 
     fn get(&self) -> u64 {
         self.value.load(Ordering::Relaxed)
     }
+}
+
+#[derive(Clone, Default)]
+struct OperatorStatsBucket {
+    second: u64,
+    rows_processed: u64,
+    state_reads: u64,
+    dlq_entries: u64,
+    latency_samples_ms: Vec<u32>,
+}
+
+impl OperatorStatsBucket {
+    fn reset(&mut self, second: u64) {
+        self.second = second;
+        self.rows_processed = 0;
+        self.state_reads = 0;
+        self.dlq_entries = 0;
+        self.latency_samples_ms.clear();
+    }
+}
+
+struct OperatorRuntimeWindow {
+    buckets: Vec<OperatorStatsBucket>,
+}
+
+impl OperatorRuntimeWindow {
+    fn new() -> Self {
+        Self {
+            buckets: vec![OperatorStatsBucket::default(); OPERATOR_STATS_WINDOW_SECS as usize],
+        }
+    }
+
+    fn record(
+        &mut self,
+        second: u64,
+        rows_processed: u64,
+        state_reads: u64,
+        latency: Duration,
+        dlq_entries: u64,
+    ) {
+        let idx = (second % OPERATOR_STATS_WINDOW_SECS) as usize;
+        let bucket = &mut self.buckets[idx];
+        if bucket.second != second {
+            bucket.reset(second);
+        }
+        bucket.rows_processed += rows_processed;
+        bucket.state_reads += state_reads;
+        bucket.dlq_entries += dlq_entries;
+        if bucket.latency_samples_ms.len() < OPERATOR_LATENCY_SAMPLES_PER_BUCKET {
+            bucket.latency_samples_ms.push(latency.as_millis() as u32);
+        }
+    }
+
+    fn snapshot(&self, operator_id: OperatorId, now_second: u64) -> OperatorRuntimeSnapshot {
+        let mut rows_processed = 0_u64;
+        let mut state_reads = 0_u64;
+        let mut dlq_entries = 0_u64;
+        let mut latency_samples_ms = Vec::new();
+
+        for bucket in &self.buckets {
+            if bucket.second > now_second
+                || now_second - bucket.second >= OPERATOR_STATS_WINDOW_SECS
+            {
+                continue;
+            }
+            rows_processed += bucket.rows_processed;
+            state_reads += bucket.state_reads;
+            dlq_entries += bucket.dlq_entries;
+            latency_samples_ms.extend(bucket.latency_samples_ms.iter().copied());
+        }
+
+        let latency_sample_fill_level = latency_samples_ms.len();
+        let p99_latency_ms = p99_latency_ms(&mut latency_samples_ms);
+
+        OperatorRuntimeSnapshot {
+            operator_id,
+            rows_per_s: rows_processed as f64 / OPERATOR_STATS_WINDOW_SECS as f64,
+            state_reads,
+            p99_latency_ms,
+            dlq_entries,
+            latency_sample_fill_level,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorRuntimeSnapshot {
+    pub operator_id: OperatorId,
+    pub rows_per_s: f64,
+    pub state_reads: u64,
+    pub p99_latency_ms: f64,
+    pub dlq_entries: u64,
+    /// Fill-level metric for the bounded latency reservoir:
+    /// `<= OPERATOR_STATS_WINDOW_SECS * OPERATOR_LATENCY_SAMPLES_PER_BUCKET`.
+    pub latency_sample_fill_level: usize,
+}
+
+fn p99_latency_ms(samples_ms: &mut [u32]) -> f64 {
+    if samples_ms.is_empty() {
+        return 0.0;
+    }
+    samples_ms.sort_unstable();
+    let idx = ((samples_ms.len() as f64 * 0.99).ceil() as usize).saturating_sub(1);
+    samples_ms[idx.min(samples_ms.len() - 1)] as f64
 }
 
 /// Global registry for merge-law metric counters.
@@ -65,14 +182,24 @@ struct MetricRegistry {
     duplicate_dropped_total: HashMap<u16, Counter>,
     tombstone_bytes: HashMap<u16, Counter>,
     monotone_partial_lag_ms: HashMap<u16, Counter>,
+    write_amplification_storage_bytes: HashMap<u16, Counter>,
+    write_amplification_logical_bytes: HashMap<u16, Counter>,
     workload_memory_bytes: HashMap<String, Counter>,
+    segment_cache_hits: HashMap<String, Counter>,
+    segment_cache_misses: HashMap<String, Counter>,
+    segment_cache_bytes_used: HashMap<String, Counter>,
+    pipeline_state_bytes: LruCache<String, u64>,
+    pipeline_state_bytes_other: AtomicU64,
     state_budget_bytes: AtomicU64,
     freshness_lag_ms: HashMap<String, Counter>,
+    session_staleness_exceeded_total: HashMap<String, Counter>,
+    session_frontier_age_ms: HashMap<String, Counter>,
 
     // Flush duration metrics
     flush_duration_sum_ms: AtomicU64,
     flush_duration_count: AtomicU64,
     flush_duration_last_ms: AtomicU64,
+    operator_runtime: HashMap<OperatorId, OperatorRuntimeWindow>,
 }
 
 impl MetricRegistry {
@@ -87,12 +214,24 @@ impl MetricRegistry {
             duplicate_dropped_total: HashMap::new(),
             tombstone_bytes: HashMap::new(),
             monotone_partial_lag_ms: HashMap::new(),
+            write_amplification_storage_bytes: HashMap::new(),
+            write_amplification_logical_bytes: HashMap::new(),
             workload_memory_bytes: HashMap::new(),
+            segment_cache_hits: HashMap::new(),
+            segment_cache_misses: HashMap::new(),
+            segment_cache_bytes_used: HashMap::new(),
+            pipeline_state_bytes: LruCache::new(
+                NonZeroUsize::new(PIPELINE_STATE_BYTES_CAPACITY).unwrap(),
+            ),
+            pipeline_state_bytes_other: AtomicU64::new(0),
             state_budget_bytes: AtomicU64::new(0),
             freshness_lag_ms: HashMap::new(),
+            session_staleness_exceeded_total: HashMap::new(),
+            session_frontier_age_ms: HashMap::new(),
             flush_duration_sum_ms: AtomicU64::new(0),
             flush_duration_count: AtomicU64::new(0),
             flush_duration_last_ms: AtomicU64::new(0),
+            operator_runtime: HashMap::new(),
         }
     }
 }
@@ -265,6 +404,74 @@ pub fn read_manifest_writes() -> u64 {
     with_registry(|reg| reg.manifest_writes.load(Ordering::Relaxed))
 }
 
+pub fn record_operator_runtime_sample(
+    operator_id: OperatorId,
+    rows_processed: u64,
+    state_reads: u64,
+    latency: Duration,
+    dlq_entries: u64,
+) {
+    record_operator_runtime_sample_at(
+        operator_id,
+        rows_processed,
+        state_reads,
+        latency,
+        dlq_entries,
+        SystemTime::now(),
+    );
+}
+
+pub fn record_operator_runtime_sample_at(
+    operator_id: OperatorId,
+    rows_processed: u64,
+    state_reads: u64,
+    latency: Duration,
+    dlq_entries: u64,
+    at: SystemTime,
+) {
+    let second = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    with_registry(|reg| {
+        reg.operator_runtime
+            .entry(operator_id)
+            .or_insert_with(OperatorRuntimeWindow::new)
+            .record(second, rows_processed, state_reads, latency, dlq_entries);
+    });
+}
+
+pub fn operator_runtime_report() -> Vec<OperatorRuntimeSnapshot> {
+    let now_second = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    with_registry(|reg| {
+        let mut out: Vec<_> = reg
+            .operator_runtime
+            .iter()
+            .map(|(operator_id, window)| window.snapshot(*operator_id, now_second))
+            .collect();
+        out.sort_by_key(|row| row.operator_id.0);
+        out
+    })
+}
+
+pub fn operator_rmw_totals(operator_id: OperatorId) -> (u64, u64) {
+    with_registry(|reg| {
+        let avoided = reg
+            .rmw_avoided
+            .iter()
+            .filter(|(key, _)| key.operator_id == Some(operator_id))
+            .map(|(_, counter)| counter.get())
+            .sum();
+        let required = reg
+            .rmw_required
+            .iter()
+            .filter(|(key, _)| key.operator_id == Some(operator_id))
+            .map(|(_, counter)| counter.get())
+            .sum();
+        (avoided, required)
+    })
+}
+
 // ─── reset_all ───────────────────────────────────────────────────────────────
 
 /// Reset all counters to zero.
@@ -283,12 +490,22 @@ pub fn reset_all() {
         reg.duplicate_dropped_total.clear();
         reg.tombstone_bytes.clear();
         reg.monotone_partial_lag_ms.clear();
+        reg.write_amplification_storage_bytes.clear();
+        reg.write_amplification_logical_bytes.clear();
         reg.workload_memory_bytes.clear();
+        reg.segment_cache_hits.clear();
+        reg.segment_cache_misses.clear();
+        reg.segment_cache_bytes_used.clear();
+        reg.pipeline_state_bytes.clear();
+        reg.pipeline_state_bytes_other.store(0, Ordering::Relaxed);
         reg.state_budget_bytes.store(0, Ordering::Relaxed);
         reg.freshness_lag_ms.clear();
+        reg.session_staleness_exceeded_total.clear();
+        reg.session_frontier_age_ms.clear();
         reg.flush_duration_sum_ms.store(0, Ordering::Relaxed);
         reg.flush_duration_count.store(0, Ordering::Relaxed);
         reg.flush_duration_last_ms.store(0, Ordering::Relaxed);
+        reg.operator_runtime.clear();
     });
 }
 
@@ -300,9 +517,7 @@ pub fn inc_compaction_bytes_reclaimed(law_id: u16, bytes: u64) {
             .compaction_bytes_reclaimed
             .entry(law_id)
             .or_insert_with(Counter::new);
-        for _ in 0..bytes {
-            counter.inc();
-        }
+        counter.add(bytes);
     });
 }
 
@@ -345,10 +560,173 @@ pub fn set_workload_memory(workload: &str, bytes: u64) {
     });
 }
 
+pub fn read_workload_memory(workload: &str) -> u64 {
+    with_registry(|reg| {
+        reg.workload_memory_bytes
+            .get(workload)
+            .map(|counter| counter.get())
+            .unwrap_or(0)
+    })
+}
+
+pub fn read_total_workload_memory() -> u64 {
+    with_registry(|reg| reg.workload_memory_bytes.values().map(Counter::get).sum())
+}
+
+/// Record additional bytes written to storage for a shard, along with the
+/// logical bytes that produced them.
+pub fn record_compaction_write(
+    shard_id: u16,
+    bytes_written_to_storage: u64,
+    logical_bytes_written: u64,
+) {
+    with_registry(|reg| {
+        reg.write_amplification_storage_bytes
+            .entry(shard_id)
+            .or_insert_with(Counter::new)
+            .add(bytes_written_to_storage);
+        reg.write_amplification_logical_bytes
+            .entry(shard_id)
+            .or_insert_with(Counter::new)
+            .add(logical_bytes_written);
+    });
+}
+
+/// Compute the per-shard write amplification ratio:
+/// `bytes_written_to_storage / logical_bytes_written`, or `1.0` if both are zero.
+pub fn write_amplification_ratio(shard_id: u16) -> f64 {
+    with_registry(|reg| {
+        let storage = reg
+            .write_amplification_storage_bytes
+            .get(&shard_id)
+            .map(|c| c.get())
+            .unwrap_or(0);
+        let logical = reg
+            .write_amplification_logical_bytes
+            .get(&shard_id)
+            .map(|c| c.get())
+            .unwrap_or(0);
+        if logical == 0 {
+            1.0
+        } else {
+            storage as f64 / logical as f64
+        }
+    })
+}
+
+pub fn record_segment_cache_hit(worker_id: &str) {
+    with_registry(|reg| {
+        reg.segment_cache_hits
+            .entry(worker_id.to_string())
+            .or_insert_with(Counter::new)
+            .inc();
+    });
+}
+
+pub fn record_segment_cache_miss(worker_id: &str) {
+    with_registry(|reg| {
+        reg.segment_cache_misses
+            .entry(worker_id.to_string())
+            .or_insert_with(Counter::new)
+            .inc();
+    });
+}
+
+/// Compute the per-worker segment-cache hit ratio:
+/// `hits / (hits + misses)`, or `1.0` if the worker has not read from cache yet.
+pub fn segment_cache_hit_ratio(worker_id: &str) -> f64 {
+    with_registry(|reg| {
+        let hits = reg
+            .segment_cache_hits
+            .get(worker_id)
+            .map(|c| c.get())
+            .unwrap_or(0);
+        let misses = reg
+            .segment_cache_misses
+            .get(worker_id)
+            .map(|c| c.get())
+            .unwrap_or(0);
+        let total = hits + misses;
+        if total == 0 {
+            1.0
+        } else {
+            hits as f64 / total as f64
+        }
+    })
+}
+
+pub fn set_segment_cache_bytes_used(worker_id: &str, bytes: u64) {
+    with_registry(|reg| {
+        let counter = reg
+            .segment_cache_bytes_used
+            .entry(worker_id.to_string())
+            .or_insert_with(Counter::new);
+        counter.value.store(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn set_pipeline_state_bytes(pipeline_id: &str, bytes: u64) {
+    with_registry(|reg| {
+        if pipeline_id == "other" {
+            reg.pipeline_state_bytes_other
+                .store(bytes, Ordering::Relaxed);
+            return;
+        }
+
+        if let Some((evicted_pipeline_id, evicted_bytes)) = reg
+            .pipeline_state_bytes
+            .push(pipeline_id.to_string(), bytes)
+        {
+            if evicted_pipeline_id != pipeline_id {
+                reg.pipeline_state_bytes_other
+                    .fetch_add(evicted_bytes, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+/// Snapshot the current bounded pipeline-state metric working set.
+///
+/// Returns up to 256 explicit pipeline buckets plus an `"other"` aggregate bucket
+/// when evicted state has accumulated.
+pub fn pipeline_state_bytes_report() -> Vec<(String, u64)> {
+    with_registry(|reg| {
+        let mut entries: Vec<(String, u64)> = reg
+            .pipeline_state_bytes
+            .iter()
+            .map(|(pipeline_id, bytes)| (pipeline_id.clone(), *bytes))
+            .collect();
+        let other = reg.pipeline_state_bytes_other.load(Ordering::Relaxed);
+        if other > 0 {
+            entries.push(("other".to_string(), other));
+        }
+        entries
+    })
+}
+
+pub fn read_pipeline_state_bytes(pipeline_id: &str) -> Option<u64> {
+    with_registry(|reg| {
+        reg.pipeline_state_bytes
+            .peek(&pipeline_id.to_string())
+            .copied()
+            .or_else(|| {
+                if pipeline_id == "other" {
+                    Some(reg.pipeline_state_bytes_other.load(Ordering::Relaxed))
+                } else {
+                    None
+                }
+            })
+    })
+}
+
 pub fn set_state_budget(bytes: u64) {
     with_registry(|reg| {
         reg.state_budget_bytes.store(bytes, Ordering::Relaxed);
     });
+}
+
+pub fn read_state_budget() -> u64 {
+    with_registry(|reg| reg.state_budget_bytes.load(Ordering::Relaxed))
 }
 
 pub fn set_freshness_lag(view_name: &str, lag_ms: u64) {
@@ -358,6 +736,29 @@ pub fn set_freshness_lag(view_name: &str, lag_ms: u64) {
             .entry(view_name.to_string())
             .or_insert_with(Counter::new);
         counter.value.store(lag_ms, Ordering::Relaxed);
+    });
+}
+
+pub fn read_freshness_lag(view_name: &str) -> Option<u64> {
+    with_registry(|reg| reg.freshness_lag_ms.get(view_name).map(Counter::get))
+}
+
+pub fn inc_session_staleness_exceeded(mode: &str) {
+    with_registry(|reg| {
+        reg.session_staleness_exceeded_total
+            .entry(mode.to_string())
+            .or_insert_with(Counter::new)
+            .inc();
+    });
+}
+
+pub fn set_session_frontier_age_ms(mode: &str, age_ms: u64) {
+    with_registry(|reg| {
+        let counter = reg
+            .session_frontier_age_ms
+            .entry(mode.to_string())
+            .or_insert_with(Counter::new);
+        counter.value.store(age_ms, Ordering::Relaxed);
     });
 }
 
@@ -461,7 +862,110 @@ pub fn generate_prometheus_metrics() -> String {
         }
         out.push('\n');
 
-        // 8. state_budget_bytes
+        // 8. write_amplification_ratio
+        out.push_str("# HELP write_amplification_ratio Gauge showing cumulative bytes written to storage divided by cumulative logical bytes written for each shard.\n");
+        out.push_str("# TYPE write_amplification_ratio gauge\n");
+        let mut shard_ids: Vec<u16> = reg
+            .write_amplification_storage_bytes
+            .keys()
+            .chain(reg.write_amplification_logical_bytes.keys())
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        shard_ids.sort_unstable();
+        for shard_id in shard_ids {
+            let storage = reg
+                .write_amplification_storage_bytes
+                .get(&shard_id)
+                .map(|c| c.get())
+                .unwrap_or(0);
+            let logical = reg
+                .write_amplification_logical_bytes
+                .get(&shard_id)
+                .map(|c| c.get())
+                .unwrap_or(0);
+            let ratio = if logical == 0 {
+                1.0
+            } else {
+                storage as f64 / logical as f64
+            };
+            out.push_str(&format!(
+                "write_amplification_ratio{{shard_id=\"{}\"}} {:.6}\n",
+                shard_id, ratio
+            ));
+        }
+        out.push('\n');
+
+        // 9. segment_cache_hit_ratio
+        out.push_str("# HELP segment_cache_hit_ratio Gauge showing segment-cache hits divided by total cache lookups for each worker.\n");
+        out.push_str("# TYPE segment_cache_hit_ratio gauge\n");
+        let mut worker_ids: Vec<String> = reg
+            .segment_cache_hits
+            .keys()
+            .chain(reg.segment_cache_misses.keys())
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        worker_ids.sort();
+        for worker_id in worker_ids {
+            let hits = reg
+                .segment_cache_hits
+                .get(&worker_id)
+                .map(|c| c.get())
+                .unwrap_or(0);
+            let misses = reg
+                .segment_cache_misses
+                .get(&worker_id)
+                .map(|c| c.get())
+                .unwrap_or(0);
+            let total = hits + misses;
+            let ratio = if total == 0 {
+                1.0
+            } else {
+                hits as f64 / total as f64
+            };
+            out.push_str(&format!(
+                "segment_cache_hit_ratio{{worker_id=\"{}\"}} {:.6}\n",
+                worker_id, ratio
+            ));
+        }
+        out.push('\n');
+
+        // 10. segment_cache_bytes_used
+        out.push_str(
+            "# HELP segment_cache_bytes_used Gauge showing live segment-cache bytes used for each worker.\n",
+        );
+        out.push_str("# TYPE segment_cache_bytes_used gauge\n");
+        for (worker_id, c) in &reg.segment_cache_bytes_used {
+            out.push_str(&format!(
+                "segment_cache_bytes_used{{worker_id=\"{}\"}} {}\n",
+                worker_id,
+                c.get()
+            ));
+        }
+        out.push('\n');
+
+        // 11. pipeline_state_bytes
+        out.push_str("# HELP pipeline_state_bytes Gauge showing live state bytes for the bounded per-pipeline metrics working set.\n");
+        out.push_str("# TYPE pipeline_state_bytes gauge\n");
+        for (pipeline_id, bytes) in reg.pipeline_state_bytes.iter() {
+            out.push_str(&format!(
+                "pipeline_state_bytes{{pipeline_id=\"{}\"}} {}\n",
+                pipeline_id, bytes
+            ));
+        }
+        let other = reg.pipeline_state_bytes_other.load(Ordering::Relaxed);
+        if other > 0 {
+            out.push_str(&format!(
+                "pipeline_state_bytes{{pipeline_id=\"other\"}} {}\n",
+                other
+            ));
+        }
+        out.push('\n');
+
+        // 12. state_budget_bytes
         out.push_str("# HELP state_budget_bytes Gauge tracking total memory allocations against state_budget_gb.\n");
         out.push_str("# TYPE state_budget_bytes gauge\n");
         out.push_str(&format!(
@@ -469,7 +973,7 @@ pub fn generate_prometheus_metrics() -> String {
             reg.state_budget_bytes.load(Ordering::Relaxed)
         ));
 
-        // 9. freshness_lag_ms
+        // 13. freshness_lag_ms
         out.push_str("# HELP freshness_lag_ms Gauge showing the lag between input source watermarks and the committed epoch.\n");
         out.push_str("# TYPE freshness_lag_ms gauge\n");
         for (view_name, c) in &reg.freshness_lag_ms {
@@ -481,13 +985,35 @@ pub fn generate_prometheus_metrics() -> String {
         }
         out.push('\n');
 
-        // 10. flush_duration_seconds_sum
+        out.push_str("# HELP session_staleness_exceeded_total Count of max_staleness-bounded queries that exceeded the frontier age budget.\n");
+        out.push_str("# TYPE session_staleness_exceeded_total counter\n");
+        for (mode, c) in &reg.session_staleness_exceeded_total {
+            out.push_str(&format!(
+                "session_staleness_exceeded_total{{mode=\"{}\"}} {}\n",
+                mode,
+                c.get()
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP session_frontier_age_ms Gauge of published frontier age observed by max_staleness sessions.\n");
+        out.push_str("# TYPE session_frontier_age_ms gauge\n");
+        for (mode, c) in &reg.session_frontier_age_ms {
+            out.push_str(&format!(
+                "session_frontier_age_ms{{mode=\"{}\"}} {}\n",
+                mode,
+                c.get()
+            ));
+        }
+        out.push('\n');
+
+        // 14. flush_duration_seconds_sum
         out.push_str("# HELP flush_duration_seconds_sum Cumulative duration of all flushes.\n");
         out.push_str("# TYPE flush_duration_seconds_sum counter\n");
         let sum_sec = reg.flush_duration_sum_ms.load(Ordering::Relaxed) as f64 / 1000.0;
         out.push_str(&format!("flush_duration_seconds_sum {sum_sec:.4}\n\n"));
 
-        // 11. flush_duration_seconds_count
+        // 15. flush_duration_seconds_count
         out.push_str("# HELP flush_duration_seconds_count Total count of flushes.\n");
         out.push_str("# TYPE flush_duration_seconds_count counter\n");
         out.push_str(&format!(
@@ -495,13 +1021,13 @@ pub fn generate_prometheus_metrics() -> String {
             reg.flush_duration_count.load(Ordering::Relaxed)
         ));
 
-        // 12. flush_duration_seconds_last
+        // 16. flush_duration_seconds_last
         out.push_str("# HELP flush_duration_seconds_last Latency of the last flush operation.\n");
         out.push_str("# TYPE flush_duration_seconds_last gauge\n");
         let last_sec = reg.flush_duration_last_ms.load(Ordering::Relaxed) as f64 / 1000.0;
         out.push_str(&format!("flush_duration_seconds_last {last_sec:.4}\n\n"));
 
-        // 13. slatedb_manifest_write_total
+        // 17. slatedb_manifest_write_total
         out.push_str("# HELP slatedb_manifest_write_total Total manifest writes.\n");
         out.push_str("# TYPE slatedb_manifest_write_total counter\n");
         out.push_str(&format!(
@@ -753,5 +1279,66 @@ mod tests {
             "WeightAdd/v1 must have 100% RMW avoidance, got {ratio}"
         );
         println!("[proof] WeightAdd/v1 RMW avoidance ratio: {ratio:.4}");
+    }
+
+    #[test]
+    fn write_amp_and_segment_cache_metrics_are_reported() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        record_compaction_write(7, 300, 200);
+        record_compaction_write(7, 150, 100);
+        record_segment_cache_hit("worker-1");
+        record_segment_cache_hit("worker-1");
+        record_segment_cache_miss("worker-1");
+        set_segment_cache_bytes_used("worker-1", 4096);
+
+        let write_amp = write_amplification_ratio(7);
+        assert!(
+            (write_amp - 1.5).abs() < 1e-9,
+            "expected 1.5 write amplification ratio, got {write_amp}"
+        );
+
+        let hit_ratio = segment_cache_hit_ratio("worker-1");
+        assert!(
+            (hit_ratio - (2.0 / 3.0)).abs() < 1e-9,
+            "expected 2/3 segment-cache hit ratio, got {hit_ratio}"
+        );
+
+        let metrics = generate_prometheus_metrics();
+        assert!(metrics.contains("write_amplification_ratio"));
+        assert!(metrics.contains("segment_cache_hit_ratio"));
+        assert!(metrics.contains("segment_cache_bytes_used"));
+    }
+
+    #[test]
+    fn pipeline_state_metrics_are_lru_bounded() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        for i in 0..300u64 {
+            set_pipeline_state_bytes(&format!("pipeline-{i:03}"), (i + 1) * 1000);
+        }
+
+        let metrics = generate_prometheus_metrics();
+        let pipeline_lines: Vec<&str> = metrics
+            .lines()
+            .filter(|line| line.starts_with("pipeline_state_bytes{pipeline_id=\""))
+            .collect();
+        assert!(pipeline_lines.len() <= 257);
+
+        let other_line = pipeline_lines
+            .iter()
+            .find(|line| line.contains("pipeline_id=\"other\""))
+            .copied()
+            .expect("expected pipeline_state_bytes other bucket");
+        let other_value = other_line
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let expected_other: u64 = (0..44u64).map(|i| (i + 1) * 1000).sum();
+        assert_eq!(other_value, expected_other);
     }
 }

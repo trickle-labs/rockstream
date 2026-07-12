@@ -5581,6 +5581,8 @@ dependencies = [
  "rockstream-sim",
  "rockstream-storage",
  "rockstream-types",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "testcontainers",
@@ -5726,9 +5728,12 @@ dependencies = [
 name = "rockstream-storage"
 version = "0.42.0"
 dependencies = [
+ "async-trait",
  "bytes",
+ "futures",
  "hex",
  "hmac 0.12.1",
+ "moka",
  "object_store 0.12.5",
  "reqwest 0.12.28",
  "rockstream-types",
@@ -5737,6 +5742,7 @@ dependencies = [
  "serial_test",
  "sha2 0.10.9",
  "slatedb",
+ "slatedb-common",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
@@ -5751,6 +5757,7 @@ version = "0.42.0"
 dependencies = [
  "antichain",
  "arrow",
+ "lru",
  "serde",
  "serde_json",
  "toml",

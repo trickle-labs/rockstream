@@ -7,6 +7,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 use std::time::SystemTime;
 
+use rockstream_types::cost::{active_pricing_config, estimate_cost_per_hour, CostEstimateInput};
+use rockstream_types::metrics::{
+    read_freshness_lag, read_pipeline_state_bytes, read_state_budget, read_workload_memory,
+};
+use rockstream_types::workload::WorkloadDef;
+
 /// Session context passed to catalog query handlers.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -201,6 +207,36 @@ pub struct CatalogSinkEntry {
     pub state: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CatalogViewResourceUsageEntry {
+    pub view_name: String,
+    pub workload_name: Option<String>,
+    pub state_bytes: u64,
+    pub memory_bytes: u64,
+    pub memory_limit_bytes: Option<u64>,
+    pub state_budget_bytes: u64,
+    pub freshness_slo_ms: Option<u64>,
+    pub freshness_lag_ms: Option<u64>,
+    pub slo_compliant: bool,
+    pub degraded_reason: Option<String>,
+    pub estimated_cost_per_hour: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogWorkloadResourceUsageEntry {
+    pub workload_name: String,
+    pub view_count: u64,
+    pub state_bytes: u64,
+    pub memory_bytes: u64,
+    pub memory_limit_bytes: Option<u64>,
+    pub state_budget_bytes: u64,
+    pub freshness_slo_ms: Option<u64>,
+    pub freshness_lag_ms: Option<u64>,
+    pub slo_compliant: bool,
+    pub degraded_reason: Option<String>,
+    pub estimated_cost_per_hour: Option<f64>,
+}
+
 /// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
 #[derive(Debug, Default)]
 struct CatalogStubsInner {
@@ -215,6 +251,10 @@ struct CatalogStubsInner {
     indexes: HashMap<String, CatalogIndexEntry>,
     /// Keyed by sink name (from CREATE SINK). v0.44.
     sinks: HashMap<String, CatalogSinkEntry>,
+    /// Keyed by workload name.
+    workloads: HashMap<String, WorkloadDef>,
+    /// View name → workload name.
+    view_workloads: HashMap<String, String>,
 }
 
 /// In-memory catalog of views exposed to Postgres clients.
@@ -265,6 +305,39 @@ impl CatalogStubs {
     pub fn get_view(&self, name: &str) -> Option<CatalogView> {
         let inner = self.inner.read().unwrap();
         inner.views.get(name).cloned()
+    }
+
+    pub fn add_workload(&self, workload: WorkloadDef) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.workloads.contains_key(&workload.name) {
+            return false;
+        }
+        inner.workloads.insert(workload.name.clone(), workload);
+        true
+    }
+
+    pub fn get_workload(&self, name: &str) -> Option<WorkloadDef> {
+        let inner = self.inner.read().unwrap();
+        inner.workloads.get(name).cloned()
+    }
+
+    pub fn list_workloads(&self) -> Vec<WorkloadDef> {
+        let inner = self.inner.read().unwrap();
+        let mut workloads: Vec<WorkloadDef> = inner.workloads.values().cloned().collect();
+        workloads.sort_by(|a, b| a.name.cmp(&b.name));
+        workloads
+    }
+
+    pub fn assign_view_workload(&self, view_name: &str, workload_name: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner
+            .view_workloads
+            .insert(view_name.to_string(), workload_name.to_string());
+    }
+
+    pub fn workload_for_view(&self, view_name: &str) -> Option<String> {
+        let inner = self.inner.read().unwrap();
+        inner.view_workloads.get(view_name).cloned()
     }
 
     /// Register a table in the catalog.
@@ -564,6 +637,13 @@ impl CatalogStubs {
             return Some(self.referential_constraints(&requested_cols));
         }
 
+        if ql.contains("rockstream_catalog.view_resource_usage") {
+            return Some(self.view_resource_usage(&requested_cols));
+        }
+        if ql.contains("rockstream_catalog.workload_resource_usage") {
+            return Some(self.workload_resource_usage(&requested_cols));
+        }
+
         // S7: bootstrap functions and identity keywords (SELECT without FROM)
         if ql.starts_with("select ") && !ql.contains(" from ") {
             if ql.contains("current_user") {
@@ -688,6 +768,235 @@ impl CatalogStubs {
         }
 
         None
+    }
+
+    pub fn view_resource_usage_entries(&self) -> Vec<CatalogViewResourceUsageEntry> {
+        let views = self.list_views();
+        let state_budget_bytes = read_state_budget();
+        let pricing = active_pricing_config();
+        let mut entries = Vec::new();
+
+        for view in views {
+            let workload = self
+                .workload_for_view(&view.name)
+                .and_then(|name| self.get_workload(&name));
+            let workload_name = workload.as_ref().map(|w| w.name.clone());
+            let workload_memory = workload_name
+                .as_deref()
+                .map(read_workload_memory)
+                .unwrap_or(0);
+            let sibling_count = workload_name
+                .as_deref()
+                .map(|name| self.views_for_workload(name).len() as u64)
+                .unwrap_or(1)
+                .max(1);
+            let memory_bytes = if workload_name.is_some() {
+                workload_memory / sibling_count
+            } else {
+                0
+            };
+            let state_bytes = read_pipeline_state_bytes(&view.name).unwrap_or(0);
+            let freshness_slo_ms = workload
+                .as_ref()
+                .and_then(|w| w.freshness_slo.map(|s| s.target_ms));
+            let freshness_lag_ms = read_freshness_lag(&view.name);
+            let memory_limit_bytes = workload
+                .as_ref()
+                .and_then(|w| w.memory_limit.map(|limit| limit.bytes));
+            let mut degraded_reason = None;
+            let mut slo_compliant = true;
+            if let (Some(limit), true) = (memory_limit_bytes, memory_bytes > 0) {
+                if memory_bytes > limit {
+                    slo_compliant = false;
+                    degraded_reason = Some(format!(
+                        "memory_bytes {} exceeds MEMORY_LIMIT {}",
+                        memory_bytes, limit
+                    ));
+                }
+            }
+            if degraded_reason.is_none() {
+                if let (Some(slo_ms), Some(lag_ms)) = (freshness_slo_ms, freshness_lag_ms) {
+                    if lag_ms > slo_ms {
+                        slo_compliant = false;
+                        degraded_reason = Some(format!(
+                            "freshness_lag_ms {} exceeds freshness_slo_ms {}",
+                            lag_ms, slo_ms
+                        ));
+                    }
+                }
+            }
+            let estimated_cost_per_hour = estimate_cost_per_hour(
+                pricing.as_ref(),
+                &CostEstimateInput {
+                    state_bytes,
+                    memory_bytes,
+                    memory_limit_bytes,
+                    shard_count: 1,
+                    object_store_storage_bytes: state_bytes,
+                    ..Default::default()
+                },
+            );
+
+            entries.push(CatalogViewResourceUsageEntry {
+                view_name: view.name,
+                workload_name,
+                state_bytes,
+                memory_bytes,
+                memory_limit_bytes,
+                state_budget_bytes,
+                freshness_slo_ms,
+                freshness_lag_ms,
+                slo_compliant,
+                degraded_reason,
+                estimated_cost_per_hour,
+            });
+        }
+
+        entries.sort_by(|a, b| a.view_name.cmp(&b.view_name));
+        entries
+    }
+
+    pub fn workload_resource_usage_entries(&self) -> Vec<CatalogWorkloadResourceUsageEntry> {
+        let workloads = self.list_workloads();
+        let view_entries = self.view_resource_usage_entries();
+        let state_budget_bytes = read_state_budget();
+        let pricing = active_pricing_config();
+        let mut rows = Vec::new();
+
+        for workload in workloads {
+            let matching: Vec<&CatalogViewResourceUsageEntry> = view_entries
+                .iter()
+                .filter(|entry| entry.workload_name.as_deref() == Some(workload.name.as_str()))
+                .collect();
+            let view_count = matching.len() as u64;
+            let state_bytes = matching.iter().map(|entry| entry.state_bytes).sum();
+            let memory_bytes = read_workload_memory(&workload.name);
+            let freshness_lag_ms = matching
+                .iter()
+                .filter_map(|entry| entry.freshness_lag_ms)
+                .max();
+            let freshness_slo_ms = workload.freshness_slo.map(|s| s.target_ms);
+            let memory_limit_bytes = workload.memory_limit.map(|m| m.bytes);
+            let mut slo_compliant = matching.iter().all(|entry| entry.slo_compliant);
+            let degraded_reason = matching
+                .iter()
+                .find_map(|entry| entry.degraded_reason.clone())
+                .or_else(|| {
+                    if let Some(limit) = memory_limit_bytes {
+                        if memory_bytes > limit {
+                            slo_compliant = false;
+                            return Some(format!(
+                                "memory_bytes {} exceeds MEMORY_LIMIT {}",
+                                memory_bytes, limit
+                            ));
+                        }
+                    }
+                    None
+                });
+            let estimated_cost_per_hour = estimate_cost_per_hour(
+                pricing.as_ref(),
+                &CostEstimateInput {
+                    state_bytes,
+                    memory_bytes,
+                    memory_limit_bytes,
+                    shard_count: view_count.max(1) as u32,
+                    object_store_storage_bytes: state_bytes,
+                    cold_storage_fraction: 0.0,
+                    ..Default::default()
+                },
+            );
+            rows.push(CatalogWorkloadResourceUsageEntry {
+                workload_name: workload.name,
+                view_count,
+                state_bytes,
+                memory_bytes,
+                memory_limit_bytes,
+                state_budget_bytes,
+                freshness_slo_ms,
+                freshness_lag_ms,
+                slo_compliant,
+                degraded_reason,
+                estimated_cost_per_hour,
+            });
+        }
+
+        rows.sort_by(|a, b| a.workload_name.cmp(&b.workload_name));
+        rows
+    }
+
+    pub fn cluster_resource_usage_entry(&self) -> CatalogWorkloadResourceUsageEntry {
+        let rows = self.workload_resource_usage_entries();
+        let state_budget_bytes = read_state_budget();
+        let state_bytes = rows.iter().map(|row| row.state_bytes).sum();
+        let memory_bytes = rows.iter().map(|row| row.memory_bytes).sum();
+        let view_count = rows.iter().map(|row| row.view_count).sum();
+        let freshness_lag_ms = rows.iter().filter_map(|row| row.freshness_lag_ms).max();
+        let degraded_reason = rows.iter().find_map(|row| row.degraded_reason.clone());
+        let estimated_cost_per_hour = rows
+            .iter()
+            .map(|row| row.estimated_cost_per_hour.unwrap_or(0.0))
+            .sum::<f64>();
+        CatalogWorkloadResourceUsageEntry {
+            workload_name: "cluster".to_string(),
+            view_count,
+            state_bytes,
+            memory_bytes,
+            memory_limit_bytes: None,
+            state_budget_bytes,
+            freshness_slo_ms: None,
+            freshness_lag_ms,
+            slo_compliant: rows.iter().all(|row| row.slo_compliant),
+            degraded_reason,
+            estimated_cost_per_hour: if active_pricing_config().is_some() {
+                Some(estimated_cost_per_hour)
+            } else {
+                None
+            },
+        }
+    }
+
+    pub fn view_resource_usage(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            view_resource_usage_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let rows = self
+            .view_resource_usage_entries()
+            .into_iter()
+            .map(|entry| project_view_resource_usage(&cols, &entry))
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn workload_resource_usage(&self, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            workload_resource_usage_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let rows = self
+            .workload_resource_usage_entries()
+            .into_iter()
+            .map(|entry| project_workload_resource_usage(&cols, &entry))
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn views_for_workload(&self, workload_name: &str) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        let mut views: Vec<String> = inner
+            .view_workloads
+            .iter()
+            .filter(|(_, assigned)| assigned.as_str() == workload_name)
+            .map(|(view, _)| view.clone())
+            .collect();
+        views.sort();
+        views
     }
 
     /// Resolve a view by name within a given search_path (S9 search-path-aware lookup).
@@ -1548,6 +1857,94 @@ fn parse_select_columns(query: &str) -> Vec<String> {
         }
     }
     cols
+}
+
+pub(crate) fn view_resource_usage_columns() -> Vec<String> {
+    vec![
+        "view_name".to_string(),
+        "workload_name".to_string(),
+        "state_bytes".to_string(),
+        "memory_bytes".to_string(),
+        "memory_limit_bytes".to_string(),
+        "state_budget_bytes".to_string(),
+        "freshness_slo_ms".to_string(),
+        "freshness_lag_ms".to_string(),
+        "slo_compliant".to_string(),
+        "degraded_reason".to_string(),
+        "estimated_cost_per_hour".to_string(),
+    ]
+}
+
+pub(crate) fn workload_resource_usage_columns() -> Vec<String> {
+    vec![
+        "workload_name".to_string(),
+        "view_count".to_string(),
+        "state_bytes".to_string(),
+        "memory_bytes".to_string(),
+        "memory_limit_bytes".to_string(),
+        "state_budget_bytes".to_string(),
+        "freshness_slo_ms".to_string(),
+        "freshness_lag_ms".to_string(),
+        "slo_compliant".to_string(),
+        "degraded_reason".to_string(),
+        "estimated_cost_per_hour".to_string(),
+    ]
+}
+
+fn fmt_bool(value: bool) -> Option<String> {
+    Some(if value { "true" } else { "false" }.to_string())
+}
+
+fn fmt_opt_u64(value: Option<u64>) -> Option<String> {
+    value.map(|value| value.to_string())
+}
+
+fn fmt_opt_f64(value: Option<f64>) -> Option<String> {
+    value.map(|value| format!("{value:.6}"))
+}
+
+pub(crate) fn project_view_resource_usage(
+    cols: &[String],
+    entry: &CatalogViewResourceUsageEntry,
+) -> Vec<Option<String>> {
+    cols.iter()
+        .map(|col| match col.as_str() {
+            "view_name" => Some(entry.view_name.clone()),
+            "workload_name" => entry.workload_name.clone(),
+            "state_bytes" => Some(entry.state_bytes.to_string()),
+            "memory_bytes" => Some(entry.memory_bytes.to_string()),
+            "memory_limit_bytes" => fmt_opt_u64(entry.memory_limit_bytes),
+            "state_budget_bytes" => Some(entry.state_budget_bytes.to_string()),
+            "freshness_slo_ms" => fmt_opt_u64(entry.freshness_slo_ms),
+            "freshness_lag_ms" => fmt_opt_u64(entry.freshness_lag_ms),
+            "slo_compliant" => fmt_bool(entry.slo_compliant),
+            "degraded_reason" => entry.degraded_reason.clone(),
+            "estimated_cost_per_hour" => fmt_opt_f64(entry.estimated_cost_per_hour),
+            _ => Some(String::new()),
+        })
+        .collect()
+}
+
+pub(crate) fn project_workload_resource_usage(
+    cols: &[String],
+    entry: &CatalogWorkloadResourceUsageEntry,
+) -> Vec<Option<String>> {
+    cols.iter()
+        .map(|col| match col.as_str() {
+            "workload_name" => Some(entry.workload_name.clone()),
+            "view_count" => Some(entry.view_count.to_string()),
+            "state_bytes" => Some(entry.state_bytes.to_string()),
+            "memory_bytes" => Some(entry.memory_bytes.to_string()),
+            "memory_limit_bytes" => fmt_opt_u64(entry.memory_limit_bytes),
+            "state_budget_bytes" => Some(entry.state_budget_bytes.to_string()),
+            "freshness_slo_ms" => fmt_opt_u64(entry.freshness_slo_ms),
+            "freshness_lag_ms" => fmt_opt_u64(entry.freshness_lag_ms),
+            "slo_compliant" => fmt_bool(entry.slo_compliant),
+            "degraded_reason" => entry.degraded_reason.clone(),
+            "estimated_cost_per_hour" => fmt_opt_f64(entry.estimated_cost_per_hour),
+            _ => Some(String::new()),
+        })
+        .collect()
 }
 
 /// A response from the catalog stub handler.

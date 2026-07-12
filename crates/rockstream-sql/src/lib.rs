@@ -29,7 +29,9 @@ pub use catalog::{ColumnDef, SchemaCatalog, ViewEntry};
 pub use distribution::apply_distribution;
 pub use error::SqlError;
 pub use estimate::{explain_incremental_estimate, format_estimate, EstimateRow};
-pub use explain_incremental::explain_incremental;
+pub use explain_incremental::{
+    explain_incremental, explain_incremental_analyze, explain_incremental_verbose,
+};
 pub use extension::{IncAggregate, IncDistinct, IncJoin};
 pub use frontend::SqlFrontend;
 pub use lower::lower;

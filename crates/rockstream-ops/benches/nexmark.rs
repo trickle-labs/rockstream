@@ -5,10 +5,12 @@ use rockstream_gateway::catalog_stubs::CatalogStubs;
 use rockstream_gateway::error::GatewayError;
 use rockstream_gateway::server::GatewayServer;
 use rockstream_gateway::view_reader::{ViewReadStrategy, ViewReader};
+use rockstream_ops::nexmark_regression::{percentile, NexmarkBenchmarkSummary};
 use rockstream_sim::{NexmarkEvent, NexmarkGenerator};
 use rockstream_storage::ShardDb;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_postgres::NoTls;
 
 struct NoopViewReader;
@@ -375,6 +377,30 @@ async fn measure_amplification_for_all_stateful_views(
     amplifications
 }
 
+async fn measure_commit_latencies_ms(
+    seed: u64,
+    num_base_events: usize,
+    dml_statements: &[String],
+    samples: usize,
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let env = setup_env(seed, num_base_events).await;
+        env.client
+            .simple_query("SET rockstream.idempotency_key = 'bench-nexmark-summary'")
+            .await
+            .unwrap();
+        let started = Instant::now();
+        env.client.simple_query("BEGIN").await.unwrap();
+        for sql in dml_statements {
+            env.client.simple_query(sql).await.unwrap();
+        }
+        env.client.simple_query("COMMIT").await.unwrap();
+        out.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    out
+}
+
 fn bench_nexmark(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -390,6 +416,8 @@ fn bench_nexmark(c: &mut Criterion) {
         ("1pct", 10),   // 1% change rate
         ("10pct", 100), // 10% change rate
     ];
+    let mut max_delta_amplification = 0.0f64;
+    let mut latency_samples_ms = Vec::new();
 
     for &(label, delta_size) in rates {
         let dml_statements = generate_dml_statements(42, delta_size, DATASET_SIZE);
@@ -401,12 +429,16 @@ fn bench_nexmark(c: &mut Criterion) {
         });
         for (view, amp) in &amps {
             println!("[nexmark_bench] View {view} delta amplification: {amp:.2}x");
+            max_delta_amplification = max_delta_amplification.max(*amp);
             let limit = if view == "q6" { 15.0 } else { 10.0 };
             assert!(
                 *amp <= limit,
                 "Delta amplification factor for view {view} ({amp:.2}x) exceeds the maximum allowed {limit}x"
             );
         }
+        latency_samples_ms.extend(rt.block_on(async {
+            measure_commit_latencies_ms(42, DATASET_SIZE, &dml_statements, 5).await
+        }));
 
         // 2. Measure timed transaction commit duration
         group.throughput(Throughput::Elements(input_rows as u64));
@@ -439,6 +471,17 @@ fn bench_nexmark(c: &mut Criterion) {
     }
 
     group.finish();
+    let mut p50_samples = latency_samples_ms.clone();
+    let mut p99_samples = latency_samples_ms;
+    let summary = NexmarkBenchmarkSummary {
+        max_delta_amplification,
+        propagation_latency_p50_ms: percentile(&mut p50_samples, 0.50),
+        propagation_latency_p99_ms: percentile(&mut p99_samples, 0.99),
+    };
+    println!(
+        "[nexmark_summary] {}",
+        serde_json::to_string(&summary).unwrap()
+    );
 }
 
 criterion_group!(benches, bench_nexmark);

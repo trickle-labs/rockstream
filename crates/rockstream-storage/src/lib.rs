@@ -17,6 +17,7 @@ pub mod keys;
 pub mod merge_registry;
 pub mod reader;
 pub mod shard_db;
+pub mod tiered_store;
 pub mod wal;
 pub mod wal_cache;
 
@@ -31,7 +32,12 @@ pub use shard_db::{
     is_allow_law_operand_fallback, set_allow_law_operand_fallback, BatchOp, CheckpointHandle,
     PartialAggSpec, ShardDb, WriteBatch,
 };
+pub use tiered_store::{
+    build_s3_backend_from_config, s3_express_build_config, tier_aged_ssts, TieredObjectStore,
+    MAX_TIERING_SCAN_OBJECTS,
+};
 pub use wal_cache::WalListingCache;
 
+mod slatedb_metrics;
 #[cfg(test)]
 mod tests;

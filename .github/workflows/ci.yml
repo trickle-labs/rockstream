@@ -158,6 +158,21 @@ jobs:
           name: coverage-lcov
           path: lcov.info
 
+  nexmark-regression-gate:
+    name: Nexmark regression gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: run nexmark bench
+        run: cargo bench -p rockstream-ops --bench nexmark -- --noplot | tee nexmark-bench.out
+      - name: compare against v0.36 baseline
+        run: cargo run -p rockstream-ops --bin nexmark_regression_gate -- --baseline crates/rockstream-ops/benches/baseline/v0.36.json --output nexmark-bench.out
+
   release-version-check:
     name: Version / tag alignment
     runs-on: ubuntu-latest

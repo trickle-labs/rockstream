@@ -137,13 +137,26 @@ impl ControlService {
         &self,
         _pipeline_id: u64,
     ) -> Vec<rockstream_types::explain::OperatorStats> {
-        vec![rockstream_types::explain::OperatorStats {
-            rows_per_s: 12500.0,
-            state_reads: 120,
-            rmw_ratio: 0.15,
-            p99_latency_ms: 12.0,
-            dlq_entries: 0,
-        }]
+        rockstream_types::metrics::operator_runtime_report()
+            .into_iter()
+            .map(|snapshot| {
+                let (rmw_avoided, rmw_required) =
+                    rockstream_types::metrics::operator_rmw_totals(snapshot.operator_id);
+                let rmw_total = rmw_avoided + rmw_required;
+                let rmw_ratio = if rmw_total == 0 {
+                    0.0
+                } else {
+                    rmw_required as f64 / rmw_total as f64
+                };
+                rockstream_types::explain::OperatorStats {
+                    rows_per_s: snapshot.rows_per_s,
+                    state_reads: snapshot.state_reads,
+                    rmw_ratio,
+                    p99_latency_ms: snapshot.p99_latency_ms,
+                    dlq_entries: snapshot.dlq_entries,
+                }
+            })
+            .collect()
     }
 }
 
@@ -533,6 +546,61 @@ mod tests {
         }
 
         handle.shutdown();
+    }
+
+    #[test]
+    fn collect_operator_stats_uses_live_windowed_metrics() {
+        use rockstream_types::ids::OperatorId;
+        use rockstream_types::merge_law::MergeLawId;
+        use rockstream_types::metrics::{self, LawMetricKey};
+        use std::time::{Duration, SystemTime};
+
+        metrics::reset_all();
+        let op_id = OperatorId(7);
+        let at = SystemTime::now();
+        metrics::record_operator_runtime_sample_at(op_id, 300, 12, Duration::from_millis(4), 1, at);
+        metrics::record_operator_runtime_sample_at(op_id, 200, 8, Duration::from_millis(9), 0, at);
+        metrics::record_operator_runtime_sample_at(
+            op_id,
+            100,
+            10,
+            Duration::from_millis(15),
+            1,
+            at,
+        );
+
+        let metric_key = LawMetricKey {
+            law_id: MergeLawId(1),
+            law_name: "WeightAdd",
+            law_version: 1,
+            operator_id: Some(op_id),
+        };
+        metrics::inc_rmw_avoided(&metric_key);
+        metrics::inc_rmw_avoided(&metric_key);
+        metrics::inc_rmw_avoided(&metric_key);
+        metrics::inc_rmw_required(&metric_key);
+
+        let svc = ControlService::new(TopologyCatalog::new());
+        let stats = svc.collect_operator_stats(0);
+        let stat = stats
+            .iter()
+            .find(|s| (s.rows_per_s - 10.0).abs() < 1e-9)
+            .expect("expected driven operator stats");
+
+        assert_ne!(stat.rows_per_s, 12500.0);
+        assert_ne!(stat.state_reads, 120);
+        assert_ne!(stat.p99_latency_ms, 12.0);
+        assert_eq!(stat.rows_per_s, 10.0);
+        assert_eq!(stat.state_reads, 30);
+        assert!(
+            (stat.rmw_ratio - 0.25).abs() < 1e-9,
+            "rmw_ratio={}",
+            stat.rmw_ratio
+        );
+        assert_eq!(stat.p99_latency_ms, 15.0);
+        assert_eq!(stat.dlq_entries, 2);
+
+        metrics::reset_all();
     }
 
     #[tokio::test]

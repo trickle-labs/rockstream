@@ -18,6 +18,10 @@ harness = false
 name = "nexmark"
 harness = false
 
+[[bench]]
+name = "tco"
+harness = false
+
 [dependencies]
 rockstream-types = { workspace = true }
 rockstream-plan = { workspace = true }
@@ -27,6 +31,8 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

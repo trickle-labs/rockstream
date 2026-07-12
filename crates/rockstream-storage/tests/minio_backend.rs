@@ -26,15 +26,22 @@
 //! skipped gracefully rather than failing.
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use object_store::aws::AmazonS3Builder;
-use object_store::ObjectStore;
+use object_store::path::Path;
+use object_store::{
+    Attribute, Attributes, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+};
 use rockstream_storage::{
     keys::{CatalogKeyEncoder, CatalogType, ShardKeyEncoder, ShardPrefix},
     merge_registry::MergeOperatorRegistry,
-    ShardDb, StorageError, WriteBatch,
+    tier_aged_ssts, ShardDb, StorageError, TieredObjectStore, WriteBatch,
 };
 use sha2::{Digest, Sha256};
 use testcontainers::runners::AsyncRunner;
@@ -230,6 +237,129 @@ fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
             .build()
             .expect("failed to build S3 object store for MinIO"),
     )
+}
+
+fn minio_object_store_for_bucket(port: u16, bucket: &str) -> Arc<dyn ObjectStore> {
+    Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint(format!("http://127.0.0.1:{port}"))
+            .with_bucket_name(bucket)
+            .with_access_key_id(MINIO_USER)
+            .with_secret_access_key(MINIO_PASS)
+            .with_region("us-east-1")
+            .with_allow_http(true)
+            .build()
+            .expect("failed to build bucket-specific MinIO store"),
+    )
+}
+
+#[derive(Debug)]
+struct RecordingStore {
+    inner: Arc<dyn ObjectStore>,
+    attributes_seen: Mutex<Vec<Attributes>>,
+}
+
+impl RecordingStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            attributes_seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn saw_storage_class(&self, value: &str) -> bool {
+        self.attributes_seen.lock().unwrap().iter().any(|attrs| {
+            attrs
+                .get(&Attribute::StorageClass)
+                .map(|seen| seen.as_ref())
+                == Some(value)
+        })
+    }
+}
+
+impl std::fmt::Display for RecordingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RecordingStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for RecordingStore {
+    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
+        self.inner.put(location, payload).await
+    }
+
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
+        self.attributes_seen
+            .lock()
+            .unwrap()
+            .push(opts.attributes.clone());
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart(location).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get(&self, location: &Path) -> Result<GetResult> {
+        self.inner.get(location).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_range(&self, location: &Path, range: std::ops::Range<u64>) -> Result<Bytes> {
+        self.inner.get_range(location, range).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Vec<Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -495,4 +625,86 @@ async fn fencing_minio() {
     // 4. Clean close.
     let _ = db1.close().await;
     db2.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn minio_tiered_store_routes_shard_meta_and_sst_separately() {
+    if !docker_available() {
+        eprintln!(
+            "SKIP minio_tiered_store_routes_shard_meta_and_sst_separately: Docker not available"
+        );
+        return;
+    }
+
+    const META_BUCKET: &str = "rockstream-tiered-meta";
+    const DATA_BUCKET: &str = "rockstream-tiered-data";
+    let (_container, port) = start_minio().await;
+    create_minio_bucket(port, META_BUCKET).await;
+    create_minio_bucket(port, DATA_BUCKET).await;
+    let meta = minio_object_store_for_bucket(port, META_BUCKET);
+    let data = minio_object_store_for_bucket(port, DATA_BUCKET);
+    let tiered =
+        TieredObjectStore::new(Arc::clone(&data)).with_route("shard_meta/", Arc::clone(&meta));
+
+    tiered
+        .put(
+            &Path::from("shard_meta/frontier"),
+            Bytes::from("frontier").into(),
+        )
+        .await
+        .unwrap();
+    tiered
+        .put(&Path::from("sst/0001.sst"), Bytes::from("sst").into())
+        .await
+        .unwrap();
+
+    assert!(meta.head(&Path::from("shard_meta/frontier")).await.is_ok());
+    assert!(data.head(&Path::from("sst/0001.sst")).await.is_ok());
+}
+
+#[tokio::test]
+async fn minio_aged_sst_moves_to_cold_bucket_with_storage_class() {
+    if !docker_available() {
+        eprintln!(
+            "SKIP minio_aged_sst_moves_to_cold_bucket_with_storage_class: Docker not available"
+        );
+        return;
+    }
+
+    const HOT_BUCKET: &str = "rockstream-hot-sst";
+    const COLD_BUCKET: &str = "rockstream-cold-sst";
+    let (_container, port) = start_minio().await;
+    create_minio_bucket(port, HOT_BUCKET).await;
+    create_minio_bucket(port, COLD_BUCKET).await;
+
+    let hot = minio_object_store_for_bucket(port, HOT_BUCKET);
+    let cold_inner = minio_object_store_for_bucket(port, COLD_BUCKET);
+    let cold_recorder = Arc::new(RecordingStore::new(Arc::clone(&cold_inner)));
+    hot.put(&Path::from("sst/aged.sst"), Bytes::from("payload").into())
+        .await
+        .unwrap();
+
+    let now = SystemTime::now() + Duration::from_secs(7200);
+    let moved = tier_aged_ssts(
+        Arc::clone(&hot),
+        cold_recorder.clone(),
+        Duration::from_secs(3600),
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(moved.copied_objects, 1);
+    assert!(hot.head(&Path::from("sst/aged.sst")).await.is_err());
+
+    let tiered =
+        TieredObjectStore::new(Arc::clone(&hot)).with_route("shard_meta/", cold_inner.clone());
+    let bytes = tiered
+        .get(&Path::from("sst/aged.sst"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), b"payload");
+    assert!(cold_recorder.saw_storage_class("STANDARD_IA"));
 }

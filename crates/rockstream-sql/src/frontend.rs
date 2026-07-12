@@ -23,13 +23,16 @@ use datafusion::execution::context::SessionConfig;
 use datafusion::prelude::SessionContext;
 
 use rockstream_plan::PlanNode;
+use rockstream_types::explain::{ExplainLevel, OperatorStats, ShardInfo};
 
 use crate::{
     catalog::{ColumnDef, IndexEntry, IndexState, SchemaCatalog, ViewEntry},
     distribution::apply_distribution,
     error::SqlError,
     estimate::{explain_incremental_estimate, format_estimate, EstimateRow},
-    explain_incremental::explain_incremental,
+    explain_incremental::{
+        explain_incremental, explain_incremental_analyze, explain_incremental_verbose,
+    },
     lower::lower_with_views,
 };
 
@@ -234,9 +237,33 @@ impl SqlFrontend {
     ///
     /// Parses and lowers the SQL, then formats the resulting `PlanNode` tree.
     /// No operators are deployed or storage accessed.
-    pub async fn explain_incremental_for_sql(&self, sql: &str) -> Result<String, SqlError> {
+    pub async fn explain_incremental_for_sql(
+        &self,
+        sql: &str,
+        level: ExplainLevel,
+        operator_stats: &[OperatorStats],
+    ) -> Result<String, SqlError> {
         let plan = self.sql_to_unoptimized_plan_node(sql).await?;
-        Ok(explain_incremental(&plan))
+        let text = match level {
+            ExplainLevel::Default => explain_incremental(&plan),
+            ExplainLevel::Verbose => {
+                let shard_info = vec![
+                    ShardInfo {
+                        shard_count: 1,
+                        parallelism: 1,
+                        frontier_epoch: 0,
+                    };
+                    Self::count_plan_nodes(&plan)
+                ];
+                explain_incremental_verbose(
+                    &plan,
+                    &shard_info,
+                    rockstream_types::metrics::read_total_workload_memory(),
+                )
+            }
+            ExplainLevel::Analyze => explain_incremental_analyze(&plan, operator_stats),
+        };
+        Ok(text)
     }
 
     /// Produce an `EXPLAIN INCREMENTAL ESTIMATE` for the given SQL.
@@ -277,6 +304,36 @@ impl SqlFrontend {
         name: &str,
     ) -> Result<Option<ViewEntry>, SqlError> {
         catalog.load_view(name).await
+    }
+
+    fn count_plan_nodes(plan: &PlanNode) -> usize {
+        match plan {
+            PlanNode::Source { .. } | PlanNode::Snapshot { .. } | PlanNode::ViewRef { .. } => 1,
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Map { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input, .. }
+            | PlanNode::Window { input, .. }
+            | PlanNode::TumbleWindow { input, .. }
+            | PlanNode::TopK { input, .. }
+            | PlanNode::Lateral { input, .. }
+            | PlanNode::IndexArrange { input, .. } => 1 + Self::count_plan_nodes(input),
+            PlanNode::Exchange { child, .. } | PlanNode::ViewSink { child, .. } => {
+                1 + Self::count_plan_nodes(child)
+            }
+            PlanNode::Join { left, right, .. }
+            | PlanNode::InnerJoin { left, right, .. }
+            | PlanNode::OuterJoin { left, right, .. }
+            | PlanNode::Union { left, right }
+            | PlanNode::Intersect { left, right, .. }
+            | PlanNode::Except { left, right, .. } => {
+                1 + Self::count_plan_nodes(left) + Self::count_plan_nodes(right)
+            }
+            PlanNode::Recursion { base, step, .. } => {
+                1 + Self::count_plan_nodes(base) + Self::count_plan_nodes(step)
+            }
+        }
     }
 
     /// Determine if a SQL query can use a secondary index (v0.32-S5).
@@ -889,7 +946,7 @@ mod tests {
         frontend.register_table("t", two_col_schema()).unwrap();
 
         let text = frontend
-            .explain_incremental_for_sql("SELECT a FROM t WHERE a > 5")
+            .explain_incremental_for_sql("SELECT a FROM t WHERE a > 5", ExplainLevel::Default, &[])
             .await
             .unwrap();
 

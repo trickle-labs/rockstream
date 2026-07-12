@@ -88,6 +88,8 @@ pub struct ShardDbBuilder {
     path: String,
     object_store: Arc<dyn ObjectStore>,
     settings: Settings,
+    metrics_shard_id: Option<u16>,
+    worker_id: Option<String>,
 }
 
 /// Specification for a partial aggregation query.
@@ -109,6 +111,8 @@ impl ShardDbBuilder {
             path: path.into(),
             object_store,
             settings: Settings::default(),
+            metrics_shard_id: None,
+            worker_id: None,
         }
     }
 
@@ -118,13 +122,28 @@ impl ShardDbBuilder {
         self
     }
 
+    /// Attach live metric labels for this shard database's compaction and cache activity.
+    pub fn with_metrics_identity(mut self, shard_id: u16, worker_id: impl Into<String>) -> Self {
+        self.metrics_shard_id = Some(shard_id);
+        self.worker_id = Some(worker_id.into());
+        self
+    }
+
     /// Build and open the shard database.
     pub async fn build(self) -> Result<ShardDb, StorageError> {
-        let db = Db::builder(self.path.as_str(), self.object_store.clone())
+        let worker_id = self
+            .worker_id
+            .unwrap_or_else(|| "worker-unknown".to_string());
+        let mut builder = Db::builder(self.path.as_str(), self.object_store.clone())
             .with_settings(self.settings)
             .with_merge_operator(Arc::new(SumCountMergeOperator))
-            .build()
-            .await?;
+            .with_db_cache(crate::slatedb_metrics::instrumented_db_cache(&worker_id));
+        if let Some(shard_id) = self.metrics_shard_id {
+            builder = builder.with_metrics_recorder(
+                crate::slatedb_metrics::instrumented_metrics_recorder(shard_id),
+            );
+        }
+        let db = builder.build().await?;
         let frontier_key = ShardKeyEncoder::frontier_key();
         let initial_epoch = if let Some(bytes) = db.get(&frontier_key).await? {
             if bytes.len() == 8 {

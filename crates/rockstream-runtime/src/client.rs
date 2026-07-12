@@ -242,7 +242,12 @@ pub async fn start_worker_client(
                     );
 
                     // Attempt to open the ShardDb
-                    match ShardDb::builder("db", store).build().await {
+                    let mut builder = ShardDb::builder("db", store);
+                    if let Ok(metric_shard_id) = u16::try_from(lease.shard_id.0) {
+                        builder = builder
+                            .with_metrics_identity(metric_shard_id, lease.worker_id.to_string());
+                    }
+                    match builder.build().await {
                         Ok(db) => {
                             active_shards_clone.write().insert(
                                 lease.shard_id,

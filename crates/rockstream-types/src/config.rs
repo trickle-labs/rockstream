@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::cost::PricingConfig;
+use crate::tiering::StorageTieringConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutotunerConfig {
     pub enabled: bool,
@@ -65,11 +68,21 @@ pub struct ConnectorConfig {
     pub dlq_retention_days: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub tiering: StorageTieringConfig,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RockstreamConfig {
     pub cluster: ClusterConfig,
     pub worker: WorkerConfig,
     pub connector: ConnectorConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub pricing: Option<PricingConfig>,
 }
 
 impl RockstreamConfig {
@@ -101,6 +114,8 @@ impl Default for RockstreamConfig {
                 dlq_warn_threshold: 100,
                 dlq_retention_days: 7,
             },
+            storage: StorageConfig::default(),
+            pricing: None,
         }
     }
 }
@@ -115,5 +130,51 @@ mod tests {
         let serialized = default_cfg.to_string().unwrap();
         let deserialized = RockstreamConfig::load_from_str(&serialized).unwrap();
         assert_eq!(default_cfg, deserialized);
+    }
+
+    #[test]
+    fn pricing_and_tiering_blocks_parse() {
+        let cfg = RockstreamConfig::load_from_str(
+            r#"
+[cluster]
+min_epoch_ms = 10
+checkpoint_retention_count = 128
+state_budget_gb = 10
+
+[worker]
+segment_cache_bytes = 536870912
+max_rows_per_quantum = 1000
+
+[connector]
+dlq_warn_threshold = 100
+dlq_retention_days = 7
+
+[storage.tiering]
+shard_meta_backend = "s3express"
+cold_sst_backend = "standard-ia"
+cold_sst_age_threshold = 3600
+
+[pricing]
+object_store_request_per_1k = 0.005
+object_store_standard_gb_month = 0.023
+object_store_standard_ia_gb_month = 0.0125
+object_store_egress_gb = 0.09
+compute_on_demand_core_hour = 0.20
+compute_spot_core_hour = 0.06
+compute_spot_mix = 0.75
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.storage.tiering.shard_meta_backend.as_deref(),
+            Some("s3express")
+        );
+        assert_eq!(
+            cfg.storage.tiering.cold_sst_backend.as_deref(),
+            Some("standard-ia")
+        );
+        assert_eq!(cfg.storage.tiering.cold_sst_age_threshold, Some(3600));
+        assert!(cfg.pricing.is_some());
     }
 }
