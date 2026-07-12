@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use rockstream_gateway::{
     catalog_stubs::{
@@ -16,6 +17,7 @@ use rockstream_gateway::{
     view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
+use rockstream_sql::WorkloadCatalog;
 use rockstream_storage::{ShardDb, ShardReader};
 use rockstream_types::{
     cost::set_active_pricing_config,
@@ -23,7 +25,10 @@ use rockstream_types::{
         reset_all, set_freshness_lag, set_pipeline_state_bytes, set_state_budget,
         set_workload_memory,
     },
+    view_lifecycle::ViewState,
+    workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority},
 };
+use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio_postgres::NoTls;
 
@@ -124,6 +129,16 @@ async fn start_gateway_noop(catalog: CatalogStubs) -> (u16, tokio::task::JoinHan
     (local_addr.port(), handle)
 }
 
+async fn open_local_shard_db(dir: &TempDir) -> Arc<ShardDb> {
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    Arc::new(
+        ShardDb::builder("gateway-workload-catalog", store)
+            .build()
+            .await
+            .unwrap(),
+    )
+}
+
 // ── S6: proof_serializable_returns_rs2003 ─────────────────────────────────────
 
 /// P3: `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns RS-2003.
@@ -149,12 +164,308 @@ async fn proof_serializable_returns_rs2003() {
                 "expected RS-2003 in error message, got: {msg}"
             );
         }
+
         Ok(msgs) => {
             // Some clients may surface the error inside the messages list
             let found = msgs.iter().any(|m| format!("{m:?}").contains("RS-2003"));
             assert!(found, "expected RS-2003 error message in response");
         }
     }
+}
+
+#[tokio::test]
+async fn create_workload_survives_catalog_stubs_restart() {
+    let dir = TempDir::new().unwrap();
+    let db = open_local_shard_db(&dir).await;
+    let workload_catalog = Arc::new(WorkloadCatalog::new(Arc::clone(&db)));
+    let catalog = Arc::new(
+        CatalogStubs::with_workload_catalog(Arc::clone(&workload_catalog))
+            .await
+            .unwrap(),
+    );
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&catalog),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query(
+            "CREATE WORKLOAD fast_lane WITH (MEMORY_LIMIT = 1048576, FRESHNESS_SLO_MS = 500)",
+        )
+        .await
+        .expect("CREATE WORKLOAD fast_lane");
+
+    handle.abort();
+    drop(client);
+    drop(catalog);
+    drop(workload_catalog);
+    drop(db);
+
+    let reopened_db = open_local_shard_db(&dir).await;
+    let reopened_catalog = Arc::new(WorkloadCatalog::new(reopened_db));
+    let restarted = CatalogStubs::with_workload_catalog(reopened_catalog)
+        .await
+        .expect("reload workload catalog");
+    let expected = WorkloadDef::new("fast_lane")
+        .with_memory_limit(MemoryLimit::new(1_048_576))
+        .with_freshness_slo(FreshnessSlo::new(500));
+    assert_eq!(restarted.get_workload("fast_lane"), Some(expected));
+}
+
+#[tokio::test]
+async fn create_workload_parses_priority_and_max_parallelism() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&catalog),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query(
+            "CREATE WORKLOAD fast WITH (MEMORY_LIMIT=1048576, FRESHNESS_SLO_MS=500, PRIORITY=HIGH, MAX_PARALLELISM=8)",
+        )
+        .await
+        .expect("CREATE WORKLOAD fast");
+
+    let workload = catalog.get_workload("fast").expect("workload registered");
+    assert_eq!(workload.memory_limit, Some(MemoryLimit::new(1_048_576)));
+    assert_eq!(workload.freshness_slo, Some(FreshnessSlo::new(500)));
+    assert_eq!(workload.priority, WorkloadPriority::HIGH);
+    assert_eq!(workload.max_parallelism, Some(8));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn alter_workload_updates_requested_fields() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&catalog),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query(
+            "CREATE WORKLOAD fast WITH (MEMORY_LIMIT=1024, FRESHNESS_SLO_MS=500, PRIORITY=DEFAULT, MAX_PARALLELISM=2)",
+        )
+        .await
+        .expect("CREATE WORKLOAD fast");
+
+    let cases = [
+        (
+            "ALTER WORKLOAD fast SET (MEMORY_LIMIT=2048)",
+            Some(MemoryLimit::new(2048)),
+            Some(FreshnessSlo::new(500)),
+            WorkloadPriority::DEFAULT,
+            Some(2),
+        ),
+        (
+            "ALTER WORKLOAD fast SET (FRESHNESS_SLO_MS=750)",
+            Some(MemoryLimit::new(2048)),
+            Some(FreshnessSlo::new(750)),
+            WorkloadPriority::DEFAULT,
+            Some(2),
+        ),
+        (
+            "ALTER WORKLOAD fast SET (PRIORITY=LOW)",
+            Some(MemoryLimit::new(2048)),
+            Some(FreshnessSlo::new(750)),
+            WorkloadPriority::LOW,
+            Some(2),
+        ),
+        (
+            "ALTER WORKLOAD fast SET (MAX_PARALLELISM=4)",
+            Some(MemoryLimit::new(2048)),
+            Some(FreshnessSlo::new(750)),
+            WorkloadPriority::LOW,
+            Some(4),
+        ),
+        (
+            "ALTER WORKLOAD fast SET (MEMORY_LIMIT=4096, FRESHNESS_SLO_MS=900, PRIORITY=HIGH, MAX_PARALLELISM=8)",
+            Some(MemoryLimit::new(4096)),
+            Some(FreshnessSlo::new(900)),
+            WorkloadPriority::HIGH,
+            Some(8),
+        ),
+    ];
+
+    for (statement, memory_limit, freshness_slo, priority, max_parallelism) in cases {
+        client.simple_query(statement).await.expect(statement);
+        let workload = catalog.get_workload("fast").expect("workload exists");
+        assert_eq!(workload.memory_limit, memory_limit);
+        assert_eq!(workload.freshness_slo, freshness_slo);
+        assert_eq!(workload.priority, priority);
+        assert_eq!(workload.max_parallelism, max_parallelism);
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn alter_workload_nonexistent_returns_rs1005() {
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    let err = client
+        .simple_query("ALTER WORKLOAD missing SET (MEMORY_LIMIT=2048)")
+        .await
+        .expect_err("ALTER WORKLOAD missing must fail");
+    let msg = err
+        .as_db_error()
+        .map(|db_err| db_err.message().to_string())
+        .unwrap_or_else(|| err.to_string());
+    assert!(msg.contains("RS-1005"), "expected RS-1005, got: {msg}");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn drop_workload_enforces_assignments_and_allows_recreate() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&catalog),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query("CREATE WORKLOAD busy WITH (MEMORY_LIMIT=1024)")
+        .await
+        .expect("CREATE WORKLOAD busy");
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE orders");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW busy_view WITH WORKLOAD = busy AS SELECT id, amount FROM orders",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW busy_view");
+
+    let err = client
+        .simple_query("DROP WORKLOAD busy")
+        .await
+        .expect_err("DROP WORKLOAD busy must fail while assigned");
+    let msg = err
+        .as_db_error()
+        .map(|db_err| db_err.message().to_string())
+        .unwrap_or_else(|| err.to_string());
+    assert!(msg.contains("RS-1014"), "expected RS-1014, got: {msg}");
+
+    client
+        .simple_query("CREATE WORKLOAD ephemeral WITH (MEMORY_LIMIT=512)")
+        .await
+        .expect("CREATE WORKLOAD ephemeral");
+    client
+        .simple_query("DROP WORKLOAD ephemeral")
+        .await
+        .expect("DROP WORKLOAD ephemeral");
+    assert!(catalog.get_workload("ephemeral").is_none());
+
+    client
+        .simple_query("CREATE WORKLOAD ephemeral WITH (MEMORY_LIMIT=2048)")
+        .await
+        .expect("recreate workload ephemeral");
+    assert_eq!(
+        catalog
+            .get_workload("ephemeral")
+            .expect("recreated workload")
+            .memory_limit,
+        Some(MemoryLimit::new(2048))
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn show_workload_status_matches_catalog_state() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&catalog),
+        Arc::new(NoopViewReader),
+    );
+    let (local_addr, handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query(
+            "CREATE WORKLOAD fast WITH (MEMORY_LIMIT=100, FRESHNESS_SLO_MS=900, PRIORITY=HIGH, MAX_PARALLELISM=8)",
+        )
+        .await
+        .expect("CREATE WORKLOAD fast");
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE orders");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW fast_a WITH WORKLOAD = fast AS SELECT id, amount FROM orders",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW fast_a");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW fast_b WITH WORKLOAD = fast AS SELECT id FROM orders",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW fast_b");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW fast_c WITH WORKLOAD = fast AS SELECT amount FROM orders",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW fast_c");
+    catalog.set_view_state("fast_b", ViewState::Paused);
+    catalog.set_view_state_bytes("fast_a", 60, None);
+    catalog.set_view_state_bytes("fast_c", 50, None);
+
+    let msgs = client
+        .simple_query("SHOW WORKLOAD STATUS FOR fast")
+        .await
+        .expect("SHOW WORKLOAD STATUS FOR fast");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("fast"));
+    assert_eq!(rows[0].get(1), Some("0"));
+    assert_eq!(rows[0].get(2), Some("8"));
+    assert_eq!(rows[0].get(3), Some("100"));
+    assert_eq!(rows[0].get(4), Some("900"));
+    assert_eq!(rows[0].get(5), Some("3"));
+    assert_eq!(rows[0].get(6), Some("1"));
+    assert_eq!(rows[0].get(7), Some("1"));
+
+    let entry = catalog
+        .workload_status_entries()
+        .into_iter()
+        .find(|entry| entry.workload_name == "fast")
+        .expect("status entry");
+    assert_eq!(entry.priority, 0);
+    assert_eq!(entry.max_parallelism, Some(8));
+    assert_eq!(entry.memory_limit_bytes, Some(100));
+    assert_eq!(entry.freshness_slo_ms, Some(900));
+    assert_eq!(entry.view_count, 3);
+    assert_eq!(entry.over_budget_relaxed_view_count, 1);
+    assert_eq!(entry.paused_view_count, 1);
+
+    handle.abort();
 }
 
 // ── S7: copy_out_streams_view_rows ────────────────────────────────────────────

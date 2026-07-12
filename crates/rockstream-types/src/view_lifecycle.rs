@@ -3,7 +3,8 @@
 //! A materialized view transitions through the following states:
 //!
 //! ```text
-//! BackfillingFromEpoch(n)  →  Running  →  Paused  →  Running
+//! BackfillingFromEpoch(n)  →  Running  →  OverBudgetRelaxed  →  Running
+//!                                        ↘ Paused ↗
 //! ```
 //!
 //! The `ViewState` enum represents these states. `ViewStatus` combines the
@@ -22,6 +23,8 @@ pub enum ViewState {
     Running,
     /// The view has been paused; no deltas are processed until resumed.
     Paused,
+    /// The view exceeded its workload memory limit and is running in a relaxed mode.
+    OverBudgetRelaxed,
     /// The view is currently backfilling from the given starting epoch.
     BackfillingFromEpoch(u64),
 }
@@ -37,6 +40,11 @@ impl ViewState {
         matches!(self, Self::Paused)
     }
 
+    /// Returns true if the view is running in over-budget relaxed mode.
+    pub fn is_over_budget_relaxed(&self) -> bool {
+        matches!(self, Self::OverBudgetRelaxed)
+    }
+
     /// Returns true if the view is backfilling.
     pub fn is_backfilling(&self) -> bool {
         matches!(self, Self::BackfillingFromEpoch(_))
@@ -48,6 +56,7 @@ impl std::fmt::Display for ViewState {
         match self {
             Self::Running => write!(f, "RUNNING"),
             Self::Paused => write!(f, "PAUSED"),
+            Self::OverBudgetRelaxed => write!(f, "OVER_BUDGET_RELAXED"),
             Self::BackfillingFromEpoch(epoch) => write!(f, "BACKFILLING(from epoch {epoch})"),
         }
     }
@@ -113,9 +122,13 @@ mod tests {
         assert!(ViewState::Running.is_running());
         assert!(!ViewState::Running.is_paused());
         assert!(!ViewState::Running.is_backfilling());
+        assert!(!ViewState::Running.is_over_budget_relaxed());
 
         assert!(ViewState::Paused.is_paused());
         assert!(!ViewState::Paused.is_running());
+
+        assert!(ViewState::OverBudgetRelaxed.is_over_budget_relaxed());
+        assert!(!ViewState::OverBudgetRelaxed.is_paused());
 
         assert!(ViewState::BackfillingFromEpoch(5).is_backfilling());
         assert!(!ViewState::BackfillingFromEpoch(5).is_paused());
@@ -125,6 +138,10 @@ mod tests {
     fn view_state_display() {
         assert_eq!(ViewState::Running.to_string(), "RUNNING");
         assert_eq!(ViewState::Paused.to_string(), "PAUSED");
+        assert_eq!(
+            ViewState::OverBudgetRelaxed.to_string(),
+            "OVER_BUDGET_RELAXED"
+        );
         assert_eq!(
             ViewState::BackfillingFromEpoch(42).to_string(),
             "BACKFILLING(from epoch 42)"
@@ -136,6 +153,7 @@ mod tests {
         for state in [
             ViewState::Running,
             ViewState::Paused,
+            ViewState::OverBudgetRelaxed,
             ViewState::BackfillingFromEpoch(7),
         ] {
             let json = serde_json::to_string(&state).unwrap();

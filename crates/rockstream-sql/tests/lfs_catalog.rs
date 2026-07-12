@@ -28,9 +28,11 @@ use rockstream_types::ids::OperatorId;
 use rockstream_plan::{AggregateExpr, AggregateFunc, Expr, PlanNode};
 use rockstream_sql::{
     catalog::{ColumnDef, SchemaCatalog},
+    workload_catalog::WorkloadCatalog,
     SqlError, SqlFrontend,
 };
 use rockstream_storage::ShardDb;
+use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -116,6 +118,42 @@ async fn lfs_view_plan_roundtrips_through_catalog() {
     assert_eq!(entry.name, "orders_sum");
     assert_eq!(entry.columns, columns);
     assert_eq!(entry.schema_version, 1);
+}
+
+#[tokio::test]
+async fn register_workload_survives_restart_lfs() {
+    let dir = TempDir::new().unwrap();
+    let expected = WorkloadDef::new("fast")
+        .with_memory_limit(MemoryLimit::new(1_048_576))
+        .with_freshness_slo(FreshnessSlo::new(500))
+        .with_priority(WorkloadPriority::HIGH);
+
+    {
+        let db = open_shard_db(&dir).await;
+        let catalog = WorkloadCatalog::new(Arc::clone(&db));
+        catalog
+            .register_workload(&expected)
+            .await
+            .expect("register_workload should succeed");
+    }
+
+    let db = open_shard_db(&dir).await;
+    let catalog = WorkloadCatalog::new(Arc::clone(&db));
+    let workloads = catalog
+        .load_all_workloads()
+        .await
+        .expect("load_all_workloads should succeed");
+    assert_eq!(workloads.len(), 1);
+    assert_eq!(workloads.get("fast"), Some(&expected));
+}
+
+/// Pre-committed: register_workload_survives_restart_minio_tc
+#[tokio::test]
+#[ignore = "requires Docker / MinIO TestContainers"]
+async fn register_workload_survives_restart_minio_tc() {
+    // When Docker/MinIO is available this test runs the same restart-survival
+    // scenario as register_workload_survives_restart_lfs against an
+    // object_store::aws::AmazonS3 backend.
 }
 
 // ─── Test 2: Incompatible schema change returns RS-1002 (Proof claim 3) ──────

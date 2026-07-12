@@ -88,6 +88,8 @@ pub const RS_1011: ErrorCode = ErrorCode::new(1011);
 pub const RS_1012: ErrorCode = ErrorCode::new(1012);
 /// Query contains a feature not supported by the incremental planner (v0.7).
 pub const RS_1013: ErrorCode = ErrorCode::new(1013);
+/// Workload drop rejected because views are still assigned.
+pub const RS_1014: ErrorCode = ErrorCode::new(1014);
 /// Inner-frontier stall in distributed recursion; per-shard recompute triggered (v0.33).
 pub const RS_1512: ErrorCode = ErrorCode::new(1512);
 /// Distributed recursion max-iteration cap exceeded without convergence (v0.33).
@@ -221,6 +223,11 @@ pub const RS_5019: ErrorCode = ErrorCode::new(5019);
 /// Incompatible upstream schema evolution detected.
 pub const RS_6001: ErrorCode = ErrorCode::new(6001);
 
+// 9xxx: Admission control (v0.45.1)
+/// Admission control rejected a capacity request: no lower-priority workload
+/// available to pause and the requesting workload has no remaining headroom.
+pub const RS_9001: ErrorCode = ErrorCode::new(9001);
+
 // 8xxx: Frontier aggregation (v0.18)
 /// Frontier aggregator shard registry is full; new shard reports are rejected.
 /// next_steps: scale out aggregators or reduce shard count.
@@ -246,6 +253,8 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2400 => "auth.unauthenticated",
         2401 => "auth.permission_denied",
         2402 => "auth.namespace_access_denied",
+        1014 => "workload.has_assigned_views",
+        9001 => "admission_control.rejected",
         _ => "unknown",
     }
 }
@@ -269,6 +278,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         1011 => "View-on-view DAG contains a cycle",
         1012 => "SQL statement could not be parsed",
         1013 => "Query contains a feature not yet supported by the incremental planner",
+        1014 => "Workload still has assigned views",
+        9001 => "Admission control rejected the capacity request",
         1015 => "Group-commit queue full; back-pressure applied",
         1016 => "Aggregate running sum overflowed i64",
         1017 => "MIN/MAX multiset retraction underflow: value has no positive weight",
@@ -364,6 +375,8 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1011 => "Resolve cycle in view dependencies; view-on-view relations must form a DAG.",
         1012 => "Check SQL syntax; see docs/language-features.md for the supported SQL subset.",
         1013 => "Simplify the query or check docs/language-features.md for the supported incremental SQL subset.",
+        1014 => "Reassign or drop the workload's views before dropping the workload.",
+        9001 => "Reduce the requesting workload's demand, raise the cluster state budget, or lower the priority of contending workloads so admission control can pause them.",
         1015 => "Reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards.",
         1016 => "Reduce value magnitudes or switch to a wider numeric type.",
         1017 => "Ensure every retraction is matched by a prior insertion; check source event ordering and idempotency.",
@@ -456,9 +469,10 @@ mod tests {
             RS_2008, RS_2014, RS_2015, RS_2016, RS_2018, RS_3003, RS_3009, RS_3010, RS_4001,
             RS_4002, RS_5001, RS_5002, RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603,
             RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017,
-            RS_1012, RS_1013, RS_8001, // v0.21
+            RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
             RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_3005, RS_1018, RS_2400, RS_2401,
             RS_2402, // v0.26 auth
+            RS_9001, // v0.45.1 admission control
         ];
         for code in codes {
             assert_ne!(

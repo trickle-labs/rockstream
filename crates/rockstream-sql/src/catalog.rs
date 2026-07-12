@@ -166,7 +166,7 @@ pub fn classify_schema_change(old: &[ColumnDef], new: &[ColumnDef]) -> SchemaCha
 
 // ─── Catalog key helpers ─────────────────────────────────────────────────────
 
-const DEFAULT_NAMESPACE: u128 = 0;
+pub(crate) const DEFAULT_NAMESPACE: u128 = 0;
 
 /// Compute the object_id (stable hash of view name) for catalog key construction.
 fn view_object_id(name: &str) -> u128 {

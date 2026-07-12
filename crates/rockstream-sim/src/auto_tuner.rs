@@ -5,6 +5,7 @@
 
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::AutotunerConfig;
+use rockstream_types::workload::WorkloadDef;
 
 use crate::buggify;
 
@@ -49,6 +50,13 @@ impl AutoTuner {
             down_window_count: 0,
             lag_above_threshold_epochs: 0,
         }
+    }
+
+    pub fn new_for_workload(mut config: AutotunerConfig, workload: &WorkloadDef) -> Self {
+        config.max_parallelism = config
+            .max_parallelism
+            .min(workload.max_parallelism.unwrap_or(u32::MAX) as usize);
+        Self::new(config)
     }
 
     pub fn new_with_state(
@@ -311,5 +319,22 @@ mod tests {
 
         assert_eq!(reductions, 3, "exactly 3 halvings: 512→256→128→64");
         assert_eq!(current_throttle, MIN_THROTTLE_BYTES, "settled at floor");
+    }
+
+    #[test]
+    fn workload_cap_limits_parallelism_scale_up() {
+        use rockstream_types::workload::WorkloadDef;
+
+        let workload = WorkloadDef::new("fast").with_max_parallelism(4);
+        let mut tuner = AutoTuner::new_for_workload(AutotunerConfig::default(), &workload);
+        let mut trace = Vec::new();
+        for _ in 0..32 {
+            trace.push(tuner.adjust_parallelism(1_000));
+        }
+        assert!(
+            trace.iter().all(|parallelism| *parallelism <= 4),
+            "parallelism trace must stay at or below 4: {trace:?}"
+        );
+        assert_eq!(tuner.current_parallelism, 4);
     }
 }

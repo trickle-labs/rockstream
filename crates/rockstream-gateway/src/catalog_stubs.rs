@@ -4,13 +4,19 @@
 //! catalogs. All responses are synthesised from the in-memory view catalog.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::SystemTime;
 
+use rockstream_sql::{SqlError, WorkloadCatalog};
+use rockstream_types::audit::AuditEvent;
 use rockstream_types::cost::{active_pricing_config, estimate_cost_per_hour, CostEstimateInput};
+use rockstream_types::ids::WorkloadId;
 use rockstream_types::metrics::{
     read_freshness_lag, read_pipeline_state_bytes, read_state_budget, read_workload_memory,
+    set_pipeline_state_bytes, set_workload_memory,
 };
+use rockstream_types::state_budget::{StateBudget, WorkloadBudget};
+use rockstream_types::view_lifecycle::ViewState;
 use rockstream_types::workload::WorkloadDef;
 
 /// Session context passed to catalog query handlers.
@@ -237,6 +243,18 @@ pub struct CatalogWorkloadResourceUsageEntry {
     pub estimated_cost_per_hour: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CatalogWorkloadStatusEntry {
+    pub workload_name: String,
+    pub priority: u8,
+    pub max_parallelism: Option<u32>,
+    pub memory_limit_bytes: Option<u64>,
+    pub freshness_slo_ms: Option<u64>,
+    pub view_count: u64,
+    pub over_budget_relaxed_view_count: u64,
+    pub paused_view_count: u64,
+}
+
 /// Interior of `CatalogStubs` — held behind an `RwLock` for runtime mutation.
 #[derive(Debug, Default)]
 struct CatalogStubsInner {
@@ -261,19 +279,58 @@ struct CatalogStubsInner {
 ///
 /// Thread-safe via interior `RwLock` so that `Arc<CatalogStubs>` can be
 /// mutated at runtime (e.g. by CREATE VIEW commands on the gateway).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CatalogStubs {
     inner: RwLock<CatalogStubsInner>,
+    workload_catalog: Option<Arc<WorkloadCatalog>>,
+    // Naturally bounded by the number of catalog-defined workloads.
+    workload_budgets: RwLock<HashMap<String, Arc<WorkloadBudget>>>,
+    view_budgets: RwLock<HashMap<String, Arc<StateBudget>>>,
+    view_states: RwLock<HashMap<String, ViewState>>,
+}
+
+impl Default for CatalogStubs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CatalogStubs {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: RwLock::new(CatalogStubsInner::default()),
+            workload_catalog: None,
+            workload_budgets: RwLock::new(HashMap::new()),
+            view_budgets: RwLock::new(HashMap::new()),
+            view_states: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub async fn with_workload_catalog(
+        workload_catalog: Arc<WorkloadCatalog>,
+    ) -> Result<Self, SqlError> {
+        let catalog = Self {
+            inner: RwLock::new(CatalogStubsInner::default()),
+            workload_catalog: Some(Arc::clone(&workload_catalog)),
+            workload_budgets: RwLock::new(HashMap::new()),
+            view_budgets: RwLock::new(HashMap::new()),
+            view_states: RwLock::new(HashMap::new()),
+        };
+        let workloads = workload_catalog.load_all_workloads().await?;
+        let mut inner = catalog.inner.write().unwrap();
+        inner.workloads = workloads;
+        drop(inner);
+        Ok(catalog)
     }
 
     /// Register a view in the catalog without dependency tracking.
     pub fn add_view(&self, view: CatalogView) {
         let mut inner = self.inner.write().unwrap();
+        self.view_states
+            .write()
+            .unwrap()
+            .entry(view.name.clone())
+            .or_insert(ViewState::Running);
         inner.views.insert(view.name.clone(), view);
     }
 
@@ -283,6 +340,11 @@ impl CatalogStubs {
     /// [`detect_cycle_with_new_view`] first if needed.
     pub fn add_view_with_deps(&self, view: CatalogView, deps: Vec<String>) {
         let mut inner = self.inner.write().unwrap();
+        self.view_states
+            .write()
+            .unwrap()
+            .entry(view.name.clone())
+            .or_insert(ViewState::Running);
         inner.deps.insert(view.name.clone(), deps);
         inner.views.insert(view.name.clone(), view);
     }
@@ -290,6 +352,11 @@ impl CatalogStubs {
     /// Register a view that already has its namespace set.
     pub fn add_view_in_namespace(&self, view: CatalogView) {
         let mut inner = self.inner.write().unwrap();
+        self.view_states
+            .write()
+            .unwrap()
+            .entry(view.name.clone())
+            .or_insert(ViewState::Running);
         inner.views.insert(view.name.clone(), view);
     }
 
@@ -314,6 +381,67 @@ impl CatalogStubs {
         }
         inner.workloads.insert(workload.name.clone(), workload);
         true
+    }
+
+    pub fn update_workload(&self, workload: WorkloadDef) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if !inner.workloads.contains_key(&workload.name) {
+            return false;
+        }
+        inner
+            .workloads
+            .insert(workload.name.clone(), workload.clone());
+        self.workload_budgets
+            .write()
+            .unwrap()
+            .remove(&workload.name);
+        true
+    }
+
+    pub fn remove_workload(&self, workload_name: &str) -> bool {
+        let removed = {
+            let mut inner = self.inner.write().unwrap();
+            inner.workloads.remove(workload_name).is_some()
+        };
+        if !removed {
+            return false;
+        }
+        self.workload_budgets.write().unwrap().remove(workload_name);
+        true
+    }
+
+    pub async fn add_workload_async(&self, workload: WorkloadDef) -> Result<bool, SqlError> {
+        if !self.add_workload(workload.clone()) {
+            return Ok(false);
+        }
+        if let Some(catalog) = &self.workload_catalog {
+            if let Err(error) = catalog.register_workload(&workload).await {
+                let mut inner = self.inner.write().unwrap();
+                inner.workloads.remove(&workload.name);
+                return Err(error);
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn update_workload_async(&self, workload: WorkloadDef) -> Result<bool, SqlError> {
+        if !self.update_workload(workload.clone()) {
+            return Ok(false);
+        }
+        if let Some(catalog) = &self.workload_catalog {
+            catalog.update_workload(&workload).await?;
+        }
+        Ok(true)
+    }
+
+    pub async fn remove_workload_async(&self, workload_name: &str) -> Result<bool, SqlError> {
+        if !self.remove_workload(workload_name) {
+            return Ok(false);
+        }
+        if let Some(catalog) = &self.workload_catalog {
+            catalog.remove_workload(workload_name).await?;
+        }
+        Ok(true)
     }
 
     pub fn get_workload(&self, name: &str) -> Option<WorkloadDef> {
@@ -997,6 +1125,163 @@ impl CatalogStubs {
             .collect();
         views.sort();
         views
+    }
+
+    pub fn set_view_state_bytes(
+        &self,
+        view_name: &str,
+        bytes: u64,
+        audit_log: Option<&rockstream_control::audit::FileAuditLog>,
+    ) {
+        set_pipeline_state_bytes(view_name, bytes);
+        self.reconcile_view_budget(view_name, bytes, audit_log);
+    }
+
+    pub fn view_state(&self, view_name: &str) -> ViewState {
+        self.view_states
+            .read()
+            .unwrap()
+            .get(view_name)
+            .cloned()
+            .unwrap_or(ViewState::Running)
+    }
+
+    pub fn set_view_state(&self, view_name: &str, state: ViewState) {
+        self.view_states
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), state);
+    }
+
+    pub fn workload_status_entries(&self) -> Vec<CatalogWorkloadStatusEntry> {
+        let workloads = self.list_workloads();
+        let mut rows = Vec::new();
+        for workload in workloads {
+            let views = self.views_for_workload(&workload.name);
+            let mut over_budget_relaxed_view_count = 0u64;
+            let mut paused_view_count = 0u64;
+            for view_name in &views {
+                match self.view_state(view_name) {
+                    ViewState::OverBudgetRelaxed => over_budget_relaxed_view_count += 1,
+                    ViewState::Paused => paused_view_count += 1,
+                    _ => {}
+                }
+            }
+            rows.push(CatalogWorkloadStatusEntry {
+                workload_name: workload.name,
+                priority: workload.priority.0,
+                max_parallelism: workload.max_parallelism,
+                memory_limit_bytes: workload.memory_limit.map(|limit| limit.bytes),
+                freshness_slo_ms: workload.freshness_slo.map(|slo| slo.target_ms),
+                view_count: views.len() as u64,
+                over_budget_relaxed_view_count,
+                paused_view_count,
+            });
+        }
+        rows.sort_by(|a, b| a.workload_name.cmp(&b.workload_name));
+        rows
+    }
+
+    pub fn workload_status(&self) -> CatalogResponse {
+        let columns = workload_status_columns();
+        let rows = self
+            .workload_status_entries()
+            .into_iter()
+            .map(|entry| project_workload_status(&columns, &entry))
+            .collect();
+        CatalogResponse::rows(columns, rows)
+    }
+
+    fn reconcile_view_budget(
+        &self,
+        view_name: &str,
+        bytes: u64,
+        audit_log: Option<&rockstream_control::audit::FileAuditLog>,
+    ) {
+        let Some(workload_name) = self.workload_for_view(view_name) else {
+            return;
+        };
+        let Some(workload) = self.get_workload(&workload_name) else {
+            return;
+        };
+        let Some(memory_limit) = workload.memory_limit.map(|limit| limit.bytes) else {
+            return;
+        };
+
+        let workload_budget = self
+            .workload_budgets
+            .write()
+            .unwrap()
+            .entry(workload_name.clone())
+            .or_insert_with(|| {
+                Arc::new(WorkloadBudget::new(
+                    workload_id_for_name(&workload_name),
+                    memory_limit,
+                ))
+            })
+            .clone();
+        let global_budget = match read_state_budget() {
+            0 => u64::MAX,
+            value => value,
+        };
+        let budget = self
+            .view_budgets
+            .write()
+            .unwrap()
+            .entry(view_name.to_string())
+            .or_insert_with(|| {
+                Arc::new(StateBudget::new_with_workload(
+                    view_name.to_string(),
+                    global_budget,
+                    Some(Arc::clone(&workload_budget)),
+                ))
+            })
+            .clone();
+        let recover_if_needed = |this: &CatalogStubs| {
+            if this.view_state(view_name).is_over_budget_relaxed()
+                && workload_budget.current_bytes() <= memory_limit
+            {
+                this.set_view_state(view_name, ViewState::Running);
+                if let Some(log) = audit_log {
+                    let _ = log.append(&AuditEvent::now(
+                        "system",
+                        "workload.memory_limit_recovered",
+                        view_name,
+                    ));
+                }
+            }
+        };
+        let accounted = budget.current_bytes();
+        if bytes > accounted {
+            let delta = bytes - accounted;
+            match budget.try_acquire(delta) {
+                Ok(()) => {
+                    set_workload_memory(&workload_name, workload_budget.current_bytes());
+                    recover_if_needed(self);
+                }
+                Err(error) => {
+                    set_workload_memory(&workload_name, workload_budget.current_bytes());
+                    if error.operator_name.starts_with("workload-")
+                        && !self.view_state(view_name).is_over_budget_relaxed()
+                    {
+                        self.set_view_state(view_name, ViewState::OverBudgetRelaxed);
+                        if let Some(log) = audit_log {
+                            let _ = log.append(&AuditEvent::now(
+                                "system",
+                                "workload.memory_limit_exceeded",
+                                view_name,
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if bytes < accounted {
+            budget.release(accounted - bytes);
+            set_workload_memory(&workload_name, workload_budget.current_bytes());
+            recover_if_needed(self);
+        } else {
+            recover_if_needed(self);
+        }
     }
 
     /// Resolve a view by name within a given search_path (S9 search-path-aware lookup).
@@ -1875,6 +2160,19 @@ pub(crate) fn view_resource_usage_columns() -> Vec<String> {
     ]
 }
 
+pub(crate) fn workload_status_columns() -> Vec<String> {
+    vec![
+        "workload_name".to_string(),
+        "priority".to_string(),
+        "max_parallelism".to_string(),
+        "memory_limit_bytes".to_string(),
+        "freshness_slo_ms".to_string(),
+        "view_count".to_string(),
+        "over_budget_relaxed_view_count".to_string(),
+        "paused_view_count".to_string(),
+    ]
+}
+
 pub(crate) fn workload_resource_usage_columns() -> Vec<String> {
     vec![
         "workload_name".to_string(),
@@ -1899,8 +2197,21 @@ fn fmt_opt_u64(value: Option<u64>) -> Option<String> {
     value.map(|value| value.to_string())
 }
 
+fn fmt_opt_u32(value: Option<u32>) -> Option<String> {
+    value.map(|value| value.to_string())
+}
+
 fn fmt_opt_f64(value: Option<f64>) -> Option<String> {
     value.map(|value| format!("{value:.6}"))
+}
+
+fn workload_id_for_name(name: &str) -> WorkloadId {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    WorkloadId(hash)
 }
 
 pub(crate) fn project_view_resource_usage(
@@ -1920,6 +2231,27 @@ pub(crate) fn project_view_resource_usage(
             "slo_compliant" => fmt_bool(entry.slo_compliant),
             "degraded_reason" => entry.degraded_reason.clone(),
             "estimated_cost_per_hour" => fmt_opt_f64(entry.estimated_cost_per_hour),
+            _ => Some(String::new()),
+        })
+        .collect()
+}
+
+pub(crate) fn project_workload_status(
+    cols: &[String],
+    entry: &CatalogWorkloadStatusEntry,
+) -> Vec<Option<String>> {
+    cols.iter()
+        .map(|col| match col.as_str() {
+            "workload_name" => Some(entry.workload_name.clone()),
+            "priority" => Some(entry.priority.to_string()),
+            "max_parallelism" => fmt_opt_u32(entry.max_parallelism),
+            "memory_limit_bytes" => fmt_opt_u64(entry.memory_limit_bytes),
+            "freshness_slo_ms" => fmt_opt_u64(entry.freshness_slo_ms),
+            "view_count" => Some(entry.view_count.to_string()),
+            "over_budget_relaxed_view_count" => {
+                Some(entry.over_budget_relaxed_view_count.to_string())
+            }
+            "paused_view_count" => Some(entry.paused_view_count.to_string()),
             _ => Some(String::new()),
         })
         .collect()
@@ -1962,5 +2294,69 @@ pub enum CatalogResponse {
 impl CatalogResponse {
     fn rows(columns: Vec<String>, rows: Vec<Vec<Option<String>>>) -> Self {
         CatalogResponse::Rows { columns, rows }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rockstream_control::audit::FileAuditLog;
+    use rockstream_types::metrics::{read_workload_memory, reset_all, set_state_budget};
+    use rockstream_types::workload::{MemoryLimit, WorkloadDef};
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn workload_memory_limit_transitions_views_and_audits() {
+        reset_all();
+        set_state_budget(1_000);
+
+        let tmp = NamedTempFile::new().unwrap();
+        let log = FileAuditLog::open(tmp.path()).unwrap();
+
+        let catalog = CatalogStubs::new();
+        catalog.add_workload(WorkloadDef::new("fast").with_memory_limit(MemoryLimit::new(100)));
+        for view_name in ["fast_a", "fast_b"] {
+            catalog.add_view_in_namespace(CatalogView {
+                name: view_name.to_string(),
+                sql: "SELECT 1".to_string(),
+                columns: vec![],
+                namespace: "public".to_string(),
+            });
+            catalog.assign_view_workload(view_name, "fast");
+        }
+
+        catalog.set_view_state_bytes("fast_a", 60, Some(&log));
+        catalog.set_view_state_bytes("fast_b", 30, Some(&log));
+        assert_eq!(catalog.view_state("fast_a"), ViewState::Running);
+        assert_eq!(catalog.view_state("fast_b"), ViewState::Running);
+        assert_eq!(read_workload_memory("fast"), 90);
+
+        catalog.set_view_state_bytes("fast_b", 50, Some(&log));
+        assert_eq!(catalog.view_state("fast_b"), ViewState::OverBudgetRelaxed);
+        assert_eq!(
+            read_workload_memory("fast"),
+            90,
+            "workload accounting must not exceed the limit when acquisition fails"
+        );
+
+        catalog.set_view_state_bytes("fast_a", 40, Some(&log));
+        catalog.set_view_state_bytes("fast_b", 50, Some(&log));
+        assert_eq!(catalog.view_state("fast_b"), ViewState::Running);
+        assert_eq!(read_workload_memory("fast"), 90);
+
+        let actions: Vec<String> = log
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.action)
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                "workload.memory_limit_exceeded".to_string(),
+                "workload.memory_limit_recovered".to_string(),
+            ]
+        );
     }
 }

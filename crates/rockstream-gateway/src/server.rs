@@ -51,7 +51,7 @@ use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
 use rockstream_sql::SqlFrontend;
 use rockstream_types::explain::ExplainLevel;
-use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef};
+use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
 use crate::auth::{
     scram_server_key, scram_server_signature, scram_stored_key, verify_client_proof, AuthMode,
@@ -1222,10 +1222,6 @@ impl GatewayHandler {
             return Some(self.handle_create_view(q));
         }
 
-        if ql.starts_with("create workload ") {
-            return Some(self.handle_create_workload(q));
-        }
-
         // REFRESH MATERIALIZED VIEW
         if ql.starts_with("refresh materialized view ") {
             return Some(Ok(self.handle_refresh_materialized_view(q)));
@@ -1821,6 +1817,47 @@ impl GatewayHandler {
                 self.catalog.view_resource_usage(&[]),
             )]);
         }
+        if ql.trim_end_matches(';') == "show workload status" {
+            return Ok(vec![catalog_resp_to_response(
+                self.catalog.workload_status(),
+            )]);
+        }
+        if ql.starts_with("show workload status for ") {
+            let workload_name = q["show workload status for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            if self.catalog.get_workload(workload_name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-1005] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before assigning views to it.",
+                        workload_name, workload_name
+                    ),
+                ))))]);
+            }
+            let response = if let CatalogResponse::Rows { columns: _, rows } =
+                self.catalog.workload_status()
+            {
+                let matching = rows
+                    .into_iter()
+                    .filter(|row| {
+                        row.first().and_then(|value| value.as_deref()) == Some(workload_name)
+                    })
+                    .collect();
+                CatalogResponse::Rows {
+                    columns: crate::catalog_stubs::workload_status_columns(),
+                    rows: matching,
+                }
+            } else {
+                CatalogResponse::Rows {
+                    columns: crate::catalog_stubs::workload_status_columns(),
+                    rows: Vec::new(),
+                }
+            };
+            return Ok(vec![catalog_resp_to_response(response)]);
+        }
         if ql.starts_with("show resource usage for workload ") {
             let workload_name = q["show resource usage for workload ".len()..]
                 .trim()
@@ -1927,6 +1964,16 @@ impl GatewayHandler {
         } else {
             crate::catalog_stubs::SessionInfo::default()
         };
+
+        if ql.starts_with("create workload ") {
+            return self.handle_create_workload(query).await;
+        }
+        if ql.starts_with("alter workload ") {
+            return self.handle_alter_workload(query).await;
+        }
+        if ql.starts_with("drop workload ") {
+            return self.handle_drop_workload(query).await;
+        }
 
         if let Some(result) = self.dispatch_sync(query, &session_info) {
             // Promote lifetime — responses from dispatch_sync hold no borrows
@@ -2861,7 +2908,7 @@ impl GatewayHandler {
         Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))])
     }
 
-    fn handle_create_workload<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
         let Some(parsed) = parse_create_workload(q) else {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -2869,7 +2916,12 @@ impl GatewayHandler {
                 "[RS-1006] workload.invalid_definition: CREATE WORKLOAD requires a name and optional WITH (...) settings. Next steps: use CREATE WORKLOAD fast WITH (MEMORY_LIMIT = 1048576, FRESHNESS_SLO_MS = 500).".to_owned(),
             )))]);
         };
-        if !self.catalog.add_workload(parsed.clone()) {
+        let inserted = self
+            .catalog
+            .add_workload_async(parsed.clone())
+            .await
+            .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+        if !inserted {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42710".to_owned(),
@@ -2888,6 +2940,98 @@ impl GatewayHandler {
         }
         Ok(vec![Response::Execution(
             Tag::new("CREATE WORKLOAD").with_rows(0),
+        )])
+    }
+
+    async fn handle_alter_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
+        let Some((workload_name, changes)) = parse_alter_workload(q) else {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "[RS-1006] workload.invalid_definition: ALTER WORKLOAD requires SET (...) assignments. Next steps: use ALTER WORKLOAD fast SET (MEMORY_LIMIT = 1048576).".to_owned(),
+            )))]);
+        };
+        let Some(mut workload) = self.catalog.get_workload(&workload_name) else {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42704".to_owned(),
+                format!(
+                    "[RS-1005] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before altering it.",
+                    workload_name, workload_name
+                ),
+            )))]);
+        };
+        apply_workload_settings(&mut workload, &changes);
+        let updated = self
+            .catalog
+            .update_workload_async(workload.clone())
+            .await
+            .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+        if !updated {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42704".to_owned(),
+                format!(
+                    "[RS-1005] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before altering it.",
+                    workload_name, workload_name
+                ),
+            )))]);
+        }
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "workload.altered",
+                &workload_name,
+            ));
+        }
+        Ok(vec![Response::Execution(
+            Tag::new("ALTER WORKLOAD").with_rows(0),
+        )])
+    }
+
+    async fn handle_drop_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
+        let Some(workload_name) = parse_drop_workload(q) else {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "[RS-1006] workload.invalid_definition: DROP WORKLOAD requires a workload name. Next steps: use DROP WORKLOAD fast.".to_owned(),
+            )))]);
+        };
+        if self.catalog.get_workload(&workload_name).is_none() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42704".to_owned(),
+                format!(
+                    "[RS-1005] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before dropping it.",
+                    workload_name, workload_name
+                ),
+            )))]);
+        }
+        let assigned_views = self.catalog.views_for_workload(&workload_name);
+        if !assigned_views.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "2BP01".to_owned(),
+                format!(
+                    "[RS-1014] workload.has_assigned_views: workload '{}' is still assigned to views {}. Next steps: reassign or drop those views before dropping the workload.",
+                    workload_name,
+                    assigned_views.join(", ")
+                ),
+            )))]);
+        }
+        self.catalog
+            .remove_workload_async(&workload_name)
+            .await
+            .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "workload.dropped",
+                &workload_name,
+            ));
+        }
+        Ok(vec![Response::Execution(
+            Tag::new("DROP WORKLOAD").with_rows(0),
         )])
     }
 
@@ -6800,6 +6944,59 @@ fn parse_create_view_query(q: &str) -> Option<String> {
     Some(q[name_start + as_pos_in_after + 3..].trim().to_string())
 }
 
+#[derive(Default)]
+struct WorkloadSettings {
+    memory_limit: Option<MemoryLimit>,
+    freshness_slo: Option<FreshnessSlo>,
+    priority: Option<WorkloadPriority>,
+    max_parallelism: Option<u32>,
+}
+
+fn parse_workload_settings(body: &str) -> Option<WorkloadSettings> {
+    let mut settings = WorkloadSettings::default();
+    for assignment in body.split(',') {
+        let (key, value) = assignment.split_once('=')?;
+        let key = key.trim().to_lowercase();
+        let value = value.trim().trim_matches('\'').trim_matches('"');
+        match key.as_str() {
+            "memory_limit" => {
+                settings.memory_limit = Some(MemoryLimit::new(value.parse().ok()?));
+            }
+            "max_parallelism" => {
+                settings.max_parallelism = Some(value.parse().ok()?);
+            }
+            "freshness_slo_ms" => {
+                settings.freshness_slo = Some(FreshnessSlo::new(value.parse().ok()?));
+            }
+            "priority" => {
+                settings.priority = Some(match value.to_ascii_uppercase().as_str() {
+                    "HIGH" => WorkloadPriority::HIGH,
+                    "DEFAULT" => WorkloadPriority::DEFAULT,
+                    "LOW" => WorkloadPriority::LOW,
+                    _ => WorkloadPriority(value.parse().ok()?),
+                });
+            }
+            _ => {}
+        }
+    }
+    Some(settings)
+}
+
+fn apply_workload_settings(workload: &mut WorkloadDef, settings: &WorkloadSettings) {
+    if let Some(memory_limit) = settings.memory_limit {
+        workload.memory_limit = Some(memory_limit);
+    }
+    if let Some(freshness_slo) = settings.freshness_slo {
+        workload.freshness_slo = Some(freshness_slo);
+    }
+    if let Some(priority) = settings.priority {
+        workload.priority = priority;
+    }
+    if let Some(max_parallelism) = settings.max_parallelism {
+        workload.max_parallelism = Some(max_parallelism);
+    }
+}
+
 fn parse_create_workload(q: &str) -> Option<WorkloadDef> {
     let after = q
         .trim()
@@ -6821,24 +7018,44 @@ fn parse_create_workload(q: &str) -> Option<WorkloadDef> {
     let mut workload = WorkloadDef::new(name);
     if let Some(options_part) = options_part {
         let body = options_part.strip_prefix('(')?.strip_suffix(')')?.trim();
-        for assignment in body.split(',') {
-            let (key, value) = assignment.split_once('=')?;
-            let key = key.trim().to_lowercase();
-            let value = value.trim().trim_matches('\'').trim_matches('"');
-            match key.as_str() {
-                "memory_limit" => {
-                    let bytes = value.parse().ok()?;
-                    workload = workload.with_memory_limit(MemoryLimit::new(bytes));
-                }
-                "freshness_slo_ms" => {
-                    let ms = value.parse().ok()?;
-                    workload = workload.with_freshness_slo(FreshnessSlo::new(ms));
-                }
-                _ => {}
-            }
-        }
+        let settings = parse_workload_settings(body)?;
+        apply_workload_settings(&mut workload, &settings);
     }
     Some(workload)
+}
+
+fn parse_alter_workload(q: &str) -> Option<(String, WorkloadSettings)> {
+    let after = q
+        .trim()
+        .strip_prefix("ALTER WORKLOAD ")
+        .or_else(|| q.trim().strip_prefix("alter workload "))?
+        .trim()
+        .trim_end_matches(';');
+    let (name_part, settings_part) = after
+        .split_once(" SET ")
+        .or_else(|| after.split_once(" set "))?;
+    let workload_name = name_part.trim().trim_matches('"');
+    let body = settings_part
+        .trim()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    Some((workload_name.to_string(), parse_workload_settings(body)?))
+}
+
+fn parse_drop_workload(q: &str) -> Option<String> {
+    let after = q
+        .trim()
+        .strip_prefix("DROP WORKLOAD ")
+        .or_else(|| q.trim().strip_prefix("drop workload "))?
+        .trim()
+        .trim_end_matches(';');
+    let workload_name = after.trim_matches('"');
+    if workload_name.is_empty() {
+        None
+    } else {
+        Some(workload_name.to_string())
+    }
 }
 
 /// Extract table/view names referenced in FROM and JOIN clauses.

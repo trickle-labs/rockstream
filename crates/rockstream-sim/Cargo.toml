@@ -24,6 +24,7 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 rockstream-oracle = { path = "../rockstream-oracle" }
 rockstream-control = { workspace = true }
 rockstream-runtime = { workspace = true }
+rockstream-gateway = { workspace = true }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["minio"] }

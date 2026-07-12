@@ -5,6 +5,7 @@
 //!
 //! - `freshness_slo_ms` — target maximum staleness in milliseconds.
 //! - `memory_limit_bytes` — maximum in-memory state budget.
+//! - `max_parallelism` — upper bound for workload-scoped auto-tuning.
 //! - `priority` — scheduling priority (lower value = higher priority).
 //!
 //! Workloads are created with `CREATE WORKLOAD` and referenced by name when
@@ -71,6 +72,8 @@ pub struct WorkloadDef {
     pub freshness_slo: Option<FreshnessSlo>,
     /// Maximum aggregate memory budget for all views in this workload.
     pub memory_limit: Option<MemoryLimit>,
+    /// Maximum parallelism ceiling for views in this workload.
+    pub max_parallelism: Option<u32>,
     /// Scheduling priority relative to other workloads.
     pub priority: WorkloadPriority,
 }
@@ -82,6 +85,7 @@ impl WorkloadDef {
             name: name.into(),
             freshness_slo: None,
             memory_limit: None,
+            max_parallelism: None,
             priority: WorkloadPriority::DEFAULT,
         }
     }
@@ -95,6 +99,12 @@ impl WorkloadDef {
     /// Set the memory limit.
     pub fn with_memory_limit(mut self, limit: MemoryLimit) -> Self {
         self.memory_limit = Some(limit);
+        self
+    }
+
+    /// Set the maximum parallelism ceiling.
+    pub fn with_max_parallelism(mut self, max_parallelism: u32) -> Self {
+        self.max_parallelism = Some(max_parallelism);
         self
     }
 
@@ -115,6 +125,7 @@ mod tests {
         assert_eq!(w.name, "batch");
         assert!(w.freshness_slo.is_none());
         assert!(w.memory_limit.is_none());
+        assert!(w.max_parallelism.is_none());
         assert_eq!(w.priority, WorkloadPriority::DEFAULT);
     }
 
@@ -123,9 +134,11 @@ mod tests {
         let w = WorkloadDef::new("fast")
             .with_freshness_slo(FreshnessSlo::new(500))
             .with_memory_limit(MemoryLimit::new(1 << 30))
+            .with_max_parallelism(8)
             .with_priority(WorkloadPriority::HIGH);
         assert_eq!(w.freshness_slo.unwrap().target_ms, 500);
         assert_eq!(w.memory_limit.unwrap().bytes, 1 << 30);
+        assert_eq!(w.max_parallelism, Some(8));
         assert_eq!(w.priority, WorkloadPriority::HIGH);
     }
 
@@ -140,6 +153,7 @@ mod tests {
         let w = WorkloadDef::new("test")
             .with_freshness_slo(FreshnessSlo::new(1000))
             .with_memory_limit(MemoryLimit::new(512 * 1024 * 1024))
+            .with_max_parallelism(4)
             .with_priority(WorkloadPriority(64));
         let json = serde_json::to_string(&w).unwrap();
         let back: WorkloadDef = serde_json::from_str(&json).unwrap();

@@ -16,6 +16,7 @@
 //! - `protocol`       — protocol type helpers
 //! - `error`          — `GatewayError`
 
+pub mod admission;
 pub mod auth;
 pub mod catalog_stubs;
 pub mod change_log;

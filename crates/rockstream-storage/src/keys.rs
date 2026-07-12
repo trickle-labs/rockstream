@@ -524,6 +524,8 @@ pub enum CatalogType {
     Connector = 0x15,
     /// Secondary index definition (v0.32).
     Index = 0x16,
+    /// Workload definition.
+    Workload = 0x17,
 }
 
 impl CatalogKeyEncoder {

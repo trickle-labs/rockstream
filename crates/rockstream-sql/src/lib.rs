@@ -24,6 +24,7 @@ pub mod explain_incremental;
 pub mod extension;
 pub mod frontend;
 pub mod lower;
+pub mod workload_catalog;
 
 pub use catalog::{ColumnDef, SchemaCatalog, ViewEntry};
 pub use distribution::apply_distribution;
@@ -35,6 +36,7 @@ pub use explain_incremental::{
 pub use extension::{IncAggregate, IncDistinct, IncJoin};
 pub use frontend::SqlFrontend;
 pub use lower::lower;
+pub use workload_catalog::WorkloadCatalog;
 
 #[cfg(test)]
 mod tests {
