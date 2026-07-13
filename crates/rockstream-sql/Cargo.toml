@@ -14,6 +14,7 @@ sf10_tests = []
 testcontainers = []
 
 [dependencies]
+rockstream-control = { workspace = true }
 rockstream-plan = { workspace = true }
 rockstream-storage = { workspace = true }
 rockstream-types = { workspace = true }

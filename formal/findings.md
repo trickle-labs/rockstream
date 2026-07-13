@@ -514,4 +514,142 @@ hard-gate failure instead of a silently-ignored one. **Fix**: authenticate the
 Releases-API `curl` call with the job's own `GITHUB_TOKEN` via an
 `Authorization: Bearer` header, raising the limit to 5,000 requests/hour.
 
+## M7 Control-Plane Raft Leader Election Model (`formal/m7_control_plane_ha.fizz`, v0.45.2 S0)
+
+### 1. Overview
+
+Binding pre-implementation gate (v0.18 rule) for v0.45.2's 3-node
+control-plane Raft leader-election protocol, required to be green *before*
+any `rockstream-control` Raft implementation code (S1–S3) was written. The
+2026-07-11 architecture review's scheduling-risk note explicitly flagged this
+as a real risk comparable to M4's own 3-sub-version history
+(v0.42.1–v0.42.3); this section records why that risk did *not* materialize
+into a version split, and the five genuine issues found and fixed along the
+way at CI-fast bounds.
+
+### 2. State-space fixes (before the model ran at all)
+
+An initial draft stored a per-candidate `votes_received` counter and a
+4-valued `pending_write_kind` string per `ControlNode` and did not terminate
+— still running, >8 GB RSS, after several minutes, never reaching FizzBee's
+first 20,000-node progress checkpoint (the same growth class as M4's
+pre-remediation history). Two changes, both removing a per-node dimension
+rather than tightening a bound, brought it back to CI-fast:
+
+1. Votes are counted by scanning `voted_for == candidate_id and current_term
+   == candidate's term` (`count_votes` helper) instead of maintaining a
+   redundant stored counter.
+2. `pending_write_kind` collapsed to one boolean `is_shard_fence_write`, and
+   both write families (plain catalog/lease/shard-assignment writes and the
+   M7-S3 composed shard-fence write) share **one** CAS pair
+   (`accepted_term`/`accepted_leader`) instead of two — this is the direct
+   spec-level expression of "the shard-fence token is derived from the
+   control-leader epoch: there is one fencing authority, not two."
+
+`DiscoverHigherTerm` (a bare "learn of a higher term via gossip" action) was
+also removed as redundant with `RequestVoteAndGrant`'s voter-side step-down
+branch.
+
+### 3. Liveness bugs found only once the model became fast enough to run the liveness checker
+
+Three genuine deadlocks were found and fixed, each only discoverable once the
+state-space fixes above made the model fast enough to actually reach FizzBee's
+liveness (Büchi) checking phase:
+
+1. **Split-vote deadlock.** Any finite `MAX_TERM`-as-election-guard permits an
+   exhaustive-BFS worst case where all 3 nodes call `StartElection` in the
+   same term and vote only for themselves, permanently splitting the vote
+   1-1-1. Real Raft avoids this via randomized per-node election timeouts —
+   a timing mechanism not modeled faithfully at this abstraction level
+   (FIZZBEE_TEST_PLAN.md §2.4 boundary). **Fix**: `StartElection` requires no
+   *other* node is currently a candidate (`any_other_candidate`), serializing
+   elections cluster-wide — the model's explicit stand-in for randomized
+   desynchronization.
+2. **Bounding the raw term value directly deadlocks recovery.** An earlier
+   guard `require n.current_term < MAX_TERM` creates an unrecoverable
+   deadlock for *any* finite `MAX_TERM`: a leader elected at term ==
+   `MAX_TERM` that later crashes can never trigger a recovery election
+   (would need `current_term == MAX_TERM + 1`). **Fix**: bound the *count* of
+   elections (`MAX_ELECTIONS`) instead of the raw term value — term stays
+   transitively bounded (`current_term <= MAX_ELECTIONS`) without ever
+   blocking legitimate post-crash recovery. This is the same anti-pattern
+   class as M4's own history: bound event counts, not monotonic values, when
+   the monotonic value's growth is also the only path to recovery.
+3. **Spurious re-election burning the recovery budget.** Two further
+   sub-bugs, found only after fix (1)+(2) made the model fast (~5.4s at
+   `MAX_ELECTIONS=2`, `MAX_WRITE_ATTEMPTS=2`) enough to reach the liveness
+   checker: (a) a candidate could restart its own unresolved candidacy
+   (`StartElection` required only `role != "leader"`) — fixed by requiring
+   `role == "follower"`; (b) a bystander follower could call `StartElection`
+   immediately after a perfectly healthy leader was just elected, wasting the
+   bounded election budget on a spurious re-election — fixed by adding
+   `any_leader_exists()` and requiring `not any_leader_exists(nodes)`.
+4. **Term-collision after crash (the deepest bug).** Even after all of the
+   above, a bystander follower — never asked to vote in round 1, still
+   locally at `current_term=0` — could call `StartElection` after
+   `CrashLeader` demoted the original leader, incrementing its own term to a
+   value **already used** by the first election (since it never learned of
+   that term). Its candidacy at the reused term can never reach majority
+   (every other node already voted for someone else *in that exact term*),
+   and with the election budget now exhausted, this is a permanent deadlock.
+   Root cause: removing `DiscoverHigherTerm` (state-space fix, §2 above)
+   means bystander followers never learn of terms they were not asked to
+   vote in. **Fix**: `BecomeLeader` now syncs `current_term` (and resets
+   `voted_for`) for every other node whose term is behind the new leader's —
+   modeling that a leader's heartbeat/`AppendEntries` always carries the
+   current term and updates any follower that observes it, exactly as real
+   Raft's heartbeat mechanism does. This was the fix that made
+   `M7_L1_LeaderEventuallyExists` finally hold.
+
+### 3.1. Vacuous-check bug found via mutation testing (safety assertions, not liveness)
+
+A first draft of the M7-S2/M7-S3 "regression net" wrote:
+
+```
+accepted_term = captured_term
+...
+if captured_term != accepted_term:   # always False — compares a value to
+    write_gate_violation = True      # itself immediately after assignment
+```
+
+This is a tautology: `accepted_term` was just set *to* `captured_term` on the
+preceding line, so the comparison can never be true regardless of whether
+`FinishWrite`'s actual guard (`is_leader_now and term_matches_current and
+term_valid_for_store`) is correct. Deliberately breaking the guard (removing
+the `is_leader_now` conjunct) and re-running confirmed the model stayed
+green — a false negative. **Fix**: replaced the ghost-flag regression net
+with two arrays, `leader_at_term[T]` (written by `BecomeLeader`) and
+`accepted_write_by_term[T]` / `shard_fence_accepted_write_by_term[T]`
+(written by `FinishWrite`) — two genuinely independent actions — and check
+`accepted_write_by_term[T] == leader_at_term[T]` whenever the former is set.
+Re-running the same guard-removal mutation against the *new* check reproduced
+the failure correctly (mismatched attribution: `accepted_write_by_term =
+[-1,1,-1]` vs `leader_at_term = [-1,0,-1]`). A second mutation test —
+attributing an accepted write to the wrong node id — was also correctly
+caught. Scope note (documented in the spec itself): this cross-check cannot
+independently re-verify the `is_leader_now` conjunct's *instantaneous*
+correctness without re-reading the same `node_role` state FinishWrite itself
+reads, since there is no other state recording "was this node's role Leader
+at this exact instant" — that conjunct's correctness rests on direct
+inspection (it reads state mutated only by four *other* actions, never by
+`FinishWrite` itself), same as any snapshot-style guard condition in a
+formal spec.
+
+### 4. Final verified result
+
+| Spec | Result | Evidence |
+|---|---|---|
+| `formal/m7_control_plane_ha.fizz` | ✅ PASSED | 37,492 nodes explored, 7,448 valid, 2,884 unique states, ~4.5s exploration + ~0.2s liveness check (~5.2s total, comparable to M4's ~6.6s CI-fast baseline); `M7_S1`–`M7_S3` (safety), `M7_L1_LeaderEventuallyExists` (liveness), and `COV_M7` (coverage) all hold at `NUM_CONTROL_NODES=3`, `MAX_ELECTIONS=2`, `MAX_CRASHES=1`, `MAX_WRITE_ATTEMPTS=2` |
+
+Net assessment: the scheduling-risk flag's concern (state space comparable to
+M4's, given M7-S3's composition with M4's own fencing predicate) was real —
+five genuine issues were found, matching M4's own iterative-fix cadence — but
+each was resolved by removing/redesigning a modeling dimension rather than by
+widening a time-box or weakening an invariant, and the model never actually
+failed to terminate quickly once each state-space fix landed (worst
+intermediate observed: ~90s / >700,000 nodes climbing, immediately fixed by
+adding `MAX_WRITE_ATTEMPTS`, not by waiting it out). The v0.45.2 plan's
+primary (non-split) path was followed to completion for S0; per its own
+process commitment, this section is that findings-archive artifact.
+
 

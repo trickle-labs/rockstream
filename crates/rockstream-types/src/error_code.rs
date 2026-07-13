@@ -122,6 +122,9 @@ pub const RS_1701: ErrorCode = ErrorCode::new(1701);
 pub const RS_1702: ErrorCode = ErrorCode::new(1702);
 /// Shard has no active lease (v0.29).
 pub const RS_1703: ErrorCode = ErrorCode::new(1703);
+/// Write rejected: the acting control node is not the current Raft-elected
+/// leader (v0.45.2, M7-S2 leader-only write gating).
+pub const RS_1731: ErrorCode = ErrorCode::new(1731);
 
 // 2xxx: Gateway / query
 /// View not found.
@@ -255,6 +258,7 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2402 => "auth.namespace_access_denied",
         1014 => "workload.has_assigned_views",
         9001 => "admission_control.rejected",
+        1731 => "control.not_leader",
         _ => "unknown",
     }
 }
@@ -292,6 +296,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         1701 => "Shard is already leased by a different worker",
         1702 => "Stale lease token; worker has been fenced out",
         1703 => "Shard has no active lease",
+        1731 => "Write rejected: acting control node is not the current Raft leader",
         2001 => "View not found",
         2002 => "Query timeout",
         2003 => "Unsupported isolation level",
@@ -386,6 +391,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1701 => "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead.",
         1702 => "Worker has been fenced out; acquire a new lease before retrying.",
         1703 => "No lease exists for this shard; acquire a lease before operating on it.",
+        1731 => "Retry the write against the current Raft leader (query cluster status for the elected leader's address); do not retry against this node until it wins a future election.",
         2001 => "Check view name and ensure the pipeline is running.",
         2002 => "Reduce query scope or increase timeout.",
         2003 => "Use a supported isolation level (snapshot or eventual).",
@@ -473,6 +479,7 @@ mod tests {
             RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_3005, RS_1018, RS_2400, RS_2401,
             RS_2402, // v0.26 auth
             RS_9001, // v0.45.1 admission control
+            RS_1731, // v0.45.2 control-plane leader-only write gating (M7-S2)
         ];
         for code in codes {
             assert_ne!(

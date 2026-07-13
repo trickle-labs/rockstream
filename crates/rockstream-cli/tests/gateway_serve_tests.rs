@@ -20,6 +20,13 @@ fn gateway_opts(dir: &tempfile::TempDir) -> StartOptions {
         auth_mode: "off".to_string(),
         metrics_addr: None,
         listen_addr: Some("127.0.0.1:0".to_string()),
+        raft_peers: None,
+        raft_node_id: None,
+        raft_bind: None,
+        raft_bootstrap: false,
+        daemon: false,
+        control_bind: None,
+        control_shared_storage: None,
     }
 }
 
@@ -302,6 +309,13 @@ async fn gateway_invalid_listen_address_returns_rs_0002() {
         auth_mode: "off".to_string(),
         metrics_addr: None,
         listen_addr: Some("not-a-valid-address".to_string()),
+        raft_peers: None,
+        raft_node_id: None,
+        raft_bind: None,
+        raft_bootstrap: false,
+        daemon: false,
+        control_bind: None,
+        control_shared_storage: None,
     };
 
     let err = start_gateway(&opts).await.unwrap_err();
@@ -327,6 +341,13 @@ async fn gateway_port_in_use_returns_rs_0003() {
         auth_mode: "off".to_string(),
         metrics_addr: None,
         listen_addr: Some(format!("127.0.0.1:{occupied_port}")),
+        raft_peers: None,
+        raft_node_id: None,
+        raft_bind: None,
+        raft_bootstrap: false,
+        daemon: false,
+        control_bind: None,
+        control_shared_storage: None,
     };
 
     let err = start_gateway(&opts).await.unwrap_err();

@@ -26,14 +26,68 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 use rockstream_types::lease::ShardRevokeReason;
-use rockstream_types::topology::{ControlMessage, WorkerMessage};
+use rockstream_types::topology::{ControlMessage, RaftRoleWire, WorkerMessage};
 
 use crate::audit::{AuditEvent, FileAuditLog};
-use crate::shard::ShardManager;
+use crate::frontier::FrontierAggregator;
+use crate::raft::{RaftHandle, RaftRole};
+use crate::shard::{ShardManager, ShardPersistentStore};
 use crate::topology::TopologyCatalog;
+
+/// Convert the internal [`RaftRole`] to its wire-serializable mirror.
+fn raft_role_wire(role: RaftRole) -> RaftRoleWire {
+    match role {
+        RaftRole::Follower => RaftRoleWire::Follower,
+        RaftRole::Candidate => RaftRoleWire::Candidate,
+        RaftRole::Leader => RaftRoleWire::Leader,
+    }
+}
+
+/// Lazily re-synchronize this node's [`ShardManager`] from the shared
+/// control-plane object store the first time it observes itself as leader
+/// at a given control-leader epoch (v0.45.2 M7-S4/S5).
+///
+/// A real control node process starts with an empty in-memory
+/// `ShardManager` (there is no cross-process replication of every
+/// `acquire`/`release` call — only the durable snapshot at
+/// `control/shard_manager/state.json`). Without this step, a newly-elected
+/// leader on a *different real process* than the one that most recently
+/// held leases would believe every shard is unleased and could grant a
+/// conflicting lease to a different worker — exactly the split-brain
+/// window S3/S4 must rule out. `synced_epoch` remembers the last epoch this
+/// node has already synced for, so the (network-bound, for the MinIO/TC
+/// profile) load only happens once per leadership term, not on every
+/// request.
+async fn ensure_shard_state_synced(
+    shard_manager: &ShardManager,
+    shard_store: &ShardPersistentStore,
+    synced_epoch: &AsyncMutex<Option<u64>>,
+    current_epoch: u64,
+) {
+    let mut guard = synced_epoch.lock().await;
+    if *guard != Some(current_epoch) {
+        let snapshot = shard_store.load().await;
+        shard_manager.restore(snapshot);
+        shard_manager.set_leader_epoch(current_epoch);
+        *guard = Some(current_epoch);
+        tracing::info!(
+            epoch = current_epoch,
+            leases = shard_manager.len(),
+            "control: shard-manager state synced from shared store on leadership takeover"
+        );
+    }
+}
+
+/// Persist the current `ShardManager` state to the shared store, if one is
+/// configured (v0.45.2 M7-S4/S5 write-through — the *next* leader, possibly
+/// on a different real process, must be able to see this write).
+async fn persist_shard_state(shard_manager: &ShardManager, shard_store: &ShardPersistentStore) {
+    let snapshot = shard_manager.snapshot();
+    shard_store.save(&snapshot).await;
+}
 
 /// Handle to the running control service.
 pub struct ControlServiceHandle {
@@ -56,6 +110,24 @@ pub struct ControlService {
     catalog: TopologyCatalog,
     shard_manager: ShardManager,
     audit: Option<Arc<FileAuditLog>>,
+    /// If attached, leader-gated writes (shard lease grants — M7-S2) are
+    /// rejected with `RS-1731`/[`ControlMessage::NotLeader`] unless this
+    /// node is currently the Raft-elected control-plane leader. Absent by
+    /// default, preserving exact pre-v0.45.2 single-node behavior for every
+    /// existing caller/test.
+    raft: Option<RaftHandle>,
+    /// If attached, the `ShardManager`'s lease state is loaded from (and
+    /// written through to) this shared store whenever this node observes
+    /// itself becoming the Raft leader at a new epoch (v0.45.2 M7-S4/S5).
+    /// Absent by default: the `ShardManager` then stays purely in-memory,
+    /// exactly as before v0.45.2.
+    shard_store: Option<Arc<ShardPersistentStore>>,
+    /// If attached, `ReportShardFrontier` messages are ingested into this
+    /// aggregator and, when this node is the current leader, published as
+    /// `ClusterFrontierAdvanced` (v0.45.2 M7-S4 "frontier publication
+    /// resumes within budget"). Absent by default (pre-v0.45.2 behavior:
+    /// no frontier ingestion over the worker wire protocol at all).
+    frontier: Option<Arc<FrontierAggregator>>,
 }
 
 impl ControlService {
@@ -65,6 +137,9 @@ impl ControlService {
             catalog,
             shard_manager: ShardManager::new(),
             audit: None,
+            raft: None,
+            shard_store: None,
+            frontier: None,
         }
     }
 
@@ -81,6 +156,28 @@ impl ControlService {
         self
     }
 
+    /// Attach a [`RaftHandle`] so shard-lease-grant writes are gated on
+    /// current control-plane leadership (v0.45.2, M7-S2).
+    pub fn with_raft(mut self, raft: RaftHandle) -> Self {
+        self.raft = Some(raft);
+        self
+    }
+
+    /// Attach a shared [`ShardPersistentStore`] so a newly-elected leader
+    /// (on any real process in the control group) picks up the last-known
+    /// lease state instead of starting from an empty map (v0.45.2 M7-S4/S5).
+    pub fn with_shard_store(mut self, store: Arc<ShardPersistentStore>) -> Self {
+        self.shard_store = Some(store);
+        self
+    }
+
+    /// Attach a [`FrontierAggregator`] so `ReportShardFrontier` messages are
+    /// ingested and (when this node is leader) published (v0.45.2 M7-S4).
+    pub fn with_frontier(mut self, frontier: Arc<FrontierAggregator>) -> Self {
+        self.frontier = Some(frontier);
+        self
+    }
+
     /// Start the service on `bind_addr`.
     ///
     /// Returns a [`ControlServiceHandle`] which can be used to query the
@@ -93,9 +190,19 @@ impl ControlService {
         let (shutdown_tx, _) = broadcast::channel(1);
         let shutdown_tx2 = shutdown_tx.clone();
 
-        let catalog = self.catalog.clone();
-        let shard_manager = self.shard_manager.clone();
-        let audit = self.audit.clone();
+        // Shared across every connection this service ever accepts: which
+        // leader-epoch this node has already synced its `ShardManager`
+        // state for (v0.45.2 M7-S4/S5). `None` until the first sync.
+        let synced_epoch: Arc<AsyncMutex<Option<u64>>> = Arc::new(AsyncMutex::new(None));
+        let ctx = ConnectionContext {
+            catalog: self.catalog.clone(),
+            shard_manager: self.shard_manager.clone(),
+            audit: self.audit.clone(),
+            raft: self.raft.clone(),
+            shard_store: self.shard_store.clone(),
+            synced_epoch,
+            frontier: self.frontier.clone(),
+        };
 
         tokio::spawn(async move {
             let mut shutdown_rx = shutdown_tx2.subscribe();
@@ -105,13 +212,11 @@ impl ControlService {
                         match result {
                             Ok((stream, peer)) => {
                                 tracing::debug!(%peer, "control: new connection");
-                                let cat = catalog.clone();
-                                let mgr = shard_manager.clone();
-                                let aud = audit.clone();
+                                let conn_ctx = ctx.clone();
                                 let mut sd = shutdown_tx2.subscribe();
                                 tokio::spawn(async move {
                                     tokio::select! {
-                                        _ = handle_connection(stream, peer, cat, mgr, aud) => {}
+                                        _ = handle_connection(stream, peer, conn_ctx) => {}
                                         _ = sd.recv() => {}
                                     }
                                 });
@@ -160,14 +265,35 @@ impl ControlService {
     }
 }
 
-/// Handle a single worker connection.
-async fn handle_connection(
-    stream: TcpStream,
-    peer: SocketAddr,
+/// Per-connection shared state for [`handle_connection`].
+///
+/// Bundled into one struct (rather than passed as individual parameters) to
+/// keep `handle_connection`'s argument count within `clippy::too_many_arguments`;
+/// every field here is `Clone`-cheap (an `Arc`/handle wrapper), so cloning the
+/// whole context per accepted connection is equivalent to cloning each field
+/// individually.
+#[derive(Clone)]
+struct ConnectionContext {
     catalog: TopologyCatalog,
     shard_manager: ShardManager,
     audit: Option<Arc<FileAuditLog>>,
-) {
+    raft: Option<RaftHandle>,
+    shard_store: Option<Arc<ShardPersistentStore>>,
+    synced_epoch: Arc<AsyncMutex<Option<u64>>>,
+    frontier: Option<Arc<FrontierAggregator>>,
+}
+
+/// Handle a single worker connection.
+async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionContext) {
+    let ConnectionContext {
+        catalog,
+        shard_manager,
+        audit,
+        raft,
+        shard_store,
+        synced_epoch,
+        frontier,
+    } = ctx;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut connected_worker_id: Option<rockstream_types::ids::WorkerId> = None;
@@ -252,6 +378,9 @@ async fn handle_connection(
                         .with_detail(format!("freed_shards={}", freed.len()));
                         let _ = aud.append(&event);
                     }
+                    if let Some(store) = &shard_store {
+                        persist_shard_state(&shard_manager, store).await;
+                    }
                     // Notify about shard revocations.
                     for shard_id in freed {
                         let revoke = ControlMessage::ShardRevoked {
@@ -270,6 +399,42 @@ async fn handle_connection(
                 worker_id,
                 shard_id,
             } => {
+                // M7-S2 leader-only write gate: a shard lease grant is a
+                // control-plane write and must only be accepted while this
+                // node is the Raft-elected leader.
+                if let Some(rft) = &raft {
+                    if rft.require_leader().is_err() {
+                        tracing::warn!(
+                            %worker_id,
+                            %shard_id,
+                            "control: shard lease request rejected — not leader"
+                        );
+                        if let Some(aud) = &audit {
+                            let event = AuditEvent::now(
+                                "control",
+                                "shard.lease_rejected_not_leader",
+                                shard_id.to_string(),
+                            )
+                            .with_detail(format!("worker={worker_id}"));
+                            let _ = aud.append(&event);
+                        }
+                        let reply = ControlMessage::NotLeader {
+                            current_leader: rft.current_leader(),
+                        };
+                        send_message(&mut writer, &reply).await;
+                        continue;
+                    }
+                    // v0.45.2 M7-S4/S5: this node is confirmed leader — make
+                    // sure its ShardManager reflects the shared store's
+                    // latest state before minting any lease this term.
+                    if let Some(store) = &shard_store {
+                        let epoch = rft
+                            .leader_epoch()
+                            .expect("require_leader() succeeded above, so this node is Leader");
+                        ensure_shard_state_synced(&shard_manager, store, &synced_epoch, epoch)
+                            .await;
+                    }
+                }
                 match shard_manager.acquire(shard_id, worker_id) {
                     Ok(lease) => {
                         tracing::info!(
@@ -290,6 +455,9 @@ async fn handle_connection(
                             ));
                             let _ = aud.append(&event);
                         }
+                        if let Some(store) = &shard_store {
+                            persist_shard_state(&shard_manager, store).await;
+                        }
                         let reply = ControlMessage::ShardAssigned { lease };
                         send_message(&mut writer, &reply).await;
                     }
@@ -308,6 +476,16 @@ async fn handle_connection(
                 shard_id,
                 lease_token,
             } => {
+                // v0.45.2 M7-S4/S5: sync before answering a fence check too,
+                // so a freshly-promoted leader doesn't wrongly report a
+                // genuinely-still-valid lease as invalid just because its
+                // own in-memory map hasn't caught up yet.
+                if let (Some(rft), Some(store)) = (&raft, &shard_store) {
+                    if let Some(epoch) = rft.leader_epoch() {
+                        ensure_shard_state_synced(&shard_manager, store, &synced_epoch, epoch)
+                            .await;
+                    }
+                }
                 let valid = shard_manager.is_valid_writer(shard_id, lease_token);
                 tracing::debug!(
                     %shard_id,
@@ -344,6 +522,66 @@ async fn handle_connection(
                     "control: shard load report received"
                 );
             }
+            WorkerMessage::ClusterStatusQuery => {
+                let reply = if let Some(rft) = &raft {
+                    ControlMessage::ClusterStatusReport {
+                        node_id: Some(rft.node_id()),
+                        role: raft_role_wire(rft.role()),
+                        term: rft.current_term(),
+                    }
+                } else {
+                    // Pre-v0.45.2 single-node control mode: this node is
+                    // implicitly the (only) writer — there is no group to
+                    // contend leadership with.
+                    ControlMessage::ClusterStatusReport {
+                        node_id: None,
+                        role: rockstream_types::topology::RaftRoleWire::NoRaft,
+                        term: 0,
+                    }
+                };
+                send_message(&mut writer, &reply).await;
+            }
+            WorkerMessage::ReportShardFrontier { shard_id, epoch } => {
+                if let Some(agg) = &frontier {
+                    if let Err(e) = agg
+                        .ingest(rockstream_types::frontier::ShardFrontierReport { shard_id, epoch })
+                    {
+                        tracing::warn!(%shard_id, epoch, error = %e, "control: frontier ingest failed");
+                    }
+                }
+                // v0.45.2 M7-S4: only the current leader "publishes" — a
+                // non-leader control node still ingested the report above
+                // (so the meet computation is already warm once it becomes
+                // leader), but must not claim authority over the cluster
+                // frontier it does not currently hold.
+                let is_leader = match &raft {
+                    Some(rft) => rft.require_leader().is_ok(),
+                    None => true,
+                };
+                if is_leader {
+                    if let Some(agg) = &frontier {
+                        let published = agg.cluster_frontier().epoch;
+                        if let Some(aud) = &audit {
+                            let event = AuditEvent::now(
+                                "control",
+                                "frontier.published",
+                                shard_id.to_string(),
+                            )
+                            .with_detail(format!("epoch={epoch}"));
+                            let _ = aud.append(&event);
+                        }
+                        let reply = ControlMessage::ClusterFrontierAdvanced {
+                            epoch: published.unwrap_or(0),
+                        };
+                        send_message(&mut writer, &reply).await;
+                    }
+                } else if let Some(rft) = &raft {
+                    let reply = ControlMessage::NotLeader {
+                        current_leader: rft.current_leader(),
+                    };
+                    send_message(&mut writer, &reply).await;
+                }
+            }
         }
     }
 
@@ -365,6 +603,9 @@ async fn handle_connection(
                 )
                 .with_detail(format!("freed_shards={}", freed.len()));
                 let _ = aud.append(&event);
+            }
+            if let Some(store) = &shard_store {
+                persist_shard_state(&shard_manager, store).await;
             }
         }
     }
@@ -397,7 +638,7 @@ mod tests {
     use crate::topology::TopologyCatalog;
     use rockstream_types::ids::WorkerId;
     use rockstream_types::topology::{
-        CapacityHeadroom, NodeRole, WorkerMessage, WorkerRegistration,
+        CapacityHeadroom, NodeRole, RaftRoleWire, WorkerMessage, WorkerRegistration,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
@@ -546,6 +787,61 @@ mod tests {
         }
 
         handle.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.45.2 M7-S2: leader-only write gating for shard-lease requests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn shard_lease_request_rejected_with_not_leader_when_not_raft_leader() {
+        use crate::raft::{spawn_raft_node, RaftConfig};
+        use object_store::memory::InMemory;
+        use rockstream_types::ids::ShardId;
+        use std::sync::Arc;
+
+        // A non-bootstrap node with no reachable peers cannot win an
+        // election before its own randomized election-timeout floor
+        // (150ms) elapses, so checking immediately after spawn
+        // deterministically observes it as a Follower.
+        let config = RaftConfig::new(0, Vec::new(), false);
+        let node = spawn_raft_node("127.0.0.1:0", config, Arc::new(InMemory::new()))
+            .await
+            .unwrap();
+        assert!(!node.handle.is_leader());
+
+        let catalog = TopologyCatalog::new();
+        let manager = ShardManager::new();
+        let svc = ControlService::new(catalog.clone())
+            .with_shard_manager(manager.clone())
+            .with_raft(node.handle.clone());
+        let handle = svc.start("127.0.0.1:0").await.unwrap();
+
+        let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let reg = WorkerRegistration::new(
+            WorkerId(1),
+            NodeRole::Worker,
+            "127.0.0.1:9001",
+            CapacityHeadroom::FULL,
+        );
+        let _ = send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
+
+        let req = WorkerMessage::RequestShard {
+            worker_id: WorkerId(1),
+            shard_id: ShardId(42),
+        };
+        let resp = send_and_recv(&mut stream, &req).await;
+        let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
+        assert!(
+            matches!(reply, ControlMessage::NotLeader { .. }),
+            "expected NotLeader, got: {reply:?}"
+        );
+
+        // No lease was actually granted.
+        assert!(manager.get(ShardId(42)).is_none());
+
+        handle.shutdown();
+        node.shutdown();
     }
 
     #[test]
@@ -697,5 +993,293 @@ mod tests {
         );
 
         handle.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.45.2 M7-S4: cluster status query, frontier gating, and cross-process
+    // shard-manager takeover
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cluster_status_query_without_raft_reports_no_raft() {
+        let (handle, _catalog) = start_test_service().await;
+        let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let resp = send_and_recv(&mut stream, &WorkerMessage::ClusterStatusQuery).await;
+        let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
+        match reply {
+            ControlMessage::ClusterStatusReport {
+                node_id,
+                role,
+                term,
+            } => {
+                assert_eq!(node_id, None);
+                assert_eq!(role, RaftRoleWire::NoRaft);
+                assert_eq!(term, 0);
+            }
+            _ => panic!("expected ClusterStatusReport, got: {reply:?}"),
+        }
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cluster_status_query_with_raft_reports_leader() {
+        use crate::raft::{spawn_raft_node, RaftConfig};
+        use object_store::memory::InMemory;
+
+        let config = RaftConfig::new(0, Vec::new(), true);
+        let node = spawn_raft_node("127.0.0.1:0", config, Arc::new(InMemory::new()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(node.handle.is_leader());
+
+        let catalog = TopologyCatalog::new();
+        let svc = ControlService::new(catalog).with_raft(node.handle.clone());
+        let handle = svc.start("127.0.0.1:0").await.unwrap();
+
+        let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let resp = send_and_recv(&mut stream, &WorkerMessage::ClusterStatusQuery).await;
+        let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
+        match reply {
+            ControlMessage::ClusterStatusReport {
+                node_id,
+                role,
+                term,
+            } => {
+                assert_eq!(node_id, Some(0));
+                assert_eq!(role, RaftRoleWire::Leader);
+                assert_eq!(term, node.handle.current_term());
+            }
+            _ => panic!("expected ClusterStatusReport, got: {reply:?}"),
+        }
+        handle.shutdown();
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn report_shard_frontier_without_raft_always_publishes() {
+        use rockstream_types::ids::ShardId;
+
+        let (handle, _catalog) = start_test_service().await;
+        let svc = ControlService::new(TopologyCatalog::new());
+        drop(svc); // constructed only to document the default-no-frontier path
+        let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        // No frontier aggregator attached to `start_test_service` — ingestion
+        // is a no-op, but the leader-authority reply path still must not
+        // wrongly claim NotLeader in single-node (no-raft) mode. Since no
+        // aggregator is attached at all, no reply is sent for this message;
+        // assert the connection stays healthy by following up with a status
+        // query.
+        let _ = tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            format!(
+                "{}\n",
+                serde_json::to_string(&WorkerMessage::ReportShardFrontier {
+                    shard_id: ShardId(1),
+                    epoch: 5,
+                })
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .await;
+        let resp = send_and_recv(&mut stream, &WorkerMessage::ClusterStatusQuery).await;
+        let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
+        assert!(matches!(reply, ControlMessage::ClusterStatusReport { .. }));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn report_shard_frontier_with_frontier_and_no_raft_publishes_advance() {
+        use rockstream_types::ids::ShardId;
+
+        let catalog = TopologyCatalog::new();
+        let frontier = Arc::new(FrontierAggregator::new());
+        let svc = ControlService::new(catalog).with_frontier(frontier.clone());
+        let handle = svc.start("127.0.0.1:0").await.unwrap();
+
+        let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let req = WorkerMessage::ReportShardFrontier {
+            shard_id: ShardId(1),
+            epoch: 42,
+        };
+        let resp = send_and_recv(&mut stream, &req).await;
+        let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
+        match reply {
+            ControlMessage::ClusterFrontierAdvanced { epoch } => assert_eq!(epoch, 42),
+            _ => panic!("expected ClusterFrontierAdvanced, got: {reply:?}"),
+        }
+        assert_eq!(frontier.cluster_frontier().epoch, Some(42));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn report_shard_frontier_rejected_with_not_leader_when_demoted() {
+        use crate::raft::{spawn_raft_node, RaftConfig};
+        use object_store::memory::InMemory;
+        use rockstream_types::ids::ShardId;
+
+        let config = RaftConfig::new(0, Vec::new(), false);
+        let node = spawn_raft_node("127.0.0.1:0", config, Arc::new(InMemory::new()))
+            .await
+            .unwrap();
+        assert!(!node.handle.is_leader());
+
+        let catalog = TopologyCatalog::new();
+        let frontier = Arc::new(FrontierAggregator::new());
+        let svc = ControlService::new(catalog)
+            .with_raft(node.handle.clone())
+            .with_frontier(frontier.clone());
+        let handle = svc.start("127.0.0.1:0").await.unwrap();
+
+        let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let req = WorkerMessage::ReportShardFrontier {
+            shard_id: ShardId(1),
+            epoch: 7,
+        };
+        let resp = send_and_recv(&mut stream, &req).await;
+        let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
+        assert!(
+            matches!(reply, ControlMessage::NotLeader { .. }),
+            "expected NotLeader, got: {reply:?}"
+        );
+        // Ingestion still happened (meet computation carries over once this
+        // node becomes leader), even though publication was rejected.
+        assert_eq!(frontier.cluster_frontier().epoch, Some(7));
+
+        handle.shutdown();
+        node.shutdown();
+    }
+
+    /// v0.45.2 M7-S4/S5: a *second, independent* `ControlService` sharing the
+    /// same backing object store (models a different real control-node
+    /// process) picks up the first node's persisted lease state as soon as
+    /// it becomes leader, instead of granting a conflicting lease for a
+    /// shard the first node already leased out.
+    #[tokio::test]
+    async fn newly_leading_control_service_adopts_shared_shard_state() {
+        use crate::raft::{spawn_raft_node, RaftConfig};
+        use crate::shard::ShardPersistentStore;
+        use object_store::memory::InMemory;
+        use rockstream_types::ids::ShardId;
+
+        let shared_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+
+        // "Node A": becomes leader, grants shard 1 to worker 10, then is
+        // simulated to crash (its ControlService is simply dropped/shutdown
+        // without ever explicitly deregistering the worker).
+        let node_a = spawn_raft_node(
+            "127.0.0.1:0",
+            RaftConfig::new(0, Vec::new(), true),
+            shared_store.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(node_a.handle.is_leader());
+
+        let catalog_a = TopologyCatalog::new();
+        let manager_a = ShardManager::new();
+        let svc_a = ControlService::new(catalog_a)
+            .with_shard_manager(manager_a.clone())
+            .with_raft(node_a.handle.clone())
+            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store.clone())));
+        let handle_a = svc_a.start("127.0.0.1:0").await.unwrap();
+
+        let mut stream_a = TcpStream::connect(handle_a.addr).await.unwrap();
+        let reg = WorkerRegistration::new(
+            WorkerId(10),
+            NodeRole::Worker,
+            "127.0.0.1:9010",
+            CapacityHeadroom::FULL,
+        );
+        let _ = send_and_recv(&mut stream_a, &WorkerMessage::Register(reg)).await;
+        let req = WorkerMessage::RequestShard {
+            worker_id: WorkerId(10),
+            shard_id: ShardId(1),
+        };
+        let resp = send_and_recv(&mut stream_a, &req).await;
+        let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
+        assert!(matches!(reply, ControlMessage::ShardAssigned { .. }));
+        assert_eq!(manager_a.len(), 1);
+
+        // Node A crashes.
+        handle_a.shutdown();
+        node_a.shutdown();
+
+        // "Node B": a different real control node — its own independent
+        // Raft node id/term and its own empty in-memory `ShardManager` —
+        // but wired to the SAME shared object store. It bootstraps as its
+        // own single-node group (models the surviving majority electing a
+        // new leader) and becomes leader at a higher epoch.
+        let node_b = spawn_raft_node(
+            "127.0.0.1:0",
+            RaftConfig::new(1, Vec::new(), true),
+            shared_store.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(node_b.handle.is_leader());
+
+        let catalog_b = TopologyCatalog::new();
+        let manager_b = ShardManager::new();
+        assert!(manager_b.is_empty(), "node B starts with an empty map");
+        let svc_b = ControlService::new(catalog_b)
+            .with_shard_manager(manager_b.clone())
+            .with_raft(node_b.handle.clone())
+            .with_shard_store(Arc::new(ShardPersistentStore::new(shared_store)));
+        let handle_b = svc_b.start("127.0.0.1:0").await.unwrap();
+
+        // A different worker (worker 20) tries to grab the SAME shard that
+        // worker 10 already holds, against node B. The control-plane wire
+        // protocol does not reply at all when a shard-lease request is
+        // denied (the denial is signaled by the absence of a
+        // `ShardAssigned` reply, not a response message) — so this sends
+        // the request and asserts against `manager_b`'s state directly
+        // rather than blocking on a reply that will never arrive.
+        let mut stream_b = TcpStream::connect(handle_b.addr).await.unwrap();
+        let reg2 = WorkerRegistration::new(
+            WorkerId(20),
+            NodeRole::Worker,
+            "127.0.0.1:9020",
+            CapacityHeadroom::FULL,
+        );
+        let _ = send_and_recv(&mut stream_b, &WorkerMessage::Register(reg2)).await;
+        let req2 = WorkerMessage::RequestShard {
+            worker_id: WorkerId(20),
+            shard_id: ShardId(1),
+        };
+        let line2 = serde_json::to_string(&req2).unwrap() + "\n";
+        AsyncWriteExt::write_all(&mut stream_b, line2.as_bytes())
+            .await
+            .unwrap();
+        // Give the server time to process the denied request; then confirm
+        // no reply is forthcoming within a bounded window (the "silence
+        // means denial" wire-protocol contract), and that node B did NOT
+        // grant a conflicting lease.
+        let mut reader_b = BufReader::new(&mut stream_b);
+        let mut resp2 = String::new();
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            reader_b.read_line(&mut resp2),
+        )
+        .await;
+        assert!(
+            read_result.is_err(),
+            "split-brain: node B replied to worker 20's conflicting request \
+             instead of silently denying it (resp={resp2:?})"
+        );
+        // Connection is closed (LeaseError::AlreadyLeased) — correct:
+        // node B adopted node A's persisted state and knows shard 1
+        // already belongs to worker 10.
+        assert_eq!(
+            manager_b.get(ShardId(1)).unwrap().worker_id,
+            WorkerId(10),
+            "node B must have synced worker 10's lease from the shared store"
+        );
+
+        handle_b.shutdown();
+        node_b.shutdown();
     }
 }

@@ -12,9 +12,10 @@ This directory contains FizzBee specifications for the RockStream distributed co
 | [`m3_sink_2pc.fizz`](m3_sink_2pc.fizz) | M3 | Exactly-Once Sink 2PC Protocol (`NativeIdempotent`/`FencingTokenRequired`/`CheckBeforeCommit` profiles) | §11 |
 | [`m4_self_fencing.fizz`](m4_self_fencing.fizz) | M4 | Worker Self-Fencing, Lease Uniqueness & Recovery Progress | §11.6 |
 | [`m5_cold_tier_sink.fizz`](m5_cold_tier_sink.fizz) | M5 | Cold-Tier Exactly-Once Sink Commit Protocol (partial-write/mid-rename crash recovery) | §11.4, §17.8 gap 1 |
+| [`m7_control_plane_ha.fizz`](m7_control_plane_ha.fizz) | M7 | Control-Plane Raft Leader Election & Leader-Only Write Fencing (3-node quorum, composed with M4's shard fencing) | §3 (Three Logical Tiers, Tier 3 Raft bootstrap) |
 
-All six specs are a hard gate in the `formal-verify` CI job
-(`.github/workflows/ci.yml`) as of v0.43 — a red result on any of them
+All seven specs are a hard gate in the `formal-verify` CI job
+(`.github/workflows/ci.yml`) as of v0.45.2 — a red result on any of them
 blocks merge; `continue-on-error` is not used for any spec.
 
 ## Running Verifications

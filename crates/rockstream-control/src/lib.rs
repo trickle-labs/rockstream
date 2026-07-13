@@ -9,6 +9,7 @@
 //! - [`frontier`] — Frontier aggregation and ClusterFrontier publishing (v0.18)
 //! - [`topology`] — In-memory worker registry / topology catalog
 //! - [`placement`] — Capacity-aware shard and operator placement
+//! - [`raft`] — Control-plane Raft leader election (v0.45.2 M7 S1–S3)
 //! - [`scheduler`] — Shard scheduling: distributes shards across workers
 //! - [`service`] — TCP control service for worker registration and shard leasing
 //! - [`shard`] — Shard lease management with fencing tokens
@@ -21,6 +22,7 @@ pub mod config_deriver;
 pub mod frontier;
 pub mod namespace;
 pub mod placement;
+pub mod raft;
 pub mod scheduler;
 pub mod service;
 pub mod shard;
@@ -35,7 +37,7 @@ pub use namespace::NamespaceCatalog;
 pub use placement::PlacementAlgorithm;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use service::{ControlService, ControlServiceHandle};
-pub use shard::{LeaseError, ShardManager};
+pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};
 pub use tls::TlsConfig;
 pub use topology::TopologyCatalog;
 

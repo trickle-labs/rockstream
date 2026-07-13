@@ -49,6 +49,66 @@ enum Command {
         /// Activates the live gateway server for the `gateway` and `all` roles.
         #[arg(long, default_value = "127.0.0.1:5432")]
         listen: String,
+
+        /// v0.45.2 M7: comma-separated list of the *other* control nodes in
+        /// this node's Raft group, `id@host:port,id@host:port`. Only
+        /// meaningful for `--role=control`. When omitted, the control role
+        /// runs exactly as before v0.45.2 (single embedded node, no Raft
+        /// leader-only write gating).
+        #[arg(long)]
+        raft_peers: Option<String>,
+
+        /// This node's id within its Raft group (required with
+        /// `--raft-peers`).
+        #[arg(long)]
+        raft_node_id: Option<u64>,
+
+        /// Address this node's Raft peer-RPC listener binds to (required
+        /// with `--raft-peers`).
+        #[arg(long)]
+        raft_bind: Option<String>,
+
+        /// Start an election immediately on boot rather than waiting out a
+        /// randomized timeout. Exactly one node in a freshly-bootstrapped
+        /// Raft group should set this.
+        #[arg(long, default_value_t = false)]
+        raft_bootstrap: bool,
+
+        /// v0.45.2 M7 S4: run the `control` role as a real long-lived
+        /// daemon that blocks on SIGTERM / Ctrl-C, exactly like the
+        /// `gateway`/`all` roles' live PostgreSQL wire server, instead of
+        /// the short embedded no-op run. Defaults to `false`, preserving
+        /// exact pre-v0.45.2 behavior (and every existing test) for every
+        /// caller that does not pass this flag. Only meaningful for
+        /// `--role=control`; required for a real multi-node control-plane
+        /// cluster (each node's process must keep running so peers can
+        /// reach it and so it can keep serving worker/status requests).
+        #[arg(long, default_value_t = false)]
+        daemon: bool,
+
+        /// v0.45.2 M7 S4: override the address the control-plane's
+        /// worker-facing `ControlService` TCP listener binds to. Defaults
+        /// to `127.0.0.1:8000` (the pre-v0.45.2 convention) when omitted.
+        /// Only meaningful for `--role=control`/`--role=all`. Needed to
+        /// bind `0.0.0.0:<port>` inside a container so peer control nodes
+        /// and workers on other hosts can reach it.
+        #[arg(long)]
+        control_bind: Option<String>,
+
+        /// v0.45.2 M7 S4/S5: directory for state that must be *shared*
+        /// across every control node in this node's Raft group — the Raft
+        /// term/vote/log and the shard-lease-manager snapshot (DESIGN.md
+        /// §3's "control SlateDB": the elected leader is its sole writer,
+        /// and a newly-elected leader on a different real process loads
+        /// the last-persisted state from here before serving its first
+        /// write). Only meaningful for `--role=control` with
+        /// `--raft-peers`. When omitted (the default), each control node's
+        /// Raft state lives under its own private `--storage` directory
+        /// exactly as before v0.45.2, and the `ShardManager` stays
+        /// purely in-memory (no cross-process lease continuity) —
+        /// preserving exact pre-v0.45.2 single-node behavior.
+        #[arg(long)]
+        control_shared_storage: Option<std::path::PathBuf>,
     },
 }
 
@@ -70,6 +130,13 @@ fn main() -> ExitCode {
             auth,
             metrics_addr,
             listen,
+            raft_peers,
+            raft_node_id,
+            raft_bind,
+            raft_bootstrap,
+            daemon,
+            control_bind,
+            control_shared_storage,
         } => {
             let opts = StartOptions {
                 storage,
@@ -78,6 +145,13 @@ fn main() -> ExitCode {
                 auth_mode: auth,
                 metrics_addr,
                 listen_addr: Some(listen),
+                raft_peers,
+                raft_node_id,
+                raft_bind,
+                raft_bootstrap,
+                daemon,
+                control_bind,
+                control_shared_storage,
             };
             match run_start(&opts) {
                 Ok(outcome) => {

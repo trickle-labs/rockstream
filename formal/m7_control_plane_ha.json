@@ -1,0 +1,5067 @@
+{
+  "sourceInfo": {
+    "fileName": "m7_control_plane_ha.fizz",
+    "start": {
+      "line": 68,
+      "column": 1
+    },
+    "end": {
+      "line": 498
+    }
+  },
+  "invariants": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 412,
+          "column": 1
+        },
+        "end": {
+          "line": 452
+        }
+      },
+      "name": "M7_S1_NoDualLeaderPerTerm",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 413,
+            "column": 5
+          },
+          "end": {
+            "line": 452
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 413,
+                "column": 5
+              },
+              "end": {
+                "line": 421,
+                "column": 4
+              }
+            },
+            "forStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 413,
+                  "column": 5
+                },
+                "end": {
+                  "line": 421,
+                  "column": 4
+                }
+              },
+              "loopVars": [
+                "term"
+              ],
+              "pyExpr": "range(1, MAX_TERM + 1)",
+              "block": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 414,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 421,
+                    "column": 4
+                  }
+                },
+                "stmts": [
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 414,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 415,
+                        "column": 8
+                      }
+                    },
+                    "pyStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 414,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 414,
+                          "column": 27
+                        }
+                      },
+                      "code": "leaders_at_term = 0"
+                    }
+                  },
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 415,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 419,
+                        "column": 8
+                      }
+                    },
+                    "forStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 415,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 419,
+                          "column": 8
+                        }
+                      },
+                      "loopVars": [
+                        "node_id"
+                      ],
+                      "pyExpr": "range(NUM_CONTROL_NODES)",
+                      "block": {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 416,
+                            "column": 13
+                          },
+                          "end": {
+                            "line": 419,
+                            "column": 8
+                          }
+                        },
+                        "stmts": [
+                          {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 416,
+                                "column": 13
+                              },
+                              "end": {
+                                "line": 417,
+                                "column": 12
+                              }
+                            },
+                            "pyStmt": {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 416,
+                                  "column": 13
+                                },
+                                "end": {
+                                  "line": 416,
+                                  "column": 30
+                                }
+                              },
+                              "code": "n = nodes[node_id]"
+                            }
+                          },
+                          {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 417,
+                                "column": 13
+                              },
+                              "end": {
+                                "line": 419,
+                                "column": 8
+                              }
+                            },
+                            "ifStmt": {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 417,
+                                  "column": 13
+                                },
+                                "end": {
+                                  "line": 419,
+                                  "column": 8
+                                }
+                              },
+                              "branches": [
+                                {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 417,
+                                      "column": 16
+                                    },
+                                    "end": {
+                                      "line": 419,
+                                      "column": 8
+                                    }
+                                  },
+                                  "condition": "n.node_role == \"leader\" and n.current_term == term",
+                                  "block": {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 418,
+                                        "column": 17
+                                      },
+                                      "end": {
+                                        "line": 419,
+                                        "column": 8
+                                      }
+                                    },
+                                    "stmts": [
+                                      {
+                                        "sourceInfo": {
+                                          "start": {
+                                            "line": 418,
+                                            "column": 17
+                                          },
+                                          "end": {
+                                            "line": 419,
+                                            "column": 8
+                                          }
+                                        },
+                                        "pyStmt": {
+                                          "sourceInfo": {
+                                            "start": {
+                                              "line": 418,
+                                              "column": 17
+                                            },
+                                            "end": {
+                                              "line": 418,
+                                              "column": 53
+                                            }
+                                          },
+                                          "code": "leaders_at_term = leaders_at_term + 1"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  "conditionExpr": {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 417,
+                                        "column": 16
+                                      },
+                                      "end": {
+                                        "line": 417,
+                                        "column": 65
+                                      }
+                                    },
+                                    "pyExpr": "n.node_role == \"leader\" and n.current_term == term"
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        ]
+                      },
+                      "iterExpr": {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 415,
+                            "column": 24
+                          },
+                          "end": {
+                            "line": 415,
+                            "column": 47
+                          }
+                        },
+                        "pyExpr": "range(NUM_CONTROL_NODES)"
+                      }
+                    }
+                  },
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 419,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 421,
+                        "column": 4
+                      }
+                    },
+                    "ifStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 419,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 421,
+                          "column": 4
+                        }
+                      },
+                      "branches": [
+                        {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 419,
+                              "column": 12
+                            },
+                            "end": {
+                              "line": 421,
+                              "column": 4
+                            }
+                          },
+                          "condition": "leaders_at_term > 1",
+                          "block": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 420,
+                                "column": 13
+                              },
+                              "end": {
+                                "line": 421,
+                                "column": 4
+                              }
+                            },
+                            "stmts": [
+                              {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 420,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 421,
+                                    "column": 4
+                                  }
+                                },
+                                "returnStmt": {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 420,
+                                      "column": 13
+                                    },
+                                    "end": {
+                                      "line": 420,
+                                      "column": 24
+                                    }
+                                  },
+                                  "pyExpr": "False",
+                                  "expr": {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 420,
+                                        "column": 20
+                                      },
+                                      "end": {
+                                        "line": 420,
+                                        "column": 24
+                                      }
+                                    },
+                                    "pyExpr": "False"
+                                  }
+                                }
+                              }
+                            ]
+                          },
+                          "conditionExpr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 419,
+                                "column": 12
+                              },
+                              "end": {
+                                "line": 419,
+                                "column": 30
+                              }
+                            },
+                            "pyExpr": "leaders_at_term > 1"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 413,
+                    "column": 17
+                  },
+                  "end": {
+                    "line": 413,
+                    "column": 38
+                  }
+                },
+                "pyExpr": "range(1, MAX_TERM + 1)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 421,
+                "column": 5
+              },
+              "end": {
+                "line": 452
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 421,
+                  "column": 5
+                },
+                "end": {
+                  "line": 421,
+                  "column": 15
+                }
+              },
+              "pyExpr": "True",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 421,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 421,
+                    "column": 15
+                  }
+                },
+                "pyExpr": "True"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M7_S1_NoDualLeaderPerTerm():\n    for term in range(1, MAX_TERM + 1):\n        leaders_at_term = 0\n        for node_id in range(NUM_CONTROL_NODES):\n            n = nodes[node_id]\n            if n.node_role == \"leader\" and n.current_term == term:\n                leaders_at_term = leaders_at_term + 1\n        if leaders_at_term > 1:\n            return False\n    return True\n\n# M7-S2: Leader-only write gating \u2014 a lease grant / workload-catalog write /\n# shard-assignment write is only ever accepted by the ObjectStore attributed\n# to the node that was actually elected leader for that term. Checked as a\n# genuine cross-action comparison: `accepted_write_by_term[T]` is written by\n# FinishWrite, `leader_at_term[T]` is written by BecomeLeader \u2014 two\n# independent actions, so a bug that attributed an accepted write to the\n# wrong node/term (e.g. a captured_term/node_id mixup, or skipping\n# `term_matches_current`/`term_valid_for_store`) is falsifiable by exhaustive\n# BFS \u2014 unlike a first draft of this net, which set `accepted_term =\n# captured_term` and then compared `captured_term != accepted_term`\n# immediately after that same assignment: always vacuously false, caught\n# only by deliberately breaking FinishWrite's guard and observing the old\n# check stayed green regardless.\n#\n# Scope note: this cross-check cannot independently re-verify the\n# `is_leader_now` conjunct specifically (whether the writing node's role was\n# still exactly \"leader\" at the instant FinishWrite ran) without re-reading\n# the same `node_role` FinishWrite itself reads \u2014 there is no other state\n# that records \"was this node's role Leader at this exact instant\" (a\n# snapshot fact, not a monotonic ledger entry), so, unlike the term/identity\n# conjuncts, that one relies on FinishWrite's own correctly-written,\n# freshly-read `n.node_role == \"leader\"` check (verified by inspection: it\n# reads live per-node state mutated only by StartElection / RequestVoteAnd-\n# Grant / BecomeLeader / CrashLeader, never by FinishWrite itself). What\n# exhaustive BFS *does* additionally verify here is that no interleaving of\n# concurrent crash/election/write actions around that correctly-written\n# guard can still produce a same-term dual acceptance or a wrong-identity\n# acceptance (M7-S1's dual-leader freedom is exactly the complementary\n# guarantee this leans on).\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 452,
+          "column": 1
+        },
+        "end": {
+          "line": 467
+        }
+      },
+      "name": "M7_S2_LeaderOnlyWriteAccepted",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 453,
+            "column": 5
+          },
+          "end": {
+            "line": 467
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 453,
+                "column": 5
+              },
+              "end": {
+                "line": 457,
+                "column": 4
+              }
+            },
+            "forStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 453,
+                  "column": 5
+                },
+                "end": {
+                  "line": 457,
+                  "column": 4
+                }
+              },
+              "loopVars": [
+                "term"
+              ],
+              "pyExpr": "range(1, MAX_TERM + 1)",
+              "block": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 454,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 457,
+                    "column": 4
+                  }
+                },
+                "stmts": [
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 454,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 455,
+                        "column": 8
+                      }
+                    },
+                    "pyStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 454,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 454,
+                          "column": 50
+                        }
+                      },
+                      "code": "accepted_by = accepted_write_by_term[term]"
+                    }
+                  },
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 455,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 457,
+                        "column": 4
+                      }
+                    },
+                    "ifStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 455,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 457,
+                          "column": 4
+                        }
+                      },
+                      "branches": [
+                        {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 455,
+                              "column": 12
+                            },
+                            "end": {
+                              "line": 457,
+                              "column": 4
+                            }
+                          },
+                          "condition": "accepted_by != -1 and accepted_by != leader_at_term[term]",
+                          "block": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 456,
+                                "column": 13
+                              },
+                              "end": {
+                                "line": 457,
+                                "column": 4
+                              }
+                            },
+                            "stmts": [
+                              {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 456,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 457,
+                                    "column": 4
+                                  }
+                                },
+                                "returnStmt": {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 456,
+                                      "column": 13
+                                    },
+                                    "end": {
+                                      "line": 456,
+                                      "column": 24
+                                    }
+                                  },
+                                  "pyExpr": "False",
+                                  "expr": {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 456,
+                                        "column": 20
+                                      },
+                                      "end": {
+                                        "line": 456,
+                                        "column": 24
+                                      }
+                                    },
+                                    "pyExpr": "False"
+                                  }
+                                }
+                              }
+                            ]
+                          },
+                          "conditionExpr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 455,
+                                "column": 12
+                              },
+                              "end": {
+                                "line": 455,
+                                "column": 68
+                              }
+                            },
+                            "pyExpr": "accepted_by != -1 and accepted_by != leader_at_term[term]"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 453,
+                    "column": 17
+                  },
+                  "end": {
+                    "line": 453,
+                    "column": 38
+                  }
+                },
+                "pyExpr": "range(1, MAX_TERM + 1)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 457,
+                "column": 5
+              },
+              "end": {
+                "line": 467
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 457,
+                  "column": 5
+                },
+                "end": {
+                  "line": 457,
+                  "column": 15
+                }
+              },
+              "pyExpr": "True",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 457,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 457,
+                    "column": 15
+                  }
+                },
+                "pyExpr": "True"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M7_S2_LeaderOnlyWriteAccepted():\n    for term in range(1, MAX_TERM + 1):\n        accepted_by = accepted_write_by_term[term]\n        if accepted_by != -1 and accepted_by != leader_at_term[term]:\n            return False\n    return True\n\n# M7-S3: Composed shard-fence fencing \u2014 a shard's fence-epoch write (the\n# `is_shard_fence_write` write, whose token is derived from\n# (raft_term, control_leader_id) per the header comment) is only accepted\n# from the node that was actually elected leader for that term. Same\n# cross-action structure as M7-S2, over the shard-fence-specific ledger.\n# Because both write families share one CAS pair (accepted_term /\n# accepted_leader), at most one write \u2014 of either family \u2014 can ever be the\n# currently accepted one: no split-brain shard grant can occur.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 467,
+          "column": 1
+        },
+        "end": {
+          "line": 480
+        }
+      },
+      "name": "M7_S3_ShardFenceComposedWithLeaderEpoch",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 468,
+            "column": 5
+          },
+          "end": {
+            "line": 480
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 468,
+                "column": 5
+              },
+              "end": {
+                "line": 472,
+                "column": 4
+              }
+            },
+            "forStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 468,
+                  "column": 5
+                },
+                "end": {
+                  "line": 472,
+                  "column": 4
+                }
+              },
+              "loopVars": [
+                "term"
+              ],
+              "pyExpr": "range(1, MAX_TERM + 1)",
+              "block": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 469,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 472,
+                    "column": 4
+                  }
+                },
+                "stmts": [
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 469,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 470,
+                        "column": 8
+                      }
+                    },
+                    "pyStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 469,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 469,
+                          "column": 62
+                        }
+                      },
+                      "code": "accepted_by = shard_fence_accepted_write_by_term[term]"
+                    }
+                  },
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 470,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 472,
+                        "column": 4
+                      }
+                    },
+                    "ifStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 470,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 472,
+                          "column": 4
+                        }
+                      },
+                      "branches": [
+                        {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 470,
+                              "column": 12
+                            },
+                            "end": {
+                              "line": 472,
+                              "column": 4
+                            }
+                          },
+                          "condition": "accepted_by != -1 and accepted_by != leader_at_term[term]",
+                          "block": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 471,
+                                "column": 13
+                              },
+                              "end": {
+                                "line": 472,
+                                "column": 4
+                              }
+                            },
+                            "stmts": [
+                              {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 471,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 472,
+                                    "column": 4
+                                  }
+                                },
+                                "returnStmt": {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 471,
+                                      "column": 13
+                                    },
+                                    "end": {
+                                      "line": 471,
+                                      "column": 24
+                                    }
+                                  },
+                                  "pyExpr": "False",
+                                  "expr": {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 471,
+                                        "column": 20
+                                      },
+                                      "end": {
+                                        "line": 471,
+                                        "column": 24
+                                      }
+                                    },
+                                    "pyExpr": "False"
+                                  }
+                                }
+                              }
+                            ]
+                          },
+                          "conditionExpr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 470,
+                                "column": 12
+                              },
+                              "end": {
+                                "line": 470,
+                                "column": 68
+                              }
+                            },
+                            "pyExpr": "accepted_by != -1 and accepted_by != leader_at_term[term]"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 468,
+                    "column": 17
+                  },
+                  "end": {
+                    "line": 468,
+                    "column": 38
+                  }
+                },
+                "pyExpr": "range(1, MAX_TERM + 1)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 472,
+                "column": 5
+              },
+              "end": {
+                "line": 480
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 472,
+                  "column": 5
+                },
+                "end": {
+                  "line": 472,
+                  "column": 15
+                }
+              },
+              "pyExpr": "True",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 472,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 472,
+                    "column": 15
+                  }
+                },
+                "pyExpr": "True"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M7_S3_ShardFenceComposedWithLeaderEpoch():\n    for term in range(1, MAX_TERM + 1):\n        accepted_by = shard_fence_accepted_write_by_term[term]\n        if accepted_by != -1 and accepted_by != leader_at_term[term]:\n            return False\n    return True\n\n# \u2500\u2500\u2500 Liveness \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n# M7-L1: after any leader crash or partition (modeled here as CrashLeader),\n# some ControlNode eventually becomes Leader again and can resume accepting\n# writes. Requires `fair` election/vote/become-leader actions; the timing of\n# *which* node wins is intentionally left nondeterministic.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 480,
+          "column": 1
+        },
+        "end": {
+          "line": 491
+        }
+      },
+      "name": "M7_L1_LeaderEventuallyExists",
+      "temporalOperators": [
+        "always",
+        "eventually"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 481,
+            "column": 5
+          },
+          "end": {
+            "line": 491
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 481,
+                "column": 5
+              },
+              "end": {
+                "line": 484,
+                "column": 4
+              }
+            },
+            "forStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 481,
+                  "column": 5
+                },
+                "end": {
+                  "line": 484,
+                  "column": 4
+                }
+              },
+              "loopVars": [
+                "node_id"
+              ],
+              "pyExpr": "range(NUM_CONTROL_NODES)",
+              "block": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 482,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 484,
+                    "column": 4
+                  }
+                },
+                "stmts": [
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 482,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 484,
+                        "column": 4
+                      }
+                    },
+                    "ifStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 482,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 484,
+                          "column": 4
+                        }
+                      },
+                      "branches": [
+                        {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 482,
+                              "column": 12
+                            },
+                            "end": {
+                              "line": 484,
+                              "column": 4
+                            }
+                          },
+                          "condition": "nodes[node_id].node_role == \"leader\"",
+                          "block": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 483,
+                                "column": 13
+                              },
+                              "end": {
+                                "line": 484,
+                                "column": 4
+                              }
+                            },
+                            "stmts": [
+                              {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 483,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 484,
+                                    "column": 4
+                                  }
+                                },
+                                "returnStmt": {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 483,
+                                      "column": 13
+                                    },
+                                    "end": {
+                                      "line": 483,
+                                      "column": 23
+                                    }
+                                  },
+                                  "pyExpr": "True",
+                                  "expr": {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 483,
+                                        "column": 20
+                                      },
+                                      "end": {
+                                        "line": 483,
+                                        "column": 23
+                                      }
+                                    },
+                                    "pyExpr": "True"
+                                  }
+                                }
+                              }
+                            ]
+                          },
+                          "conditionExpr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 482,
+                                "column": 12
+                              },
+                              "end": {
+                                "line": 482,
+                                "column": 47
+                              }
+                            },
+                            "pyExpr": "nodes[node_id].node_role == \"leader\""
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 481,
+                    "column": 20
+                  },
+                  "end": {
+                    "line": 481,
+                    "column": 43
+                  }
+                },
+                "pyExpr": "range(NUM_CONTROL_NODES)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 484,
+                "column": 5
+              },
+              "end": {
+                "line": 491
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 484,
+                  "column": 5
+                },
+                "end": {
+                  "line": 484,
+                  "column": 16
+                }
+              },
+              "pyExpr": "False",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 484,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 484,
+                    "column": 16
+                  }
+                },
+                "pyExpr": "False"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M7_L1_LeaderEventuallyExists():\n    for node_id in range(NUM_CONTROL_NODES):\n        if nodes[node_id].node_role == \"leader\":\n            return True\n    return False\n\n# \u2500\u2500\u2500 Coverage \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n# COV-M7: a state is reached where the leader crashes mid-term, a new leader\n# is elected at a higher term, and the stale (deposed) leader's in-flight\n# lease/catalog/shard-assignment/shard-fence write is rejected.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 491,
+          "column": 1
+        },
+        "end": {
+          "line": 498
+        }
+      },
+      "name": "COV_M7",
+      "temporalOperators": [
+        "exists"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 492,
+            "column": 5
+          },
+          "end": {
+            "line": 498
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 492,
+                "column": 5
+              },
+              "end": {
+                "line": 498
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 492,
+                  "column": 5
+                },
+                "end": {
+                  "line": 497,
+                  "column": 5
+                }
+              },
+              "pyExpr": "(\n        crash_occurred\n        and new_leader_elected_at_higher_term\n        and (write_rejected_nonleader_observed or write_rejected_stale_term_observed)\n        and shard_fence_write_rejected_observed\n    )",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 492,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 497,
+                    "column": 5
+                  }
+                },
+                "pyExpr": "(\n        crash_occurred\n        and new_leader_elected_at_higher_term\n        and (write_rejected_nonleader_observed or write_rejected_stale_term_observed)\n        and shard_fence_write_rejected_observed\n    )"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def COV_M7():\n    return (\n        crash_occurred\n        and new_leader_elected_at_higher_term\n        and (write_rejected_nonleader_observed or write_rejected_stale_term_observed)\n        and shard_fence_write_rejected_observed\n    )\n"
+    }
+  ],
+  "actions": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 157,
+          "column": 1
+        },
+        "end": {
+          "line": 203
+        }
+      },
+      "name": "Init",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_STRONG"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 162,
+            "column": 5
+          },
+          "end": {
+            "line": 203
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 162,
+                "column": 5
+              },
+              "end": {
+                "line": 163,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 162,
+                  "column": 5
+                },
+                "end": {
+                  "line": 162,
+                  "column": 21
+                }
+              },
+              "code": "accepted_term = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 163,
+                "column": 5
+              },
+              "end": {
+                "line": 165,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 163,
+                  "column": 5
+                },
+                "end": {
+                  "line": 163,
+                  "column": 24
+                }
+              },
+              "code": "accepted_leader = -1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 165,
+                "column": 5
+              },
+              "end": {
+                "line": 166,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 165,
+                  "column": 5
+                },
+                "end": {
+                  "line": 165,
+                  "column": 19
+                }
+              },
+              "code": "crash_count = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 166,
+                "column": 5
+              },
+              "end": {
+                "line": 167,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 166,
+                  "column": 5
+                },
+                "end": {
+                  "line": 166,
+                  "column": 22
+                }
+              },
+              "code": "election_count = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 167,
+                "column": 5
+              },
+              "end": {
+                "line": 179,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 167,
+                  "column": 5
+                },
+                "end": {
+                  "line": 167,
+                  "column": 27
+                }
+              },
+              "code": "write_attempt_count = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 179,
+                "column": 5
+              },
+              "end": {
+                "line": 180,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 179,
+                  "column": 5
+                },
+                "end": {
+                  "line": 179,
+                  "column": 42
+                }
+              },
+              "code": "leader_at_term = [-1] * (MAX_TERM + 1)"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 180,
+                "column": 5
+              },
+              "end": {
+                "line": 181,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 180,
+                  "column": 5
+                },
+                "end": {
+                  "line": 180,
+                  "column": 50
+                }
+              },
+              "code": "accepted_write_by_term = [-1] * (MAX_TERM + 1)"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 181,
+                "column": 5
+              },
+              "end": {
+                "line": 185,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 181,
+                  "column": 5
+                },
+                "end": {
+                  "line": 181,
+                  "column": 62
+                }
+              },
+              "code": "shard_fence_accepted_write_by_term = [-1] * (MAX_TERM + 1)"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 185,
+                "column": 5
+              },
+              "end": {
+                "line": 186,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 185,
+                  "column": 5
+                },
+                "end": {
+                  "line": 185,
+                  "column": 26
+                }
+              },
+              "code": "crash_occurred = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 186,
+                "column": 5
+              },
+              "end": {
+                "line": 187,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 186,
+                  "column": 5
+                },
+                "end": {
+                  "line": 186,
+                  "column": 45
+                }
+              },
+              "code": "new_leader_elected_at_higher_term = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 187,
+                "column": 5
+              },
+              "end": {
+                "line": 188,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 187,
+                  "column": 5
+                },
+                "end": {
+                  "line": 187,
+                  "column": 45
+                }
+              },
+              "code": "write_rejected_nonleader_observed = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 188,
+                "column": 5
+              },
+              "end": {
+                "line": 189,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 188,
+                  "column": 5
+                },
+                "end": {
+                  "line": 188,
+                  "column": 46
+                }
+              },
+              "code": "write_rejected_stale_term_observed = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 189,
+                "column": 5
+              },
+              "end": {
+                "line": 191,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 189,
+                  "column": 5
+                },
+                "end": {
+                  "line": 189,
+                  "column": 47
+                }
+              },
+              "code": "shard_fence_write_rejected_observed = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 191,
+                "column": 5
+              },
+              "end": {
+                "line": 192,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 191,
+                  "column": 5
+                },
+                "end": {
+                  "line": 191,
+                  "column": 14
+                }
+              },
+              "code": "nodes = []"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 192,
+                "column": 5
+              },
+              "end": {
+                "line": 203
+              }
+            },
+            "forStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 192,
+                  "column": 5
+                },
+                "end": {
+                  "line": 203
+                }
+              },
+              "loopVars": [
+                "i"
+              ],
+              "pyExpr": "range(NUM_CONTROL_NODES)",
+              "block": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 193,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 203
+                  }
+                },
+                "stmts": [
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 193,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 203
+                      }
+                    },
+                    "callStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 193,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 193,
+                          "column": 39
+                        }
+                      },
+                      "name": "append",
+                      "args": [
+                        {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 193,
+                              "column": 22
+                            },
+                            "end": {
+                              "line": 193,
+                              "column": 38
+                            }
+                          },
+                          "pyExpr": "ControlNode(id=i)",
+                          "expr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 193,
+                                "column": 22
+                              },
+                              "end": {
+                                "line": 193,
+                                "column": 38
+                              }
+                            },
+                            "pyExpr": "ControlNode(id=i)"
+                          }
+                        }
+                      ],
+                      "receiver": "nodes"
+                    }
+                  }
+                ]
+              },
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 192,
+                    "column": 14
+                  },
+                  "end": {
+                    "line": 192,
+                    "column": 37
+                  }
+                },
+                "pyExpr": "range(NUM_CONTROL_NODES)"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 229,
+          "column": 1
+        },
+        "end": {
+          "line": 259
+        }
+      },
+      "name": "StartElection",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 229,
+            "column": 8
+          },
+          "end": {
+            "line": 229,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 230,
+            "column": 5
+          },
+          "end": {
+            "line": 259
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 230,
+                "column": 5
+              },
+              "end": {
+                "line": 231,
+                "column": 4
+              }
+            },
+            "anyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 230,
+                  "column": 5
+                },
+                "end": {
+                  "line": 230,
+                  "column": 44
+                }
+              },
+              "loopVars": [
+                "node_id"
+              ],
+              "pyExpr": "range(NUM_CONTROL_NODES)",
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 230,
+                    "column": 21
+                  },
+                  "end": {
+                    "line": 230,
+                    "column": 44
+                  }
+                },
+                "pyExpr": "range(NUM_CONTROL_NODES)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 231,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 231,
+                  "column": 5
+                },
+                "end": {
+                  "line": 231,
+                  "column": 22
+                }
+              },
+              "code": "n = nodes[node_id]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 233,
+                "column": 5
+              },
+              "end": {
+                "line": 234,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 233,
+                  "column": 5
+                },
+                "end": {
+                  "line": 233,
+                  "column": 37
+                }
+              },
+              "condition": "n.node_role == \"follower\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 233,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 233,
+                    "column": 37
+                  }
+                },
+                "pyExpr": "n.node_role == \"follower\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 234,
+                "column": 5
+              },
+              "end": {
+                "line": 243,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 234,
+                  "column": 5
+                },
+                "end": {
+                  "line": 234,
+                  "column": 42
+                }
+              },
+              "condition": "election_count < MAX_ELECTIONS",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 234,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 234,
+                    "column": 42
+                  }
+                },
+                "pyExpr": "election_count < MAX_ELECTIONS"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 243,
+                "column": 5
+              },
+              "end": {
+                "line": 244,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 243,
+                  "column": 5
+                },
+                "end": {
+                  "line": 243,
+                  "column": 51
+                }
+              },
+              "condition": "not any_other_candidate(nodes, node_id)",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 243,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 243,
+                    "column": 51
+                  }
+                },
+                "pyExpr": "not any_other_candidate(nodes, node_id)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 244,
+                "column": 5
+              },
+              "end": {
+                "line": 246,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 244,
+                  "column": 5
+                },
+                "end": {
+                  "line": 244,
+                  "column": 40
+                }
+              },
+              "condition": "not any_leader_exists(nodes)",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 244,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 244,
+                    "column": 40
+                  }
+                },
+                "pyExpr": "not any_leader_exists(nodes)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 246,
+                "column": 5
+              },
+              "end": {
+                "line": 247,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 246,
+                  "column": 5
+                },
+                "end": {
+                  "line": 246,
+                  "column": 39
+                }
+              },
+              "code": "election_count = election_count + 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 247,
+                "column": 5
+              },
+              "end": {
+                "line": 248,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 247,
+                  "column": 5
+                },
+                "end": {
+                  "line": 247,
+                  "column": 39
+                }
+              },
+              "code": "n.current_term = n.current_term + 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 248,
+                "column": 5
+              },
+              "end": {
+                "line": 249,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 248,
+                  "column": 5
+                },
+                "end": {
+                  "line": 248,
+                  "column": 29
+                }
+              },
+              "code": "n.node_role = \"candidate\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 249,
+                "column": 5
+              },
+              "end": {
+                "line": 259
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 249,
+                  "column": 5
+                },
+                "end": {
+                  "line": 249,
+                  "column": 25
+                }
+              },
+              "code": "n.voted_for = node_id"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 259,
+          "column": 1
+        },
+        "end": {
+          "line": 289
+        }
+      },
+      "name": "RequestVoteAndGrant",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 259,
+            "column": 8
+          },
+          "end": {
+            "line": 259,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 260,
+            "column": 5
+          },
+          "end": {
+            "line": 289
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 260,
+                "column": 5
+              },
+              "end": {
+                "line": 261,
+                "column": 4
+              }
+            },
+            "anyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 260,
+                  "column": 5
+                },
+                "end": {
+                  "line": 260,
+                  "column": 49
+                }
+              },
+              "loopVars": [
+                "candidate_id"
+              ],
+              "pyExpr": "range(NUM_CONTROL_NODES)",
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 260,
+                    "column": 26
+                  },
+                  "end": {
+                    "line": 260,
+                    "column": 49
+                  }
+                },
+                "pyExpr": "range(NUM_CONTROL_NODES)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 261,
+                "column": 5
+              },
+              "end": {
+                "line": 262,
+                "column": 4
+              }
+            },
+            "anyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 261,
+                  "column": 5
+                },
+                "end": {
+                  "line": 261,
+                  "column": 45
+                }
+              },
+              "loopVars": [
+                "voter_id"
+              ],
+              "pyExpr": "range(NUM_CONTROL_NODES)",
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 261,
+                    "column": 22
+                  },
+                  "end": {
+                    "line": 261,
+                    "column": 45
+                  }
+                },
+                "pyExpr": "range(NUM_CONTROL_NODES)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 262,
+                "column": 5
+              },
+              "end": {
+                "line": 264,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 262,
+                  "column": 5
+                },
+                "end": {
+                  "line": 262,
+                  "column": 36
+                }
+              },
+              "condition": "candidate_id != voter_id",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 262,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 262,
+                    "column": 36
+                  }
+                },
+                "pyExpr": "candidate_id != voter_id"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 264,
+                "column": 5
+              },
+              "end": {
+                "line": 265,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 264,
+                  "column": 5
+                },
+                "end": {
+                  "line": 264,
+                  "column": 27
+                }
+              },
+              "code": "c = nodes[candidate_id]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 265,
+                "column": 5
+              },
+              "end": {
+                "line": 267,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 265,
+                  "column": 5
+                },
+                "end": {
+                  "line": 265,
+                  "column": 23
+                }
+              },
+              "code": "v = nodes[voter_id]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 267,
+                "column": 5
+              },
+              "end": {
+                "line": 270,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 267,
+                  "column": 5
+                },
+                "end": {
+                  "line": 267,
+                  "column": 38
+                }
+              },
+              "condition": "c.node_role == \"candidate\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 267,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 267,
+                    "column": 38
+                  }
+                },
+                "pyExpr": "c.node_role == \"candidate\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 270,
+                "column": 5
+              },
+              "end": {
+                "line": 272,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 270,
+                  "column": 5
+                },
+                "end": {
+                  "line": 270,
+                  "column": 65
+                }
+              },
+              "condition": "v.current_term != c.current_term or v.voted_for == -1",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 270,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 270,
+                    "column": 65
+                  }
+                },
+                "pyExpr": "v.current_term != c.current_term or v.voted_for == -1"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 272,
+                "column": 5
+              },
+              "end": {
+                "line": 289
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 272,
+                  "column": 5
+                },
+                "end": {
+                  "line": 289
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 272,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 278,
+                      "column": 4
+                    }
+                  },
+                  "condition": "v.current_term < c.current_term",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 275,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 278,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 275,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 276,
+                            "column": 8
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 275,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 275,
+                              "column": 39
+                            }
+                          },
+                          "code": "v.current_term = c.current_term"
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 276,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 277,
+                            "column": 8
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 276,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 276,
+                              "column": 32
+                            }
+                          },
+                          "code": "v.node_role = \"follower\""
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 277,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 278,
+                            "column": 4
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 277,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 277,
+                              "column": 34
+                            }
+                          },
+                          "code": "v.voted_for = candidate_id"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 272,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 272,
+                        "column": 38
+                      }
+                    },
+                    "pyExpr": "v.current_term < c.current_term"
+                  }
+                },
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 278,
+                      "column": 5
+                    },
+                    "end": {
+                      "line": 281,
+                      "column": 4
+                    }
+                  },
+                  "condition": "v.current_term == c.current_term",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 280,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 281,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 280,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 281,
+                            "column": 4
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 280,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 280,
+                              "column": 34
+                            }
+                          },
+                          "code": "v.voted_for = candidate_id"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 278,
+                        "column": 10
+                      },
+                      "end": {
+                        "line": 278,
+                        "column": 41
+                      }
+                    },
+                    "pyExpr": "v.current_term == c.current_term"
+                  }
+                },
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 281,
+                      "column": 5
+                    },
+                    "end": {
+                      "line": 289
+                    }
+                  },
+                  "condition": "True",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 284,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 289
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 284,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 285,
+                            "column": 8
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 284,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 284,
+                              "column": 32
+                            }
+                          },
+                          "code": "c.node_role = \"follower\""
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 285,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 286,
+                            "column": 8
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 285,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 285,
+                              "column": 39
+                            }
+                          },
+                          "code": "c.current_term = v.current_term"
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 286,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 289
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 286,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 286,
+                              "column": 24
+                            }
+                          },
+                          "code": "c.voted_for = -1"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "pyExpr": "True"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 289,
+          "column": 1
+        },
+        "end": {
+          "line": 331
+        }
+      },
+      "name": "BecomeLeader",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 289,
+            "column": 8
+          },
+          "end": {
+            "line": 289,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 290,
+            "column": 5
+          },
+          "end": {
+            "line": 331
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 290,
+                "column": 5
+              },
+              "end": {
+                "line": 291,
+                "column": 4
+              }
+            },
+            "anyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 290,
+                  "column": 5
+                },
+                "end": {
+                  "line": 290,
+                  "column": 44
+                }
+              },
+              "loopVars": [
+                "node_id"
+              ],
+              "pyExpr": "range(NUM_CONTROL_NODES)",
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 290,
+                    "column": 21
+                  },
+                  "end": {
+                    "line": 290,
+                    "column": 44
+                  }
+                },
+                "pyExpr": "range(NUM_CONTROL_NODES)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 291,
+                "column": 5
+              },
+              "end": {
+                "line": 293,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 291,
+                  "column": 5
+                },
+                "end": {
+                  "line": 291,
+                  "column": 22
+                }
+              },
+              "code": "n = nodes[node_id]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 293,
+                "column": 5
+              },
+              "end": {
+                "line": 294,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 293,
+                  "column": 5
+                },
+                "end": {
+                  "line": 293,
+                  "column": 38
+                }
+              },
+              "condition": "n.node_role == \"candidate\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 293,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 293,
+                    "column": 38
+                  }
+                },
+                "pyExpr": "n.node_role == \"candidate\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 294,
+                "column": 5
+              },
+              "end": {
+                "line": 295,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 294,
+                  "column": 5
+                },
+                "end": {
+                  "line": 294,
+                  "column": 41
+                }
+              },
+              "code": "majority = NUM_CONTROL_NODES // 2 + 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 295,
+                "column": 5
+              },
+              "end": {
+                "line": 297,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 295,
+                  "column": 5
+                },
+                "end": {
+                  "line": 295,
+                  "column": 51
+                }
+              },
+              "condition": "count_votes(nodes, node_id) >= majority",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 295,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 295,
+                    "column": 51
+                  }
+                },
+                "pyExpr": "count_votes(nodes, node_id) >= majority"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 297,
+                "column": 5
+              },
+              "end": {
+                "line": 310,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 297,
+                  "column": 5
+                },
+                "end": {
+                  "line": 297,
+                  "column": 26
+                }
+              },
+              "code": "n.node_role = \"leader\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 310,
+                "column": 5
+              },
+              "end": {
+                "line": 318,
+                "column": 4
+              }
+            },
+            "forStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 310,
+                  "column": 5
+                },
+                "end": {
+                  "line": 318,
+                  "column": 4
+                }
+              },
+              "loopVars": [
+                "i"
+              ],
+              "pyExpr": "range(len(nodes))",
+              "block": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 311,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 318,
+                    "column": 4
+                  }
+                },
+                "stmts": [
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 311,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 318,
+                        "column": 4
+                      }
+                    },
+                    "ifStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 311,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 318,
+                          "column": 4
+                        }
+                      },
+                      "branches": [
+                        {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 311,
+                              "column": 12
+                            },
+                            "end": {
+                              "line": 318,
+                              "column": 4
+                            }
+                          },
+                          "condition": "i != node_id and nodes[i].current_term < n.current_term",
+                          "block": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 312,
+                                "column": 13
+                              },
+                              "end": {
+                                "line": 318,
+                                "column": 4
+                              }
+                            },
+                            "stmts": [
+                              {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 312,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 313,
+                                    "column": 12
+                                  }
+                                },
+                                "pyStmt": {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 312,
+                                      "column": 13
+                                    },
+                                    "end": {
+                                      "line": 312,
+                                      "column": 50
+                                    }
+                                  },
+                                  "code": "nodes[i].current_term = n.current_term"
+                                }
+                              },
+                              {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 313,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 318,
+                                    "column": 4
+                                  }
+                                },
+                                "pyStmt": {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 313,
+                                      "column": 13
+                                    },
+                                    "end": {
+                                      "line": 313,
+                                      "column": 35
+                                    }
+                                  },
+                                  "code": "nodes[i].voted_for = -1"
+                                }
+                              }
+                            ]
+                          },
+                          "conditionExpr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 311,
+                                "column": 12
+                              },
+                              "end": {
+                                "line": 311,
+                                "column": 66
+                              }
+                            },
+                            "pyExpr": "i != node_id and nodes[i].current_term < n.current_term"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 310,
+                    "column": 14
+                  },
+                  "end": {
+                    "line": 310,
+                    "column": 30
+                  }
+                },
+                "pyExpr": "range(len(nodes))"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 318,
+                "column": 5
+              },
+              "end": {
+                "line": 320,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 318,
+                  "column": 5
+                },
+                "end": {
+                  "line": 318,
+                  "column": 44
+                }
+              },
+              "code": "leader_at_term[n.current_term] = node_id"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 320,
+                "column": 5
+              },
+              "end": {
+                "line": 331
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 320,
+                  "column": 5
+                },
+                "end": {
+                  "line": 331
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 320,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 331
+                    }
+                  },
+                  "condition": "n.current_term >= 2",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 321,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 331
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 321,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 331
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 321,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 321,
+                              "column": 48
+                            }
+                          },
+                          "code": "new_leader_elected_at_higher_term = True"
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 320,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 320,
+                        "column": 26
+                      }
+                    },
+                    "pyExpr": "n.current_term >= 2"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 331,
+          "column": 1
+        },
+        "end": {
+          "line": 350
+        }
+      },
+      "name": "CrashLeader",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 332,
+            "column": 5
+          },
+          "end": {
+            "line": 350
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 332,
+                "column": 5
+              },
+              "end": {
+                "line": 333,
+                "column": 4
+              }
+            },
+            "anyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 332,
+                  "column": 5
+                },
+                "end": {
+                  "line": 332,
+                  "column": 44
+                }
+              },
+              "loopVars": [
+                "node_id"
+              ],
+              "pyExpr": "range(NUM_CONTROL_NODES)",
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 332,
+                    "column": 21
+                  },
+                  "end": {
+                    "line": 332,
+                    "column": 44
+                  }
+                },
+                "pyExpr": "range(NUM_CONTROL_NODES)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 333,
+                "column": 5
+              },
+              "end": {
+                "line": 335,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 333,
+                  "column": 5
+                },
+                "end": {
+                  "line": 333,
+                  "column": 22
+                }
+              },
+              "code": "n = nodes[node_id]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 335,
+                "column": 5
+              },
+              "end": {
+                "line": 336,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 335,
+                  "column": 5
+                },
+                "end": {
+                  "line": 335,
+                  "column": 35
+                }
+              },
+              "condition": "n.node_role == \"leader\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 335,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 335,
+                    "column": 35
+                  }
+                },
+                "pyExpr": "n.node_role == \"leader\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 336,
+                "column": 5
+              },
+              "end": {
+                "line": 338,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 336,
+                  "column": 5
+                },
+                "end": {
+                  "line": 336,
+                  "column": 37
+                }
+              },
+              "condition": "crash_count < MAX_CRASHES",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 336,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 336,
+                    "column": 37
+                  }
+                },
+                "pyExpr": "crash_count < MAX_CRASHES"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 338,
+                "column": 5
+              },
+              "end": {
+                "line": 339,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 338,
+                  "column": 5
+                },
+                "end": {
+                  "line": 338,
+                  "column": 33
+                }
+              },
+              "code": "crash_count = crash_count + 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 339,
+                "column": 5
+              },
+              "end": {
+                "line": 340,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 339,
+                  "column": 5
+                },
+                "end": {
+                  "line": 339,
+                  "column": 25
+                }
+              },
+              "code": "crash_occurred = True"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 340,
+                "column": 5
+              },
+              "end": {
+                "line": 350
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 340,
+                  "column": 5
+                },
+                "end": {
+                  "line": 340,
+                  "column": 28
+                }
+              },
+              "code": "n.node_role = \"follower\""
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 350,
+          "column": 1
+        },
+        "end": {
+          "line": 367
+        }
+      },
+      "name": "BeginWrite",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 350,
+            "column": 8
+          },
+          "end": {
+            "line": 350,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 351,
+            "column": 5
+          },
+          "end": {
+            "line": 367
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 351,
+                "column": 5
+              },
+              "end": {
+                "line": 352,
+                "column": 4
+              }
+            },
+            "anyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 351,
+                  "column": 5
+                },
+                "end": {
+                  "line": 351,
+                  "column": 44
+                }
+              },
+              "loopVars": [
+                "node_id"
+              ],
+              "pyExpr": "range(NUM_CONTROL_NODES)",
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 351,
+                    "column": 21
+                  },
+                  "end": {
+                    "line": 351,
+                    "column": 44
+                  }
+                },
+                "pyExpr": "range(NUM_CONTROL_NODES)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 352,
+                "column": 5
+              },
+              "end": {
+                "line": 353,
+                "column": 4
+              }
+            },
+            "anyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 352,
+                  "column": 5
+                },
+                "end": {
+                  "line": 352,
+                  "column": 40
+                }
+              },
+              "loopVars": [
+                "is_shard_fence"
+              ],
+              "pyExpr": "[False, True]",
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 352,
+                    "column": 28
+                  },
+                  "end": {
+                    "line": 352,
+                    "column": 40
+                  }
+                },
+                "pyExpr": "[False, True]"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 353,
+                "column": 5
+              },
+              "end": {
+                "line": 355,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 353,
+                  "column": 5
+                },
+                "end": {
+                  "line": 353,
+                  "column": 22
+                }
+              },
+              "code": "n = nodes[node_id]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 355,
+                "column": 5
+              },
+              "end": {
+                "line": 356,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 355,
+                  "column": 5
+                },
+                "end": {
+                  "line": 355,
+                  "column": 35
+                }
+              },
+              "condition": "n.node_role == \"leader\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 355,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 355,
+                    "column": 35
+                  }
+                },
+                "pyExpr": "n.node_role == \"leader\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 356,
+                "column": 5
+              },
+              "end": {
+                "line": 357,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 356,
+                  "column": 5
+                },
+                "end": {
+                  "line": 356,
+                  "column": 38
+                }
+              },
+              "condition": "n.pending_write_term == -1",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 356,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 356,
+                    "column": 38
+                  }
+                },
+                "pyExpr": "n.pending_write_term == -1"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 357,
+                "column": 5
+              },
+              "end": {
+                "line": 359,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 357,
+                  "column": 5
+                },
+                "end": {
+                  "line": 357,
+                  "column": 52
+                }
+              },
+              "condition": "write_attempt_count < MAX_WRITE_ATTEMPTS",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 357,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 357,
+                    "column": 52
+                  }
+                },
+                "pyExpr": "write_attempt_count < MAX_WRITE_ATTEMPTS"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 359,
+                "column": 5
+              },
+              "end": {
+                "line": 360,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 359,
+                  "column": 5
+                },
+                "end": {
+                  "line": 359,
+                  "column": 49
+                }
+              },
+              "code": "write_attempt_count = write_attempt_count + 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 360,
+                "column": 5
+              },
+              "end": {
+                "line": 361,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 360,
+                  "column": 5
+                },
+                "end": {
+                  "line": 360,
+                  "column": 41
+                }
+              },
+              "code": "n.pending_write_term = n.current_term"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 361,
+                "column": 5
+              },
+              "end": {
+                "line": 367
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 361,
+                  "column": 5
+                },
+                "end": {
+                  "line": 361,
+                  "column": 43
+                }
+              },
+              "code": "n.is_shard_fence_write = is_shard_fence"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 367,
+          "column": 1
+        },
+        "end": {
+          "line": 412
+        }
+      },
+      "name": "FinishWrite",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 367,
+            "column": 8
+          },
+          "end": {
+            "line": 367,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 368,
+            "column": 5
+          },
+          "end": {
+            "line": 412
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 368,
+                "column": 5
+              },
+              "end": {
+                "line": 369,
+                "column": 4
+              }
+            },
+            "anyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 368,
+                  "column": 5
+                },
+                "end": {
+                  "line": 368,
+                  "column": 44
+                }
+              },
+              "loopVars": [
+                "node_id"
+              ],
+              "pyExpr": "range(NUM_CONTROL_NODES)",
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 368,
+                    "column": 21
+                  },
+                  "end": {
+                    "line": 368,
+                    "column": 44
+                  }
+                },
+                "pyExpr": "range(NUM_CONTROL_NODES)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 369,
+                "column": 5
+              },
+              "end": {
+                "line": 371,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 369,
+                  "column": 5
+                },
+                "end": {
+                  "line": 369,
+                  "column": 22
+                }
+              },
+              "code": "n = nodes[node_id]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 371,
+                "column": 5
+              },
+              "end": {
+                "line": 373,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 371,
+                  "column": 5
+                },
+                "end": {
+                  "line": 371,
+                  "column": 38
+                }
+              },
+              "condition": "n.pending_write_term != -1",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 371,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 371,
+                    "column": 38
+                  }
+                },
+                "pyExpr": "n.pending_write_term != -1"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 373,
+                "column": 5
+              },
+              "end": {
+                "line": 374,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 373,
+                  "column": 5
+                },
+                "end": {
+                  "line": 373,
+                  "column": 40
+                }
+              },
+              "code": "captured_term = n.pending_write_term"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 374,
+                "column": 5
+              },
+              "end": {
+                "line": 375,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 374,
+                  "column": 5
+                },
+                "end": {
+                  "line": 374,
+                  "column": 52
+                }
+              },
+              "code": "captured_is_shard_fence = n.is_shard_fence_write"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 375,
+                "column": 5
+              },
+              "end": {
+                "line": 376,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 375,
+                  "column": 5
+                },
+                "end": {
+                  "line": 375,
+                  "column": 29
+                }
+              },
+              "code": "n.pending_write_term = -1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 376,
+                "column": 5
+              },
+              "end": {
+                "line": 378,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 376,
+                  "column": 5
+                },
+                "end": {
+                  "line": 376,
+                  "column": 34
+                }
+              },
+              "code": "n.is_shard_fence_write = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 378,
+                "column": 5
+              },
+              "end": {
+                "line": 379,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 378,
+                  "column": 5
+                },
+                "end": {
+                  "line": 378,
+                  "column": 43
+                }
+              },
+              "code": "is_leader_now = n.node_role == \"leader\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 379,
+                "column": 5
+              },
+              "end": {
+                "line": 380,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 379,
+                  "column": 5
+                },
+                "end": {
+                  "line": 379,
+                  "column": 58
+                }
+              },
+              "code": "term_matches_current = captured_term == n.current_term"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 380,
+                "column": 5
+              },
+              "end": {
+                "line": 381,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 380,
+                  "column": 5
+                },
+                "end": {
+                  "line": 380,
+                  "column": 57
+                }
+              },
+              "code": "term_valid_for_store = captured_term >= accepted_term"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 381,
+                "column": 5
+              },
+              "end": {
+                "line": 383,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 381,
+                  "column": 5
+                },
+                "end": {
+                  "line": 381,
+                  "column": 78
+                }
+              },
+              "code": "accepted = is_leader_now and term_matches_current and term_valid_for_store"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 383,
+                "column": 5
+              },
+              "end": {
+                "line": 412
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 383,
+                  "column": 5
+                },
+                "end": {
+                  "line": 412
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 383,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 395,
+                      "column": 4
+                    }
+                  },
+                  "condition": "accepted",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 384,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 395,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 384,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 385,
+                            "column": 8
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 384,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 384,
+                              "column": 37
+                            }
+                          },
+                          "code": "accepted_term = captured_term"
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 385,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 391,
+                            "column": 8
+                          }
+                        },
+                        "pyStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 385,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 385,
+                              "column": 33
+                            }
+                          },
+                          "code": "accepted_leader = node_id"
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 391,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 395,
+                            "column": 4
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 391,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 395,
+                              "column": 4
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 391,
+                                  "column": 12
+                                },
+                                "end": {
+                                  "line": 393,
+                                  "column": 8
+                                }
+                              },
+                              "condition": "captured_is_shard_fence",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 392,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 393,
+                                    "column": 8
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 392,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 393,
+                                        "column": 8
+                                      }
+                                    },
+                                    "pyStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 392,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 392,
+                                          "column": 71
+                                        }
+                                      },
+                                      "code": "shard_fence_accepted_write_by_term[captured_term] = node_id"
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 391,
+                                    "column": 12
+                                  },
+                                  "end": {
+                                    "line": 391,
+                                    "column": 34
+                                  }
+                                },
+                                "pyExpr": "captured_is_shard_fence"
+                              }
+                            },
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 393,
+                                  "column": 9
+                                },
+                                "end": {
+                                  "line": 395,
+                                  "column": 4
+                                }
+                              },
+                              "condition": "True",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 394,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 395,
+                                    "column": 4
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 394,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 395,
+                                        "column": 4
+                                      }
+                                    },
+                                    "pyStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 394,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 394,
+                                          "column": 59
+                                        }
+                                      },
+                                      "code": "accepted_write_by_term[captured_term] = node_id"
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "pyExpr": "True"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 383,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 383,
+                        "column": 15
+                      }
+                    },
+                    "pyExpr": "accepted"
+                  }
+                },
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 395,
+                      "column": 5
+                    },
+                    "end": {
+                      "line": 412
+                    }
+                  },
+                  "condition": "True",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 396,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 412
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 396,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 398,
+                            "column": 8
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 396,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 398,
+                              "column": 8
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 396,
+                                  "column": 12
+                                },
+                                "end": {
+                                  "line": 398,
+                                  "column": 8
+                                }
+                              },
+                              "condition": "not is_leader_now",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 397,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 398,
+                                    "column": 8
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 397,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 398,
+                                        "column": 8
+                                      }
+                                    },
+                                    "pyStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 397,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 397,
+                                          "column": 52
+                                        }
+                                      },
+                                      "code": "write_rejected_nonleader_observed = True"
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 396,
+                                    "column": 12
+                                  },
+                                  "end": {
+                                    "line": 396,
+                                    "column": 28
+                                  }
+                                },
+                                "pyExpr": "not is_leader_now"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 398,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 400,
+                            "column": 8
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 398,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 400,
+                              "column": 8
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 398,
+                                  "column": 12
+                                },
+                                "end": {
+                                  "line": 400,
+                                  "column": 8
+                                }
+                              },
+                              "condition": "not term_valid_for_store",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 399,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 400,
+                                    "column": 8
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 399,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 400,
+                                        "column": 8
+                                      }
+                                    },
+                                    "pyStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 399,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 399,
+                                          "column": 53
+                                        }
+                                      },
+                                      "code": "write_rejected_stale_term_observed = True"
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 398,
+                                    "column": 12
+                                  },
+                                  "end": {
+                                    "line": 398,
+                                    "column": 35
+                                  }
+                                },
+                                "pyExpr": "not term_valid_for_store"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 400,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 412
+                          }
+                        },
+                        "ifStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 400,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 412
+                            }
+                          },
+                          "branches": [
+                            {
+                              "sourceInfo": {
+                                "start": {
+                                  "line": 400,
+                                  "column": 12
+                                },
+                                "end": {
+                                  "line": 412
+                                }
+                              },
+                              "condition": "captured_is_shard_fence",
+                              "block": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 401,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 412
+                                  }
+                                },
+                                "stmts": [
+                                  {
+                                    "sourceInfo": {
+                                      "start": {
+                                        "line": 401,
+                                        "column": 13
+                                      },
+                                      "end": {
+                                        "line": 412
+                                      }
+                                    },
+                                    "pyStmt": {
+                                      "sourceInfo": {
+                                        "start": {
+                                          "line": 401,
+                                          "column": 13
+                                        },
+                                        "end": {
+                                          "line": 401,
+                                          "column": 54
+                                        }
+                                      },
+                                      "code": "shard_fence_write_rejected_observed = True"
+                                    }
+                                  }
+                                ]
+                              },
+                              "conditionExpr": {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 400,
+                                    "column": 12
+                                  },
+                                  "end": {
+                                    "line": 400,
+                                    "column": 34
+                                  }
+                                },
+                                "pyExpr": "captured_is_shard_fence"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "pyExpr": "True"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "stmts": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 68,
+          "column": 1
+        },
+        "end": {
+          "line": 84
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 68,
+            "column": 1
+          },
+          "end": {
+            "line": 68,
+            "column": 21
+          }
+        },
+        "code": "NUM_CONTROL_NODES = 3"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 92
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 84,
+            "column": 1
+          },
+          "end": {
+            "line": 84,
+            "column": 12
+          }
+        },
+        "code": "MAX_TERM = 2"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 92,
+          "column": 1
+        },
+        "end": {
+          "line": 98
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 92,
+            "column": 1
+          },
+          "end": {
+            "line": 92,
+            "column": 17
+          }
+        },
+        "code": "MAX_ELECTIONS = 2"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 98,
+          "column": 1
+        },
+        "end": {
+          "line": 112
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 98,
+            "column": 1
+          },
+          "end": {
+            "line": 98,
+            "column": 15
+          }
+        },
+        "code": "MAX_CRASHES = 1"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 112,
+          "column": 1
+        },
+        "end": {
+          "line": 119
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 112,
+            "column": 1
+          },
+          "end": {
+            "line": 112,
+            "column": 22
+          }
+        },
+        "code": "MAX_WRITE_ATTEMPTS = 2"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 119,
+          "column": 1
+        },
+        "end": {
+          "line": 134
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 119,
+            "column": 1
+          },
+          "end": {
+            "line": 134
+          }
+        },
+        "code": "def count_votes(nodes, candidate_id):\n    c = nodes[candidate_id]\n    count = 0\n    for node_id in range(len(nodes)):\n        if nodes[node_id].voted_for == candidate_id and nodes[node_id].current_term == c.current_term:\n            count = count + 1\n    return count\n\n# True if some *other* node is currently a candidate. Used to serialize\n# elections (see the state-space/liveness design note below) \u2014 this is the\n# abstraction this model uses in place of Raft's real randomized-timeout\n# desynchronization mechanism, which is out of scope to model faithfully at\n# this abstraction level (FIZZBEE_TEST_PLAN.md \u00a72.4 \"SimNetwork fidelity\n# boundary\": timing/randomization gaps are documented, not silently assumed\n# away).\n"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 134,
+          "column": 1
+        },
+        "end": {
+          "line": 149
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 134,
+            "column": 1
+          },
+          "end": {
+            "line": 149
+          }
+        },
+        "code": "def any_other_candidate(nodes, self_id):\n    for i in range(len(nodes)):\n        if i != self_id and nodes[i].node_role == \"candidate\":\n            return True\n    return False\n\n# True if some node currently believes itself Leader. A real Raft follower\n# resets its election timeout on every heartbeat/AppendEntries from a live\n# leader, so it never starts a spurious election while a functioning leader\n# exists; this model does not represent heartbeats explicitly, so\n# StartElection uses this check as the direct stand-in. Without it, an\n# exhaustive-BFS worst case has a follower call StartElection immediately\n# after a perfectly healthy first leader is elected, burning the entire\n# MAX_ELECTIONS budget on a spurious re-election and leaving none for the\n# post-crash recovery this spec exists to prove.\n"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 149,
+          "column": 1
+        },
+        "end": {
+          "line": 157
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 149,
+            "column": 1
+          },
+          "end": {
+            "line": 157
+          }
+        },
+        "code": "def any_leader_exists(nodes):\n    for i in range(len(nodes)):\n        if nodes[i].node_role == \"leader\":\n            return True\n    return False\n\n# \u2500\u2500\u2500 State \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+      }
+    }
+  ],
+  "roles": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 204,
+          "column": 1
+        },
+        "end": {
+          "line": 229
+        }
+      },
+      "name": "ControlNode",
+      "actions": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 205,
+              "column": 5
+            },
+            "end": {
+              "line": 229
+            }
+          },
+          "name": "Init",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "level": "FAIRNESS_LEVEL_STRONG"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 206,
+                "column": 9
+              },
+              "end": {
+                "line": 229
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 206,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 207,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 206,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 206,
+                      "column": 29
+                    }
+                  },
+                  "code": "self.current_term = 0"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 207,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 208,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 207,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 207,
+                      "column": 27
+                    }
+                  },
+                  "code": "self.voted_for = -1"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 208,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 215,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 208,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 208,
+                      "column": 35
+                    }
+                  },
+                  "code": "self.node_role = \"follower\""
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 215,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 216,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 215,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 215,
+                      "column": 36
+                    }
+                  },
+                  "code": "self.pending_write_term = -1"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 216,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 229
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 216,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 216,
+                      "column": 41
+                    }
+                  },
+                  "code": "self.is_shard_fence_write = False"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "decorators": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 203,
+              "column": 1
+            },
+            "end": {
+              "line": 204
+            }
+          },
+          "name": "state",
+          "args": [
+            {
+              "sourceInfo": {
+                "start": {
+                  "line": 203,
+                  "column": 8
+                },
+                "end": {
+                  "line": 203,
+                  "column": 76
+                }
+              },
+              "pyExpr": "ephemeral=[\"node_role\", \"pending_write_term\", \"is_shard_fence_write\"]",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 203,
+                    "column": 8
+                  },
+                  "end": {
+                    "line": 203,
+                    "column": 76
+                  }
+                },
+                "pyExpr": "ephemeral=[\"node_role\", \"pending_write_term\", \"is_shard_fence_write\"]"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "frontMatter": {}
+}

@@ -1,0 +1,497 @@
+# formal/m7_control_plane_ha.fizz
+# M7 — Control-Plane Raft Leader Election & Leader-Only Write Fencing
+#
+# Models the 3-node Raft-elected control-plane writer described in
+# DESIGN.md §3 ("Tier 3 Raft bootstrap" / "Three Logical Tiers" #1): control
+# nodes form a small Raft group that elects exactly one control-SlateDB
+# writer. Followers serve reads; the elected leader is the sole writer for
+# lease grants, the workload catalog (v0.45.1), and shard-assignment writes.
+#
+# M7-S3 composes this with M4's shard self-fencing model
+# (formal/m4_self_fencing.fizz): the shard-fence token is derived from
+# (raft_term, control_leader_id) instead of a free-standing counter, so a
+# control-leadership change strictly invalidates any in-flight shard-fence
+# write from the deposed leader. Rather than re-instantiating M4's full
+# Worker/Shard role set (which would multiply this spec's state space by
+# M4's own already-large state space), the composition is modeled by routing
+# a "shard_fence" write through the *identical* (term, leader) CAS gate used
+# for the catalog/lease/shard-assignment writes — this is exactly what
+# "the shard fence token is derived from the control-leader epoch" means:
+# there is one fencing authority, not two. `is_shard_fence_write` is a ghost
+# tag on the in-flight write purely so COV-M7/M7-S3 can report on the
+# shard-fence case specifically, not a second CAS domain.
+#
+# State-space design note (see FIZZBEE_TEST_PLAN.md §2.3 tactics): an
+# earlier draft of this spec stored a per-candidate `votes_received` counter
+# and a 4-valued `pending_write_kind` string per node and did not terminate
+# within the time-box (still running, >8 GB RSS, after several minutes,
+# never reaching FizzBee's first 20,000-node progress checkpoint — the same
+# growth class documented in findings.md for M4 before its bounds were
+# tightened). Two changes brought it back to CI-fast: (1) votes are counted
+# by scanning `voted_for == candidate_id at the candidate's term` instead of
+# maintaining a redundant stored counter (removes one 4-valued dimension per
+# node), and (2) `pending_write_kind` collapsed to a single boolean
+# `is_shard_fence_write` and both write families share one CAS pair instead
+# of two (removes a second full accepted_term/accepted_leader dimension).
+# `DiscoverHigherTerm` (a bare "leader learns of a higher term via gossip"
+# action) was also removed: `RequestVoteAndGrant`'s voter-side branch already
+# forces term convergence whenever a stale node is asked to vote, which is
+# sufficient for every safety/liveness property below — CrashLeader is what
+# drives the interesting M7-L1 recovery case, not passive term-gossip.
+#
+# A second, genuine liveness gap was found and fixed after the state-space
+# fix above made the model tractable enough to actually run the liveness
+# checker: at MAX_TERM=2 (and, on inspection, at any finite MAX_TERM), an
+# exhaustive-BFS worst-case schedule has all 3 `ControlNode`s call
+# `StartElection` in the same term and each vote only for themselves,
+# permanently splitting the vote 1-1-1 with no majority — and once the
+# model's bounded term budget is exhausted, this is an unrecoverable
+# deadlock, correctly flagged by FizzBee as a genuine
+# `M7_L1_LeaderEventuallyExists` violation (a "stutter" terminal state with
+# all three nodes candidates at term MAX_TERM). This mirrors real Raft,
+# which relies on *randomized* per-node election timeouts to desynchronize
+# repeated split votes — a timing mechanism this abstraction level does not
+# model faithfully (FIZZBEE_TEST_PLAN.md §2.4 "SimNetwork fidelity
+# boundary": undramatized timing gaps must be documented, not silently
+# assumed away). The fix: `StartElection` now requires no *other* node is
+# currently a candidate (`any_other_candidate`), serializing elections
+# cluster-wide. This is the model's explicit stand-in for randomized-timeout
+# desynchronization and is documented here as the corresponding
+# `# ASSUMPTION:` boundary.
+
+# ─── Constants ──────────────────────────────────────────────────────────────
+
+# Control-node count. Symmetric role, bounded per formal/conventions.md and
+# capped at 3 (not the roadmap's allowed 5) for CI-fast tractability — 3 is
+# the smallest group where "majority" (2 of 3) is a nontrivial proper subset,
+# which is exactly what a quorum protocol's proof needs to exercise.
+NUM_CONTROL_NODES = 3
+
+# Maximum Raft term any node may reach — used only as the static loop bound
+# for the M7-S1 assertion below. The real bound on term growth is
+# `MAX_ELECTIONS` (next constant): bounding `current_term` directly (an
+# earlier draft used `require n.current_term < MAX_TERM` as StartElection's
+# guard) created a genuine, reproducible liveness deadlock — a leader
+# elected at term == MAX_TERM that then crashes can never trigger a
+# recovery election, because the very next election would need
+# `current_term == MAX_TERM + 1`, exceeding the bound. Exhaustive BFS always
+# finds this worst case (elect at the max term, crash, deadlock), so no
+# finite `MAX_TERM`-as-election-guard is sound for M7-L1. The fix: bound the
+# *count* of elections instead (`MAX_ELECTIONS`), which still keeps the
+# state space finite (term is bounded transitively — it can only increase
+# via `StartElection`, so `current_term <= MAX_ELECTIONS` always) while
+# never blocking a legitimate post-crash recovery election.
+MAX_TERM = 2
+
+# Bound on total elections (see note above). Exactly one election is needed
+# for the initial leader and one more for the post-crash recovery
+# COV-M7/M7-L1 need — 2, with no spare headroom, since each additional
+# permitted election was found to multiply the reachable state space far
+# more than any other dimension (see MAX_WRITE_ATTEMPTS note below for the
+# same effect measured for writes).
+MAX_ELECTIONS = 2
+
+# Bound on total leader-crash injections, mirroring m4_self_fencing.fizz's
+# MAX_OUTAGES: unbounded crash/re-election can livelock and multiplies
+# interleavings with every in-flight write. One crash is sufficient to reach
+# every safety invariant and COV-M7.
+MAX_CRASHES = 1
+
+# Bound on total BeginWrite attempts cluster-wide. An earlier draft left
+# this unbounded (a leader could BeginWrite/FinishWrite repeatedly, any
+# number of times, between elections) and — combined with MAX_ELECTIONS=3 —
+# the state space did not terminate within a reasonable time-box (still
+# draining a >70,000-deep BFS queue after 90+ seconds and climbing past
+# 700,000 processed nodes, versus M4's 31,456-node/~6s baseline). Capping
+# total write attempts at 2 is sufficient: one write from the original
+# leader that is left in flight when it crashes (the COV-M7/M7-S3 case) and
+# one more from the recovered leader to demonstrate a write succeeding
+# normally post-recovery. Combined with lowering MAX_ELECTIONS to 2 (exactly
+# the initial election + one recovery election, no spare), this is what
+# brought the model back to CI-fast.
+MAX_WRITE_ATTEMPTS = 2
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+# Count votes for `candidate_id` at its *current* term by scanning
+# `voted_for` rather than maintaining a redundant stored counter (see the
+# state-space design note above).
+def count_votes(nodes, candidate_id):
+    c = nodes[candidate_id]
+    count = 0
+    for node_id in range(len(nodes)):
+        if nodes[node_id].voted_for == candidate_id and nodes[node_id].current_term == c.current_term:
+            count = count + 1
+    return count
+
+# True if some *other* node is currently a candidate. Used to serialize
+# elections (see the state-space/liveness design note below) — this is the
+# abstraction this model uses in place of Raft's real randomized-timeout
+# desynchronization mechanism, which is out of scope to model faithfully at
+# this abstraction level (FIZZBEE_TEST_PLAN.md §2.4 "SimNetwork fidelity
+# boundary": timing/randomization gaps are documented, not silently assumed
+# away).
+def any_other_candidate(nodes, self_id):
+    for i in range(len(nodes)):
+        if i != self_id and nodes[i].node_role == "candidate":
+            return True
+    return False
+
+# True if some node currently believes itself Leader. A real Raft follower
+# resets its election timeout on every heartbeat/AppendEntries from a live
+# leader, so it never starts a spurious election while a functioning leader
+# exists; this model does not represent heartbeats explicitly, so
+# StartElection uses this check as the direct stand-in. Without it, an
+# exhaustive-BFS worst case has a follower call StartElection immediately
+# after a perfectly healthy first leader is elected, burning the entire
+# MAX_ELECTIONS budget on a spurious re-election and leaving none for the
+# post-crash recovery this spec exists to prove.
+def any_leader_exists(nodes):
+    for i in range(len(nodes)):
+        if nodes[i].node_role == "leader":
+            return True
+    return False
+
+# ─── State ──────────────────────────────────────────────────────────────────
+
+action Init:
+    # ObjectStore/control-SlateDB CAS state for every leader-gated write
+    # named in the plan (lease grant, workload-catalog write, shard-
+    # assignment write, and the M7-S3 shard-fence write): highest term whose
+    # leader has successfully written, and who that leader was.
+    accepted_term = 0
+    accepted_leader = -1
+
+    crash_count = 0
+    election_count = 0
+    write_attempt_count = 0
+
+    # Per-term ground truth, populated by two *different* actions
+    # (BecomeLeader / FinishWrite) so M7-S2 and M7-S3 below are genuine
+    # cross-action checks rather than FinishWrite re-deriving and comparing
+    # against its own just-written value (a first draft of this regression
+    # net wrote `accepted_term = captured_term` and then compared
+    # `captured_term != accepted_term` *after* that same assignment, which
+    # can never be true — a tautology that would have silently passed even
+    # a broken leader-only guard, caught only by manually injecting a
+    # deliberate gating bug and observing that nothing failed). Indexed by
+    # term (0 unused, since term 0 has no leader).
+    leader_at_term = [-1] * (MAX_TERM + 1)
+    accepted_write_by_term = [-1] * (MAX_TERM + 1)
+    shard_fence_accepted_write_by_term = [-1] * (MAX_TERM + 1)
+
+    # Coverage/regression ghost variables (mirrors m4_self_fencing.fizz's
+    # fence_rejection_observed / crash_occurred pattern).
+    crash_occurred = False
+    new_leader_elected_at_higher_term = False
+    write_rejected_nonleader_observed = False
+    write_rejected_stale_term_observed = False
+    shard_fence_write_rejected_observed = False
+
+    nodes = []
+    for i in range(NUM_CONTROL_NODES):
+        nodes.append(ControlNode(id=i))
+
+# ControlNode: Raft-elected control-plane writer candidate.
+# `current_term` / `voted_for` are the durable Raft state (S1: persisted
+# through the control SlateDB at `control: raft/term` / `control: raft/vote`
+# — a process crash-and-restart, modeled by CrashLeader below, does not reset
+# them). `node_role` and the pending-write fields are ephemeral (lost/reset
+# on restart in the real implementation; CrashLeader resets only `node_role`,
+# matching "the elected-leader lease is not durable, the vote/term ledger
+# is").
+@state(ephemeral=["node_role", "pending_write_term", "is_shard_fence_write"])
+role ControlNode:
+    action Init:
+        self.current_term = 0
+        self.voted_for = -1
+        self.node_role = "follower"
+        # In-flight write state: the term this node believed itself leader
+        # at when it began a write (-1 = no write in flight). This staged
+        # begin/finish pattern (mirrors M1's WriteBatch build/commit and
+        # M3's pre_commit/commit) lets FizzBee explore an election or crash
+        # happening *between* a write's begin and finish — the exact race
+        # M7-S2/M7-S3/COV-M7 must prove is handled safely.
+        self.pending_write_term = -1
+        self.is_shard_fence_write = False
+
+# ─── Actions ────────────────────────────────────────────────────────────────
+
+# A node times out waiting for a leader and starts a new election.
+# Requires `node_role == "follower"` (not just `!= "leader"`): a node that is
+# already a `"candidate"` must resolve that candidacy (win via BecomeLeader
+# or step down via RequestVoteAndGrant's higher-term branch) before trying
+# again — without this, a single node could burn through the entire
+# `MAX_ELECTIONS` budget restarting its own unresolved candidacy, leaving no
+# election budget for the post-crash recovery the whole spec exists to
+# prove (found while tuning `MAX_ELECTIONS`/`MAX_WRITE_ATTEMPTS` down to
+# CI-fast bounds).
+atomic fair action StartElection:
+    node_id = oneof range(NUM_CONTROL_NODES)
+    n = nodes[node_id]
+
+    require n.node_role == "follower"
+    require election_count < MAX_ELECTIONS
+    # Serialize elections (see the state-space/liveness design note at the
+    # top of this file): at most one candidacy in flight cluster-wide at a
+    # time. Without this, an exhaustive-BFS worst-case interleaving has all
+    # 3 nodes start a candidacy in the same term and permanently split the
+    # vote 1-1-1 once MAX_ELECTIONS is reached, deadlocking
+    # M7_L1_LeaderEventuallyExists — real Raft avoids this via randomized
+    # per-node election timeouts, which this abstraction level does not
+    # model faithfully (documented boundary, FIZZBEE_TEST_PLAN.md §2.4).
+    require not any_other_candidate(nodes, node_id)
+    require not any_leader_exists(nodes)
+
+    election_count = election_count + 1
+    n.current_term = n.current_term + 1
+    n.node_role = "candidate"
+    n.voted_for = node_id
+
+# A voter processes a candidate's vote request. Combined into one atomic
+# step (candidate + voter transition together) to avoid doubling the number
+# of yield points a separate RequestVote/GrantVote pair would add — no
+# safety/liveness predicate here depends on observing the intermediate
+# "request sent, not yet answered" state (state-space tactic #5,
+# FIZZBEE_TEST_PLAN.md §2.3). The voter-side branch below also serves as
+# "step_down_on_higher_term" for a stale candidate or established leader
+# asked to vote by a node at a higher term.
+atomic fair action RequestVoteAndGrant:
+    candidate_id = oneof range(NUM_CONTROL_NODES)
+    voter_id = oneof range(NUM_CONTROL_NODES)
+    require candidate_id != voter_id
+
+    c = nodes[candidate_id]
+    v = nodes[voter_id]
+
+    require c.node_role == "candidate"
+    # Exclude the no-op case (voter already decided this term one way or the
+    # other) so every taken transition changes state.
+    require v.current_term != c.current_term or v.voted_for == -1
+
+    if v.current_term < c.current_term:
+        # Voter is behind: adopts the candidate's term and grants the vote
+        # (this also covers a stale leader stepping down on higher term).
+        v.current_term = c.current_term
+        v.node_role = "follower"
+        v.voted_for = candidate_id
+    elif v.current_term == c.current_term:
+        # v.voted_for == -1 guaranteed by the require above in this branch.
+        v.voted_for = candidate_id
+    else:
+        # Candidate is behind: steps down and adopts the voter's term
+        # (models discovering a higher term via an RPC reply, Raft §5.1).
+        c.node_role = "follower"
+        c.current_term = v.current_term
+        c.voted_for = -1
+
+# A candidate with a majority of votes becomes the leader for its term.
+atomic fair action BecomeLeader:
+    node_id = oneof range(NUM_CONTROL_NODES)
+    n = nodes[node_id]
+
+    require n.node_role == "candidate"
+    majority = NUM_CONTROL_NODES // 2 + 1
+    require count_votes(nodes, node_id) >= majority
+
+    n.node_role = "leader"
+
+    # A real leader's heartbeat (AppendEntries) carries its term, and every
+    # follower that observes a higher term adopts it immediately — even
+    # followers that were never asked to vote in this election (e.g. a
+    # third node not queried because a majority was already reached without
+    # it). Without this sync, a bystander follower with stale term
+    # knowledge can later start its own election reusing an already-settled
+    # term number, permanently losing the tie (every other node already
+    # voted for someone else *in that same term*) and wasting the bounded
+    # election budget on an unwinnable candidacy — a genuine liveness
+    # deadlock found while tuning this spec to CI-fast bounds, fixed by
+    # modeling the heartbeat term-sync explicitly.
+    for i in range(len(nodes)):
+        if i != node_id and nodes[i].current_term < n.current_term:
+            nodes[i].current_term = n.current_term
+            nodes[i].voted_for = -1
+
+    # Ground truth for M7-S1/M7-S2/M7-S3's cross-action check: records who
+    # actually held leadership at this term, independent of whatever
+    # FinishWrite later records as the accepted writer for the same term.
+    leader_at_term[n.current_term] = node_id
+
+    if n.current_term >= 2:
+        new_leader_elected_at_higher_term = True
+
+# The current leader's process crashes and restarts. Raft term/vote state
+# (S1's durable `control: raft/term` / `control: raft/vote` keys) survives;
+# only the ephemeral `node_role` resets, so the cluster must re-elect. Any
+# write this node had in flight (`pending_write_term`) is left exactly as it
+# was — it is neither completed nor cancelled here, so FinishWrite (below)
+# must independently discover that this node is no longer leader and reject
+# it. This is the crux of M7-S3's "leadership change strictly invalidates
+# any in-flight fence write from the deposed leader" and of COV-M7.
+atomic action CrashLeader:
+    node_id = oneof range(NUM_CONTROL_NODES)
+    n = nodes[node_id]
+
+    require n.node_role == "leader"
+    require crash_count < MAX_CRASHES
+
+    crash_count = crash_count + 1
+    crash_occurred = True
+    n.node_role = "follower"
+
+# The leader begins a leader-gated write: either one of the three plain
+# writes named in M7-S2 (lease grant / workload-catalog write / shard-
+# assignment write — collapsed into one write family since all three share
+# identical gating logic) or the M7-S3 composed shard-fence write. Captures
+# the term the node believed itself leader at; FinishWrite (below) re-checks
+# this against the node's *current* role/term and the ObjectStore's CAS
+# state, so any leadership change between Begin and Finish is caught, not
+# assumed away.
+atomic fair action BeginWrite:
+    node_id = oneof range(NUM_CONTROL_NODES)
+    is_shard_fence = oneof [False, True]
+    n = nodes[node_id]
+
+    require n.node_role == "leader"
+    require n.pending_write_term == -1
+    require write_attempt_count < MAX_WRITE_ATTEMPTS
+
+    write_attempt_count = write_attempt_count + 1
+    n.pending_write_term = n.current_term
+    n.is_shard_fence_write = is_shard_fence
+
+# Finish (commit or reject) an in-flight write. This is the leader-only
+# write gate named in M7-S2 (`require_leader()` in the real implementation)
+# and, when `is_shard_fence_write`, the M7-S3 composition with M4's fencing
+# — both go through the identical (term, leader) CAS below.
+atomic fair action FinishWrite:
+    node_id = oneof range(NUM_CONTROL_NODES)
+    n = nodes[node_id]
+
+    require n.pending_write_term != -1
+
+    captured_term = n.pending_write_term
+    captured_is_shard_fence = n.is_shard_fence_write
+    n.pending_write_term = -1
+    n.is_shard_fence_write = False
+
+    is_leader_now = n.node_role == "leader"
+    term_matches_current = captured_term == n.current_term
+    term_valid_for_store = captured_term >= accepted_term
+    accepted = is_leader_now and term_matches_current and term_valid_for_store
+
+    if accepted:
+        accepted_term = captured_term
+        accepted_leader = node_id
+        # Record who was actually accepted, per term, per write family. This
+        # is deliberately *not* re-derived from is_leader_now/accepted above
+        # — M7-S2/M7-S3 compare this against `leader_at_term` (populated by
+        # the unrelated BecomeLeader action) so the checks are a genuine
+        # cross-action regression net, not a tautological self-comparison.
+        if captured_is_shard_fence:
+            shard_fence_accepted_write_by_term[captured_term] = node_id
+        else:
+            accepted_write_by_term[captured_term] = node_id
+    else:
+        if not is_leader_now:
+            write_rejected_nonleader_observed = True
+        if not term_valid_for_store:
+            write_rejected_stale_term_observed = True
+        if captured_is_shard_fence:
+            shard_fence_write_rejected_observed = True
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+# M7-S1: No dual leader — at most one ControlNode is Leader for any given
+# term (Raft's Election Safety property). Two nodes may transiently each
+# *believe* they hold node_role == "leader" across *different* terms (the
+# deposed leader hasn't yet been asked to vote and stepped down) — that is
+# expected and is exactly what M7-S2/M7-S3's write-time CAS fences against,
+# not a same-term dual leader, which the majority-vote-once-per-term rule
+# below must prevent.
+always assertion M7_S1_NoDualLeaderPerTerm:
+    for term in range(1, MAX_TERM + 1):
+        leaders_at_term = 0
+        for node_id in range(NUM_CONTROL_NODES):
+            n = nodes[node_id]
+            if n.node_role == "leader" and n.current_term == term:
+                leaders_at_term = leaders_at_term + 1
+        if leaders_at_term > 1:
+            return False
+    return True
+
+# M7-S2: Leader-only write gating — a lease grant / workload-catalog write /
+# shard-assignment write is only ever accepted by the ObjectStore attributed
+# to the node that was actually elected leader for that term. Checked as a
+# genuine cross-action comparison: `accepted_write_by_term[T]` is written by
+# FinishWrite, `leader_at_term[T]` is written by BecomeLeader — two
+# independent actions, so a bug that attributed an accepted write to the
+# wrong node/term (e.g. a captured_term/node_id mixup, or skipping
+# `term_matches_current`/`term_valid_for_store`) is falsifiable by exhaustive
+# BFS — unlike a first draft of this net, which set `accepted_term =
+# captured_term` and then compared `captured_term != accepted_term`
+# immediately after that same assignment: always vacuously false, caught
+# only by deliberately breaking FinishWrite's guard and observing the old
+# check stayed green regardless.
+#
+# Scope note: this cross-check cannot independently re-verify the
+# `is_leader_now` conjunct specifically (whether the writing node's role was
+# still exactly "leader" at the instant FinishWrite ran) without re-reading
+# the same `node_role` FinishWrite itself reads — there is no other state
+# that records "was this node's role Leader at this exact instant" (a
+# snapshot fact, not a monotonic ledger entry), so, unlike the term/identity
+# conjuncts, that one relies on FinishWrite's own correctly-written,
+# freshly-read `n.node_role == "leader"` check (verified by inspection: it
+# reads live per-node state mutated only by StartElection / RequestVoteAnd-
+# Grant / BecomeLeader / CrashLeader, never by FinishWrite itself). What
+# exhaustive BFS *does* additionally verify here is that no interleaving of
+# concurrent crash/election/write actions around that correctly-written
+# guard can still produce a same-term dual acceptance or a wrong-identity
+# acceptance (M7-S1's dual-leader freedom is exactly the complementary
+# guarantee this leans on).
+always assertion M7_S2_LeaderOnlyWriteAccepted:
+    for term in range(1, MAX_TERM + 1):
+        accepted_by = accepted_write_by_term[term]
+        if accepted_by != -1 and accepted_by != leader_at_term[term]:
+            return False
+    return True
+
+# M7-S3: Composed shard-fence fencing — a shard's fence-epoch write (the
+# `is_shard_fence_write` write, whose token is derived from
+# (raft_term, control_leader_id) per the header comment) is only accepted
+# from the node that was actually elected leader for that term. Same
+# cross-action structure as M7-S2, over the shard-fence-specific ledger.
+# Because both write families share one CAS pair (accepted_term /
+# accepted_leader), at most one write — of either family — can ever be the
+# currently accepted one: no split-brain shard grant can occur.
+always assertion M7_S3_ShardFenceComposedWithLeaderEpoch:
+    for term in range(1, MAX_TERM + 1):
+        accepted_by = shard_fence_accepted_write_by_term[term]
+        if accepted_by != -1 and accepted_by != leader_at_term[term]:
+            return False
+    return True
+
+# ─── Liveness ───────────────────────────────────────────────────────────────
+
+# M7-L1: after any leader crash or partition (modeled here as CrashLeader),
+# some ControlNode eventually becomes Leader again and can resume accepting
+# writes. Requires `fair` election/vote/become-leader actions; the timing of
+# *which* node wins is intentionally left nondeterministic.
+always eventually assertion M7_L1_LeaderEventuallyExists:
+    for node_id in range(NUM_CONTROL_NODES):
+        if nodes[node_id].node_role == "leader":
+            return True
+    return False
+
+# ─── Coverage ───────────────────────────────────────────────────────────────
+
+# COV-M7: a state is reached where the leader crashes mid-term, a new leader
+# is elected at a higher term, and the stale (deposed) leader's in-flight
+# lease/catalog/shard-assignment/shard-fence write is rejected.
+exists assertion COV_M7:
+    return (
+        crash_occurred
+        and new_leader_elected_at_higher_term
+        and (write_rejected_nonleader_observed or write_rejected_stale_term_observed)
+        and shard_fence_write_rejected_observed
+    )

@@ -578,6 +578,60 @@ the binding v0.18 FizzBee model-check gate for the cold-tier exactly-once
 commit protocol, required before v0.44's Iceberg/Delta-specific sinks reuse
 the same protocol.
 
+### 3.8 M7 — Control-Plane Raft Leader Election
+
+**Safety**
+
+- **M7-S1 — No dual leader per term.** `always`: at most one `ControlNode` has
+  `node_role == "leader"` for any given Raft term — the majority-vote-once
+  rule (a voter grants at most one vote per term) makes two nodes reaching
+  majority in the *same* term unreachable. Two nodes may transiently each
+  believe themselves leader across *different* terms (the deposed leader has
+  not yet learned of the new term); that is expected and is exactly what
+  M7-S2/M7-S3's write-time CAS fences against.
+
+- **M7-S2 — Leader-only write gating.** `always`: a lease grant /
+  workload-catalog write / shard-assignment write is only ever attributed, in
+  the ObjectStore's per-term acceptance ledger, to the node that was actually
+  elected leader for that term — checked as a genuine cross-action comparison
+  between state written by `FinishWrite` and state written by the unrelated
+  `BecomeLeader` action (see the spec's own header comments for the tautology
+  this replaced and the mutation test that validated the fix).
+
+- **M7-S3 — Composed shard-fence fencing.** `always`: the shard-fence write
+  (`is_shard_fence_write`), whose real-implementation token is derived from
+  `(raft_term, control_leader_id)`, is only ever attributed to the term's
+  actual elected leader, using the identical cross-action check as M7-S2 over
+  a shard-fence-specific ledger. Because both write families share one CAS
+  pair, at most one write of either family can ever be the currently accepted
+  one — no split-brain shard grant is representable.
+
+**Liveness**
+
+- **M7-L1 — Leader eventually exists.** `always eventually`, `liveness:
+  nondeterministic` per M2-L2/M4-L1 precedent: after any leader crash, some
+  `ControlNode` eventually becomes leader again and can resume accepting
+  writes. Required `fair` election/vote/become-leader actions plus two
+  genuine liveness bugs found and fixed while tuning to CI-fast bounds (a
+  bystander follower re-using an already-contested term after a crash, and a
+  spurious re-election racing a healthy leader) — see the spec's header
+  comments for both.
+
+**Coverage**
+
+- **COV-M7**: `exists` a state where the leader crashes mid-term, a new
+  leader is elected at a higher term, and the stale (deposed) leader's
+  in-flight lease/catalog/shard-assignment write **and** its shard-fence
+  write are both rejected.
+
+Spec: [`formal/m7_control_plane_ha.fizz`](formal/m7_control_plane_ha.fizz).
+This is the binding v0.18 FizzBee model-check gate for the 3-node
+control-plane Raft leader-election protocol, required before v0.45.2's
+`rockstream-control` Raft implementation (S1–S3) was written — the model
+reached a green CI-fast result (~5s, comparable to M4's own ~6.6s baseline)
+after five iterative state-space/liveness fixes, documented in the spec's own
+header comments and in `formal/findings.md`.
+
 ### 3.6 Cross-Cutting Coverage Assertions
 
 To guard against vacuously-passing models (a model that never reaches the
@@ -597,6 +651,10 @@ interesting state trivially satisfies every `always`), each spec includes
   `pre_commit` and `commit`, leaving a partial object at the final prefix,
   and recovery cleans it up via scan-and-delete before completing the commit
   (see §3.5 above).
+- **COV-M7**: `exists` a state where the control-plane leader crashes
+  mid-term, a new leader is elected at a higher term, and the stale leader's
+  in-flight write (both the plain and shard-fence write families) is rejected
+  (see §3.8 above).
 
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
@@ -626,6 +684,11 @@ every row has both a green FizzBee assertion and a present runtime `assert!`.
 | M5-S2 | `assert_no_lost_delivery_after_checkpoint` (reused from M3-S2 — no data loss is the same invariant across the sink protocol family). Spec: `formal/m5_cold_tier_sink.fizz` M5-S2. | `rockstream-connectors` |
 | M5-L1 (liveness) | `test_partial_write_recovery_lfs` / `test_partial_write_recovery_minio_tc` in `crates/rockstream-connectors/tests/partial_write_recovery_tests.rs` drive `ObjectStoreSink` through `partial_write_probability=0.5`-injected crashes and assert the commit protocol always reaches a fully committed, non-duplicate terminal state. Spec: `formal/m5_cold_tier_sink.fizz` M5-L1. | `rockstream-connectors`, `rockstream-sim` |
 | COV-M5 | Seeded `SimRuntime` test in `crates/rockstream-connectors/tests/partial_write_recovery_tests.rs` uses `buggify!("object_store.partial_write", p)` to force a mid-rename truncation, then asserts `assert_commit_pointer_atomic` holds across seeds while the sink recovers. Spec: `formal/m5_cold_tier_sink.fizz` COV-M5. | `rockstream-connectors`, `rockstream-sim` |
+| M7-S1 | `assert_single_control_leader(term, node_id, …)` in `crates/rockstream-control/src/raft.rs`. Spec: `formal/m7_control_plane_ha.fizz` M7-S1. | `rockstream-control` |
+| M7-S2 | `assert_write_requires_leadership(role, term, …)` in `crates/rockstream-control/src/raft.rs`, backing the `require_leader()` guard in all three v0.45.2 write paths — `ControlService` (shard-lease grant), `ShardScheduler` (shard-assignment, `crates/rockstream-control/src/scheduler.rs`), and `rockstream_sql::workload_catalog::WorkloadCatalog` (workload-catalog writes); rejected non-leader writes return `RS-1731`. Spec: `formal/m7_control_plane_ha.fizz` M7-S2. | `rockstream-control`, `rockstream-sql` |
+| M7-S3 | `assert_valid_control_leader_epoch(write_epoch, current_epoch)` in `crates/rockstream-runtime/src/fence.rs` (alongside M4's existing `assert_valid_writer`, per `.claude/v0.45.2-plan.md` §6); the shard fence token is derived from `control_leader_epoch(term, leader_id)` in `crates/rockstream-control/src/raft.rs` and packed into the token by `ShardManager::mint_token`. Spec: `formal/m7_control_plane_ha.fizz` M7-S3. | `rockstream-control`, `rockstream-runtime` |
+| M7-L1 (liveness) | `RaftNode` election loop in `crates/rockstream-control/src/raft.rs` eventually elects a new leader after `CrashLeader`/process kill, verified by `control_plane_ha_tests.rs::three_node_raft_elects_single_leader` (multi-seed) and the real-cluster drills `control_plane_ha_tests.rs::three_node_tc_cluster_boots_and_elects_leader` and `leader_kill_recovers_within_budget_tc`/`_sim` (v0.45.2 S4: a real 3-container `rockstream --role=control --daemon` TestContainers cluster survives a real `docker kill` of its leader and elects a new one within the DESIGN.md §11.5 recovery-time budgets, with zero split-brain shard grants, paired with a `SimRuntime`-style seeded equivalent). Spec: `formal/m7_control_plane_ha.fizz` M7-L1 (`liveness: nondeterministic`). | `rockstream-control`, `rockstream-sim` |
+| COV-M7 | `control_plane_ha_tests.rs::leader_crash_composed_with_shard_fence_no_split_brain` forces a real leader crash (process/task shutdown) mid-write via `buggify!("control.leader_crash", p)`, combined with an in-flight shard-fence write, and asserts (multi-seed) the stale leader's captured epoch is rejected by `assert_valid_control_leader_epoch` and no split-brain shard grant occurs; `control_plane_ha_tests.rs::stale_leader_write_rejected_with_rs_1731` separately forces a mid-flight demotion via `buggify!("control.stale_leader_write", p)` and asserts `RaftHandle::require_leader` rejects the write. v0.45.2 S5 extends this coverage to a real one-at-a-time rolling restart of *every* control node in a live 3-node TestContainers cluster (`rolling_restart_preserves_worker_leases_and_quotas_tc`, paired with a `SimRuntime`-style `_sim` equivalent), asserting a worker's shard lease and a workload's `WorkloadCatalog` quota state both survive every single restart in the cycle byte-identically, backed by the new Raft term/vote durability tests `crates/rockstream-control/tests/raft_state_durability_tests.rs::raft_term_vote_log_survive_restart_lfs`/`_minio_tc`. Spec: `formal/m7_control_plane_ha.fizz` COV-M7. | `rockstream-control`, `rockstream-sim` |
 
 ---
 
@@ -797,17 +860,23 @@ a precondition for v0.43's exit criteria (partial-write fault injection
 recovers without duplicates); v0.44's cold-tier sink implementation depends on
 this proof.
 
-### 4.6 Gates: M7 — Control-Plane HA (Phase 12.5) and M6 — Shard Migration (Phase 13) — Pending
+### 4.6 Gates: M7 — Control-Plane HA (Phase 12.5, ✅ Done, v0.45.2) and M6 — Shard Migration (Phase 13) — Pending
 
 M7 (`formal/m7_control_plane_ha.fizz`, [NEW_ROADMAP.md](NEW_ROADMAP.md) v0.45.2)
-and M6 (`formal/m6_shard_migration.fizz`, v0.46) are scheduled,
-pre-implementation models — neither version is `✅ Done` yet, so unlike M1–M5
-above, this document does not yet carry their detailed role/action write-ups
-or §3.7 mapping rows; those are a required deliverable of v0.45.2 and v0.46
-respectively (the same D-numbered deliverable pattern as §4.1–4.3), not
-optional follow-up. Until each model is authored here and turns green, no
-self-fencing-composed shard-lease code (M7) or migration-state-machine code
-(M6) may be written, per the binding v0.18 "modeled before Rust code" rule.
+reached a green CI-fast result (§3.8, §3.6 above; `formal/findings.md`) and
+gated the v0.45.2 `rockstream-control` Raft implementation (S1–S3) per the
+binding v0.18 "modeled before Rust code" rule; its detailed role/action
+write-up and §3.7 mapping rows are the D-numbered deliverable for v0.45.2 and
+are present above.
+
+M6 (`formal/m6_shard_migration.fizz`, v0.46) remains a scheduled,
+pre-implementation model — that version is not `✅ Done` yet, so unlike M1–M5
+and M7 above, this document does not yet carry its detailed role/action
+write-up or §3.7 mapping rows; those are a required deliverable of v0.46 (the
+same D-numbered deliverable pattern as §4.1–4.3), not optional follow-up.
+Until the model is authored here and turns green, no migration-state-machine
+code (M6) may be written, per the binding v0.18 "modeled before Rust code"
+rule.
 
 ### 4.7 Roadmap Summary
 
@@ -819,7 +888,7 @@ self-fencing-composed shard-lease code (M7) or migration-state-machine code
 | Phase 6 | `m4_self_fencing.fizz`, `m3_sink_2pc.fizz`, M1 duplication variant | M3, M4 | Precondition for Phase 6 chaos/exactly-once exit |
 | Phase 6→8 | Continuous `formal-verify` + path-coupling | all | Pre-release relaxed-bounds sweep |
 | Phase 12 | `m5_cold_tier_sink.fizz` (✅ Done, v0.43) | M5 | Precondition for v0.43/v0.44 cold-tier exactly-once exit |
-| Phase 12.5 | `m7_control_plane_ha.fizz` (pending, v0.45.2) | M7 | Precondition for v0.45.2 control-plane HA exit |
+| Phase 12.5 | `m7_control_plane_ha.fizz` (✅ Done, v0.45.2) | M7 | Precondition for v0.45.2 control-plane HA exit |
 | Phase 13 | `m6_shard_migration.fizz` (pending, v0.46) | M6 | Precondition for v0.46 shard-migration exit |
 
 ---
@@ -833,6 +902,7 @@ self-fencing-composed shard-lease code (M7) or migration-state-machine code
 | `formal/m3_sink_2pc.fizz` | M3 | `SinkConnector`, `ExternalSystem`, `Shard`, `CheckpointCoordinator`, `ControlPlane`, `ObjectStore` | M3-S1…S4, M3-L1 | §11.2, §11.4 |
 | `formal/m4_self_fencing.fizz` | M4 | `Worker`, `Shard`, `ControlPlane`, `ObjectStore` | M4-S1…S4, M4-L1…L2 | §10.4, §11.5, §11.6, §11.7 |
 | `formal/m5_cold_tier_sink.fizz` | M5 | `SinkConnector`, `ExternalObjectStore`, `Shard`, `ControlPlane`, `CheckpointCoordinator` | M5-S1…S3, M5-L1 | §11.4, §17.8 gap 1 |
+| `formal/m7_control_plane_ha.fizz` | M7 | `ControlNode` | M7-S1…S3, M7-L1 | §3 (Three Logical Tiers, Tier 3 Raft bootstrap) |
 | `formal/conventions.md` | — | — | role/durability/bounds conventions | §2 of this doc |
 | `formal/findings.md` | — | — | counterexample log + regression-seed map | §17.6 |
 

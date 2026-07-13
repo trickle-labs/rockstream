@@ -209,6 +209,47 @@ pub enum ControlMessage {
         /// The new cluster frontier epoch.
         epoch: u64,
     },
+    /// A shard-lease request (or other leader-gated write) was rejected
+    /// because this control node is not currently the Raft-elected
+    /// control-plane leader (v0.45.2, M7-S2 leader-only write gating).
+    ///
+    /// RS-1731: the worker should re-resolve control-plane leadership and
+    /// retry against the current leader.
+    NotLeader {
+        /// The current known leader's node id, if any is known.
+        current_leader: Option<u64>,
+    },
+    /// Response to [`WorkerMessage::ClusterStatusQuery`] (v0.45.2 M7 S4):
+    /// this control node's current Raft leadership status, used by
+    /// operators/tests to locate the current elected leader without
+    /// depending on any specific node already being it (e.g. after a
+    /// leader-kill drill's failover).
+    ClusterStatusReport {
+        /// This node's own Raft node id, or `None` if this node is running
+        /// without Raft attached (pre-v0.45.2 single-node control mode).
+        node_id: Option<u64>,
+        /// This node's current Raft role.
+        role: RaftRoleWire,
+        /// This node's current Raft term (`0` if Raft is not attached).
+        term: u64,
+    },
+}
+
+/// Wire-serializable mirror of `rockstream_control::raft::RaftRole`
+/// (`rockstream-types` cannot depend on `rockstream-control`, so the
+/// leadership status reported over the wire uses this small local copy;
+/// `rockstream-control::service` is responsible for the conversion at the
+/// boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RaftRoleWire {
+    Follower,
+    Candidate,
+    Leader,
+    /// This control node is not running with Raft attached at all
+    /// (pre-v0.45.2 single embedded control node — implicitly the sole
+    /// writer, since there is no group to contend leadership with).
+    NoRaft,
 }
 
 /// Lifecycle state of a worker node (v0.38 drain protocol).
@@ -419,6 +460,23 @@ pub enum WorkerMessage {
     ShardLoadReport {
         worker_id: WorkerId,
         samples: Vec<ShardLoadSample>,
+    },
+    /// Query this control node's current Raft leadership status (v0.45.2
+    /// M7 S4). Any connected client (worker, ops tooling, or a test) may
+    /// send this at any time without first registering; the control plane
+    /// always answers with [`ControlMessage::ClusterStatusReport`].
+    ClusterStatusQuery,
+    /// Report a shard's current committed frontier epoch to the control
+    /// plane's frontier aggregator (v0.45.2 M7 S4 — "frontier publication
+    /// resumes within budget" after a control-leadership change). Only the
+    /// current Raft leader publishes the resulting cluster frontier; a
+    /// non-leader control node still ingests the report (so the meet
+    /// computation carries over once it becomes leader) but replies
+    /// [`ControlMessage::NotLeader`] instead of
+    /// [`ControlMessage::ClusterFrontierAdvanced`].
+    ReportShardFrontier {
+        shard_id: ShardId,
+        epoch: crate::timestamp::Epoch,
     },
 }
 

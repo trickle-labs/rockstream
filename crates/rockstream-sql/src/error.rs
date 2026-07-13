@@ -4,7 +4,7 @@
 //! with actionable next_steps text.
 
 use rockstream_types::error_code::{
-    ErrorCode, RS_0001, RS_0003, RS_1002, RS_1011, RS_1012, RS_1013, RS_1016, RS_2016,
+    ErrorCode, RS_0001, RS_0003, RS_1002, RS_1011, RS_1012, RS_1013, RS_1016, RS_1731, RS_2016,
 };
 use thiserror::Error;
 
@@ -77,6 +77,18 @@ pub enum SqlError {
     /// DDL parse error: unrecognized or malformed DDL statement.
     #[error("[RS-1012] DDL parse error: {message}")]
     DdlParseError { message: String },
+
+    /// A workload-catalog write (`CREATE WORKLOAD` / update / drop) was
+    /// attempted on a control node that is not the current Raft-elected
+    /// control leader (v0.45.2, M7-S2 leader-only write gating).
+    ///
+    /// RS-1731: retry against the current control leader; the caller
+    /// should re-resolve leadership (e.g. via `cluster status`) before
+    /// retrying.
+    #[error(
+        "[RS-1731] Workload-catalog write rejected: this node is not the control-plane leader"
+    )]
+    NotLeader,
 }
 
 impl SqlError {
@@ -93,6 +105,7 @@ impl SqlError {
             Self::Serde(_) => RS_0001,
             Self::IndexNameConflict { .. } => RS_2016,
             Self::DdlParseError { .. } => RS_1012,
+            Self::NotLeader => RS_1731,
         }
     }
 }

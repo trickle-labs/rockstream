@@ -1,7 +1,9 @@
-//! Paired runtime assertions for M4 — self-fencing and lease uniqueness.
+//! Paired runtime assertions for M4 — self-fencing and lease uniqueness —
+//! and M7-S3 — control-leader-epoch fence composition (v0.45.2).
 //!
 //! Every assertion in this module is directly paired with a FizzBee invariant
-//! in `formal/m4_self_fencing.fizz` (FIZZBEE_TEST_PLAN.md §3.6).
+//! in `formal/m4_self_fencing.fizz` or `formal/m7_control_plane_ha.fizz`
+//! (FIZZBEE_TEST_PLAN.md §3.6/§3.8).
 //!
 //! ## Paired assertions
 //!
@@ -10,6 +12,7 @@
 //! | M4-S1 / M4-S3 | [`assert_valid_writer`] — fence-epoch CAS check before every epoch commit. |
 //! | M4-S1 / M4-S3 | [`assert_single_lease_holder`] — at most one worker holds an active lease per shard. |
 //! | M4-S2 | [`assert_self_fence_deadline`] — partitioned worker must self-fence before deadline. |
+//! | M7-S3 | [`assert_valid_control_leader_epoch`] — a shard-fence write's captured control-leader epoch must not be stale. |
 
 use std::time::{Duration, Instant};
 
@@ -73,6 +76,40 @@ pub fn assert_single_lease_holder(shard_id: ShardId, holder_count: usize) {
         "RS-1701: M4-S3 violation — lease uniqueness: \
          shard={shard_id} has {holder_count} simultaneous holders (expected ≤ 1). \
          next_steps: Check worker assignments; force-acquire to evict the stale holder."
+    );
+}
+
+// ─── M7-S3: Control-leader-epoch fence composition ───────────────────────────
+
+/// Extract the control-leader epoch packed into a [`LeaseToken`]'s high 32
+/// bits (v0.45.2 M7-S3 — see `rockstream_control::shard::ShardManager::set_leader_epoch`
+/// and `rockstream_control::raft::control_leader_epoch`, which mint tokens
+/// as `(leader_epoch << 32) | counter`).
+pub fn control_leader_epoch_of(token: LeaseToken) -> u64 {
+    token.0 >> 32
+}
+
+/// Assert that a shard-fence write's captured control-leader epoch is not
+/// stale relative to the control plane's current epoch — the control-plane
+/// analogue of [`assert_valid_writer`]'s fence check, but keyed on Raft
+/// leadership epoch (derived from `(raft_term, control_leader_id)`) rather
+/// than lease-token identity. A control-leadership change (new Raft term or
+/// newly elected leader) must strictly invalidate any in-flight write
+/// issued under the old epoch — this is the M7-S3 "no dual-leader write
+/// window" guarantee, composed with M4's existing per-shard fencing.
+///
+/// # Panics
+///
+/// Panics with an `RS-1731` message if `write_epoch < current_epoch`.
+pub fn assert_valid_control_leader_epoch(write_epoch: u64, current_epoch: u64) {
+    // M7-S3 paired assertion: control-leader-epoch fence composition.
+    assert!(
+        write_epoch >= current_epoch,
+        "RS-1731: M7-S3 violation — stale control-leader epoch on shard-fence \
+         write: write_epoch={write_epoch}, current_epoch={current_epoch}. \
+         next_steps: control leadership changed mid-write (new Raft term or \
+         newly elected leader); the writer must re-acquire its lease under \
+         the new leader before retrying."
     );
 }
 
@@ -209,6 +246,32 @@ mod tests {
     #[should_panic(expected = "RS-1701")]
     fn assert_single_lease_holder_panics_on_two_holders() {
         assert_single_lease_holder(ShardId(0), 2);
+    }
+
+    // ── M7-S3: control-leader-epoch fence composition ───────────────────────
+
+    #[test]
+    fn control_leader_epoch_of_extracts_high_bits() {
+        let token = LeaseToken((7u64 << 32) | 3);
+        assert_eq!(control_leader_epoch_of(token), 7);
+    }
+
+    #[test]
+    fn control_leader_epoch_of_zero_epoch_token() {
+        let token = LeaseToken(42);
+        assert_eq!(control_leader_epoch_of(token), 0);
+    }
+
+    #[test]
+    fn assert_valid_control_leader_epoch_passes_when_current_or_newer() {
+        assert_valid_control_leader_epoch(2, 2);
+        assert_valid_control_leader_epoch(5, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "RS-1731")]
+    fn assert_valid_control_leader_epoch_panics_on_stale_epoch() {
+        assert_valid_control_leader_epoch(1, 2);
     }
 
     // ── M4-S2: Self-fence deadline ─────────────────────────────────────────────

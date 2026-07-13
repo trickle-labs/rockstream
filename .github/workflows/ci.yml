@@ -102,9 +102,10 @@ jobs:
           echo "$install_dir" >> "$GITHUB_PATH"
           "$install_dir/fizzbee" --version || true
       # M1 (smoke + epoch-commit), M2 (frontier aggregation), M3 (sink 2PC),
-      # M4 (self-fencing), and M5 (cold-tier exactly-once sink, v0.43) are all
-      # genuinely green (safety + liveness) — see formal/findings.md
-      # "Post-v0.42.3 Remediation". All six specs are a hard gate: a red
+      # M4 (self-fencing), M5 (cold-tier exactly-once sink, v0.43), and M7
+      # (control-plane Raft leader election, v0.45.2) are all genuinely green
+      # (safety + liveness) — see formal/findings.md "Post-v0.42.3
+      # Remediation" and the M7 entry. All seven specs are a hard gate: a red
       # result here blocks merge, per the binding v0.18 contract. M4's
       # exhaustive BFS completes in ~6s / ~31,000 nodes at MAX_OUTAGES
       # lowered from 2 to 1 (every other bound unchanged from its original
@@ -114,8 +115,12 @@ jobs:
       # memory/wall-clock caps are removed. M5 formalizes the existing
       # `object_store_sink.rs` 2PC protocol with an explicit mid-rename
       # crash-yield point (DESIGN.md §17.8 gap 1) ahead of v0.44's
-      # Iceberg/Delta sinks reusing the same protocol.
-      - name: Formal verify — smoke, M1, M2, M3, M4, M5 (hard gate)
+      # Iceberg/Delta sinks reusing the same protocol. M7 completes in ~5s /
+      # ~37,000 nodes at NUM_CONTROL_NODES=3, MAX_ELECTIONS=2,
+      # MAX_WRITE_ATTEMPTS=2 — the pre-implementation gate for v0.45.2's
+      # `rockstream-control` Raft group, per the binding v0.18 rule that
+      # S0 (the model) must be green before S1+ (implementation) is written.
+      - name: Formal verify — smoke, M1, M2, M3, M4, M5, M7 (hard gate)
         if: steps.filter.outputs.run == 'true'
         run: |
           fizz formal/smoke.fizz
@@ -124,6 +129,7 @@ jobs:
           fizz formal/m3_sink_2pc.fizz
           fizz formal/m4_self_fencing.fizz
           fizz formal/m5_cold_tier_sink.fizz
+          fizz formal/m7_control_plane_ha.fizz
 
   coverage:
     name: Coverage

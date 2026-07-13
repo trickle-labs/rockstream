@@ -25,7 +25,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use object_store::path::Path;
+use object_store::ObjectStore;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
@@ -56,6 +59,34 @@ struct ShardManagerInner {
     leases: HashMap<ShardId, ShardLease>,
     /// Global monotonic counter; incremented on every `acquire`.
     next_token: u64,
+    /// Control-leader epoch mixed into every newly minted [`LeaseToken`]
+    /// (v0.45.2 M7-S3): `token = (leader_epoch << 32) | counter`. Defaults
+    /// to `0`, which makes every token exactly equal to the raw counter —
+    /// preserving byte-for-byte backward compatibility with pre-v0.45.2
+    /// behavior and every pre-existing M4 fencing test. Set via
+    /// [`ShardManager::set_leader_epoch`], normally derived from
+    /// `raft::control_leader_epoch(term, leader_id)` whenever the
+    /// control-plane Raft term or leader identity changes.
+    leader_epoch: u64,
+}
+
+/// Mint the next [`LeaseToken`], mixing in the current control-leader epoch
+/// (M7-S3). `next_token` is bounded to `< 2^32` so it can never collide
+/// with the epoch bits packed into the high 32 bits — this is the named
+/// bound for the token counter; exceeding it is a hard invariant violation
+/// (panics) rather than silently wrapping into the epoch bits and forging a
+/// token that looks like it came from a different control-leader term.
+fn mint_token(guard: &mut ShardManagerInner) -> LeaseToken {
+    assert!(
+        guard.next_token < (1u64 << 32),
+        "shard lease token counter exhausted (would collide with the M7-S3 \
+         leader-epoch bits); this indicates the control plane has been \
+         running far longer than any deployment horizon and needs a token \
+         counter reset/rotation, not a silent wraparound"
+    );
+    let token = (guard.leader_epoch << 32) | guard.next_token;
+    guard.next_token += 1;
+    LeaseToken(token)
 }
 
 /// Thread-safe manager for shard write leases.
@@ -73,8 +104,28 @@ impl ShardManager {
             inner: Arc::new(RwLock::new(ShardManagerInner {
                 leases: HashMap::new(),
                 next_token: 1,
+                leader_epoch: 0,
             })),
         }
+    }
+
+    /// Set the control-leader epoch to mix into every subsequently minted
+    /// [`LeaseToken`] (v0.45.2 M7-S3). Callers derive `epoch` from
+    /// `raft::control_leader_epoch(term, leader_id)` whenever the
+    /// control-plane Raft term or leader identity changes. Panics if
+    /// `epoch >= 2^32` (the reserved high half of a `LeaseToken`'s 64 bits).
+    pub fn set_leader_epoch(&self, epoch: u64) {
+        assert!(
+            epoch < (1u64 << 32),
+            "control-leader epoch {epoch} does not fit in the reserved high \
+             32 bits of a LeaseToken"
+        );
+        self.inner.write().leader_epoch = epoch;
+    }
+
+    /// The control-leader epoch currently mixed into newly minted tokens.
+    pub fn leader_epoch(&self) -> u64 {
+        self.inner.read().leader_epoch
     }
 
     /// Acquire a write lease on `shard_id` for `worker_id`.
@@ -102,8 +153,7 @@ impl ShardManager {
                 });
             }
         }
-        let token = LeaseToken(guard.next_token);
-        guard.next_token += 1;
+        let token = mint_token(&mut guard);
         let lease = ShardLease::new(shard_id, worker_id, token);
         guard.leases.insert(shard_id, lease.clone());
         Ok(lease)
@@ -120,8 +170,7 @@ impl ShardManager {
     ) -> (ShardLease, Option<WorkerId>) {
         let mut guard = self.inner.write();
         let evicted = guard.leases.get(&shard_id).map(|l| l.worker_id);
-        let token = LeaseToken(guard.next_token);
-        guard.next_token += 1;
+        let token = mint_token(&mut guard);
         let lease = ShardLease::new(shard_id, worker_id, token);
         guard.leases.insert(shard_id, lease.clone());
         (lease, evicted)
@@ -195,11 +244,99 @@ impl ShardManager {
     pub fn is_empty(&self) -> bool {
         self.inner.read().leases.is_empty()
     }
+
+    /// Capture a full point-in-time snapshot of this manager's state
+    /// (v0.45.2 M7-S4/S5: cross-control-node lease continuity).
+    ///
+    /// Used to persist state to the shared control object store so that a
+    /// newly-elected leader on a *different real process* can pick up where
+    /// the previous leader left off, instead of starting from an empty
+    /// in-memory map (which would otherwise let a new leader believe every
+    /// shard is unleased and hand out a conflicting grant — a real
+    /// split-brain window that only a single-process test could hide).
+    pub fn snapshot(&self) -> ShardManagerSnapshot {
+        let guard = self.inner.read();
+        ShardManagerSnapshot {
+            leases: guard.leases.clone(),
+            next_token: guard.next_token,
+            leader_epoch: guard.leader_epoch,
+        }
+    }
+
+    /// Replace this manager's entire state with a previously-captured
+    /// snapshot. Used when a node transitions to Raft leader and must adopt
+    /// the shared control-plane's last-known lease state before granting any
+    /// new lease (v0.45.2 M7-S4/S5).
+    pub fn restore(&self, snapshot: ShardManagerSnapshot) {
+        let mut guard = self.inner.write();
+        guard.leases = snapshot.leases;
+        guard.next_token = snapshot.next_token;
+        guard.leader_epoch = snapshot.leader_epoch;
+    }
 }
 
 impl Default for ShardManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A serializable point-in-time snapshot of [`ShardManager`]'s state
+/// (v0.45.2 M7-S4/S5).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShardManagerSnapshot {
+    pub leases: HashMap<ShardId, ShardLease>,
+    pub next_token: u64,
+    pub leader_epoch: u64,
+}
+
+/// Durable store for [`ShardManagerSnapshot`], backed by the same shared
+/// [`ObjectStore`] the control-plane Raft group uses for its term/vote state
+/// (v0.45.2 M7-S4/S5 — the "control SlateDB" DESIGN.md §3 describes: the
+/// elected leader is the sole writer, and a newly-elected leader on a
+/// different real process loads the last-persisted snapshot here before
+/// serving its first write).
+///
+/// This is a bounded, single-object snapshot (not an unbounded log): each
+/// `save` fully overwrites the one object at [`Self::path`] rather than
+/// appending, so storage size is bounded by the current lease-table size —
+/// never by write history — and no SlateDB range-delete is ever involved.
+pub struct ShardPersistentStore {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+}
+
+impl ShardPersistentStore {
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            path: Path::from("control/shard_manager/state.json"),
+        }
+    }
+
+    /// Load the persisted snapshot, or the empty default if nothing has been
+    /// persisted yet (first-ever boot of this control group).
+    pub async fn load(&self) -> ShardManagerSnapshot {
+        match self.store.get(&self.path).await {
+            Ok(result) => match result.bytes().await {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                Err(_) => ShardManagerSnapshot::default(),
+            },
+            Err(_) => ShardManagerSnapshot::default(),
+        }
+    }
+
+    /// Persist a snapshot. Panics on failure (same discipline as
+    /// `raft::RaftPersistentStore::save` — a silently-dropped write here
+    /// could let a newly-elected leader forget a lease that genuinely still
+    /// has a live holder, which is exactly the hazard this store exists to
+    /// prevent).
+    pub async fn save(&self, snapshot: &ShardManagerSnapshot) {
+        let bytes = serde_json::to_vec(snapshot).expect("serialize ShardManagerSnapshot");
+        self.store
+            .put(&self.path, bytes.into())
+            .await
+            .expect("RS-0003: failed to persist shard-manager lease state");
     }
 }
 
@@ -232,6 +369,50 @@ mod tests {
         let l2 = m.acquire(ShardId(1), WorkerId(10)).unwrap();
         // Token must be strictly higher on reacquire.
         assert!(l2.lease_token.0 > l1.lease_token.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // M7-S3: control-leader-epoch token composition
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_leader_epoch_is_zero_and_token_equals_raw_counter() {
+        let m = mgr();
+        assert_eq!(m.leader_epoch(), 0);
+        let lease = m.acquire(ShardId(1), WorkerId(10)).unwrap();
+        // With epoch=0, token == raw counter value (byte-for-byte backward
+        // compatible with pre-v0.45.2 behavior).
+        assert_eq!(lease.lease_token.0, 1);
+    }
+
+    #[test]
+    fn setting_leader_epoch_is_packed_into_high_bits_of_new_tokens() {
+        let m = mgr();
+        m.acquire(ShardId(1), WorkerId(10)).unwrap(); // token 1, epoch 0
+        m.set_leader_epoch(7);
+        assert_eq!(m.leader_epoch(), 7);
+        let lease = m.acquire(ShardId(2), WorkerId(11)).unwrap();
+        assert_eq!(lease.lease_token.0 >> 32, 7);
+        assert_eq!(lease.lease_token.0 & 0xFFFF_FFFF, 2);
+    }
+
+    #[test]
+    fn raising_leader_epoch_makes_every_subsequent_token_strictly_greater() {
+        let m = mgr();
+        let l1 = m.acquire(ShardId(1), WorkerId(10)).unwrap();
+        m.set_leader_epoch(1);
+        let l2 = m.acquire(ShardId(1), WorkerId(10)).unwrap();
+        assert!(l2.lease_token.0 > l1.lease_token.0);
+        m.set_leader_epoch(2);
+        let l3 = m.acquire(ShardId(1), WorkerId(10)).unwrap();
+        assert!(l3.lease_token.0 > l2.lease_token.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn set_leader_epoch_rejects_out_of_range_epoch() {
+        let m = mgr();
+        m.set_leader_epoch(1u64 << 32);
     }
 
     #[test]
@@ -398,5 +579,52 @@ mod tests {
     fn get_returns_none_for_unknown_shard() {
         let m = mgr();
         assert!(m.get(ShardId(99)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.45.2 M7-S4/S5: snapshot / restore for cross-process leader takeover
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_restore_round_trips_state() {
+        let m = mgr();
+        m.acquire(ShardId(1), WorkerId(10)).unwrap();
+        m.set_leader_epoch(3);
+        m.acquire(ShardId(2), WorkerId(20)).unwrap();
+        let snap = m.snapshot();
+
+        let m2 = mgr();
+        assert!(m2.is_empty());
+        m2.restore(snap.clone());
+        assert_eq!(m2.len(), 2);
+        assert_eq!(m2.leader_epoch(), 3);
+        assert_eq!(
+            m2.get(ShardId(1)).unwrap().worker_id,
+            m.get(ShardId(1)).unwrap().worker_id
+        );
+        assert_eq!(m2.snapshot(), snap);
+    }
+
+    #[tokio::test]
+    async fn shard_persistent_store_round_trips_through_object_store() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let persist = ShardPersistentStore::new(store.clone());
+
+        // Nothing persisted yet → empty default.
+        let loaded = persist.load().await;
+        assert_eq!(loaded, ShardManagerSnapshot::default());
+
+        let m = mgr();
+        m.acquire(ShardId(5), WorkerId(50)).unwrap();
+        m.set_leader_epoch(9);
+        let snap = m.snapshot();
+        persist.save(&snap).await;
+
+        // A second store instance sharing the same backing object store
+        // sees the persisted snapshot (models a different real process /
+        // newly-elected leader).
+        let persist2 = ShardPersistentStore::new(store);
+        let loaded2 = persist2.load().await;
+        assert_eq!(loaded2, snap);
     }
 }

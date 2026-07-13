@@ -81,6 +81,58 @@ pub struct StartOptions {
     /// For the `gateway` role this defaults to `127.0.0.1:5432`.  When
     /// `None` the gateway is not started (no-op / test mode).
     pub listen_addr: Option<String>,
+    /// v0.45.2 M7 (control-plane Raft leader election): the other control
+    /// nodes in this node's Raft group, `"id@host:port,id@host:port"`.
+    /// When `None` (the default), the `control` role runs exactly as it
+    /// did before v0.45.2 — a single embedded control node with no Raft
+    /// gating attached, preserving full backward compatibility. When
+    /// `Some`, this node joins a real multi-node Raft group and every
+    /// leader-gated write (shard lease grants) is rejected with `RS-1731`
+    /// unless this node is the current elected leader.
+    pub raft_peers: Option<String>,
+    /// This node's id within its Raft group. Required when `raft_peers` is
+    /// `Some`.
+    pub raft_node_id: Option<u64>,
+    /// The address this node's Raft peer-RPC listener binds to (distinct
+    /// from the worker-facing `ControlService` port). Required when
+    /// `raft_peers` is `Some`, since peers must know it ahead of time.
+    pub raft_bind: Option<String>,
+    /// If `true`, this node starts an election immediately on boot rather
+    /// than waiting out a randomized timeout. Exactly one node in a
+    /// freshly-bootstrapped group should set this.
+    pub raft_bootstrap: bool,
+    /// v0.45.2 M7 S4: when `true`, the `control` role blocks on SIGTERM /
+    /// Ctrl-C like the `gateway`/`all` roles' live wire server, instead of
+    /// running the short embedded no-op sleep. Defaults to `false`,
+    /// preserving exact pre-v0.45.2 behavior. Only meaningful for
+    /// `--role=control`; required for a real multi-process control-plane
+    /// cluster, where every node's process must stay alive to serve peers
+    /// and workers.
+    pub daemon: bool,
+    /// v0.45.2 M7 S4: override the address the `control` role's
+    /// worker-facing `ControlService` binds to. Defaults to
+    /// `127.0.0.1:8000` when `None` (the pre-v0.45.2 convention).
+    pub control_bind: Option<String>,
+    /// v0.45.2 M7 S4/S5: directory for state shared across every control
+    /// node in this node's Raft group — specifically the shard-lease-
+    /// manager snapshot (`ShardPersistentStore`), the one piece of state
+    /// DESIGN.md §3's "one writer (leader), many readers" architecture
+    /// requires every control node to actually share so a newly-elected
+    /// leader (a different real process) can adopt the outgoing leader's
+    /// lease state. When `None` (the default), each control node's state
+    /// lives under its own private `--storage` directory exactly as before
+    /// v0.45.2, and lease continuity across a real process crash/restart on
+    /// a *different* node is not available.
+    ///
+    /// Raft's own `current_term`/`voted_for` persistence is **never** routed
+    /// through this shared directory, even when it is set — that state is,
+    /// by definition, per-replica-local durable state (each Raft node must
+    /// independently remember its own vote to avoid double-voting in a
+    /// term), and routing it through one cross-node-shared object-store key
+    /// would let concurrent writes from different node processes corrupt
+    /// each other's persisted term/vote on restart. It always lives under
+    /// this node's own private `--storage`/`raft` directory.
+    pub control_shared_storage: Option<PathBuf>,
 }
 
 /// The result of a successful `rockstream start` no-op run.
@@ -337,6 +389,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         let mut control_handle = None;
         let mut worker_handle = None;
         let mut control_url = opts.control.clone();
+        let mut raft_node_guard: Option<rockstream_control::raft::RaftNodeHandleFull> = None;
 
         if opts.role == "all" {
             let catalog = rockstream_control::TopologyCatalog::new();
@@ -352,12 +405,128 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         } else if opts.role == "control" {
             let catalog = rockstream_control::TopologyCatalog::new();
             let manager = rockstream_control::ShardManager::new();
-            let service = rockstream_control::ControlService::new(catalog)
-                .with_shard_manager(manager)
+            let frontier = Arc::new(rockstream_control::FrontierAggregator::new());
+            let mut service = rockstream_control::ControlService::new(catalog)
+                .with_shard_manager(manager.clone())
+                .with_frontier(frontier)
                 .with_audit(Arc::new(
                     rockstream_control::audit::FileAuditLog::open(&audit_path).unwrap(),
                 ));
-            let handle = service.start("127.0.0.1:8000").await.unwrap();
+
+            // v0.45.2 M7 S4/S5: state that must be visible to whichever
+            // control node in the group is currently elected leader (the
+            // shard-lease-manager snapshot) lives under
+            // `--control-shared-storage` when provided, so a newly-elected
+            // leader running as a *different real process* loads the
+            // last-persisted lease state before granting new leases —
+            // closing the split-brain gap a purely private, per-node
+            // directory would leave open. When omitted, this falls back to
+            // the node's own private `--storage` dir, preserving exact
+            // pre-v0.45.2 single-node behavior (no cross-process lease
+            // continuity, which is fine because there is only ever one
+            // process).
+            let shared_store_dir = opts
+                .control_shared_storage
+                .clone()
+                .unwrap_or_else(|| opts.storage.join("raft"));
+            fs::create_dir_all(&shared_store_dir).map_err(|e| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed to create control shared-storage dir: {e}"),
+                    "Check filesystem permissions for --storage/--control-shared-storage.",
+                )
+            })?;
+            let shared_object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(&shared_store_dir).map_err(
+                    |e| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to open control shared-storage dir: {e}"),
+                            "Check filesystem permissions for --storage/--control-shared-storage.",
+                        )
+                    },
+                )?,
+            );
+            service = service.with_shard_store(Arc::new(
+                rockstream_control::ShardPersistentStore::new(shared_object_store.clone()),
+            ));
+
+            // v0.45.2 M7: join a real multi-node Raft group when
+            // `--raft-peers` is provided; otherwise run exactly as before
+            // v0.45.2 (no Raft gating attached).
+            if let Some(peers_spec) = &opts.raft_peers {
+                let peers = rockstream_control::raft::parse_peers(peers_spec).map_err(|e| {
+                    CliError::new(
+                        RS_0002,
+                        format!("invalid --raft-peers: {e}"),
+                        "Use the format id@host:port,id@host:port for every OTHER control node in the group.",
+                    )
+                })?;
+                let node_id = opts.raft_node_id.ok_or_else(|| {
+                    CliError::new(
+                        RS_0002,
+                        "control role with --raft-peers requires --raft-node-id",
+                        "Pass --raft-node-id=<u64>, this node's id within the group.",
+                    )
+                })?;
+                let raft_bind = opts.raft_bind.as_deref().ok_or_else(|| {
+                    CliError::new(
+                        RS_0002,
+                        "control role with --raft-peers requires --raft-bind",
+                        "Pass --raft-bind=<host:port>; every peer's --raft-peers list must reference this address.",
+                    )
+                })?;
+                let raft_config = rockstream_control::raft::RaftConfig::new(
+                    node_id,
+                    peers,
+                    opts.raft_bootstrap,
+                );
+                // Raft's own term/vote durability is per-node-private —
+                // see `StartOptions::control_shared_storage`'s doc comment
+                // for why this must never be routed through the
+                // cross-node-shared directory even when one is configured.
+                let raft_store_dir = opts.storage.join("raft");
+                fs::create_dir_all(&raft_store_dir).map_err(|e| {
+                    CliError::new(
+                        RS_0003,
+                        format!("failed to create private raft-state dir: {e}"),
+                        "Check filesystem permissions for --storage.",
+                    )
+                })?;
+                let raft_object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(&raft_store_dir)
+                        .map_err(|e| {
+                            CliError::new(
+                                RS_0003,
+                                format!("failed to open private raft-state dir: {e}"),
+                                "Check filesystem permissions for --storage.",
+                            )
+                        })?,
+                );
+                let raft_node = rockstream_control::raft::spawn_raft_node(
+                    raft_bind,
+                    raft_config,
+                    raft_object_store,
+                )
+                .await
+                .map_err(|e| {
+                    CliError::new(
+                        RS_0003,
+                        format!("failed to start raft peer listener on {raft_bind}: {e}"),
+                        "Check that --raft-bind is not already in use.",
+                    )
+                })?;
+                tracing::info!(
+                    node_id,
+                    addr = %raft_node.listen_addr,
+                    "control: raft peer listener started"
+                );
+                service = service.with_raft(raft_node.handle.clone());
+                raft_node_guard = Some(raft_node);
+            }
+
+            let control_bind = opts.control_bind.as_deref().unwrap_or("127.0.0.1:8000");
+            let handle = service.start(control_bind).await.unwrap();
             control_handle = Some(handle);
         }
 
@@ -444,6 +613,9 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     if let Some(ch) = control_handle.take() {
                         ch.shutdown();
                     }
+                    if let Some(rn) = raft_node_guard.take() {
+                        rn.shutdown();
+                    }
                     if let Some(mh) = metrics_handle.take() {
                         mh.shutdown();
                     }
@@ -452,12 +624,41 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             }
         } else {
             // ── No-op / test mode ─────────────────────────────────────────
-            // Allow live interactions to complete, then exit cleanly.
-            let sleep_ms = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(50);
-            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            // v0.45.2 M7 S4: `--role=control --daemon` blocks on SIGTERM /
+            // Ctrl-C exactly like the live gateway server, instead of
+            // running the short embedded no-op sleep. This is what lets a
+            // real multi-process control-plane cluster stay up long enough
+            // for peers/workers to reach it. Every other combination keeps
+            // the pre-v0.45.2 short-sleep-then-exit behavior unchanged.
+            let daemon_mode = opts.daemon && opts.role == "control";
+            if daemon_mode {
+                tracing::info!(
+                    role = %opts.role,
+                    "control node running in daemon mode — blocking until shutdown signal"
+                );
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = signal(SignalKind::terminate())
+                        .unwrap_or_else(|_| panic!("failed to install SIGTERM handler"));
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = sigterm.recv() => {}
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+                tracing::info!("shutdown signal received — stopping control daemon");
+            } else {
+                // Allow live interactions to complete, then exit cleanly.
+                let sleep_ms = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(50);
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            }
         }
 
         if let Some(wh) = worker_handle {
@@ -465,6 +666,9 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         }
         if let Some(ch) = control_handle {
             ch.shutdown();
+        }
+        if let Some(rn) = raft_node_guard {
+            rn.shutdown();
         }
         if let Some(mh) = metrics_handle {
             mh.shutdown();
@@ -574,6 +778,13 @@ mod tests {
             auth_mode: "off".to_string(),
             metrics_addr: None,
             listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
         };
         let outcome = run_start(&opts).unwrap();
 
@@ -613,6 +824,13 @@ mod tests {
             auth_mode: "off".to_string(),
             metrics_addr: None,
             listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
         };
         run_start(&opts).unwrap();
         assert!(nested.join("audit.jsonl").exists());
@@ -628,6 +846,13 @@ mod tests {
             auth_mode: "off".to_string(),
             metrics_addr: None,
             listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -645,6 +870,13 @@ mod tests {
             auth_mode: "off".to_string(),
             metrics_addr: None,
             listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
         };
         // Should succeed: gateway + no listen_addr → no-op path
         let outcome = run_start(&opts).unwrap();
@@ -662,6 +894,13 @@ mod tests {
             auth_mode: "off".to_string(),
             metrics_addr: None,
             listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -673,5 +912,116 @@ mod tests {
     fn frontier_role_is_known() {
         assert!(KNOWN_ROLES.contains(&"frontier"));
         assert!(validate_role("frontier").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.45.2 M7: control-plane Raft CLI wiring
+    // -----------------------------------------------------------------------
+
+    /// `--role=control`, with and without `--raft-peers`, both start
+    /// successfully end-to-end through the CLI. Combined into one test
+    /// (run sequentially, not in parallel) because the `control` role binds
+    /// its control-service listener on the conventional default port 8000
+    /// (matching pre-v0.45.2 behavior, unchanged by this phase) — two
+    /// separate `#[test]` functions doing a real bind would race for that
+    /// port under cargo's default parallel test execution.
+    #[test]
+    fn control_role_start_end_to_end_with_and_without_raft() {
+        // Without `--raft-peers`: runs exactly as before v0.45.2 — no Raft
+        // gating attached, shard leases granted immediately.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = StartOptions {
+                storage: dir.path().to_path_buf(),
+                role: "control".to_string(),
+                control: None,
+                auth_mode: "off".to_string(),
+                metrics_addr: None,
+                listen_addr: None,
+                raft_peers: None,
+                raft_node_id: None,
+                raft_bind: None,
+                raft_bootstrap: false,
+                daemon: false,
+                control_bind: None,
+                control_shared_storage: None,
+            };
+            let outcome = run_start(&opts).unwrap();
+            assert!(outcome.events_written >= 2);
+        }
+
+        // With `--raft-peers` (single-node bootstrap group): becomes its own
+        // leader and starts up successfully, creating the raft storage dir.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = StartOptions {
+                storage: dir.path().to_path_buf(),
+                role: "control".to_string(),
+                control: None,
+                auth_mode: "off".to_string(),
+                metrics_addr: None,
+                listen_addr: None,
+                raft_peers: Some(String::new()),
+                raft_node_id: Some(0),
+                raft_bind: Some("127.0.0.1:0".to_string()),
+                raft_bootstrap: true,
+                daemon: false,
+                control_bind: None,
+                control_shared_storage: None,
+            };
+            let outcome = run_start(&opts).unwrap();
+            assert!(outcome.events_written >= 2);
+            assert!(dir.path().join("raft").exists());
+        }
+    }
+
+    /// `control` role with `--raft-peers` but no `--raft-node-id` fails with
+    /// an actionable `RS-0002`.
+    #[test]
+    fn control_role_with_raft_peers_requires_node_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StartOptions {
+            storage: dir.path().to_path_buf(),
+            role: "control".to_string(),
+            control: None,
+            auth_mode: "off".to_string(),
+            metrics_addr: None,
+            listen_addr: None,
+            raft_peers: Some(String::new()),
+            raft_node_id: None,
+            raft_bind: Some("127.0.0.1:0".to_string()),
+            raft_bootstrap: true,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
+        };
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(err.code.to_string(), "RS-0002");
+        assert!(err.message.contains("raft-node-id"));
+    }
+
+    /// `control` role with `--raft-peers` but no `--raft-bind` fails with an
+    /// actionable `RS-0002`.
+    #[test]
+    fn control_role_with_raft_peers_requires_raft_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StartOptions {
+            storage: dir.path().to_path_buf(),
+            role: "control".to_string(),
+            control: None,
+            auth_mode: "off".to_string(),
+            metrics_addr: None,
+            listen_addr: None,
+            raft_peers: Some(String::new()),
+            raft_node_id: Some(0),
+            raft_bind: None,
+            raft_bootstrap: true,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
+        };
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(err.code.to_string(), "RS-0002");
+        assert!(err.message.contains("raft-bind"));
     }
 }
