@@ -1,0 +1,26 @@
+name: Dependency Audit
+
+# Runs `cargo deny check` against main on a fixed schedule, independent of any
+# push/pull_request activity. Introduced in v0.45.3 to close the gap called
+# out in DEPENDENCY_POLICY.md: the PR-triggered `cargo deny` step in ci.yml
+# only runs when a PR touches the repo, so a newly-published advisory against
+# an unchanged Cargo.lock would otherwise go undetected until the next PR.
+#
+# Schedule: daily at 03:00 UTC (period <= 24h, per DEPENDENCY_POLICY.md).
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dependency-audit:
+    name: Scheduled cargo deny check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2

@@ -413,7 +413,7 @@ mod tests {
         for row in &full_rows {
             let s = String::from_utf8_lossy(row);
             let cols: Vec<&str> = s.split('\t').collect();
-            let key = cols.get(0).copied().unwrap_or("").to_string();
+            let key = cols.first().copied().unwrap_or("").to_string();
             let val: i64 = cols.get(1).copied().unwrap_or("0").parse().unwrap_or(0);
             *expected.entry(key).or_insert(0) += val;
         }
@@ -423,7 +423,7 @@ mod tests {
         for row in &pushdown_rows {
             let s = String::from_utf8_lossy(row);
             let cols: Vec<&str> = s.split('\t').collect();
-            let key = cols.get(0).copied().unwrap_or("").to_string();
+            let key = cols.first().copied().unwrap_or("").to_string();
             let val: i64 = cols.get(1).copied().unwrap_or("0").parse().unwrap_or(0);
             pushdown_map.insert(key, val);
         }

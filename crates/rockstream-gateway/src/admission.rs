@@ -83,7 +83,7 @@ impl AdmissionController {
                 workload.name != requesting_workload && workload.priority > requester.priority
             })
             .collect();
-        contenders.sort_by(|a, b| b.priority.cmp(&a.priority));
+        contenders.sort_by_key(|c| std::cmp::Reverse(c.priority));
 
         let mut paused_views = Vec::new();
         'outer: for contender in &contenders {

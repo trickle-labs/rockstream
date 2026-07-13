@@ -885,8 +885,8 @@ impl CatalogStubs {
         }
 
         // S7: SHOW client_encoding / SHOW server_encoding
-        if ql.starts_with("show ") {
-            let key = ql["show ".len()..].trim().trim_end_matches(';');
+        if let Some(rest) = ql.strip_prefix("show ") {
+            let key = rest.trim().trim_end_matches(';');
             if key == "client_encoding" || key == "server_encoding" {
                 return Some(CatalogResponse::rows(
                     vec![key.to_string()],
@@ -2065,20 +2065,18 @@ fn parse_select_columns(query: &str) -> Vec<String> {
             if paren_level > 0 {
                 paren_level -= 1;
             }
-        } else if c.is_alphabetic() && paren_level == 0 {
-            if i + 4 <= chars.len() {
-                let word: String = chars[i..i + 4].iter().collect();
-                if word.eq_ignore_ascii_case("from") {
-                    let prev_char = if i > 0 { chars[i - 1] } else { ' ' };
-                    let next_char = if i + 4 < chars.len() {
-                        chars[i + 4]
-                    } else {
-                        ' '
-                    };
-                    if !prev_char.is_alphanumeric() && !next_char.is_alphanumeric() {
-                        from_idx = Some(i);
-                        break;
-                    }
+        } else if c.is_alphabetic() && paren_level == 0 && i + 4 <= chars.len() {
+            let word: String = chars[i..i + 4].iter().collect();
+            if word.eq_ignore_ascii_case("from") {
+                let prev_char = if i > 0 { chars[i - 1] } else { ' ' };
+                let next_char = if i + 4 < chars.len() {
+                    chars[i + 4]
+                } else {
+                    ' '
+                };
+                if !prev_char.is_alphanumeric() && !next_char.is_alphanumeric() {
+                    from_idx = Some(i);
+                    break;
                 }
             }
         }

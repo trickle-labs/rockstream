@@ -390,10 +390,8 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
                 let vals: Vec<Option<bool>> = col_strs[i]
                     .iter()
                     .map(|s| {
-                        s.as_deref().map(|v| match v.to_lowercase().as_str() {
-                            "true" | "t" | "1" => true,
-                            _ => false,
-                        })
+                        s.as_deref()
+                            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "t" | "1"))
                     })
                     .collect();
                 Arc::new(BooleanArray::from(vals)) as ArrayRef
@@ -514,8 +512,8 @@ fn extract_sql_refs(sql: &str) -> Vec<String> {
     let tokens_orig: Vec<&str> = sql.split_whitespace().collect();
     let tokens_lower: Vec<String> = tokens_orig.iter().map(|t| t.to_lowercase()).collect();
     let mut deps = Vec::new();
-    for i in 0..tokens_lower.len() {
-        if tokens_lower[i] == "from" || tokens_lower[i] == "join" {
+    for (i, tok_lower) in tokens_lower.iter().enumerate() {
+        if tok_lower == "from" || tok_lower == "join" {
             if let Some(next) = tokens_orig.get(i + 1) {
                 if next.starts_with('(') {
                     continue;

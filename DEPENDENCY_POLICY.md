@@ -26,14 +26,11 @@ compliance, and build reproducibility.
 
 ## Enforcement
 
-- `cargo deny check` runs in CI on every PR.
-- **Not yet true — found by the 2026-07-11 testing-quality review**: this
-  section previously stated "Dependabot or Renovate keeps dependencies
-  current" as settled fact. Neither `.github/dependabot.yml` nor
-  `renovate.json` exists in this repository today, and `cargo deny check` has
-  no scheduled (cron) trigger — it runs only when a PR happens to touch the
-  repo, so a CVE disclosed against an already-merged, otherwise-untouched
-  dependency produces no signal until the next unrelated change runs CI.
-  Scheduled to be made real at `NEW_ROADMAP.md` v0.45.3 (a scheduled
-  `cargo deny check` workflow plus a real `dependabot.yml`).
+- `cargo deny check` runs in CI on every PR, plus a scheduled daily run via
+  `.github/workflows/dependency-audit.yml` (cron, independent of PR/push
+  activity) so a CVE disclosed against an already-merged, otherwise-untouched
+  dependency is caught within 24h instead of waiting for the next unrelated
+  PR.
+- `.github/dependabot.yml` keeps `cargo` dependencies current with a weekly
+  version-bump PR schedule.
 - MSRV is tested in CI by using the pinned toolchain.

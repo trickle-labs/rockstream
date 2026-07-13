@@ -1,5 +1,3 @@
-#![allow(clippy::all, unused_variables, dead_code)]
-
 //! PostgreSQL wire gateway service for RockStream (v0.24).
 //!
 //! Serves reads of maintained views and accepts direct-write DML (INSERT/UPDATE/DELETE)

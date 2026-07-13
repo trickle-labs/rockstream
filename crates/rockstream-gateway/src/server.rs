@@ -83,6 +83,12 @@ pub struct CancelToken {
     rx: tokio::sync::watch::Receiver<bool>,
 }
 
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CancelToken {
     pub fn new() -> Self {
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -211,8 +217,8 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                         } => {
                             if let Expr::Value(v) = &**inner {
                                 if let Value::Placeholder(name) = &v.value {
-                                    if name.starts_with('$') {
-                                        if let Ok(idx) = name[1..].parse::<usize>() {
+                                    if let Some(rest) = name.strip_prefix('$') {
+                                        if let Ok(idx) = rest.parse::<usize>() {
                                             self.casts
                                                 .insert(idx, map_data_type_to_pg_type(data_type));
                                         }
@@ -224,8 +230,8 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                         }
                         Expr::Value(v) => {
                             if let Value::Placeholder(name) = &v.value {
-                                if name.starts_with('$') {
-                                    if let Ok(idx) = name[1..].parse::<usize>() {
+                                if let Some(rest) = name.strip_prefix('$') {
+                                    if let Ok(idx) = rest.parse::<usize>() {
                                         if self.in_any {
                                             self.casts.insert(idx, Type::TEXT_ARRAY);
                                         }
@@ -256,27 +262,24 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                         }
                         Expr::Function(func) => {
                             use sqlparser::ast::{FunctionArg, FunctionArguments};
-                            match &func.args {
-                                FunctionArguments::List(arg_list) => {
-                                    for arg in &arg_list.args {
-                                        match arg {
-                                            FunctionArg::Unnamed(arg_expr) => {
-                                                use sqlparser::ast::FunctionArgExpr;
-                                                if let FunctionArgExpr::Expr(e) = arg_expr {
-                                                    self.visit_expr(e);
-                                                }
+                            if let FunctionArguments::List(arg_list) = &func.args {
+                                for arg in &arg_list.args {
+                                    match arg {
+                                        FunctionArg::Unnamed(arg_expr) => {
+                                            use sqlparser::ast::FunctionArgExpr;
+                                            if let FunctionArgExpr::Expr(e) = arg_expr {
+                                                self.visit_expr(e);
                                             }
-                                            FunctionArg::Named { arg, .. } => {
-                                                use sqlparser::ast::FunctionArgExpr;
-                                                if let FunctionArgExpr::Expr(e) = arg {
-                                                    self.visit_expr(e);
-                                                }
-                                            }
-                                            _ => {}
                                         }
+                                        FunctionArg::Named { arg, .. } => {
+                                            use sqlparser::ast::FunctionArgExpr;
+                                            if let FunctionArgExpr::Expr(e) = arg {
+                                                self.visit_expr(e);
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                _ => {}
                             }
                         }
                         Expr::InList {
@@ -323,23 +326,20 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
                 casts: &mut explicit_casts,
                 in_any: false,
             };
-            match stmt {
-                sqlparser::ast::Statement::Query(q) => {
-                    if let sqlparser::ast::SetExpr::Select(select) = &*q.body {
-                        for projection in &select.projection {
-                            use sqlparser::ast::SelectItem;
-                            match projection {
-                                SelectItem::UnnamedExpr(expr) => visitor.visit_expr(expr),
-                                SelectItem::ExprWithAlias { expr, .. } => visitor.visit_expr(expr),
-                                _ => {}
-                            }
-                        }
-                        if let Some(selection) = &select.selection {
-                            visitor.visit_expr(selection);
+            if let sqlparser::ast::Statement::Query(q) = stmt {
+                if let sqlparser::ast::SetExpr::Select(select) = &*q.body {
+                    for projection in &select.projection {
+                        use sqlparser::ast::SelectItem;
+                        match projection {
+                            SelectItem::UnnamedExpr(expr) => visitor.visit_expr(expr),
+                            SelectItem::ExprWithAlias { expr, .. } => visitor.visit_expr(expr),
+                            _ => {}
                         }
                     }
+                    if let Some(selection) = &select.selection {
+                        visitor.visit_expr(selection);
+                    }
                 }
-                _ => {}
             }
         }
     }
@@ -405,8 +405,8 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
             if let Ok(opt_plan) = df.into_optimized_plan() {
                 visit_plan_expressions(&opt_plan, &mut |expr| {
                     visit_expr_placeholders(expr, &mut |id, dt| {
-                        if id.starts_with('$') {
-                            if let Ok(idx) = id[1..].parse::<usize>() {
+                        if let Some(rest) = id.strip_prefix('$') {
+                            if let Ok(idx) = rest.parse::<usize>() {
                                 if let Some(arrow_dt) = dt {
                                     df_inferred.insert(idx, pg_type_from_arrow_datatype(arrow_dt));
                                 }
@@ -422,10 +422,8 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
     }
 
     for (idx, ty) in df_inferred {
-        if idx > 0 && idx <= max_idx {
-            if !explicit_casts.contains_key(&idx) {
-                inferred_types[idx - 1] = ty;
-            }
+        if idx > 0 && idx <= max_idx && !explicit_casts.contains_key(&idx) {
+            inferred_types[idx - 1] = ty;
         }
     }
 
@@ -916,10 +914,7 @@ impl GatewayHandler {
 
     fn capture_max_staleness_metadata(&self, conn_id: &str) {
         let age_ms = self.published_frontier_age_ms();
-        let mut session = self
-            .sessions
-            .entry(conn_id.to_string())
-            .or_insert_with(SessionState::new);
+        let mut session = self.sessions.entry(conn_id.to_string()).or_default();
         session.pending_notice = None;
         if let Some(max_staleness) = session.max_staleness {
             let age_ms = age_ms.unwrap_or(0);
@@ -1002,7 +997,7 @@ impl GatewayHandler {
         // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
         let ql = query.trim().to_lowercase();
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
-            return self.handle_copy_from_stdin(query, &conn_id);
+            return self.handle_copy_from_stdin(query, conn_id);
         }
 
         // COPY OUT: stream CopyData messages directly through the client sink.
@@ -1253,15 +1248,9 @@ impl GatewayHandler {
 
         // BEGIN is handled in dispatch_async_with_conn (needs session state for idempotency).
 
-        // COMMIT and ROLLBACK are handled in dispatch_async (need write buffer access).
+        // COMMIT and ROLLBACK are handled in dispatch_async_with_conn (need write buffer access).
 
         None
-    }
-
-    /// Dispatch any query asynchronously.  Catalog/session queries are handled
-    /// immediately; DML/COMMIT/ROLLBACK uses write buffer; view SELECT queries await the storage read.
-    async fn dispatch_async(&self, query: &str) -> PgWireResult<Vec<Response<'static>>> {
-        self.dispatch_async_with_conn(query, None).await
     }
 
     /// Dispatch with an optional connection ID for write buffer routing.
@@ -1313,10 +1302,7 @@ impl GatewayHandler {
                         "BEGIN",
                     )))]);
                 }
-                let mut session = self
-                    .sessions
-                    .entry(id.to_string())
-                    .or_insert_with(SessionState::new);
+                let mut session = self.sessions.entry(id.to_string()).or_default();
                 session.begin_explicit();
                 let current_frontier = self
                     .shard_db
@@ -1529,10 +1515,7 @@ impl GatewayHandler {
                     .trim()
                     .trim_matches('"')
                     .to_string();
-                let mut session = self
-                    .sessions
-                    .entry(id.to_string())
-                    .or_insert_with(SessionState::new);
+                let mut session = self.sessions.entry(id.to_string()).or_default();
                 if is_local {
                     // SET LOCAL: store in local_guc_params; cleared at ROLLBACK/COMMIT.
                     session
@@ -1741,10 +1724,7 @@ impl GatewayHandler {
                     } else {
                         crate::session::IsolationLevel::ReadCommitted
                     };
-                    let mut session = self
-                        .sessions
-                        .entry(id.to_string())
-                        .or_insert_with(SessionState::new);
+                    let mut session = self.sessions.entry(id.to_string()).or_default();
                     session.isolation_level = level;
                     return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
                 } else {
@@ -1795,10 +1775,7 @@ impl GatewayHandler {
                         .trim_matches('\'')
                         .trim_matches('"')
                         .to_string();
-                    let mut session = self
-                        .sessions
-                        .entry(id.to_string())
-                        .or_insert_with(SessionState::new);
+                    let mut session = self.sessions.entry(id.to_string()).or_default();
                     if is_local {
                         session.local_guc_params.insert(key, val);
                     } else if session.guc_params.len() < crate::session::MAX_GUC_PARAMS
@@ -1905,8 +1882,8 @@ impl GatewayHandler {
                 rows: vec![row],
             })]);
         }
-        if ql.starts_with("show ") {
-            let key_raw = ql["show ".len()..].trim().trim_end_matches(';').to_string();
+        if let Some(rest) = ql.strip_prefix("show ") {
+            let key_raw = rest.trim().trim_end_matches(';').to_string();
             let session_val: Option<String> = if let Some(id) = conn_id {
                 self.sessions.get(id).map(|s| {
                     // local_guc_params first (SET LOCAL), then guc_params, then session fields
@@ -2098,10 +2075,7 @@ impl GatewayHandler {
                 let query_after_fence = extract_after_fence_token(q);
                 self.capture_max_staleness_metadata(id);
                 let (wait_token, timeout_ms) = {
-                    let mut session = self
-                        .sessions
-                        .entry(id.to_string())
-                        .or_insert_with(SessionState::new);
+                    let mut session = self.sessions.entry(id.to_string()).or_default();
                     // Explicit wait_for takes priority; fall back to session RYW.
                     let explicit = query_after_fence.or_else(|| session.wait_for_token.take());
                     let auto = if session.session_wait_for_enabled {
@@ -2633,10 +2607,7 @@ impl GatewayHandler {
     ) -> PgWireResult<Vec<Response<'static>>> {
         // Get principal and session namespace (v0.26)
         let (principal, session_namespace) = if let Some(id) = conn_id {
-            let session = self
-                .sessions
-                .entry(id.to_string())
-                .or_insert_with(SessionState::new);
+            let session = self.sessions.entry(id.to_string()).or_default();
             (session.principal.clone(), session.current_namespace.clone())
         } else {
             (Principal::System, "public".to_string())
@@ -3398,7 +3369,7 @@ impl GatewayHandler {
     /// Handle `SET rockstream.<var> = <value>` — update per-connection session state.
     fn handle_set_rockstream(
         &self,
-        q: &str,
+        _q: &str,
         ql: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
@@ -3408,20 +3379,17 @@ impl GatewayHandler {
 
         // Parse: SET [LOCAL] rockstream.<var> = <value>
         // ql is already lowercased
-        let after_set = if ql.starts_with("set local rockstream.") {
-            &ql["set local rockstream.".len()..]
+        let after_set = if let Some(rest) = ql.strip_prefix("set local rockstream.") {
+            rest
         } else {
-            &ql["set rockstream.".len()..]
+            ql.strip_prefix("set rockstream.").unwrap_or(ql)
         };
         // after_set: "idempotency_key = 'str'" or "source_epoch = 42"
         let eq_pos = after_set.find('=').unwrap_or(after_set.len());
         let var_name = after_set[..eq_pos].trim();
         let val_raw = after_set[eq_pos + 1..].trim().trim_end_matches(';');
 
-        let mut session = self
-            .sessions
-            .entry(id.to_string())
-            .or_insert_with(SessionState::new);
+        let mut session = self.sessions.entry(id.to_string()).or_default();
 
         match var_name {
             "idempotency_key" => {
@@ -3520,10 +3488,7 @@ impl GatewayHandler {
 
         // ── Idempotency check ─────────────────────────────────────────────────
         let (idempotency_key, source_epoch_envelope) = {
-            let session = self
-                .sessions
-                .entry(conn_id.to_string())
-                .or_insert_with(SessionState::new);
+            let session = self.sessions.entry(conn_id.to_string()).or_default();
             (session.idempotency_key, session.source_epoch_envelope)
         };
         if idempotency_key.is_none() && source_epoch_envelope.is_none() {
@@ -3834,10 +3799,7 @@ impl GatewayHandler {
 
         // Check cursor limit
         let cursor_count = {
-            let session = self
-                .sessions
-                .entry(conn_id_str.to_string())
-                .or_insert_with(SessionState::new);
+            let session = self.sessions.entry(conn_id_str.to_string()).or_default();
             session.cursors.len()
         };
         if cursor_count >= MAX_CURSORS_PER_CONNECTION {
@@ -3849,10 +3811,7 @@ impl GatewayHandler {
 
         // Check for duplicate cursor name
         {
-            let session = self
-                .sessions
-                .entry(conn_id_str.to_string())
-                .or_insert_with(SessionState::new);
+            let session = self.sessions.entry(conn_id_str.to_string()).or_default();
             if session.cursors.contains_key(&cursor_name) {
                 return Ok(vec![promote_response(Response::Error(Box::new(
                     ErrorInfo::new("ERROR".to_string(), "42P03".to_string(),
@@ -3882,10 +3841,7 @@ impl GatewayHandler {
 
         // Store in session
         {
-            let mut session = self
-                .sessions
-                .entry(conn_id_str.to_string())
-                .or_insert_with(SessionState::new);
+            let mut session = self.sessions.entry(conn_id_str.to_string()).or_default();
             session
                 .cursors
                 .insert(cursor_name.clone(), CursorState { rows, position: 0 });
@@ -3898,7 +3854,7 @@ impl GatewayHandler {
 
     fn handle_fetch_cursor(
         &self,
-        q: &str,
+        _q: &str,
         ql: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
@@ -3922,8 +3878,8 @@ impl GatewayHandler {
         let (count_str, cursor_name) = if let Some(from_pos) = after_fetch.find(" from ") {
             let count_part = after_fetch[..from_pos].trim();
             // Strip "forward" keyword
-            let count_part = if count_part.starts_with("forward ") {
-                count_part["forward ".len()..].trim()
+            let count_part = if let Some(rest) = count_part.strip_prefix("forward ") {
+                rest.trim()
             } else {
                 count_part
             };
@@ -3966,7 +3922,7 @@ impl GatewayHandler {
         };
         drop(session_opt);
 
-        let (start, end, fetched_rows) = match cursor_data {
+        let (_start, end, fetched_rows) = match cursor_data {
             Some(d) => d,
             None => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
@@ -3983,7 +3939,7 @@ impl GatewayHandler {
             }
         }
 
-        let n_fetched = fetched_rows.len();
+        let _n_fetched = fetched_rows.len();
 
         // Build DataRow responses
         let schema = Arc::new(vec![FieldInfo::new(
@@ -4012,7 +3968,7 @@ impl GatewayHandler {
     /// MOVE [FORWARD] n FROM <name> | MOVE ALL FROM <name>
     fn handle_move_cursor(
         &self,
-        q: &str,
+        _q: &str,
         ql: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
@@ -4032,8 +3988,8 @@ impl GatewayHandler {
         let after_move = ql["move ".len()..].trim();
         let (count_str, cursor_name) = if let Some(from_pos) = after_move.find(" from ") {
             let count_part = after_move[..from_pos].trim();
-            let count_part = if count_part.starts_with("forward ") {
-                count_part["forward ".len()..].trim()
+            let count_part = if let Some(rest) = count_part.strip_prefix("forward ") {
+                rest.trim()
             } else {
                 count_part
             };
@@ -4094,7 +4050,7 @@ impl GatewayHandler {
     /// CLOSE <name> | CLOSE ALL
     fn handle_close_cursor(
         &self,
-        q: &str,
+        _q: &str,
         ql: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
@@ -4684,10 +4640,7 @@ impl StartupHandler for GatewayHandler {
                             .metadata_mut()
                             .insert("_rs_conn_id".to_string(), conn_id.clone());
                         {
-                            let mut session = self
-                                .sessions
-                                .entry(conn_id.clone())
-                                .or_insert_with(SessionState::new);
+                            let mut session = self.sessions.entry(conn_id.clone()).or_default();
                             session.application_name = app_name;
                             session.scram_auth_state = ScramAuthState::Idle;
                         }
@@ -4725,10 +4678,7 @@ impl StartupHandler for GatewayHandler {
                             .insert("_rs_conn_id".to_string(), conn_id.clone());
                         let salt: [u8; 4] = rand::random();
                         {
-                            let mut session = self
-                                .sessions
-                                .entry(conn_id.clone())
-                                .or_insert_with(SessionState::new);
+                            let mut session = self.sessions.entry(conn_id.clone()).or_default();
                             session.application_name = app_name;
                             session.md5_auth_salt = Some(salt);
                         }
@@ -4761,15 +4711,12 @@ impl StartupHandler for GatewayHandler {
             }
 
             // Off / Oidc / Mtls: finish authentication with per-connection pid/secret
-            if let Some(conn_id) = CONN_ID.try_with(|id| id.clone()).ok() {
+            if let Ok(conn_id) = CONN_ID.try_with(|id| id.clone()) {
                 client
                     .metadata_mut()
                     .insert("_rs_conn_id".to_string(), conn_id.clone());
                 let (pid, secret) = {
-                    let mut session = self
-                        .sessions
-                        .entry(conn_id.clone())
-                        .or_insert_with(SessionState::new);
+                    let mut session = self.sessions.entry(conn_id.clone()).or_default();
                     session.application_name = app_name;
                     (session.backend_pid, session.cancel_secret)
                 };
@@ -4782,9 +4729,7 @@ impl StartupHandler for GatewayHandler {
                 client
                     .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
                     .await?;
-                if let Some(params) =
-                    GatewayServerParameterProvider::default().server_parameters(client)
-                {
+                if let Some(params) = GatewayServerParameterProvider.server_parameters(client) {
                     for (k, v) in params {
                         client
                             .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
@@ -4806,7 +4751,7 @@ impl StartupHandler for GatewayHandler {
                     .await?;
                 client.set_state(PgWireConnectionState::ReadyForQuery);
             } else {
-                finish_authentication(client, &GatewayServerParameterProvider::default()).await?;
+                finish_authentication(client, &GatewayServerParameterProvider).await?;
             }
             return Ok(());
         }
@@ -5005,7 +4950,7 @@ impl StartupHandler for GatewayHandler {
                                 .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
                                 .await?;
                             if let Some(params) =
-                                GatewayServerParameterProvider::default().server_parameters(client)
+                                GatewayServerParameterProvider.server_parameters(client)
                             {
                                 for (k, v) in params {
                                     client
@@ -5075,9 +5020,7 @@ impl StartupHandler for GatewayHandler {
                     client
                         .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
                         .await?;
-                    if let Some(params) =
-                        GatewayServerParameterProvider::default().server_parameters(client)
-                    {
+                    if let Some(params) = GatewayServerParameterProvider.server_parameters(client) {
                         for (k, v) in params {
                             client
                                 .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
@@ -5136,10 +5079,7 @@ impl SimpleQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
-            let mut session = self
-                .sessions
-                .entry(conn_id.clone())
-                .or_insert_with(SessionState::new);
+            let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
                     Principal::Jwt {
@@ -5184,7 +5124,7 @@ impl SimpleQueryHandler for GatewayHandler {
                         all_responses.push(promote_response(r));
                     }
                 }
-                let coerced: Vec<Response<'a>> = all_responses.into_iter().map(|r| r).collect();
+                let coerced: Vec<Response<'a>> = all_responses.into_iter().collect();
                 return Ok(coerced);
             } else if active_statements.len() == 1 {
                 return self.do_query_single(client, query, &conn_id).await;
@@ -5386,7 +5326,7 @@ impl ExtendedQueryHandler for GatewayHandler {
                         )
                     });
 
-                let (rows, schema, command_tag, offset) = if let Some(state) = cached {
+                let (rows, _schema, command_tag, offset) = if let Some(state) = cached {
                     state
                 } else {
                     match ExtendedQueryHandler::do_query(
@@ -5489,9 +5429,9 @@ impl ExtendedQueryHandler for GatewayHandler {
 
                 let end = std::cmp::min(offset + limit, rows.len());
                 let mut rows_sent = 0;
-                for i in offset..end {
+                for row in &rows[offset..end] {
                     client
-                        .feed(PgWireBackendMessage::DataRow(rows[i].clone()))
+                        .feed(PgWireBackendMessage::DataRow(row.clone()))
                         .await?;
                     rows_sent += 1;
                 }
@@ -5589,10 +5529,7 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // Sync principal from startup metadata into the session (once per connection).
         if let Some(raw_principal) = client.metadata().get("_rs_principal").cloned() {
-            let mut session = self
-                .sessions
-                .entry(conn_id.clone())
-                .or_insert_with(SessionState::new);
+            let mut session = self.sessions.entry(conn_id.clone()).or_default();
             if session.principal == Principal::System && raw_principal != "system" {
                 session.principal = if let Some(sub) = raw_principal.strip_prefix("jwt:") {
                     Principal::Jwt {
@@ -6371,18 +6308,13 @@ fn parse_copy_to_stdout_view(q: &str) -> Option<String> {
 
 /// Build FieldInfo list for a query (for DESCRIBE).
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
-    if let Some(catalog_resp) =
+    if let Some(CatalogResponse::Rows { columns, .. }) =
         catalog.handle_query(q, &crate::catalog_stubs::SessionInfo::default())
     {
-        match catalog_resp {
-            CatalogResponse::Rows { columns, .. } => {
-                return columns
-                    .iter()
-                    .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
-                    .collect();
-            }
-            _ => {}
-        }
+        return columns
+            .iter()
+            .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+            .collect();
     }
     if let Some(view_name) = extract_view_name_from_select(q) {
         if let Some(cv) = catalog.get_view(&view_name) {
@@ -7065,8 +6997,8 @@ fn extract_sql_refs(sql: &str) -> Vec<String> {
     let tokens_orig: Vec<&str> = sql.split_whitespace().collect();
     let tokens_lower: Vec<String> = tokens_orig.iter().map(|t| t.to_lowercase()).collect();
     let mut deps = Vec::new();
-    for i in 0..tokens_lower.len() {
-        if tokens_lower[i] == "from" || tokens_lower[i] == "join" {
+    for (i, tok_lower) in tokens_lower.iter().enumerate() {
+        if tok_lower == "from" || tok_lower == "join" {
             if let Some(next) = tokens_orig.get(i + 1) {
                 // Skip subquery openers
                 if next.starts_with('(') {
@@ -7267,7 +7199,10 @@ fn build_row_key(cols: &[String], vals: &[String]) -> String {
 /// becomes its own entry instead of being silently mis-split). A malformed
 /// row (wrong value count relative to the declared column list, or relative
 /// to the first row when no column list is given) is a hard parse error.
-fn parse_insert(q: &str) -> Result<(String, Vec<String>, Vec<Vec<String>>), String> {
+/// Result of parsing an `INSERT` statement: `(table_name, col_names, rows)`.
+type ParsedInsert = (String, Vec<String>, Vec<Vec<String>>);
+
+fn parse_insert(q: &str) -> Result<ParsedInsert, String> {
     let ql = q.to_lowercase();
     let start = ql.find("insert into ").ok_or("not an INSERT")?;
     let after_lower = ql[start + 12..].trim_start().to_string();
@@ -7442,7 +7377,9 @@ fn split_value_tuples(s: &str) -> Result<Vec<String>, String> {
 /// Parse `UPDATE <table> SET col = val [, ...] WHERE col = val`.
 ///
 /// Returns `(table, set_pairs, where_pairs)`.
-fn parse_update(q: &str) -> Result<(String, Vec<(String, String)>, Vec<(String, String)>), String> {
+type ParsedUpdate = (String, Vec<(String, String)>, Vec<(String, String)>);
+
+fn parse_update(q: &str) -> Result<ParsedUpdate, String> {
     let ql = q.to_lowercase();
     let after = ql.strip_prefix("update ").ok_or("not UPDATE")?.trim_start();
     let _orig_after = q[q.to_lowercase().find("update ").unwrap() + 7..].trim_start();
@@ -7616,10 +7553,7 @@ mod s4_tests {
         // Create a session for alice in ns-a
         let conn_id = "test-conn-1";
         {
-            let mut session = handler
-                .sessions
-                .entry(conn_id.to_string())
-                .or_insert_with(SessionState::new);
+            let mut session = handler.sessions.entry(conn_id.to_string()).or_default();
             session.current_namespace = "ns-a".to_string();
             session.principal = Principal::Jwt {
                 sub: "alice".to_string(),
@@ -7669,10 +7603,7 @@ mod s4_tests {
         // Create a session for carol in ns-a
         let conn_id = "test-conn-2";
         {
-            let mut session = handler
-                .sessions
-                .entry(conn_id.to_string())
-                .or_insert_with(SessionState::new);
+            let mut session = handler.sessions.entry(conn_id.to_string()).or_default();
             session.current_namespace = "ns-a".to_string();
             session.principal = Principal::Jwt {
                 sub: "carol".to_string(),
@@ -7717,10 +7648,7 @@ mod s4_tests {
 
         let conn_id = "audit-conn";
         {
-            let mut s = handler
-                .sessions
-                .entry(conn_id.to_string())
-                .or_insert_with(crate::session::SessionState::new);
+            let mut s = handler.sessions.entry(conn_id.to_string()).or_default();
             s.principal = crate::auth::Principal::Jwt {
                 sub: "alice".to_string(),
             };
@@ -7770,10 +7698,7 @@ mod s4_tests {
 
         let conn_id = "sys-conn";
         {
-            let mut s = handler
-                .sessions
-                .entry(conn_id.to_string())
-                .or_insert_with(crate::session::SessionState::new);
+            let mut s = handler.sessions.entry(conn_id.to_string()).or_default();
             s.idempotency_key = Some([2u8; 16]);
         }
 

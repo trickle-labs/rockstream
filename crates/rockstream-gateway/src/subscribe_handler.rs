@@ -394,18 +394,18 @@ pub fn passes_where(encoded_row: &Bytes, where_clause: Option<&str>, col_names: 
                 } else {
                     lhs.partial_cmp(rhs)
                 };
-                return match (cmp, *op) {
+                return matches!(
+                    (cmp, *op),
                     (Some(std::cmp::Ordering::Greater), ">")
-                    | (Some(std::cmp::Ordering::Greater), ">=")
-                    | (Some(std::cmp::Ordering::Equal), ">=")
-                    | (Some(std::cmp::Ordering::Less), "<")
-                    | (Some(std::cmp::Ordering::Less), "<=")
-                    | (Some(std::cmp::Ordering::Equal), "<=")
-                    | (Some(std::cmp::Ordering::Equal), "=")
-                    | (Some(std::cmp::Ordering::Less), "!=")
-                    | (Some(std::cmp::Ordering::Greater), "!=") => true,
-                    _ => false,
-                };
+                        | (Some(std::cmp::Ordering::Greater), ">=")
+                        | (Some(std::cmp::Ordering::Equal), ">=")
+                        | (Some(std::cmp::Ordering::Less), "<")
+                        | (Some(std::cmp::Ordering::Less), "<=")
+                        | (Some(std::cmp::Ordering::Equal), "<=")
+                        | (Some(std::cmp::Ordering::Equal), "=")
+                        | (Some(std::cmp::Ordering::Less), "!=")
+                        | (Some(std::cmp::Ordering::Greater), "!=")
+                );
             }
         }
     }

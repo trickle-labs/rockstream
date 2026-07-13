@@ -25,15 +25,17 @@ pub enum AuthMode {
     Md5,   // --auth=md5: MD5 password with RoleCatalog
 }
 
-impl AuthMode {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::str::FromStr for AuthMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "oidc" => AuthMode::Oidc,
             "mtls" => AuthMode::Mtls,
             "scram" => AuthMode::Scram,
             "md5" => AuthMode::Md5,
             _ => AuthMode::Off,
-        }
+        })
     }
 }
 
@@ -280,6 +282,12 @@ pub struct JwtVerifier {
     default_key: Option<Vec<u8>>, // for HS256 tests
 }
 
+impl Default for JwtVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JwtVerifier {
     pub fn new() -> Self {
         Self {
@@ -402,7 +410,7 @@ mod tests {
     /// --auth=off: AuthMode::Off produces Principal::System; zero JWKS calls.
     #[test]
     fn auth_off_bypasses_all_checks() {
-        let mode = AuthMode::from_str("off");
+        let mode: AuthMode = "off".parse().unwrap();
         assert_eq!(mode, AuthMode::Off);
 
         let p = Principal::System;
