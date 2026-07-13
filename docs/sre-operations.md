@@ -51,11 +51,50 @@ To debug critical catalog errors, search log files for `RS-XXXX` codes (e.g. `RS
 
 ## Support Bundle Parsing
 
-The support bundle is generated via `rockstream support-bundle` as a tarball:
-```bash
-tar -xzvf support-bundle.tar.gz
+There is no `rockstream support-bundle` CLI command today. Instead, a support
+bundle is generated automatically every time a node runs `rockstream start`
+(`write_support_bundle()` in `crates/rockstream-cli/src/lib.rs`), written as a
+single pretty-printed JSON file directly under the node's `--storage`
+directory:
+
 ```
-It contains:
-- `audit.jsonl`: Complete sequence of control plane events and administrative actions.
-- `config.toml`: Reloaded node settings and active cluster parameters.
-- `metrics.json`: Per-law statistical snapshots from the last 24h.
+<storage>/support-bundle-<generated_at_ms>.json
+```
+
+Its top-level shape (field-for-field, no tarball, no separate
+`audit.jsonl`/`config.toml`/`metrics.json` files):
+
+```json
+{
+  "generated_at_ms": 1732000000000,
+  "system_info": {
+    "version": "0.45.5",
+    "os": "linux",
+    "arch": "x86_64",
+    "role": "all"
+  },
+  "metrics": {
+    "uptime_ms": 1234,
+    "audit_events_emitted": 6
+  },
+  "audit_events": [
+    {
+      "timestamp_ms": 1732000000000,
+      "actor": "system",
+      "action": "server.started",
+      "resource": "rockstream",
+      "error_code": null,
+      "detail": null
+    }
+  ]
+}
+```
+
+Parse it directly with any JSON tool, e.g.:
+```bash
+jq '.system_info, .metrics' support-bundle-*.json
+```
+
+A two-word `rockstream support bundle` CLI command that regenerates or
+re-exports this bundle on demand is roadmapped for v0.55 and is not yet
+available.

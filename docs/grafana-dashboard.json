@@ -66,30 +66,12 @@
       },
       "id": 3,
       "title": "Memory / State Budget Utilization",
+      "description": "Ratio of live memory consumption per workload (`workload_memory_bytes`) against the `state_budget_gb` config knob, expressed in bytes via the `$state_budget_limit_bytes` dashboard variable (no `memory_limit`/`memory_limit_bytes` metric is exported; `state_budget_gb` is a static config value, not a Prometheus metric).",
       "type": "timeseries",
       "targets": [
         {
-          "expr": "workload_memory_bytes / memory_limit",
-          "legendFormat": "{{workload_id}}",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 8
-      },
-      "id": 4,
-      "title": "gRPC Exchange Queue Depths",
-      "type": "timeseries",
-      "targets": [
-        {
-          "expr": "exchange_queue_depth",
-          "legendFormat": "{{channel_id}}",
+          "expr": "workload_memory_bytes / $state_budget_limit_bytes",
+          "legendFormat": "{{workload_name}}",
           "refId": "A"
         }
       ]
@@ -99,6 +81,21 @@
   "schemaVersion": 36,
   "style": "dark",
   "tags": ["rockstream", "observability"],
+  "templating": {
+    "list": [
+      {
+        "name": "state_budget_limit_bytes",
+        "type": "textbox",
+        "label": "State budget limit (bytes)",
+        "description": "Static value in bytes for the `state_budget_gb` config knob (default 10 GiB = 10737418240 bytes; `state_budget_gb` has no corresponding Prometheus metric, so this must be set by the operator to match the cluster's real config).",
+        "current": {
+          "text": "10737418240",
+          "value": "10737418240"
+        },
+        "query": "10737418240"
+      }
+    ]
+  },
   "time": {
     "from": "now-1h",
     "to": "now"

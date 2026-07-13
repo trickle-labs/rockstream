@@ -54,15 +54,19 @@ grows with you, paying object-storage prices.
 
 ### 2. The Mental Model
 
-When you use RockStream, you only ever interact with three kinds of things and
-one verb. The things are **workloads**, **views**, and **sources**. The verb is
-**create**. Everything else — sharding, shuffling, recovery, compaction, garbage
-collection, rebalancing — happens for you, behind a curtain, and you don't
-need to think about it unless something is wrong.
+When you use RockStream today, the SQL-reachable objects are mainly
+**workloads**, **tables**, and **views**. **Sources** and connector-managed
+ingest still exist in the architecture, but they are not yet a pgwire SQL DDL
+surface: `crates/rockstream-gateway/src/server.rs` dispatches `CREATE
+WORKLOAD`, `CREATE TABLE`, `CREATE VIEW`, and `CREATE MATERIALIZED VIEW`, but
+no `CREATE SOURCE` family. Everything else — sharding, shuffling, recovery,
+compaction, garbage collection, rebalancing — happens for you, behind a
+curtain, and you don't need to think about it unless something is wrong.
 
 A **view** is a SQL query that has a name. It might be a tiny one-liner that
 just selects a subset of a table, or it might be a complicated join with
-window functions and recursion. From the outside, a view looks like a table:
+window functions and — in the planned surface described later — recursion.
+From the outside, a view looks like a table:
 you can run `SELECT * FROM my_view` against it just like you would against
 `orders` or `customers`. The difference is that the view's contents are
 computed from other data, and RockStream keeps those contents fresh as the
@@ -79,9 +83,12 @@ machines to use, how big to make each batch, when to flush to disk — to honor
 what you asked for.
 
 The verb is **create**. You write `CREATE MATERIALIZED VIEW`, you submit it,
-and the system goes to work. If you want to change something, you replace it
-or use the blue/green replacement path. The mental model deliberately stops
-there. You never have to ask "which shard does this row live on?" or "is
+and the system goes to work. If you want to change something today, you
+generally use `CREATE OR REPLACE VIEW` / `CREATE OR REPLACE MATERIALIZED VIEW`
+or create a new object name; the blue/green replacement workflow described
+later in this guide is still documented/planned rather than SQL-dispatched.
+The mental model deliberately stops there. You never have to ask "which shard
+does this row live on?" or "is
 operator instance number 47 healthy?" Those questions exist, but they exist
 inside diagnostic tools that you only reach for when something has gone wrong.
 In normal life, you have workloads and views, and that's it.
@@ -194,41 +201,21 @@ clears its backlog, credits replenish and the connector resumes. This same
 mechanism is what makes features like source gating (covered in chapter 21)
 possible.
 
-The takeaway is that you don't usually think about connectors much. You
-declare a source, point it at the system you want data from, and the engine
-takes care of the rest. For getting started quickly, RockStream includes a
-built-in data generator (`CREATE SOURCE ... FROM GENERATE ROWS`) that
-produces synthetic rows without any external dependencies — you can have a
-working materialized view in under two minutes.
+The takeaway is that you don't usually think about connectors much. In the
+current SQL frontend, you create tables and views, while connector-managed
+sources remain a Rust/control-plane concept rather than a `CREATE SOURCE` SQL
+surface (`crates/rockstream-gateway/src/server.rs`,
+`crates/rockstream-sql/src/frontend.rs`). For quick SQL-only experimentation,
+the live ingest path today is `CREATE TABLE` plus `INSERT`/`UPDATE`/`DELETE`
+over pgwire; `CREATE SOURCE ... FROM GENERATE ROWS` is documented/planned, not
+currently dispatched.
 
-**Dead-letter queue.** When a connector encounters a record it cannot
-decode — a malformed message, a schema mismatch, a corrupt payload — it
-doesn't crash or skip the record silently. The record is routed to a
-per-source **dead-letter queue** (DLQ), a catalog table you can query
-with regular SQL:
-
-```sql
-SELECT * FROM rockstream_catalog.dead_letter_queue
-  WHERE source_name = 'kafka_orders';
-```
-
-Each entry records the arrival time, source offset, error code, error
-message, the raw bytes (as hex), and a `replay_attempt` counter. You can
-replay failed records after fixing the underlying issue:
-
-```sql
-ALTER SOURCE kafka_orders REPLAY DEAD_LETTER_QUEUE SINCE '2026-05-01';
-```
-
-Or dismiss records you've confirmed are unrecoverable:
-
-```sql
-ALTER SOURCE kafka_orders DISMISS DEAD_LETTER_QUEUE WHERE error_code = 'RS-1003';
-```
-
-The system proactively warns you when DLQ entries accumulate beyond a
-configurable threshold (`dlq_warn_threshold`, default 100 per hour).
-This surfaces decode problems before they affect downstream freshness.
+**Dead-letter queue.** The DLQ is real as a Rust data model
+(`rockstream-types::dlq`), but it is not yet a SQL-queryable catalog table and
+there is no `ALTER SOURCE ... REPLAY/DISMISS DEAD_LETTER_QUEUE` dispatch in
+`crates/rockstream-gateway/src/server.rs`. So the operational concept is
+accurate, but the SQL snippets that earlier revisions of this guide showed were
+ahead of the current frontend.
 
 ### 5. Deltas and Z-sets
 
@@ -263,8 +250,9 @@ and a count of three in a way that makes the math trickier. Some
 aggregates (like `MIN` and `MAX`) cannot be incrementally updated when a
 row disappears — you need to know what the second-smallest value was, and
 you have to keep that around. Some queries (recursive CTEs, certain
-outer joins) need clever fixed-point machinery. RockStream handles all of
-these, but the underlying idea remains the same: maintain a view by
+outer joins) need clever fixed-point machinery. RockStream handles the
+supported cases today and documents recursion as planned surface, but the
+underlying idea remains the same: maintain a view by
 processing the *changes* to its inputs rather than by re-running the query.
 
 For most workloads, the practical consequence is that view maintenance is
@@ -454,8 +442,11 @@ running the defining query from scratch — either manually with `REFRESH
 MATERIALIZED VIEW` or via triggers that fire on every write. The first
 approach is slow; the second is expensive and serializes writes. In
 RockStream, the view is maintained continuously and incrementally. There
-is no refresh step. There is no per-write trigger. The view simply stays
-fresh as a side effect of the engine processing input epochs.
+is no per-write trigger. The view simply stays fresh as a side effect of
+the engine processing input epochs. The gateway does also recognize
+`REFRESH MATERIALIZED VIEW` (`crates/rockstream-gateway/src/server.rs`), but
+that's an explicit command on top of the continuous incremental path, not
+the primary maintenance mechanism.
 
 Storage-wise, a materialized view occupies space in the system. The
 view's contents are stored in a shard of SlateDB (or across many shards
@@ -474,11 +465,13 @@ the price you pay for incremental maintenance. It is bounded by your
 workload's memory limit (chapter 16), and the system reports how much
 state each view consumes so you can plan.
 
-You can query a materialized view at the latest committed epoch or, in
-some cases, at a historical epoch using `AS OF EPOCH` syntax (covered in
-chapter 22). You can also subscribe to a view's output to receive a
-stream of changes as they happen (chapter 14), which is useful when you
-want to forward updates to external systems.
+You can query a materialized view at the latest committed epoch with
+ordinary `SELECT`. Historical replay is currently exposed through
+`SUBSCRIBE ... AS OF NOW WITH SNAPSHOT` / `SUBSCRIBE ... AS OF EPOCH <n>`
+(chapter 14), not through plain `SELECT ... AS OF ...` syntax. You can
+also subscribe to a view's output to receive a stream of changes as they
+happen (chapter 14), which is useful when you want to forward updates to
+external systems.
 
 ### 11. Inline Views: Just Named Queries
 
@@ -530,21 +523,21 @@ A typical setup looks like this:
 ```sql
 -- Declare the resource policy once.
 CREATE WORKLOAD sales_analytics WITH (
-    FRESHNESS_SLO  = '1s',
-    MEMORY_LIMIT   = '100GB',
-    PRIORITY       = normal
+    FRESHNESS_SLO_MS = 1000,
+    MEMORY_LIMIT     = 107374182400,
+    PRIORITY         = DEFAULT
 );
 
--- Create sources and views; assign them to the workload.
-CREATE SOURCE orders FROM kafka (...);
+-- Assume the input table already exists (for example via CREATE TABLE +
+-- pgwire DML, or via a connector path outside today's SQL surface).
 
 CREATE MATERIALIZED VIEW revenue_by_region
-WITH (WORKLOAD = sales_analytics)
+WITH WORKLOAD = 'sales_analytics'
 AS
     SELECT region, SUM(amount) FROM orders GROUP BY region;
 
 CREATE MATERIALIZED VIEW revenue_by_product
-WITH (WORKLOAD = sales_analytics)
+WITH WORKLOAD = 'sales_analytics'
 AS
     SELECT product_id, SUM(amount) FROM orders GROUP BY product_id;
 ```
@@ -582,10 +575,11 @@ affected. This encourages you to group related views with similar
 operational requirements, which usually matches how teams actually
 operate them.
 
-If you omit `WITH WORKLOAD` when creating a view, the view inherits the
-schema's default workload (set with `ALTER SCHEMA ... SET DEFAULT WORKLOAD
-= name`). If no schema default is set, the view uses the system default
-workload, which has generous limits and normal priority.
+If you omit `WITH WORKLOAD` when creating a view, the current SQL frontend
+does not offer a schema-level `ALTER SCHEMA ... SET DEFAULT WORKLOAD`
+fallback. Earlier design notes described that inheritance path, but the
+live parser only recognizes the per-view `WITH WORKLOAD = '<name>'` clause
+(`crates/rockstream-gateway/src/server.rs`: `parse_create_view_workload()`).
 
 ### 13. Composing Views Out of Views
 
@@ -600,19 +594,21 @@ CREATE MATERIALIZED VIEW recent_orders AS
 CREATE MATERIALIZED VIEW recent_revenue_by_region AS
   SELECT region, SUM(amount) FROM recent_orders GROUP BY region;
 
-CREATE MATERIALIZED VIEW top_recent_regions AS
-  SELECT region FROM recent_revenue_by_region
-  ORDER BY revenue DESC LIMIT 5;
+CREATE MATERIALIZED VIEW revenue_alerts AS
+  SELECT region,
+         revenue,
+         CASE WHEN revenue > 1000 THEN true ELSE false END AS is_large
+  FROM recent_revenue_by_region;
 ```
 
 Each view does one thing. The first filters; the second aggregates; the
-third ranks. From the user's perspective, each view stands on its own:
+third classifies. From the user's perspective, each view stands on its own:
 you can query `recent_orders` directly, or `recent_revenue_by_region`,
-or `top_recent_regions`. From the system's perspective, the three views
+or `revenue_alerts`. From the system's perspective, the three views
 form a chain. When new orders arrive, only deltas flow through the
 chain. The filter view forwards only the orders that match its
 predicate. The aggregate view applies the deltas to its running totals.
-The ranking view updates its top-5 list when totals change.
+The final view derives one more column from those totals.
 
 The frontier protocol coordinates the chain. Each view publishes its
 frontier as it commits each epoch. Downstream views consume frontiers
@@ -677,10 +673,12 @@ SUBSCRIBE revenue_by_region AS OF EPOCH 12345;
 ```
 
 This skips everything before epoch 12345 and streams changes from there
-forward. How far back you can resume is controlled by the view's
-**change retention** (`CHANGE_RETENTION`, default 1 hour). If you try
-to resume from a position older than the retention window, you get an
-error (`RS-2005`) explaining that the data has been garbage-collected.
+forward. How far back you can resume is controlled by the in-memory
+**change log** (`crates/rockstream-gateway/src/change_log.rs`, default
+`CHANGE_LOG_MAX_ENTRIES = 10_000`). If you try to resume from a position
+older than the retained earliest epoch, the subscribe handler returns
+`RS-2006` (`crates/rockstream-gateway/src/subscribe_handler.rs`), not
+`RS-2005`.
 
 **Server-side filtering.** You can push filtering to the server so you
 only receive the changes you care about:
@@ -693,13 +691,10 @@ Column projection works too — only named columns are sent over the wire.
 This reduces network traffic and client-side processing for subscribers
 that only need a subset of the view's output.
 
-**Retention configuration.** Set per-view at creation time:
-
-```sql
-CREATE MATERIALIZED VIEW revenue_by_region
-WITH (CHANGE_RETENTION = '4 hours')
-AS SELECT region, SUM(amount) FROM orders GROUP BY region;
-```
+**Retention configuration.** Earlier design notes described a per-view
+`CHANGE_RETENTION` option, but the current gateway/parser do not recognize
+that clause anywhere. The live subscribe retention knob today is the
+engine-level entry bound in `crates/rockstream-gateway/src/change_log.rs`.
 
 ---
 
@@ -753,9 +748,9 @@ A workload declares its SLO in the `CREATE WORKLOAD` statement:
 
 ```sql
 CREATE WORKLOAD my_workload WITH (
-    FRESHNESS_SLO  = '1s',
-    MEMORY_LIMIT   = '200GB',
-    PRIORITY       = normal
+    FRESHNESS_SLO_MS = 1000,
+    MEMORY_LIMIT     = 214748364800,
+    PRIORITY         = DEFAULT
 );
 ```
 
@@ -820,8 +815,10 @@ When you want to override the tuner, you can. Every adaptive knob has a
 manual setting. You might pin parallelism to a specific value if you're
 benchmarking, or set an epoch ceiling lower than the SLO loop would
 choose if you have a strict freshness requirement that's tighter than
-the budget. Overrides survive across restarts and show up in `SHOW
-WORKLOAD` output so you remember they're there.
+the budget. Overrides survive across restarts and show up in workload
+status / resource-usage inspection rather than a distinct `SHOW
+WORKLOAD` command (`crates/rockstream-gateway/src/server.rs` dispatches
+`SHOW WORKLOAD STATUS`, not `SHOW WORKLOAD`).
 
 The philosophy is that tuning is the system's job, not yours, and
 overrides are escape hatches for the cases where you know something the
@@ -842,9 +839,10 @@ generous state budget, and the system delivers.
 If you want **low latency and low cost**, you accept that throughput
 will be limited: a tight freshness SLO with a constrained state budget
 and a modest cluster size means you can only handle workloads up to a
-certain input rate. The system tells you when that ceiling is reached
-by reporting an SLO violation with a named reason like
-`INPUT_RATE_EXCEEDS_CAPACITY`.
+certain input rate. The system tells you when that ceiling is reached by
+surfacing an SLO violation, resource-budget warnings such as `RS-5018` /
+`RS-5019`, or recovery/backpressure states elsewhere in the diagnostics
+surface.
 
 If you want **high throughput and low cost**, you accept higher latency:
 a loose freshness SLO (say, one minute instead of one second) lets the
@@ -982,7 +980,10 @@ up where it left off, and the accumulated changes flow through as
 either one large epoch or a small number of large epochs — much more
 efficient than processing them in small bites.
 
-In the SQL interface, this looks something like:
+At the mechanism level, this is real: a connector with zero credits stops
+emitting new epochs. But the current pgwire surface does **not** dispatch
+`PAUSE SOURCE` / `RESUME SOURCE`, so the SQL below is target-shape
+documentation rather than a runnable command today:
 
 ```sql
 PAUSE SOURCE my_source;
@@ -1007,51 +1008,31 @@ ordinary operation.
 
 A materialized view is a moving target. Most of the time you want the
 latest committed state, and that's what `SELECT * FROM my_view`
-returns. But sometimes you want to read the view as it was at some
-earlier point — to reproduce a result, to debug a regression, to
-generate a snapshot for downstream comparison. RockStream supports
-this through the `AS OF` clause:
+returns. Today, the SQL surface for historical replay is narrower than
+some earlier drafts of this guide implied:
 
 ```sql
-SELECT * FROM my_view AS OF EPOCH 12345;
-SELECT * FROM my_view AS OF TIMESTAMP '2026-05-28 14:00:00';
+SUBSCRIBE my_view AS OF NOW WITH SNAPSHOT;
+SUBSCRIBE my_view AS OF EPOCH 12345;
 ```
 
-The first form reads at an explicit epoch number. The second form
-translates the timestamp to the nearest committed epoch and reads
-there. Both forms are bounded by the view's retention window: if you
-ask for data older than the retention horizon, you get an error
-explaining what happened.
+Those are the two real historical/streaming read forms parsed by
+`crates/rockstream-gateway/src/subscribe_parser.rs`. Plain `SELECT * FROM
+my_view AS OF EPOCH ...` and `AS OF TIMESTAMP ...` are not dispatched by
+`crates/rockstream-gateway/src/server.rs`, and `rockstream-sql` has no
+lowering support for them.
 
-Retention is a property of the materialized view. By default, the
-system retains enough history to cover the last seven days or one
-hundred and twenty-eight committed checkpoints, whichever is longer.
-You can override this per view:
+Replay depth is currently bounded by the in-memory change log entry
+window (`CHANGE_LOG_MAX_ENTRIES`) rather than a per-view SQL `retention`
+option. Falling behind that window returns `RS-2006`
+(`crates/rockstream-gateway/src/subscribe_handler.rs`).
 
-```sql
-CREATE MATERIALIZED VIEW my_view WITH (retention = '30d') AS ...;
-```
-
-Retention costs storage. A view with thirty days of retention may have
-significantly more data on disk than a view with the default seven
-days, depending on how much the view changes. The system reports
-per-view storage usage so you can tune this consciously.
-
-For ad-hoc analytics over a longer history, the **cold tier** is the
-right tool. The cold tier writes periodic snapshots of view contents as
-Iceberg or Delta Lake tables in object storage. Tools like DuckDB,
-Trino, and Spark can read these directly without going through
-RockStream. The cold tier is enabled per view and runs on a slower
-cadence — typically every few minutes to every hour — producing
-columnar snapshots that are cheap to scan but lag behind the live
-view's state.
-
-The distinction matters. The live view (in SlateDB) is optimized for
-incremental maintenance and key-based lookups; it serves point queries
-and dashboards with low latency. The cold tier (in Iceberg) is
-optimized for analytical scans; it serves ad-hoc SQL over weeks or
-months of data. You usually want both: live for dashboards, cold for
-exploration.
+For ad-hoc analytics over a longer history, the **cold tier** remains
+the intended shape: `CREATE SINK ... FOR VIEW ... TO ICEBERG|DELTA ...`
+is real DDL, and the sink connector implementations exist, but
+`handle_create_sink()` currently registers sink metadata in the gateway
+catalog rather than wiring the sink automatically into the epoch-commit
+loop (`crates/rockstream-gateway/src/server.rs`, `docs/cold-tier-sinks.md`).
 
 ### 23. Recursive Queries and Graphs
 
@@ -1082,21 +1063,12 @@ edges might create new reachability paths. Deleted edges might remove
 paths. The system has to figure out which paths in the answer are
 still valid after every change.
 
-RockStream supports this through a technique called **semi-naive
-evaluation** for insert-only changes and **Delete-and-Rederive (DRed)**
-for mixed changes. Semi-naive works on the principle that any new path
-must involve at least one new edge, so you only need to consider
-extensions of recently-added edges rather than re-running the whole
-recursion. DRed is more involved: it tentatively removes paths that
-depended on deleted edges, then re-derives any paths that survive
-through alternate routes. Both techniques are bounded by a recursion
-depth limit to prevent runaway iteration.
-
-For most users, the only thing to know is that `WITH RECURSIVE` works
-and that the system maintains it incrementally. You write the SQL and
-the engine handles the rest. For very large or deeply recursive
-workloads, there are diagnostic tools that let you see what strategy
-the engine chose and how many iterations it took.
+Those are still important design goals, but they are not yet part of the
+live SQL frontend. `crates/rockstream-sql/src/lower.rs` reports
+`LogicalPlan::RecursiveQuery` as unsupported, so `WITH RECURSIVE`
+belongs in the documented/planned surface rather than the implemented
+surface today. The semi-naive/DRed discussion remains useful as the
+architectural direction for future recursion support.
 
 ---
 
@@ -1114,11 +1086,11 @@ of the time. A value of 0.0 means it was never met.
 You put this single number on your dashboard, one per view. If
 they're all at 1.0, everything is fine and you don't need to look at
 anything else. If one dips, you click into it and the system shows you
-the **degradation reason**: a short, named code like
-`INPUT_RATE_EXCEEDS_CAPACITY`, `SHARD_REBALANCING`, `OBJECT_STORE_SLOW`,
-`STATE_BUDGET_EXHAUSTED`. Each reason has a known meaning and a known
-mitigation. You don't have to chase mysterious symptoms; the system
-tells you what's wrong in operator terms.
+the **degradation reason** or related warning/error code. The current
+source tree has concrete budget and recovery signals such as `RS-5018`,
+`RS-5019`, `RS-3602`, and `RS-3603`; the exact public taxonomy is still
+evolving, but the intent is the same: you shouldn't have to infer the
+problem from raw counters alone.
 
 This is a deliberate operational stance. Most monitoring systems give
 you a thousand metrics and let you figure out which ones matter.
@@ -1139,8 +1111,8 @@ SlateDB single-writer mechanism prevents split-brain: the old writer's
 manifest is fenced, so even if it comes back online it cannot commit.
 The new writer opens the shard, reads its last committed frontier,
 replays any WAL entries beyond the last checkpoint, and resumes
-processing from there. The view transitions to a `RECOVERING`
-state during this process and back to `ACTIVE` when the frontier
+processing from there. The pipeline enters a `RECOVERING`
+state during this process and returns to normal running operation when the frontier
 catches up. The recovery time is bounded by the cluster's recovery
 SLO, typically under sixty seconds.
 
@@ -1209,20 +1181,15 @@ mental model and the SQL never change.
 If multiple teams share a cluster, you'll want each team's workloads to
 be isolated from the others. RockStream supports this through
 **namespaces**, which are roughly analogous to PostgreSQL databases:
-each namespace has its own catalog of tables, views, and workloads, and
-its own set of quotas.
-
-A workload lives in a namespace. The workload's resource usage counts
-against the namespace's quotas, not against any global cluster budget.
-This means one team's runaway workload cannot starve another team's
-views: if team A's namespace exceeds its budget, team A's views
-degrade, but team B's views continue normally.
+each namespace has its own catalog of tables, views, and workloads.
 
 Access control is also per-namespace. A user with `pipeline_owner`
 rights on namespace A can deploy, alter, and drop views in
-namespace A, but cannot even see what exists in namespace B. The pgwire
-gateway routes connections to the right namespace based on the
-connection string, exactly like a database in PostgreSQL.
+namespace A, but cannot even see what exists in namespace B. The current
+gateway surface uses `CREATE NAMESPACE` and session namespace switching
+through `SET search_path = <namespace>` (`crates/rockstream-gateway/src/server.rs`);
+it does not expose a separate "namespace quotas" SQL statement family in
+the gateway today.
 
 For most single-team deployments, you don't need to think about
 namespaces; there's a default namespace and everything goes there. For
@@ -1239,80 +1206,39 @@ it accordingly:
   encoding; reads project the new column as NULL or a default until fresh
   deltas rewrite the rows.
 - **Breaking changes** (rename, drop, narrow, change a join key type)
-  require explicit action. The view transitions to `BLOCKED(RS-1002)` and
-  stops consuming new offsets until the operator resolves the mismatch.
+  require explicit action. At the current SQL/frontend boundary, the
+  concrete guarantee is that incompatible view changes surface `RS-1002`.
 
-For planned breaking changes, RockStream offers **zero-downtime view
-replacement**:
-
-```sql
--- Create a replacement that hydrates in the background
-CREATE REPLACEMENT MATERIALIZED VIEW v2 FOR revenue_by_region AS
-  SELECT region, SUM(amount), COUNT(*) AS order_count
-  FROM   orders
-  GROUP  BY region;
-
--- Monitor progress
-SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW revenue_by_region;
-
--- Apply atomically when the replacement has caught up
-ALTER MATERIALIZED VIEW revenue_by_region APPLY REPLACEMENT v2;
-```
-
-During replacement, the original view continues serving queries at full
-SLO. The new view backfills in the background, running in parallel with
-the live version. Once the replacement's frontier catches up to the
-original's frontier, `APPLY REPLACEMENT` atomically swaps query routing.
-Subscribers see the new definition without reconnecting. If you change
-your mind, `ALTER MATERIALIZED VIEW ... DISCARD REPLACEMENT v2` abandons
-the shadow plan and frees its resources.
-
-**Proactive detection.** You can inspect upcoming incompatibilities before
-they block consumption:
-
-```sql
-SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA reporting;
-```
-
-When a connector detects an incompatible upstream schema change that hasn't
-yet been applied, the system emits a proactive `NOTICE` giving you time to
-prepare a replacement before consumption blocks.
+At the current SQL/frontend layer, the guaranteed behavior is narrower:
+incompatible view changes return `RS-1002` from the SQL/frontend path, and
+the blue/green replacement workflow is still documented/planned rather
+than dispatched. `crates/rockstream-gateway/src/server.rs` has no
+`replacement` or `schema_evolution` statement family, even though
+`rockstream-types::error_code` already reserves `RS-3607`/`RS-3608`/`RS-3609`
+for the future clone/backfill/flip lifecycle.
 
 ### 29. View Lifecycle States
 
-A materialized view isn't just "running" or "stopped." It has a rich
-lifecycle with named states that tell you exactly what's happening and
-what, if anything, you need to do. The system never fails silently;
-every transition has a name and a reason.
+A materialized view isn't just "running" or "stopped." The current data
+model in `crates/rockstream-types/src/view_lifecycle.rs` already defines a
+small lifecycle vocabulary, even though the richer `SHOW VIEW STATUS` SQL
+surface described in earlier drafts is not yet dispatched by
+`crates/rockstream-gateway/src/server.rs`.
 
 | State | What it means | What to do |
 |---|---|---|
-| `HEALTHY` | SLO met, resources within budget. | Nothing. |
-| `BUILDING` | Initial backfill in progress. View is queryable but may be incomplete. | Wait; monitor with `SHOW BACKFILL STATUS`. |
-| `BACKFILLING` | Loading historical source data. SLO compliance not counted yet. | Wait or raise bootstrap parallelism. |
-| `RECOVERING` | Replaying from checkpoint after a worker restart. | Watch recovery progress. |
-| `STRESSED` | SLO met but quota ≥ 80% utilised. | Plan capacity addition. |
-| `OVER_BUDGET_RELAXED` | State budget full; freshness degraded to stay within limits. | Raise `MEMORY_LIMIT` or revise query. |
-| `RPS_THROTTLED` | Object-store quota is the bottleneck. | Raise `object_store_rps` or revise SLO. |
-| `PAUSED` | Explicitly paused by operator or by admission control. | Resume when ready. |
-| `REPLACING` | A replacement view is hydrating in the background. | Monitor with `SHOW REPLACEMENT STATUS`. |
-| `BLOCKED` | Non-recoverable error (auth failure, schema mismatch). | Inspect reason; fix; resume. |
+| `RUNNING` | The view is actively processing deltas. | Nothing. |
+| `BACKFILLING(from epoch N)` | Initial or catch-up backfill is running. | Wait for the frontier to advance. |
+| `OVER_BUDGET_RELAXED` | State-budget pressure has relaxed the freshness target. | Raise `MEMORY_LIMIT` or revise the query/workload. |
+| `PAUSED` | The view is paused in the lifecycle model. | Resume through the control-plane path that paused it. |
 
 Every state transition is recorded in the audit log with the metric or
 event that caused it. The SLO compliance number dips together with the
 state transition so your dashboard tells the same story.
 
-You can query view lifecycle status at multiple levels:
-
-```sql
-SHOW VIEW STATUS;                              -- all views
-SHOW VIEW STATUS FOR SCHEMA reporting;         -- one schema
-SHOW BACKFILL STATUS FOR MATERIALIZED VIEW reporting.daily_summary;
-```
-
-The output includes the view's lifecycle state, freshness, SLO compliance,
-workload assignment, and how the workload was resolved (`workload_source`:
-`view`, `schema_default`, or `system_default`).
+The `ViewStatus` / `BackfillStatus` structs are already defined in
+`rockstream-types/src/view_lifecycle.rs`, but `SHOW VIEW STATUS` and
+`SHOW BACKFILL STATUS` are not yet wired into the gateway dispatch table.
 
 ### 30. Diagnosing Your Views
 
@@ -1350,14 +1276,15 @@ EXPLAIN INCREMENTAL ANALYZE revenue_by_region;
 without executing:
 
 ```sql
-EXPLAIN INCREMENTAL ESTIMATE CREATE MATERIALIZED VIEW ...;
+EXPLAIN INCREMENTAL ESTIMATE
+SELECT region, SUM(amount) FROM orders GROUP BY region;
 ```
 
-This reports predicted state size, per-operator epoch latency,
-object-store request rate, and minimum achievable frontier lag. When
-`CREATE MATERIALIZED VIEW` would require an expensive backfill, the
-system presents the cost estimate interactively and waits for
-confirmation. Add `WITHOUT CONFIRMATION` for CI/programmatic use.
+This reports predicted state size and estimated operator cost for the
+query you pass to the frontend. The current gateway path does not have
+an interactive confirmation / `WITHOUT CONFIRMATION` workflow around
+`CREATE MATERIALIZED VIEW`; that text in earlier revisions described a
+planned control flow, not today's parser/dispatch behavior.
 
 ### 31. Session Ergonomics: Read-After-Write and Staleness
 
@@ -1379,11 +1306,9 @@ disable it:
 SET rockstream.session_wait_for = off;
 ```
 
-Or use a per-query hint for a single read:
-
-```sql
-SELECT /*+ ALLOW_STALE */ * FROM order_summary WHERE order_id = 42;
-```
+There is no per-query `/*+ ALLOW_STALE */` hint parser in the current
+gateway; session-level `SET rockstream.max_staleness = ...` is the real
+staleness control surface.
 
 **Cross-session coordination.** When one service writes and a different
 service reads, use a write fence token:
@@ -1395,7 +1320,8 @@ SELECT rockstream.write_fence() AS fence;
 -- Pass 'fence' to the reader service via your application protocol
 
 -- Reader session: wait for that specific write
-SELECT * FROM order_summary WHERE rockstream.after_fence(:fence);
+SELECT * FROM order_summary
+WHERE rockstream.after_fence('{"table_name":"orders","source_epoch":42}');
 ```
 
 **Bounded staleness for analytics.** Sessions that accept a bounded-stale
@@ -1411,19 +1337,18 @@ enough" is fine and you don't want to block on frontier advancement.
 
 ### 32. Resource Visibility and Alerts
 
-You can always see what your cluster's resources are doing. Once
-`NEW_ROADMAP.md` v0.45 (wiring `SHOW RESOURCE USAGE` into the gateway) and
-v0.45.5 ship, the system will expose resource usage through standard SQL
-(found not yet reachable via SQL by the 2026-07-11 usability review — the
-statements below are the target shape, not runnable today):
+You can always see what your cluster's resources are doing. The
+2026-07-11 caveat about this section being "target shape only" is now
+obsolete: these statements are dispatched in
+`crates/rockstream-gateway/src/server.rs` and backed by
+`crates/rockstream-gateway/src/catalog_stubs.rs`:
 
 ```sql
 -- Cluster-wide summary
 SHOW CLUSTER RESOURCE USAGE;
 
 -- Per-view detail
-SELECT * FROM rockstream_catalog.view_resource_usage
-  WHERE schema_name = 'reporting';
+SELECT * FROM rockstream_catalog.view_resource_usage;
 
 -- Per-workload detail
 SELECT * FROM rockstream_catalog.workload_resource_usage;
@@ -1441,41 +1366,18 @@ thresholds, it emits actionable notices:
 These fire automatically and appear in the SQL session, the audit log,
 and any configured alerting integration.
 
-**Actionable errors.** Every RockStream error code (`RS-XXXX`) includes a
-structured `next_steps` field — a human-readable description of what to
-do. You never get a raw error without guidance. The error tells you what
-happened, why it happened, and what to try next.
+**Actionable errors.** RockStream errors are designed to include
+human-readable next-step guidance. You never get a raw error without
+helpful context: the message tells you what happened, why it happened,
+and what to try next.
 
 ### 33. Background DDL and Schema-Level Lifecycle
 
-`CREATE MATERIALIZED VIEW` runs backfill in the background by default.
-The session that issues the DDL does not need to stay open while the
-view hydrates. For explicit control:
-
-```sql
-SET BACKGROUND_DDL = ON;
-CREATE MATERIALIZED VIEW reporting.large_view AS SELECT ...;
--- Returns immediately with an INFO message and job_id.
-```
-
-If you want to wait for a view to become ready (for example, in a
-migration script):
-
-```sql
-WAIT FOR MATERIALIZED VIEW reporting.large_view TO BE READY TIMEOUT '1 hour';
-```
-
-**Schema-level operations.** Pause or resume all views in a schema
-atomically:
-
-```sql
-ALTER SCHEMA reporting PAUSE;
--- ... maintenance window, schema changes, bulk loads ...
-ALTER SCHEMA reporting RESUME;
-```
-
-This is more convenient than pausing views individually when you need to
-perform coordinated maintenance across a group of related views.
+Earlier revisions of this guide described `SET BACKGROUND_DDL`,
+`WAIT FOR MATERIALIZED VIEW ... TO BE READY`, and schema-level
+`ALTER SCHEMA ... PAUSE/RESUME` commands. None of those statement shapes
+appear in the current gateway dispatch table, so treat them as planned
+surface rather than runnable SQL today.
 
 ---
 
@@ -1521,16 +1423,12 @@ upstream view. In practice you set a freshness SLO and let the system
 choose its cadence.
 
 **Change retention** — How long a view's change history is kept
-available for subscribers to resume from after a disconnect. When a
-`SUBSCRIBE` connection drops and reconnects, it can specify an epoch to
-resume from. If that epoch is within the change retention window, the
-subscriber receives exactly the changes it missed — no data lost, no
-need to restart from scratch. If the epoch is older than the retention
-window, the subscriber gets an error (`RS-2005`) and must restart with a
-full snapshot. The default is one hour, configurable per view with
-`CHANGE_RETENTION`. Longer retention costs more storage in the change
-log; shorter retention reduces storage but increases the risk that a
-slow subscriber has to re-snapshot.
+available for subscribers to resume from after a disconnect. In the
+current gateway implementation, this is bounded by the in-memory change
+log entry count (`CHANGE_LOG_MAX_ENTRIES`) rather than a per-view SQL
+`CHANGE_RETENTION` clause. If a subscriber asks for an epoch older than
+the retained earliest epoch, the subscribe path returns `RS-2006` and
+the client must restart with a fresh snapshot.
 
 **Connector** — A piece of code that bridges one external system and the
 RockStream engine. Source connectors translate external events (Kafka
@@ -1560,18 +1458,10 @@ syntax; you write the SQL and the guarantee follows from the operator
 graph.
 
 **Dead-letter queue (DLQ)** — A per-source safety net for records that
-failed to decode. When a connector encounters a message it can't parse
-— because the payload is corrupt, the schema changed, or a required
-field is missing — it doesn't crash, skip the record silently, or block
-the entire source. Instead, it routes the record to the DLQ: a catalog
-table you can query with regular SQL. Each DLQ entry stores the arrival
-time, source offset, error code and message, the raw bytes as hex (so
-you can inspect or reprocess them externally), and a `replay_attempt`
-counter tracking how many times the record has been replayed. You can
-replay entries after fixing the underlying issue or dismiss ones that
-are permanently unrecoverable. The system warns you automatically when
-entries accumulate faster than a configurable threshold
-(`dlq_warn_threshold`, default 100 per hour).
+failed to decode. The DLQ exists today as a Rust data model, but not yet
+as a SQL-queryable `rockstream_catalog.dead_letter_queue` table or a
+`REPLAY` / `DISMISS` SQL command family. So the concept is real; the SQL
+management surface remains planned.
 
 **Delta** — A description of change, not a description of state. Rather
 than saying "the NORTH region's revenue is 1100," a delta says "the
@@ -1625,25 +1515,17 @@ the computation is shared.
 
 **Lifecycle state** — A named, machine-readable label describing what a
 materialized view is currently doing and whether operator attention is
-needed. Rather than surfacing a wall of metrics and leaving you to
-diagnose the situation yourself, RockStream distills the view's
-condition into a single named state. HEALTHY means everything is fine.
-BUILDING means the initial backfill is running and the view is
-queryable but may be incomplete. RECOVERING means a worker restarted
-and is replaying from a checkpoint. STRESSED means the SLO is met but
-resources are nearly exhausted — a warning to plan capacity before
-hitting a problem. OVER_BUDGET_RELAXED means the memory limit was hit
-and the system is voluntarily degrading freshness to stay within budget.
-REPLACING means a replacement view is hydrating in the background.
-BLOCKED means a non-recoverable error requires manual intervention.
-Each non-HEALTHY state maps to a documented action.
+needed. The current `rockstream-types::view_lifecycle::ViewState` enum is
+small but real: `RUNNING`, `PAUSED`, `OVER_BUDGET_RELAXED`, and
+`BACKFILLING(from epoch N)`. A richer `SHOW VIEW STATUS` SQL surface is
+documented, but not yet gateway-dispatched.
 
 **Materialized view** — A SQL query whose result is continuously
 maintained by the engine as the underlying source data changes. Unlike
 a table, you never write to it directly — the engine writes to it for
-you, applying deltas as inputs arrive. Unlike a traditional database
-materialized view, there is no `REFRESH` step; the view is always
-current to within the workload's SLO. It occupies storage proportional
+you, applying deltas as inputs arrive. Continuous maintenance is the
+main model, although the gateway also recognizes `REFRESH MATERIALIZED
+VIEW`. It occupies storage proportional
 to its result size, plus arrangement state for the intermediate
 computation. Querying it is no different from querying a table. The
 cost model is inverted compared to a regular query: you pay upfront at
@@ -1653,22 +1535,19 @@ frequently.
 
 **Namespace** — An isolation boundary that groups related catalog
 objects, workloads, and users together, roughly analogous to a database
-in PostgreSQL. All catalog objects (tables, views, workloads, connectors)
-belong to a namespace. Resource quotas are enforced per namespace, so
-one team's runaway workload cannot consume capacity allocated to another
-team. Access control is also scoped to namespaces — a user can have full
-rights in namespace A and no visibility into namespace B. Connections
-route to a namespace via the connection string, exactly like a database
-name in Postgres. For single-team deployments the default namespace is
-fine; namespaces become important when multiple teams share a cluster.
+in PostgreSQL. Access control is scoped to namespaces — a user can have
+full rights in namespace A and no visibility into namespace B. The
+current gateway exposes namespace creation and switching via `CREATE
+NAMESPACE` and `SET search_path = <namespace>`. For single-team
+deployments the default namespace is fine; namespaces become important
+when multiple teams share a cluster.
 
 **Quota** — A hard or soft resource cap applied at the workload or
 namespace level, preventing any single workload or tenant from consuming
 more than its share of the cluster. The most important quota is the
 memory limit (`MEMORY_LIMIT`), which caps how much arrangement state the
-views in a workload can collectively hold. There are also object-store
-RPS quotas and CPU quotas. Quotas are enforced continuously; when a
-workload approaches its limit the system emits proactive warnings
+views in a workload can collectively hold. That memory-budget path is
+concrete today, and when a workload approaches its limit the system emits proactive warnings
 (RS-5018 at 80%, RS-5019 at 95%). If the limit is exceeded, the system
 degrades freshness gracefully rather than crashing or dropping data.
 
@@ -1701,45 +1580,29 @@ this workload matters more than lower-priority ones." The engine then
 tunes its internal knobs — epoch size, parallelism, source throttling,
 shard placement — to honor those targets. SLO compliance (a 0.0–1.0
 metric per view) tells you whether the target is being met. When it
-falls below 1.0, the engine reports a named degradation reason so you
-know exactly what to change.
+falls below 1.0, the diagnostics surface is meant to tell you what to
+change — today via workload/resource status, budget warnings, and
+related recovery/error codes rather than a single finalized public enum.
 
-**Source** — The input side of a pipeline. A source is declared with
-`CREATE SOURCE` and points at an external system via a connector, or at
-RockStream's internal direct-write path for applications that push rows
-directly via SQL DML. Sources produce a continuous stream of deltas that
-flow into the engine's operator graph. Sources can be paused for bulk
-loads or maintenance windows, gated on watermark alignment, or limited
-by partition filters if the connector supports them. A source's
-exactly-once delivery guarantee is built on opaque offset tokens: the
-connector remembers where it is, the engine stores that token durably,
-and on restart the connector resumes from the last committed offset.
+**Source** — The input side of a pipeline. Sources and their connectors
+are real engine concepts, but `CREATE SOURCE` / `PAUSE SOURCE` /
+`RESUME SOURCE` are not part of today's pgwire SQL surface. The current
+SQL-reachable ingest path is `CREATE TABLE` plus DML, while connector
+sources live in the Rust/control-plane layer.
 
 **Subscribe** — A long-lived SQL connection that streams view changes
 to the client as the engine commits them, instead of requiring the
 client to poll with repeated `SELECT` statements. A subscriber sees
-every change to the view in real time, with metadata indicating whether
-each row was inserted (+1) or deleted (-1). Subscribing is ideal for
-event-driven architectures: cache invalidation, pushing updates to
-downstream Kafka topics, notifying application services of changes.
-Subscribers can apply server-side filters and column projections to
-reduce network traffic. They can resume from a past epoch after a
-disconnect — within the change retention window — without missing any
-updates. For bootstrapping, `AS OF NOW WITH SNAPSHOT` first delivers
-the full current state and then switches to live deltas.
+every change to the view in real time, with `mz_timestamp` / `mz_diff`
+metadata. Subscribers can apply server-side filters and column
+projections, and can resume from a past epoch as long as it is still
+within the retained change-log window.
 
-**View replacement** — A mechanism for upgrading a materialized view's
-definition with zero downtime. Instead of dropping the old view (which
-would create a gap in freshness and error out any running consumers),
-you create a replacement view that hydrates in the background while the
-original continues serving queries at full SLO. Once the replacement's
-frontier catches up to the original's frontier, you apply the swap
-atomically: the catalog flips query routing in one step, and the
-original view's resources are freed. Subscribers to the original view
-see the new definition without reconnecting. If something goes wrong
-during hydration, `DISCARD REPLACEMENT` abandons the shadow plan and
-the original is unaffected. View replacement is the recommended path
-for any breaking schema change, query restructuring, or join-key rename.
+**View replacement** — The documented zero-downtime upgrade workflow for
+materialized views. The idea is real and the error-code registry already
+reserves blue/green lifecycle codes, but the SQL commands (`CREATE
+REPLACEMENT ...`, `APPLY REPLACEMENT`, `DISCARD REPLACEMENT`, `SHOW
+REPLACEMENT STATUS`) are not yet wired into the current gateway.
 
 **Watermark** — Event-time metadata emitted by source connectors to tell
 time-window operators when they can safely close a window. A watermark
@@ -1755,13 +1618,11 @@ queries, watermarks are irrelevant and the engine ignores them.
 
 **Workload** — A named resource policy that groups related materialized
 views under shared operational intent. A workload specifies a freshness
-SLO, a memory limit, and a priority. The engine builds a single shared
-operator graph for all views in the workload, so common subplans are
-computed once and fanned out to multiple view outputs — more efficient
-than maintaining each view independently. Workloads also form the unit
-of multi-tenancy: different workloads have independent resource budgets
-and priorities. A view that omits `WITH WORKLOAD` inherits its schema's
-default workload, which in turn falls back to the system default.
+SLO, a memory limit, and a priority. Workloads also form the unit of
+multi-tenancy: different workloads have independent resource budgets and
+priorities. The live view-assignment syntax is `WITH WORKLOAD =
+'<name>'`; schema-level default-workload inheritance is still
+documented/planned rather than implemented in the gateway parser.
 
 **Write fence** — A cross-session coordination token that lets one
 service tell another "wait until you can see the write I just made."
@@ -1853,17 +1714,12 @@ more efficient than each view independently inlining and recomputing it.
 
 **"Should I enable the cold tier?"**
 
-Yes, if anyone needs to run ad-hoc SQL over weeks or months of data.
-The live view (in SlateDB) is optimized for point queries and real-time
-dashboards; it's not the right tool for scanning three months of order
-history. The cold tier writes periodic columnar snapshots (Iceberg or
-Delta Lake format) to object storage, which tools like DuckDB, Trino,
-and Spark can read directly without going through RockStream. The cost
-is low (object storage pricing, a periodic background write) and the
-benefit is large (full analytical SQL over the view's history). If all
-your reads are key lookups, point queries, or dashboard aggregations
-over the last few hours, skip it — the cold tier adds cost without
-adding value for those use cases.
+Use the cold tier when you want lakehouse-style export semantics, but
+remember the current boundary: `CREATE SINK ... TO ICEBERG|DELTA ...` is
+real DDL and the sink connector implementations exist, yet the gateway
+currently registers sink metadata rather than wiring the sink
+automatically into the view commit loop. So this is a strong near-term
+surface, not a fully automatic "flip it on and forget it" path today.
 
 **"How tight should my freshness SLO be?"**
 
@@ -1909,32 +1765,21 @@ polling is simpler for infrequent, stateless reads.
 
 **"When should I use view replacement vs. DROP + CREATE?"**
 
-Use view replacement whenever there are active consumers — running
-queries, subscribers, downstream views — that would notice a gap.
-Replacement lets you upgrade a view's definition (new columns, query
-restructuring, breaking schema change) with zero downtime: the original
-keeps serving queries at full SLO while the replacement hydrates in the
-background, and the swap is atomic. Subscribers to the original
-automatically see the new definition without reconnecting. DROP + CREATE
-is simpler but creates a window where the view doesn't exist: any
-running query against it fails, any subscriber errors, and any
-downstream materialized view that reads from it blocks. That is
-acceptable for a development environment or a non-critical view where
-a brief gap is tolerable, but should be avoided in production.
+Today, if you need a production-safe migration path, prefer creating a
+new view name alongside the old one and cutting consumers over
+explicitly; the fully named replacement workflow is still planned rather
+than SQL-dispatched. `DROP + CREATE` is fine for local/dev cases, but in
+production it creates exactly the visibility gap the planned replacement
+surface is meant to avoid.
 
 **"How do I know if a view needs attention?"**
 
-Start with `SHOW VIEW STATUS`. If every view shows HEALTHY you're done.
-If any view is in a non-HEALTHY state, the status output includes the
-reason and the recommended action — no guessing required. For views that
-are HEALTHY but slower than expected, run `EXPLAIN INCREMENTAL` to see
-the operator graph annotated with per-operator statistics. A ⚠ on a
-specific operator means that operator is the bottleneck. For more detail
-— shard counts, memory usage per operator, parallelism utilisation —
-add VERBOSE. For live runtime numbers — rows per second, state read
-rate, p99 latency, recent DLQ entries — add ANALYZE. The right pattern
-is to start with the cheapest tool (status), escalate only if the answer
-isn't there, and stop when you find the cause.
+Start with the surfaces the gateway actually exposes today: `SHOW
+WORKLOAD STATUS`, `SHOW RESOURCE USAGE`, `SHOW CLUSTER RESOURCE USAGE`,
+and `EXPLAIN INCREMENTAL`. For a specific query or maintained view,
+`EXPLAIN INCREMENTAL` / `... VERBOSE` / `... ANALYZE` are the main
+frontdoor diagnostics. The richer `SHOW VIEW STATUS` surface exists in
+the lifecycle data model, but not yet in gateway dispatch.
 
 ### 36. Further Reading
 
@@ -1948,7 +1793,7 @@ takes from pg-trickle as a correctness oracle, and the per-operator
 differentiation rules.
 
 For the phased build-out, see
-[IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md) — the roadmap from
+[NEW_IMPLEMENTATION_PLAN.md](../NEW_IMPLEMENTATION_PLAN.md) — the roadmap from
 the current state to a production-grade system, with milestones and
 deliverables.
 
@@ -2003,8 +1848,11 @@ This rule is proven correct by the oracle property test
 **Error codes**:
 - `RS-1015`: Group-commit queue full (capacity = `GROUP_COMMIT_MAX_BATCHES = 64`).
   Back-pressure applied; reduce epoch rate or increase shard count.
-- `RS-1016`: Aggregate running sum overflowed `i64`.  Reduce value magnitudes
-  or switch to a wider numeric type.
+- `RS-1016`: historically used in the operator-level registry for aggregate
+  overflow, while the current SQL frontend also emits `RS-1016` for
+  unsupported window functions such as `NTILE`; check the emitting crate
+  (`rockstream-types` / `rockstream-ops` vs. `rockstream-sql`) for the
+  exact call site.
 
 ### Group Commit (shard-level epoch coalescing)
 
@@ -2031,14 +1879,18 @@ re-processing already-committed data.
 ## SQL Frontend (v0.7)
 
 RockStream v0.7 adds a full SQL frontend built on [DataFusion](https://datafusion.apache.org/).
-You can now write views in standard SQL rather than constructing `PlanNode` trees by hand.
+You can now write views in standard SQL rather than constructing `PlanNode`
+trees by hand. This appendix is historical milestone context; for the
+current authoritative SQL surface, see `docs/language-features.md`.
 
 ### CREATE VIEW
 
-Register a named incremental view backed by storage:
+In the current gateway/frontend split, `CREATE VIEW` registers an inline
+macro-expanded view, while `CREATE MATERIALIZED VIEW` registers the
+storage-backed maintained view:
 
 ```sql
-CREATE VIEW orders_summary AS
+CREATE MATERIALIZED VIEW orders_summary AS
   SELECT region, SUM(amount) AS total, COUNT(*) AS n
   FROM orders
   GROUP BY region;
@@ -2065,6 +1917,13 @@ The SQL frontend:
 Expressions supported in predicates and projections: column references,
 integer/boolean/string literals, `+`, `-`, `*`, `/`, `>`, `<`, `>=`, `<=`,
 `=`, `<>`, `AND`, `OR`.
+
+That v0.7 table is only the original minimal slice. The current lowering
+path in `crates/rockstream-sql/src/lower.rs` also covers joins,
+`UNION`/`INTERSECT`/`EXCEPT`, `DISTINCT`, window functions such as
+`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`LAG`/`LEAD`, sliding `SUM`/`AVG`,
+`TRY_CAST`, and `TUMBLE`; it still rejects `LIMIT`, `ORDER BY` as
+top-level plan nodes, `DISTINCT ON`, and `WITH RECURSIVE`.
 
 ### Schema Evolution
 

@@ -33,7 +33,7 @@ reports and computes the cluster-wide minimum.
 ### 1.3 Frontier Stall Detection
 
 If the cluster frontier does not advance within the configured
-`frontier_stall_timeout_ms`, the `LivenessChecker` surfaces a
+`frontier_stall_threshold_ms`, the `LivenessChecker` surfaces a
 `FrontierStalled` degraded state. The operator should check:
 - Is any shard stuck on a slow input?
 - Is the object store available? (see §4 Brownout Handling)
@@ -78,25 +78,29 @@ the same `WriteBatch` as the new checkpoint commit.
 
 ## 3. Recovery Budgets
 
-RockStream commits to the following recovery SLOs at `target_shard_state_bytes`
-(DESIGN.md §11.5):
+RockStream commits to the following recovery SLOs (DESIGN.md §11.5):
 
 | Phase | Budget | Mechanism |
 |---|---|---|
-| Failure detection | **≤ 5 s** | `WorkerHealthMonitor` with `failure_timeout_ms = 5000` |
+| Failure detection | **≤ 5 s** | The control plane's per-connection handler notices a worker's TCP connection close (or a failed `Heartbeat`/`RequestShard` round-trip) and calls `ShardScheduler::on_worker_dead`, which releases the worker's leases and triggers reassignment (`crates/rockstream-control/src/scheduler.rs`, `crates/rockstream-control/src/service.rs`). |
 | Shard reassignment | **≤ 30 s** | Checkpoint-from-storage; no full WAL replay |
 | Pipeline freshness recovery | **≤ 60 s** | Catch-up ingest at burst rate |
 
-When the freshness recovery budget is exceeded, `RecoveryStatus::RecoveringSlow`
-fires with `RS-1603`. The `LivenessChecker` maps this to the `RecoveringSlow`
-named degraded state.
+When the freshness recovery budget is exceeded, `RecoveringSlow` fires with
+`RS-1603`. The `LivenessChecker` (`crates/rockstream-sim/src/liveness.rs`)
+maps this to the `RecoveringSlow` named degraded state.
 
 ### 3.1 Self-Fencing
 
-A worker that fails to deliver a heartbeat to the control plane for
-`self_fence_after_ms` (default 30 000 ms) transitions to `Fenced` via
-`ControlPlaneFence` and must stop committing (DESIGN.md §11.6). This prevents
-a partitioned worker from racing the new shard owner.
+A worker that cannot reach the control plane starts an isolation clock via
+`SelfFenceGuard::tick` (`crates/rockstream-runtime/src/fence.rs`). Once the
+isolation duration reaches `DEFAULT_SELF_FENCE_DEADLINE` (30 s),
+`SelfFenceGuard::must_self_fence` returns `true` and the worker must
+terminate immediately rather than attempt another epoch commit
+(`assert_within_deadline` panics with `RS-1702` if this is violated). This
+prevents a partitioned worker from racing the new shard owner. Every epoch
+commit is additionally fence-checked with `assert_valid_writer`, which
+rejects a stale lease token with `RS-1702` (DESIGN.md §11.6).
 
 ---
 
@@ -116,17 +120,23 @@ During an object store brownout (DESIGN.md §11.7):
 
 ## 5. Shuffle Transport
 
-Shuffle (exchange) moves rows between workers in a pipeline. Two transport
-paths exist:
+Shuffle (exchange) moves rows between workers in a pipeline. The path for
+each exchange is recorded as an `ExchangePath` (`Elided`, `Loopback`, or
+`Direct`) on its `ExchangeAnn` (`crates/rockstream-types/src/exchange.rs`).
+Two transport paths exist:
 
 - **Loopback**: source and destination are on the same worker. Rows pass
-  through an in-memory channel (`LoopbackSender` / `LoopbackReceiver`).
+  through a bounded in-process `tokio::mpsc` channel managed by the
+  `LoopbackRouter` (`crates/rockstream-runtime/src/exchange/loopback.rs`);
+  zero worker-to-worker network calls are made.
 - **Direct**: source and destination are on different workers. Rows are
-  encoded as Arrow IPC frames and transmitted over gRPC.
+  encoded as Arrow IPC frames (`crates/rockstream-runtime/src/exchange/
+  serialization.rs`) and transmitted over the gRPC shuffle service
+  (`crates/rockstream-runtime/src/exchange/service.rs`).
 
-The `ExchangeClassifier` routes each row to the correct path at compile time.
-The `DurableShuffleWriter` ensures shuffle objects are written to the WAL
-before the sending epoch commits.
+The `DurableShuffleWriter` (`crates/rockstream-runtime/src/exchange/
+durable.rs`) ensures shuffle objects are written to the WAL before the
+sending epoch commits.
 
 ---
 
@@ -181,21 +191,23 @@ path re-runs `commit` (idempotent).
 ## 8. Cluster Bootstrap Walkthrough
 
 1. **Control plane starts**: initializes the shard map, worker registry, and
-   lease grant rate limiter (`ThrottledLeaseGranter`, max 50 grants/s).
+   (if `--raft-peers` is set) the Raft group.
 
-2. **Workers start**: each worker waits `worker_id mod jitter_buckets × jitter_ms`
-   before beginning shard acquisition (thundering-herd prevention, DESIGN.md §11.8).
+2. **Workers start**: each worker opens a TCP connection to the control
+   plane and sends `WorkerMessage::Register` with its `WorkerRegistration`
+   (`crates/rockstream-runtime/src/client.rs`,
+   `crates/rockstream-types/src/topology.rs`).
 
-3. **Shard acquisition**: each worker calls `AcquireLease` for its assigned
-   shards. The control plane issues at most `max_lease_grants_per_second`
-   leases cluster-wide.
+3. **Shard acquisition**: each worker sends `WorkerMessage::RequestShard`
+   for its assigned shards. The control plane responds with
+   `ControlMessage::ShardAssigned` carrying the lease.
 
 4. **Shard open**: each worker opens its SlateDB instances. The latest
    checkpoint manifest is loaded; the shard replays from the checkpointed state.
 
-5. **Heartbeats and frontiers**: workers begin sending heartbeats at
-   `heartbeat_interval_ms` (default 1500 ms) and frontier reports after each
-   epoch commit.
+5. **Heartbeats and frontiers**: workers send `WorkerMessage::Heartbeat`
+   every 500 ms (`crates/rockstream-runtime/src/client.rs`) and frontier
+   reports after each epoch commit.
 
 6. **Sources start**: connectors begin polling at their committed offsets.
 
