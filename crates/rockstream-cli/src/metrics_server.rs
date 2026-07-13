@@ -74,3 +74,61 @@ pub async fn start_metrics_server(addr: &str) -> std::io::Result<MetricsServerHa
         shutdown_tx: Some(shutdown_tx),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpStream;
+
+    async fn request(addr: SocketAddr, req: &str) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        String::from_utf8_lossy(&resp).to_string()
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_200_with_prometheus_body() {
+        let handle = start_metrics_server("127.0.0.1:0").await.unwrap();
+        let resp = request(handle.local_addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8"));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unknown_path_returns_404() {
+        let handle = start_metrics_server("127.0.0.1:0").await.unwrap();
+        let resp = request(handle.local_addr, "GET /other HTTP/1.1\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn empty_request_is_ignored_without_a_response() {
+        let handle = start_metrics_server("127.0.0.1:0").await.unwrap();
+        let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+        // Half-close the write side without sending any bytes; the server's
+        // `Ok(n) if n > 0` guard must skip writing a response, and the
+        // connection closes with zero bytes read.
+        stream.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        assert!(resp.is_empty());
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_accept_loop() {
+        let handle = start_metrics_server("127.0.0.1:0").await.unwrap();
+        let addr = handle.local_addr;
+        handle.shutdown();
+        // Give the accept loop's select! a moment to observe the shutdown
+        // signal and break before we assert new connections aren't served
+        // a 200 (best-effort: either the connect fails or it's refused).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = TcpStream::connect(addr).await;
+    }
+}

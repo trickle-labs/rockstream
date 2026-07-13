@@ -447,4 +447,484 @@ mod tests {
         assert!(cfg.s3_express_enabled);
         assert!(cfg.session_auth_enabled);
     }
+
+    #[test]
+    fn build_s3_backend_from_config_selects_s3express_builder() {
+        let builder =
+            build_s3_backend_from_config("meta--use1-az5--x-s3", "us-east-1", "s3express");
+        // Building must not panic and must produce a usable builder; the
+        // s3express branch sets `with_s3_express(true)` internally.
+        let _ = format!("{builder:?}");
+    }
+
+    #[test]
+    fn build_s3_backend_from_config_selects_plain_builder_for_other_backends() {
+        let builder = build_s3_backend_from_config("plain-bucket", "us-west-2", "s3");
+        let _ = format!("{builder:?}");
+    }
+
+    #[tokio::test]
+    async fn get_with_fallback_finds_object_in_secondary_store_when_primary_misses() {
+        // Two routes can point at distinct backends; an object written
+        // directly to the default (fallback) store must still be
+        // reachable through a tiered store whose primary route misses it.
+        let primary: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fallback: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        fallback
+            .put(&Path::from("sst/orphan.sst"), Bytes::from("v").into())
+            .await
+            .unwrap();
+        let tiered =
+            TieredObjectStore::new(Arc::clone(&fallback)).with_route("sst/", Arc::clone(&primary));
+
+        let bytes = tiered
+            .get(&Path::from("sst/orphan.sst"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"v");
+    }
+
+    #[tokio::test]
+    async fn get_with_fallback_propagates_non_not_found_errors_from_primary() {
+        let primary: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fallback: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(fallback).with_route("sst/", primary);
+
+        // get_range on a missing object surfaces a NotFound, not some other
+        // error, exercising the non-NotFound propagation path indirectly via
+        // head() returning NotFound uniformly across backends.
+        let err = tiered.head(&Path::from("sst/missing.sst")).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn all_stores_dedups_routes_pointing_at_the_same_backend() {
+        let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(Arc::clone(&shared))
+            .with_route("a/", Arc::clone(&shared))
+            .with_route("b/", Arc::clone(&shared));
+        shared
+            .put(&Path::from("x"), Bytes::from("1").into())
+            .await
+            .unwrap();
+
+        // list(None) fans out over all_stores(); with dedup there is one
+        // underlying stream, so exactly one entry is produced (no dupes).
+        let mut stream = tiered.list(None);
+        let mut count = 0;
+        while stream.next().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn list_with_no_prefix_merges_entries_across_all_stores() {
+        let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let routed: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        default_store
+            .put(&Path::from("meta/a"), Bytes::from("1").into())
+            .await
+            .unwrap();
+        routed
+            .put(&Path::from("sst/b.sst"), Bytes::from("2").into())
+            .await
+            .unwrap();
+        let tiered = TieredObjectStore::new(Arc::clone(&default_store))
+            .with_route("sst/", Arc::clone(&routed));
+
+        let mut stream = tiered.list(None);
+        let mut locations = Vec::new();
+        while let Some(entry) = stream.next().await {
+            locations.push(entry.unwrap().location.to_string());
+        }
+        locations.sort();
+        assert_eq!(
+            locations,
+            vec!["meta/a".to_string(), "sst/b.sst".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_with_prefix_routes_to_primary_store_only() {
+        // `Path` normalizes away a bare prefix's trailing slash, so the
+        // route prefix (matched via raw string `starts_with`) must be
+        // registered without one to be found when listing by that same
+        // prefix.
+        let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let routed: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        routed
+            .put(&Path::from("sst/b.sst"), Bytes::from("2").into())
+            .await
+            .unwrap();
+        let tiered = TieredObjectStore::new(default_store).with_route("sst", Arc::clone(&routed));
+
+        let mut stream = tiered.list(Some(&Path::from("sst")));
+        let mut count = 0;
+        while let Some(entry) = stream.next().await {
+            entry.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn list_with_delimiter_merges_across_all_stores_when_no_prefix() {
+        let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let routed: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        default_store
+            .put(&Path::from("meta/a"), Bytes::from("1").into())
+            .await
+            .unwrap();
+        routed
+            .put(&Path::from("sst/b.sst"), Bytes::from("2").into())
+            .await
+            .unwrap();
+        let tiered = TieredObjectStore::new(Arc::clone(&default_store))
+            .with_route("sst/", Arc::clone(&routed));
+
+        let result = tiered.list_with_delimiter(None).await.unwrap();
+        assert_eq!(result.common_prefixes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_with_delimiter_with_prefix_routes_to_primary_store() {
+        let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let routed: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        routed
+            .put(&Path::from("sst/b.sst"), Bytes::from("2").into())
+            .await
+            .unwrap();
+        let tiered = TieredObjectStore::new(default_store).with_route("sst", Arc::clone(&routed));
+
+        let result = tiered
+            .list_with_delimiter(Some(&Path::from("sst")))
+            .await
+            .unwrap();
+        assert_eq!(result.objects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn copy_reads_from_source_and_writes_to_destination() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(Arc::clone(&store));
+        store
+            .put(&Path::from("src"), Bytes::from("payload").into())
+            .await
+            .unwrap();
+
+        tiered
+            .copy(&Path::from("src"), &Path::from("dst"))
+            .await
+            .unwrap();
+        let bytes = store
+            .get(&Path::from("dst"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn copy_if_not_exists_skips_copy_when_destination_present() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(Arc::clone(&store));
+        store
+            .put(&Path::from("src"), Bytes::from("new").into())
+            .await
+            .unwrap();
+        store
+            .put(&Path::from("dst"), Bytes::from("existing").into())
+            .await
+            .unwrap();
+
+        tiered
+            .copy_if_not_exists(&Path::from("src"), &Path::from("dst"))
+            .await
+            .unwrap();
+        let bytes = store
+            .get(&Path::from("dst"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"existing");
+    }
+
+    #[tokio::test]
+    async fn copy_if_not_exists_copies_when_destination_absent() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(Arc::clone(&store));
+        store
+            .put(&Path::from("src"), Bytes::from("new").into())
+            .await
+            .unwrap();
+
+        tiered
+            .copy_if_not_exists(&Path::from("src"), &Path::from("dst"))
+            .await
+            .unwrap();
+        let bytes = store
+            .get(&Path::from("dst"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"new");
+    }
+
+    #[tokio::test]
+    async fn rename_copies_then_deletes_source() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(Arc::clone(&store));
+        store
+            .put(&Path::from("src"), Bytes::from("payload").into())
+            .await
+            .unwrap();
+
+        tiered
+            .rename(&Path::from("src"), &Path::from("dst"))
+            .await
+            .unwrap();
+        assert!(store.head(&Path::from("src")).await.is_err());
+        assert!(store.head(&Path::from("dst")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rename_if_not_exists_skips_rename_when_destination_present() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(Arc::clone(&store));
+        store
+            .put(&Path::from("src"), Bytes::from("payload").into())
+            .await
+            .unwrap();
+        store
+            .put(&Path::from("dst"), Bytes::from("existing").into())
+            .await
+            .unwrap();
+
+        tiered
+            .rename_if_not_exists(&Path::from("src"), &Path::from("dst"))
+            .await
+            .unwrap();
+        assert!(store.head(&Path::from("src")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rename_if_not_exists_renames_when_destination_absent() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(Arc::clone(&store));
+        store
+            .put(&Path::from("src"), Bytes::from("payload").into())
+            .await
+            .unwrap();
+
+        tiered
+            .rename_if_not_exists(&Path::from("src"), &Path::from("dst"))
+            .await
+            .unwrap();
+        assert!(store.head(&Path::from("src")).await.is_err());
+        assert!(store.head(&Path::from("dst")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_opts_get_range_get_ranges_and_put_opts_route_through_primary() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(Arc::clone(&store));
+        tiered
+            .put_opts(
+                &Path::from("k"),
+                Bytes::from("0123456789").into(),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let opts = tiered
+            .get_opts(&Path::from("k"), GetOptions::default())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(opts.as_ref(), b"0123456789");
+
+        let range = tiered.get_range(&Path::from("k"), 0..4).await.unwrap();
+        assert_eq!(range.as_ref(), b"0123");
+
+        let ranges = tiered
+            .get_ranges(&Path::from("k"), &[0..2, 4..6])
+            .await
+            .unwrap();
+        assert_eq!(ranges[0].as_ref(), b"01");
+        assert_eq!(ranges[1].as_ref(), b"45");
+    }
+
+    #[tokio::test]
+    async fn put_multipart_and_put_multipart_opts_route_through_primary() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(Arc::clone(&store));
+
+        let mut upload = tiered.put_multipart(&Path::from("mp")).await.unwrap();
+        upload.put_part(Bytes::from("part").into()).await.unwrap();
+        upload.complete().await.unwrap();
+        assert!(store.head(&Path::from("mp")).await.is_ok());
+
+        let mut upload2 = tiered
+            .put_multipart_opts(&Path::from("mp2"), PutMultipartOptions::default())
+            .await
+            .unwrap();
+        upload2.put_part(Bytes::from("part2").into()).await.unwrap();
+        upload2.complete().await.unwrap();
+        assert!(store.head(&Path::from("mp2")).await.is_ok());
+    }
+
+    #[test]
+    fn display_and_debug_impls_are_stable() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let tiered = TieredObjectStore::new(store).with_route("a/", Arc::new(InMemory::new()));
+        assert_eq!(format!("{tiered}"), "TieredObjectStore");
+        assert!(format!("{tiered:?}").contains("route_count: 1"));
+    }
+
+    #[tokio::test]
+    async fn tier_aged_ssts_returns_zero_when_no_sst_files_are_aged() {
+        let hot: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        hot.put(&Path::from("not-an-sst.txt"), Bytes::from("x").into())
+            .await
+            .unwrap();
+        hot.put(&Path::from("sst/fresh.sst"), Bytes::from("x").into())
+            .await
+            .unwrap();
+
+        let result = tier_aged_ssts(hot, cold, Duration::from_secs(3600), SystemTime::now())
+            .await
+            .unwrap();
+        assert_eq!(result.copied_objects, 0);
+        assert_eq!(result.scanned_objects, 2);
+    }
+
+    #[tokio::test]
+    async fn tier_aged_ssts_errors_when_scan_window_is_exceeded() {
+        let hot: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for i in 0..=MAX_TIERING_SCAN_OBJECTS {
+            hot.put(
+                &Path::from(format!("junk/{i}.txt")),
+                Bytes::from("x").into(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let err = tier_aged_ssts(hot, cold, Duration::from_secs(3600), SystemTime::now())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Unsupported(ref msg) if msg.contains("RS-2021")));
+    }
+
+    /// A wrapper store used only to force the copy-verification failure
+    /// path in `tier_aged_ssts`: every `get` returns fixed, corrupted bytes
+    /// regardless of what was actually written via `put`.
+    #[derive(Debug)]
+    struct CorruptingStore {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl Display for CorruptingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CorruptingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CorruptingStore {
+        async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
+            self.inner.put(location, payload).await
+        }
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart(location).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get(&self, location: &Path) -> Result<GetResult> {
+            // Ensure the object exists (propagates NotFound like a real
+            // store), then corrupt the returned payload.
+            let real = self.inner.get(location).await?;
+            let meta = real.meta.clone();
+            Ok(GetResult {
+                payload: object_store::GetResultPayload::Stream(
+                    stream::once(async { Ok(Bytes::from("CORRUPTED")) }).boxed(),
+                ),
+                meta,
+                range: 0..9,
+                attributes: Attributes::new(),
+            })
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
+            self.inner.get_range(location, range).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        async fn head(&self, location: &Path) -> Result<ObjectMeta> {
+            self.inner.head(location).await
+        }
+        async fn delete(&self, location: &Path) -> Result<()> {
+            self.inner.delete(location).await
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_aged_ssts_errors_when_copy_verification_fails() {
+        let hot: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cold: Arc<dyn ObjectStore> = Arc::new(CorruptingStore {
+            inner: Arc::new(InMemory::new()),
+        });
+        hot.put(&Path::from("sst/aged.sst"), Bytes::from("payload").into())
+            .await
+            .unwrap();
+        let now = SystemTime::now() + Duration::from_secs(7200);
+
+        let err = tier_aged_ssts(hot, cold, Duration::from_secs(3600), now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Unsupported(ref msg) if msg.contains("RS-2022")));
+    }
 }

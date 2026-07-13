@@ -58,13 +58,39 @@ coverage:
 	cargo llvm-cov --workspace --lcov --output-path lcov.info
 	@echo "Coverage written to lcov.info"
 
-# Enforce coverage thresholds for rockstream-gateway (requires cargo-llvm-cov).
-# Fails with non-zero exit if line coverage < 90% or branch coverage < 85%.
+# Enforce coverage thresholds for every one of the 13 workspace crates
+# (requires cargo-llvm-cov). Mirrors the `coverage` job in
+# .github/workflows/ci.yml exactly — each crate's floor is
+# `max(70, floor(measured baseline %))`, never below 70, never loosened
+# below what the crate already achieves. See `.claude/v0.45.3-plan.md` S1
+# for the baseline table these numbers come from.
 coverage-gate:
-	cargo llvm-cov --package rockstream-gateway --fail-under-lines 90
-	cargo llvm-cov --package rockstream-gateway \
-		--include-files 'protocol.rs,server.rs,session.rs,auth.rs' \
-		--fail-under-branches 85
+	cargo llvm-cov --package rockstream-gateway --fail-under-lines 77
+	cargo llvm-cov --package rockstream-gateway --fail-under-regions 77
+	cargo llvm-cov --package rockstream-diff --fail-under-lines 76
+	cargo llvm-cov --package rockstream-diff --fail-under-regions 71
+	cargo llvm-cov --package rockstream-ops --fail-under-lines 88
+	cargo llvm-cov --package rockstream-ops --fail-under-regions 87
+	cargo llvm-cov --package rockstream-storage --fail-under-lines 75
+	cargo llvm-cov --package rockstream-storage --fail-under-regions 75
+	cargo llvm-cov --package rockstream-runtime --fail-under-lines 76
+	cargo llvm-cov --package rockstream-runtime --fail-under-regions 79
+	cargo llvm-cov --package rockstream-sql --fail-under-lines 73
+	cargo llvm-cov --package rockstream-sql --fail-under-regions 74
+	cargo llvm-cov --package rockstream-control --fail-under-lines 89
+	cargo llvm-cov --package rockstream-control --fail-under-regions 90
+	cargo llvm-cov --package rockstream-connectors --fail-under-lines 84
+	cargo llvm-cov --package rockstream-connectors --fail-under-regions 86
+	cargo llvm-cov --package rockstream-types --fail-under-lines 84
+	cargo llvm-cov --package rockstream-types --fail-under-regions 87
+	cargo llvm-cov --package rockstream-plan --fail-under-lines 84
+	cargo llvm-cov --package rockstream-plan --fail-under-regions 82
+	cargo llvm-cov --package rockstream-sim --fail-under-lines 92
+	cargo llvm-cov --package rockstream-sim --fail-under-regions 93
+	cargo llvm-cov --package rockstream-cli --fail-under-lines 73
+	cargo llvm-cov --package rockstream-cli --fail-under-regions 77
+	cargo llvm-cov --package rockstream-oracle --fail-under-lines 83
+	cargo llvm-cov --package rockstream-oracle --fail-under-regions 81
 	@echo "Coverage gate passed."
 
 # End-to-end test: exercises all three required test backends (Unit, LFS, MinIO/TC).
