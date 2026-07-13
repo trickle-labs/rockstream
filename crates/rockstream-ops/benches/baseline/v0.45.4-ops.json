@@ -1,0 +1,11 @@
+{
+  "aggregate_performance/aggregate_in_memory/10000": 336320.0989947159,
+  "delta_propagation_cost/aggregate_update/0.1pct": 7852.907142857142,
+  "delta_propagation_cost/aggregate_update/10pct": 681748.5041666668,
+  "delta_propagation_cost/aggregate_update/1pct": 67913.71499999997,
+  "filter_delta_cost/filter_update/0.1pct": 1465.783681468277,
+  "filter_delta_cost/filter_update/10pct": 96321.90944843472,
+  "filter_delta_cost/filter_update/1pct": 8985.568800462554,
+  "filter_performance/filter_in_memory/10000": 42115.72929783561,
+  "join_performance/join_in_memory/10000": 293217897.07
+}

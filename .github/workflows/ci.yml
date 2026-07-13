@@ -304,6 +304,37 @@ jobs:
       - name: compare against v0.36 baseline
         run: cargo run -p rockstream-ops --bin nexmark_regression_gate -- --baseline crates/rockstream-ops/benches/baseline/v0.36.json --output nexmark-bench.out
 
+  benchmark:
+    name: Performance-regression gate (ops/storage/runtime/control)
+    runs-on: ubuntu-latest
+    # Locally measured sum of the four `cargo bench --noplot` wall-clock
+    # times is ~4 minutes on a warm cache; sized generously above that plus
+    # checkout/build overhead so a slow CI runner doesn't flake. Recorded in
+    # `.claude/v0.45.4-evidence.md`.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: run rockstream-ops bench
+        run: cargo bench -p rockstream-ops --bench perf_regression -- --noplot | tee ops-bench.out
+      - name: compare rockstream-ops against v0.45.4 baseline
+        run: cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-ops/benches/baseline/v0.45.4-ops.json --output ops-bench.out --tag ops
+      - name: run rockstream-storage bench
+        run: cargo bench -p rockstream-storage --bench storage_bench -- --noplot | tee storage-bench.out
+      - name: compare rockstream-storage against v0.45.4 baseline
+        run: cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-storage/benches/baseline/v0.45.4-storage.json --output storage-bench.out --tag storage
+      - name: run rockstream-runtime bench
+        run: cargo bench -p rockstream-runtime --bench exchange_bench -- --noplot | tee runtime-bench.out
+      - name: compare rockstream-runtime against v0.45.4 baseline
+        run: cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.45.4-runtime.json --output runtime-bench.out --tag runtime
+      - name: run rockstream-control bench
+        run: cargo bench -p rockstream-control --bench frontier_bench -- --noplot | tee control-bench.out
+      - name: compare rockstream-control against v0.45.4 baseline
+        run: cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-control/benches/baseline/v0.45.4-control.json --output control-bench.out --tag control
+
   release-version-check:
     name: Version / tag alignment
     runs-on: ubuntu-latest

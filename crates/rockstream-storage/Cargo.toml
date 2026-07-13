@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Storage abstraction layer wrapping SlateDB for RockStream"
 
+[[bench]]
+name = "storage_bench"
+harness = false
+
 [dependencies]
 rockstream-types = { workspace = true }
 async-trait = { workspace = true }
@@ -32,3 +36,4 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
+criterion = { workspace = true, features = ["async_tokio"] }

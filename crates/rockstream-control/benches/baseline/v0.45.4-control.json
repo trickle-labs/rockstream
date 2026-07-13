@@ -1,0 +1,5 @@
+{
+  "frontier_cluster_frontier_read/read_under_load": 4.9830213281373545,
+  "frontier_fill_level_read/read_under_load": 4.954984147368275,
+  "frontier_ingest/steady_state_monotonic_advance": 4861.810598404196
+}

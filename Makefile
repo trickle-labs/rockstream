@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage coverage-gate release verify verify-relaxed path-coupling
+.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
 
 # Build the workspace
 build:
@@ -92,6 +92,26 @@ coverage-gate:
 	cargo llvm-cov --package rockstream-oracle --fail-under-lines 83
 	cargo llvm-cov --package rockstream-oracle --fail-under-regions 81
 	@echo "Coverage gate passed."
+
+# Re-measure all four v0.45.4 performance-regression benchmark suites and
+# overwrite their checked-in baseline JSON files with the freshly measured
+# means. Deliberately NOT invoked anywhere in ci.yml — baseline updates must
+# stay an explicit, code-reviewed, human-triggered step so a regression can
+# never quietly become the new "normal."
+bench-baseline-update:
+	cargo bench -p rockstream-ops --bench perf_regression -- --noplot | tee /tmp/rockstream-ops-bench.out
+	grep '^\[bench_summary:ops\] ' /tmp/rockstream-ops-bench.out | sed 's/^\[bench_summary:ops\] //' \
+		| python3 -m json.tool > crates/rockstream-ops/benches/baseline/v0.45.4-ops.json
+	cargo bench -p rockstream-storage --bench storage_bench -- --noplot | tee /tmp/rockstream-storage-bench.out
+	grep '^\[bench_summary:storage\] ' /tmp/rockstream-storage-bench.out | sed 's/^\[bench_summary:storage\] //' \
+		| python3 -m json.tool > crates/rockstream-storage/benches/baseline/v0.45.4-storage.json
+	cargo bench -p rockstream-runtime --bench exchange_bench -- --noplot | tee /tmp/rockstream-runtime-bench.out
+	grep '^\[bench_summary:runtime\] ' /tmp/rockstream-runtime-bench.out | sed 's/^\[bench_summary:runtime\] //' \
+		| python3 -m json.tool > crates/rockstream-runtime/benches/baseline/v0.45.4-runtime.json
+	cargo bench -p rockstream-control --bench frontier_bench -- --noplot | tee /tmp/rockstream-control-bench.out
+	grep '^\[bench_summary:control\] ' /tmp/rockstream-control-bench.out | sed 's/^\[bench_summary:control\] //' \
+		| python3 -m json.tool > crates/rockstream-control/benches/baseline/v0.45.4-control.json
+	@echo "Baselines updated. Review the diff (git diff crates/*/benches/baseline/v0.45.4-*.json) before committing."
 
 # End-to-end test: exercises all three required test backends (Unit, LFS, MinIO/TC).
 #

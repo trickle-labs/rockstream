@@ -15,6 +15,7 @@
 //! arrangement with cached extremum.  Crash-replay proved on LFS and MinIO.
 
 pub mod aggregate;
+pub mod bench_regression;
 pub mod distinct;
 pub mod embedded;
 pub mod error;

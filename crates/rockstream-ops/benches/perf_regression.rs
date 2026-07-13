@@ -14,7 +14,7 @@
 //! for filter it is ≤ 1.  Tracking this over time guards against regressions
 //! where a small input delta causes unexpectedly large output fan-out.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput};
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
@@ -238,12 +238,35 @@ fn bench_filter_delta_rates(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_filter,
-    bench_aggregate,
-    bench_join,
-    bench_delta_propagation_rates,
-    bench_filter_delta_rates
-);
-criterion_main!(benches);
+// Custom main (instead of `criterion_main!`) so we can read back the mean
+// point estimates criterion just wrote to `target/criterion/**/new/
+// estimates.json` and print a single tagged `[bench_summary:ops]` JSON line
+// once all groups finish — closing the "descriptive only" gap flagged in
+// DESIGN.md/roadmap for this suite. This is a small wrapper around what
+// `criterion_main!` expands to; it does not change any criterion API usage.
+fn main() {
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_filter(&mut criterion);
+    bench_aggregate(&mut criterion);
+    bench_join(&mut criterion);
+    bench_delta_propagation_rates(&mut criterion);
+    bench_filter_delta_rates(&mut criterion);
+    criterion.final_summary();
+
+    let criterion_dir =
+        rockstream_ops::bench_regression::default_criterion_dir(env!("CARGO_MANIFEST_DIR"));
+    let summary = rockstream_ops::bench_regression::collect_criterion_summary(
+        &criterion_dir,
+        &[
+            "filter_performance",
+            "aggregate_performance",
+            "join_performance",
+            "delta_propagation_cost",
+            "filter_delta_cost",
+        ],
+    );
+    println!(
+        "[bench_summary:ops] {}",
+        serde_json::to_string(&summary).unwrap()
+    );
+}

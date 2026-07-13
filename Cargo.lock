@@ -1450,6 +1450,7 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
+ "futures",
  "is-terminal",
  "itertools 0.10.5",
  "num-traits",
@@ -1462,6 +1463,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 
@@ -5504,6 +5506,7 @@ dependencies = [
 name = "rockstream-control"
 version = "0.42.0"
 dependencies = [
+ "criterion",
  "futures",
  "hex",
  "hmac 0.12.1",
@@ -5511,6 +5514,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "rockstream-ops",
  "rockstream-types",
  "serde",
  "serde_json",
@@ -5646,6 +5650,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "criterion",
  "futures",
  "hex",
  "hmac 0.12.1",
@@ -5742,6 +5747,7 @@ version = "0.42.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "criterion",
  "futures",
  "hex",
  "hmac 0.12.1",

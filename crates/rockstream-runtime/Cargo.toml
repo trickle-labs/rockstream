@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Worker process, scheduler, epoch-commit coordinator, and exchange for RockStream"
 
+[[bench]]
+name = "exchange_bench"
+harness = false
+
 [dependencies]
 rockstream-ops = { workspace = true }
 rockstream-types = { workspace = true }
@@ -40,4 +44,5 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 async-trait = { workspace = true }
+criterion = { workspace = true, features = ["async_tokio"] }
 

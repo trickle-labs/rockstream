@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Control-plane service for RockStream cluster management"
 
+[[bench]]
+name = "frontier_bench"
+harness = false
+
 [dependencies]
 rockstream-types = { workspace = true }
 serde = { workspace = true }
@@ -27,3 +31,6 @@ reqwest = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+criterion = { workspace = true, features = ["async_tokio"] }
+rockstream-ops = { workspace = true }
+serde_json = { workspace = true }

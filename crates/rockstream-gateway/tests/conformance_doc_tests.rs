@@ -512,3 +512,99 @@ fn test_dependabot_config_is_valid() {
         "dependabot.yml must have `schedule.interval: \"weekly\"`"
     );
 }
+
+/// v0.45.4 S7.3 / Proof P1 (wiring half): parses `ci.yml` and asserts a
+/// `benchmark` job exists, carries a numeric `timeout-minutes` bound, and
+/// its steps reference all four subsystem tags (`ops`, `storage`, `runtime`,
+/// `control`) and all four `v0.45.4-<tag>.json` baseline paths — i.e. that
+/// each subsystem's CI step actually invokes the shared
+/// `bench_regression_gate` binary with its own tag/baseline, not just that
+/// the comparator logic works in isolation.
+#[test]
+fn test_benchmark_ci_job_exists_and_covers_four_subsystems() {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let ci_path = repo_root.join(".github/workflows/ci.yml");
+
+    let content = std::fs::read_to_string(&ci_path).expect("failed to read ci.yml");
+
+    // Isolate the `benchmark:` job's body: from its header (a line starting
+    // with exactly two spaces then `benchmark:`) up to the next line that
+    // starts a new top-level job (two-space indent followed by a bare key,
+    // not further-indented step content).
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| *l == "  benchmark:")
+        .expect("ci.yml must contain a top-level `benchmark:` job");
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| {
+            !l.is_empty() && l.starts_with("  ") && !l.starts_with("   ") && l.ends_with(':')
+        })
+        .map(|i| start + 1 + i)
+        .unwrap_or(lines.len());
+    let job_body = lines[start..end].join("\n");
+    let job_body = job_body.as_str();
+
+    assert!(
+        job_body.contains("timeout-minutes:"),
+        "benchmark job must declare a `timeout-minutes` bound"
+    );
+    let timeout_line = job_body
+        .lines()
+        .find(|l| l.trim_start().starts_with("timeout-minutes:"))
+        .expect("timeout-minutes line must exist");
+    let timeout_value = timeout_line
+        .split(':')
+        .nth(1)
+        .map(|s| s.trim())
+        .unwrap_or("");
+    assert!(
+        timeout_value.parse::<u32>().is_ok(),
+        "benchmark job's timeout-minutes must be numeric, got {:?}",
+        timeout_value
+    );
+
+    for tag in ["ops", "storage", "runtime", "control"] {
+        assert!(
+            job_body.contains(&format!("--tag {tag}")),
+            "benchmark job must invoke bench_regression_gate with `--tag {tag}`"
+        );
+        let baseline_path = format!("crates/rockstream-{tag}/benches/baseline/v0.45.4-{tag}.json");
+        let baseline_path = if tag == "ops" {
+            "crates/rockstream-ops/benches/baseline/v0.45.4-ops.json".to_string()
+        } else {
+            baseline_path
+        };
+        assert!(
+            job_body.contains(&baseline_path),
+            "benchmark job must reference baseline path `{baseline_path}`"
+        );
+    }
+}
+
+/// v0.45.4 S7.4 / Proof P2 (guard half): the `bench-baseline-update` Makefile
+/// target must exist, and the literal string `bench-baseline-update` must
+/// never appear in `ci.yml` — baseline updates stay an explicit,
+/// code-reviewed, human-triggered step, never auto-invoked by CI.
+#[test]
+fn test_makefile_has_bench_baseline_update_target_not_invoked_by_ci() {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let ci_path = repo_root.join(".github/workflows/ci.yml");
+    let makefile_path = repo_root.join("Makefile");
+
+    let ci_content = std::fs::read_to_string(&ci_path).expect("failed to read ci.yml");
+    let makefile_content =
+        std::fs::read_to_string(&makefile_path).expect("failed to read Makefile");
+
+    assert!(
+        makefile_content.contains("\nbench-baseline-update:"),
+        "Makefile must contain a `bench-baseline-update:` target"
+    );
+    assert!(
+        !ci_content.contains("bench-baseline-update"),
+        "ci.yml must never invoke `bench-baseline-update` — it is a human-triggered-only step"
+    );
+}
