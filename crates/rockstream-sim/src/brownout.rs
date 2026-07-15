@@ -26,6 +26,18 @@ pub enum BrownoutStatus {
 
 /// Handles object store brownout by buffering epoch commits and applying
 /// backpressure when the local buffer is full (DESIGN.md §11.7).
+///
+/// INVARIANT-BY-CONSTRUCTION: M4-S4 — this guard's only failure states are
+/// [`BrownoutStatus::Stalled`] and [`BrownoutStatus::Blocked`]; there is no
+/// code path here that terminates the worker or invokes
+/// `SelfFenceGuard`/`must_self_fence()` (`crates/rockstream-runtime/src/
+/// fence.rs`). Self-fencing is gated exclusively on control-plane
+/// reachability there, which is an entirely separate signal from object
+/// store reachability tracked by this struct, so a worker that can reach
+/// the control plane but not the object store is structurally always
+/// `Blocked`, never `terminated` — proven by `test_checkpoint_under_slow_input`
+/// (`crates/rockstream-sim/tests/`) completing without a self-fence panic
+/// under a slow/unavailable object store.
 pub struct ObjectStoreBrownoutGuard {
     max_buffered_epochs: usize,
     buffered_epochs: usize,

@@ -34,6 +34,10 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
       - name: error-code enforcement
         run: bash scripts/check-error-codes.sh
+      - name: invariant-pairs cross-check
+        run: bash scripts/check-invariant-pairs.sh
+      - name: invariant-pairs checker self-test
+        run: bash scripts/check-invariant-pairs.test.sh
       - name: exit criteria sign-offs
         run: bash scripts/check-exit-criteria.sh
       - name: path-coupling check

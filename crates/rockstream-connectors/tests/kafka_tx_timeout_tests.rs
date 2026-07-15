@@ -49,6 +49,12 @@ mod sim_coordination {
                     // the topic (absent, since `recover()` never re-invokes
                     // the fault) and re-commits in a fresh transaction,
                     // which always converges in one recovery call.
+                    //
+                    // COV-M3: this branch is exactly the coverage-witness
+                    // state the FizzBee model requires — the sink crashes
+                    // (here: the broker aborts the open transaction) between
+                    // `pre_commit` and `commit`, observed via `commit()`
+                    // returning `Err` before recovery re-drives it below.
                     let action = RecoveryAction::RerunCommit {
                         epoch,
                         profile: SinkIdempotencyProfile::CheckBeforeCommit,
@@ -60,7 +66,7 @@ mod sim_coordination {
 
                 assert!(
                     sink.check_epoch_delivered(epoch),
-                    "seed {seed} epoch {epoch}: must be delivered after commit/recovery"
+                    "COV-M3: seed {seed} epoch {epoch}: must be delivered after commit/recovery"
                 );
             }
 

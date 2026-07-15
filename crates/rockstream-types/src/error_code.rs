@@ -236,6 +236,21 @@ pub const RS_9001: ErrorCode = ErrorCode::new(9001);
 /// next_steps: scale out aggregators or reduce shard count.
 pub const RS_8001: ErrorCode = ErrorCode::new(8001);
 
+/// Stale fencing token on the frontier-aggregator's publisher-lease CAS
+/// path (v0.45.6, M2-S3): either a lease-acquisition CAS lost the race
+/// against a newer token, or a `publish_frontier` write carried a
+/// superseded token. next_steps: re-acquire the lease under the current
+/// fence token before retrying; the aggregator has been fenced out.
+pub const RS_8002: ErrorCode = ErrorCode::new(8002);
+
+/// Sync-flush-before-lease-handoff-read violation (v0.45.6, M2-S3/S4): a
+/// newly-elected publisher's first read of the published frontier observed
+/// a write that was not confirmed synchronously durable before the lease
+/// handoff. next_steps: verify every `publish_frontier` write path uses
+/// `WriteOptions { await_durable: true }`; this indicates a durability
+/// regression in `FrontierLeaseStore`.
+pub const RS_8003: ErrorCode = ErrorCode::new(8003);
+
 /// Metadata for a registered error code.
 pub struct ErrorCodeMeta {
     /// The error code.
@@ -333,6 +348,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         5019 => "Resource usage budget critical (95% threshold reached)",
         6001 => "Incompatible upstream schema evolution detected",
         8001 => "Frontier aggregator shard registry is full; new shard reports rejected",
+        8002 => "Stale fencing token on frontier-aggregator publisher-lease CAS or publish",
+        8003 => "Sync-flush-before-lease-handoff-read violation on frontier publication",
         2019 => "Shard write buffer full; backpressure applied",
         2012 => "Session wait-for deadline exceeded; query proceeded at current frontier",
         2020 => "Subscribe consumer fell behind the change-log retention window",
@@ -431,6 +448,8 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         5019 => "Immediately free unused view resources or scale cluster capacity to prevent pipeline stalls.",
         6001 => "Apply view replacement or run manual migration to match the new upstream schema.",
         8001 => "Scale out frontier aggregators (add more nodes with --role=frontier) or reduce shard count below the configured limit.",
+        8002 => "Re-acquire the publisher lease under the current fence token before retrying; this aggregator has been fenced out by a newer publisher.",
+        8003 => "Verify every publish_frontier write path uses WriteOptions { await_durable: true }; this indicates a durability regression in FrontierLeaseStore.",
         2400 => "Provide valid credentials (Bearer token or mTLS certificate)",
         2401 => "Request elevated RBAC role from an admin or contact the namespace owner",
         2402 => "Switch to the correct namespace with SET search_path or request cross-namespace admin role",
@@ -480,6 +499,7 @@ mod tests {
             RS_2402, // v0.26 auth
             RS_9001, // v0.45.1 admission control
             RS_1731, // v0.45.2 control-plane leader-only write gating (M7-S2)
+            RS_8002, RS_8003, // v0.45.6 frontier-lease publisher fencing (M2-S3)
         ];
         for code in codes {
             assert_ne!(

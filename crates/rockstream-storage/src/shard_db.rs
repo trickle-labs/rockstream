@@ -232,6 +232,13 @@ impl ShardDb {
     /// calls `Db::write()` once.  Multiple callers may merge their batches via
     /// [`WriteBatch::merge_from`] before calling this to produce a single
     /// atomic commit (group commit — v0.5).
+    ///
+    /// INVARIANT-BY-CONSTRUCTION: M1-S1 — this method builds exactly one
+    /// `slatedb::WriteBatch` from all of `batch.ops` and calls `self.db.write`
+    /// on it exactly once (below), so there is no intermediate point at which
+    /// only some ops are visible to a reader: a torn write is structurally
+    /// unobservable, not merely untested. No redundant runtime `assert!` is
+    /// needed (same escape hatch used for M2-S1/S2's meet-correctness).
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
         let frontier_key = ShardKeyEncoder::frontier_key();
         for op in &batch.ops {

@@ -220,6 +220,9 @@ async fn test_one_checkpoint_per_shard_lfs() {
 /// 4. Open a fresh `ShardReader` (reader-only view, simulating post-crash reader).
 /// 5. Assert the reader can read back exactly the same values written before the
 ///    checkpoint.
+///
+/// Also the runtime witness for M1-L1 (`EpochProgress`) and COV-M1 (a crash
+/// occurred and progress resumed) — see the step-5 assertions below.
 #[tokio::test]
 async fn test_recovery_bit_identical_lfs() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -259,20 +262,26 @@ async fn test_recovery_bit_identical_lfs() {
         .unwrap();
 
     // Step 5: Assert bit-identical state — reader returns pre-crash values.
+    // M1-S5 (IdempotentReplay) paired assertion: recovery must reproduce
+    // exactly the pre-crash persisted state, never a divergent replayed
+    // value — these `assert!`s are the runtime check for that invariant.
+    // Also the runtime witness for M1-L1 (EpochProgress: recovery does not
+    // stall progress) and COV-M1 (a state exists where a crash occurred —
+    // simulated by `db.close()` above — and progress resumed after it).
     let foo = recovered.reader.get(b"rec/key/foo").await.unwrap();
-    assert_eq!(
-        foo.as_deref(),
-        Some(b"bar".as_ref()),
-        "rec/key/foo must be 'bar' after recovery"
+    assert!(
+        foo.as_deref() == Some(b"bar".as_ref()),
+        "M1-S5: rec/key/foo must be 'bar' after recovery (idempotent replay)"
     );
     let baz = recovered.reader.get(b"rec/key/baz").await.unwrap();
-    assert_eq!(
-        baz.as_deref(),
-        Some(b"qux".as_ref()),
-        "rec/key/baz must be 'qux' after recovery"
+    assert!(
+        baz.as_deref() == Some(b"qux".as_ref()),
+        "M1-S5: rec/key/baz must be 'qux' after recovery (idempotent replay)"
     );
 
-    // Recovery progress metric: 1/1 = 100%.
+    // Recovery progress metric: 1/1 = 100% — the M4-L1 (RecoveryProgress)
+    // witness: after the simulated crash above, recovery is not stalled and
+    // reaches full progress.
     let prog = driver.progress();
     assert_eq!(prog.recovered, 1);
     assert_eq!(prog.total, 1);
@@ -474,18 +483,17 @@ async fn test_recovery_bit_identical_minio() {
         .await
         .unwrap();
 
-    // Assert bit-identical state.
+    // Assert bit-identical state. M1-S5 (IdempotentReplay) paired assertion:
+    // recovery must reproduce exactly the pre-crash persisted state.
     let alpha = recovered.reader.get(b"minio/key/alpha").await.unwrap();
-    assert_eq!(
-        alpha.as_deref(),
-        Some(b"beta".as_ref()),
-        "alpha must be 'beta'"
+    assert!(
+        alpha.as_deref() == Some(b"beta".as_ref()),
+        "M1-S5: alpha must be 'beta' after recovery (idempotent replay)"
     );
     let gamma = recovered.reader.get(b"minio/key/gamma").await.unwrap();
-    assert_eq!(
-        gamma.as_deref(),
-        Some(b"delta".as_ref()),
-        "gamma must be 'delta'"
+    assert!(
+        gamma.as_deref() == Some(b"delta".as_ref()),
+        "M1-S5: gamma must be 'delta' after recovery (idempotent replay)"
     );
 }
 
@@ -635,7 +643,8 @@ fn test_self_fence_on_partition() {
         "M4-S2: worker w1 must self-fence when deadline exceeded under partition"
     );
 
-    // After w1 self-fences, lease is re-granted to w2 (token 2).
+    // After w1 self-fences, lease is re-granted to w2 (token 2) — the
+    // orphaned shard's recovery: M4-L1 (RecoveryProgress) witness.
     // M4-S1/S3: assert_valid_writer succeeds for w2 but would panic for w1's stale token.
     let current_token = w2_token; // control plane has advanced the token
     assert_valid_writer(shard_id, w2_token, current_token, Some(WorkerId(2)));

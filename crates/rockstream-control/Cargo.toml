@@ -21,6 +21,7 @@ parking_lot = { workspace = true }
 object_store = { workspace = true }
 rand = { workspace = true }
 futures = { workspace = true }
+slatedb = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

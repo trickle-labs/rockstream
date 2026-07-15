@@ -663,17 +663,31 @@ corresponding `always` proofs are untrustworthy — treated as a build failure.
 
 Per the TigerBeetle assertion discipline ([DESIGN.md §17.3](DESIGN.md)), every
 FizzBee invariant has a corresponding Rust paired assertion. This table is a
-**required deliverable** maintained alongside the specs; CI cross-checks that
-every row has both a green FizzBee assertion and a present runtime `assert!`.
+**required deliverable** maintained alongside the specs; CI cross-checks this
+concretely via `scripts/check-invariant-pairs.sh` (wired into the `check` job,
+self-tested by `scripts/check-invariant-pairs.test.sh`), which parses every
+`always`/`always eventually`/`exists assertion` in `formal/*.fizz`, extracts
+its `M<n>-S<n>`/`M<n>-L<n>`/`COV-M<n>` ID(s), and fails the build if any ID
+lacks either a real `assert!`/`debug_assert!` site or a justified
+`// INVARIANT-BY-CONSTRUCTION: <ID> — <reason>` comment somewhere in `crates/`
+— so every row below has both a green FizzBee assertion and a present runtime
+check, not just an aspirational claim.
 
 | FizzBee invariant | Rust paired assertion ([DESIGN.md §17.3](DESIGN.md)) | Crate |
 |---|---|---|
-| M1-S1, M1-S2 | Assert `committed_epoch` non-decreasing before `WriteBatch` build and after `ShardDb` decode. | `rockstream-storage` |
-| M1-S3, M1-S4 | Assert object-store-derived `cluster_committed` equals control-plane view at each checkpoint. | `rockstream-runtime` |
+| M1-S1 | `INVARIANT-BY-CONSTRUCTION` comment in `crates/rockstream-storage/src/shard_db.rs::write_batch`: exactly one `slatedb::WriteBatch` is built from all ops and written via one `Db::write` call, so a torn intermediate is structurally unobservable — no separate runtime `assert!` needed. | `rockstream-storage` |
+| M1-S2 | Assert `committed_epoch` non-decreasing before `WriteBatch` build and after `ShardDb` decode. | `rockstream-storage` |
+| M1-S3, M1-S4 | `INVARIANT-BY-CONSTRUCTION` comment at the `RecoveryDriver::recover_all` checkpoint boundary (`crates/rockstream-runtime/src/recovery.rs`): `cluster_committed` is derived fresh from `checkpoint.shards`' per-shard frontier keys on every call — there is no separate control-plane-cached copy anywhere in the crate that could diverge from it, so CALM monotonicity/verifiability cannot be violated by a stale comparison. | `rockstream-runtime` |
 | M1-S5 | Assert epoch-keyed replay produces byte-identical state (crash-replay test). | `rockstream-storage` |
+| M1-L1 (liveness) | `test_recovery_bit_identical_lfs`/`_minio` (`crates/rockstream-sim/tests/checkpoint_recovery.rs`) assert the recovered reader's state matches pre-crash values immediately after `RecoveryDriver::recover_shard`, witnessing that recovery does not stall epoch progress. Spec: `formal/m1_epoch_commit.fizz` M1-L1. | `rockstream-sim` |
+| COV-M1 | Same tests as M1-L1 above: `db.close()` simulates the crash, and the post-recovery assertions witness progress resumed after it, reaching the coverage-witness state (`crash_occurred` and epoch progress). Spec: `formal/m1_epoch_commit.fizz` COV-M1. | `rockstream-sim` |
 | M2-S1, M2-S2 | Assert published frontier `≤` true frontier; assert meet associativity before publish and after read. | `rockstream-control` |
-| M2-S3, M2-S4 | Assert single CAS-holder of `frontier/leader`; assert `sync:true` flush before lease-handoff read. | `rockstream-control` |
+| M2-S3, M2-S4 | Assert single CAS-holder of `frontier/leader`; assert `sync:true` flush before lease-handoff read. Durability: `crates/rockstream-control/tests/frontier_lease_tests.rs::frontier_leader_lease_cas_survives_restart_lfs`/`_minio_tc` and `sync_flush_before_lease_handoff_read_lfs`/`_minio_tc` (v0.45.6 S7). | `rockstream-control` |
+| M2-L1 (liveness) | `frontier_lease_tests.rs::frontier_leader_lease_cas_survives_restart_lfs`/`_minio_tc` assert `published_frontier` survives a restart and is observed by the recovering handle — publication progress is not lost across a crash. Spec: `formal/m2_frontier_agg.fizz` M2-L1. | `rockstream-control` |
+| M2-L2 (liveness) | Same tests as M2-L1: a second aggregator acquires with a strictly higher token after the first's simulated crash and continues publishing successfully — failover progress. Spec: `formal/m2_frontier_agg.fizz` M2-L2. | `rockstream-control` |
+| COV-M2 | `crates/rockstream-sim/tests/frontier_publisher_election.rs::three_frontier_aggregators_stale_publisher_never_republishes` (v0.45.6 S8): three simulated `FrontierAggregator`s contend for the same `frontier/leader` CAS record; `buggify!("frontier.stale_publish_race", p)` forces a fenced aggregator to attempt a late publish after a new leader's CAS has already succeeded, reaching the `fencing_occurred` coverage-witness state and asserting the stale attempt is always rejected. Spec: `formal/m2_frontier_agg.fizz` COV-M2. | `rockstream-sim` |
 | M3-S1–S4 | Assert idempotency-key uniqueness before `prepare`; assert one external artifact per key after recovery. Specifically: `assert_no_duplicate_delivery` (M3-S1), `assert_no_lost_delivery_after_checkpoint` (M3-S2), `assert_epoch_committed_only_after_cluster_checkpoint` (M3-S3), `assert_recovery_dispatch_idempotent` (M3-S4) — all in `crates/rockstream-connectors/src/sink_connector.rs`. | `rockstream-connectors` |
+| COV-M3 | `crates/rockstream-connectors/tests/kafka_tx_timeout_tests.rs::seeded_kafka_tx_timeout_fault_injection_across_seeds` uses `buggify!("kafka.tx_timeout", p)` to force the broker to abort an open transaction between `pre_commit` and `commit`, reaching the coverage-witness state, then drives `CheckBeforeCommit` recovery and asserts exactly-once delivery. Spec: `formal/m3_sink_2pc.fizz` COV-M3. | `rockstream-connectors` |
 | M4-S1, M4-S3 | `assert_valid_writer(shard_id, token, current_token, …)` in `crates/rockstream-runtime/src/fence.rs` before every epoch commit; `assert_single_lease_holder(shard_id, count)` checked after every lease `acquire`/`force_acquire` call. Panics with `RS-1702` on stale token. Spec: `formal/m4_self_fencing.fizz` M4-S1, M4-S3. | `rockstream-runtime` |
 | M4-S2 | `SelfFenceGuard::must_self_fence()` / `assert_within_deadline()` in `crates/rockstream-runtime/src/fence.rs`; worker must call `guard.tick(can_reach_control)` on every heartbeat and terminate when `must_self_fence()` returns `true`. Panics with `RS-1702` on deadline exceeded. Spec: `formal/m4_self_fencing.fizz` M4-S2. | `rockstream-runtime` |
 | M4-S4 | No `assert!` fires when an object-store-only partition occurs (worker cannot reach object store but can still reach control plane): the worker blocks (backpressure) rather than self-fencing, because lease validity is determined by control-plane contact alone. Verified by `test_checkpoint_under_slow_input` (object-store stall → backpressure, not panic). Spec: `formal/m4_self_fencing.fizz` M4-S4. | `rockstream-runtime`, `rockstream-sim` |

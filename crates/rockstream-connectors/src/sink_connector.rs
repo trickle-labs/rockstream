@@ -20,7 +20,7 @@
 //!
 //! | FizzBee invariant | Assertion |
 //! |---|---|
-//! | M5-S3 | [`assert_commit_pointer_atomic`] |
+//! | M5-S1 / M5-S3 | [`assert_commit_pointer_atomic`] |
 
 use std::collections::BTreeSet;
 
@@ -211,6 +211,8 @@ pub fn assert_no_lost_delivery_after_checkpoint(
 ) {
     if cluster_committed >= epoch {
         // The epoch has been checkpointed; the sink must have at least staged it.
+        // M3-S2 / M3-L1: this is the safety prefix of M3-L1's liveness
+        // property — checking the durable staging step was not skipped.
         assert!(
             !matches!(sink_state, SinkState::Idle),
             "RS-4004: M3-S2 violation — lost delivery: \
@@ -222,9 +224,13 @@ pub fn assert_no_lost_delivery_after_checkpoint(
     }
 }
 
-/// M5-S3 paired assertion: assert that the final-prefix pointer produced by
-/// the cold-tier sink's commit-time atomic rename is never observed in a
-/// partially-written state (DESIGN.md §17.8 gap 1).
+/// M5-S1 / M5-S3 paired assertion: assert that the final-prefix pointer
+/// produced by the cold-tier sink's commit-time atomic rename is never
+/// observed in a partially-written state (DESIGN.md §17.8 gap 1). A
+/// truncated final-prefix object is both a duplicate-output risk (M5-S1: the
+/// retried rename would otherwise re-append/re-fragment the same epoch's
+/// output) and an atomicity violation (M5-S3), so this single check
+/// implements both invariants per FIZZBEE_TEST_PLAN.md §3.7.
 ///
 /// Real object stores (S3/GCS) do not implement the `_pending/{epoch}/` →
 /// final-prefix rename as a single atomic operation; a crash mid-rename (or
@@ -245,7 +251,7 @@ pub fn assert_commit_pointer_atomic(
 ) {
     assert!(
         observed_len == expected_len,
-        "RS-4006: M5-S3 violation — commit pointer not atomic: \
+        "RS-4006: M5-S1/M5-S3 violation — commit pointer not atomic: \
          connector={connector_id}, epoch={epoch} observed final-prefix object length={observed_len} \
          but expected={expected_len} (a partial/truncated write is visible at the final prefix). \
          next_steps: This indicates a crash mid-rename (DESIGN.md §17.8 gap 1). Recovery must \
@@ -380,7 +386,7 @@ mod tests {
         assert_no_lost_delivery_after_checkpoint(ConnectorId(1), 5, 2, &SinkState::Idle);
     }
 
-    // ── M5-S3: Commit pointer atomicity ───────────────────────────────────────
+    // ── M5-S1 / M5-S3: Commit pointer atomicity ───────────────────────────────
 
     #[test]
     fn assert_commit_pointer_atomic_passes_when_lengths_match() {

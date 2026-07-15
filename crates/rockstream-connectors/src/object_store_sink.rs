@@ -48,7 +48,7 @@ pub struct ObjectStoreSink {
     /// Simulated `_pending/{epoch}/` staging area.
     pending: BTreeMap<Epoch, Vec<u8>>,
     /// Simulated `final/{epoch}/` committed area. Stores the actual bytes
-    /// written so `assert_commit_pointer_atomic` (M5-S3) can detect a
+    /// written so `assert_commit_pointer_atomic` (M5-S1/M5-S3) can detect a
     /// truncated/partial write left by a crash mid-rename.
     committed_final: BTreeMap<Epoch, Vec<u8>>,
     /// Epochs already delivered (for duplicate-delivery assertion).
@@ -165,7 +165,7 @@ impl SinkConnector for ObjectStoreSink {
         }
         // Write to `_pending/{epoch}/part-0`: a synthetic payload standing in
         // for the staged row bytes (one byte per row, minimum one byte) so
-        // that a mid-rename truncation (M5-S3) has real bytes to truncate
+        // that a mid-rename truncation (M5-S1/M5-S3) has real bytes to truncate
         // and recovery has a source-of-truth length to compare against.
         let pending_path = format!("_pending/{epoch}/part-0");
         let payload = vec![0xABu8; row_count.max(1)];
@@ -194,7 +194,7 @@ impl SinkConnector for ObjectStoreSink {
                     // Atomic rename: move _pending/{epoch}/ → final/{epoch}/,
                     // applying the `object_store.partial_write` fault (M5,
                     // DESIGN.md §17.8 gap 1) if armed. `assert_commit_pointer_atomic`
-                    // (M5-S3) panics immediately if the write was truncated —
+                    // (M5-S1/M5-S3) panics immediately if the write was truncated —
                     // modeling the process crashing mid-rename before it can
                     // report success. `recover` must scan-and-delete the
                     // resulting orphaned partial object and retry.
@@ -210,6 +210,17 @@ impl SinkConnector for ObjectStoreSink {
                     if self.pending_epochs_count > 0 {
                         self.pending_epochs_count -= 1;
                     }
+                    // INVARIANT-BY-CONSTRUCTION: M5-S2 — `delivered_epochs`
+                    // (this sink's Committed marker) is only ever inserted
+                    // for `epoch` on the line directly below, which is
+                    // reached only after `write_final` has written the
+                    // final-prefix object for `epoch` AND
+                    // `assert_commit_pointer_atomic` above has confirmed that
+                    // write was not truncated. There is no code path that
+                    // marks an epoch delivered/Committed without first
+                    // writing (and length-verifying) its final-prefix
+                    // object, so "Committed but no final object exists" is
+                    // structurally unreachable, not merely untested.
                     self.delivered_epochs.insert(epoch);
                 }
                 Ok(())
@@ -394,7 +405,7 @@ mod tests {
     }
 
     // ── M5: crash mid-rename leaves a truncated final object ─────────────────
-    // (DESIGN.md §17.8 gap 1 / formal/m5_cold_tier_sink.fizz M5-S3, M5-L1)
+    // (DESIGN.md §17.8 gap 1 / formal/m5_cold_tier_sink.fizz M5-S1, M5-S3, M5-L1)
 
     #[test]
     fn crash_during_rename_partial_write_recovery() {
@@ -412,6 +423,12 @@ mod tests {
         sink.recover(action).unwrap();
         // Recovery must scan-and-delete the truncated object and retry the
         // rename with the full staged payload — no duplicate, no data loss.
+        //
+        // COV-M5: this test reaches exactly the coverage-witness state the
+        // FizzBee model requires — the sink crashes mid-rename (a partial
+        // object was briefly visible at the final prefix, simulated above),
+        // and recovery cleans it up via scan-and-delete before completing
+        // the commit, asserted by the checks below.
         assert_eq!(sink.final_len(9), Some(8));
         assert_eq!(sink.delivered_epochs.len(), 1);
         assert!(!sink.pending_exists(9));
@@ -419,7 +436,7 @@ mod tests {
 
     #[test]
     fn commit_panics_via_assert_commit_pointer_atomic_on_truncated_write() {
-        // Directly exercises the M5-S3 paired assertion's panic path: a
+        // Directly exercises the M5-S1/M5-S3 paired assertion's panic path: a
         // `write_final` that (hypothetically) truncates bytes must be caught
         // before the sink can report success. `assert_commit_pointer_atomic`
         // itself is unit-tested exhaustively in `sink_connector.rs`; here we
@@ -428,7 +445,10 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             crate::sink_connector::assert_commit_pointer_atomic(ConnectorId(1), 9, 4, 8);
         });
-        assert!(result.is_err(), "expected RS-4006 panic on truncated write");
+        assert!(
+            result.is_err(),
+            "M5-S1/M5-S3: expected RS-4006 panic on truncated write"
+        );
     }
 
     #[test]

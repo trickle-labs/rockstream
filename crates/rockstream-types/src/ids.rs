@@ -75,6 +75,12 @@ define_id!(
     ConnectorId, u64, "connector"
 );
 
+define_id!(
+    /// Identifies a `FrontierAggregator` instance (v0.45.6 — frontier-lease
+    /// publisher election).
+    AggregatorId, u64, "aggregator"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

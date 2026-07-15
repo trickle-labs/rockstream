@@ -123,6 +123,16 @@ pub fn assert_valid_control_leader_epoch(write_epoch: u64, current_epoch: u64) {
 /// the caller **must** terminate (self-fence).
 ///
 /// Paired assertion for FizzBee M4-S2.
+///
+/// INVARIANT-BY-CONSTRUCTION: M4-S4 — this guard's isolation clock is driven
+/// solely by `can_reach_control` (see [`SelfFenceGuard::tick`]); nothing in
+/// this module reads object-store reachability. An object-store-only
+/// partition (control reachable, object store not) can therefore never
+/// start the isolation clock here and so can never reach
+/// [`SelfFenceGuard::must_self_fence`]'s panic path — that scenario is
+/// handled exclusively by `ObjectStoreBrownoutGuard`
+/// (`crates/rockstream-sim/src/brownout.rs`), whose only failure states are
+/// `Stalled`/`Blocked`, never termination.
 #[derive(Debug)]
 pub struct SelfFenceGuard {
     /// When the worker first lost contact with the control plane.

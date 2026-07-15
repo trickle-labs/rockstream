@@ -131,6 +131,11 @@ async fn spawn_bootstrapped_three_node_group() -> [RaftNodeHandleFull; 3] {
 /// 3-node Raft control group always elects exactly one leader, and
 /// `assert_single_control_leader` (the M7-S1 paired assertion) never fires.
 ///
+/// This is also the runtime witness for **M7-L1** (`LeaderEventuallyExists`):
+/// after the group has had time to run its election protocol, a leader must
+/// exist — the `leader_count == 1` check below fails if no leader (or more
+/// than one) is present.
+///
 /// `.claude/v0.45.2-plan.md` Proof Mapping: "No dual-leader window exists".
 #[tokio::test]
 async fn three_node_raft_elects_single_leader() {
@@ -143,10 +148,11 @@ async fn three_node_raft_elects_single_leader() {
 
         let handles = [n0.handle.clone(), n1.handle.clone(), n2.handle.clone()];
         let leader_count = handles.iter().filter(|h| h.is_leader()).count();
-        assert_eq!(
-            leader_count,
-            1,
-            "seed={seed}: expected exactly one leader, roles={:?}",
+        // M7-L1: a leader must eventually exist — not zero, and (per M7-S1)
+        // not more than one.
+        assert!(
+            leader_count == 1,
+            "seed={seed}: expected exactly one leader (M7-L1), roles={:?}",
             handles.iter().map(|h| h.role()).collect::<Vec<_>>()
         );
 
@@ -307,6 +313,11 @@ async fn leader_crash_composed_with_shard_fence_no_split_brain() {
 
         // M7-S3 paired assertion: the stale in-flight write (captured under
         // epoch_1) must be rejected against the new current epoch.
+        //
+        // COV-M7: this test reaches exactly the coverage-witness state the
+        // FizzBee model requires — leader crashes mid-term, a new leader is
+        // elected at a strictly higher term, and the stale (deposed)
+        // leader's in-flight shard-fence write is rejected (asserted below).
         let outcome = std::panic::catch_unwind(|| {
             assert_valid_control_leader_epoch(write_epoch_1, epoch_2);
         });

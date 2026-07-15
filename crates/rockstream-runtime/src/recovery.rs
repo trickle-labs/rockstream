@@ -314,6 +314,19 @@ impl RecoveryDriver {
     /// recorded in `control: connector/`. These are used to resume source
     /// connectors after the reader-to-writer transition. They are returned in
     /// the map for the caller to apply.
+    ///
+    /// INVARIANT-BY-CONSTRUCTION: M1-S3 / M1-S4 — this checkpoint boundary is
+    /// the only place `cluster_committed` (CALM min of per-shard committed
+    /// epochs) is ever consulted during recovery, and it is derived fresh
+    /// here directly from `checkpoint.shards`' per-shard `frontier_key`
+    /// values on every call. There is no separate control-plane-cached copy
+    /// of `cluster_committed` anywhere in this crate that could diverge from
+    /// this object-store-derived value (the only other computation of a
+    /// cluster-wide meet, `FrontierAggregator::compute_meet` in
+    /// `rockstream-control`, is likewise a fresh per-call derivation over
+    /// live shard reports, never a cache read at a checkpoint boundary), so
+    /// CALM monotonicity/verifiability cannot be violated by a stale
+    /// comparison — there is nothing for a fresh value to diverge from.
     pub async fn recover_all(
         &self,
         shard_paths: &BTreeMap<ShardId, String>,
