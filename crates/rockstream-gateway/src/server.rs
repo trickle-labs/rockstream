@@ -3127,7 +3127,7 @@ impl GatewayHandler {
 
         if self.catalog.get_view(&parsed.view).is_none() {
             return Ok(vec![create_sink_error_response(format!(
-                "CREATE SINK references unknown view '{}'",
+                "[RS-4007] CREATE SINK references unknown view '{}'. Next steps: {CREATE_SINK_NEXT_STEPS}",
                 parsed.view
             ))]);
         }
@@ -3137,7 +3137,7 @@ impl GatewayHandler {
             "filesystem" | "glue" | "rest" | "hive" | "ducklake"
         ) {
             return Ok(vec![create_sink_error_response(format!(
-                "CREATE SINK catalog '{}' is invalid; expected filesystem|glue|rest|hive|ducklake",
+                "[RS-4007] CREATE SINK catalog '{}' is invalid; expected filesystem|glue|rest|hive|ducklake. Next steps: {CREATE_SINK_NEXT_STEPS}",
                 parsed.catalog
             ))]);
         }
@@ -6509,13 +6509,15 @@ enum CreateSinkOptionValue {
     Array(Vec<String>),
 }
 
+/// Actionable remediation text shared by every CREATE SINK DDL/option parse failure.
+const CREATE_SINK_NEXT_STEPS: &str =
+    "check CREATE SINK syntax, referenced view name, and WITH option types; use catalog=filesystem|glue|rest|hive|ducklake.";
+
 fn create_sink_error_response(message: String) -> Response<'static> {
     Response::Error(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
         "42601".to_owned(),
-        format!(
-            "[RS-4007] {message}. Next steps: check CREATE SINK syntax, referenced view, and WITH option types."
-        ),
+        message,
     )))
 }
 
@@ -6523,27 +6525,33 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
     let trimmed = q.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_lowercase();
     if !lower.starts_with("create sink ") {
-        return Err("CREATE SINK statement must start with CREATE SINK".to_string());
+        return Err(format!(
+            "[RS-4007] CREATE SINK statement must start with CREATE SINK. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
     }
 
     let after_create = &trimmed["CREATE SINK".len()..].trim();
     let after_create_lower = after_create.to_lowercase();
-    let for_view_pos = after_create_lower
-        .find(" for view ")
-        .ok_or_else(|| "CREATE SINK requires FOR VIEW clause".to_string())?;
+    let for_view_pos = after_create_lower.find(" for view ").ok_or_else(|| {
+        format!(
+            "[RS-4007] CREATE SINK requires FOR VIEW clause. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        )
+    })?;
     let name = after_create[..for_view_pos]
         .trim()
         .trim_matches('"')
         .to_lowercase();
     if name.is_empty() {
-        return Err("CREATE SINK requires a sink name".to_string());
+        return Err(format!(
+            "[RS-4007] CREATE SINK requires a sink name. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
     }
 
     let after_for_view = after_create[for_view_pos + " for view ".len()..].trim();
     let after_for_view_lower = after_for_view.to_lowercase();
-    let to_pos = after_for_view_lower
-        .find(" to ")
-        .ok_or_else(|| "CREATE SINK requires TO clause".to_string())?;
+    let to_pos = after_for_view_lower.find(" to ").ok_or_else(|| {
+        format!("[RS-4007] CREATE SINK requires TO clause. Next steps: {CREATE_SINK_NEXT_STEPS}")
+    })?;
     let view = after_for_view[..to_pos]
         .trim()
         .trim_matches('"')
@@ -6552,23 +6560,31 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         .unwrap_or("")
         .to_lowercase();
     if view.is_empty() {
-        return Err("CREATE SINK requires a referenced view name".to_string());
+        return Err(format!(
+            "[RS-4007] CREATE SINK requires a referenced view name. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
     }
 
     let after_to = after_for_view[to_pos + " to ".len()..].trim();
-    let format_end = after_to
-        .find(char::is_whitespace)
-        .ok_or_else(|| "CREATE SINK requires a quoted sink path".to_string())?;
+    let format_end = after_to.find(char::is_whitespace).ok_or_else(|| {
+        format!(
+            "[RS-4007] CREATE SINK requires a quoted sink path. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        )
+    })?;
     let format = after_to[..format_end].trim().to_uppercase();
     if !matches!(format.as_str(), "ICEBERG" | "DELTA") {
-        return Err("CREATE SINK format must be ICEBERG or DELTA".to_string());
+        return Err(format!(
+            "[RS-4007] CREATE SINK format must be ICEBERG or DELTA. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
     }
 
     let after_format = after_to[format_end..].trim();
     let (path, consumed) = parse_sql_single_quoted_string(after_format)?;
     let after_path = after_format[consumed..].trim();
     if !after_path.to_lowercase().starts_with("with") {
-        return Err("CREATE SINK requires WITH (...) options".to_string());
+        return Err(format!(
+            "[RS-4007] CREATE SINK requires WITH (...) options. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
     }
     let with_body = after_path["with".len()..].trim();
     let option_map = parse_create_sink_options(with_body)?;
@@ -6581,13 +6597,19 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
     let format_version = parse_optional_u64_option(&option_map, "format_version")?;
     let partition_by = match option_map.get("partition_by") {
         Some(CreateSinkOptionValue::Array(values)) => values.clone(),
-        Some(_) => return Err("CREATE SINK option partition_by must be ARRAY[...]".to_string()),
+        Some(_) => {
+            return Err(format!(
+                "[RS-4007] CREATE SINK option partition_by must be ARRAY[...]. Next steps: {CREATE_SINK_NEXT_STEPS}"
+            ))
+        }
         None => Vec::new(),
     };
     let catalog = match option_map.get("catalog") {
         Some(CreateSinkOptionValue::String(value)) => value.to_lowercase(),
         Some(_) => {
-            return Err("CREATE SINK option catalog must be an identifier or string".to_string())
+            return Err(format!(
+                "[RS-4007] CREATE SINK option catalog must be an identifier or string. Next steps: {CREATE_SINK_NEXT_STEPS}"
+            ))
         }
         None => "filesystem".to_string(),
     };
@@ -6611,7 +6633,9 @@ fn parse_create_sink_options(
 ) -> Result<std::collections::HashMap<String, CreateSinkOptionValue>, String> {
     let raw = raw_with.trim();
     if !raw.starts_with('(') || !raw.ends_with(')') {
-        return Err("CREATE SINK WITH clause must be parenthesized".to_string());
+        return Err(format!(
+            "[RS-4007] CREATE SINK WITH clause must be parenthesized. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
     }
     let inner = &raw[1..raw.len() - 1];
     let mut options = std::collections::HashMap::new();
@@ -6619,12 +6643,17 @@ fn parse_create_sink_options(
         if part.trim().is_empty() {
             continue;
         }
-        let eq_idx = find_top_level_equals(&part)
-            .ok_or_else(|| format!("CREATE SINK option '{part}' must use key=value syntax"))?;
+        let eq_idx = find_top_level_equals(&part).ok_or_else(|| {
+            format!(
+                "[RS-4007] CREATE SINK option '{part}' must use key=value syntax. Next steps: {CREATE_SINK_NEXT_STEPS}"
+            )
+        })?;
         let key = part[..eq_idx].trim().to_lowercase();
         let raw_value = part[eq_idx + 1..].trim();
         if key.is_empty() || raw_value.is_empty() {
-            return Err(format!("CREATE SINK option '{part}' is malformed"));
+            return Err(format!(
+                "[RS-4007] CREATE SINK option '{part}' is malformed. Next steps: {CREATE_SINK_NEXT_STEPS}"
+            ));
         }
         let value = parse_create_sink_option_value(raw_value)?;
         options.insert(key, value);
@@ -6636,7 +6665,9 @@ fn parse_create_sink_option_value(raw: &str) -> Result<CreateSinkOptionValue, St
     let trimmed = raw.trim();
     if trimmed.to_uppercase().starts_with("ARRAY[") {
         if !trimmed.ends_with(']') {
-            return Err(format!("malformed ARRAY value '{trimmed}'"));
+            return Err(format!(
+                "[RS-4007] malformed ARRAY value '{trimmed}'. Next steps: {CREATE_SINK_NEXT_STEPS}"
+            ));
         }
         let inner = &trimmed[6..trimmed.len() - 1];
         let mut values = Vec::new();
@@ -6651,7 +6682,9 @@ fn parse_create_sink_option_value(raw: &str) -> Result<CreateSinkOptionValue, St
                     values.push(value);
                     continue;
                 }
-                return Err(format!("malformed ARRAY item '{item}'"));
+                return Err(format!(
+                    "[RS-4007] malformed ARRAY item '{item}'. Next steps: {CREATE_SINK_NEXT_STEPS}"
+                ));
             }
             values.push(item.trim_matches('"').to_string());
         }
@@ -6661,7 +6694,9 @@ fn parse_create_sink_option_value(raw: &str) -> Result<CreateSinkOptionValue, St
     if trimmed.starts_with('\'') {
         let (value, consumed) = parse_sql_single_quoted_string(trimmed)?;
         if !trimmed[consumed..].trim().is_empty() {
-            return Err(format!("malformed string literal '{trimmed}'"));
+            return Err(format!(
+                "[RS-4007] malformed string literal '{trimmed}'. Next steps: {CREATE_SINK_NEXT_STEPS}"
+            ));
         }
         return Ok(CreateSinkOptionValue::String(value));
     }
@@ -6681,7 +6716,9 @@ fn parse_optional_u64_option(
 ) -> Result<Option<u64>, String> {
     match options.get(key) {
         Some(CreateSinkOptionValue::Number(value)) => Ok(Some(*value)),
-        Some(_) => Err(format!("CREATE SINK option {key} must be a number")),
+        Some(_) => Err(format!(
+            "[RS-4007] CREATE SINK option {key} must be a number. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        )),
         None => Ok(None),
     }
 }
@@ -6689,7 +6726,9 @@ fn parse_optional_u64_option(
 fn parse_sql_single_quoted_string(input: &str) -> Result<(String, usize), String> {
     let bytes = input.as_bytes();
     if bytes.first().copied() != Some(b'\'') {
-        return Err("expected single-quoted string literal".to_string());
+        return Err(format!(
+            "[RS-4007] expected single-quoted string literal. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
     }
     let mut idx = 1usize;
     let mut value = String::new();
@@ -6709,7 +6748,9 @@ fn parse_sql_single_quoted_string(input: &str) -> Result<(String, usize), String
             }
         }
     }
-    Err("unterminated string literal".to_string())
+    Err(format!(
+        "[RS-4007] unterminated string literal. Next steps: {CREATE_SINK_NEXT_STEPS}"
+    ))
 }
 
 fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {
@@ -6739,7 +6780,9 @@ fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {
             }
             ']' if !in_string => {
                 if bracket_depth == 0 {
-                    return Err("unbalanced ] in WITH clause".to_string());
+                    return Err(format!(
+                        "[RS-4007] unbalanced ] in WITH clause. Next steps: {CREATE_SINK_NEXT_STEPS}"
+                    ));
                 }
                 bracket_depth -= 1;
                 current.push(ch);
@@ -6753,10 +6796,14 @@ fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {
     }
 
     if in_string {
-        return Err("unterminated string literal in WITH clause".to_string());
+        return Err(format!(
+            "[RS-4007] unterminated string literal in WITH clause. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
     }
     if bracket_depth != 0 {
-        return Err("unbalanced ARRAY[...] in WITH clause".to_string());
+        return Err(format!(
+            "[RS-4007] unbalanced ARRAY[...] in WITH clause. Next steps: {CREATE_SINK_NEXT_STEPS}"
+        ));
     }
     if !current.trim().is_empty() {
         parts.push(current.trim().to_string());

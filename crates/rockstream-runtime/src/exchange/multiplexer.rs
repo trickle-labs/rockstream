@@ -218,7 +218,7 @@ impl WorkerStreamMultiplexer {
             let store = self.get_object_store().ok_or_else(|| {
                 format!(
                     "[{}] Durable fallback failed: no object store available for multiplexer",
-                    rockstream_types::error_code::RS_3010
+                    rockstream_types::error_code::RS_3012
                 )
             })?;
 
@@ -254,7 +254,7 @@ impl WorkerStreamMultiplexer {
                                 ) {
                                     return Err(format!(
                                         "[{}] Failed to add existing frame during coalescing: {:?}",
-                                        rockstream_types::error_code::RS_3010,
+                                        rockstream_types::error_code::RS_3013,
                                         e
                                     ));
                                 }
@@ -262,7 +262,7 @@ impl WorkerStreamMultiplexer {
                             Err(e) => {
                                 return Err(format!(
                                     "[{}] Failed to read existing frame during coalescing: {:?}",
-                                    rockstream_types::error_code::RS_3010,
+                                    rockstream_types::error_code::RS_3012,
                                     e
                                 ));
                             }
@@ -285,7 +285,7 @@ impl WorkerStreamMultiplexer {
                 .map_err(|e| {
                     format!(
                         "[{}] Fallback write error: {:?}",
-                        rockstream_types::error_code::RS_3010,
+                        rockstream_types::error_code::RS_3013,
                         e
                     )
                 })?;
@@ -294,7 +294,7 @@ impl WorkerStreamMultiplexer {
             writer.finish(store.as_ref(), &path).await.map_err(|e| {
                 format!(
                     "[{}] Fallback upload error: {:?}",
-                    rockstream_types::error_code::RS_3010,
+                    rockstream_types::error_code::RS_3012,
                     e
                 )
             })?;

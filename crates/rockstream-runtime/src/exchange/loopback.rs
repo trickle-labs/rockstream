@@ -36,7 +36,13 @@ impl LoopbackRouter {
         shards
             .get(&shard_id)
             .and_then(|state| state.db.clone())
-            .ok_or_else(|| format!("Shard db not active for shard {:?}", shard_id))
+            .ok_or_else(|| {
+                format!(
+                    "[{}] Shard db not active for shard {:?}",
+                    rockstream_types::error_code::RS_3018,
+                    shard_id
+                )
+            })
     }
 
     /// Route a batch over the loopback path.

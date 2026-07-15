@@ -11,7 +11,7 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 
-use rockstream_types::error_code::RS_3010;
+use rockstream_types::error_code::{RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016};
 
 /// Named upper bound for in-memory shuffle frame accumulation (16MB).
 pub const MAX_DURABLE_BUFFER_SIZE_BYTES: usize = 16 * 1024 * 1024;
@@ -30,7 +30,7 @@ macro_rules! retry_op {
                         if attempts >= 5 {
                             break Err(format!(
                                 "[{}] Failed to complete operation after 5 rate-limited attempts: {:?}",
-                                RS_3010, e
+                                RS_3011, e
                             ));
                         }
                         tokio::time::sleep(delay).await;
@@ -38,7 +38,7 @@ macro_rules! retry_op {
                     } else {
                         break Err(format!(
                             "[{}] Object store operation failed: {:?}",
-                            RS_3010, e
+                            RS_3012, e
                         ));
                     }
                 }
@@ -105,7 +105,7 @@ impl DurableShuffleWriter {
         if self.buffer.len() + frame_len > MAX_DURABLE_BUFFER_SIZE_BYTES {
             return Err(format!(
                 "[{}] Durable shuffle buffer capacity exceeded (limit: {} bytes)",
-                RS_3010, MAX_DURABLE_BUFFER_SIZE_BYTES
+                RS_3013, MAX_DURABLE_BUFFER_SIZE_BYTES
             ));
         }
 
@@ -127,7 +127,7 @@ impl DurableShuffleWriter {
     /// Serializes the footer, appends it along with the footer length, and uploads the object.
     pub async fn finish(mut self, store: &dyn ObjectStore, path: &Path) -> Result<(), String> {
         let footer_bytes = serde_json::to_vec(&self.footer)
-            .map_err(|e| format!("[{}] Failed to serialize index footer: {:?}", RS_3010, e))?;
+            .map_err(|e| format!("[{}] Failed to serialize index footer: {:?}", RS_3014, e))?;
 
         let footer_len = footer_bytes.len() as u64;
 
@@ -161,7 +161,7 @@ impl DurableShuffleReader {
         if size < 8 {
             return Err(format!(
                 "[{}] File too small to contain a footer length: size={}",
-                RS_3010, size
+                RS_3016, size
             ));
         }
 
@@ -172,7 +172,7 @@ impl DurableShuffleReader {
         if footer_len_bytes.len() != 8 {
             return Err(format!(
                 "[{}] Invalid footer length bytes read: expected 8, got {}",
-                RS_3010,
+                RS_3016,
                 footer_len_bytes.len()
             ));
         }
@@ -182,7 +182,7 @@ impl DurableShuffleReader {
         if size < 8 + footer_len {
             return Err(format!(
                 "[{}] File size too small for specified footer length: size={}, footer_len={}",
-                RS_3010, size, footer_len
+                RS_3016, size, footer_len
             ));
         }
 
@@ -192,7 +192,7 @@ impl DurableShuffleReader {
 
         // 3. Deserialize footer
         let footer: ShuffleIndexFooter = serde_json::from_slice(&footer_bytes)
-            .map_err(|e| format!("[{}] Failed to deserialize index footer: {:?}", RS_3010, e))?;
+            .map_err(|e| format!("[{}] Failed to deserialize index footer: {:?}", RS_3015, e))?;
 
         Ok(footer)
     }
@@ -290,6 +290,6 @@ mod tests {
         let large_payload = vec![0u8; MAX_DURABLE_BUFFER_SIZE_BYTES + 1];
         let res = writer.add_frame(1, 2, 3, &large_payload);
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("RS-3010"));
+        assert!(res.unwrap_err().contains("RS-3013"));
     }
 }

@@ -4627,6 +4627,7 @@ RS-2015  index.frontier_lag
 RS-2016  index.name_conflict
 RS-2017  shard_stats.too_stale
 RS-2018  session.staleness_exceeded
+RS-2021  copy.malformed_stdin_statement
 RS-2501  coordinator.leader_unavailable        (was RS-2012)
 RS-2502  coordinator.prepare_conflict          (was RS-2013)
 RS-2503  coordinator.cross_group_rejected      (was RS-2017 collision)
@@ -4634,6 +4635,15 @@ RS-2504  coordinator.quorum_lost               (was RS-2018 collision)
 RS-3001  shard.fence_lost
 RS-3002  shard.recovery_replay_failed
 RS-3009  merge.malformed_operand
+RS-3011  durable.rate_limit_exhausted
+RS-3012  durable.object_store_io_failure
+RS-3013  durable.buffer_capacity_exceeded
+RS-3014  durable.footer_serialization_failed
+RS-3015  durable.footer_deserialization_failed
+RS-3016  durable.footer_corrupt_or_undersized
+RS-3017  exchange.ipc_shuffle_decode_error
+RS-3018  exchange.loopback_shard_not_active
+RS-3501  merge.law_accumulator_decode_error
 RS-4001  control.quota_violation
 RS-4002  control.autotune_bounds_exhausted
 RS-4101  cold_tier.not_enabled                 (was RS-4001 collision)

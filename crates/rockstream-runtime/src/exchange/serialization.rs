@@ -5,6 +5,7 @@ use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::arrow_batch::{append_weight_column, split_weight_column};
+use rockstream_types::error_code::RS_3017;
 
 /// Serialize an ArrowZSet to a binary payload using Arrow IPC stream format.
 /// The `_weight` column is appended as the last column of the batch.
@@ -48,8 +49,17 @@ pub fn deserialize_zset(
 
     let weighted_batch = match reader.next() {
         Some(Ok(batch)) => batch,
-        Some(Err(e)) => return Err(format!("Failed to read IPC batch: {:?}", e)),
-        None => return Err("Empty Arrow IPC stream".to_string()),
+        Some(Err(e)) => {
+            return Err(format!(
+                "[{RS_3017}] Failed to read IPC batch: {:?}. Next steps: inspect the Arrow IPC shuffle payload for truncation or a writer/reader version mismatch.",
+                e
+            ))
+        }
+        None => {
+            return Err(format!(
+                "[{RS_3017}] Empty Arrow IPC stream. Next steps: inspect the Arrow IPC shuffle payload for truncation or a writer/reader version mismatch."
+            ))
+        }
     };
 
     let (data, weights) = split_weight_column(&weighted_batch)

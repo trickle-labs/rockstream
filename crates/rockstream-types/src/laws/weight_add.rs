@@ -101,7 +101,11 @@ pub fn decode_weight(bytes: &[u8]) -> Result<i64, String> {
 
 fn parse_weight(bytes: &[u8]) -> Result<i64, String> {
     if bytes.len() != 8 {
-        return Err(format!("WeightAdd: expected 8 bytes, got {}", bytes.len()));
+        return Err(format!(
+            "[{}] WeightAdd: expected 8 bytes, got {}. Next steps: inspect the stored merge-law accumulator bytes; possible data corruption or an accumulator wire-format version mismatch.",
+            crate::error_code::RS_3501,
+            bytes.len()
+        ));
     }
     let arr: [u8; 8] = bytes.try_into().unwrap();
     Ok(i64::from_be_bytes(arr))

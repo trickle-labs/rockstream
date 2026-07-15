@@ -163,6 +163,8 @@ pub const RS_2012: ErrorCode = ErrorCode::new(2012);
 /// Subscribe consumer fell behind the change-log retention window (v0.25).
 /// next_steps: "Reconnect with AS OF NOW WITH SNAPSHOT or increase CHANGE_LOG_MAX_ENTRIES."
 pub const RS_2020: ErrorCode = ErrorCode::new(2020);
+/// COPY FROM STDIN statement is malformed and could not be parsed (v0.45.7).
+pub const RS_2021: ErrorCode = ErrorCode::new(2021);
 
 // 24xx: Auth (v0.26)
 /// Unauthenticated: request missing or carrying invalid credentials.
@@ -175,8 +177,22 @@ pub const RS_2402: ErrorCode = ErrorCode::new(2402);
 // 3xxx: Merge / arrangement
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
-/// Durable shuffle fallback operation failed.
-pub const RS_3010: ErrorCode = ErrorCode::new(3010);
+/// Durable shuffle rate-limit retry budget exhausted (v0.45.7, split from RS-3010).
+pub const RS_3011: ErrorCode = ErrorCode::new(3011);
+/// Durable shuffle generic object-store I/O failure (v0.45.7, split from RS-3010).
+pub const RS_3012: ErrorCode = ErrorCode::new(3012);
+/// Durable shuffle in-memory buffer capacity exceeded (v0.45.7, split from RS-3010).
+pub const RS_3013: ErrorCode = ErrorCode::new(3013);
+/// Durable shuffle footer serialization failed (v0.45.7, split from RS-3010).
+pub const RS_3014: ErrorCode = ErrorCode::new(3014);
+/// Durable shuffle footer deserialization failed (v0.45.7, split from RS-3010).
+pub const RS_3015: ErrorCode = ErrorCode::new(3015);
+/// Durable shuffle footer is corrupt or undersized (v0.45.7, split from RS-3010).
+pub const RS_3016: ErrorCode = ErrorCode::new(3016);
+/// Exchange IPC shuffle decode error (v0.45.7).
+pub const RS_3017: ErrorCode = ErrorCode::new(3017);
+/// Exchange loopback route target shard has no active `ShardDb` (v0.45.7).
+pub const RS_3018: ErrorCode = ErrorCode::new(3018);
 /// Pipeline blocked due to object store brownout; local buffer exhausted (v0.36, DESIGN.md §11.7).
 pub const RS_3003: ErrorCode = ErrorCode::new(3003);
 /// Worker drain in progress; new shard assignments rejected (v0.38).
@@ -191,6 +207,11 @@ pub const RS_3607: ErrorCode = ErrorCode::new(3607);
 pub const RS_3608: ErrorCode = ErrorCode::new(3608);
 /// Clone backfill lag exceeded the allowed threshold before flip (v0.39).
 pub const RS_3609: ErrorCode = ErrorCode::new(3609);
+
+// 3500-3999: Merge laws
+/// Merge-law accumulator wire bytes have the wrong size and cannot be decoded (v0.45.7).
+pub const RS_3501: ErrorCode = ErrorCode::new(3501);
+
 // 4xxx: Connector
 /// Source connection failed.
 pub const RS_4001: ErrorCode = ErrorCode::new(4001);
@@ -326,7 +347,15 @@ pub fn description(code: ErrorCode) -> &'static str {
         2018 => "Published frontier exceeded the session max_staleness bound; query proceeded",
         3003 => "Pipeline blocked: object store brownout, local buffer exhausted",
         3009 => "Merge operand malformed",
-        3010 => "Durable shuffle fallback operation failed",
+        3011 => "Durable shuffle rate-limit retry budget exhausted",
+        3012 => "Durable shuffle generic object-store I/O failure",
+        3013 => "Durable shuffle in-memory buffer capacity exceeded",
+        3014 => "Durable shuffle footer serialization failed",
+        3015 => "Durable shuffle footer deserialization failed",
+        3016 => "Durable shuffle footer is corrupt or undersized",
+        3017 => "Exchange IPC shuffle decode error",
+        3018 => "Exchange loopback route target shard has no active ShardDb",
+        3501 => "Merge-law accumulator wire bytes have the wrong size",
         3604 => "Worker drain in progress; new shard assignments rejected",
         3605 => "Shard load factor exceeds skew threshold; adaptive re-sharding scheduled",
         3606 => "Worker drain deadline exceeded; worker self-fenced",
@@ -353,6 +382,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         2019 => "Shard write buffer full; backpressure applied",
         2012 => "Session wait-for deadline exceeded; query proceeded at current frontier",
         2020 => "Subscribe consumer fell behind the change-log retention window",
+        2021 => "COPY FROM STDIN statement is malformed",
         2400 => "Unauthenticated: request missing or carrying invalid credentials",
         2401 => "Permission denied: authenticated principal lacks required RBAC role",
         2402 => "Namespace access denied: cross-namespace access attempt by non-admin principal",
@@ -367,7 +397,15 @@ pub fn severity(code: ErrorCode) -> Severity {
         2 => Severity::Error,
         3 => Severity::Error,
         3009 => Severity::Error,
-        3010 => Severity::Error,
+        3011 => Severity::Error,
+        3012 => Severity::Error,
+        3013 => Severity::Error,
+        3014 => Severity::Error,
+        3015 => Severity::Error,
+        3016 => Severity::Error,
+        3017 => Severity::Error,
+        3018 => Severity::Error,
+        3501 => Severity::Error,
         5001 => Severity::Fatal,
         5002 => Severity::Fatal,
         5018 => Severity::Warning,
@@ -421,9 +459,18 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2015 => "Index is too far behind view. Wait for synchronization or increase index_max_lag_ms.",
         2016 => "An index with the same name already exists.",
         2018 => "Increase rockstream.max_staleness, reduce publish lag, or switch to session_wait_for mode.",
+        2021 => "Check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)].",
         3003 => "Reduce input rate or increase local_buffer_max_epochs; check object store availability.",
         3009 => "Inspect the stored arrangement value; possible data corruption or law version mismatch.",
-        3010 => "Verify object store connectivity, credentials, and bucket settings.",
+        3011 => "Object store is rate-limiting requests; reduce shuffle write concurrency or request a higher rate limit/quota from the object store provider.",
+        3012 => "Verify object store connectivity, credentials, and bucket settings.",
+        3013 => "Reduce per-epoch shuffle frame size or flush more frequently; increase MAX_DURABLE_BUFFER_SIZE_BYTES if the workload legitimately needs a larger buffer.",
+        3014 => "Report this bug with the support bundle; the index footer failed to serialize to JSON.",
+        3015 => "The stored footer bytes are not valid JSON; the object may be corrupt or written by an incompatible version. Re-run the shuffle epoch.",
+        3016 => "The coalesced shuffle object is truncated or its footer-length header is inconsistent with the object size; re-run the shuffle epoch or restore from a prior checkpoint.",
+        3017 => "Inspect the Arrow IPC shuffle payload; possible truncation or a version mismatch between the writer and reader.",
+        3018 => "Verify the target shard is registered and its ShardDb has been attached before routing; check shard assignment and worker startup order.",
+        3501 => "Inspect the stored merge-law accumulator bytes; possible data corruption or an accumulator wire-format version mismatch.",
         3601 => "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation.",
         3602 => "Wait for recovery to complete; monitor shard reassignment and frontier progress via SHOW VIEW STATUS.",
         3603 => "Recovery is exceeding SLO; check worker health, storage latency, and frontier progress. Escalate if recovery does not complete within expected bounds.",
@@ -491,7 +538,8 @@ mod tests {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
             RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007,
-            RS_2008, RS_2014, RS_2015, RS_2016, RS_2018, RS_3003, RS_3009, RS_3010, RS_4001,
+            RS_2008, RS_2014, RS_2015, RS_2016, RS_2018, RS_2021, RS_3003, RS_3009, RS_3011,
+            RS_3012, RS_3013, RS_3014, RS_3015, RS_3016, RS_3017, RS_3018, RS_3501, RS_4001,
             RS_4002, RS_5001, RS_5002, RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603,
             RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017,
             RS_1012, RS_1013, RS_1014, RS_8001, // v0.21

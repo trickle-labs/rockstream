@@ -59,17 +59,23 @@ pub fn parse_copy_from_stmt(q: &str) -> Result<(String, Vec<String>), String> {
     let ql = q.to_lowercase();
 
     if !ql.starts_with("copy ") {
-        return Err(format!("not a COPY statement: {q}"));
+        return Err(format!(
+            "[RS-2021] not a COPY statement: {q}. Next steps: check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)]."
+        ));
     }
 
     // Find " from stdin" boundary
-    let from_pos = ql
-        .find(" from stdin")
-        .ok_or_else(|| format!("missing FROM STDIN in COPY statement: {q}"))?;
+    let from_pos = ql.find(" from stdin").ok_or_else(|| {
+        format!(
+            "[RS-2021] missing FROM STDIN in COPY statement: {q}. Next steps: check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)]."
+        )
+    })?;
 
     // "copy " is 5 bytes; if from_pos <= 5 there is no table name.
     if from_pos <= 5 {
-        return Err(format!("missing table name in COPY statement: {q}"));
+        return Err(format!(
+            "[RS-2021] missing table name in COPY statement: {q}. Next steps: check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)]."
+        ));
     }
 
     // Middle part: between "copy " and " from stdin"
@@ -79,11 +85,15 @@ pub fn parse_copy_from_stmt(q: &str) -> Result<(String, Vec<String>), String> {
         // Has explicit column list
         let table_name = middle[..paren_open].trim().to_lowercase();
         if table_name.is_empty() {
-            return Err(format!("missing table name in COPY statement: {q}"));
+            return Err(format!(
+                "[RS-2021] missing table name in COPY statement: {q}. Next steps: check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)]."
+            ));
         }
-        let paren_close = middle
-            .rfind(')')
-            .ok_or_else(|| format!("unmatched '(' in COPY statement: {q}"))?;
+        let paren_close = middle.rfind(')').ok_or_else(|| {
+            format!(
+                "[RS-2021] unmatched '(' in COPY statement: {q}. Next steps: check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)]."
+            )
+        })?;
         let cols_str = &middle[paren_open + 1..paren_close];
         let columns: Vec<String> = cols_str
             .split(',')
@@ -91,14 +101,18 @@ pub fn parse_copy_from_stmt(q: &str) -> Result<(String, Vec<String>), String> {
             .filter(|s| !s.is_empty())
             .collect();
         if columns.is_empty() {
-            return Err(format!("empty column list in COPY statement: {q}"));
+            return Err(format!(
+                "[RS-2021] empty column list in COPY statement: {q}. Next steps: check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)]."
+            ));
         }
         Ok((table_name, columns))
     } else {
         // No column list
         let table_name = middle.to_lowercase();
         if table_name.is_empty() {
-            return Err(format!("missing table name in COPY statement: {q}"));
+            return Err(format!(
+                "[RS-2021] missing table name in COPY statement: {q}. Next steps: check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)]."
+            ));
         }
         Ok((table_name, vec![]))
     }

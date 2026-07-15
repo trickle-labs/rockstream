@@ -132,7 +132,8 @@ pub fn aggregate_avg(bytes: &[u8]) -> Option<f64> {
 fn parse_sum_count(bytes: &[u8]) -> Result<(i64, i64), String> {
     if bytes.len() != SUM_COUNT_WIRE_SIZE {
         return Err(format!(
-            "SumCount: expected {} bytes, got {}",
+            "[{}] SumCount: expected {} bytes, got {}. Next steps: inspect the stored merge-law accumulator bytes; possible data corruption or an accumulator wire-format version mismatch.",
+            crate::error_code::RS_3501,
             SUM_COUNT_WIRE_SIZE,
             bytes.len()
         ));
