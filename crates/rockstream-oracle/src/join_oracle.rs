@@ -31,7 +31,15 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_ops::JoinOp;
+#[cfg(test)]
+use rockstream_plan::virtual_bucket::route_virtual_bucket;
+#[cfg(test)]
+use rockstream_types::error_code::{ErrorCode, RS_5035};
 use rockstream_types::ids::OperatorId;
+
+type DeltaRow = (i64, i64, i64);
+type JoinEpoch = (Vec<DeltaRow>, Vec<DeltaRow>);
+type Join3Epoch = (Vec<DeltaRow>, Vec<DeltaRow>, Vec<DeltaRow>);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -115,9 +123,7 @@ pub fn batch_reference_join(
 /// Accumulate the incremental output of a join over multiple epochs.
 ///
 /// Returns sorted `Vec<(l_k, l_v, r_w)>` for all live join tuples.
-pub fn incremental_join_output(
-    epochs: &[(Vec<(i64, i64, i64)>, Vec<(i64, i64, i64)>)],
-) -> Vec<(i64, i64, i64)> {
+pub fn incremental_join_output(epochs: &[JoinEpoch]) -> Vec<(i64, i64, i64)> {
     let op = JoinOp::new(OperatorId(0), vec![0], vec![0]);
     let mut output_acc: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
 
@@ -235,13 +241,7 @@ pub fn batch_reference_3way(
 /// 2. `lmr_op`: LM ⋈ R → output schema (l_k, l_v, m_v, r_k, r_v) = 5 columns
 ///
 /// Returns sorted `Vec<(k, l_v, m_v, r_v)>` (dropping the duplicate r_k column at index 3).
-pub fn incremental_3way_join_output(
-    epochs: &[(
-        Vec<(i64, i64, i64)>,
-        Vec<(i64, i64, i64)>,
-        Vec<(i64, i64, i64)>,
-    )],
-) -> Vec<(i64, i64, i64, i64)> {
+pub fn incremental_3way_join_output(epochs: &[Join3Epoch]) -> Vec<(i64, i64, i64, i64)> {
     // LM join: 2-col L ⋈ 2-col M → output (l_k, l_v, m_k, m_v) = 4 columns
     let lm_op = JoinOp::with_schema(OperatorId(1), vec![0], vec![0], 2, 2);
 
@@ -330,7 +330,7 @@ pub fn incremental_3way_join_output(
 ///
 /// `epochs`: sequence of `(left_delta, right_delta)` pairs.
 /// Each delta is a `Vec<(k, v, weight)>` where weight ∈ {+1, -1}.
-pub fn assert_oracle_join(epochs: &[(Vec<(i64, i64, i64)>, Vec<(i64, i64, i64)>)]) {
+pub fn assert_oracle_join(epochs: &[JoinEpoch]) {
     // Accumulate input Z-sets.
     let mut left_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
     let mut right_acc: BTreeMap<(i64, i64), i64> = BTreeMap::new();
@@ -370,6 +370,41 @@ pub fn assert_oracle_join(epochs: &[(Vec<(i64, i64, i64)>, Vec<(i64, i64, i64)>)
     );
 }
 
+#[cfg(test)]
+fn bucketed_join_output(
+    epochs: &[JoinEpoch],
+    bucket_count: u16,
+    replication_state_quota: usize,
+) -> Result<Vec<(i64, i64, i64)>, ErrorCode> {
+    let replicated_rows: usize = epochs.iter().map(|(_, right)| right.len()).sum();
+    if replicated_rows.saturating_mul(bucket_count as usize) > replication_state_quota {
+        return Err(RS_5035);
+    }
+
+    let mut merged = Vec::new();
+    for bucket in 0..bucket_count {
+        let bucket_epochs = epochs
+            .iter()
+            .map(|(left, right)| {
+                let left_bucket = left
+                    .iter()
+                    .copied()
+                    .filter(|(k, v, _)| {
+                        let mut key = [0u8; 16];
+                        key[..8].copy_from_slice(&k.to_be_bytes());
+                        key[8..].copy_from_slice(&v.to_be_bytes());
+                        route_virtual_bucket(&key, bucket_count, key.len()) == Some(bucket)
+                    })
+                    .collect::<Vec<_>>();
+                (left_bucket, right.clone())
+            })
+            .collect::<Vec<_>>();
+        merged.extend(incremental_join_output(&bucket_epochs));
+    }
+    merged.sort();
+    Ok(merged)
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -389,7 +424,11 @@ mod tests {
         // Left key=1, right key=2 — no join partner.
         assert_oracle_join(&[(vec![(1, 10, 1)], vec![(2, 20, 1)])]);
         let result = incremental_join_output(&[(vec![(1, 10, 1)], vec![(2, 20, 1)])]);
-        assert_eq!(result, vec![], "non-matching keys must produce empty join output");
+        assert_eq!(
+            result,
+            vec![],
+            "non-matching keys must produce empty join output"
+        );
     }
 
     #[test]
@@ -518,10 +557,8 @@ mod tests {
     fn oracle_join_cross_product_exact() {
         // l: (k=3, v=1), (k=3, v=2); r: (k=3, v=10), (k=3, v=20).
         // Cross product: (3,1,10), (3,1,20), (3,2,10), (3,2,20) — 4 tuples.
-        let result = incremental_join_output(&[(
-            vec![(3, 1, 1), (3, 2, 1)],
-            vec![(3, 10, 1), (3, 20, 1)],
-        )]);
+        let result =
+            incremental_join_output(&[(vec![(3, 1, 1), (3, 2, 1)], vec![(3, 10, 1), (3, 20, 1)])]);
         let mut got = result.clone();
         got.sort();
         assert_eq!(
@@ -539,7 +576,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         use super::super::{
-            assert_oracle_join, batch_reference_3way, incremental_3way_join_output,
+            assert_oracle_join, batch_reference_3way, incremental_3way_join_output, JoinEpoch,
         };
 
         /// Random delta: key ∈ [0,4], value ∈ [0,9], weight ∈ {+1, -1}.
@@ -551,7 +588,7 @@ mod tests {
         }
 
         /// Random epoch: a pair of (left_delta, right_delta).
-        fn arb_epoch() -> impl Strategy<Value = (Vec<(i64, i64, i64)>, Vec<(i64, i64, i64)>)> {
+        fn arb_epoch() -> impl Strategy<Value = JoinEpoch> {
             (arb_delta(), arb_delta())
         }
 
@@ -628,6 +665,32 @@ mod tests {
                 assert_eq!(inc, batch,
                     "3-way join oracle FAILED: incremental != batch\ninc={inc:?}\nbatch={batch:?}");
             }
+        }
+
+        #[test]
+        fn hot_key_bucketed_join_matches_unsplit_oracle() {
+            let epochs = vec![
+                (
+                    vec![(1, 10, 1), (1, 11, 1), (2, 20, 1)],
+                    vec![(1, 100, 1), (2, 200, 1)],
+                ),
+                (vec![(1, 10, -1), (1, 12, 1)], vec![(1, 101, 1)]),
+            ];
+
+            let unsplit = super::super::incremental_join_output(&epochs);
+            let bucketed = super::super::bucketed_join_output(&epochs, 4, 128).unwrap();
+            assert_eq!(bucketed, unsplit);
+        }
+
+        #[test]
+        fn hot_key_bucketed_join_returns_skew_bound_when_replication_exceeds_quota() {
+            let epochs = vec![(
+                vec![(1, 10, 1), (1, 11, 1), (1, 12, 1)],
+                vec![(1, 100, 1), (1, 101, 1), (1, 102, 1)],
+            )];
+
+            let err = super::super::bucketed_join_output(&epochs, 8, 4).unwrap_err();
+            assert_eq!(err, super::super::RS_5035);
         }
     }
 }

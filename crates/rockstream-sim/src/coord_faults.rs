@@ -39,6 +39,32 @@ pub fn register_coord_faults(model: &mut FaultModel) {
                        client-side retry and backoff logic.",
         category: FaultCategory::Io,
     });
+    model.register(FaultEntry {
+        id: "skew.control_loop_delay",
+        description: "Adaptive skew-splitting control loop pauses between observing the skew \
+                       breach and emitting the split action; the loop must still converge once \
+                       the 30s sustain window is met.",
+        category: FaultCategory::Timing,
+    });
+    model.register(FaultEntry {
+        id: "split.kill_donor_mid_copy",
+        description: "Proactive split loses the donor mid-copy; restart must recover to a \
+                       consistent post-split or pre-split state without losing rows.",
+        category: FaultCategory::Io,
+    });
+    model.register(FaultEntry {
+        id: "merge.concurrent_split_race",
+        description: "Cold-shard merge races a concurrent proactive split decision on the same \
+                       shard pair; the one-per-minute throttle must prevent both actions from \
+                       firing together.",
+        category: FaultCategory::Logic,
+    });
+    model.register(FaultEntry {
+        id: "hotkey.concurrent_bucket_map_bump",
+        description: "Hot-key detection runs while the bucket-map version advances; the control \
+                       loop must still emit a safe split plan for the observed hot shard.",
+        category: FaultCategory::Logic,
+    });
 }
 
 /// Fault-model entries registered by `register_coord_faults`.
@@ -47,6 +73,10 @@ pub const COORD_FAULT_IDS: &[&str] = &[
     "epoch.frontier_write_delay",
     "task.output_channel_closed",
     "object_store.rate_limit",
+    "skew.control_loop_delay",
+    "split.kill_donor_mid_copy",
+    "merge.concurrent_split_race",
+    "hotkey.concurrent_bucket_map_bump",
 ];
 
 #[cfg(test)]

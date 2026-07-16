@@ -28,11 +28,29 @@ impl Default for AutotunerConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkewSplitConfig {
+    pub enabled: bool,
+    pub hot_key_factor: f64,
+    pub max_skew_buckets: u16,
+}
+
+impl Default for SkewSplitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hot_key_factor: 20.0,
+            max_skew_buckets: 16,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TunerOverrides {
     pub parallelism: Option<usize>,
     pub epoch_size_ms: Option<u64>,
     pub memory_limit_mb: Option<u64>,
+    pub skew_buckets: Option<u16>,
 }
 
 fn default_selectivity_threshold() -> f64 {
@@ -50,6 +68,8 @@ pub struct ClusterConfig {
     pub state_budget_gb: u64,
     #[serde(default)]
     pub autotuner: AutotunerConfig,
+    #[serde(default)]
+    pub skew_split: SkewSplitConfig,
     #[serde(default = "default_selectivity_threshold")]
     pub index_prefer_selectivity_threshold: f64,
     #[serde(default = "default_max_lag_ms")]
@@ -103,6 +123,7 @@ impl Default for RockstreamConfig {
                 checkpoint_retention_count: 128,
                 state_budget_gb: 10,
                 autotuner: AutotunerConfig::default(),
+                skew_split: SkewSplitConfig::default(),
                 index_prefer_selectivity_threshold: 0.01,
                 index_max_lag_ms: 1000,
             },

@@ -192,6 +192,10 @@ struct MetricRegistry {
     pipeline_state_bytes_other: AtomicU64,
     state_budget_bytes: AtomicU64,
     freshness_lag_ms: HashMap<String, Counter>,
+    cluster_worker_pressure_bits: AtomicU64,
+    cluster_worker_pressure_pipeline_id: String,
+    demanded_shard_count: AtomicU64,
+    placed_shard_count: AtomicU64,
     session_staleness_exceeded_total: HashMap<String, Counter>,
     session_frontier_age_ms: HashMap<String, Counter>,
 
@@ -226,6 +230,10 @@ impl MetricRegistry {
             pipeline_state_bytes_other: AtomicU64::new(0),
             state_budget_bytes: AtomicU64::new(0),
             freshness_lag_ms: HashMap::new(),
+            cluster_worker_pressure_bits: AtomicU64::new(0.0f64.to_bits()),
+            cluster_worker_pressure_pipeline_id: String::new(),
+            demanded_shard_count: AtomicU64::new(0),
+            placed_shard_count: AtomicU64::new(0),
             session_staleness_exceeded_total: HashMap::new(),
             session_frontier_age_ms: HashMap::new(),
             flush_duration_sum_ms: AtomicU64::new(0),
@@ -500,6 +508,11 @@ pub fn reset_all() {
         reg.pipeline_state_bytes_other.store(0, Ordering::Relaxed);
         reg.state_budget_bytes.store(0, Ordering::Relaxed);
         reg.freshness_lag_ms.clear();
+        reg.cluster_worker_pressure_bits
+            .store(0.0f64.to_bits(), Ordering::Relaxed);
+        reg.cluster_worker_pressure_pipeline_id.clear();
+        reg.demanded_shard_count.store(0, Ordering::Relaxed);
+        reg.placed_shard_count.store(0, Ordering::Relaxed);
         reg.session_staleness_exceeded_total.clear();
         reg.session_frontier_age_ms.clear();
         reg.flush_duration_sum_ms.store(0, Ordering::Relaxed);
@@ -743,6 +756,30 @@ pub fn read_freshness_lag(view_name: &str) -> Option<u64> {
     with_registry(|reg| reg.freshness_lag_ms.get(view_name).map(Counter::get))
 }
 
+pub fn set_cluster_worker_pressure(snapshot: &crate::topology::ClusterWorkerPressure) {
+    with_registry(|reg| {
+        reg.cluster_worker_pressure_bits
+            .store(snapshot.pressure.to_bits(), Ordering::Relaxed);
+        reg.cluster_worker_pressure_pipeline_id = snapshot.pipeline_id.clone();
+        reg.demanded_shard_count
+            .store(snapshot.demanded_shard_count as u64, Ordering::Relaxed);
+        reg.placed_shard_count
+            .store(snapshot.placed_shard_count as u64, Ordering::Relaxed);
+    });
+}
+
+pub fn read_cluster_worker_pressure() -> f64 {
+    with_registry(|reg| f64::from_bits(reg.cluster_worker_pressure_bits.load(Ordering::Relaxed)))
+}
+
+pub fn read_demanded_shard_count() -> u64 {
+    with_registry(|reg| reg.demanded_shard_count.load(Ordering::Relaxed))
+}
+
+pub fn read_placed_shard_count() -> u64 {
+    with_registry(|reg| reg.placed_shard_count.load(Ordering::Relaxed))
+}
+
 pub fn inc_session_staleness_exceeded(mode: &str) {
     with_registry(|reg| {
         reg.session_staleness_exceeded_total
@@ -984,6 +1021,28 @@ pub fn generate_prometheus_metrics() -> String {
             ));
         }
         out.push('\n');
+
+        out.push_str("# HELP cluster_worker_pressure Gauge showing the highest demanded_shard_count / placed_shard_count ratio across active pipelines.\n");
+        out.push_str("# TYPE cluster_worker_pressure gauge\n");
+        let cluster_worker_pressure =
+            f64::from_bits(reg.cluster_worker_pressure_bits.load(Ordering::Relaxed));
+        out.push_str(&format!(
+            "cluster_worker_pressure {cluster_worker_pressure:.6}\n\n"
+        ));
+
+        out.push_str("# HELP demanded_shard_count Gauge showing the demanded shard count of the pipeline currently defining cluster_worker_pressure.\n");
+        out.push_str("# TYPE demanded_shard_count gauge\n");
+        out.push_str(&format!(
+            "demanded_shard_count {}\n\n",
+            reg.demanded_shard_count.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP placed_shard_count Gauge showing the placed shard count of the pipeline currently defining cluster_worker_pressure.\n");
+        out.push_str("# TYPE placed_shard_count gauge\n");
+        out.push_str(&format!(
+            "placed_shard_count {}\n\n",
+            reg.placed_shard_count.load(Ordering::Relaxed)
+        ));
 
         out.push_str("# HELP session_staleness_exceeded_total Count of max_staleness-bounded queries that exceeded the frontier age budget.\n");
         out.push_str("# TYPE session_staleness_exceeded_total counter\n");

@@ -44,6 +44,7 @@ pub mod distinct_oracle;
 pub mod filter_oracle;
 pub mod harness;
 pub mod hot_key_bucket_oracle;
+pub mod join_oracle;
 pub mod minmax_oracle;
 pub mod outer_join_oracle;
 pub mod sql_fuzzer;

@@ -45,10 +45,12 @@ pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use service::{ControlService, ControlServiceHandle};
 pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};
 pub use skew::{
-    detect_hot_key, plan_hot_key_mitigation, HotKeyDetector, HotKeyDetectorError,
-    HotKeyMitigationPlan, HotKeyReport, ProactiveSplitConfig, ProactiveSplitError,
-    ProactiveSplitOutcome, ProactiveSplitter, ShardFootprintReport, SkewFillLevel,
-    MAX_PROACTIVE_SPLIT_SAMPLE_KEYS, MAX_TRACKED_KEY_LOADS,
+    compute_cluster_worker_pressure, detect_hot_key, plan_hot_key_mitigation,
+    publish_cluster_worker_pressure, AdaptiveSkewSplitter, HotKeyDetector, HotKeyDetectorError,
+    HotKeyMitigationPlan, HotKeyReport, PipelineShardPressureSample, ProactiveMergeOutcome,
+    ProactiveSplitConfig, ProactiveSplitError, ProactiveSplitOutcome, ProactiveSplitter,
+    ShardFootprintReport, SkewFillLevel, SkewSplitDecision, MAX_PROACTIVE_SPLIT_SAMPLE_KEYS,
+    MAX_TRACKED_KEY_LOADS, SKEW_SPLIT_TRIGGER_WINDOW,
 };
 pub use tls::TlsConfig;
 pub use topology::{TopologyCatalog, TopologyPersistentStore};

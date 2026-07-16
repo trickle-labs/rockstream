@@ -415,6 +415,76 @@ impl BucketedAggregateOp {
         key[8..].copy_from_slice(&v.to_be_bytes());
         route_virtual_bucket(&key, self.bucket_count, key.len()).unwrap_or(0)
     }
+
+    pub fn live_partials(&self) -> usize {
+        self.partials
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned")
+            .len()
+    }
+
+    pub async fn load_from_storage(
+        db: &ShardDb,
+        op_id: OperatorId,
+        hot_key: i64,
+        bucket_count: u16,
+    ) -> Result<Self, OpError> {
+        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op_id.0);
+        let (entries, _truncated) = db
+            .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
+            .await
+            .map_err(OpError::storage)?;
+        let op = Self::new(op_id, hot_key, bucket_count);
+        let mut combined = op
+            .combined
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+        let mut partials = op
+            .partials
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+        for (key, value) in &entries {
+            if key.len() < prefix.len() + 8 || !key.starts_with(&prefix) || value.len() < 16 {
+                continue;
+            }
+            let Ok(group_key_bytes) = key[prefix.len()..prefix.len() + 8].try_into() else {
+                continue;
+            };
+            let Ok(sum_bytes) = value[..8].try_into() else {
+                continue;
+            };
+            let Ok(count_bytes) = value[8..16].try_into() else {
+                continue;
+            };
+            let group_key = i64::from_be_bytes(group_key_bytes);
+            let sum = i64::from_be_bytes(sum_bytes);
+            let count = i64::from_be_bytes(count_bytes);
+            if key.len() == prefix.len() + 10 {
+                let Ok(bucket_bytes) = key[prefix.len() + 8..prefix.len() + 10].try_into() else {
+                    continue;
+                };
+                let bucket = u16::from_be_bytes(bucket_bytes);
+                partials.insert((group_key, bucket), (sum, count));
+            } else {
+                combined.insert(group_key, (sum, count));
+            }
+        }
+        for (&(group_key, _bucket), &(sum, count)) in partials.iter() {
+            if let Some((combined_sum, combined_count)) = combined.get_mut(&group_key) {
+                if *combined_count == 0 {
+                    *combined_sum += sum;
+                    *combined_count += count;
+                }
+            } else {
+                let entry = combined.entry(group_key).or_insert((0, 0));
+                entry.0 += sum;
+                entry.1 += count;
+            }
+        }
+        drop(partials);
+        drop(combined);
+        Ok(op)
+    }
 }
 
 impl Operator for BucketedAggregateOp {
@@ -650,6 +720,74 @@ pub async fn persist_agg_state(db: &ShardDb, op: &AggregateOp) -> Result<(), OpE
         db.write_batch(wb).await.map_err(OpError::storage)?;
     }
     Ok(())
+}
+
+pub async fn persist_bucketed_agg_state(
+    db: &ShardDb,
+    op: &BucketedAggregateOp,
+) -> Result<(), OpError> {
+    let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op.op_id.0);
+    let (existing, _truncated) = db
+        .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
+        .await
+        .map_err(OpError::storage)?;
+
+    let wb = {
+        let combined = op
+            .combined
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+        let partials = op
+            .partials
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+        let mut wb = WriteBatch::new();
+        let expected_keys: std::collections::HashSet<Vec<u8>> = combined
+            .iter()
+            .map(|(&k, _)| bucketed_combined_key(op.op_id, k))
+            .chain(
+                partials
+                    .iter()
+                    .map(|(&(k, bucket), _)| bucketed_partial_key(op.op_id, k, bucket)),
+            )
+            .collect();
+
+        for (key, _) in &existing {
+            if !expected_keys.contains(key.as_ref()) {
+                wb.delete(key);
+            }
+        }
+
+        for (&k, &(sum, count)) in combined.iter() {
+            let mut value = [0u8; 16];
+            value[..8].copy_from_slice(&sum.to_be_bytes());
+            value[8..].copy_from_slice(&count.to_be_bytes());
+            wb.put(&bucketed_combined_key(op.op_id, k), &value);
+        }
+        for (&(k, bucket), &(sum, count)) in partials.iter() {
+            let mut value = [0u8; 16];
+            value[..8].copy_from_slice(&sum.to_be_bytes());
+            value[8..].copy_from_slice(&count.to_be_bytes());
+            wb.put(&bucketed_partial_key(op.op_id, k, bucket), &value);
+        }
+        wb
+    };
+
+    if !wb.is_empty() {
+        db.write_batch(wb).await.map_err(OpError::storage)?;
+    }
+    Ok(())
+}
+
+fn bucketed_combined_key(op_id: OperatorId, group_key: i64) -> Vec<u8> {
+    ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &group_key.to_be_bytes())
+}
+
+fn bucketed_partial_key(op_id: OperatorId, group_key: i64, bucket: u16) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(10);
+    suffix.extend_from_slice(&group_key.to_be_bytes());
+    suffix.extend_from_slice(&bucket.to_be_bytes());
+    ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &suffix)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

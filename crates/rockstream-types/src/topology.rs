@@ -222,7 +222,7 @@ pub enum ControlMessage {
         next_steps: String,
     },
     /// Published by the control plane after all workers have reported their
-    /// pressure samples; consumers (HPA adapters) read this gauge (v0.38).
+    /// pressure samples; consumers (HPA adapters) read this gauge (v0.47).
     ClusterPressureGauge(ClusterWorkerPressure),
     /// Notification that the global cluster frontier has advanced.
     ClusterFrontierAdvanced {
@@ -433,7 +433,7 @@ pub struct VirtualBucketConfig {
 }
 
 /// The `cluster_worker_pressure` metric exposed for infrastructure autoscaling
-/// (e.g. Kubernetes HPA) (v0.38).
+/// (e.g. Kubernetes HPA) (v0.47).
 ///
 /// Values:
 /// - `< 1.0` — cluster has headroom; scale-in safe
@@ -444,24 +444,24 @@ pub struct VirtualBucketConfig {
 pub struct ClusterWorkerPressure {
     /// Pressure value (dimensionless ratio).
     pub pressure: f64,
-    /// Number of workers currently in `Active` state.
-    pub active_workers: u32,
-    /// Number of workers currently in `Draining` state.
-    pub draining_workers: u32,
-    /// Total shard count across the cluster.
-    pub total_shards: u32,
+    /// Pipeline whose demanded/placed ratio currently defines the cluster max.
+    pub pipeline_id: String,
+    /// Number of shards this pipeline currently demands.
+    pub demanded_shard_count: u32,
+    /// Number of shards currently placed for this pipeline.
+    pub placed_shard_count: u32,
     /// Timestamp when this sample was computed (ms since Unix epoch).
     pub sampled_at_ms: u64,
 }
 
 impl ClusterWorkerPressure {
-    /// A freshly initialised gauge representing a single idle worker.
+    /// A freshly initialised gauge representing an idle cluster.
     pub fn idle() -> Self {
         Self {
             pressure: 0.0,
-            active_workers: 1,
-            draining_workers: 0,
-            total_shards: 0,
+            pipeline_id: "idle".to_string(),
+            demanded_shard_count: 0,
+            placed_shard_count: 1,
             sampled_at_ms: 0,
         }
     }

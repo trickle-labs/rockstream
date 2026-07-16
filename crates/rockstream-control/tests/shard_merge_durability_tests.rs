@@ -21,7 +21,7 @@ fn docker_available() -> bool {
 
 const MINIO_USER: &str = "minioadmin";
 const MINIO_PASS: &str = "minioadmin";
-const MINIO_BUCKET: &str = "rockstream-proactive-split-test";
+const MINIO_BUCKET: &str = "rockstream-cold-merge-test";
 
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -165,26 +165,27 @@ async fn seed_shard(db: &ShardDb, rows: usize) {
             1,
             format!("row-{idx:04}").as_bytes(),
         );
-        db.put(&op_key, &[5u8; 64]).await.unwrap();
-        db.put(&view_key, &[6u8; 64]).await.unwrap();
+        db.put(&op_key, &[7u8; 64]).await.unwrap();
+        db.put(&view_key, &[9u8; 64]).await.unwrap();
     }
     db.flush().await.unwrap();
 }
 
-async fn run_split(store: Arc<dyn ObjectStore>) -> String {
-    let donor = make_shard(1, "durability/donor", store.clone(), 88).await;
-    let recipient = make_shard(2, "durability/recipient", store.clone(), 88).await;
-    seed_shard(&donor.db, 24).await;
+async fn run_merge(store: Arc<dyn ObjectStore>) -> String {
+    let donor = make_shard(1, "durability-merge/donor", store.clone(), 88).await;
+    let recipient = make_shard(2, "durability-merge/recipient", store.clone(), 88).await;
+    seed_shard(&donor.db, 2).await;
+    seed_shard(&recipient.db, 2).await;
     let checkpoints = CheckpointCoordinator::new(vec![donor.shard_id]);
     let persistent = MigrationPersistentStore::new(store.clone());
     let mut splitter = ProactiveSplitter::new(ProactiveSplitConfig {
         target_shard_state_bytes: 512,
-        min_shard_state_bytes: 4 * 1024,
+        min_shard_state_bytes: 1024,
         split_trigger_fraction: 1.5,
         alert_threshold_fraction: 1.75,
     });
     splitter
-        .maybe_split(
+        .maybe_merge(
             &donor,
             &recipient,
             &checkpoints,
@@ -199,11 +200,11 @@ async fn run_split(store: Arc<dyn ObjectStore>) -> String {
 }
 
 #[tokio::test]
-async fn proactive_split_survives_restart_lfs() {
+async fn cold_merge_survives_restart_lfs() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-    let migration_id = run_split(store.clone()).await;
+    let migration_id = run_merge(store.clone()).await;
 
     let persistent = MigrationPersistentStore::new(Arc::new(
         LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
@@ -215,9 +216,9 @@ async fn proactive_split_survives_restart_lfs() {
 }
 
 #[tokio::test]
-async fn proactive_split_survives_restart_minio_tc() {
+async fn cold_merge_survives_restart_minio_tc() {
     if !docker_available() {
-        eprintln!("SKIP proactive_split_survives_restart_minio_tc: Docker not available");
+        eprintln!("SKIP cold_merge_survives_restart_minio_tc: Docker not available");
         return;
     }
     use testcontainers::runners::AsyncRunner;
@@ -229,7 +230,7 @@ async fn proactive_split_survives_restart_minio_tc() {
     create_minio_bucket(port, MINIO_BUCKET).await;
 
     let store = minio_object_store(port);
-    let migration_id = run_split(store.clone()).await;
+    let migration_id = run_merge(store.clone()).await;
     let persistent = MigrationPersistentStore::new(store);
     assert_eq!(
         persistent.load_history(&migration_id).await.unwrap().state,
@@ -238,7 +239,7 @@ async fn proactive_split_survives_restart_minio_tc() {
 }
 
 #[tokio::test]
-async fn proactive_split_is_scan_and_delete_never_range_delete() {
+async fn cold_merge_is_scan_and_delete_never_range_delete() {
     let source =
         std::fs::read_to_string(format!("{}/src/skew.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
     assert!(source.contains("scan_prefix_bounded"));
@@ -247,21 +248,22 @@ async fn proactive_split_is_scan_and_delete_never_range_delete() {
 }
 
 #[tokio::test]
-async fn proactive_split_is_bounded_with_fill_level_metric() {
+async fn cold_merge_is_bounded_with_fill_level_metric() {
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let donor = make_shard(1, "bounded/donor", store.clone(), 99).await;
-    let recipient = make_shard(2, "bounded/recipient", store.clone(), 99).await;
-    seed_shard(&donor.db, 24).await;
+    let donor = make_shard(1, "bounded-merge/donor", store.clone(), 99).await;
+    let recipient = make_shard(2, "bounded-merge/recipient", store.clone(), 99).await;
+    seed_shard(&donor.db, 2).await;
+    seed_shard(&recipient.db, 2).await;
     let checkpoints = CheckpointCoordinator::new(vec![donor.shard_id]);
     let mut splitter = ProactiveSplitter::new(ProactiveSplitConfig {
         target_shard_state_bytes: 512,
-        min_shard_state_bytes: 4 * 1024,
+        min_shard_state_bytes: 1024,
         split_trigger_fraction: 1.5,
         alert_threshold_fraction: 1.75,
     });
 
     let outcome = splitter
-        .maybe_split(&donor, &recipient, &checkpoints, None, None, 60_000)
+        .maybe_merge(&donor, &recipient, &checkpoints, None, None, 60_000)
         .await
         .unwrap()
         .unwrap();
