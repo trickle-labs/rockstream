@@ -41,6 +41,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use tracing::debug;
 
+use rockstream_plan::virtual_bucket::route_virtual_bucket;
 use rockstream_storage::{ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch};
 use rockstream_types::ids::OperatorId;
 
@@ -383,6 +384,188 @@ impl Operator for AggregateOp {
             Arc::new(Int64Array::from(out_avg)),
         ];
         let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
+        Ok(ArrowZSet::new(data, out_weights))
+    }
+}
+
+/// Aggregate operator that splits one designated hot key into virtual buckets
+/// and combines the partial states back into the unsalted aggregate output.
+pub struct BucketedAggregateOp {
+    combined: Mutex<HashMap<i64, (i64, i64)>>,
+    partials: Mutex<HashMap<(i64, u16), (i64, i64)>>,
+    op_id: OperatorId,
+    hot_key: i64,
+    bucket_count: u16,
+}
+
+impl BucketedAggregateOp {
+    pub fn new(op_id: OperatorId, hot_key: i64, bucket_count: u16) -> Self {
+        Self {
+            combined: Mutex::new(HashMap::new()),
+            partials: Mutex::new(HashMap::new()),
+            op_id,
+            hot_key,
+            bucket_count,
+        }
+    }
+
+    fn bucket_for(&self, k: i64, v: i64) -> u16 {
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&k.to_be_bytes());
+        key[8..].copy_from_slice(&v.to_be_bytes());
+        route_virtual_bucket(&key, self.bucket_count, key.len()).unwrap_or(0)
+    }
+}
+
+impl Operator for BucketedAggregateOp {
+    fn name(&self) -> &str {
+        "BucketedAggregateOp"
+    }
+
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        let started_at = Instant::now();
+        if delta.is_empty() {
+            return Ok(ArrowZSet::empty(output_schema()));
+        }
+        if delta.data.num_columns() < 2 {
+            return Err(OpError::column_out_of_bounds(1, delta.data.num_columns()));
+        }
+
+        let k_col = delta
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
+        let v_col = delta
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
+
+        let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
+            std::collections::HashMap::new();
+        let mut order: Vec<(i64, i64)> = Vec::new();
+        for row in 0..delta.num_rows() {
+            let k = k_col.value(row);
+            let v = v_col.value(row);
+            let w = delta.weights[row];
+            let entry = consolidated.entry((k, v)).or_insert_with(|| {
+                order.push((k, v));
+                0
+            });
+            *entry += w;
+        }
+
+        let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_avg: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
+
+        let mut combined = self
+            .combined
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+        let mut partials = self
+            .partials
+            .lock()
+            .expect("BucketedAggregateOp mutex poisoned");
+
+        for (k, v) in order {
+            let w = consolidated[&(k, v)];
+            if w == 0 {
+                continue;
+            }
+
+            let (old_sum, old_count) = combined.get(&k).copied().unwrap_or((0, 0));
+            let old_state = (old_count != 0).then_some((old_sum, old_count));
+
+            let new_sum = old_sum
+                .checked_add(
+                    v.checked_mul(w)
+                        .ok_or_else(|| OpError::aggregate_overflow(k))?,
+                )
+                .ok_or_else(|| OpError::aggregate_overflow(k))?;
+            let new_count = old_count + w;
+
+            if k == self.hot_key && self.bucket_count > 1 {
+                let bucket = self.bucket_for(k, v);
+                let partial_key = (k, bucket);
+                let (partial_sum, partial_count) =
+                    partials.get(&partial_key).copied().unwrap_or((0, 0));
+                let next_partial_sum = partial_sum
+                    .checked_add(
+                        v.checked_mul(w)
+                            .ok_or_else(|| OpError::aggregate_overflow(k))?,
+                    )
+                    .ok_or_else(|| OpError::aggregate_overflow(k))?;
+                let next_partial_count = partial_count + w;
+                if next_partial_count != 0 {
+                    partials.insert(partial_key, (next_partial_sum, next_partial_count));
+                } else {
+                    partials.remove(&partial_key);
+                }
+            }
+
+            let new_state = if new_count != 0 {
+                combined.insert(k, (new_sum, new_count));
+                Some((new_sum, new_count))
+            } else {
+                combined.remove(&k);
+                None
+            };
+
+            if let Some((old_sum, old_count)) = old_state {
+                out_k.push(k);
+                out_sum.push(old_sum);
+                out_count.push(old_count);
+                out_avg.push(old_sum / old_count);
+                out_weights.push(-1);
+            }
+            if let Some((new_sum, new_count)) = new_state {
+                out_k.push(k);
+                out_sum.push(new_sum);
+                out_count.push(new_count);
+                out_avg.push(new_sum / new_count);
+                out_weights.push(1);
+            }
+        }
+
+        drop(partials);
+        drop(combined);
+
+        debug!(
+            op_id = self.op_id.0,
+            input_rows = delta.num_rows(),
+            output_rows = out_k.len(),
+            hot_key = self.hot_key,
+            bucket_count = self.bucket_count,
+            "BucketedAggregateOp: processed delta"
+        );
+        rockstream_types::metrics::record_operator_runtime_sample(
+            self.op_id,
+            delta.num_rows() as u64,
+            delta.num_rows() as u64,
+            started_at.elapsed(),
+            0,
+        );
+
+        if out_k.is_empty() {
+            return Ok(ArrowZSet::empty(output_schema()));
+        }
+
+        let data = RecordBatch::try_new(
+            output_schema(),
+            vec![
+                Arc::new(Int64Array::from(out_k)) as ArrayRef,
+                Arc::new(Int64Array::from(out_sum)) as ArrayRef,
+                Arc::new(Int64Array::from(out_count)) as ArrayRef,
+                Arc::new(Int64Array::from(out_avg)) as ArrayRef,
+            ],
+        )
+        .map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(data, out_weights))
     }
 }

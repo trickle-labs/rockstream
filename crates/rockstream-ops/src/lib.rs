@@ -43,7 +43,9 @@ pub mod view_ref;
 pub mod window;
 pub mod zset;
 
-pub use aggregate::{load_frontier, persist_agg_state, persist_frontier, AggState, AggregateOp};
+pub use aggregate::{
+    load_frontier, persist_agg_state, persist_frontier, AggState, AggregateOp, BucketedAggregateOp,
+};
 pub use distinct::{
     load_distinct_state, persist_distinct_state, DistinctOp, DualArrangement, ExceptOp, IntersectOp,
 };

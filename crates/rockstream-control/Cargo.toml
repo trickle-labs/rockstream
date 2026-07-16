@@ -11,6 +11,7 @@ name = "frontier_bench"
 harness = false
 
 [dependencies]
+rockstream-plan = { workspace = true }
 rockstream-storage = { workspace = true }
 rockstream-types = { workspace = true }
 serde = { workspace = true }

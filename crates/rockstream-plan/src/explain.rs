@@ -57,6 +57,13 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
         OpKind::Project => "Project".to_string(),
         OpKind::Map => "Map".to_string(),
         OpKind::Aggregate => "Aggregate".to_string(),
+        OpKind::VirtualBucketSplit {
+            bucket_count,
+            key_prefix_len,
+        } => format!("VirtualBucketSplit[buckets={bucket_count},prefix={key_prefix_len}]"),
+        OpKind::VirtualBucketCombine { source } => {
+            format!("VirtualBucketCombine[source={source}]")
+        }
         OpKind::Join => "Join".to_string(),
         OpKind::Union => "Union".to_string(),
         OpKind::Sink { name } => format!("Sink[{name}]"),

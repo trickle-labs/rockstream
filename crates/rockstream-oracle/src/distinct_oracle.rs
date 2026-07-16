@@ -351,4 +351,28 @@ mod proptest_oracle {
             }
         }
     }
+
+    #[test]
+    fn distinct_hot_key_spill_shard_never_double_emits_across_epoch_boundary() {
+        let schema = schema_kv();
+        let op = DistinctOp::new(schema);
+
+        let epoch0 = op.process_delta(make_kv_batch(&[(7, 42, 1)])).unwrap();
+        let epoch1 = op
+            .process_delta(make_kv_batch(&[(7, 42, 1), (7, 42, -1)]))
+            .unwrap();
+        let epoch2 = op.process_delta(make_kv_batch(&[(7, 42, -1)])).unwrap();
+
+        let mut output_acc = BTreeMap::new();
+        accumulate(&mut output_acc, &epoch0);
+        accumulate(&mut output_acc, &epoch1);
+        accumulate(&mut output_acc, &epoch2);
+
+        assert_eq!(epoch0.positive_ab_rows(), vec![(7, 42)]);
+        assert!(epoch1.is_empty(), "net-zero epoch must not double-emit");
+        assert!(
+            output_acc.is_empty(),
+            "final DISTINCT output must return to zero exactly once"
+        );
+    }
 }

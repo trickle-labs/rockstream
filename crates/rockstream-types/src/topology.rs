@@ -367,6 +367,22 @@ impl ProactiveSplitConfig {
 
 /// Per-shard load sample used for skew detection (v0.38).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyLoadSample {
+    /// The logical key prefix contributing the load.
+    pub key_prefix: Vec<u8>,
+    /// CPU consumed by this key in the most recent epoch.
+    #[serde(default)]
+    pub cpu_nanos: u64,
+    /// Bytes processed by this key in the most recent epoch.
+    #[serde(default)]
+    pub bytes_per_epoch: u64,
+    /// State writes attributed to this key in the most recent epoch.
+    #[serde(default)]
+    pub state_writes_per_epoch: u64,
+}
+
+/// Per-shard load sample used for skew detection (v0.47).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardLoadSample {
     /// Which shard this sample describes.
     pub shard_id: ShardId,
@@ -374,6 +390,18 @@ pub struct ShardLoadSample {
     pub state_bytes: u64,
     /// Number of input rows processed in the most recent epoch.
     pub rows_per_epoch: u64,
+    /// CPU consumed by the shard in the most recent epoch.
+    #[serde(default)]
+    pub cpu_nanos: u64,
+    /// Bytes processed by the shard in the most recent epoch.
+    #[serde(default)]
+    pub bytes_per_epoch: u64,
+    /// State writes issued by the shard in the most recent epoch.
+    #[serde(default)]
+    pub state_writes_per_epoch: u64,
+    /// Per-key breakdown used to detect hot logical keys.
+    #[serde(default)]
+    pub key_loads: Vec<KeyLoadSample>,
 }
 
 /// Result of a skew-detection pass across all shards (v0.38).

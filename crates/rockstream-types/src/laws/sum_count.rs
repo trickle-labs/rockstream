@@ -53,6 +53,7 @@ impl LawBundle for SumCountV1 {
             idempotent: false,
             has_inverse: true,
             has_identity: true,
+            composable: true,
         }
     }
 

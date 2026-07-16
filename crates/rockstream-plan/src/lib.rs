@@ -6,6 +6,7 @@
 
 pub mod dag;
 pub mod explain;
+pub mod virtual_bucket;
 
 use rockstream_types::ids::OperatorId;
 use rockstream_types::merge_law::MergeLawId;
@@ -608,6 +609,13 @@ pub enum OpKind {
     Map,
     /// Stateful aggregate with an arrangement.
     Aggregate,
+    /// Deterministically split a hot logical key into virtual buckets.
+    VirtualBucketSplit {
+        bucket_count: u16,
+        key_prefix_len: usize,
+    },
+    /// Recombine virtual-bucket partial state back into the unsalted key.
+    VirtualBucketCombine { source: OperatorId },
     /// Stateful join with dual arrangements.
     Join,
     /// Outer / semi / anti equi-join (v0.9 — IVM-5).

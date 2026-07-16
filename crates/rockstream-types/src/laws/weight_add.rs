@@ -41,6 +41,7 @@ impl LawBundle for WeightAddV1 {
             idempotent: false,
             has_inverse: true,
             has_identity: true,
+            composable: false,
         }
     }
 
@@ -174,6 +175,7 @@ mod tests {
         assert!(!props.idempotent);
         assert!(props.has_inverse);
         assert!(props.has_identity);
+        assert!(!props.composable);
         assert_eq!(law.class(), MergeLawClass::AbelianGroup);
     }
 }

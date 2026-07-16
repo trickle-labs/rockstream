@@ -53,6 +53,9 @@ pub struct LawProperties {
     pub has_inverse: bool,
     /// An identity element exists.
     pub has_identity: bool,
+    /// The law can be split into independently-computed partial states and
+    /// recombined without changing the final answer.
+    pub composable: bool,
 }
 
 /// Policy for handling duplicate merge operations.
@@ -189,6 +192,7 @@ pub struct LawDescriptor {
     pub compaction_policy: CompactionPolicy,
     pub frontier_policy: FrontierPolicy,
     pub idempotent: bool,
+    pub composable: bool,
 }
 
 impl LawDescriptor {
@@ -204,7 +208,12 @@ impl LawDescriptor {
             compaction_policy: bundle.compaction_policy(),
             frontier_policy: bundle.frontier_policy(),
             idempotent: bundle.properties().idempotent,
+            composable: bundle.properties().composable,
         }
+    }
+
+    pub fn composable(&self) -> bool {
+        self.composable
     }
 }
 
