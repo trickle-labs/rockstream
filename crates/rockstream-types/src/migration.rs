@@ -1,0 +1,275 @@
+//! Shard-migration types for distributed bucket handoff in RockStream.
+//!
+//! A shard migration moves a bounded set of virtual buckets from one or more
+//! donor shards to a recipient shard without ever creating a dual-authoritative
+//! window. The control plane persists a single [`MigrationRecord`] per
+//! migration and advances it through the explicit state machine defined in the
+//! v0.46 plan.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::ids::ShardId;
+use crate::timestamp::Epoch;
+
+/// The explicit migration state machine for online shard handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationState {
+    Planned,
+    Snapshotting,
+    Copying,
+    DualWriting,
+    CatchingUp,
+    FencingOld,
+    Cutover,
+    Verifying,
+    GcEligible,
+    Done,
+    Aborted,
+}
+
+impl std::fmt::Display for MigrationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Planned => "planned",
+            Self::Snapshotting => "snapshotting",
+            Self::Copying => "copying",
+            Self::DualWriting => "dual_writing",
+            Self::CatchingUp => "catching_up",
+            Self::FencingOld => "fencing_old",
+            Self::Cutover => "cutover",
+            Self::Verifying => "verifying",
+            Self::GcEligible => "gc_eligible",
+            Self::Done => "done",
+            Self::Aborted => "aborted",
+        };
+        write!(f, "{name}")
+    }
+}
+
+/// A bounded logical set of migrated virtual buckets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BucketSet {
+    /// Sorted logical bucket identifiers.
+    pub buckets: BTreeSet<u64>,
+}
+
+impl BucketSet {
+    /// Construct a `BucketSet` from explicit bucket ids.
+    pub fn new<I>(buckets: I) -> Self
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        Self {
+            buckets: buckets.into_iter().collect(),
+        }
+    }
+
+    /// Returns `true` if `bucket` is part of the migration.
+    pub fn contains(&self, bucket: u64) -> bool {
+        self.buckets.contains(&bucket)
+    }
+
+    /// Number of buckets in the set.
+    pub fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Returns `true` when the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+}
+
+/// Durable record for one online shard migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationRecord {
+    /// Stable migration identifier.
+    pub migration_id: String,
+    /// Current state in the explicit migration state machine.
+    pub state: MigrationState,
+    /// Source shards whose buckets are moving.
+    pub donor_shards: Vec<ShardId>,
+    /// The shard that will own the buckets after cutover.
+    pub recipient_shard: ShardId,
+    /// Buckets included in this migration.
+    pub buckets: BucketSet,
+    /// Frontier captured at planning time (`F_plan`).
+    pub planned_frontier: Epoch,
+    /// The target bucket-map version used for dual-write / cutover.
+    pub target_bucket_map_version: u64,
+    /// Donor checkpoint ids keyed by donor shard.
+    #[serde(default)]
+    pub donor_checkpoints: BTreeMap<ShardId, u64>,
+    /// Epoch used to gate `GC_ELIGIBLE`.
+    pub cutover_epoch: Option<Epoch>,
+    /// Wall-clock timestamp (ms since Unix epoch) when the record was created.
+    pub created_at_ms: u64,
+    /// Wall-clock timestamp (ms since Unix epoch) when the record last changed.
+    pub updated_at_ms: u64,
+}
+
+impl MigrationRecord {
+    /// Construct a new `MigrationRecord` in [`MigrationState::Planned`].
+    pub fn new(
+        migration_id: impl Into<String>,
+        donor_shards: Vec<ShardId>,
+        recipient_shard: ShardId,
+        buckets: BucketSet,
+        planned_frontier: Epoch,
+        target_bucket_map_version: u64,
+    ) -> Self {
+        let now = now_ms();
+        Self {
+            migration_id: migration_id.into(),
+            state: MigrationState::Planned,
+            donor_shards,
+            recipient_shard,
+            buckets,
+            planned_frontier,
+            target_bucket_map_version,
+            donor_checkpoints: BTreeMap::new(),
+            cutover_epoch: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        }
+    }
+
+    /// Returns `true` if the record may transition from `self.state` to `next`.
+    pub fn can_transition_to(&self, next: MigrationState) -> bool {
+        use MigrationState::*;
+        if self.state == next {
+            return true;
+        }
+        matches!(
+            (self.state, next),
+            (Planned, Snapshotting)
+                | (Snapshotting, Copying)
+                | (Copying, DualWriting)
+                | (DualWriting, CatchingUp)
+                | (CatchingUp, FencingOld)
+                | (FencingOld, Cutover)
+                | (Cutover, Verifying)
+                | (Verifying, DualWriting)
+                | (Verifying, GcEligible)
+                | (GcEligible, Done)
+                | (Planned, Aborted)
+                | (Snapshotting, Aborted)
+                | (Copying, Aborted)
+                | (DualWriting, Aborted)
+                | (CatchingUp, Aborted)
+                | (FencingOld, Aborted)
+                | (Cutover, Aborted)
+                | (Verifying, Aborted)
+                | (GcEligible, Aborted)
+        )
+    }
+
+    /// Apply a validated state transition.
+    ///
+    /// Returns `true` if the state changed, or `false` when the transition was
+    /// idempotently re-applied.
+    pub fn apply_transition(
+        &mut self,
+        next: MigrationState,
+    ) -> Result<bool, InvalidTransitionError> {
+        if !self.can_transition_to(next) {
+            return Err(InvalidTransitionError {
+                from: self.state,
+                to: next,
+            });
+        }
+        if self.state == next {
+            return Ok(false);
+        }
+        self.state = next;
+        self.updated_at_ms = now_ms();
+        if next == MigrationState::Cutover && self.cutover_epoch.is_none() {
+            self.cutover_epoch = Some(self.planned_frontier);
+        }
+        Ok(true)
+    }
+}
+
+/// Returned by [`MigrationRecord::apply_transition`] when the requested
+/// transition is not permitted by the migration state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidTransitionError {
+    pub from: MigrationState,
+    pub to: MigrationState,
+}
+
+impl std::fmt::Display for InvalidTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid migration transition: {:?} -> {:?}",
+            self.from, self.to
+        )
+    }
+}
+
+impl std::error::Error for InvalidTransitionError {}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_state_roundtrips() {
+        let states = [
+            MigrationState::Planned,
+            MigrationState::Snapshotting,
+            MigrationState::Copying,
+            MigrationState::DualWriting,
+            MigrationState::CatchingUp,
+            MigrationState::FencingOld,
+            MigrationState::Cutover,
+            MigrationState::Verifying,
+            MigrationState::GcEligible,
+            MigrationState::Done,
+            MigrationState::Aborted,
+        ];
+        for state in states {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: MigrationState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn migration_record_allows_verify_rollback() {
+        let mut record = MigrationRecord::new(
+            "m1",
+            vec![ShardId(1)],
+            ShardId(2),
+            BucketSet::new([1, 2]),
+            7,
+            9,
+        );
+        for state in [
+            MigrationState::Snapshotting,
+            MigrationState::Copying,
+            MigrationState::DualWriting,
+            MigrationState::CatchingUp,
+            MigrationState::FencingOld,
+            MigrationState::Cutover,
+            MigrationState::Verifying,
+        ] {
+            record.apply_transition(state).unwrap();
+        }
+        assert!(record
+            .apply_transition(MigrationState::DualWriting)
+            .unwrap());
+    }
+}

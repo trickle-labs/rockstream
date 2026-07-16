@@ -195,12 +195,32 @@ pub enum ControlMessage {
         /// `true` if `lease_token` is the current active token.
         valid: bool,
     },
-    /// Instructs the worker to begin the drain protocol (v0.38).
+    /// Instructs the worker to begin the drain protocol (v0.46).
     ///
     /// The worker must transition to `WorkerLifecycleState::Draining`, stop
     /// accepting new shard assignments, and hand off all owned shards within
     /// the specified deadline.
     BeginDrain(DrainRequest),
+    /// Operator-visible acknowledgement that a drain request was accepted.
+    DrainStatus {
+        /// The drained worker.
+        worker_id: WorkerId,
+        /// Current lifecycle state after applying the request.
+        state: WorkerLifecycleState,
+        /// Current drain-queue fill level.
+        queue_fill: u32,
+        /// Configured drain-queue bound.
+        queue_capacity: u32,
+    },
+    /// Generic coded control-plane failure for operator actions.
+    OperationFailed {
+        /// Registered RS-XXXX code.
+        code: String,
+        /// Human-readable failure description.
+        message: String,
+        /// Actionable operator guidance.
+        next_steps: String,
+    },
     /// Published by the control plane after all workers have reported their
     /// pressure samples; consumers (HPA adapters) read this gauge (v0.38).
     ClusterPressureGauge(ClusterWorkerPressure),
@@ -252,7 +272,7 @@ pub enum RaftRoleWire {
     NoRaft,
 }
 
-/// Lifecycle state of a worker node (v0.38 drain protocol).
+/// Lifecycle state of a worker node (v0.46 drain protocol).
 ///
 /// Transitions: `Active` → `Draining` → `Decommissioned`.
 ///
@@ -477,6 +497,12 @@ pub enum WorkerMessage {
     ReportShardFrontier {
         shard_id: ShardId,
         epoch: crate::timestamp::Epoch,
+    },
+    /// Operator-initiated request to begin draining a worker (v0.46).
+    RequestDrain {
+        /// The worker that should stop receiving new shard assignments and
+        /// migrate away its current shard set.
+        worker_id: WorkerId,
     },
 }
 

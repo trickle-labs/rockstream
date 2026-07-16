@@ -698,6 +698,11 @@ check, not just an aspirational claim.
 | M5-S2 | `assert_no_lost_delivery_after_checkpoint` (reused from M3-S2 — no data loss is the same invariant across the sink protocol family). Spec: `formal/m5_cold_tier_sink.fizz` M5-S2. | `rockstream-connectors` |
 | M5-L1 (liveness) | `test_partial_write_recovery_lfs` / `test_partial_write_recovery_minio_tc` in `crates/rockstream-connectors/tests/partial_write_recovery_tests.rs` drive `ObjectStoreSink` through `partial_write_probability=0.5`-injected crashes and assert the commit protocol always reaches a fully committed, non-duplicate terminal state. Spec: `formal/m5_cold_tier_sink.fizz` M5-L1. | `rockstream-connectors`, `rockstream-sim` |
 | COV-M5 | Seeded `SimRuntime` test in `crates/rockstream-connectors/tests/partial_write_recovery_tests.rs` uses `buggify!("object_store.partial_write", p)` to force a mid-rename truncation, then asserts `assert_commit_pointer_atomic` holds across seeds while the sink recovers. Spec: `formal/m5_cold_tier_sink.fizz` COV-M5. | `rockstream-connectors`, `rockstream-sim` |
+| M6-S1 | `assert_single_authoritative(record)` in `crates/rockstream-control/src/migration.rs` enforces that exactly one side is authoritative at every migration state boundary; `worker_drain_tests.rs::drain_completes_after_all_shards_migrate` and `shard_migration_sim_tests.rs::{migration_converges_under_buggify_seed,donor_killed_mid_dual_writing_recovers_sim,donor_killed_mid_cutover_recovers_sim}` prove the control path never leaves a stuck or dual-authoritative state. Spec: `formal/m6_shard_migration.fizz` M6-S1. | `rockstream-control`, `rockstream-sim` |
+| M6-S2 | `dual_write_zero_loss_tests.rs` in `crates/rockstream-runtime/tests` replays accepted writes across donor+recipient and asserts recipient state is bit-identical by `CATCHING_UP` exit; the happy-path `shard_migration_sim_tests.rs::migration_converges_under_buggify_seed` and real-network `shard_migration_tc_tests.rs::live_migration_zero_loss_tc` carry the same zero-loss claim through seeded reordering and a TC cluster. Spec: `formal/m6_shard_migration.fizz` M6-S2. | `rockstream-runtime`, `rockstream-control`, `rockstream-sim` |
+| M6-S3 | `gc_eligible_blocked_until_consumer_frontier_passes_cutover` in `crates/rockstream-control/tests/shard_migration_state_machine_tests.rs` blocks `GC_ELIGIBLE` until the tracked minimum consumer frontier reaches `cutover_epoch`; `MigrationConsumerFrontierTracker` is the bounded runtime mirror. Spec: `formal/m6_shard_migration.fizz` M6-S3. | `rockstream-control` |
+| M6-L1 (liveness) | `MigrationCoordinator` drives `PLANNED → … → DONE/ABORTED`, with timeout-to-`ABORTED` wired to `RS-1030`; seeded `shard_migration_sim_tests.rs::{migration_converges_under_buggify_seed,donor_killed_mid_dual_writing_recovers_sim,donor_killed_mid_cutover_recovers_sim}` and `worker_drain_sim_tests.rs::drain_converges_under_buggify_seed` assert progress to a terminal state, never a stuck migration/drain. Spec: `formal/m6_shard_migration.fizz` M6-L1 (`liveness: nondeterministic`). | `rockstream-control`, `rockstream-sim` |
+| COV-M6 | Coverage obligations are mirrored by the seeded `SimRuntime` tests above, the durability tests `migration_record_durability_tests.rs::{migration_record_survives_restart_lfs,migration_record_survives_restart_minio_tc}` and `worker_drain_durability_tests.rs::{draining_state_survives_restart_lfs,draining_state_survives_restart_minio_tc}`, plus the real-network drills `shard_migration_tc_tests.rs::{live_migration_zero_loss_tc,donor_killed_mid_dual_writing_tc,donor_killed_mid_cutover_tc}` and `worker_drain_tc_tests.rs::drain_completes_zero_downtime_tc`. Spec: `formal/m6_shard_migration.fizz` COV-M6. | `rockstream-control`, `rockstream-runtime`, `rockstream-sim` |
 | M7-S1 | `assert_single_control_leader(term, node_id, …)` in `crates/rockstream-control/src/raft.rs`. Spec: `formal/m7_control_plane_ha.fizz` M7-S1. | `rockstream-control` |
 | M7-S2 | `assert_write_requires_leadership(role, term, …)` in `crates/rockstream-control/src/raft.rs`, backing the `require_leader()` guard in all three v0.45.2 write paths — `ControlService` (shard-lease grant), `ShardScheduler` (shard-assignment, `crates/rockstream-control/src/scheduler.rs`), and `rockstream_sql::workload_catalog::WorkloadCatalog` (workload-catalog writes); rejected non-leader writes return `RS-1731`. Spec: `formal/m7_control_plane_ha.fizz` M7-S2. | `rockstream-control`, `rockstream-sql` |
 | M7-S3 | `assert_valid_control_leader_epoch(write_epoch, current_epoch)` in `crates/rockstream-runtime/src/fence.rs` (alongside M4's existing `assert_valid_writer`, per `.claude/v0.45.2-plan.md` §6); the shard fence token is derived from `control_leader_epoch(term, leader_id)` in `crates/rockstream-control/src/raft.rs` and packed into the token by `ShardManager::mint_token`. Spec: `formal/m7_control_plane_ha.fizz` M7-S3. | `rockstream-control`, `rockstream-runtime` |
@@ -874,7 +879,7 @@ a precondition for v0.43's exit criteria (partial-write fault injection
 recovers without duplicates); v0.44's cold-tier sink implementation depends on
 this proof.
 
-### 4.6 Gates: M7 — Control-Plane HA (Phase 12.5, ✅ Done, v0.45.2) and M6 — Shard Migration (Phase 13) — Pending
+### 4.6 Gates: M7 — Control-Plane HA (Phase 12.5, ✅ Done, v0.45.2) and M6 — Shard Migration (Phase 13, ✅ Done, v0.46)
 
 M7 (`formal/m7_control_plane_ha.fizz`, [NEW_ROADMAP.md](NEW_ROADMAP.md) v0.45.2)
 reached a green CI-fast result (§3.8, §3.6 above; `formal/findings.md`) and
@@ -883,14 +888,31 @@ binding v0.18 "modeled before Rust code" rule; its detailed role/action
 write-up and §3.7 mapping rows are the D-numbered deliverable for v0.45.2 and
 are present above.
 
-M6 (`formal/m6_shard_migration.fizz`, v0.46) remains a scheduled,
-pre-implementation model — that version is not `✅ Done` yet, so unlike M1–M5
-and M7 above, this document does not yet carry its detailed role/action
-write-up or §3.7 mapping rows; those are a required deliverable of v0.46 (the
-same D-numbered deliverable pattern as §4.1–4.3), not optional follow-up.
-Until the model is authored here and turns green, no migration-state-machine
-code (M6) may be written, per the binding v0.18 "modeled before Rust code"
-rule.
+M6 (`formal/m6_shard_migration.fizz`, v0.46) is now green at CI-fast bounds and
+gated the shipped shard-migration / worker-drain implementation in
+`rockstream-control`, `rockstream-runtime`, and the new `rockstream cluster
+workers drain <id>` CLI stub. Roles/actions, matching the v0.18 modeling
+conventions:
+
+- **`ControlPlane`** owns the `migration_state`, `bucket_map_version`,
+  authoritative donor/recipient choice, timeout budgets, and the worker-drain
+  queue; its actions are `PlanMigration`, `AdvanceState`, `AbortOnTimeout`,
+  `MarkWorkerDraining`, and `CompleteDrain`.
+- **`Shard`** (donor and recipient instances) owns the migrating bucket set and
+  transitions through `SNAPSHOTTING`, `COPYING`, `DUAL_WRITING`,
+  `CATCHING_UP`, `FENCING_OLD`, `CUTOVER`, `VERIFYING`, `GC_ELIGIBLE`, and
+  `DONE`/`ABORTED`.
+- **`Consumer`** is the ghost downstream-frontier tracker that blocks
+  `GC_ELIGIBLE` until `consumer_frontier >= cutover_epoch` (M6-S3).
+- **Worker-drain composition**: `BeginDrain` marks a worker
+  `WorkerLifecycleState::Draining`, suppresses new placements structurally via
+  `TopologyCatalog::healthy_workers()`, enqueues one migration per held shard,
+  and transitions to `Decommissioned` once `shards_remaining == 0`.
+
+The §3.7 mapping rows above are the D-numbered v0.46 deliverable: runtime
+assertions pair M6-S1/M6-S3, the dual-write oracle test pairs M6-S2, the
+durability tests cover the new persistent stores, and the seeded/TC drills are
+the implementation mirror of the model's liveness/coverage claims.
 
 ### 4.7 Roadmap Summary
 
@@ -903,7 +925,7 @@ rule.
 | Phase 6→8 | Continuous `formal-verify` + path-coupling | all | Pre-release relaxed-bounds sweep |
 | Phase 12 | `m5_cold_tier_sink.fizz` (✅ Done, v0.43) | M5 | Precondition for v0.43/v0.44 cold-tier exactly-once exit |
 | Phase 12.5 | `m7_control_plane_ha.fizz` (✅ Done, v0.45.2) | M7 | Precondition for v0.45.2 control-plane HA exit |
-| Phase 13 | `m6_shard_migration.fizz` (pending, v0.46) | M6 | Precondition for v0.46 shard-migration exit |
+| Phase 13 | `m6_shard_migration.fizz` (✅ Done, v0.46) | M6 | Precondition for v0.46 shard-migration exit |
 
 ---
 

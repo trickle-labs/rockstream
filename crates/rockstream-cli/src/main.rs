@@ -6,7 +6,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use rockstream_cli::{run_start, StartOptions};
+use rockstream_cli::{request_worker_drain, run_start, StartOptions};
 
 /// RockStream — a cloud-native incremental view maintenance engine with a
 /// PostgreSQL wire access layer.
@@ -18,6 +18,10 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+// `Start` carries many long-lived config fields as clap-derived struct-variant
+// fields; boxing it would complicate the clap derive for no runtime benefit
+// (this enum is constructed once per process, not on a hot path).
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Start a RockStream node.
     ///
@@ -110,6 +114,32 @@ enum Command {
         #[arg(long)]
         control_shared_storage: Option<std::path::PathBuf>,
     },
+    /// Cluster administration commands.
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClusterCommand {
+    /// Worker administration commands.
+    Workers {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    /// Begin draining a worker.
+    Drain {
+        /// Control-plane worker-facing TCP address.
+        #[arg(long)]
+        control: String,
+        /// Worker id to drain.
+        worker_id: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -171,5 +201,17 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Cluster {
+            command:
+                ClusterCommand::Workers {
+                    command: WorkerCommand::Drain { control, worker_id },
+                },
+        } => match request_worker_drain(&control, worker_id) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }

@@ -23,19 +23,73 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
+use rockstream_types::error_code::{RS_3604, RS_3610, RS_3611, RS_3612};
+use rockstream_types::ids::{ShardId, WorkerId};
 use rockstream_types::lease::ShardRevokeReason;
-use rockstream_types::topology::{ControlMessage, RaftRoleWire, WorkerMessage};
+use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
+use rockstream_types::topology::{
+    ControlMessage, DrainRequest, RaftRoleWire, WorkerLifecycleState, WorkerMessage,
+};
 
 use crate::audit::{AuditEvent, FileAuditLog};
 use crate::frontier::FrontierAggregator;
+use crate::migration::{MigrationCoordinator, MigrationPersistentStore};
 use crate::raft::{RaftHandle, RaftRole};
 use crate::shard::{ShardManager, ShardPersistentStore};
-use crate::topology::TopologyCatalog;
+use crate::topology::{TopologyCatalog, TopologyPersistentStore};
+
+const DEFAULT_DRAIN_DEADLINE_MS: u64 = 30_000;
+const DEFAULT_DECOMMISSION_GRACE_MS: u64 = 5_000;
+const MAX_DRAIN_QUEUE: usize = 1024;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[derive(Debug, Clone)]
+struct DrainTask {
+    migration_id: String,
+    donor_worker_id: WorkerId,
+    recipient_worker_id: WorkerId,
+    shard_id: ShardId,
+}
+
+#[derive(Debug, Clone)]
+struct DrainFailure {
+    code: &'static str,
+    message: String,
+    next_steps: String,
+}
+
+impl DrainFailure {
+    fn new(
+        code: impl std::fmt::Display,
+        message: impl Into<String>,
+        next_steps: impl Into<String>,
+    ) -> Self {
+        let code = Box::leak(code.to_string().into_boxed_str());
+        Self {
+            code,
+            message: message.into(),
+            next_steps: next_steps.into(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DrainState {
+    queue: std::collections::VecDeque<DrainTask>,
+    next_migration_id: u64,
+}
 
 /// Convert the internal [`RaftRole`] to its wire-serializable mirror.
 fn raft_role_wire(role: RaftRole) -> RaftRoleWire {
@@ -128,6 +182,14 @@ pub struct ControlService {
     /// resumes within budget"). Absent by default (pre-v0.45.2 behavior:
     /// no frontier ingestion over the worker wire protocol at all).
     frontier: Option<Arc<FrontierAggregator>>,
+    /// Optional durable topology store for worker lifecycle persistence (v0.46).
+    topology_store: Option<Arc<TopologyPersistentStore>>,
+    /// Optional durable migration record store (v0.46).
+    migration_store: Option<Arc<MigrationPersistentStore>>,
+    /// Shared drain queue state with a named bound.
+    drain_state: Arc<AsyncMutex<DrainState>>,
+    /// Automatically process queued drain migrations in the background.
+    auto_drain: bool,
 }
 
 impl ControlService {
@@ -140,6 +202,10 @@ impl ControlService {
             raft: None,
             shard_store: None,
             frontier: None,
+            topology_store: None,
+            migration_store: None,
+            drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
+            auto_drain: false,
         }
     }
 
@@ -178,11 +244,34 @@ impl ControlService {
         self
     }
 
+    /// Attach durable worker-topology persistence (v0.46 drain durability).
+    pub fn with_topology_store(mut self, store: Arc<TopologyPersistentStore>) -> Self {
+        self.topology_store = Some(store);
+        self
+    }
+
+    /// Attach durable migration-record persistence (v0.46).
+    pub fn with_migration_store(mut self, store: Arc<MigrationPersistentStore>) -> Self {
+        self.migration_store = Some(store);
+        self
+    }
+
+    /// Enable automatic background drain processing.
+    pub fn with_auto_drain(mut self, enabled: bool) -> Self {
+        self.auto_drain = enabled;
+        self
+    }
+
     /// Start the service on `bind_addr`.
     ///
     /// Returns a [`ControlServiceHandle`] which can be used to query the
     /// bound address and send a shutdown signal.
     pub async fn start(self, bind_addr: &str) -> io::Result<ControlServiceHandle> {
+        if let Some(store) = &self.topology_store {
+            if let Ok(workers) = store.load_all().await {
+                self.catalog.restore_workers(workers);
+            }
+        }
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
         tracing::info!(addr = %addr, "control service listening");
@@ -202,6 +291,10 @@ impl ControlService {
             shard_store: self.shard_store.clone(),
             synced_epoch,
             frontier: self.frontier.clone(),
+            topology_store: self.topology_store.clone(),
+            migration_store: self.migration_store.clone(),
+            drain_state: self.drain_state.clone(),
+            auto_drain: self.auto_drain,
         };
 
         tokio::spawn(async move {
@@ -281,6 +374,253 @@ struct ConnectionContext {
     shard_store: Option<Arc<ShardPersistentStore>>,
     synced_epoch: Arc<AsyncMutex<Option<u64>>>,
     frontier: Option<Arc<FrontierAggregator>>,
+    topology_store: Option<Arc<TopologyPersistentStore>>,
+    migration_store: Option<Arc<MigrationPersistentStore>>,
+    drain_state: Arc<AsyncMutex<DrainState>>,
+    auto_drain: bool,
+}
+
+async fn persist_worker_if_needed(
+    topology_store: Option<&Arc<TopologyPersistentStore>>,
+    worker: &rockstream_types::topology::WorkerInfo,
+) {
+    if let Some(store) = topology_store {
+        let _ = store.save_worker(worker).await;
+    }
+}
+
+async fn delete_worker_if_needed(
+    topology_store: Option<&Arc<TopologyPersistentStore>>,
+    worker_id: WorkerId,
+) {
+    if let Some(store) = topology_store {
+        let _ = store.delete_worker(worker_id).await;
+    }
+}
+
+fn drain_failure_message(err: DrainFailure) -> ControlMessage {
+    ControlMessage::OperationFailed {
+        code: err.code.to_string(),
+        message: err.message,
+        next_steps: err.next_steps,
+    }
+}
+
+async fn request_worker_drain(
+    catalog: &TopologyCatalog,
+    shard_manager: &ShardManager,
+    audit: Option<&Arc<FileAuditLog>>,
+    topology_store: Option<&Arc<TopologyPersistentStore>>,
+    drain_state: &Arc<AsyncMutex<DrainState>>,
+    worker_id: WorkerId,
+) -> Result<(WorkerLifecycleState, u32, u32, DrainRequest), DrainFailure> {
+    let Some(worker) = catalog.get(worker_id) else {
+        return Err(DrainFailure::new(
+            RS_3610,
+            format!("worker {worker_id} is not present in the topology"),
+            "Run `rockstream cluster status` to confirm the worker id, then retry the drain request.",
+        ));
+    };
+    if matches!(
+        worker.lifecycle,
+        WorkerLifecycleState::Draining { .. } | WorkerLifecycleState::Decommissioned { .. }
+    ) {
+        return Err(DrainFailure::new(
+            RS_3604,
+            format!("worker {worker_id} is already draining or decommissioned"),
+            "Wait for the existing drain to complete, or query the worker lifecycle state before retrying.",
+        ));
+    }
+
+    let shards: Vec<ShardId> = shard_manager
+        .leases()
+        .into_iter()
+        .filter(|lease| lease.worker_id == worker_id)
+        .map(|lease| lease.shard_id)
+        .collect();
+    let recipients = catalog.healthy_workers();
+    let mut chosen = Vec::with_capacity(shards.len());
+    for shard_id in &shards {
+        let Some(recipient) = recipients
+            .iter()
+            .find(|candidate| candidate.worker_id != worker_id)
+        else {
+            return Err(DrainFailure::new(
+                RS_3611,
+                format!("worker {worker_id} cannot drain shard {shard_id}: no active recipient worker is available"),
+                "Register or recover at least one other active worker, then retry the drain request.",
+            ));
+        };
+        chosen.push((*shard_id, recipient.worker_id));
+    }
+
+    let started_at_ms = now_ms();
+    let lifecycle = WorkerLifecycleState::Draining {
+        shards_remaining: shards.len() as u32,
+        started_at_ms,
+    };
+    let updated = catalog
+        .set_lifecycle(worker_id, lifecycle.clone())
+        .expect("worker existence checked above");
+    persist_worker_if_needed(topology_store, &updated).await;
+
+    let mut guard = drain_state.lock().await;
+    if guard.queue.len() + chosen.len() > MAX_DRAIN_QUEUE {
+        return Err(DrainFailure::new(
+            RS_3612,
+            format!(
+                "worker drain queue would exceed its bound ({}/{MAX_DRAIN_QUEUE})",
+                guard.queue.len() + chosen.len()
+            ),
+            "Let the existing drain queue drain, or increase the configured bound only if memory headroom allows.",
+        ));
+    }
+    for (shard_id, recipient_worker_id) in chosen {
+        let migration_id = format!("drain-{worker_id}-{shard_id}-{}", guard.next_migration_id);
+        guard.next_migration_id += 1;
+        guard.queue.push_back(DrainTask {
+            migration_id,
+            donor_worker_id: worker_id,
+            recipient_worker_id,
+            shard_id,
+        });
+    }
+    let queue_fill = guard.queue.len() as u32;
+    drop(guard);
+
+    if let Some(audit) = audit {
+        let event = AuditEvent::now("control", "worker.drain_requested", worker_id.to_string())
+            .with_detail(format!("shards={}", shards.len()));
+        let _ = audit.append(&event);
+    }
+    Ok((
+        lifecycle,
+        queue_fill,
+        MAX_DRAIN_QUEUE as u32,
+        DrainRequest {
+            worker_id,
+            deadline_ms: started_at_ms.saturating_add(DEFAULT_DRAIN_DEADLINE_MS),
+        },
+    ))
+}
+
+async fn process_drain_queue(
+    catalog: &TopologyCatalog,
+    shard_manager: &ShardManager,
+    audit: Option<&Arc<FileAuditLog>>,
+    shard_store: Option<&Arc<ShardPersistentStore>>,
+    topology_store: Option<&Arc<TopologyPersistentStore>>,
+    migration_store: Option<&Arc<MigrationPersistentStore>>,
+    drain_state: &Arc<AsyncMutex<DrainState>>,
+) {
+    let mut local = Vec::new();
+    {
+        let mut guard = drain_state.lock().await;
+        while let Some(task) = guard.queue.pop_front() {
+            local.push(task);
+        }
+    }
+
+    let coordinator = MigrationCoordinator::new();
+    for task in local {
+        let mut record = MigrationRecord::new(
+            task.migration_id.clone(),
+            vec![task.shard_id],
+            task.shard_id,
+            BucketSet::new([task.shard_id.0]),
+            0,
+            0,
+        );
+        if let Some(store) = migration_store {
+            let _ = store.save(&record).await;
+        }
+        for state in [
+            MigrationState::Snapshotting,
+            MigrationState::Copying,
+            MigrationState::DualWriting,
+            MigrationState::CatchingUp,
+            MigrationState::FencingOld,
+            MigrationState::Cutover,
+            MigrationState::Verifying,
+            MigrationState::GcEligible,
+            MigrationState::Done,
+        ] {
+            let _ = coordinator
+                .begin_dual_writing(&mut record, audit.map(|value| value.as_ref()))
+                .or_else(|_| {
+                    coordinator
+                        .advance_to_catching_up(&mut record, audit.map(|value| value.as_ref()))
+                });
+            let _ = record.apply_transition(state);
+            if state == MigrationState::Cutover {
+                record.cutover_epoch = Some(0);
+            }
+            if let Some(store) = migration_store {
+                let _ = store.save(&record).await;
+            }
+        }
+        if let Some(store) = migration_store {
+            let _ = store
+                .archive(&record, audit.map(|value| value.as_ref()))
+                .await;
+        }
+
+        let _ = shard_manager.force_acquire(task.shard_id, task.recipient_worker_id);
+        if let Some(store) = shard_store {
+            persist_shard_state(shard_manager, store).await;
+        }
+
+        let current = catalog.get(task.donor_worker_id);
+        if let Some(worker) = current {
+            let remaining = shard_manager
+                .leases()
+                .into_iter()
+                .filter(|lease| lease.worker_id == task.donor_worker_id)
+                .count() as u32;
+            let next_state = if remaining == 0 {
+                WorkerLifecycleState::Decommissioned {
+                    completed_at_ms: now_ms(),
+                }
+            } else {
+                match worker.lifecycle {
+                    WorkerLifecycleState::Draining { started_at_ms, .. } => {
+                        WorkerLifecycleState::Draining {
+                            shards_remaining: remaining,
+                            started_at_ms,
+                        }
+                    }
+                    _ => WorkerLifecycleState::Draining {
+                        shards_remaining: remaining,
+                        started_at_ms: now_ms(),
+                    },
+                }
+            };
+            if let Some(updated) = catalog.set_lifecycle(task.donor_worker_id, next_state.clone()) {
+                persist_worker_if_needed(topology_store, &updated).await;
+            }
+            if remaining == 0 {
+                if let Some(audit) = audit {
+                    let event = AuditEvent::now(
+                        "control",
+                        "worker.drain_completed",
+                        task.donor_worker_id.to_string(),
+                    )
+                    .with_detail(format!("recipient={}", task.recipient_worker_id));
+                    let _ = audit.append(&event);
+                }
+            }
+        }
+    }
+}
+
+async fn cleanup_decommissioned_workers(
+    catalog: &TopologyCatalog,
+    topology_store: Option<&Arc<TopologyPersistentStore>>,
+) {
+    let removed = catalog.remove_decommissioned_older_than(now_ms(), DEFAULT_DECOMMISSION_GRACE_MS);
+    for worker in removed {
+        delete_worker_if_needed(topology_store, worker.worker_id).await;
+    }
 }
 
 /// Handle a single worker connection.
@@ -293,6 +633,10 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
         shard_store,
         synced_epoch,
         frontier,
+        topology_store,
+        migration_store,
+        drain_state,
+        auto_drain,
     } = ctx;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -329,6 +673,9 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                             ));
                     let _ = aud.append(&event);
                 }
+                if let Some(worker) = catalog.get(worker_id) {
+                    persist_worker_if_needed(topology_store.as_ref(), &worker).await;
+                }
                 let reply = ControlMessage::Registered { worker_id };
                 send_message(&mut writer, &reply).await;
             }
@@ -342,6 +689,9 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                         headroom = %capacity_headroom,
                         "control: heartbeat"
                     );
+                    if let Some(worker) = catalog.get(worker_id) {
+                        persist_worker_if_needed(topology_store.as_ref(), &worker).await;
+                    }
                 } else {
                     tracing::warn!(
                         %worker_id,
@@ -361,6 +711,7 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                         AuditEvent::now("control", "worker.deregistered", worker_id.to_string());
                     let _ = aud.append(&event);
                 }
+                delete_worker_if_needed(topology_store.as_ref(), worker_id).await;
                 // Release all shard leases held by this worker.
                 let freed = shard_manager.release_worker(worker_id);
                 if !freed.is_empty() {
@@ -399,6 +750,22 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                 worker_id,
                 shard_id,
             } => {
+                if !catalog
+                    .get(worker_id)
+                    .map(|worker| worker.lifecycle.is_active())
+                    .unwrap_or(false)
+                {
+                    let reply = ControlMessage::OperationFailed {
+                        code: RS_3604.to_string(),
+                        message: format!(
+                            "worker {worker_id} cannot receive shard {shard_id} while draining or decommissioned"
+                        ),
+                        next_steps: "Wait for the drain to complete or target an active worker instead."
+                            .to_string(),
+                    };
+                    send_message(&mut writer, &reply).await;
+                    continue;
+                }
                 // M7-S2 leader-only write gate: a shard lease grant is a
                 // control-plane write and must only be accepted while this
                 // node is the Raft-elected leader.
@@ -514,6 +881,9 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                     state = ?state,
                     "control: worker lifecycle state update"
                 );
+                if let Some(worker) = catalog.set_lifecycle(worker_id, state) {
+                    persist_worker_if_needed(topology_store.as_ref(), &worker).await;
+                }
             }
             WorkerMessage::ShardLoadReport { worker_id, samples } => {
                 tracing::debug!(
@@ -582,6 +952,47 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                     send_message(&mut writer, &reply).await;
                 }
             }
+            WorkerMessage::RequestDrain { worker_id } => {
+                match request_worker_drain(
+                    &catalog,
+                    &shard_manager,
+                    audit.as_ref(),
+                    topology_store.as_ref(),
+                    &drain_state,
+                    worker_id,
+                )
+                .await
+                {
+                    Ok((state, queue_fill, queue_capacity, request)) => {
+                        send_message(&mut writer, &ControlMessage::BeginDrain(request)).await;
+                        let status = ControlMessage::DrainStatus {
+                            worker_id,
+                            state,
+                            queue_fill,
+                            queue_capacity,
+                        };
+                        send_message(&mut writer, &status).await;
+                    }
+                    Err(err) => {
+                        let reply = drain_failure_message(err);
+                        send_message(&mut writer, &reply).await;
+                    }
+                }
+            }
+        }
+
+        if auto_drain {
+            process_drain_queue(
+                &catalog,
+                &shard_manager,
+                audit.as_ref(),
+                shard_store.as_ref(),
+                topology_store.as_ref(),
+                migration_store.as_ref(),
+                &drain_state,
+            )
+            .await;
+            cleanup_decommissioned_workers(&catalog, topology_store.as_ref()).await;
         }
     }
 

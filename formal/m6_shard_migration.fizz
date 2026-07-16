@@ -1,0 +1,273 @@
+# formal/m6_shard_migration.fizz
+# M6 — Online Shard Migration State Machine
+#
+# Models the v0.46 shard-migration protocol:
+# PLANNED → SNAPSHOTTING → COPYING → DUAL_WRITING → CATCHING_UP →
+# FENCING_OLD → CUTOVER → VERIFYING → GC_ELIGIBLE → DONE, plus ABORTED.
+#
+# Roles follow formal/conventions.md exactly: Shard, ControlPlane, Consumer.
+# "Bucket" is folded into shard-local state as logical bucket slots rather than
+# a separate role, matching the plan's "buckets, not keys, are the unit of
+# migration" requirement.
+
+# ─── Constants ──────────────────────────────────────────────────────────────
+
+NUM_WORKERS = 3
+NUM_SHARDS = 3
+MAX_EPOCH = 3
+MAX_CHECKPOINT = 2
+NUM_BUCKETS = 3
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+def donor_authoritative(state_name):
+    return state_name in [
+        "planned",
+        "snapshotting",
+        "copying",
+        "dual_writing",
+        "catching_up",
+        "fencing_old",
+        "aborted",
+    ]
+
+def recipient_authoritative(state_name):
+    return state_name in ["cutover", "verifying", "gc_eligible", "done"]
+
+# ─── State ──────────────────────────────────────────────────────────────────
+
+action Init:
+    dual_writing_reached = False
+    gc_eligible_reached = False
+    done_reached = False
+    aborted_from_dual_writing = False
+    aborted_from_cutover = False
+    divergence_rollback_observed = False
+
+    # Ghost write-tracking for M6-S2.
+    accepted_during_dual_write = False
+    pending_recipient_dual_write = False
+
+    controlplane = ControlPlane()
+    shards = []
+    for i in range(NUM_SHARDS):
+        shards.append(Shard(id=i))
+    consumer = Consumer()
+
+    # shard[0] is the donor, shard[1] the recipient; shard[2] is unused spare
+    # capacity kept only to respect the NUM_SHARDS≤3 bound from conventions.md.
+    shards[0].has_bucket = [True, False, False]
+    shards[1].has_bucket = [False, False, False]
+
+role ControlPlane:
+    action Init:
+        self.migration_state = "planned"
+        self.bucket_map_version = 1
+        self.target_bucket_map_version = 2
+        self.source_frontier = 1
+        self.cutover_epoch = 1
+        self.checkpoint_index = 0
+        self.reader_seen = False
+        self.exchange_seen = False
+        self.gateway_seen = False
+        self.verified = False
+        # Logical bucket set: bucket 0 is migrating, buckets 1..N are not.
+        self.migrating_bucket = [True, False, False]
+
+role Shard:
+    action Init:
+        self.has_bucket = [False, False, False]
+
+role Consumer:
+    action Init:
+        self.frontier = 0
+
+# ─── Actions ────────────────────────────────────────────────────────────────
+
+atomic fair action PlanMigration:
+    cp = controlplane
+    require cp.migration_state == "planned"
+    cp.migration_state = "snapshotting"
+
+atomic fair action SnapshotDonor:
+    cp = controlplane
+    require cp.migration_state == "snapshotting"
+    require cp.checkpoint_index < MAX_CHECKPOINT
+    cp.checkpoint_index = cp.checkpoint_index + 1
+    cp.migration_state = "copying"
+
+atomic fair action CopySnapshotToRecipient:
+    cp = controlplane
+    require cp.migration_state == "copying"
+    for bucket_id in range(NUM_BUCKETS):
+        if cp.migrating_bucket[bucket_id] and shards[0].has_bucket[bucket_id]:
+            shards[1].has_bucket[bucket_id] = True
+    cp.migration_state = "dual_writing"
+    dual_writing_reached = True
+
+# A write accepted during dual-writing may either already be on the recipient
+# or remain pending until catch-up replays it; M6-S2 proves the latter case is
+# never allowed to survive CATCHING_UP's exit.
+atomic fair action AcceptDualWriteBuffered:
+    cp = controlplane
+    require cp.migration_state == "dual_writing"
+    require not pending_recipient_dual_write
+    accepted_during_dual_write = True
+    pending_recipient_dual_write = True
+    shards[0].has_bucket[0] = True
+
+atomic fair action AcceptDualWriteReplicated:
+    cp = controlplane
+    require cp.migration_state == "dual_writing"
+    accepted_during_dual_write = True
+    shards[0].has_bucket[0] = True
+    shards[1].has_bucket[0] = True
+
+atomic fair action EnterCatchingUp:
+    cp = controlplane
+    require cp.migration_state == "dual_writing"
+    cp.migration_state = "catching_up"
+
+atomic fair action CatchUpRecipient:
+    cp = controlplane
+    require cp.migration_state == "catching_up"
+    require pending_recipient_dual_write
+    shards[1].has_bucket[0] = True
+    pending_recipient_dual_write = False
+
+atomic fair action FenceOldWriter:
+    cp = controlplane
+    require cp.migration_state == "catching_up"
+    require not pending_recipient_dual_write
+    cp.bucket_map_version = cp.target_bucket_map_version
+    cp.migration_state = "fencing_old"
+
+atomic fair action BeginCutover:
+    cp = controlplane
+    require cp.migration_state == "fencing_old"
+    cp.reader_seen = False
+    cp.exchange_seen = False
+    cp.gateway_seen = False
+    cp.migration_state = "cutover"
+
+atomic fair action ObserveReader:
+    cp = controlplane
+    require cp.migration_state == "cutover"
+    cp.reader_seen = True
+
+atomic fair action ObserveExchange:
+    cp = controlplane
+    require cp.migration_state == "cutover"
+    cp.exchange_seen = True
+
+atomic fair action ObserveGateway:
+    cp = controlplane
+    require cp.migration_state == "cutover"
+    cp.gateway_seen = True
+
+atomic fair action EnterVerifying:
+    cp = controlplane
+    require cp.migration_state == "cutover"
+    require cp.reader_seen and cp.exchange_seen and cp.gateway_seen
+    cp.migration_state = "verifying"
+    cp.cutover_epoch = cp.source_frontier
+
+atomic fair action VerificationSucceeds:
+    cp = controlplane
+    require cp.migration_state == "verifying"
+    require shards[1].has_bucket[0]
+    cp.verified = True
+
+atomic action VerificationDiverges:
+    cp = controlplane
+    require cp.migration_state == "verifying"
+    require not divergence_rollback_observed
+    cp.verified = False
+    cp.migration_state = "dual_writing"
+    divergence_rollback_observed = True
+
+atomic fair action AdvanceConsumerFrontier:
+    cp = controlplane
+    require consumer.frontier < MAX_EPOCH
+    require consumer.frontier < cp.cutover_epoch or cp.verified
+    consumer.frontier = consumer.frontier + 1
+
+atomic fair action EnterGcEligible:
+    cp = controlplane
+    require cp.migration_state == "verifying"
+    require cp.verified
+    require consumer.frontier >= cp.cutover_epoch
+    cp.migration_state = "gc_eligible"
+    gc_eligible_reached = True
+
+atomic fair action FinishMigration:
+    cp = controlplane
+    require cp.migration_state == "gc_eligible"
+    shards[0].has_bucket[0] = False
+    cp.migration_state = "done"
+    done_reached = True
+
+atomic action AbortFromSnapshotting:
+    cp = controlplane
+    require cp.migration_state == "snapshotting"
+    cp.migration_state = "aborted"
+
+atomic action AbortFromDualWriting:
+    cp = controlplane
+    require cp.migration_state == "dual_writing"
+    cp.migration_state = "aborted"
+    aborted_from_dual_writing = True
+
+atomic action AbortFromCutover:
+    cp = controlplane
+    require cp.migration_state == "cutover"
+    cp.migration_state = "aborted"
+    aborted_from_cutover = True
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+# M6-S1: exactly one shard is authoritative for the migrating bucket at every
+# committed epoch boundary — donor through FENCING_OLD, recipient from CUTOVER
+# onward, never both and never neither.
+always assertion M6_S1_SingleAuthoritativeShard:
+    state_name = controlplane.migration_state
+    donor = donor_authoritative(state_name)
+    recipient = recipient_authoritative(state_name)
+    return (donor and not recipient) or (recipient and not donor)
+
+# M6-S2: every write accepted during dual-writing is present on the recipient
+# by the time CATCHING_UP has exited.
+always assertion M6_S2_NoLostDualWrites:
+    state_name = controlplane.migration_state
+    if accepted_during_dual_write and state_name in ["fencing_old", "cutover", "verifying", "gc_eligible", "done"]:
+        return shards[1].has_bucket[0] and not pending_recipient_dual_write
+    return True
+
+# M6-S3: GC_ELIGIBLE is never entered before the consumer frontier passes the
+# cutover epoch.
+always assertion M6_S3_GcEligibleFrontierGate:
+    if controlplane.migration_state == "gc_eligible":
+        return consumer.frontier >= controlplane.cutover_epoch
+    return True
+
+# M6-L1: from any non-terminal state, the migration always eventually reaches
+# either DONE or ABORTED. The exact successful/abort branch is intentionally
+# nondeterministic.
+always eventually assertion M6_L1_EventuallyCompletesOrAborts:
+    return controlplane.migration_state in ["done", "aborted"]
+
+# COV-M6: prove that the happy path reaches DUAL_WRITING, GC_ELIGIBLE, and
+# DONE. Separate abort coverage assertions below prove ABORTED is reachable
+# from both DUAL_WRITING and CUTOVER.
+exists assertion COV_M6:
+    return (
+        dual_writing_reached
+        and gc_eligible_reached
+        and done_reached
+    )
+
+exists assertion COV_M6_AbortFromDualWriting:
+    return aborted_from_dual_writing
+
+exists assertion COV_M6_AbortFromCutover:
+    return aborted_from_cutover

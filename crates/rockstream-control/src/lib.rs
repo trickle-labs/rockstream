@@ -20,6 +20,7 @@ pub mod audit;
 pub mod checkpoint;
 pub mod config_deriver;
 pub mod frontier;
+pub mod migration;
 pub mod namespace;
 pub mod placement;
 pub mod raft;
@@ -33,13 +34,17 @@ pub mod topology;
 pub use acl::{AclError, AclStore};
 pub use checkpoint::{CheckpointCoordinator, CoordinatorError, DEFAULT_ALIGNMENT_MAX_CREDITS};
 pub use frontier::{AggregatorError, FrontierAggregator};
+pub use migration::{
+    BucketMapVersionTracker, MigrationConsumerFrontierTracker, MigrationCoordinator,
+    MigrationError, MigrationFillLevel, MigrationPersistentStore, MigrationShard, PhaseClocks,
+};
 pub use namespace::NamespaceCatalog;
 pub use placement::PlacementAlgorithm;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use service::{ControlService, ControlServiceHandle};
 pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};
 pub use tls::TlsConfig;
-pub use topology::TopologyCatalog;
+pub use topology::{TopologyCatalog, TopologyPersistentStore};
 
 #[cfg(test)]
 mod tests {

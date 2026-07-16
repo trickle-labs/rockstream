@@ -90,6 +90,8 @@ pub const RS_1012: ErrorCode = ErrorCode::new(1012);
 pub const RS_1013: ErrorCode = ErrorCode::new(1013);
 /// Workload drop rejected because views are still assigned.
 pub const RS_1014: ErrorCode = ErrorCode::new(1014);
+/// Migration state exceeded its configured timeout budget (v0.46).
+pub const RS_1030: ErrorCode = ErrorCode::new(1030);
 /// Inner-frontier stall in distributed recursion; per-shard recompute triggered (v0.33).
 pub const RS_1512: ErrorCode = ErrorCode::new(1512);
 /// Distributed recursion max-iteration cap exceeded without convergence (v0.33).
@@ -201,6 +203,12 @@ pub const RS_3604: ErrorCode = ErrorCode::new(3604);
 pub const RS_3605: ErrorCode = ErrorCode::new(3605);
 /// Worker drain deadline exceeded; worker self-fenced (v0.38).
 pub const RS_3606: ErrorCode = ErrorCode::new(3606);
+/// Worker drain target does not exist in the current topology (v0.46).
+pub const RS_3610: ErrorCode = ErrorCode::new(3610);
+/// Worker drain cannot proceed because no active recipient worker is available (v0.46).
+pub const RS_3611: ErrorCode = ErrorCode::new(3611);
+/// Worker drain queue reached its configured bound; backpressure applied (v0.46).
+pub const RS_3612: ErrorCode = ErrorCode::new(3612);
 /// Schema change requires blue/green clone/backfill/flip; in-place apply rejected (v0.39).
 pub const RS_3607: ErrorCode = ErrorCode::new(3607);
 /// A blue/green clone operation is already in progress for this view (v0.39).
@@ -238,6 +246,12 @@ pub const RS_5001: ErrorCode = ErrorCode::new(5001);
 pub const RS_5002: ErrorCode = ErrorCode::new(5002);
 /// Wire protocol version not supported; rolling upgrade version skew (v0.36, DESIGN.md §5.5).
 pub const RS_5003: ErrorCode = ErrorCode::new(5003);
+/// Illegal shard-migration state transition rejected (v0.46).
+pub const RS_5030: ErrorCode = ErrorCode::new(5030);
+/// Shard-migration verify scan window exceeded its configured bound (v0.46).
+pub const RS_5031: ErrorCode = ErrorCode::new(5031);
+/// Shard-migration bucket-map version or watcher acknowledgement mismatch (v0.46).
+pub const RS_5032: ErrorCode = ErrorCode::new(5032);
 /// Resource usage budget warning (80% threshold reached).
 pub const RS_5018: ErrorCode = ErrorCode::new(5018);
 /// Resource usage budget critical (95% threshold reached).
@@ -319,6 +333,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         1012 => "SQL statement could not be parsed",
         1013 => "Query contains a feature not yet supported by the incremental planner",
         1014 => "Workload still has assigned views",
+        1030 => "Migration state exceeded its configured timeout budget",
         9001 => "Admission control rejected the capacity request",
         1015 => "Group-commit queue full; back-pressure applied",
         1016 => "Aggregate running sum overflowed i64",
@@ -373,6 +388,9 @@ pub fn description(code: ErrorCode) -> &'static str {
         5001 => "Incompatible storage format",
         5002 => "Unknown merge law in arrangement header",
         5003 => "Wire protocol version not supported; rolling upgrade version skew",
+        5030 => "Illegal shard-migration state transition rejected",
+        5031 => "Shard-migration verify scan window exceeded its configured bound",
+        5032 => "Shard-migration bucket-map version or watcher acknowledgement mismatch",
         5018 => "Resource usage budget warning (80% threshold reached)",
         5019 => "Resource usage budget critical (95% threshold reached)",
         6001 => "Incompatible upstream schema evolution detected",
@@ -408,6 +426,9 @@ pub fn severity(code: ErrorCode) -> Severity {
         3501 => Severity::Error,
         5001 => Severity::Fatal,
         5002 => Severity::Fatal,
+        5030 => Severity::Error,
+        5031 => Severity::Error,
+        5032 => Severity::Error,
         5018 => Severity::Warning,
         5019 => Severity::Warning,
         6001 => Severity::Warning,
@@ -436,6 +457,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1012 => "Check SQL syntax; see docs/language-features.md for the supported SQL subset.",
         1013 => "Simplify the query or check docs/language-features.md for the supported incremental SQL subset.",
         1014 => "Reassign or drop the workload's views before dropping the workload.",
+        1030 => "Check donor/recipient shard health, then retry or abort the migration; increase the specific migration timeout only if the cluster is healthy but the workload is larger than expected.",
         9001 => "Reduce the requesting workload's demand, raise the cluster state budget, or lower the priority of contending workloads so admission control can pause them.",
         1015 => "Reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards.",
         1016 => "Reduce value magnitudes or switch to a wider numeric type.",
@@ -491,6 +513,9 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         5001 => "Run the storage migration tool before upgrading.",
         5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
         5003 => "Ensure N+1 binary is backward compatible with N; check rolling upgrade procedure in DESIGN.md §5.5.",
+        5030 => "Drive the migration through the documented next state only, or resume from the persisted record instead of forcing a skipped state.",
+        5031 => "Reduce verify_sample_rate, split the migration into fewer buckets, or increase the configured verify scan bound if memory headroom allows.",
+        5032 => "Wait for every reader, exchange receiver, and gateway to observe the new bucket_map_version, then retry the migration step under the current version.",
         5018 => "Examine view resource usage and plan to scale out cluster capacity or adjust memory limits.",
         5019 => "Immediately free unused view resources or scale cluster capacity to prevent pipeline stalls.",
         6001 => "Apply view replacement or run manual migration to match the new upstream schema.",
@@ -537,12 +562,12 @@ mod tests {
     fn all_codes_have_descriptions_and_actionable_next_steps() {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
-            RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006, RS_2007,
-            RS_2008, RS_2014, RS_2015, RS_2016, RS_2018, RS_2021, RS_3003, RS_3009, RS_3011,
-            RS_3012, RS_3013, RS_3014, RS_3015, RS_3016, RS_3017, RS_3018, RS_3501, RS_4001,
-            RS_4002, RS_5001, RS_5002, RS_5003, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603,
-            RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017,
-            RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
+            RS_1007, RS_1008, RS_1030, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006,
+            RS_2007, RS_2008, RS_2014, RS_2015, RS_2016, RS_2018, RS_2021, RS_3003, RS_3009,
+            RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016, RS_3017, RS_3018, RS_3501,
+            RS_4001, RS_4002, RS_5001, RS_5002, RS_5003, RS_5030, RS_5031, RS_5032, RS_1512,
+            RS_1513, RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019,
+            RS_6001, RS_1015, RS_1016, RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
             RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_3005, RS_1018, RS_2400, RS_2401,
             RS_2402, // v0.26 auth
             RS_9001, // v0.45.1 admission control

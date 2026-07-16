@@ -1,0 +1,5578 @@
+{
+  "sourceInfo": {
+    "fileName": "m6_shard_migration.fizz",
+    "start": {
+      "line": 15,
+      "column": 1
+    },
+    "end": {
+      "line": 274
+    }
+  },
+  "invariants": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 232,
+          "column": 1
+        },
+        "end": {
+          "line": 240
+        }
+      },
+      "name": "M6_S1_SingleAuthoritativeShard",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 233,
+            "column": 5
+          },
+          "end": {
+            "line": 240
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 233,
+                "column": 5
+              },
+              "end": {
+                "line": 234,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 233,
+                  "column": 5
+                },
+                "end": {
+                  "line": 233,
+                  "column": 45
+                }
+              },
+              "code": "state_name = controlplane.migration_state"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 234,
+                "column": 5
+              },
+              "end": {
+                "line": 235,
+                "column": 4
+              }
+            },
+            "callStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 234,
+                  "column": 5
+                },
+                "end": {
+                  "line": 234,
+                  "column": 43
+                }
+              },
+              "vars": [
+                "donor"
+              ],
+              "name": "donor_authoritative",
+              "args": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 234,
+                      "column": 33
+                    },
+                    "end": {
+                      "line": 234,
+                      "column": 42
+                    }
+                  },
+                  "pyExpr": "state_name",
+                  "expr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 234,
+                        "column": 33
+                      },
+                      "end": {
+                        "line": 234,
+                        "column": 42
+                      }
+                    },
+                    "pyExpr": "state_name"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 235,
+                "column": 5
+              },
+              "end": {
+                "line": 236,
+                "column": 4
+              }
+            },
+            "callStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 235,
+                  "column": 5
+                },
+                "end": {
+                  "line": 235,
+                  "column": 51
+                }
+              },
+              "vars": [
+                "recipient"
+              ],
+              "name": "recipient_authoritative",
+              "args": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 235,
+                      "column": 41
+                    },
+                    "end": {
+                      "line": 235,
+                      "column": 50
+                    }
+                  },
+                  "pyExpr": "state_name",
+                  "expr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 235,
+                        "column": 41
+                      },
+                      "end": {
+                        "line": 235,
+                        "column": 50
+                      }
+                    },
+                    "pyExpr": "state_name"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 236,
+                "column": 5
+              },
+              "end": {
+                "line": 240
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 236,
+                  "column": 5
+                },
+                "end": {
+                  "line": 236,
+                  "column": 65
+                }
+              },
+              "pyExpr": "(donor and not recipient) or (recipient and not donor)",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 236,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 236,
+                    "column": 65
+                  }
+                },
+                "pyExpr": "(donor and not recipient) or (recipient and not donor)"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M6_S1_SingleAuthoritativeShard():\n    state_name = controlplane.migration_state\n    donor = donor_authoritative(state_name)\n    recipient = recipient_authoritative(state_name)\n    return (donor and not recipient) or (recipient and not donor)\n\n# M6-S2: every write accepted during dual-writing is present on the recipient\n# by the time CATCHING_UP has exited.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 240,
+          "column": 1
+        },
+        "end": {
+          "line": 248
+        }
+      },
+      "name": "M6_S2_NoLostDualWrites",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 241,
+            "column": 5
+          },
+          "end": {
+            "line": 248
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 241,
+                "column": 5
+              },
+              "end": {
+                "line": 242,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 241,
+                  "column": 5
+                },
+                "end": {
+                  "line": 241,
+                  "column": 45
+                }
+              },
+              "code": "state_name = controlplane.migration_state"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 242,
+                "column": 5
+              },
+              "end": {
+                "line": 244,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 242,
+                  "column": 5
+                },
+                "end": {
+                  "line": 244,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 242,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 244,
+                      "column": 4
+                    }
+                  },
+                  "condition": "accepted_during_dual_write and state_name in [\"fencing_old\", \"cutover\", \"verifying\", \"gc_eligible\", \"done\"]",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 243,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 244,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 243,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 244,
+                            "column": 4
+                          }
+                        },
+                        "returnStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 243,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 243,
+                              "column": 75
+                            }
+                          },
+                          "pyExpr": "shards[1].has_bucket[0] and not pending_recipient_dual_write",
+                          "expr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 243,
+                                "column": 16
+                              },
+                              "end": {
+                                "line": 243,
+                                "column": 75
+                              }
+                            },
+                            "pyExpr": "shards[1].has_bucket[0] and not pending_recipient_dual_write"
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 242,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 242,
+                        "column": 114
+                      }
+                    },
+                    "pyExpr": "accepted_during_dual_write and state_name in [\"fencing_old\", \"cutover\", \"verifying\", \"gc_eligible\", \"done\"]"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 244,
+                "column": 5
+              },
+              "end": {
+                "line": 248
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 244,
+                  "column": 5
+                },
+                "end": {
+                  "line": 244,
+                  "column": 15
+                }
+              },
+              "pyExpr": "True",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 244,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 244,
+                    "column": 15
+                  }
+                },
+                "pyExpr": "True"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M6_S2_NoLostDualWrites():\n    state_name = controlplane.migration_state\n    if accepted_during_dual_write and state_name in [\"fencing_old\", \"cutover\", \"verifying\", \"gc_eligible\", \"done\"]:\n        return shards[1].has_bucket[0] and not pending_recipient_dual_write\n    return True\n\n# M6-S3: GC_ELIGIBLE is never entered before the consumer frontier passes the\n# cutover epoch.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 248,
+          "column": 1
+        },
+        "end": {
+          "line": 256
+        }
+      },
+      "name": "M6_S3_GcEligibleFrontierGate",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 249,
+            "column": 5
+          },
+          "end": {
+            "line": 256
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 249,
+                "column": 5
+              },
+              "end": {
+                "line": 251,
+                "column": 4
+              }
+            },
+            "ifStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 249,
+                  "column": 5
+                },
+                "end": {
+                  "line": 251,
+                  "column": 4
+                }
+              },
+              "branches": [
+                {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 249,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 251,
+                      "column": 4
+                    }
+                  },
+                  "condition": "controlplane.migration_state == \"gc_eligible\"",
+                  "block": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 250,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 251,
+                        "column": 4
+                      }
+                    },
+                    "stmts": [
+                      {
+                        "sourceInfo": {
+                          "start": {
+                            "line": 250,
+                            "column": 9
+                          },
+                          "end": {
+                            "line": 251,
+                            "column": 4
+                          }
+                        },
+                        "returnStmt": {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 250,
+                              "column": 9
+                            },
+                            "end": {
+                              "line": 250,
+                              "column": 62
+                            }
+                          },
+                          "pyExpr": "consumer.frontier >= controlplane.cutover_epoch",
+                          "expr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 250,
+                                "column": 16
+                              },
+                              "end": {
+                                "line": 250,
+                                "column": 62
+                              }
+                            },
+                            "pyExpr": "consumer.frontier >= controlplane.cutover_epoch"
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  "conditionExpr": {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 249,
+                        "column": 8
+                      },
+                      "end": {
+                        "line": 249,
+                        "column": 52
+                      }
+                    },
+                    "pyExpr": "controlplane.migration_state == \"gc_eligible\""
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 251,
+                "column": 5
+              },
+              "end": {
+                "line": 256
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 251,
+                  "column": 5
+                },
+                "end": {
+                  "line": 251,
+                  "column": 15
+                }
+              },
+              "pyExpr": "True",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 251,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 251,
+                    "column": 15
+                  }
+                },
+                "pyExpr": "True"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M6_S3_GcEligibleFrontierGate():\n    if controlplane.migration_state == \"gc_eligible\":\n        return consumer.frontier >= controlplane.cutover_epoch\n    return True\n\n# M6-L1: from any non-terminal state, the migration always eventually reaches\n# either DONE or ABORTED. The exact successful/abort branch is intentionally\n# nondeterministic.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 256,
+          "column": 1
+        },
+        "end": {
+          "line": 262
+        }
+      },
+      "name": "M6_L1_EventuallyCompletesOrAborts",
+      "temporalOperators": [
+        "always",
+        "eventually"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 257,
+            "column": 5
+          },
+          "end": {
+            "line": 262
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 257,
+                "column": 5
+              },
+              "end": {
+                "line": 262
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 257,
+                  "column": 5
+                },
+                "end": {
+                  "line": 257,
+                  "column": 62
+                }
+              },
+              "pyExpr": "controlplane.migration_state in [\"done\", \"aborted\"]",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 257,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 257,
+                    "column": 62
+                  }
+                },
+                "pyExpr": "controlplane.migration_state in [\"done\", \"aborted\"]"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def M6_L1_EventuallyCompletesOrAborts():\n    return controlplane.migration_state in [\"done\", \"aborted\"]\n\n# COV-M6: prove that the happy path reaches DUAL_WRITING, GC_ELIGIBLE, and\n# DONE. Separate abort coverage assertions below prove ABORTED is reachable\n# from both DUAL_WRITING and CUTOVER.\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 262,
+          "column": 1
+        },
+        "end": {
+          "line": 269
+        }
+      },
+      "name": "COV_M6",
+      "temporalOperators": [
+        "exists"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 263,
+            "column": 5
+          },
+          "end": {
+            "line": 269
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 263,
+                "column": 5
+              },
+              "end": {
+                "line": 269
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 263,
+                  "column": 5
+                },
+                "end": {
+                  "line": 267,
+                  "column": 5
+                }
+              },
+              "pyExpr": "(\n        dual_writing_reached\n        and gc_eligible_reached\n        and done_reached\n    )",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 263,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 267,
+                    "column": 5
+                  }
+                },
+                "pyExpr": "(\n        dual_writing_reached\n        and gc_eligible_reached\n        and done_reached\n    )"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def COV_M6():\n    return (\n        dual_writing_reached\n        and gc_eligible_reached\n        and done_reached\n    )\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 269,
+          "column": 1
+        },
+        "end": {
+          "line": 272
+        }
+      },
+      "name": "COV_M6_AbortFromDualWriting",
+      "temporalOperators": [
+        "exists"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 270,
+            "column": 5
+          },
+          "end": {
+            "line": 272
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 270,
+                "column": 5
+              },
+              "end": {
+                "line": 272
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 270,
+                  "column": 5
+                },
+                "end": {
+                  "line": 270,
+                  "column": 36
+                }
+              },
+              "pyExpr": "aborted_from_dual_writing",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 270,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 270,
+                    "column": 36
+                  }
+                },
+                "pyExpr": "aborted_from_dual_writing"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def COV_M6_AbortFromDualWriting():\n    return aborted_from_dual_writing\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 272,
+          "column": 1
+        },
+        "end": {
+          "line": 274
+        }
+      },
+      "name": "COV_M6_AbortFromCutover",
+      "temporalOperators": [
+        "exists"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 273,
+            "column": 5
+          },
+          "end": {
+            "line": 274
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 273,
+                "column": 5
+              },
+              "end": {
+                "line": 274
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 273,
+                  "column": 5
+                },
+                "end": {
+                  "line": 273,
+                  "column": 31
+                }
+              },
+              "pyExpr": "aborted_from_cutover",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 273,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 273,
+                    "column": 31
+                  }
+                },
+                "pyExpr": "aborted_from_cutover"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def COV_M6_AbortFromCutover():\n    return aborted_from_cutover\n"
+    }
+  ],
+  "actions": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 39,
+          "column": 1
+        },
+        "end": {
+          "line": 62
+        }
+      },
+      "name": "Init",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_STRONG"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 40,
+            "column": 5
+          },
+          "end": {
+            "line": 62
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 40,
+                "column": 5
+              },
+              "end": {
+                "line": 41,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 40,
+                  "column": 5
+                },
+                "end": {
+                  "line": 40,
+                  "column": 32
+                }
+              },
+              "code": "dual_writing_reached = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 41,
+                "column": 5
+              },
+              "end": {
+                "line": 42,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 41,
+                  "column": 5
+                },
+                "end": {
+                  "line": 41,
+                  "column": 31
+                }
+              },
+              "code": "gc_eligible_reached = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 42,
+                "column": 5
+              },
+              "end": {
+                "line": 43,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 42,
+                  "column": 5
+                },
+                "end": {
+                  "line": 42,
+                  "column": 24
+                }
+              },
+              "code": "done_reached = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 43,
+                "column": 5
+              },
+              "end": {
+                "line": 44,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 43,
+                  "column": 5
+                },
+                "end": {
+                  "line": 43,
+                  "column": 37
+                }
+              },
+              "code": "aborted_from_dual_writing = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 44,
+                "column": 5
+              },
+              "end": {
+                "line": 45,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 44,
+                  "column": 5
+                },
+                "end": {
+                  "line": 44,
+                  "column": 32
+                }
+              },
+              "code": "aborted_from_cutover = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 45,
+                "column": 5
+              },
+              "end": {
+                "line": 48,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 45,
+                  "column": 5
+                },
+                "end": {
+                  "line": 45,
+                  "column": 40
+                }
+              },
+              "code": "divergence_rollback_observed = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 48,
+                "column": 5
+              },
+              "end": {
+                "line": 49,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 48,
+                  "column": 5
+                },
+                "end": {
+                  "line": 48,
+                  "column": 38
+                }
+              },
+              "code": "accepted_during_dual_write = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 49,
+                "column": 5
+              },
+              "end": {
+                "line": 51,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 49,
+                  "column": 5
+                },
+                "end": {
+                  "line": 49,
+                  "column": 40
+                }
+              },
+              "code": "pending_recipient_dual_write = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 51,
+                "column": 5
+              },
+              "end": {
+                "line": 52,
+                "column": 4
+              }
+            },
+            "callStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 51,
+                  "column": 5
+                },
+                "end": {
+                  "line": 51,
+                  "column": 33
+                }
+              },
+              "vars": [
+                "controlplane"
+              ],
+              "name": "ControlPlane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 52,
+                "column": 5
+              },
+              "end": {
+                "line": 53,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 52,
+                  "column": 5
+                },
+                "end": {
+                  "line": 52,
+                  "column": 15
+                }
+              },
+              "code": "shards = []"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 53,
+                "column": 5
+              },
+              "end": {
+                "line": 55,
+                "column": 4
+              }
+            },
+            "forStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 53,
+                  "column": 5
+                },
+                "end": {
+                  "line": 55,
+                  "column": 4
+                }
+              },
+              "loopVars": [
+                "i"
+              ],
+              "pyExpr": "range(NUM_SHARDS)",
+              "block": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 54,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 55,
+                    "column": 4
+                  }
+                },
+                "stmts": [
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 54,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 55,
+                        "column": 4
+                      }
+                    },
+                    "callStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 54,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 54,
+                          "column": 34
+                        }
+                      },
+                      "name": "append",
+                      "args": [
+                        {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 54,
+                              "column": 23
+                            },
+                            "end": {
+                              "line": 54,
+                              "column": 33
+                            }
+                          },
+                          "pyExpr": "Shard(id=i)",
+                          "expr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 54,
+                                "column": 23
+                              },
+                              "end": {
+                                "line": 54,
+                                "column": 33
+                              }
+                            },
+                            "pyExpr": "Shard(id=i)"
+                          }
+                        }
+                      ],
+                      "receiver": "shards"
+                    }
+                  }
+                ]
+              },
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 53,
+                    "column": 14
+                  },
+                  "end": {
+                    "line": 53,
+                    "column": 30
+                  }
+                },
+                "pyExpr": "range(NUM_SHARDS)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 55,
+                "column": 5
+              },
+              "end": {
+                "line": 59,
+                "column": 4
+              }
+            },
+            "callStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 55,
+                  "column": 5
+                },
+                "end": {
+                  "line": 55,
+                  "column": 25
+                }
+              },
+              "vars": [
+                "consumer"
+              ],
+              "name": "Consumer"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 59,
+                "column": 5
+              },
+              "end": {
+                "line": 60,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 59,
+                  "column": 5
+                },
+                "end": {
+                  "line": 59,
+                  "column": 47
+                }
+              },
+              "code": "shards[0].has_bucket = [True, False, False]"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 60,
+                "column": 5
+              },
+              "end": {
+                "line": 62
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 60,
+                  "column": 5
+                },
+                "end": {
+                  "line": 60,
+                  "column": 48
+                }
+              },
+              "code": "shards[1].has_bucket = [False, False, False]"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 87,
+          "column": 1
+        },
+        "end": {
+          "line": 92
+        }
+      },
+      "name": "PlanMigration",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 87,
+            "column": 8
+          },
+          "end": {
+            "line": 87,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 88,
+            "column": 5
+          },
+          "end": {
+            "line": 92
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 88,
+                "column": 5
+              },
+              "end": {
+                "line": 89,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 88,
+                  "column": 5
+                },
+                "end": {
+                  "line": 88,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 89,
+                "column": 5
+              },
+              "end": {
+                "line": 90,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 89,
+                  "column": 5
+                },
+                "end": {
+                  "line": 89,
+                  "column": 43
+                }
+              },
+              "condition": "cp.migration_state == \"planned\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 89,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 89,
+                    "column": 43
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"planned\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 90,
+                "column": 5
+              },
+              "end": {
+                "line": 92
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 90,
+                  "column": 5
+                },
+                "end": {
+                  "line": 90,
+                  "column": 39
+                }
+              },
+              "code": "cp.migration_state = \"snapshotting\""
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 92,
+          "column": 1
+        },
+        "end": {
+          "line": 99
+        }
+      },
+      "name": "SnapshotDonor",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 92,
+            "column": 8
+          },
+          "end": {
+            "line": 92,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 93,
+            "column": 5
+          },
+          "end": {
+            "line": 99
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 93,
+                "column": 5
+              },
+              "end": {
+                "line": 94,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 93,
+                  "column": 5
+                },
+                "end": {
+                  "line": 93,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 94,
+                "column": 5
+              },
+              "end": {
+                "line": 95,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 94,
+                  "column": 5
+                },
+                "end": {
+                  "line": 94,
+                  "column": 48
+                }
+              },
+              "condition": "cp.migration_state == \"snapshotting\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 94,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 94,
+                    "column": 48
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"snapshotting\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 95,
+                "column": 5
+              },
+              "end": {
+                "line": 96,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 95,
+                  "column": 5
+                },
+                "end": {
+                  "line": 95,
+                  "column": 48
+                }
+              },
+              "condition": "cp.checkpoint_index < MAX_CHECKPOINT",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 95,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 95,
+                    "column": 48
+                  }
+                },
+                "pyExpr": "cp.checkpoint_index < MAX_CHECKPOINT"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 96,
+                "column": 5
+              },
+              "end": {
+                "line": 97,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 96,
+                  "column": 5
+                },
+                "end": {
+                  "line": 96,
+                  "column": 49
+                }
+              },
+              "code": "cp.checkpoint_index = cp.checkpoint_index + 1"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 97,
+                "column": 5
+              },
+              "end": {
+                "line": 99
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 97,
+                  "column": 5
+                },
+                "end": {
+                  "line": 97,
+                  "column": 34
+                }
+              },
+              "code": "cp.migration_state = \"copying\""
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 99,
+          "column": 1
+        },
+        "end": {
+          "line": 111
+        }
+      },
+      "name": "CopySnapshotToRecipient",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 99,
+            "column": 8
+          },
+          "end": {
+            "line": 99,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 100,
+            "column": 5
+          },
+          "end": {
+            "line": 111
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 100,
+                "column": 5
+              },
+              "end": {
+                "line": 101,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 100,
+                  "column": 5
+                },
+                "end": {
+                  "line": 100,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 101,
+                "column": 5
+              },
+              "end": {
+                "line": 102,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 101,
+                  "column": 5
+                },
+                "end": {
+                  "line": 101,
+                  "column": 43
+                }
+              },
+              "condition": "cp.migration_state == \"copying\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 101,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 101,
+                    "column": 43
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"copying\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 102,
+                "column": 5
+              },
+              "end": {
+                "line": 105,
+                "column": 4
+              }
+            },
+            "forStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 102,
+                  "column": 5
+                },
+                "end": {
+                  "line": 105,
+                  "column": 4
+                }
+              },
+              "loopVars": [
+                "bucket_id"
+              ],
+              "pyExpr": "range(NUM_BUCKETS)",
+              "block": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 103,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 105,
+                    "column": 4
+                  }
+                },
+                "stmts": [
+                  {
+                    "sourceInfo": {
+                      "start": {
+                        "line": 103,
+                        "column": 9
+                      },
+                      "end": {
+                        "line": 105,
+                        "column": 4
+                      }
+                    },
+                    "ifStmt": {
+                      "sourceInfo": {
+                        "start": {
+                          "line": 103,
+                          "column": 9
+                        },
+                        "end": {
+                          "line": 105,
+                          "column": 4
+                        }
+                      },
+                      "branches": [
+                        {
+                          "sourceInfo": {
+                            "start": {
+                              "line": 103,
+                              "column": 12
+                            },
+                            "end": {
+                              "line": 105,
+                              "column": 4
+                            }
+                          },
+                          "condition": "cp.migrating_bucket[bucket_id] and shards[0].has_bucket[bucket_id]",
+                          "block": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 104,
+                                "column": 13
+                              },
+                              "end": {
+                                "line": 105,
+                                "column": 4
+                              }
+                            },
+                            "stmts": [
+                              {
+                                "sourceInfo": {
+                                  "start": {
+                                    "line": 104,
+                                    "column": 13
+                                  },
+                                  "end": {
+                                    "line": 105,
+                                    "column": 4
+                                  }
+                                },
+                                "pyStmt": {
+                                  "sourceInfo": {
+                                    "start": {
+                                      "line": 104,
+                                      "column": 13
+                                    },
+                                    "end": {
+                                      "line": 104,
+                                      "column": 50
+                                    }
+                                  },
+                                  "code": "shards[1].has_bucket[bucket_id] = True"
+                                }
+                              }
+                            ]
+                          },
+                          "conditionExpr": {
+                            "sourceInfo": {
+                              "start": {
+                                "line": 103,
+                                "column": 12
+                              },
+                              "end": {
+                                "line": 103,
+                                "column": 77
+                              }
+                            },
+                            "pyExpr": "cp.migrating_bucket[bucket_id] and shards[0].has_bucket[bucket_id]"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "iterExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 102,
+                    "column": 22
+                  },
+                  "end": {
+                    "line": 102,
+                    "column": 39
+                  }
+                },
+                "pyExpr": "range(NUM_BUCKETS)"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 105,
+                "column": 5
+              },
+              "end": {
+                "line": 106,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 105,
+                  "column": 5
+                },
+                "end": {
+                  "line": 105,
+                  "column": 39
+                }
+              },
+              "code": "cp.migration_state = \"dual_writing\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 106,
+                "column": 5
+              },
+              "end": {
+                "line": 111
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 106,
+                  "column": 5
+                },
+                "end": {
+                  "line": 106,
+                  "column": 31
+                }
+              },
+              "code": "dual_writing_reached = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 111,
+          "column": 1
+        },
+        "end": {
+          "line": 119
+        }
+      },
+      "name": "AcceptDualWriteBuffered",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 111,
+            "column": 8
+          },
+          "end": {
+            "line": 111,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 112,
+            "column": 5
+          },
+          "end": {
+            "line": 119
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 112,
+                "column": 5
+              },
+              "end": {
+                "line": 113,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 112,
+                  "column": 5
+                },
+                "end": {
+                  "line": 112,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 113,
+                "column": 5
+              },
+              "end": {
+                "line": 114,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 113,
+                  "column": 5
+                },
+                "end": {
+                  "line": 113,
+                  "column": 48
+                }
+              },
+              "condition": "cp.migration_state == \"dual_writing\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 113,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 113,
+                    "column": 48
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"dual_writing\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 114,
+                "column": 5
+              },
+              "end": {
+                "line": 115,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 114,
+                  "column": 5
+                },
+                "end": {
+                  "line": 114,
+                  "column": 44
+                }
+              },
+              "condition": "not pending_recipient_dual_write",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 114,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 114,
+                    "column": 44
+                  }
+                },
+                "pyExpr": "not pending_recipient_dual_write"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 115,
+                "column": 5
+              },
+              "end": {
+                "line": 116,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 115,
+                  "column": 5
+                },
+                "end": {
+                  "line": 115,
+                  "column": 37
+                }
+              },
+              "code": "accepted_during_dual_write = True"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 116,
+                "column": 5
+              },
+              "end": {
+                "line": 117,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 116,
+                  "column": 5
+                },
+                "end": {
+                  "line": 116,
+                  "column": 39
+                }
+              },
+              "code": "pending_recipient_dual_write = True"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 117,
+                "column": 5
+              },
+              "end": {
+                "line": 119
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 117,
+                  "column": 5
+                },
+                "end": {
+                  "line": 117,
+                  "column": 34
+                }
+              },
+              "code": "shards[0].has_bucket[0] = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 119,
+          "column": 1
+        },
+        "end": {
+          "line": 126
+        }
+      },
+      "name": "AcceptDualWriteReplicated",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 119,
+            "column": 8
+          },
+          "end": {
+            "line": 119,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 120,
+            "column": 5
+          },
+          "end": {
+            "line": 126
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 120,
+                "column": 5
+              },
+              "end": {
+                "line": 121,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 120,
+                  "column": 5
+                },
+                "end": {
+                  "line": 120,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 121,
+                "column": 5
+              },
+              "end": {
+                "line": 122,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 121,
+                  "column": 5
+                },
+                "end": {
+                  "line": 121,
+                  "column": 48
+                }
+              },
+              "condition": "cp.migration_state == \"dual_writing\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 121,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 121,
+                    "column": 48
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"dual_writing\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 122,
+                "column": 5
+              },
+              "end": {
+                "line": 123,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 122,
+                  "column": 5
+                },
+                "end": {
+                  "line": 122,
+                  "column": 37
+                }
+              },
+              "code": "accepted_during_dual_write = True"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 123,
+                "column": 5
+              },
+              "end": {
+                "line": 124,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 123,
+                  "column": 5
+                },
+                "end": {
+                  "line": 123,
+                  "column": 34
+                }
+              },
+              "code": "shards[0].has_bucket[0] = True"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 124,
+                "column": 5
+              },
+              "end": {
+                "line": 126
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 124,
+                  "column": 5
+                },
+                "end": {
+                  "line": 124,
+                  "column": 34
+                }
+              },
+              "code": "shards[1].has_bucket[0] = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 126,
+          "column": 1
+        },
+        "end": {
+          "line": 131
+        }
+      },
+      "name": "EnterCatchingUp",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 126,
+            "column": 8
+          },
+          "end": {
+            "line": 126,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 127,
+            "column": 5
+          },
+          "end": {
+            "line": 131
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 127,
+                "column": 5
+              },
+              "end": {
+                "line": 128,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 127,
+                  "column": 5
+                },
+                "end": {
+                  "line": 127,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 129,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 128,
+                  "column": 5
+                },
+                "end": {
+                  "line": 128,
+                  "column": 48
+                }
+              },
+              "condition": "cp.migration_state == \"dual_writing\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 128,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 128,
+                    "column": 48
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"dual_writing\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 129,
+                "column": 5
+              },
+              "end": {
+                "line": 131
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 129,
+                  "column": 5
+                },
+                "end": {
+                  "line": 129,
+                  "column": 38
+                }
+              },
+              "code": "cp.migration_state = \"catching_up\""
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 131,
+          "column": 1
+        },
+        "end": {
+          "line": 138
+        }
+      },
+      "name": "CatchUpRecipient",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 131,
+            "column": 8
+          },
+          "end": {
+            "line": 131,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 132,
+            "column": 5
+          },
+          "end": {
+            "line": 138
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 132,
+                "column": 5
+              },
+              "end": {
+                "line": 133,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 132,
+                  "column": 5
+                },
+                "end": {
+                  "line": 132,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 133,
+                "column": 5
+              },
+              "end": {
+                "line": 134,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 133,
+                  "column": 5
+                },
+                "end": {
+                  "line": 133,
+                  "column": 47
+                }
+              },
+              "condition": "cp.migration_state == \"catching_up\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 133,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 133,
+                    "column": 47
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"catching_up\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 134,
+                "column": 5
+              },
+              "end": {
+                "line": 135,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 134,
+                  "column": 5
+                },
+                "end": {
+                  "line": 134,
+                  "column": 40
+                }
+              },
+              "condition": "pending_recipient_dual_write",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 134,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 134,
+                    "column": 40
+                  }
+                },
+                "pyExpr": "pending_recipient_dual_write"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 135,
+                "column": 5
+              },
+              "end": {
+                "line": 136,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 135,
+                  "column": 5
+                },
+                "end": {
+                  "line": 135,
+                  "column": 34
+                }
+              },
+              "code": "shards[1].has_bucket[0] = True"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 136,
+                "column": 5
+              },
+              "end": {
+                "line": 138
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 136,
+                  "column": 5
+                },
+                "end": {
+                  "line": 136,
+                  "column": 40
+                }
+              },
+              "code": "pending_recipient_dual_write = False"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 138,
+          "column": 1
+        },
+        "end": {
+          "line": 145
+        }
+      },
+      "name": "FenceOldWriter",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 138,
+            "column": 8
+          },
+          "end": {
+            "line": 138,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 139,
+            "column": 5
+          },
+          "end": {
+            "line": 145
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 139,
+                "column": 5
+              },
+              "end": {
+                "line": 140,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 139,
+                  "column": 5
+                },
+                "end": {
+                  "line": 139,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 140,
+                "column": 5
+              },
+              "end": {
+                "line": 141,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 140,
+                  "column": 5
+                },
+                "end": {
+                  "line": 140,
+                  "column": 47
+                }
+              },
+              "condition": "cp.migration_state == \"catching_up\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 140,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 140,
+                    "column": 47
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"catching_up\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 141,
+                "column": 5
+              },
+              "end": {
+                "line": 142,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 141,
+                  "column": 5
+                },
+                "end": {
+                  "line": 141,
+                  "column": 44
+                }
+              },
+              "condition": "not pending_recipient_dual_write",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 141,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 141,
+                    "column": 44
+                  }
+                },
+                "pyExpr": "not pending_recipient_dual_write"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 142,
+                "column": 5
+              },
+              "end": {
+                "line": 143,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 142,
+                  "column": 5
+                },
+                "end": {
+                  "line": 142,
+                  "column": 56
+                }
+              },
+              "code": "cp.bucket_map_version = cp.target_bucket_map_version"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 143,
+                "column": 5
+              },
+              "end": {
+                "line": 145
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 143,
+                  "column": 5
+                },
+                "end": {
+                  "line": 143,
+                  "column": 38
+                }
+              },
+              "code": "cp.migration_state = \"fencing_old\""
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 145,
+          "column": 1
+        },
+        "end": {
+          "line": 153
+        }
+      },
+      "name": "BeginCutover",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 145,
+            "column": 8
+          },
+          "end": {
+            "line": 145,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 146,
+            "column": 5
+          },
+          "end": {
+            "line": 153
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 146,
+                "column": 5
+              },
+              "end": {
+                "line": 147,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 146,
+                  "column": 5
+                },
+                "end": {
+                  "line": 146,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 147,
+                "column": 5
+              },
+              "end": {
+                "line": 148,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 147,
+                  "column": 5
+                },
+                "end": {
+                  "line": 147,
+                  "column": 47
+                }
+              },
+              "condition": "cp.migration_state == \"fencing_old\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 147,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 147,
+                    "column": 47
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"fencing_old\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 148,
+                "column": 5
+              },
+              "end": {
+                "line": 149,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 148,
+                  "column": 5
+                },
+                "end": {
+                  "line": 148,
+                  "column": 26
+                }
+              },
+              "code": "cp.reader_seen = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 149,
+                "column": 5
+              },
+              "end": {
+                "line": 150,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 149,
+                  "column": 5
+                },
+                "end": {
+                  "line": 149,
+                  "column": 28
+                }
+              },
+              "code": "cp.exchange_seen = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 150,
+                "column": 5
+              },
+              "end": {
+                "line": 151,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 150,
+                  "column": 5
+                },
+                "end": {
+                  "line": 150,
+                  "column": 27
+                }
+              },
+              "code": "cp.gateway_seen = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 151,
+                "column": 5
+              },
+              "end": {
+                "line": 153
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 151,
+                  "column": 5
+                },
+                "end": {
+                  "line": 151,
+                  "column": 34
+                }
+              },
+              "code": "cp.migration_state = \"cutover\""
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 153,
+          "column": 1
+        },
+        "end": {
+          "line": 158
+        }
+      },
+      "name": "ObserveReader",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 153,
+            "column": 8
+          },
+          "end": {
+            "line": 153,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 154,
+            "column": 5
+          },
+          "end": {
+            "line": 158
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 154,
+                "column": 5
+              },
+              "end": {
+                "line": 155,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 154,
+                  "column": 5
+                },
+                "end": {
+                  "line": 154,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 155,
+                "column": 5
+              },
+              "end": {
+                "line": 156,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 155,
+                  "column": 5
+                },
+                "end": {
+                  "line": 155,
+                  "column": 43
+                }
+              },
+              "condition": "cp.migration_state == \"cutover\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 155,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 155,
+                    "column": 43
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"cutover\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 156,
+                "column": 5
+              },
+              "end": {
+                "line": 158
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 156,
+                  "column": 5
+                },
+                "end": {
+                  "line": 156,
+                  "column": 25
+                }
+              },
+              "code": "cp.reader_seen = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 158,
+          "column": 1
+        },
+        "end": {
+          "line": 163
+        }
+      },
+      "name": "ObserveExchange",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 158,
+            "column": 8
+          },
+          "end": {
+            "line": 158,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 159,
+            "column": 5
+          },
+          "end": {
+            "line": 163
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 159,
+                "column": 5
+              },
+              "end": {
+                "line": 160,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 159,
+                  "column": 5
+                },
+                "end": {
+                  "line": 159,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 160,
+                "column": 5
+              },
+              "end": {
+                "line": 161,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 160,
+                  "column": 5
+                },
+                "end": {
+                  "line": 160,
+                  "column": 43
+                }
+              },
+              "condition": "cp.migration_state == \"cutover\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 160,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 160,
+                    "column": 43
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"cutover\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 161,
+                "column": 5
+              },
+              "end": {
+                "line": 163
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 161,
+                  "column": 5
+                },
+                "end": {
+                  "line": 161,
+                  "column": 27
+                }
+              },
+              "code": "cp.exchange_seen = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 163,
+          "column": 1
+        },
+        "end": {
+          "line": 168
+        }
+      },
+      "name": "ObserveGateway",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 163,
+            "column": 8
+          },
+          "end": {
+            "line": 163,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 164,
+            "column": 5
+          },
+          "end": {
+            "line": 168
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 164,
+                "column": 5
+              },
+              "end": {
+                "line": 165,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 164,
+                  "column": 5
+                },
+                "end": {
+                  "line": 164,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 165,
+                "column": 5
+              },
+              "end": {
+                "line": 166,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 165,
+                  "column": 5
+                },
+                "end": {
+                  "line": 165,
+                  "column": 43
+                }
+              },
+              "condition": "cp.migration_state == \"cutover\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 165,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 165,
+                    "column": 43
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"cutover\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 166,
+                "column": 5
+              },
+              "end": {
+                "line": 168
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 166,
+                  "column": 5
+                },
+                "end": {
+                  "line": 166,
+                  "column": 26
+                }
+              },
+              "code": "cp.gateway_seen = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 168,
+          "column": 1
+        },
+        "end": {
+          "line": 175
+        }
+      },
+      "name": "EnterVerifying",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 168,
+            "column": 8
+          },
+          "end": {
+            "line": 168,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 169,
+            "column": 5
+          },
+          "end": {
+            "line": 175
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 169,
+                "column": 5
+              },
+              "end": {
+                "line": 170,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 169,
+                  "column": 5
+                },
+                "end": {
+                  "line": 169,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 170,
+                "column": 5
+              },
+              "end": {
+                "line": 171,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 170,
+                  "column": 5
+                },
+                "end": {
+                  "line": 170,
+                  "column": 43
+                }
+              },
+              "condition": "cp.migration_state == \"cutover\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 170,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 170,
+                    "column": 43
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"cutover\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 171,
+                "column": 5
+              },
+              "end": {
+                "line": 172,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 171,
+                  "column": 5
+                },
+                "end": {
+                  "line": 171,
+                  "column": 67
+                }
+              },
+              "condition": "cp.reader_seen and cp.exchange_seen and cp.gateway_seen",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 171,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 171,
+                    "column": 67
+                  }
+                },
+                "pyExpr": "cp.reader_seen and cp.exchange_seen and cp.gateway_seen"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 172,
+                "column": 5
+              },
+              "end": {
+                "line": 173,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 172,
+                  "column": 5
+                },
+                "end": {
+                  "line": 172,
+                  "column": 36
+                }
+              },
+              "code": "cp.migration_state = \"verifying\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 173,
+                "column": 5
+              },
+              "end": {
+                "line": 175
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 173,
+                  "column": 5
+                },
+                "end": {
+                  "line": 173,
+                  "column": 41
+                }
+              },
+              "code": "cp.cutover_epoch = cp.source_frontier"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 175,
+          "column": 1
+        },
+        "end": {
+          "line": 181
+        }
+      },
+      "name": "VerificationSucceeds",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 175,
+            "column": 8
+          },
+          "end": {
+            "line": 175,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 176,
+            "column": 5
+          },
+          "end": {
+            "line": 181
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 176,
+                "column": 5
+              },
+              "end": {
+                "line": 177,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 176,
+                  "column": 5
+                },
+                "end": {
+                  "line": 176,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 177,
+                "column": 5
+              },
+              "end": {
+                "line": 178,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 177,
+                  "column": 5
+                },
+                "end": {
+                  "line": 177,
+                  "column": 45
+                }
+              },
+              "condition": "cp.migration_state == \"verifying\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 177,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 177,
+                    "column": 45
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"verifying\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 178,
+                "column": 5
+              },
+              "end": {
+                "line": 179,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 178,
+                  "column": 5
+                },
+                "end": {
+                  "line": 178,
+                  "column": 35
+                }
+              },
+              "condition": "shards[1].has_bucket[0]",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 178,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 178,
+                    "column": 35
+                  }
+                },
+                "pyExpr": "shards[1].has_bucket[0]"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 179,
+                "column": 5
+              },
+              "end": {
+                "line": 181
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 179,
+                  "column": 5
+                },
+                "end": {
+                  "line": 179,
+                  "column": 22
+                }
+              },
+              "code": "cp.verified = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 181,
+          "column": 1
+        },
+        "end": {
+          "line": 189
+        }
+      },
+      "name": "VerificationDiverges",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 182,
+            "column": 5
+          },
+          "end": {
+            "line": 189
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 182,
+                "column": 5
+              },
+              "end": {
+                "line": 183,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 182,
+                  "column": 5
+                },
+                "end": {
+                  "line": 182,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 183,
+                "column": 5
+              },
+              "end": {
+                "line": 184,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 183,
+                  "column": 5
+                },
+                "end": {
+                  "line": 183,
+                  "column": 45
+                }
+              },
+              "condition": "cp.migration_state == \"verifying\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 183,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 183,
+                    "column": 45
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"verifying\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 184,
+                "column": 5
+              },
+              "end": {
+                "line": 185,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 184,
+                  "column": 5
+                },
+                "end": {
+                  "line": 184,
+                  "column": 44
+                }
+              },
+              "condition": "not divergence_rollback_observed",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 184,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 184,
+                    "column": 44
+                  }
+                },
+                "pyExpr": "not divergence_rollback_observed"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 185,
+                "column": 5
+              },
+              "end": {
+                "line": 186,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 185,
+                  "column": 5
+                },
+                "end": {
+                  "line": 185,
+                  "column": 23
+                }
+              },
+              "code": "cp.verified = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 186,
+                "column": 5
+              },
+              "end": {
+                "line": 187,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 186,
+                  "column": 5
+                },
+                "end": {
+                  "line": 186,
+                  "column": 39
+                }
+              },
+              "code": "cp.migration_state = \"dual_writing\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 187,
+                "column": 5
+              },
+              "end": {
+                "line": 189
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 187,
+                  "column": 5
+                },
+                "end": {
+                  "line": 187,
+                  "column": 39
+                }
+              },
+              "code": "divergence_rollback_observed = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 189,
+          "column": 1
+        },
+        "end": {
+          "line": 195
+        }
+      },
+      "name": "AdvanceConsumerFrontier",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 189,
+            "column": 8
+          },
+          "end": {
+            "line": 189,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 190,
+            "column": 5
+          },
+          "end": {
+            "line": 195
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 190,
+                "column": 5
+              },
+              "end": {
+                "line": 191,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 190,
+                  "column": 5
+                },
+                "end": {
+                  "line": 190,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 191,
+                "column": 5
+              },
+              "end": {
+                "line": 192,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 191,
+                  "column": 5
+                },
+                "end": {
+                  "line": 191,
+                  "column": 41
+                }
+              },
+              "condition": "consumer.frontier < MAX_EPOCH",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 191,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 191,
+                    "column": 41
+                  }
+                },
+                "pyExpr": "consumer.frontier < MAX_EPOCH"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 192,
+                "column": 5
+              },
+              "end": {
+                "line": 193,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 192,
+                  "column": 5
+                },
+                "end": {
+                  "line": 192,
+                  "column": 63
+                }
+              },
+              "condition": "consumer.frontier < cp.cutover_epoch or cp.verified",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 192,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 192,
+                    "column": 63
+                  }
+                },
+                "pyExpr": "consumer.frontier < cp.cutover_epoch or cp.verified"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 193,
+                "column": 5
+              },
+              "end": {
+                "line": 195
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 193,
+                  "column": 5
+                },
+                "end": {
+                  "line": 193,
+                  "column": 45
+                }
+              },
+              "code": "consumer.frontier = consumer.frontier + 1"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 195,
+          "column": 1
+        },
+        "end": {
+          "line": 203
+        }
+      },
+      "name": "EnterGcEligible",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 195,
+            "column": 8
+          },
+          "end": {
+            "line": 195,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 196,
+            "column": 5
+          },
+          "end": {
+            "line": 203
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 196,
+                "column": 5
+              },
+              "end": {
+                "line": 197,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 196,
+                  "column": 5
+                },
+                "end": {
+                  "line": 196,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 197,
+                "column": 5
+              },
+              "end": {
+                "line": 198,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 197,
+                  "column": 5
+                },
+                "end": {
+                  "line": 197,
+                  "column": 45
+                }
+              },
+              "condition": "cp.migration_state == \"verifying\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 197,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 197,
+                    "column": 45
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"verifying\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 198,
+                "column": 5
+              },
+              "end": {
+                "line": 199,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 198,
+                  "column": 5
+                },
+                "end": {
+                  "line": 198,
+                  "column": 23
+                }
+              },
+              "condition": "cp.verified",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 198,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 198,
+                    "column": 23
+                  }
+                },
+                "pyExpr": "cp.verified"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 199,
+                "column": 5
+              },
+              "end": {
+                "line": 200,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 199,
+                  "column": 5
+                },
+                "end": {
+                  "line": 199,
+                  "column": 49
+                }
+              },
+              "condition": "consumer.frontier >= cp.cutover_epoch",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 199,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 199,
+                    "column": 49
+                  }
+                },
+                "pyExpr": "consumer.frontier >= cp.cutover_epoch"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 200,
+                "column": 5
+              },
+              "end": {
+                "line": 201,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 200,
+                  "column": 5
+                },
+                "end": {
+                  "line": 200,
+                  "column": 38
+                }
+              },
+              "code": "cp.migration_state = \"gc_eligible\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 201,
+                "column": 5
+              },
+              "end": {
+                "line": 203
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 201,
+                  "column": 5
+                },
+                "end": {
+                  "line": 201,
+                  "column": 30
+                }
+              },
+              "code": "gc_eligible_reached = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 203,
+          "column": 1
+        },
+        "end": {
+          "line": 210
+        }
+      },
+      "name": "FinishMigration",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 203,
+            "column": 8
+          },
+          "end": {
+            "line": 203,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 204,
+            "column": 5
+          },
+          "end": {
+            "line": 210
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 204,
+                "column": 5
+              },
+              "end": {
+                "line": 205,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 204,
+                  "column": 5
+                },
+                "end": {
+                  "line": 204,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 205,
+                "column": 5
+              },
+              "end": {
+                "line": 206,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 205,
+                  "column": 5
+                },
+                "end": {
+                  "line": 205,
+                  "column": 47
+                }
+              },
+              "condition": "cp.migration_state == \"gc_eligible\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 205,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 205,
+                    "column": 47
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"gc_eligible\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 206,
+                "column": 5
+              },
+              "end": {
+                "line": 207,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 206,
+                  "column": 5
+                },
+                "end": {
+                  "line": 206,
+                  "column": 35
+                }
+              },
+              "code": "shards[0].has_bucket[0] = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 207,
+                "column": 5
+              },
+              "end": {
+                "line": 208,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 207,
+                  "column": 5
+                },
+                "end": {
+                  "line": 207,
+                  "column": 31
+                }
+              },
+              "code": "cp.migration_state = \"done\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 208,
+                "column": 5
+              },
+              "end": {
+                "line": 210
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 208,
+                  "column": 5
+                },
+                "end": {
+                  "line": 208,
+                  "column": 23
+                }
+              },
+              "code": "done_reached = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 210,
+          "column": 1
+        },
+        "end": {
+          "line": 215
+        }
+      },
+      "name": "AbortFromSnapshotting",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 211,
+            "column": 5
+          },
+          "end": {
+            "line": 215
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 211,
+                "column": 5
+              },
+              "end": {
+                "line": 212,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 211,
+                  "column": 5
+                },
+                "end": {
+                  "line": 211,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 212,
+                "column": 5
+              },
+              "end": {
+                "line": 213,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 212,
+                  "column": 5
+                },
+                "end": {
+                  "line": 212,
+                  "column": 48
+                }
+              },
+              "condition": "cp.migration_state == \"snapshotting\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 212,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 212,
+                    "column": 48
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"snapshotting\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 213,
+                "column": 5
+              },
+              "end": {
+                "line": 215
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 213,
+                  "column": 5
+                },
+                "end": {
+                  "line": 213,
+                  "column": 34
+                }
+              },
+              "code": "cp.migration_state = \"aborted\""
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 215,
+          "column": 1
+        },
+        "end": {
+          "line": 221
+        }
+      },
+      "name": "AbortFromDualWriting",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 216,
+            "column": 5
+          },
+          "end": {
+            "line": 221
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 216,
+                "column": 5
+              },
+              "end": {
+                "line": 217,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 216,
+                  "column": 5
+                },
+                "end": {
+                  "line": 216,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 217,
+                "column": 5
+              },
+              "end": {
+                "line": 218,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 217,
+                  "column": 5
+                },
+                "end": {
+                  "line": 217,
+                  "column": 48
+                }
+              },
+              "condition": "cp.migration_state == \"dual_writing\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 217,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 217,
+                    "column": 48
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"dual_writing\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 218,
+                "column": 5
+              },
+              "end": {
+                "line": 219,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 218,
+                  "column": 5
+                },
+                "end": {
+                  "line": 218,
+                  "column": 34
+                }
+              },
+              "code": "cp.migration_state = \"aborted\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 219,
+                "column": 5
+              },
+              "end": {
+                "line": 221
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 219,
+                  "column": 5
+                },
+                "end": {
+                  "line": 219,
+                  "column": 36
+                }
+              },
+              "code": "aborted_from_dual_writing = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 221,
+          "column": 1
+        },
+        "end": {
+          "line": 232
+        }
+      },
+      "name": "AbortFromCutover",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_UNFAIR"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 222,
+            "column": 5
+          },
+          "end": {
+            "line": 232
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 222,
+                "column": 5
+              },
+              "end": {
+                "line": 223,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 222,
+                  "column": 5
+                },
+                "end": {
+                  "line": 222,
+                  "column": 21
+                }
+              },
+              "code": "cp = controlplane"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 223,
+                "column": 5
+              },
+              "end": {
+                "line": 224,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 223,
+                  "column": 5
+                },
+                "end": {
+                  "line": 223,
+                  "column": 43
+                }
+              },
+              "condition": "cp.migration_state == \"cutover\"",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 223,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 223,
+                    "column": 43
+                  }
+                },
+                "pyExpr": "cp.migration_state == \"cutover\""
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 224,
+                "column": 5
+              },
+              "end": {
+                "line": 225,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 224,
+                  "column": 5
+                },
+                "end": {
+                  "line": 224,
+                  "column": 34
+                }
+              },
+              "code": "cp.migration_state = \"aborted\""
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 225,
+                "column": 5
+              },
+              "end": {
+                "line": 232
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 225,
+                  "column": 5
+                },
+                "end": {
+                  "line": 225,
+                  "column": 31
+                }
+              },
+              "code": "aborted_from_cutover = True"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "stmts": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 15,
+          "column": 1
+        },
+        "end": {
+          "line": 16
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 15,
+            "column": 1
+          },
+          "end": {
+            "line": 15,
+            "column": 15
+          }
+        },
+        "code": "NUM_WORKERS = 3"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 16,
+          "column": 1
+        },
+        "end": {
+          "line": 17
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 16,
+            "column": 1
+          },
+          "end": {
+            "line": 16,
+            "column": 14
+          }
+        },
+        "code": "NUM_SHARDS = 3"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 17,
+          "column": 1
+        },
+        "end": {
+          "line": 18
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 17,
+            "column": 1
+          },
+          "end": {
+            "line": 17,
+            "column": 13
+          }
+        },
+        "code": "MAX_EPOCH = 3"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 18,
+          "column": 1
+        },
+        "end": {
+          "line": 19
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 18,
+            "column": 1
+          },
+          "end": {
+            "line": 18,
+            "column": 18
+          }
+        },
+        "code": "MAX_CHECKPOINT = 2"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 19,
+          "column": 1
+        },
+        "end": {
+          "line": 23
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 19,
+            "column": 1
+          },
+          "end": {
+            "line": 19,
+            "column": 15
+          }
+        },
+        "code": "NUM_BUCKETS = 3"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 23,
+          "column": 1
+        },
+        "end": {
+          "line": 34
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 23,
+            "column": 1
+          },
+          "end": {
+            "line": 34
+          }
+        },
+        "code": "def donor_authoritative(state_name):\n    return state_name in [\n        \"planned\",\n        \"snapshotting\",\n        \"copying\",\n        \"dual_writing\",\n        \"catching_up\",\n        \"fencing_old\",\n        \"aborted\",\n    ]\n\n"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 34,
+          "column": 1
+        },
+        "end": {
+          "line": 39
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 34,
+            "column": 1
+          },
+          "end": {
+            "line": 39
+          }
+        },
+        "code": "def recipient_authoritative(state_name):\n    return state_name in [\"cutover\", \"verifying\", \"gc_eligible\", \"done\"]\n\n# \u2500\u2500\u2500 State \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+      }
+    }
+  ],
+  "roles": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 62,
+          "column": 1
+        },
+        "end": {
+          "line": 77
+        }
+      },
+      "name": "ControlPlane",
+      "actions": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 63,
+              "column": 5
+            },
+            "end": {
+              "line": 77
+            }
+          },
+          "name": "Init",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "level": "FAIRNESS_LEVEL_STRONG"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 64,
+                "column": 9
+              },
+              "end": {
+                "line": 77
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 64,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 65,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 64,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 64,
+                      "column": 40
+                    }
+                  },
+                  "code": "self.migration_state = \"planned\""
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 65,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 66,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 65,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 65,
+                      "column": 35
+                    }
+                  },
+                  "code": "self.bucket_map_version = 1"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 66,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 67,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 66,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 66,
+                      "column": 42
+                    }
+                  },
+                  "code": "self.target_bucket_map_version = 2"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 67,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 68,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 67,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 67,
+                      "column": 32
+                    }
+                  },
+                  "code": "self.source_frontier = 1"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 68,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 69,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 68,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 68,
+                      "column": 30
+                    }
+                  },
+                  "code": "self.cutover_epoch = 1"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 69,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 70,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 69,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 69,
+                      "column": 33
+                    }
+                  },
+                  "code": "self.checkpoint_index = 0"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 70,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 71,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 70,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 70,
+                      "column": 32
+                    }
+                  },
+                  "code": "self.reader_seen = False"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 71,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 72,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 71,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 71,
+                      "column": 34
+                    }
+                  },
+                  "code": "self.exchange_seen = False"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 72,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 73,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 72,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 72,
+                      "column": 33
+                    }
+                  },
+                  "code": "self.gateway_seen = False"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 73,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 75,
+                    "column": 8
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 73,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 73,
+                      "column": 29
+                    }
+                  },
+                  "code": "self.verified = False"
+                }
+              },
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 75,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 77
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 75,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 75,
+                      "column": 52
+                    }
+                  },
+                  "code": "self.migrating_bucket = [True, False, False]"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 77,
+          "column": 1
+        },
+        "end": {
+          "line": 81
+        }
+      },
+      "name": "Shard",
+      "actions": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 78,
+              "column": 5
+            },
+            "end": {
+              "line": 81
+            }
+          },
+          "name": "Init",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "level": "FAIRNESS_LEVEL_STRONG"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 79,
+                "column": 9
+              },
+              "end": {
+                "line": 81
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 79,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 81
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 79,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 79,
+                      "column": 47
+                    }
+                  },
+                  "code": "self.has_bucket = [False, False, False]"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 81,
+          "column": 1
+        },
+        "end": {
+          "line": 87
+        }
+      },
+      "name": "Consumer",
+      "actions": [
+        {
+          "sourceInfo": {
+            "start": {
+              "line": 82,
+              "column": 5
+            },
+            "end": {
+              "line": 87
+            }
+          },
+          "name": "Init",
+          "flow": "FLOW_ATOMIC",
+          "fairness": {
+            "level": "FAIRNESS_LEVEL_STRONG"
+          },
+          "block": {
+            "sourceInfo": {
+              "start": {
+                "line": 83,
+                "column": 9
+              },
+              "end": {
+                "line": 87
+              }
+            },
+            "flow": "FLOW_ATOMIC",
+            "stmts": [
+              {
+                "sourceInfo": {
+                  "start": {
+                    "line": 83,
+                    "column": 9
+                  },
+                  "end": {
+                    "line": 87
+                  }
+                },
+                "pyStmt": {
+                  "sourceInfo": {
+                    "start": {
+                      "line": 83,
+                      "column": 9
+                    },
+                    "end": {
+                      "line": 83,
+                      "column": 25
+                    }
+                  },
+                  "code": "self.frontier = 0"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "frontMatter": {}
+}

@@ -27,6 +27,7 @@ verify:
 	fizz formal/m3_sink_2pc.fizz
 	fizz formal/m4_self_fencing.fizz
 	fizz formal/m5_cold_tier_sink.fizz
+	fizz formal/m6_shard_migration.fizz
 	fizz formal/m7_control_plane_ha.fizz
 
 # Run formal verification specs at relaxed pre-release bounds (DC.4).
@@ -38,6 +39,7 @@ verify-relaxed:
 	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/m3_sink_2pc.fizz
 	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/m4_self_fencing.fizz
 	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/m5_cold_tier_sink.fizz
+	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/m6_shard_migration.fizz
 	NUM_WORKERS=3 NUM_SHARDS=3 MAX_EPOCH=4 fizz formal/m7_control_plane_ha.fizz
 
 # Path-coupling check: any change to a coordination crate or DESIGN.md requires

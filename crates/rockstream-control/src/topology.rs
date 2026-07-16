@@ -4,12 +4,17 @@
 //! known to the cluster. It is maintained by the `ControlService` and read by
 //! the placement algorithm and the gateway for routing.
 
+use futures::StreamExt;
+use object_store::path::Path;
+use object_store::ObjectStore;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use rockstream_types::ids::WorkerId;
-use rockstream_types::topology::{CapacityHeadroom, WorkerInfo, WorkerRegistration};
+use rockstream_types::topology::{
+    CapacityHeadroom, WorkerInfo, WorkerLifecycleState, WorkerRegistration,
+};
 
 /// Thread-safe, in-memory registry of all workers in the cluster.
 #[derive(Debug, Clone)]
@@ -65,6 +70,61 @@ impl TopologyCatalog {
         }
     }
 
+    /// Update one worker's lifecycle state.
+    pub fn set_lifecycle(
+        &self,
+        worker_id: WorkerId,
+        lifecycle: WorkerLifecycleState,
+    ) -> Option<WorkerInfo> {
+        let mut guard = self.inner.write();
+        let info = guard.workers.get_mut(&worker_id)?;
+        info.lifecycle = lifecycle;
+        let updated = info.clone();
+        guard.version += 1;
+        Some(updated)
+    }
+
+    /// Remove decommissioned workers whose grace period has elapsed.
+    pub fn remove_decommissioned_older_than(
+        &self,
+        now_ms: u64,
+        grace_period_ms: u64,
+    ) -> Vec<WorkerInfo> {
+        let mut guard = self.inner.write();
+        let ids: Vec<WorkerId> = guard
+            .workers
+            .iter()
+            .filter_map(|(id, worker)| match worker.lifecycle {
+                WorkerLifecycleState::Decommissioned { completed_at_ms }
+                    if now_ms.saturating_sub(completed_at_ms) >= grace_period_ms =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut removed = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(worker) = guard.workers.remove(&id) {
+                removed.push(worker);
+            }
+        }
+        if !removed.is_empty() {
+            guard.version += 1;
+        }
+        removed
+    }
+
+    /// Replace the catalog contents from a durable snapshot.
+    pub fn restore_workers(&self, workers: Vec<WorkerInfo>) {
+        let mut guard = self.inner.write();
+        guard.workers = workers
+            .into_iter()
+            .map(|worker| (worker.worker_id, worker))
+            .collect();
+        guard.version += 1;
+    }
+
     /// Mark a worker as deregistered (removed from the catalog).
     ///
     /// Returns `Some(WorkerInfo)` of the removed entry, or `None` if the
@@ -84,7 +144,7 @@ impl TopologyCatalog {
         guard
             .workers
             .values()
-            .filter(|w| w.healthy)
+            .filter(|w| w.healthy && w.lifecycle.is_active())
             .cloned()
             .collect()
     }
@@ -114,6 +174,75 @@ impl TopologyCatalog {
     /// Returns `true` if no workers are registered.
     pub fn is_empty(&self) -> bool {
         self.inner.read().workers.is_empty()
+    }
+}
+
+/// Durable worker-topology persistence for v0.46 drain lifecycle state.
+pub struct TopologyPersistentStore {
+    store: Arc<dyn ObjectStore>,
+    prefix: Path,
+}
+
+impl TopologyPersistentStore {
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            prefix: Path::from("topology/workers"),
+        }
+    }
+
+    fn worker_path(&self, worker_id: WorkerId) -> Path {
+        self.prefix.child(format!("{}.json", worker_id.0))
+    }
+
+    pub async fn save_worker(&self, worker: &WorkerInfo) -> Result<(), String> {
+        let bytes = serde_json::to_vec(worker).map_err(|e| format!("serialize worker: {e}"))?;
+        self.store
+            .put(&self.worker_path(worker.worker_id), bytes.into())
+            .await
+            .map_err(|e| format!("persist worker: {e}"))?;
+        Ok(())
+    }
+
+    pub async fn delete_worker(&self, worker_id: WorkerId) -> Result<(), String> {
+        self.store
+            .delete(&self.worker_path(worker_id))
+            .await
+            .map_err(|e| format!("delete worker: {e}"))?;
+        Ok(())
+    }
+
+    pub async fn load_worker(&self, worker_id: WorkerId) -> Option<WorkerInfo> {
+        let bytes = self
+            .store
+            .get(&self.worker_path(worker_id))
+            .await
+            .ok()?
+            .bytes()
+            .await
+            .ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    pub async fn load_all(&self) -> Result<Vec<WorkerInfo>, String> {
+        let mut listing = self.store.list(Some(&self.prefix));
+        let mut workers = Vec::new();
+        while let Some(entry) = listing.next().await {
+            let meta = entry.map_err(|e| format!("list workers: {e}"))?;
+            let bytes = self
+                .store
+                .get(&meta.location)
+                .await
+                .map_err(|e| format!("read worker {}: {e}", meta.location))?
+                .bytes()
+                .await
+                .map_err(|e| format!("buffer worker {}: {e}", meta.location))?;
+            let worker = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("decode worker {}: {e}", meta.location))?;
+            workers.push(worker);
+        }
+        workers.sort_by_key(|worker: &WorkerInfo| worker.worker_id.0);
+        Ok(workers)
     }
 }
 

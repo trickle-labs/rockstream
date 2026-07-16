@@ -14,6 +14,8 @@ pub mod client;
 pub use client::{start_worker_client, ShardState, WorkerClientHandle};
 
 pub mod exchange;
+pub mod migration;
+pub use migration::{DualWriteRouter, RoutedWrite, RoutingError};
 
 pub mod fence;
 pub use fence::{

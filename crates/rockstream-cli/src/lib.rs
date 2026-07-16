@@ -13,6 +13,7 @@
 
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::error_code::{ErrorCode, RS_0002, RS_0003};
+use rockstream_types::topology::{ControlMessage, WorkerMessage};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -450,6 +451,14 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             service = service.with_shard_store(Arc::new(
                 rockstream_control::ShardPersistentStore::new(shared_object_store.clone()),
             ));
+            service = service
+                .with_topology_store(Arc::new(rockstream_control::TopologyPersistentStore::new(
+                    shared_object_store.clone(),
+                )))
+                .with_migration_store(Arc::new(rockstream_control::MigrationPersistentStore::new(
+                    shared_object_store.clone(),
+                )))
+                .with_auto_drain(true);
 
             // v0.45.2 M7: join a real multi-node Raft group when
             // `--raft-peers` is provided; otherwise run exactly as before
@@ -704,6 +713,88 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         audit_path,
         bundle_path,
         events_written: events.len(),
+    })
+}
+
+/// Thin v0.46 admin-CLI stub: request a worker drain over the control wire API.
+pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), CliError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
+    rt.block_on(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpStream;
+
+        let mut stream = TcpStream::connect(control).await.map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("failed to connect to control service at {control}: {e}"),
+                "Check that the control node is running and --control points at its worker-facing address.",
+            )
+        })?;
+        let request = serde_json::to_string(&WorkerMessage::RequestDrain {
+            worker_id: rockstream_types::ids::WorkerId(worker_id),
+        })
+        .map_err(|e| CliError::new(RS_0003, format!("failed to encode drain request: {e}"), ""))?
+            + "\n";
+        stream.write_all(request.as_bytes()).await.map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("failed to send drain request: {e}"),
+                "Retry the request after verifying network connectivity to the control node.",
+            )
+        })?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).await.map_err(|e| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed reading control response: {e}"),
+                    "Retry the request after checking the control-plane logs.",
+                )
+            })?;
+            if read == 0 {
+                return Err(CliError::new(
+                    RS_0003,
+                    "control service closed the drain request without a reply",
+                    "Retry against the current control leader and inspect the control-plane audit log.",
+                ));
+            }
+            match serde_json::from_str::<ControlMessage>(line.trim()).map_err(|e| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed to decode control response: {e}"),
+                    "Upgrade the CLI and control plane together so they agree on the wire format.",
+                )
+            })? {
+                ControlMessage::BeginDrain(_) => continue,
+                ControlMessage::DrainStatus { state, .. } => {
+                    println!("{state:?}");
+                    return Ok(());
+                }
+                ControlMessage::OperationFailed {
+                    code,
+                    message,
+                    next_steps,
+                } => {
+                    return Err(CliError::new(
+                        ErrorCode::new(code.trim_start_matches("RS-").parse().unwrap_or(3)),
+                        message,
+                        next_steps,
+                    ));
+                }
+                other => {
+                    return Err(CliError::new(
+                        RS_0003,
+                        format!("unexpected control response to drain request: {other:?}"),
+                        "Retry against the current control leader; if the problem persists, inspect the control-plane logs.",
+                    ));
+                }
+            }
+        }
     })
 }
 
