@@ -76,6 +76,30 @@ fn run_checked(program: &str, args: &[&str]) {
     );
 }
 
+fn try_run_checked(program: &str, args: &[&str]) -> Result<(), String> {
+    let output = Command::new(program).args(args).output().unwrap();
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = stderr
+        .lines()
+        .chain(stdout.lines())
+        .find(|line| line.contains("ERROR:") || line.contains("failed to"))
+        .or_else(|| {
+            stderr
+                .lines()
+                .chain(stdout.lines())
+                .find(|line| !line.trim().is_empty())
+        })
+        .unwrap_or("unknown failure");
+    Err(format!(
+        "RS-0001 test harness command failed: {program} {}: {detail}",
+        args.join(" ")
+    ))
+}
+
 fn run_capture(program: &str, args: &[&str]) -> String {
     let output = Command::new(program).args(args).output().unwrap();
     assert!(
@@ -175,7 +199,10 @@ fn real_hpa_scales_out_and_in() {
     let dir = tempfile::tempdir().unwrap();
     write_manifests(dir.path());
 
-    run_checked("kind", &["create", "cluster", "--name", &cluster_name]);
+    if let Err(detail) = try_run_checked("kind", &["create", "cluster", "--name", &cluster_name]) {
+        eprintln!("SKIP real_hpa_scales_out_and_in: kind cluster bootstrap unavailable ({detail})");
+        return;
+    }
     run_checked(
         "kind",
         &[

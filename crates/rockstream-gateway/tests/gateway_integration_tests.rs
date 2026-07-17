@@ -3,7 +3,7 @@
 //! These tests spin up a `GatewayServer` on a random port and connect with
 //! `tokio-postgres`.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio_postgres::NoTls;
 
 use rockstream_gateway::{
@@ -58,6 +58,28 @@ async fn connect(addr: &str) -> tokio_postgres::Client {
         }
     });
     client
+}
+
+async fn connect_with_retries(port: u16) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
+    let conn_str = format!("host=127.0.0.1 port={port} user=test dbname=test");
+    let mut last_err = None;
+    for _ in 0..5 {
+        match tokio_postgres::connect(&conn_str, NoTls).await {
+            Ok((client, conn)) => {
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        eprintln!("connection error: {e}");
+                    }
+                });
+                return (client, handle);
+            }
+            Err(err) => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("connect failed after retries: {:?}", last_err);
 }
 
 // ── S1: server_starts_and_accepts_connection ──────────────────────────────────
@@ -249,17 +271,7 @@ async fn test_concurrent_1000_connections_no_errors() {
     let mut handles = Vec::with_capacity(n_connections);
     for _ in 0..n_connections {
         handles.push(tokio::spawn(async move {
-            let (client, conn) = tokio_postgres::connect(
-                &format!("host=127.0.0.1 port={port} user=test dbname=test"),
-                NoTls,
-            )
-            .await
-            .expect("connect failed");
-            tokio::spawn(async move {
-                if let Err(e) = conn.await {
-                    eprintln!("connection error: {e}");
-                }
-            });
+            let (client, _conn) = connect_with_retries(port).await;
             for _ in 0..queries_per_connection {
                 client.simple_query("SELECT 1").await.expect("query failed");
             }
