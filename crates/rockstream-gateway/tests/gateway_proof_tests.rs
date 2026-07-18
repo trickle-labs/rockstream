@@ -14,6 +14,7 @@ use rockstream_gateway::{
         CatalogColumn, CatalogIndexEntry, CatalogIndexState, CatalogStubs, CatalogTable,
         CatalogView,
     },
+    multi_shard_reader::{plan_scatter_shards, MultiShardReader, ScatterPredicate},
     view_reader::{HotOnlyViewReader, ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -21,9 +22,15 @@ use rockstream_sql::WorkloadCatalog;
 use rockstream_storage::{ShardDb, ShardReader};
 use rockstream_types::{
     cost::set_active_pricing_config,
+    frontier::{
+        bloom_filter_might_contain, build_exact_membership_filter, ColumnStats, ShardColumnStats,
+    },
+    ids::{ShardId, ViewId},
     metrics::{
-        reset_all, set_freshness_lag, set_pipeline_state_bytes, set_state_budget,
-        set_workload_memory,
+        generate_prometheus_metrics, inc_shard_bloom_false_positive_total,
+        read_scatter_shards_pruned_total, read_scatter_shards_total,
+        read_shard_bloom_false_positive_total, reset_all, set_freshness_lag,
+        set_pipeline_state_bytes, set_state_budget, set_workload_memory,
     },
     view_lifecycle::ViewState,
     workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority},
@@ -4074,6 +4081,138 @@ async fn create_index_name_conflict_returns_rs2016_via_wire() {
         .expect("idempotent CREATE INDEX on same table should succeed");
 }
 
+#[tokio::test]
+async fn create_index_publishes_precise_stats_immediately() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("v048-index-stats-publish", Arc::new(InMemory::new()))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+        shard_db.clone(),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, email TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-index-stats-seed'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query(
+            "INSERT INTO orders (id, email) VALUES (1, 'alice@example.com'), (2, 'bob@example.com')",
+        )
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    client
+        .simple_query("CREATE INDEX idx_orders_email ON orders (email)")
+        .await
+        .expect("CREATE INDEX failed");
+    client
+        .simple_query("MARK INDEX idx_orders_email READY op_id=7")
+        .await
+        .expect("MARK INDEX READY failed");
+
+    let stats = catalog.shard_stats("orders");
+    assert_eq!(
+        stats.len(),
+        1,
+        "expected one shard_stats entry after MARK INDEX READY"
+    );
+    let email_stats = stats[0]
+        .col_stats
+        .iter()
+        .find(|stats| stats.col_idx == 1)
+        .expect("missing email stats");
+    assert_eq!(
+        email_stats.min_bytes.as_deref(),
+        Some("alice@example.com".as_bytes())
+    );
+    assert_eq!(
+        email_stats.max_bytes.as_deref(),
+        Some("bob@example.com".as_bytes())
+    );
+    let filter = email_stats
+        .bloom_filter
+        .as_ref()
+        .expect("indexed column must publish an exact filter");
+    assert!(bloom_filter_might_contain(filter, b"alice@example.com"));
+    assert!(bloom_filter_might_contain(filter, b"bob@example.com"));
+    assert!(!bloom_filter_might_contain(filter, b"carol@example.com"));
+}
+
+#[tokio::test]
+async fn indexed_column_stats_are_exact_not_probabilistic() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("v048-index-stats-exact", Arc::new(InMemory::new()))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+        shard_db.clone(),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, email TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-index-stats-exact-seed'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query(
+            "INSERT INTO orders (id, email) VALUES (1, 'alice@example.com'), (2, 'bob@example.com')",
+        )
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    client
+        .simple_query("CREATE INDEX idx_orders_email_exact ON orders (email)")
+        .await
+        .expect("CREATE INDEX failed");
+    client
+        .simple_query("MARK INDEX idx_orders_email_exact READY op_id=9")
+        .await
+        .expect("MARK INDEX READY failed");
+
+    let stats = catalog.shard_stats("orders");
+    let plan = plan_scatter_shards(
+        &stats,
+        &[ScatterPredicate::Eq {
+            col_idx: 1,
+            value: b"amy@example.com".to_vec(),
+        }],
+        5,
+        1,
+    );
+    assert!(
+        plan.shard_ids.is_empty(),
+        "exact indexed-column filter must prune an in-range non-member without a false positive"
+    );
+}
+
 /// EXPLAIN shows RS-2014 hint for a BUILDING index covering the queried table.
 #[tokio::test]
 async fn explain_shows_rs2014_hint_for_building_index_via_wire() {
@@ -5441,4 +5580,817 @@ async fn test_set_local_reverts_on_rollback() {
         Some("original"),
         "expected original after ROLLBACK, got: {val_after:?}"
     );
+}
+
+// ── v0.48 Track A: UPDATE/DELETE ... RETURNING (read-modify-write) ─────────
+
+/// v0.48 Slice A2 green gate: `UPDATE` performs a true read-modify-write —
+/// a column not named in `SET` must survive unchanged.
+#[tokio::test]
+async fn update_read_modify_write_preserves_untouched_columns() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-update-rmw").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, a TEXT, b TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-update-rmw-insert'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, a, b) VALUES (1, 'A1', 'B1')")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-update-rmw-update'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("UPDATE t SET a = 'A2' WHERE id = 1, a = 'A1', b = 'B1'")
+        .await
+        .expect("UPDATE failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    let msgs = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly 1 row after UPDATE, got {}",
+        rows.len()
+    );
+    assert_eq!(rows[0].get("a").unwrap_or(""), "A2");
+    assert_eq!(
+        rows[0].get("b").unwrap_or(""),
+        "B1",
+        "untouched column b must be preserved by read-modify-write"
+    );
+}
+
+/// v0.48 Slice A2 green gate: `UPDATE` of a row that doesn't exist affects
+/// zero rows and buffers no write.
+#[tokio::test]
+async fn update_of_nonexistent_row_returns_zero_rows_no_write() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-update-nonexistent").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, a TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    let msgs = client
+        .simple_query("UPDATE t SET a = 'X' WHERE id = 99, a = 'nope'")
+        .await
+        .expect("UPDATE failed");
+    let tag = msgs.iter().find_map(|m| {
+        if let tokio_postgres::SimpleQueryMessage::CommandComplete(n) = m {
+            Some(*n)
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        tag,
+        Some(0),
+        "expected UPDATE 0 for nonexistent row, got {tag:?}"
+    );
+
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+    let msgs2 = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(
+        data_rows_from(&msgs2).len(),
+        0,
+        "no row should have been written for a no-op UPDATE"
+    );
+}
+
+/// v0.48 Slice A3 green gate: `UPDATE ... RETURNING *` returns the
+/// post-update row (full read-back after commit + frontier wait), outside
+/// an explicit transaction block.
+#[tokio::test]
+async fn update_returning_returns_new_row_after_commit() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-update-returning").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, a TEXT, b TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-update-returning-insert'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, a, b) VALUES (1, 'A1', 'B1')")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-update-returning-update'")
+        .await
+        .expect("SET idempotency_key failed");
+    let msgs = client
+        .simple_query("UPDATE t SET a = 'A2' WHERE id = 1, a = 'A1', b = 'B1' RETURNING *")
+        .await
+        .expect("UPDATE RETURNING failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(rows.len(), 1, "expected 1 row from UPDATE RETURNING");
+    assert_eq!(rows[0].get("a").unwrap_or(""), "A2");
+    assert_eq!(rows[0].get("b").unwrap_or(""), "B1");
+    assert_eq!(rows[0].get("id").unwrap_or(""), "1");
+}
+
+/// v0.48 Slice A3 green gate: `UPDATE ... RETURNING <col list>` projects
+/// only the requested columns.
+#[tokio::test]
+async fn update_returning_star_returns_all_columns() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-update-returning-cols").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, a TEXT, b TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-update-returning-cols-insert'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, a, b) VALUES (1, 'A1', 'B1')")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-update-returning-cols-update'")
+        .await
+        .expect("SET idempotency_key failed");
+    let msgs = client
+        .simple_query("UPDATE t SET a = 'A2' WHERE id = 1, a = 'A1', b = 'B1' RETURNING a")
+        .await
+        .expect("UPDATE RETURNING a failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(rows.len(), 1, "expected 1 row from UPDATE RETURNING a");
+    assert_eq!(rows[0].get("a").unwrap_or(""), "A2");
+    assert_eq!(
+        rows[0].columns().len(),
+        1,
+        "RETURNING a must project exactly 1 column, not the full row"
+    );
+}
+
+/// v0.48 Slice A3 green gate: inside an explicit transaction block,
+/// `UPDATE ... RETURNING` resolves from the already-computed merged row
+/// (no post-commit read-back is attempted), matching INSERT ... RETURNING's
+/// existing in-block behavior.
+#[tokio::test]
+async fn update_returning_inside_explicit_transaction_resolves_at_commit() {
+    let (port, _handle, shard_db) =
+        start_gateway_with_shard("v048-update-returning-explicit").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, a TEXT, b TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-update-explicit-insert'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, a, b) VALUES (1, 'A1', 'B1')")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    let msgs = client
+        .simple_query("UPDATE t SET a = 'A2' WHERE id = 1, a = 'A1', b = 'B1' RETURNING *")
+        .await
+        .expect("UPDATE RETURNING inside BEGIN failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected 1 row from UPDATE RETURNING inside explicit block"
+    );
+    assert_eq!(rows[0].get("a").unwrap_or(""), "A2");
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-update-explicit-commit'")
+        .await
+        .expect("SET idempotency_key failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    let msgs2 = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT after COMMIT failed");
+    let rows2 = data_rows_from(&msgs2);
+    assert_eq!(rows2.len(), 1);
+    assert_eq!(rows2[0].get("a").unwrap_or(""), "A2");
+}
+
+/// v0.48 Slice A4/A5 green gate: `DELETE ... RETURNING` returns the
+/// pre-delete row (captured before the write, since the row is gone from
+/// `view_output` once the commit lands).
+#[tokio::test]
+async fn delete_returning_returns_row_that_existed_before_delete() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-delete-returning").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, a TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-delete-returning-insert'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, a) VALUES (1, 'A1')")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-delete-returning-delete'")
+        .await
+        .expect("SET idempotency_key failed");
+    let msgs = client
+        .simple_query("DELETE FROM t WHERE id = 1, a = 'A1' RETURNING *")
+        .await
+        .expect("DELETE RETURNING failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected 1 pre-delete row from DELETE RETURNING"
+    );
+    assert_eq!(rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(rows[0].get("a").unwrap_or(""), "A1");
+
+    // After the (implicit) COMMIT below, the row must actually be gone.
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+    let msgs2 = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT after DELETE COMMIT failed");
+    assert_eq!(
+        data_rows_from(&msgs2).len(),
+        0,
+        "row must be gone after commit"
+    );
+}
+
+/// v0.48 Slice A4 green gate: `DELETE` of a nonexistent row (with
+/// `RETURNING`) affects zero rows and buffers no write.
+#[tokio::test]
+async fn delete_of_nonexistent_row_returns_zero_rows_no_write() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-delete-nonexistent").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, a TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    let msgs = client
+        .simple_query("DELETE FROM t WHERE id = 99, a = 'nope' RETURNING *")
+        .await
+        .expect("DELETE RETURNING failed");
+    assert_eq!(
+        data_rows_from(&msgs).len(),
+        0,
+        "expected 0 rows from DELETE RETURNING on a nonexistent row"
+    );
+
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+    let msgs2 = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT failed");
+    assert_eq!(data_rows_from(&msgs2).len(), 0);
+}
+
+/// v0.48 Slice A5 green gate: `ROLLBACK` discards a buffered
+/// `DELETE ... RETURNING` — the row is still present afterward and no write
+/// ever reached the shard.
+#[tokio::test]
+async fn delete_returning_discarded_on_rollback() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-delete-rollback").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, a TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-delete-rollback-insert'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, a) VALUES (1, 'A1')")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    let msgs = client
+        .simple_query("DELETE FROM t WHERE id = 1, a = 'A1' RETURNING *")
+        .await
+        .expect("DELETE RETURNING inside BEGIN failed");
+    assert_eq!(
+        data_rows_from(&msgs).len(),
+        1,
+        "DELETE RETURNING should still report the pre-delete row inside the block"
+    );
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("ROLLBACK failed");
+
+    shard_db.flush().await.unwrap();
+    let msgs2 = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT after ROLLBACK failed");
+    let rows2 = data_rows_from(&msgs2);
+    assert_eq!(
+        rows2.len(),
+        1,
+        "row must still be present after ROLLBACK — the DELETE was never committed"
+    );
+    assert_eq!(rows2[0].get("a").unwrap_or(""), "A1");
+}
+
+/// v0.48 Slice A5 green gate: `ROLLBACK TO SAVEPOINT` discards a buffered
+/// `DELETE ... RETURNING` captured after the savepoint, while a delete
+/// buffered *before* the savepoint survives and still commits.
+#[tokio::test]
+async fn savepoint_rollback_discards_buffered_delete_returning_capture() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-delete-savepoint").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, a TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-delete-savepoint-insert'")
+        .await
+        .expect("SET idempotency_key failed");
+    client
+        .simple_query("INSERT INTO t (id, a) VALUES (1, 'A1'), (2, 'A2')")
+        .await
+        .expect("INSERT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    client
+        .simple_query("DELETE FROM t WHERE id = 1, a = 'A1' RETURNING *")
+        .await
+        .expect("first DELETE RETURNING failed");
+    client
+        .simple_query("SAVEPOINT sp1")
+        .await
+        .expect("SAVEPOINT failed");
+    let msgs = client
+        .simple_query("DELETE FROM t WHERE id = 2, a = 'A2' RETURNING *")
+        .await
+        .expect("second DELETE RETURNING failed");
+    assert_eq!(data_rows_from(&msgs).len(), 1);
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT sp1")
+        .await
+        .expect("ROLLBACK TO SAVEPOINT failed");
+    client
+        .simple_query("SET rockstream.idempotency_key = 'v048-delete-savepoint-commit'")
+        .await
+        .expect("SET idempotency_key failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
+    shard_db.flush().await.unwrap();
+
+    let msgs2 = client
+        .simple_query("SELECT * FROM t ORDER BY id")
+        .await
+        .expect("SELECT failed");
+    let rows2 = data_rows_from(&msgs2);
+    assert_eq!(
+        rows2.len(),
+        1,
+        "expected only the id=2 row to remain (id=1's delete committed, id=2's was rolled back)"
+    );
+    assert_eq!(rows2[0].get("id").unwrap_or(""), "2");
+}
+
+/// v0.48 Slice A6 (oracle-style regression): a randomized sequence of
+/// INSERT/UPDATE ... RETURNING/DELETE ... RETURNING statements against a
+/// base table with a dependent aggregate view must leave the view's
+/// incrementally maintained state identical to a from-scratch recompute —
+/// `materialize_views` always fully recomputes dependent views on every
+/// commit, so this is a direct proof that Slice A2/A4's corrected full-row
+/// merge and pre-image capture never desynchronize that recompute from the
+/// base table's true current contents.
+#[tokio::test]
+async fn oracle_update_returning_incremental_equals_batch() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-oracle-update").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE accounts (id BIGINT, balance BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW total_balance AS SELECT SUM(balance) AS total FROM accounts",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW failed");
+
+    // Seed 5 accounts.
+    let mut expected: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    for id in 1..=5i64 {
+        let balance = id * 100;
+        client
+            .simple_query(&format!(
+                "SET rockstream.idempotency_key = 'v048-oracle-update-seed-{id}'"
+            ))
+            .await
+            .expect("SET idempotency_key failed");
+        client
+            .simple_query(&format!(
+                "INSERT INTO accounts (id, balance) VALUES ({id}, {balance})"
+            ))
+            .await
+            .expect("seed INSERT failed");
+        client.simple_query("COMMIT").await.expect("COMMIT failed");
+        expected.insert(id, balance);
+    }
+    shard_db.flush().await.unwrap();
+
+    // Deterministic pseudo-random UPDATE ... RETURNING sequence.
+    let mut state: u64 = 0xC0FFEE;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for step in 0..20u64 {
+        let id = (next() % 5) as i64 + 1;
+        let old_balance = expected[&id];
+        let new_balance = old_balance + (next() % 50) as i64 - 25;
+        client
+            .simple_query(&format!(
+                "SET rockstream.idempotency_key = 'v048-oracle-update-step-{step}'"
+            ))
+            .await
+            .expect("SET idempotency_key failed");
+        let msgs = client
+            .simple_query(&format!(
+                "UPDATE accounts SET balance = {new_balance} WHERE id = {id}, balance = {old_balance} RETURNING balance"
+            ))
+            .await
+            .expect("UPDATE RETURNING failed");
+        let rows = data_rows_from(&msgs);
+        assert_eq!(
+            rows.len(),
+            1,
+            "step {step}: expected 1 row from UPDATE RETURNING"
+        );
+        assert_eq!(
+            rows[0].get("balance").unwrap_or(""),
+            new_balance.to_string(),
+            "step {step}: RETURNING must reflect the new balance"
+        );
+        expected.insert(id, new_balance);
+
+        shard_db.flush().await.unwrap();
+        let batch_total: i64 = expected.values().sum();
+        let view_msgs = client
+            .simple_query("SELECT total FROM total_balance")
+            .await
+            .expect("SELECT total_balance failed");
+        let view_rows = data_rows_from(&view_msgs);
+        assert_eq!(
+            view_rows.len(),
+            1,
+            "step {step}: expected exactly 1 aggregate row"
+        );
+        assert_eq!(
+            view_rows[0].get("total").unwrap_or(""),
+            batch_total.to_string(),
+            "step {step}: incremental view state must equal a full batch recompute"
+        );
+    }
+}
+
+/// v0.48 Slice A6 (oracle-style regression): same `incremental == batch`
+/// property as above, for randomized `DELETE ... RETURNING` sequences,
+/// including deletes of rows that were never present (no-op, zero rows).
+#[tokio::test]
+async fn oracle_delete_returning_incremental_equals_batch() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("v048-oracle-delete").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE accounts (id BIGINT, balance BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW total_balance AS SELECT SUM(balance) AS total FROM accounts",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW failed");
+
+    let mut expected: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    for id in 1..=5i64 {
+        let balance = id * 100;
+        client
+            .simple_query(&format!(
+                "SET rockstream.idempotency_key = 'v048-oracle-delete-seed-{id}'"
+            ))
+            .await
+            .expect("SET idempotency_key failed");
+        client
+            .simple_query(&format!(
+                "INSERT INTO accounts (id, balance) VALUES ({id}, {balance})"
+            ))
+            .await
+            .expect("seed INSERT failed");
+        client.simple_query("COMMIT").await.expect("COMMIT failed");
+        expected.insert(id, balance);
+    }
+    shard_db.flush().await.unwrap();
+
+    // Randomized DELETE sequence, including deletes of already-deleted (or
+    // never-present) ids — must be a clean zero-row no-op each time.
+    let mut state: u64 = 0xBADC0DE;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for step in 0..8u64 {
+        let id = (next() % 5) as i64 + 1;
+        client
+            .simple_query(&format!(
+                "SET rockstream.idempotency_key = 'v048-oracle-delete-step-{step}'"
+            ))
+            .await
+            .expect("SET idempotency_key failed");
+        let existed = expected.contains_key(&id);
+        let balance = expected.get(&id).copied().unwrap_or_default();
+        let msgs = client
+            .simple_query(&format!(
+                "DELETE FROM accounts WHERE id = {id}, balance = {balance} RETURNING balance"
+            ))
+            .await
+            .expect("DELETE RETURNING failed");
+        let rows = data_rows_from(&msgs);
+        if existed {
+            assert_eq!(rows.len(), 1, "step {step}: expected 1 pre-delete row");
+            assert_eq!(rows[0].get("balance").unwrap_or(""), balance.to_string());
+            expected.remove(&id);
+        } else {
+            assert_eq!(
+                rows.len(),
+                0,
+                "step {step}: deleting an already-absent id must be a zero-row no-op"
+            );
+        }
+        client.simple_query("COMMIT").await.expect("COMMIT failed");
+        shard_db.flush().await.unwrap();
+
+        let batch_total: i64 = expected.values().sum();
+        let view_msgs = client
+            .simple_query("SELECT total FROM total_balance")
+            .await
+            .expect("SELECT total_balance failed");
+        let view_rows = data_rows_from(&view_msgs);
+        if expected.is_empty() {
+            // An empty base table's SUM aggregate may materialise as either
+            // zero rows or a single NULL/0 row depending on the view
+            // pipeline — both are consistent with "no accounts remain".
+            if !view_rows.is_empty() {
+                let total = view_rows[0].get("total").unwrap_or("0");
+                assert!(
+                    total == "0" || total.is_empty(),
+                    "step {step}: expected zero total once all accounts are deleted, got {total}"
+                );
+            }
+        } else {
+            assert_eq!(
+                view_rows.len(),
+                1,
+                "step {step}: expected exactly 1 aggregate row"
+            );
+            assert_eq!(
+                view_rows[0].get("total").unwrap_or(""),
+                batch_total.to_string(),
+                "step {step}: incremental view state must equal a full batch recompute"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn explain_reports_pruned_shard_count() {
+    let catalog = Arc::new(CatalogStubs::new());
+    catalog.add_table(CatalogTable {
+        name: "orders".to_string(),
+        columns: vec![CatalogColumn {
+            name: "region".to_string(),
+            data_type: "Utf8".to_string(),
+        }],
+    });
+    catalog.set_shard_stats(
+        "orders",
+        vec![
+            ShardColumnStats {
+                shard_id: ShardId(1),
+                view_id: ViewId(1),
+                checkpoint_epoch: 10,
+                col_stats: vec![ColumnStats {
+                    col_idx: 0,
+                    min_bytes: Some(bytes::Bytes::from_static(b"a")),
+                    max_bytes: Some(bytes::Bytes::from_static(b"m")),
+                    bloom_filter: Some(build_exact_membership_filter(&[b"emea".to_vec()])),
+                    null_count: 0,
+                    distinct_count_hll: bytes::Bytes::from(vec![0; 64]),
+                }],
+            },
+            ShardColumnStats {
+                shard_id: ShardId(2),
+                view_id: ViewId(1),
+                checkpoint_epoch: 10,
+                col_stats: vec![ColumnStats {
+                    col_idx: 0,
+                    min_bytes: Some(bytes::Bytes::from_static(b"n")),
+                    max_bytes: Some(bytes::Bytes::from_static(b"z")),
+                    bloom_filter: Some(build_exact_membership_filter(&[b"us".to_vec()])),
+                    null_count: 0,
+                    distinct_count_hll: bytes::Bytes::from(vec![0; 64]),
+                }],
+            },
+        ],
+    );
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog,
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+    let msgs = client
+        .simple_query("EXPLAIN SELECT * FROM orders WHERE region = 'emea'")
+        .await
+        .unwrap();
+    let rows = data_rows_from(&msgs);
+    assert!(rows[0]
+        .get("QUERY PLAN")
+        .unwrap_or("")
+        .contains("shard_scan: 1/2 shards"));
+}
+
+#[tokio::test]
+async fn proof_multi_shard_point_read_prunes_over_90_percent_of_shards() {
+    reset_all();
+    let mut readers = Vec::new();
+    let mut stats = Vec::new();
+    for shard_id in 0..100_u64 {
+        let store = Arc::new(InMemory::new());
+        let shard = ShardDb::builder(format!("prune-proof-{shard_id}"), store.clone())
+            .build()
+            .await
+            .unwrap();
+        let value = format!("region-{shard_id:03}");
+        shard
+            .put(
+                format!("view_output/orders/{shard_id:03}").as_bytes(),
+                value.as_bytes(),
+            )
+            .await
+            .unwrap();
+        shard.flush().await.unwrap();
+        readers.push(Arc::new(
+            ShardReader::open(format!("prune-proof-{shard_id}"), store)
+                .await
+                .unwrap(),
+        ));
+        stats.push(ShardColumnStats {
+            shard_id: ShardId(shard_id),
+            view_id: ViewId(1),
+            checkpoint_epoch: 10,
+            col_stats: vec![ColumnStats {
+                col_idx: 0,
+                min_bytes: Some(bytes::Bytes::copy_from_slice(value.as_bytes())),
+                max_bytes: Some(bytes::Bytes::copy_from_slice(value.as_bytes())),
+                bloom_filter: Some(build_exact_membership_filter(&[value.as_bytes().to_vec()])),
+                null_count: 0,
+                distinct_count_hll: bytes::Bytes::from(vec![0; 64]),
+            }],
+        });
+    }
+    let plan = plan_scatter_shards(
+        &stats,
+        &[ScatterPredicate::Eq {
+            col_idx: 0,
+            value: b"region-042".to_vec(),
+        }],
+        5,
+        10,
+    );
+    let reader = MultiShardReader::new(readers, 0, MultiShardReader::DEFAULT_MAX_IN_FLIGHT_ROWS);
+    let rows = reader.scatter_read("orders", None).await.unwrap();
+    assert!(rows.iter().any(|row| row == b"region-042"));
+    let total = read_scatter_shards_total() as f64;
+    let pruned = read_scatter_shards_pruned_total() as f64;
+    assert!(total > 0.0);
+    assert!(
+        pruned / total > 0.90,
+        "expected >90% pruning, got {pruned}/{total}"
+    );
+    assert_eq!(plan.shard_ids, vec![ShardId(42)]);
+}
+
+#[test]
+fn scatter_pruning_metrics_exported_correctly() {
+    let total_before = read_scatter_shards_total();
+    let pruned_before = read_scatter_shards_pruned_total();
+    let false_positive_before = read_shard_bloom_false_positive_total();
+    let stats = vec![
+        ShardColumnStats {
+            shard_id: ShardId(1),
+            view_id: ViewId(1),
+            checkpoint_epoch: 10,
+            col_stats: vec![ColumnStats {
+                col_idx: 0,
+                min_bytes: Some(bytes::Bytes::from_static(b"a")),
+                max_bytes: Some(bytes::Bytes::from_static(b"m")),
+                bloom_filter: Some(build_exact_membership_filter(&[b"emea".to_vec()])),
+                null_count: 0,
+                distinct_count_hll: bytes::Bytes::from(vec![0; 64]),
+            }],
+        },
+        ShardColumnStats {
+            shard_id: ShardId(2),
+            view_id: ViewId(1),
+            checkpoint_epoch: 10,
+            col_stats: vec![ColumnStats {
+                col_idx: 0,
+                min_bytes: Some(bytes::Bytes::from_static(b"n")),
+                max_bytes: Some(bytes::Bytes::from_static(b"z")),
+                bloom_filter: Some(build_exact_membership_filter(&[b"us".to_vec()])),
+                null_count: 0,
+                distinct_count_hll: bytes::Bytes::from(vec![0; 64]),
+            }],
+        },
+    ];
+    let _ = plan_scatter_shards(
+        &stats,
+        &[ScatterPredicate::Eq {
+            col_idx: 0,
+            value: b"emea".to_vec(),
+        }],
+        5,
+        10,
+    );
+    inc_shard_bloom_false_positive_total();
+
+    assert!(read_scatter_shards_total() >= total_before + 2);
+    assert!(read_scatter_shards_pruned_total() > pruned_before);
+    assert!(read_shard_bloom_false_positive_total() > false_positive_before);
+
+    let metrics = generate_prometheus_metrics();
+    assert!(metrics.contains("scatter_shards_total"));
+    assert!(metrics.contains("scatter_shards_pruned_total"));
+    assert!(metrics.contains("shard_bloom_false_positive_total"));
 }

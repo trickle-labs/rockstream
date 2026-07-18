@@ -50,7 +50,10 @@ use tokio::net::TcpListener;
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
 use rockstream_sql::SqlFrontend;
+use rockstream_types::config::ScatterPruningConfig;
 use rockstream_types::explain::ExplainLevel;
+use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
+use rockstream_types::ids::{ShardId, ViewId};
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
 use crate::auth::{
@@ -1242,9 +1245,6 @@ impl GatewayHandler {
         if ql.starts_with("rebuild index ") {
             return Some(self.handle_rebuild_index(q));
         }
-        if ql.starts_with("mark index ") {
-            return Some(self.handle_mark_index_ready(q));
-        }
 
         // BEGIN is handled in dispatch_async_with_conn (needs session state for idempotency).
 
@@ -1284,6 +1284,10 @@ impl GatewayHandler {
                         ),
                     )))]);
                 }
+            }
+
+            if ql.starts_with("mark index ") {
+                return self.handle_mark_index_ready(q).await;
             }
         }
 
@@ -1690,8 +1694,10 @@ impl GatewayHandler {
                 note
             };
 
+            let shard_note = build_scatter_explain_note(&self.catalog, inner_sql);
+
             let plan_text = format!(
-                "Plan: SeqScan → {pushdown_note}{index_note}{sink_note}\nQuery: {inner_sql}"
+                "Plan: SeqScan → {pushdown_note}{index_note}{sink_note}{shard_note}\nQuery: {inner_sql}"
             );
             let schema = Arc::new(vec![FieldInfo::new(
                 "QUERY PLAN".to_string(),
@@ -3248,6 +3254,72 @@ impl GatewayHandler {
         )])
     }
 
+    async fn publish_exact_index_stats(&self, table: &str, index_cols: &[String]) {
+        let Some(shard_db) = &self.shard_db else {
+            return;
+        };
+        let Some(catalog_table) = self.catalog.get_table(table) else {
+            return;
+        };
+        let rows = match shard_db
+            .scan_prefix(format!("view_output/{table}/").as_bytes())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return,
+        };
+
+        let mut col_stats = Vec::new();
+        for index_col in index_cols {
+            let Some(col_idx) = catalog_table
+                .columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(index_col))
+            else {
+                continue;
+            };
+            let values: Vec<Option<Vec<u8>>> = rows
+                .iter()
+                .map(|(_, value)| {
+                    String::from_utf8_lossy(value)
+                        .split('\t')
+                        .nth(col_idx)
+                        .map(|field| field.as_bytes().to_vec())
+                })
+                .collect();
+            let exact_values: Vec<Vec<u8>> =
+                values.iter().filter_map(|value| value.clone()).collect();
+            let mut stats = ColumnStats::from_values(
+                col_idx as u16,
+                &values,
+                ScatterPruningConfig::default().shard_bloom_budget_bytes,
+            );
+            if !exact_values.is_empty() {
+                let filter = build_exact_membership_filter(&exact_values);
+                rockstream_types::metrics::set_shard_bloom_filter_bytes_used(
+                    1,
+                    0,
+                    col_idx as u16,
+                    filter.len() as u64,
+                );
+                stats.bloom_filter = Some(filter);
+            }
+            col_stats.push(stats);
+        }
+
+        if !col_stats.is_empty() {
+            self.catalog.set_shard_stats(
+                table,
+                vec![ShardColumnStats {
+                    shard_id: ShardId(0),
+                    view_id: ViewId(1),
+                    checkpoint_epoch: 1,
+                    col_stats,
+                }],
+            );
+        }
+    }
+
     /// Handle `DROP INDEX <name>` — v0.32.
     fn handle_drop_index<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let rest = q["DROP INDEX".len()..].trim();
@@ -3315,7 +3387,7 @@ impl GatewayHandler {
     ///
     /// Called by the IVM engine (or admin) after backfill completes so the gateway
     /// can route equality-predicate SELECTs through the index arrangement.
-    fn handle_mark_index_ready<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_mark_index_ready(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
         // Parse: MARK INDEX <name> READY [op_id=<n>]
         let rest = q["MARK INDEX".len()..].trim();
         let parts: Vec<&str> = rest.split_whitespace().collect();
@@ -3359,6 +3431,11 @@ impl GatewayHandler {
                 "42704".to_owned(),
                 format!("index \"{name}\" does not exist"),
             )))]);
+        }
+
+        if let Some(entry) = self.catalog.get_index(&name) {
+            self.publish_exact_index_stats(&entry.table, &entry.index_cols)
+                .await;
         }
 
         Ok(vec![Response::Execution(
@@ -3550,7 +3627,7 @@ impl GatewayHandler {
                     batch.delete(old_key.as_bytes());
                     batch.put(new_key.as_bytes(), new_tsv.as_bytes());
                 }
-                DmlOp::Delete { table, row_key } => {
+                DmlOp::Delete { table, row_key, .. } => {
                     let key = format!("view_output/{table}/{row_key}");
                     batch.delete(key.as_bytes());
                 }
@@ -4283,13 +4360,84 @@ impl GatewayHandler {
         ))])
     }
 
-    /// UPDATE handler: accumulate in write buffer.
+    /// Build a `RETURNING` response for `UPDATE`/`DELETE`, projecting `rows`
+    /// (each aligned to `table_columns` order) down to `returning_cols`
+    /// (`["*"]` means "all declared columns").
+    fn build_returning_response(
+        &self,
+        table: &str,
+        table_columns: &[String],
+        returning_cols: &[String],
+        rows: Vec<Vec<String>>,
+    ) -> Response<'static> {
+        let is_star = returning_cols.len() == 1 && returning_cols[0] == "*";
+        let projected_cols: Vec<String> = if is_star {
+            table_columns.to_vec()
+        } else {
+            returning_cols.to_vec()
+        };
+        let catalog_table = self.catalog.get_table(table);
+        let schema_fields: Vec<FieldInfo> = projected_cols
+            .iter()
+            .map(|col| {
+                if let Some(ct) = &catalog_table {
+                    if let Some(c) = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
+                        let oid = arrow_type_to_pg_oid(&c.data_type);
+                        return FieldInfo::new(
+                            c.name.clone(),
+                            None,
+                            None,
+                            pg_type_from_oid(oid),
+                            FieldFormat::Text,
+                        );
+                    }
+                }
+                FieldInfo::new(col.clone(), None, None, Type::TEXT, FieldFormat::Text)
+            })
+            .collect();
+        let schema = Arc::new(schema_fields);
+        let schema_ref = schema.clone();
+        let projected_rows: Vec<Vec<String>> = rows
+            .into_iter()
+            .map(|row| {
+                projected_cols
+                    .iter()
+                    .map(|col| {
+                        table_columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(col))
+                            .and_then(|idx| row.get(idx).cloned())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<String>>()
+            })
+            .collect();
+        let data_stream = stream::iter(projected_rows).map(move |values| {
+            let mut encoder = DataRowEncoder::new(schema_ref.clone());
+            for v in &values {
+                encoder
+                    .encode_field(&Some(v.clone()))
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            }
+            encoder.finish()
+        });
+        let stream = Box::pin(data_stream);
+        promote_response(Response::Query(QueryResponse::new(schema, stream)))
+    }
+
+    /// UPDATE handler: true read-modify-write (v0.48 Slice A2/A3).
+    ///
+    /// Reads the existing row via `shard_db.get()` *before* buffering the
+    /// write, so the complete new row (untouched columns preserved, per
+    /// DESIGN.md §12.8.2) can be built and — when `RETURNING` was requested —
+    /// projected back to the client. A nonexistent row is a zero-row no-op:
+    /// no `DmlOp` is buffered.
     async fn handle_update(
         &self,
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        let (table, set_pairs, where_pairs) = match parse_update(q) {
+        let (table, set_pairs, where_pairs, returning_cols) = match parse_update(q) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
@@ -4298,27 +4446,97 @@ impl GatewayHandler {
             }
         };
 
-        // Build old row key from WHERE clause, new values from SET clause
+        // Build old row key from WHERE clause (unchanged from prior versions).
         let (old_cols, old_vals): (Vec<_>, Vec<_>) = where_pairs
             .iter()
             .map(|(c, v)| (c.clone(), v.clone()))
             .unzip();
         let old_row_key = build_row_key(&old_cols, &old_vals);
-        let old_tsv = old_vals.join("\t");
 
-        let (new_cols, new_vals): (Vec<_>, Vec<_>) = set_pairs
+        // Full declared column order — used to build the complete merged
+        // row. Falls back to WHERE ∪ SET columns if the table isn't in the
+        // catalog (defensive; CREATE TABLE always registers it in practice).
+        let table_columns: Vec<String> = self
+            .catalog
+            .get_table(&table)
+            .map(|ct| ct.columns.into_iter().map(|c| c.name).collect())
+            .unwrap_or_else(|| {
+                let mut cols = old_cols.clone();
+                for (c, _) in &set_pairs {
+                    if !cols.contains(c) {
+                        cols.push(c.clone());
+                    }
+                }
+                cols
+            });
+
+        let Some(shard_db) = &self.shard_db else {
+            // No shard attached: nothing to read or write.
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("UPDATE 0").with_rows(0),
+            ))]);
+        };
+
+        let buffered_existing = conn_id.and_then(|id| {
+            self.write_buffers
+                .get(id)
+                .and_then(|buffer| buffer.current_row_image(&table, &old_row_key))
+        });
+        let existing_str = match buffered_existing {
+            Some(Some(tsv)) => Some(tsv),
+            Some(None) => None,
+            None => {
+                let old_key = format!("view_output/{table}/{old_row_key}");
+                shard_db
+                    .get(old_key.as_bytes())
+                    .await
+                    .map_err(|e| {
+                        PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+                    })?
+                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            }
+        };
+
+        let Some(existing_str) = existing_str else {
+            // Row does not exist: zero rows affected, no write buffered.
+            if let Some(returning_cols) = &returning_cols {
+                return Ok(vec![self.build_returning_response(
+                    &table,
+                    &table_columns,
+                    returning_cols,
+                    Vec::new(),
+                )]);
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("UPDATE 0").with_rows(0),
+            ))]);
+        };
+
+        let existing_fields: Vec<String> =
+            existing_str.split('\t').map(|s| s.to_string()).collect();
+        let mut value_map: HashMap<String, String> = HashMap::new();
+        for (i, col) in table_columns.iter().enumerate() {
+            value_map.insert(
+                col.clone(),
+                existing_fields.get(i).cloned().unwrap_or_default(),
+            );
+        }
+        for (c, v) in &set_pairs {
+            value_map.insert(c.clone(), v.clone());
+        }
+        let new_vals: Vec<String> = table_columns
             .iter()
-            .map(|(c, v)| (c.clone(), v.clone()))
-            .unzip();
-        let new_row_key = build_row_key(&new_cols, &new_vals);
+            .map(|c| value_map.get(c).cloned().unwrap_or_default())
+            .collect();
+        let new_row_key = build_row_key(&table_columns, &new_vals);
         let new_tsv = new_vals.join("\t");
 
         let op = DmlOp::Update {
-            table,
-            old_row_key,
-            old_tsv,
-            new_row_key,
-            new_tsv,
+            table: table.clone(),
+            old_row_key: old_row_key.clone(),
+            old_tsv: existing_str,
+            new_row_key: new_row_key.clone(),
+            new_tsv: new_tsv.clone(),
         };
 
         if let Some(id) = conn_id {
@@ -4330,18 +4548,85 @@ impl GatewayHandler {
             }
         }
 
+        if let Some(returning_cols) = &returning_cols {
+            // Slice A3: reuse the INSERT ... RETURNING read-back pattern —
+            // only performed outside an explicit transaction block; inside
+            // one, RETURNING resolves at the eventual COMMIT using the
+            // already-computed merged row (matches INSERT's literal-echo
+            // behavior when no server-side generated value is involved).
+            let in_explicit_block = conn_id
+                .and_then(|id| self.sessions.get(id))
+                .map(|s| s.in_explicit_block)
+                .unwrap_or(false);
+            let mut result_row = new_vals.clone();
+            if !in_explicit_block {
+                let commit_responses = self.handle_commit(conn_id).await?;
+                if commit_responses
+                    .iter()
+                    .any(|response| matches!(response, Response::Error(_)))
+                {
+                    return Ok(commit_responses);
+                }
+                if let Some(id) = conn_id {
+                    let timeout_ms = self
+                        .sessions
+                        .get(id)
+                        .map(|s| s.session_wait_for_timeout_ms)
+                        .unwrap_or(5_000);
+                    if let Some(token) = self
+                        .sessions
+                        .get(id)
+                        .and_then(|s| s.last_written_epoch.clone())
+                    {
+                        let _ = self.wait_for_epoch(token.source_epoch, timeout_ms).await;
+                    }
+                }
+                let new_key = format!("view_output/{table}/{new_row_key}");
+                if let Some(raw) = shard_db.get(new_key.as_bytes()).await.map_err(|e| {
+                    PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+                })? {
+                    let mut row: Vec<String> = String::from_utf8_lossy(&raw)
+                        .split('\t')
+                        .map(|s| s.to_string())
+                        .collect();
+                    row.resize(table_columns.len(), String::new());
+                    result_row = row;
+                } else {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "XX000".to_owned(),
+                            "[RS-2013] transaction.returning_key_not_found: UPDATE ... RETURNING committed, but the gateway could not read the expected post-update row at the current frontier. next_steps: Retry the write; if the row is consistently missing, check that the frontier used for the read-back has advanced past the commit epoch.".to_owned(),
+                        ),
+                    )))]);
+                }
+            }
+            return Ok(vec![self.build_returning_response(
+                &table,
+                &table_columns,
+                returning_cols,
+                vec![result_row],
+            )]);
+        }
+
         Ok(vec![promote_response(Response::Execution(
             Tag::new("UPDATE 1").with_rows(1),
         ))])
     }
 
-    /// DELETE handler: accumulate in write buffer.
+    /// DELETE handler: pre-image capture for RETURNING (v0.48 Slice A4/A5).
+    ///
+    /// When a `RETURNING` clause is present, the existing row is read via
+    /// `shard_db.get()` *before* the write is enqueued — the row is gone
+    /// from `view_output` once the `WriteBatch` commits, so this is the only
+    /// point the pre-delete state can be captured (DESIGN.md §13.5.2). Plain
+    /// `DELETE` (no `RETURNING`) skips this extra read entirely.
     async fn handle_delete(
         &self,
         q: &str,
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        let (table, where_pairs) = match parse_delete(q) {
+        let (table, where_pairs, returning_cols) = match parse_delete(q) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(vec![promote_response(Response::Error(Box::new(
@@ -4356,7 +4641,65 @@ impl GatewayHandler {
             .unzip();
         let row_key = build_row_key(&cols, &vals);
 
-        let op = DmlOp::Delete { table, row_key };
+        let table_columns: Vec<String> = self
+            .catalog
+            .get_table(&table)
+            .map(|ct| ct.columns.into_iter().map(|c| c.name).collect())
+            .unwrap_or_else(|| cols.clone());
+
+        // Only read the pre-image when RETURNING was requested, so a plain
+        // DELETE never pays for an extra read.
+        let mut captured_row: Option<Vec<String>> = None;
+        if let Some(cols) = &returning_cols {
+            let buffered_existing = conn_id.and_then(|id| {
+                self.write_buffers
+                    .get(id)
+                    .and_then(|buffer| buffer.current_row_image(&table, &row_key))
+            });
+            let existing_str = match buffered_existing {
+                Some(Some(tsv)) => Some(tsv),
+                Some(None) => None,
+                None => {
+                    if let Some(shard_db) = &self.shard_db {
+                        let key = format!("view_output/{table}/{row_key}");
+                        shard_db
+                            .get(key.as_bytes())
+                            .await
+                            .map_err(|e| {
+                                PgWireError::ApiError(Box::new(
+                                    crate::error::GatewayError::Storage(e),
+                                ))
+                            })?
+                            .map(|raw| String::from_utf8_lossy(&raw).to_string())
+                    } else {
+                        None
+                    }
+                }
+            };
+            match existing_str {
+                Some(tsv) => {
+                    let mut row: Vec<String> = tsv.split('\t').map(|s| s.to_string()).collect();
+                    row.resize(table_columns.len(), String::new());
+                    captured_row = Some(row);
+                }
+                None => {
+                    return Ok(vec![self.build_returning_response(
+                        &table,
+                        &table_columns,
+                        cols,
+                        Vec::new(),
+                    )]);
+                }
+            }
+        }
+
+        let returning_tsv = captured_row.as_ref().map(|row| row.join("\t"));
+
+        let op = DmlOp::Delete {
+            table: table.clone(),
+            row_key,
+            returning_tsv,
+        };
 
         if let Some(id) = conn_id {
             let mut entry = self.write_buffers.entry(id.to_string()).or_default();
@@ -4365,6 +4708,22 @@ impl GatewayHandler {
                     ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
                 )))]);
             }
+        }
+
+        if let Some(returning_cols) = &returning_cols {
+            // Slice A5: project the captured pre-image directly — the row
+            // is gone from view_output once the WriteBatch commits, so
+            // there is no post-commit re-read to perform. ROLLBACK / ROLLBACK
+            // TO SAVEPOINT discard this buffered DmlOp::Delete (and its
+            // captured returning_tsv) via WriteBuffer's existing mechanism;
+            // nothing is ever written to the shard before an actual COMMIT.
+            let row = captured_row.unwrap_or_default();
+            return Ok(vec![self.build_returning_response(
+                &table,
+                &table_columns,
+                returning_cols,
+                vec![row],
+            )]);
         }
 
         Ok(vec![promote_response(Response::Execution(
@@ -6217,6 +6576,78 @@ fn extract_view_name_from_select(q: &str) -> Option<String> {
     }
 }
 
+fn extract_simple_scatter_predicates(
+    catalog: &CatalogStubs,
+    view_name: &str,
+    q: &str,
+) -> Vec<crate::multi_shard_reader::ScatterPredicate> {
+    let where_pos = match q.to_lowercase().find(" where ") {
+        Some(pos) => pos,
+        None => return Vec::new(),
+    };
+    let where_clause = q[where_pos + 7..]
+        .split(" ORDER BY ")
+        .next()
+        .unwrap_or("")
+        .split(" LIMIT ")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(';');
+    let columns = catalog
+        .get_table(view_name)
+        .map(|table| table.columns)
+        .or_else(|| catalog.get_view(view_name).map(|view| view.columns))
+        .unwrap_or_default();
+    where_clause
+        .split(" AND ")
+        .filter_map(|part| {
+            let (name, value) = part.split_once('=')?;
+            let col_idx = columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(name.trim()))?;
+            let raw = value.trim().trim_matches('\'').trim_matches('"');
+            Some(crate::multi_shard_reader::ScatterPredicate::Eq {
+                col_idx: col_idx as u16,
+                value: raw.as_bytes().to_vec(),
+            })
+        })
+        .collect()
+}
+
+fn build_scatter_explain_note(catalog: &CatalogStubs, inner_sql: &str) -> String {
+    let Some(view_name) = extract_view_name_from_select(inner_sql) else {
+        return String::new();
+    };
+    let shard_stats = catalog.shard_stats(&view_name);
+    if shard_stats.is_empty() {
+        return String::new();
+    }
+    let predicates = extract_simple_scatter_predicates(catalog, &view_name, inner_sql);
+    let latest_epoch = shard_stats
+        .iter()
+        .map(|stats| stats.checkpoint_epoch)
+        .max()
+        .unwrap_or(0);
+    let plan =
+        crate::multi_shard_reader::plan_scatter_shards(&shard_stats, &predicates, 5, latest_epoch);
+    let cols = if plan.pruned_columns.is_empty() {
+        String::from("none")
+    } else {
+        plan.pruned_columns
+            .iter()
+            .map(|col_idx| col_idx.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "\nshard_scan: {}/{} shards (pruned by column statistics on {})",
+        plan.shard_ids.len(),
+        plan.total_shards,
+        cols
+    )
+}
+
 /// Extract LIMIT value from a query string.
 fn extract_limit(q: &str) -> Option<usize> {
     let ql = q.to_lowercase();
@@ -7421,10 +7852,17 @@ fn split_value_tuples(s: &str) -> Result<Vec<String>, String> {
     Ok(tuples)
 }
 
-/// Parse `UPDATE <table> SET col = val [, ...] WHERE col = val`.
+/// Parse `UPDATE <table> SET col = val [, ...] WHERE col = val [RETURNING ...]`.
 ///
-/// Returns `(table, set_pairs, where_pairs)`.
-type ParsedUpdate = (String, Vec<(String, String)>, Vec<(String, String)>);
+/// Returns `(table, set_pairs, where_pairs, returning_cols)`. `returning_cols`
+/// is `None` when no `RETURNING` clause is present, `Some(vec!["*".into()])`
+/// for `RETURNING *`, or `Some(cols)` for an explicit column list.
+type ParsedUpdate = (
+    String,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    Option<Vec<String>>,
+);
 
 fn parse_update(q: &str) -> Result<ParsedUpdate, String> {
     let ql = q.to_lowercase();
@@ -7448,16 +7886,20 @@ fn parse_update(q: &str) -> Result<ParsedUpdate, String> {
     let _ = set_str_lower; // used for case-insensitive parsing
     let set_pairs = parse_kv_list(set_str_orig);
 
-    let where_str = &q[where_pos + 7..].trim_end_matches(';');
-    let where_pairs = parse_kv_list(where_str);
+    let rest_after_where = &q[where_pos + 7..];
+    let (where_str, returning_cols) = split_returning_clause(rest_after_where)?;
+    let where_pairs = parse_kv_list(where_str.trim_end_matches(';'));
 
-    Ok((table, set_pairs, where_pairs))
+    Ok((table, set_pairs, where_pairs, returning_cols))
 }
 
-/// Parse `DELETE FROM <table> WHERE col = val`.
+/// Parse `DELETE FROM <table> WHERE col = val [RETURNING ...]`.
 ///
-/// Returns `(table, where_pairs)`.
-fn parse_delete(q: &str) -> Result<(String, Vec<(String, String)>), String> {
+/// Returns `(table, where_pairs, returning_cols)` — see `parse_update`'s doc
+/// comment for the `returning_cols` shape.
+type ParsedDelete = (String, Vec<(String, String)>, Option<Vec<String>>);
+
+fn parse_delete(q: &str) -> Result<ParsedDelete, String> {
     let ql = q.to_lowercase();
     let after = ql
         .strip_prefix("delete from ")
@@ -7472,10 +7914,67 @@ fn parse_delete(q: &str) -> Result<(String, Vec<(String, String)>), String> {
     let where_pos = ql
         .find(" where ")
         .ok_or("missing WHERE (v0.24 requires WHERE)")?;
-    let where_str = &q[where_pos + 7..].trim_end_matches(';');
-    let where_pairs = parse_kv_list(where_str);
+    let rest_after_where = &q[where_pos + 7..];
+    let (where_str, returning_cols) = split_returning_clause(rest_after_where)?;
+    let where_pairs = parse_kv_list(where_str.trim_end_matches(';'));
 
-    Ok((table, where_pairs))
+    Ok((table, where_pairs, returning_cols))
+}
+
+/// Split a trailing ` RETURNING <col[, col...]>` or ` RETURNING *` clause off
+/// the end of `s` (the text following `WHERE ...`), mirroring `parse_insert`'s
+/// existing `RETURNING` handling for `INSERT`.
+///
+/// Returns `(remainder_without_returning, returning_cols)`. A `RETURNING`
+/// keyword with no usable column list after it (empty, or containing an
+/// empty/malformed column token) is a hard parse error: `RS-2022`
+/// (`write.malformed_returning_clause`).
+fn split_returning_clause(s: &str) -> Result<(&str, Option<Vec<String>>), String> {
+    let sl = s.to_lowercase();
+    let trimmed_end = sl.trim_end_matches(';').trim_end();
+
+    let pos = if let Some(p) = sl.find(" returning ") {
+        Some(p)
+    } else if trimmed_end.ends_with(" returning") {
+        // `RETURNING` is the very last keyword with nothing (or only
+        // whitespace/`;`) after it — malformed (empty column list), not
+        // "no RETURNING clause at all".
+        Some(trimmed_end.len() - " returning".len())
+    } else {
+        None
+    };
+    let Some(pos) = pos else {
+        return Ok((s, None));
+    };
+
+    let remainder = &s[..pos];
+    let clause = s[pos..].trim_start();
+    let clause_len = "returning".len();
+    if clause.len() < clause_len || !clause[..clause_len].eq_ignore_ascii_case("returning") {
+        return Err(malformed_returning_clause_err());
+    }
+    let clause = clause[clause_len..].trim().trim_end_matches(';').trim();
+
+    if clause.is_empty() {
+        return Err(malformed_returning_clause_err());
+    }
+    if clause == "*" {
+        return Ok((remainder, Some(vec!["*".to_string()])));
+    }
+    let cols: Vec<String> = clause.split(',').map(|c| c.trim().to_string()).collect();
+    if cols
+        .iter()
+        .any(|c| c.is_empty() || !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+    {
+        return Err(malformed_returning_clause_err());
+    }
+    Ok((remainder, Some(cols)))
+}
+
+fn malformed_returning_clause_err() -> String {
+    "[RS-2022] write.malformed_returning_clause: RETURNING clause is malformed. \
+     next_steps: Use RETURNING * or RETURNING <col>[, <col>...] with no trailing content."
+        .to_string()
 }
 
 /// Parse a comma-separated list of `col = val` pairs.
@@ -7989,6 +8488,90 @@ mod parse_insert_tests {
         assert!(
             err.contains("RS-2056"),
             "expected RS-2056 error, got: {err}"
+        );
+    }
+}
+
+// ── v0.48: RETURNING clause parsing for UPDATE/DELETE ───────────────────────
+
+#[cfg(test)]
+mod parse_update_returning_tests {
+    use super::*;
+
+    /// v0.48 Slice A1 green gate: `UPDATE ... RETURNING *` parses, keeping
+    /// SET/WHERE pairs intact.
+    #[test]
+    fn update_returning_star_parses() {
+        let (table, set_pairs, where_pairs, returning) =
+            parse_update("UPDATE t SET val = 'new' WHERE id = 1 RETURNING *").unwrap();
+        assert_eq!(table, "t");
+        assert_eq!(set_pairs, vec![("val".to_string(), "new".to_string())]);
+        assert_eq!(where_pairs, vec![("id".to_string(), "1".to_string())]);
+        assert_eq!(returning, Some(vec!["*".to_string()]));
+    }
+
+    /// `UPDATE` with no `RETURNING` clause parses as before (`returning ==
+    /// None`), and a trailing semicolon is still handled.
+    #[test]
+    fn update_without_returning_parses_none() {
+        let (_, _, where_pairs, returning) =
+            parse_update("UPDATE t SET val = 'new' WHERE id = 1;").unwrap();
+        assert_eq!(where_pairs, vec![("id".to_string(), "1".to_string())]);
+        assert_eq!(returning, None);
+    }
+
+    /// A malformed `RETURNING` clause (no columns after the keyword) is a
+    /// hard `RS-2022` parse error.
+    #[test]
+    fn update_malformed_returning_clause_returns_rs2022() {
+        let err = parse_update("UPDATE t SET val = 'new' WHERE id = 1 RETURNING").unwrap_err();
+        assert!(
+            err.contains("RS-2022"),
+            "expected RS-2022 error, got: {err}"
+        );
+    }
+
+    /// `RETURNING` followed by a dangling comma is also malformed.
+    #[test]
+    fn update_returning_trailing_comma_returns_rs2022() {
+        let err = parse_update("UPDATE t SET val = 'new' WHERE id = 1 RETURNING id,").unwrap_err();
+        assert!(
+            err.contains("RS-2022"),
+            "expected RS-2022 error, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_delete_returning_tests {
+    use super::*;
+
+    /// v0.48 Slice A1 green gate: `DELETE ... RETURNING <col list>` parses.
+    #[test]
+    fn delete_returning_column_list_parses() {
+        let (table, where_pairs, returning) =
+            parse_delete("DELETE FROM t WHERE id = 1 RETURNING id, val").unwrap();
+        assert_eq!(table, "t");
+        assert_eq!(where_pairs, vec![("id".to_string(), "1".to_string())]);
+        assert_eq!(returning, Some(vec!["id".to_string(), "val".to_string()]));
+    }
+
+    /// `DELETE` with no `RETURNING` clause parses as before.
+    #[test]
+    fn delete_without_returning_parses_none() {
+        let (_, where_pairs, returning) = parse_delete("DELETE FROM t WHERE id = 1").unwrap();
+        assert_eq!(where_pairs, vec![("id".to_string(), "1".to_string())]);
+        assert_eq!(returning, None);
+    }
+
+    /// A malformed `RETURNING` clause on `DELETE` is also a hard `RS-2022`
+    /// parse error.
+    #[test]
+    fn delete_malformed_returning_clause_returns_rs2022() {
+        let err = parse_delete("DELETE FROM t WHERE id = 1 RETURNING").unwrap_err();
+        assert!(
+            err.contains("RS-2022"),
+            "expected RS-2022 error, got: {err}"
         );
     }
 }

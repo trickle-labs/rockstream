@@ -27,6 +27,7 @@ pub mod raft;
 pub mod scheduler;
 pub mod service;
 pub mod shard;
+pub mod shard_stats;
 pub mod skew;
 pub mod tls;
 pub mod topology;
@@ -44,6 +45,7 @@ pub use placement::PlacementAlgorithm;
 pub use scheduler::{ShardAssignment, ShardScheduler};
 pub use service::{ControlService, ControlServiceHandle};
 pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};
+pub use shard_stats::ShardStatsPersistentStore;
 pub use skew::{
     compute_cluster_worker_pressure, detect_hot_key, plan_hot_key_mitigation,
     publish_cluster_worker_pressure, AdaptiveSkewSplitter, HotKeyDetector, HotKeyDetectorError,

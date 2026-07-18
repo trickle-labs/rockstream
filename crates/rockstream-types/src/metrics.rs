@@ -198,6 +198,10 @@ struct MetricRegistry {
     placed_shard_count: AtomicU64,
     session_staleness_exceeded_total: HashMap<String, Counter>,
     session_frontier_age_ms: HashMap<String, Counter>,
+    shard_bloom_filter_bytes_used: HashMap<String, Counter>,
+    scatter_shards_total: AtomicU64,
+    scatter_shards_pruned_total: AtomicU64,
+    shard_bloom_false_positive_total: AtomicU64,
 
     // Flush duration metrics
     flush_duration_sum_ms: AtomicU64,
@@ -236,6 +240,10 @@ impl MetricRegistry {
             placed_shard_count: AtomicU64::new(0),
             session_staleness_exceeded_total: HashMap::new(),
             session_frontier_age_ms: HashMap::new(),
+            shard_bloom_filter_bytes_used: HashMap::new(),
+            scatter_shards_total: AtomicU64::new(0),
+            scatter_shards_pruned_total: AtomicU64::new(0),
+            shard_bloom_false_positive_total: AtomicU64::new(0),
             flush_duration_sum_ms: AtomicU64::new(0),
             flush_duration_count: AtomicU64::new(0),
             flush_duration_last_ms: AtomicU64::new(0),
@@ -515,6 +523,11 @@ pub fn reset_all() {
         reg.placed_shard_count.store(0, Ordering::Relaxed);
         reg.session_staleness_exceeded_total.clear();
         reg.session_frontier_age_ms.clear();
+        reg.shard_bloom_filter_bytes_used.clear();
+        reg.scatter_shards_total.store(0, Ordering::Relaxed);
+        reg.scatter_shards_pruned_total.store(0, Ordering::Relaxed);
+        reg.shard_bloom_false_positive_total
+            .store(0, Ordering::Relaxed);
         reg.flush_duration_sum_ms.store(0, Ordering::Relaxed);
         reg.flush_duration_count.store(0, Ordering::Relaxed);
         reg.flush_duration_last_ms.store(0, Ordering::Relaxed);
@@ -799,6 +812,64 @@ pub fn set_session_frontier_age_ms(mode: &str, age_ms: u64) {
     });
 }
 
+fn shard_bloom_metric_key(view_id: u64, shard_id: u64, col_idx: u16) -> String {
+    format!("view-{view_id}/shard-{shard_id}/col-{col_idx}")
+}
+
+pub fn set_shard_bloom_filter_bytes_used(view_id: u64, shard_id: u64, col_idx: u16, bytes: u64) {
+    with_registry(|reg| {
+        let counter = reg
+            .shard_bloom_filter_bytes_used
+            .entry(shard_bloom_metric_key(view_id, shard_id, col_idx))
+            .or_insert_with(Counter::new);
+        counter.value.store(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shard_bloom_filter_bytes_used(
+    view_id: u64,
+    shard_id: u64,
+    col_idx: u16,
+) -> Option<u64> {
+    with_registry(|reg| {
+        reg.shard_bloom_filter_bytes_used
+            .get(&shard_bloom_metric_key(view_id, shard_id, col_idx))
+            .map(Counter::get)
+    })
+}
+
+pub fn add_scatter_shards_total(value: u64) {
+    with_registry(|reg| {
+        reg.scatter_shards_total.fetch_add(value, Ordering::Relaxed);
+    });
+}
+
+pub fn add_scatter_shards_pruned_total(value: u64) {
+    with_registry(|reg| {
+        reg.scatter_shards_pruned_total
+            .fetch_add(value, Ordering::Relaxed);
+    });
+}
+
+pub fn inc_shard_bloom_false_positive_total() {
+    with_registry(|reg| {
+        reg.shard_bloom_false_positive_total
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub fn read_scatter_shards_total() -> u64 {
+    with_registry(|reg| reg.scatter_shards_total.load(Ordering::Relaxed))
+}
+
+pub fn read_scatter_shards_pruned_total() -> u64 {
+    with_registry(|reg| reg.scatter_shards_pruned_total.load(Ordering::Relaxed))
+}
+
+pub fn read_shard_bloom_false_positive_total() -> u64 {
+    with_registry(|reg| reg.shard_bloom_false_positive_total.load(Ordering::Relaxed))
+}
+
 pub fn record_flush_duration(duration: std::time::Duration) {
     with_registry(|reg| {
         let ms = duration.as_millis() as u64;
@@ -1065,6 +1136,38 @@ pub fn generate_prometheus_metrics() -> String {
             ));
         }
         out.push('\n');
+
+        out.push_str("# HELP shard_bloom_filter_bytes_used Gauge of bloom-filter bytes used per shard column.\n");
+        out.push_str("# TYPE shard_bloom_filter_bytes_used gauge\n");
+        for (target, c) in &reg.shard_bloom_filter_bytes_used {
+            out.push_str(&format!(
+                "shard_bloom_filter_bytes_used{{target=\"{}\"}} {}\n",
+                target,
+                c.get()
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP scatter_shards_total Shards considered for scatter before pruning.\n");
+        out.push_str("# TYPE scatter_shards_total counter\n");
+        out.push_str(&format!(
+            "scatter_shards_total {}\n\n",
+            reg.scatter_shards_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP scatter_shards_pruned_total Shards skipped by column statistics.\n");
+        out.push_str("# TYPE scatter_shards_pruned_total counter\n");
+        out.push_str(&format!(
+            "scatter_shards_pruned_total {}\n\n",
+            reg.scatter_shards_pruned_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP shard_bloom_false_positive_total Bloom-positive shards that produced no matching rows.\n");
+        out.push_str("# TYPE shard_bloom_false_positive_total counter\n");
+        out.push_str(&format!(
+            "shard_bloom_false_positive_total {}\n\n",
+            reg.shard_bloom_false_positive_total.load(Ordering::Relaxed)
+        ));
 
         // 14. flush_duration_seconds_sum
         out.push_str("# HELP flush_duration_seconds_sum Cumulative duration of all flushes.\n");
@@ -1399,5 +1502,20 @@ mod tests {
             .unwrap();
         let expected_other: u64 = (0..44u64).map(|i| (i + 1) * 1000).sum();
         assert_eq!(other_value, expected_other);
+    }
+
+    #[test]
+    fn scatter_pruning_metrics_are_exported() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+        set_shard_bloom_filter_bytes_used(7, 9, 1, 128);
+        add_scatter_shards_total(10);
+        add_scatter_shards_pruned_total(9);
+        inc_shard_bloom_false_positive_total();
+        let metrics = generate_prometheus_metrics();
+        assert!(metrics.contains("shard_bloom_filter_bytes_used"));
+        assert!(metrics.contains("scatter_shards_total 10"));
+        assert!(metrics.contains("scatter_shards_pruned_total 9"));
+        assert!(metrics.contains("shard_bloom_false_positive_total 1"));
     }
 }

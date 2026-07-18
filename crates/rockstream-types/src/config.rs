@@ -45,6 +45,21 @@ impl Default for SkewSplitConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScatterPruningConfig {
+    pub shard_bloom_budget_bytes: usize,
+    pub shard_stats_max_age_checkpoints: u64,
+}
+
+impl Default for ScatterPruningConfig {
+    fn default() -> Self {
+        Self {
+            shard_bloom_budget_bytes: 65_536,
+            shard_stats_max_age_checkpoints: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TunerOverrides {
     pub parallelism: Option<usize>,
@@ -70,6 +85,8 @@ pub struct ClusterConfig {
     pub autotuner: AutotunerConfig,
     #[serde(default)]
     pub skew_split: SkewSplitConfig,
+    #[serde(default)]
+    pub scatter_pruning: ScatterPruningConfig,
     #[serde(default = "default_selectivity_threshold")]
     pub index_prefer_selectivity_threshold: f64,
     #[serde(default = "default_max_lag_ms")]
@@ -124,6 +141,7 @@ impl Default for RockstreamConfig {
                 state_budget_gb: 10,
                 autotuner: AutotunerConfig::default(),
                 skew_split: SkewSplitConfig::default(),
+                scatter_pruning: ScatterPruningConfig::default(),
                 index_prefer_selectivity_threshold: 0.01,
                 index_max_lag_ms: 1000,
             },
@@ -151,6 +169,24 @@ mod tests {
         let serialized = default_cfg.to_string().unwrap();
         let deserialized = RockstreamConfig::load_from_str(&serialized).unwrap();
         assert_eq!(default_cfg, deserialized);
+    }
+
+    #[test]
+    fn config_scatter_pruning_defaults_roundtrip() {
+        let cfg = RockstreamConfig::default();
+        assert_eq!(cfg.cluster.scatter_pruning, ScatterPruningConfig::default());
+        let roundtrip = RockstreamConfig::load_from_str(&cfg.to_string().unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.cluster.scatter_pruning.shard_bloom_budget_bytes,
+            65_536
+        );
+        assert_eq!(
+            roundtrip
+                .cluster
+                .scatter_pruning
+                .shard_stats_max_age_checkpoints,
+            5
+        );
     }
 
     #[test]

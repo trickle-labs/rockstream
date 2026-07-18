@@ -18,6 +18,8 @@ use std::sync::{
 };
 
 use rockstream_storage::{PartialAggSpec, ShardReader};
+use rockstream_types::frontier::{bloom_filter_might_contain, ColumnStats, ShardColumnStats};
+use rockstream_types::ids::ShardId;
 
 use crate::error::GatewayError;
 
@@ -35,6 +37,130 @@ pub fn can_pushdown_partial_agg(sql: &str) -> bool {
         return false;
     }
     ql.contains("sum(") || ql.contains("count(") || ql.contains("count(*)") || ql.contains("avg(")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScatterPredicate {
+    Eq {
+        col_idx: u16,
+        value: Vec<u8>,
+    },
+    Range {
+        col_idx: u16,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScatterPlan {
+    pub shard_ids: Vec<ShardId>,
+    pub total_shards: usize,
+    pub pruned_columns: Vec<u16>,
+}
+
+pub fn plan_scatter_shards(
+    shard_stats: &[ShardColumnStats],
+    predicates: &[ScatterPredicate],
+    max_stats_age_checkpoints: u64,
+    latest_checkpoint_epoch: u64,
+) -> ScatterPlan {
+    if shard_stats.is_empty() {
+        return ScatterPlan {
+            shard_ids: Vec::new(),
+            total_shards: 0,
+            pruned_columns: Vec::new(),
+        };
+    }
+    let too_stale = shard_stats.iter().any(|stats| {
+        latest_checkpoint_epoch.saturating_sub(stats.checkpoint_epoch) > max_stats_age_checkpoints
+    });
+    rockstream_types::metrics::add_scatter_shards_total(shard_stats.len() as u64);
+    if too_stale {
+        return ScatterPlan {
+            shard_ids: shard_stats.iter().map(|stats| stats.shard_id).collect(),
+            total_shards: shard_stats.len(),
+            pruned_columns: Vec::new(),
+        };
+    }
+
+    let mut kept = Vec::new();
+    let mut pruned_columns = std::collections::BTreeSet::new();
+    for stats in shard_stats {
+        let mut keep = true;
+        for predicate in predicates {
+            let (col_idx, column) = match predicate {
+                ScatterPredicate::Eq { col_idx, .. } | ScatterPredicate::Range { col_idx, .. } => (
+                    *col_idx,
+                    stats
+                        .col_stats
+                        .iter()
+                        .find(|column| column.col_idx == *col_idx),
+                ),
+            };
+            let Some(column) = column else {
+                continue;
+            };
+            if should_prune_column(column, predicate) {
+                keep = false;
+                pruned_columns.insert(col_idx);
+                break;
+            }
+        }
+        if keep {
+            kept.push(stats.shard_id);
+        }
+    }
+    rockstream_types::metrics::add_scatter_shards_pruned_total(
+        shard_stats.len().saturating_sub(kept.len()) as u64,
+    );
+    ScatterPlan {
+        shard_ids: kept,
+        total_shards: shard_stats.len(),
+        pruned_columns: pruned_columns.into_iter().collect(),
+    }
+}
+
+fn should_prune_column(column: &ColumnStats, predicate: &ScatterPredicate) -> bool {
+    match predicate {
+        ScatterPredicate::Eq { value, .. } => {
+            outside_bounds(column, value, value)
+                || column
+                    .bloom_filter
+                    .as_ref()
+                    .is_some_and(|filter| !bloom_filter_might_contain(filter, value))
+        }
+        ScatterPredicate::Range { lower, upper, .. } => {
+            outside_optional_bounds(column, lower, upper)
+        }
+    }
+}
+
+fn outside_bounds(column: &ColumnStats, lower: &[u8], upper: &[u8]) -> bool {
+    column
+        .min_bytes
+        .as_ref()
+        .is_some_and(|min| upper < min.as_ref())
+        || column
+            .max_bytes
+            .as_ref()
+            .is_some_and(|max| lower > max.as_ref())
+}
+
+fn outside_optional_bounds(
+    column: &ColumnStats,
+    lower: &Option<Vec<u8>>,
+    upper: &Option<Vec<u8>>,
+) -> bool {
+    let lower_prunes = lower
+        .as_ref()
+        .zip(column.max_bytes.as_ref())
+        .is_some_and(|(lower, max)| lower.as_slice() > max.as_ref());
+    let upper_prunes = upper
+        .as_ref()
+        .zip(column.min_bytes.as_ref())
+        .is_some_and(|(upper, min)| upper.as_slice() < min.as_ref());
+    lower_prunes || upper_prunes
 }
 
 /// Extract a PartialAggSpec from a GROUP BY SQL query.
@@ -249,6 +375,7 @@ impl MultiShardReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use object_store::memory::InMemory;
     use rockstream_storage::{ShardDb, ShardReader};
     use std::sync::Arc;
@@ -441,5 +568,88 @@ mod tests {
                 pushdown_map.get(k).copied().unwrap_or(0)
             );
         }
+    }
+
+    fn make_stats(
+        shard_id: u64,
+        epoch: u64,
+        col_idx: u16,
+        min: &str,
+        max: &str,
+        bloom_values: &[&str],
+    ) -> ShardColumnStats {
+        let filter = rockstream_types::frontier::build_budget_capped_bloom_filter(
+            &bloom_values
+                .iter()
+                .map(|value| value.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            64,
+        );
+        ShardColumnStats {
+            shard_id: ShardId(shard_id),
+            view_id: rockstream_types::ids::ViewId(1),
+            checkpoint_epoch: epoch,
+            col_stats: vec![ColumnStats {
+                col_idx,
+                min_bytes: Some(Bytes::copy_from_slice(min.as_bytes())),
+                max_bytes: Some(Bytes::copy_from_slice(max.as_bytes())),
+                bloom_filter: Some(filter),
+                null_count: 0,
+                distinct_count_hll: Bytes::from(vec![0; 64]),
+            }],
+        }
+    }
+
+    #[test]
+    fn scatter_planner_prunes_shards_outside_min_max_bounds() {
+        let plan = plan_scatter_shards(
+            &[
+                make_stats(1, 10, 0, "a", "m", &["a", "b", "f"]),
+                make_stats(2, 10, 0, "n", "z", &["n", "z"]),
+            ],
+            &[ScatterPredicate::Eq {
+                col_idx: 0,
+                value: b"b".to_vec(),
+            }],
+            5,
+            10,
+        );
+        assert_eq!(plan.shard_ids, vec![ShardId(1)]);
+        assert_eq!(plan.total_shards, 2);
+    }
+
+    #[test]
+    fn scatter_planner_prunes_shards_via_bloom_negative() {
+        let plan = plan_scatter_shards(
+            &[
+                make_stats(1, 10, 0, "a", "z", &["match-me"]),
+                make_stats(2, 10, 0, "a", "z", &["other"]),
+            ],
+            &[ScatterPredicate::Eq {
+                col_idx: 0,
+                value: b"match-me".to_vec(),
+            }],
+            5,
+            10,
+        );
+        assert_eq!(plan.shard_ids, vec![ShardId(1)]);
+    }
+
+    #[test]
+    fn stale_shard_stats_falls_back_to_full_scatter_with_warning() {
+        let plan = plan_scatter_shards(
+            &[
+                make_stats(1, 1, 0, "a", "m", &["a"]),
+                make_stats(2, 1, 0, "n", "z", &["z"]),
+            ],
+            &[ScatterPredicate::Eq {
+                col_idx: 0,
+                value: b"b".to_vec(),
+            }],
+            5,
+            10,
+        );
+        assert_eq!(plan.shard_ids, vec![ShardId(1), ShardId(2)]);
+        assert!(plan.pruned_columns.is_empty());
     }
 }

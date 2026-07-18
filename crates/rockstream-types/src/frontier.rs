@@ -14,8 +14,10 @@
 use crate::ids::{OperatorId, ShardId, SourceId, WorkerId};
 use crate::merge_law::MergeLawId;
 use crate::timestamp::Epoch;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 
 pub use antichain::{Antichain, Frontier, Lattice, ProductTimestamp};
 
@@ -224,6 +226,136 @@ pub struct WorkerFrontierSummary {
     pub min_epoch: Option<Epoch>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardColumnStats {
+    pub shard_id: ShardId,
+    pub view_id: crate::ids::ViewId,
+    pub checkpoint_epoch: u64,
+    pub col_stats: Vec<ColumnStats>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnStats {
+    pub col_idx: u16,
+    pub min_bytes: Option<Bytes>,
+    pub max_bytes: Option<Bytes>,
+    pub bloom_filter: Option<Bytes>,
+    pub null_count: u64,
+    pub distinct_count_hll: Bytes,
+}
+
+impl ColumnStats {
+    pub fn from_values(
+        col_idx: u16,
+        values: &[Option<Vec<u8>>],
+        bloom_budget_bytes: usize,
+    ) -> Self {
+        let mut min_bytes: Option<Vec<u8>> = None;
+        let mut max_bytes: Option<Vec<u8>> = None;
+        let mut bloom_values = Vec::new();
+        let mut null_count = 0_u64;
+        let mut hll = [0_u8; 64];
+        for value in values {
+            match value {
+                Some(bytes) => {
+                    if min_bytes.as_ref().is_none_or(|min| bytes < min) {
+                        min_bytes = Some(bytes.clone());
+                    }
+                    if max_bytes.as_ref().is_none_or(|max| bytes > max) {
+                        max_bytes = Some(bytes.clone());
+                    }
+                    bloom_values.push(bytes.clone());
+                    hll_add(&mut hll, bytes);
+                }
+                None => null_count += 1,
+            }
+        }
+        Self {
+            col_idx,
+            min_bytes: min_bytes.map(Bytes::from),
+            max_bytes: max_bytes.map(Bytes::from),
+            bloom_filter: (!bloom_values.is_empty())
+                .then(|| build_budget_capped_bloom_filter(&bloom_values, bloom_budget_bytes)),
+            null_count,
+            distinct_count_hll: Bytes::from(hll.to_vec()),
+        }
+    }
+}
+
+pub fn build_budget_capped_bloom_filter(values: &[Vec<u8>], budget_bytes: usize) -> Bytes {
+    let total_bytes = budget_bytes.max(9);
+    let bitset_bytes = total_bytes.saturating_sub(1);
+    let mut filter = vec![3_u8; total_bytes];
+    if bitset_bytes == 0 {
+        return Bytes::from(filter);
+    }
+    for value in values {
+        for bit in bloom_hashes(value, bitset_bytes * 8, filter[0]) {
+            let idx = 1 + (bit / 8);
+            let mask = 1_u8 << (bit % 8);
+            filter[idx] |= mask;
+        }
+    }
+    Bytes::from(filter)
+}
+
+pub fn build_exact_membership_filter(values: &[Vec<u8>]) -> Bytes {
+    let mut encoded = vec![0_u8];
+    for value in values {
+        encoded.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(value);
+    }
+    Bytes::from(encoded)
+}
+
+pub fn bloom_filter_might_contain(filter: &[u8], value: &[u8]) -> bool {
+    if filter.len() <= 1 {
+        return true;
+    }
+    if filter[0] == 0 {
+        let mut offset = 1;
+        while offset + 4 <= filter.len() {
+            let len = u32::from_be_bytes(filter[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + len > filter.len() {
+                return true;
+            }
+            if &filter[offset..offset + len] == value {
+                return true;
+            }
+            offset += len;
+        }
+        return false;
+    }
+    bloom_hashes(value, (filter.len() - 1) * 8, filter[0].max(1))
+        .into_iter()
+        .all(|bit| {
+            let idx = 1 + (bit / 8);
+            let mask = 1_u8 << (bit % 8);
+            filter.get(idx).is_some_and(|byte| (*byte & mask) != 0)
+        })
+}
+
+fn bloom_hashes(value: &[u8], modulus: usize, hashes: u8) -> Vec<usize> {
+    (0..hashes.max(1))
+        .map(|seed| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            seed.hash(&mut hasher);
+            value.hash(&mut hasher);
+            (hasher.finish() as usize) % modulus.max(1)
+        })
+        .collect()
+}
+
+fn hll_add(registers: &mut [u8; 64], value: &[u8]) {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    let hash = hasher.finish();
+    let idx = (hash & 0x3f) as usize;
+    let rho = ((hash >> 6).leading_zeros() + 1).min(u8::MAX as u32) as u8;
+    registers[idx] = registers[idx].max(rho);
+}
+
 /// The cluster-wide committed frontier.
 ///
 /// `ClusterFrontierPublisher` computes this as the minimum `min_epoch` across
@@ -305,6 +437,41 @@ mod protocol_tests {
             min_epoch: Some(5),
         };
         assert_eq!(s.min_epoch, Some(5));
+    }
+
+    #[test]
+    fn shard_column_stats_roundtrip_tests() {
+        let stats = ShardColumnStats {
+            shard_id: ShardId(7),
+            view_id: crate::ids::ViewId(11),
+            checkpoint_epoch: 99,
+            col_stats: vec![ColumnStats {
+                col_idx: 2,
+                min_bytes: Some(Bytes::from_static(b"a")),
+                max_bytes: Some(Bytes::from_static(b"z")),
+                bloom_filter: Some(Bytes::from_static(b"\x03abcdefghi")),
+                null_count: 1,
+                distinct_count_hll: Bytes::from(vec![0; 64]),
+            }],
+        };
+        let json = serde_json::to_vec(&stats).unwrap();
+        let decoded: ShardColumnStats = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded, stats);
+    }
+
+    #[test]
+    fn bloom_filter_never_exceeds_budget_bytes_at_high_cardinality() {
+        let values: Vec<Vec<u8>> = (0..10_000)
+            .map(|idx| format!("customer-{idx:05}").into_bytes())
+            .collect();
+        let filter = build_budget_capped_bloom_filter(&values, 128);
+        crate::metrics::set_shard_bloom_filter_bytes_used(1, 2, 3, filter.len() as u64);
+        assert!(filter.len() <= 128);
+        assert_eq!(
+            crate::metrics::read_shard_bloom_filter_bytes_used(1, 2, 3),
+            Some(filter.len() as u64)
+        );
+        assert!(bloom_filter_might_contain(&filter, b"customer-00042"));
     }
 
     #[test]

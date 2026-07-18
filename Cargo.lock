@@ -5506,6 +5506,7 @@ dependencies = [
 name = "rockstream-control"
 version = "0.42.0"
 dependencies = [
+ "bytes",
  "criterion",
  "futures",
  "hex",
@@ -5780,6 +5781,7 @@ version = "0.42.0"
 dependencies = [
  "antichain",
  "arrow",
+ "bytes",
  "lru",
  "serde",
  "serde_json",

@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use rockstream_sql::{SqlError, WorkloadCatalog};
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::cost::{active_pricing_config, estimate_cost_per_hour, CostEstimateInput};
+use rockstream_types::frontier::ShardColumnStats;
 use rockstream_types::ids::WorkloadId;
 use rockstream_types::metrics::{
     read_freshness_lag, read_pipeline_state_bytes, read_state_budget, read_workload_memory,
@@ -273,6 +274,8 @@ struct CatalogStubsInner {
     workloads: HashMap<String, WorkloadDef>,
     /// View name → workload name.
     view_workloads: HashMap<String, String>,
+    /// View name → latest per-shard pruning statistics.
+    shard_stats: HashMap<String, Vec<ShardColumnStats>>,
 }
 
 /// In-memory catalog of views exposed to Postgres clients.
@@ -626,6 +629,20 @@ impl CatalogStubs {
         let mut idxs: Vec<CatalogIndexEntry> = inner.indexes.values().cloned().collect();
         idxs.sort_by(|a, b| a.name.cmp(&b.name));
         idxs
+    }
+
+    pub fn set_shard_stats(&self, view_name: &str, stats: Vec<ShardColumnStats>) {
+        let mut inner = self.inner.write().unwrap();
+        inner.shard_stats.insert(view_name.to_lowercase(), stats);
+    }
+
+    pub fn shard_stats(&self, view_name: &str) -> Vec<ShardColumnStats> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .shard_stats
+            .get(&view_name.to_lowercase())
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Register a new sink. Returns `false` if a sink with the same name and a

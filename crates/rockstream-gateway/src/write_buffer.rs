@@ -33,6 +33,14 @@ pub enum DmlOp {
     Delete {
         table: String,
         row_key: String,
+        /// Pre-delete row image, captured before the write when a
+        /// `RETURNING` clause was present (v0.48 Slice A4). `None` for a
+        /// plain `DELETE` with no `RETURNING` — the row is gone from
+        /// `view_output` once the `WriteBatch` commits, so this is the only
+        /// point the pre-image can be captured. Never touched by the
+        /// `WriteBatch` construction path; used solely for post-commit
+        /// projection.
+        returning_tsv: Option<String>,
     },
 }
 
@@ -66,7 +74,16 @@ impl DmlOp {
                     + new_tsv.len()
                     + 64
             }
-            DmlOp::Delete { table, row_key } => table.len() + row_key.len() + 32,
+            DmlOp::Delete {
+                table,
+                row_key,
+                returning_tsv,
+            } => {
+                table.len()
+                    + row_key.len()
+                    + returning_tsv.as_ref().map(|s| s.len()).unwrap_or(0)
+                    + 32
+            }
         }
     }
 }
@@ -202,6 +219,50 @@ impl WriteBuffer {
     pub fn len(&self) -> usize {
         self.ops.len()
     }
+
+    /// Resolve the latest row image for `table`/`row_key` within this buffer.
+    ///
+    /// Returns:
+    /// - `None` when the buffer has not touched the row key
+    /// - `Some(Some(tsv))` when the buffer's latest state for the key is a row image
+    /// - `Some(None)` when the buffer deleted the key, or updated it away from this key
+    pub fn current_row_image(&self, table: &str, row_key: &str) -> Option<Option<String>> {
+        for op in self.ops.iter().rev() {
+            match op {
+                DmlOp::Insert {
+                    table: op_table,
+                    values_tsv,
+                    row_key: op_row_key,
+                    ..
+                } if op_table.eq_ignore_ascii_case(table) && op_row_key == row_key => {
+                    return Some(Some(values_tsv.clone()));
+                }
+                DmlOp::Update {
+                    table: op_table,
+                    old_row_key,
+                    new_row_key,
+                    new_tsv,
+                    ..
+                } if op_table.eq_ignore_ascii_case(table) => {
+                    if new_row_key == row_key {
+                        return Some(Some(new_tsv.clone()));
+                    }
+                    if old_row_key == row_key {
+                        return Some(None);
+                    }
+                }
+                DmlOp::Delete {
+                    table: op_table,
+                    row_key: op_row_key,
+                    ..
+                } if op_table.eq_ignore_ascii_case(table) && op_row_key == row_key => {
+                    return Some(None);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 impl Default for WriteBuffer {
@@ -221,6 +282,41 @@ mod tests {
             values_tsv: val.to_string(),
             row_key: format!("id=1|val={val}"),
         }
+    }
+
+    /// v0.48 Slice A4 green gate: `DmlOp::Delete::returning_tsv` (the
+    /// captured pre-image for `DELETE ... RETURNING`) is accounted for in
+    /// `byte_size()`, and stays inside the existing 64 MiB
+    /// `WRITE_BUFFER_LIMIT_BYTES` bound — an existing bounded buffer gains a
+    /// field, not a new unbounded one.
+    #[test]
+    fn write_buffer_accounts_delete_returning_capture_bytes() {
+        let plain_delete = DmlOp::Delete {
+            table: "t".to_string(),
+            row_key: "id=1".to_string(),
+            returning_tsv: None,
+        };
+        let delete_with_capture = DmlOp::Delete {
+            table: "t".to_string(),
+            row_key: "id=1".to_string(),
+            returning_tsv: Some("1\thello\tworld".to_string()),
+        };
+        assert!(
+            delete_with_capture.byte_size() > plain_delete.byte_size(),
+            "captured returning_tsv must increase byte_size over a plain DELETE"
+        );
+        assert_eq!(
+            delete_with_capture.byte_size() - plain_delete.byte_size(),
+            "1\thello\tworld".len(),
+            "byte_size delta must equal the captured tsv's exact length"
+        );
+
+        let mut buf = WriteBuffer::new();
+        buf.push(delete_with_capture).unwrap();
+        assert!(
+            buf.byte_count() < WRITE_BUFFER_LIMIT_BYTES,
+            "a single capture-bearing DELETE must stay far under the named bound"
+        );
     }
 
     /// S1 green gate: basic push/drain/clear cycle.

@@ -151,13 +151,18 @@ pub const RS_2014: ErrorCode = ErrorCode::new(2014);
 pub const RS_2015: ErrorCode = ErrorCode::new(2015);
 /// Index name conflict.
 pub const RS_2016: ErrorCode = ErrorCode::new(2016);
+/// Shard statistics are older than the configured pruning freshness horizon;
+/// the query fell back to a full scatter scan instead of pruning (v0.48).
+/// next_steps: "Wait for the next checkpoint to publish fresh shard_stats or increase shard_stats_max_age_checkpoints."
+pub const RS_2017: ErrorCode = ErrorCode::new(2017);
 /// Published frontier exceeded the session max_staleness bound; query continued with the current frontier (v0.45).
 /// next_steps: "Increase rockstream.max_staleness, reduce publish lag, or switch to session_wait_for mode."
 pub const RS_2018: ErrorCode = ErrorCode::new(2018);
 /// Shard write buffer full — backpressure (v0.24).
 /// next_steps: "Wait for downstream IVM processing to drain, then retry COMMIT."
 pub const RS_2019: ErrorCode = ErrorCode::new(2019);
-/// RETURNING sub-select shape not supported in this context (v0.24).
+/// Transaction RETURNING read-back could not find the expected row at the
+/// current frontier (v0.48, DESIGN.md §13.5.2 `transaction.returning_key_not_found`).
 pub const RS_2013: ErrorCode = ErrorCode::new(2013);
 /// Session wait-for deadline exceeded; query proceeded at current frontier (v0.25).
 /// next_steps: "Increase session_wait_for_timeout or reduce write latency."
@@ -167,6 +172,9 @@ pub const RS_2012: ErrorCode = ErrorCode::new(2012);
 pub const RS_2020: ErrorCode = ErrorCode::new(2020);
 /// COPY FROM STDIN statement is malformed and could not be parsed (v0.45.7).
 pub const RS_2021: ErrorCode = ErrorCode::new(2021);
+/// `UPDATE`/`DELETE ... RETURNING` clause is malformed and could not be
+/// parsed (v0.48, `write.malformed_returning_clause`).
+pub const RS_2022: ErrorCode = ErrorCode::new(2022);
 
 // 24xx: Auth (v0.26)
 /// Unauthenticated: request missing or carrying invalid credentials.
@@ -307,6 +315,9 @@ pub struct ErrorCodeMeta {
 /// Returns a short slug for a known error code (e.g. "auth.unauthenticated").
 pub fn slug(code: ErrorCode) -> &'static str {
     match code.0 {
+        2013 => "transaction.returning_key_not_found",
+        2017 => "shard_stats.too_stale",
+        2022 => "write.malformed_returning_clause",
         2400 => "auth.unauthenticated",
         2401 => "auth.permission_denied",
         2402 => "auth.namespace_access_denied",
@@ -403,10 +414,13 @@ pub fn description(code: ErrorCode) -> &'static str {
         8001 => "Frontier aggregator shard registry is full; new shard reports rejected",
         8002 => "Stale fencing token on frontier-aggregator publisher-lease CAS or publish",
         8003 => "Sync-flush-before-lease-handoff-read violation on frontier publication",
+        2017 => "Shard statistics are too stale for safe pruning; query fell back to a full scatter scan",
         2019 => "Shard write buffer full; backpressure applied",
         2012 => "Session wait-for deadline exceeded; query proceeded at current frontier",
         2020 => "Subscribe consumer fell behind the change-log retention window",
         2021 => "COPY FROM STDIN statement is malformed",
+        2022 => "UPDATE/DELETE RETURNING clause is malformed",
+        2013 => "Transaction RETURNING read-back could not find the row at the current frontier",
         2400 => "Unauthenticated: request missing or carrying invalid credentials",
         2401 => "Permission denied: authenticated principal lacks required RBAC role",
         2402 => "Namespace access denied: cross-namespace access attempt by non-admin principal",
@@ -440,6 +454,7 @@ pub fn severity(code: ErrorCode) -> Severity {
         5018 => Severity::Warning,
         5019 => Severity::Warning,
         6001 => Severity::Warning,
+        2017 => Severity::Warning,
         2018 => Severity::Warning,
         _ => Severity::Error,
     }
@@ -488,8 +503,11 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2014 => "Wait for index backfill to complete.",
         2015 => "Index is too far behind view. Wait for synchronization or increase index_max_lag_ms.",
         2016 => "An index with the same name already exists.",
+        2017 => "Wait for the next checkpoint to publish fresh shard_stats, or increase shard_stats_max_age_checkpoints if this fallback is expected for the workload.",
         2018 => "Increase rockstream.max_staleness, reduce publish lag, or switch to session_wait_for mode.",
         2021 => "Check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)].",
+        2022 => "Check RETURNING syntax; it must be RETURNING * or RETURNING <col>[, <col>...] with no trailing content.",
+        2013 => "Retry the write; if the row is consistently missing, check that the frontier used for the read-back has advanced past the commit epoch.",
         3003 => "Reduce input rate or increase local_buffer_max_epochs; check object store availability.",
         3009 => "Inspect the stored arrangement value; possible data corruption or law version mismatch.",
         3011 => "Object store is rate-limiting requests; reduce shuffle write concurrency or request a higher rate limit/quota from the object store provider.",
@@ -573,17 +591,18 @@ mod tests {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
             RS_1007, RS_1008, RS_1030, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006,
-            RS_2007, RS_2008, RS_2014, RS_2015, RS_2016, RS_2018, RS_2021, RS_3003, RS_3009,
-            RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016, RS_3017, RS_3018, RS_3501,
-            RS_4001, RS_4002, RS_5001, RS_5002, RS_5003, RS_5030, RS_5031, RS_5032, RS_5035,
-            RS_5036, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703,
-            RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017, RS_1012, RS_1013, RS_1014,
-            RS_8001, // v0.21
+            RS_2007, RS_2008, RS_2014, RS_2015, RS_2016, RS_2017, RS_2018, RS_2021, RS_3003,
+            RS_3009, RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016, RS_3017, RS_3018,
+            RS_3501, RS_4001, RS_4002, RS_5001, RS_5002, RS_5003, RS_5030, RS_5031, RS_5032,
+            RS_5035, RS_5036, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701, RS_1702,
+            RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017, RS_1012, RS_1013,
+            RS_1014, RS_8001, // v0.21
             RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_3005, RS_1018, RS_2400, RS_2401,
             RS_2402, // v0.26 auth
             RS_9001, // v0.45.1 admission control
             RS_1731, // v0.45.2 control-plane leader-only write gating (M7-S2)
             RS_8002, RS_8003, // v0.45.6 frontier-lease publisher fencing (M2-S3)
+            RS_2013, RS_2022, // v0.48 UPDATE/DELETE RETURNING (Track A)
         ];
         for code in codes {
             assert_ne!(
@@ -636,5 +655,22 @@ mod tests {
         assert_eq!(severity(RS_5036), Severity::Warning);
         assert!(next_steps(RS_5035).contains("composable partial-state semantics"));
         assert!(next_steps(RS_5036).contains("single spill shard"));
+    }
+
+    #[test]
+    fn advanced_dml_and_scatter_pruning_error_codes_registered() {
+        assert_eq!(RS_2013.value(), 2013);
+        assert_eq!(RS_2017.value(), 2017);
+        assert_eq!(RS_2022.value(), 2022);
+
+        assert_eq!(slug(RS_2013), "transaction.returning_key_not_found");
+        assert_eq!(slug(RS_2017), "shard_stats.too_stale");
+        assert_eq!(slug(RS_2022), "write.malformed_returning_clause");
+
+        assert_eq!(severity(RS_2017), Severity::Warning);
+        assert!(description(RS_2017).contains("too stale"));
+        assert!(next_steps(RS_2017).contains("shard_stats"));
+        assert!(description(RS_2022).contains("RETURNING"));
+        assert!(next_steps(RS_2013).contains("frontier"));
     }
 }

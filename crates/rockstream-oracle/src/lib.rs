@@ -47,6 +47,7 @@ pub mod hot_key_bucket_oracle;
 pub mod join_oracle;
 pub mod minmax_oracle;
 pub mod outer_join_oracle;
+pub mod scatter_pruning_oracle;
 pub mod sql_fuzzer;
 pub mod topk_oracle;
 pub mod tpch_gen;
