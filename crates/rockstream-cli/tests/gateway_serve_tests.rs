@@ -8,6 +8,8 @@
 //! conflict with each other or with a running server.
 
 use rockstream_cli::{start_gateway, StartOptions};
+use rockstream_types::config::RockstreamConfig;
+use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 use tokio_postgres::NoTls;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -18,6 +20,9 @@ fn gateway_opts(dir: &tempfile::TempDir) -> StartOptions {
         role: "gateway".to_string(),
         control: None,
         auth_mode: "off".to_string(),
+        worker_location: WorkerLocation::default(),
+        worker_capabilities: WorkerCapabilities::default(),
+        config: RockstreamConfig::default(),
         metrics_addr: None,
         listen_addr: Some("127.0.0.1:0".to_string()),
         raft_peers: None,
@@ -307,6 +312,9 @@ async fn gateway_invalid_listen_address_returns_rs_0002() {
         role: "gateway".to_string(),
         control: None,
         auth_mode: "off".to_string(),
+        worker_location: WorkerLocation::default(),
+        worker_capabilities: WorkerCapabilities::default(),
+        config: RockstreamConfig::default(),
         metrics_addr: None,
         listen_addr: Some("not-a-valid-address".to_string()),
         raft_peers: None,
@@ -339,6 +347,9 @@ async fn gateway_port_in_use_returns_rs_0003() {
         role: "gateway".to_string(),
         control: None,
         auth_mode: "off".to_string(),
+        worker_location: WorkerLocation::default(),
+        worker_capabilities: WorkerCapabilities::default(),
+        config: RockstreamConfig::default(),
         metrics_addr: None,
         listen_addr: Some(format!("127.0.0.1:{occupied_port}")),
         raft_peers: None,

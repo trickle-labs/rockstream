@@ -1,3 +1,5 @@
+pub mod classifier;
+pub mod compression_tuner;
 pub mod durable;
 pub mod flow_control;
 pub mod loopback;
@@ -6,6 +8,7 @@ pub mod persistence;
 pub mod pool;
 pub mod serialization;
 pub mod service;
+pub mod shared_memory;
 
 /// Re-export generated proto definitions
 pub mod proto {

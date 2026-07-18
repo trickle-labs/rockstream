@@ -63,6 +63,28 @@ pub async fn delete_outbox(
         .map_err(|e| format!("Failed to delete outbox: {:?}", e))
 }
 
+/// Deletes an outbox entry only if it still exists, returning whether a delete happened.
+pub async fn delete_outbox_if_present(
+    db: &ShardDb,
+    exchange_id: u64,
+    target_shard: u32,
+    epoch: u64,
+    seq: u64,
+) -> Result<bool, String> {
+    let key = outbox_key(exchange_id, target_shard, epoch, seq);
+    let exists = db
+        .get(&key)
+        .await
+        .map_err(|e| format!("Failed to read outbox before delete: {:?}", e))?
+        .is_some();
+    if exists {
+        db.delete(&key)
+            .await
+            .map_err(|e| format!("Failed to delete outbox: {:?}", e))?;
+    }
+    Ok(exists)
+}
+
 /// Deletes an inbox entry.
 pub async fn delete_inbox(
     db: &ShardDb,
@@ -122,4 +144,21 @@ pub async fn gc_exchange_storage(db: &ShardDb, up_to_epoch: u64) -> Result<(), S
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn exchange_codec_gc_uses_scan_and_delete_not_range_delete() {
+        let source = std::fs::read_to_string(format!(
+            "{}/src/exchange/persistence.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+        assert!(production.contains("scan_prefix"));
+        assert!(production.contains("batch.delete"));
+        assert!(!production.contains(".range_delete("));
+        assert!(!production.contains("delete_range("));
+    }
 }

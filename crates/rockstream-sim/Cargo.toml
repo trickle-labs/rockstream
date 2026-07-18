@@ -8,7 +8,7 @@ description = "Deterministic simulation harness for RockStream (SimRuntime, bugg
 
 [features]
 default = []
-simulation = []
+simulation = ["rockstream-control/simulation", "rockstream-runtime/simulation"]
 docker_tests = []
 
 [dependencies]
@@ -39,4 +39,4 @@ rockstream-ops = { workspace = true }
 rockstream-connectors = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
-
+tonic = { workspace = true }

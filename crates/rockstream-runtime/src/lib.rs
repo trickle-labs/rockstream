@@ -11,7 +11,9 @@ pub use rockstream_ops::scheduler::CreditScheduler;
 pub use rockstream_ops::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
 
 pub mod client;
-pub use client::{start_worker_client, ShardState, WorkerClientHandle};
+pub use client::{
+    start_worker_client, start_worker_client_with_metadata, ShardState, WorkerClientHandle,
+};
 
 pub mod exchange;
 pub mod migration;

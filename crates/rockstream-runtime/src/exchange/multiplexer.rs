@@ -6,11 +6,16 @@ use std::task::{Context, Poll};
 use futures::{Stream, StreamExt};
 use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
+use rockstream_types::config::ExchangeConfig;
+use rockstream_types::exchange::{
+    ExchangeAnn, ExchangePath, ExchangeTransport, ShuffleCompression,
+};
 use tokio::sync::mpsc;
 
 use crate::exchange::pool::ShuffleClientPool;
 use crate::exchange::proto::ShuffleFrame;
-use rockstream_types::ids::WorkerId;
+use crate::exchange::shared_memory::{ticket, SharedMemorySegmentPool};
+use rockstream_types::ids::{ExchangeId, ShardId, WorkerId};
 
 /// Stream wrapper to adapt mpsc::Receiver to Stream for tonic.
 struct RxStream<T> {
@@ -34,6 +39,8 @@ pub struct WorkerStreamMultiplexer {
     streams: Arc<Mutex<HashMap<WorkerId, mpsc::Sender<ShuffleFrame>>>>,
     object_store: Option<Arc<dyn ObjectStore>>,
     src_worker: Option<WorkerId>,
+    exchange_config: ExchangeConfig,
+    shared_memory: SharedMemorySegmentPool,
 }
 
 impl WorkerStreamMultiplexer {
@@ -49,6 +56,8 @@ impl WorkerStreamMultiplexer {
             streams: Arc::new(Mutex::new(HashMap::new())),
             object_store: None,
             src_worker: None,
+            exchange_config: ExchangeConfig::default(),
+            shared_memory: SharedMemorySegmentPool::new(ExchangeConfig::default()),
         }
     }
 
@@ -67,6 +76,8 @@ impl WorkerStreamMultiplexer {
             streams: Arc::new(Mutex::new(HashMap::new())),
             object_store: None,
             src_worker: None,
+            exchange_config: ExchangeConfig::default(),
+            shared_memory: SharedMemorySegmentPool::new(ExchangeConfig::default()),
         }
     }
 
@@ -79,6 +90,12 @@ impl WorkerStreamMultiplexer {
     /// Add a source worker ID.
     pub fn with_src_worker(mut self, src_worker: WorkerId) -> Self {
         self.src_worker = Some(src_worker);
+        self
+    }
+
+    pub fn with_exchange_config(mut self, exchange_config: ExchangeConfig) -> Self {
+        self.shared_memory = SharedMemorySegmentPool::new(exchange_config.clone());
+        self.exchange_config = exchange_config;
         self
     }
 
@@ -110,6 +127,62 @@ impl WorkerStreamMultiplexer {
         shards.values().map(|state| state.lease.worker_id).next()
     }
 
+    fn classify_route(
+        &self,
+        target_worker: WorkerId,
+        frame: &ShuffleFrame,
+    ) -> crate::exchange::classifier::ResolvedExchangeRoute {
+        let src_worker = self.get_src_worker().unwrap_or(WorkerId(0));
+        let local_worker = self.client_pool.local_worker_info();
+        let peer_worker = self.client_pool.peer_info(target_worker);
+        crate::exchange::classifier::classify_exchange(
+            crate::exchange::classifier::ExchangeClassificationInput {
+                ann: &ExchangeAnn {
+                    exchange_id: ExchangeId(frame.exchange_id),
+                    law_id: None,
+                    source_shard: ShardId(frame.src_shard as u64),
+                    target_shard: ShardId(frame.target_shard as u64),
+                    source_worker: src_worker,
+                    target_worker,
+                    path: if src_worker == target_worker {
+                        ExchangePath::Loopback
+                    } else {
+                        ExchangePath::Direct
+                    },
+                },
+                local_worker: local_worker.as_ref(),
+                peer_worker: peer_worker.as_ref(),
+                receiver_reachable: true,
+                batch_bytes: frame.payload.len(),
+                epoch_exchange_bytes: frame.payload.len() as u64,
+                config: &self.exchange_config,
+            },
+        )
+    }
+
+    fn encode_payload_for_route(
+        &self,
+        target_worker: WorkerId,
+        route: &crate::exchange::classifier::ResolvedExchangeRoute,
+        payload: &[u8],
+    ) -> Result<bytes::Bytes, String> {
+        let codec_capability_floor =
+            matches!(route.path, ExchangePath::Loopback | ExchangePath::Elided)
+                || self
+                    .client_pool
+                    .peer_info(target_worker)
+                    .map(|worker| worker.capabilities.shuffle_codec_v1)
+                    .unwrap_or(false);
+        if matches!(route.compression, ShuffleCompression::None) {
+            return Ok(bytes::Bytes::copy_from_slice(payload));
+        }
+        crate::exchange::serialization::frame_payload_bytes(
+            payload,
+            route.compression,
+            codec_capability_floor,
+        )
+    }
+
     /// Send a frame to a target worker, establishing the stream if necessary.
     /// Falls back to the durable object store path if gRPC connectivity fails.
     pub async fn send_frame(
@@ -117,6 +190,47 @@ impl WorkerStreamMultiplexer {
         target_worker: WorkerId,
         frame: ShuffleFrame,
     ) -> Result<(), String> {
+        let route = self.classify_route(target_worker, &frame);
+        let encoded_payload =
+            self.encode_payload_for_route(target_worker, &route, &frame.payload)?;
+        if matches!(
+            route.transport,
+            ExchangeTransport::Grpc | ExchangeTransport::SharedMemory
+        ) {
+            rockstream_types::metrics::add_shuffle_direct_bytes_total(frame.payload.len() as u64);
+            if matches!(
+                route.locality,
+                crate::exchange::classifier::PeerLocality::CrossAvailabilityZone
+            ) {
+                rockstream_types::metrics::add_shuffle_cross_az_direct_bytes_total(
+                    frame.payload.len() as u64,
+                );
+            }
+        }
+        if encoded_payload.len() < frame.payload.len() {
+            let saved = (frame.payload.len() - encoded_payload.len()) as u64;
+            match route.compression {
+                ShuffleCompression::Lz4 => {
+                    rockstream_types::metrics::add_shuffle_lz4_bytes_saved_total(saved)
+                }
+                ShuffleCompression::Zstd => {
+                    rockstream_types::metrics::add_shuffle_zstd_bytes_saved_total(saved)
+                }
+                ShuffleCompression::None => {}
+            }
+        }
+        let frame = ShuffleFrame {
+            payload: encoded_payload.into(),
+            ..frame
+        };
+        if route.metadata_fallback {
+            tracing::warn!(
+                code = %rockstream_types::error_code::RS_3021,
+                exchange_id = frame.exchange_id,
+                target_worker = %target_worker,
+                "exchange route used safe fallback because worker locality metadata was unavailable"
+            );
+        }
         // Persist to outbox if source shard db is active on this worker
         if let Some(db) = self.get_shard_db(frame.src_shard) {
             crate::exchange::persistence::persist_outbox(
@@ -132,21 +246,54 @@ impl WorkerStreamMultiplexer {
 
         let mut fast_path_ok = false;
 
-        let tx_opt = {
-            let streams = self.streams.lock();
-            streams.get(&target_worker).cloned()
-        };
-
-        if let Some(tx) = tx_opt {
-            if tx.send(frame.clone()).await.is_ok() {
-                fast_path_ok = true;
-            } else {
-                // Connection was broken, remove it from cached streams
-                self.streams.lock().remove(&target_worker);
+        if matches!(route.transport, ExchangeTransport::SharedMemory) {
+            match self.send_shared_memory_frame(target_worker, &frame).await {
+                Ok(ack) => {
+                    self.flow_controller.handle_ack(&ack);
+                    if let Some(db) = self.get_shard_db(ack.src_shard) {
+                        let _ = crate::exchange::persistence::delete_outbox_if_present(
+                            &db,
+                            ack.exchange_id,
+                            ack.target_shard,
+                            ack.epoch,
+                            ack.seq,
+                        )
+                        .await;
+                    }
+                    fast_path_ok = true;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        code = %rockstream_types::error_code::RS_3019,
+                        target_worker = %target_worker,
+                        error = %error,
+                        "shared-memory exchange failed; falling back to gRPC"
+                    );
+                }
             }
         }
 
         if !fast_path_ok {
+            let tx_opt = {
+                let streams = self.streams.lock();
+                streams.get(&target_worker).cloned()
+            };
+
+            if let Some(tx) = tx_opt {
+                if tx.send(frame.clone()).await.is_ok() {
+                    fast_path_ok = true;
+                } else {
+                    self.streams.lock().remove(&target_worker);
+                }
+            }
+        }
+
+        if !fast_path_ok
+            && matches!(
+                route.transport,
+                ExchangeTransport::Grpc | ExchangeTransport::SharedMemory
+            )
+        {
             // Attempt to connect or send via client pool
             match self.client_pool.get_client(target_worker).await {
                 Ok(mut client) => {
@@ -166,7 +313,7 @@ impl WorkerStreamMultiplexer {
                                             if let Some(db) = self_clone.get_shard_db(ack.src_shard)
                                             {
                                                 let _ =
-                                                    crate::exchange::persistence::delete_outbox(
+                                                    crate::exchange::persistence::delete_outbox_if_present(
                                                         &db,
                                                         ack.exchange_id,
                                                         ack.target_shard,
@@ -209,9 +356,10 @@ impl WorkerStreamMultiplexer {
             }
         }
 
-        if !fast_path_ok {
+        if !fast_path_ok || matches!(route.transport, ExchangeTransport::DurableObject) {
             tracing::info!(
-                "gRPC connection to {:?} failed or unavailable. Falling back to durable shuffle.",
+                transport = ?route.transport,
+                "shuffle fast path to {:?} unavailable or bypassed; falling back to durable shuffle.",
                 target_worker
             );
 
@@ -313,6 +461,38 @@ impl WorkerStreamMultiplexer {
         }
 
         Ok(())
+    }
+
+    async fn send_shared_memory_frame(
+        &self,
+        target_worker: WorkerId,
+        frame: &ShuffleFrame,
+    ) -> Result<crate::exchange::proto::ShuffleAck, String> {
+        let shm_ticket = self.shared_memory.publish(target_worker, frame)?;
+        match self
+            .client_pool
+            .get_shared_memory_client(target_worker)
+            .await
+        {
+            Ok(client) => match client.deliver(ticket(&shm_ticket)?).await {
+                Ok(response) => {
+                    self.shared_memory
+                        .release_usage(target_worker, frame.payload.len());
+                    Ok(response)
+                }
+                Err(error) => {
+                    self.shared_memory.revoke(target_worker, &shm_ticket);
+                    Err(format!(
+                        "[{}] flight do_get failed: {error}",
+                        rockstream_types::error_code::RS_3019
+                    ))
+                }
+            },
+            Err(error) => {
+                self.shared_memory.revoke(target_worker, &shm_ticket);
+                Err(error)
+            }
+        }
     }
 
     /// Pull and process durable shuffle frames for a given exchange, epoch, and sender worker.

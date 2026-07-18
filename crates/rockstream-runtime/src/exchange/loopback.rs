@@ -4,12 +4,16 @@ use std::sync::Arc;
 
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_storage::shard_db::ShardDb;
+use rockstream_types::config::ExchangeConfig;
+use rockstream_types::exchange::{ExchangeAnn, ExchangePath, ExchangeTransport};
 use rockstream_types::ids::ShardId;
+use rockstream_types::ids::{ExchangeId, WorkerId};
 
 use crate::client::ShardState;
 use crate::exchange::persistence::{delete_outbox, persist_inbox, persist_outbox};
-use crate::exchange::serialization::{deserialize_zset, serialize_zset};
+use crate::exchange::serialization::{deserialize_zset, serialize_zset_with_compression};
 use crate::exchange::service::ExchangeRegistry;
+use rockstream_types::exchange::ShuffleCompression;
 
 /// Routes exchange batches locally within the same worker process.
 #[derive(Clone)]
@@ -58,11 +62,38 @@ impl LoopbackRouter {
         seq: u64,
         zset: &ArrowZSet,
     ) -> Result<(), String> {
+        let route = crate::exchange::classifier::classify_exchange(
+            crate::exchange::classifier::ExchangeClassificationInput {
+                ann: &ExchangeAnn {
+                    exchange_id: ExchangeId(exchange_id),
+                    law_id: None,
+                    source_shard: ShardId(src_shard as u64),
+                    target_shard: ShardId(target_shard as u64),
+                    source_worker: WorkerId(0),
+                    target_worker: WorkerId(0),
+                    path: ExchangePath::Loopback,
+                },
+                local_worker: None,
+                peer_worker: None,
+                receiver_reachable: true,
+                batch_bytes: 0,
+                epoch_exchange_bytes: 0,
+                config: &ExchangeConfig::default(),
+            },
+        );
+        if route.transport != ExchangeTransport::InProcess {
+            return Err(format!(
+                "[{}] loopback exchange {} classified to unexpected transport {:?}",
+                rockstream_types::error_code::RS_3018,
+                exchange_id,
+                route.transport
+            ));
+        }
         let src_db = self.get_db(ShardId(src_shard as u64))?;
         let target_db = self.get_db(ShardId(target_shard as u64))?;
 
         // 1. Serialize payload to bytes (Arrow IPC)
-        let payload = serialize_zset(zset)?;
+        let payload = serialize_zset_with_compression(zset, ShuffleCompression::Lz4, true)?;
 
         // 2. Persist to outbox on the source shard db
         persist_outbox(&src_db, exchange_id, target_shard, epoch, seq, &payload).await?;

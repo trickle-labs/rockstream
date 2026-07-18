@@ -1644,6 +1644,18 @@ The planner annotates each exchange edge with the expected path at `EXPLAIN
 INCREMENTAL` time based on operator cardinality estimates. Actual path
 selection is re-evaluated per batch at runtime.
 
+#### v0.49 locality/capability-gated route classifier
+
+**Ships**: v0.49
+
+The runtime classifier consumes the planner's existing `ExchangeAnn`, worker
+`host_id` / `availability_zone` metadata, capability bits, reachability, and
+the `exchange_*` thresholds above. `Elided` and `Loopback` remain hard planner
+constraints; `Direct` is refined to same-host shared memory or same-AZ gRPC,
+and cross-AZ traffic is forced onto the durable object-store path. Missing or
+stale locality metadata never drops traffic: the classifier emits an operator
+warning and falls back to the safe legacy-compatible route.
+
 ### 7.3 Outbox & Inbox Encoding
 
 ```
@@ -1703,6 +1715,27 @@ Arrow batches across domains, and the destination domain fans into target
 workers. The hierarchy is a transport optimization only: every frame still
 carries `(exchange_id, src_shard, target_shard, epoch, seq)`, and replay uses
 the same outbox/inbox idempotency keys.
+
+#### v0.49 same-host shared-memory fast path
+
+**Ships**: v0.49
+
+When two different worker processes advertise the same-host Arrow SHM
+capability and share a `host_id`, the classifier selects a bounded shared-memory
+transport ahead of gRPC. The zero-copy segment is only a transport optimization:
+the canonical outbox/inbox bytes are still written and ACK semantics stay
+identical to the existing direct path. Segment allocation, pool exhaustion, or
+handshake failure logs a registered error code and falls back once to gRPC.
+
+#### v0.49 AZ-aware hierarchical domains
+
+**Ships**: v0.49
+
+`exchange_domain_size` domains are built inside each availability zone as
+`(availability_zone, domain_idx)` rather than as one flat global worker set.
+Same-AZ peers may stay on the direct path, but cross-AZ worker-to-worker
+traffic is routed through the durable object-store path so wide shuffles avoid
+opening steady-state cross-AZ gRPC payload streams.
 
 ---
 
@@ -2334,9 +2367,16 @@ Every `T` seconds (or every `N` epochs), the control plane runs a
    excessive waiting into `RECOVERING` or `BLOCKED`, never unbounded memory.
 5. When all shards have reported, the control plane commits the cluster
    checkpoint atomically: writes `control: checkpoints/{checkpoint_id}` with the
-   full map of per-shard checkpoints.
+   full map of per-shard checkpoints. **Ships**: v0.49 — the
+   `CheckpointManifestStore` decode path remains backward-compatible with legacy
+   plain JSON manifests during rolling upgrade, then switches writes to a
+   ZSTD-framed manifest once the control-plane capability floor advertises
+   `checkpoint_manifest_codec_v1`.
 6. Old cluster checkpoints (beyond the retention horizon) are released, allowing
-   SlateDB GC to reclaim SSTs.
+   SlateDB GC to reclaim SSTs. **Ships**: v0.49 — manifest retention is
+   implemented as point `put` + explicit scan/delete of old
+   `control: checkpoints/` objects; no SlateDB or object-store range delete is
+   required.
 
 ### 11.3 Recovery
 
@@ -2344,7 +2384,9 @@ To recover the cluster:
 1. Pick the latest committed cluster checkpoint.
 2. Open every shard's `DbReader` pinned to its recorded checkpoint.
 3. Each worker brings up its assigned shards as writers, starting from the
-   checkpointed state.
+   checkpointed state. **Ships**: v0.49 — recovery accepts both legacy JSON and
+   ZSTD-framed cluster manifests from `control: checkpoints/`, so mixed-version
+   clusters stay restart-safe throughout the upgrade.
 4. Source connectors resume from offsets recorded in `control: connector/`.
 5. Frontiers held in the checkpoint resume; processing continues.
 

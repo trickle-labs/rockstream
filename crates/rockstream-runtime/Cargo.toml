@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Worker process, scheduler, epoch-commit coordinator, and exchange for RockStream"
 
+[features]
+simulation = ["rockstream-sim/simulation"]
+
 [[bench]]
 name = "exchange_bench"
 harness = false
@@ -23,9 +26,13 @@ object_store = { workspace = true }
 prost = { workspace = true }
 tonic = { workspace = true }
 arrow = { workspace = true }
+arrow-flight = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
+rockstream-sim = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -35,7 +42,6 @@ protoc-bin-vendored = "3"
 [dev-dependencies]
 rockstream-control = { workspace = true }
 rockstream-cli = { workspace = true }
-rockstream-sim = { workspace = true }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true, features = ["minio"] }

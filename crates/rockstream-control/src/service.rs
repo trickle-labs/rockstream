@@ -438,13 +438,40 @@ async fn request_worker_drain(
         .filter(|lease| lease.worker_id == worker_id)
         .map(|lease| lease.shard_id)
         .collect();
-    let recipients = catalog.healthy_workers();
+    let (recipients, preferred_az) = {
+        #[cfg(feature = "simulation")]
+        {
+            let mut recipients = catalog.healthy_workers();
+            let mut preferred_az = worker.location.availability_zone.clone();
+            if rockstream_sim::buggify!("exchange.domain_rebuild_during_drain", 1.0) {
+                tokio::task::yield_now().await;
+                recipients = catalog.healthy_workers();
+                preferred_az = catalog
+                    .get(worker_id)
+                    .map(|current| current.location.availability_zone)
+                    .unwrap_or(preferred_az);
+            }
+            (recipients, preferred_az)
+        }
+        #[cfg(not(feature = "simulation"))]
+        {
+            (
+                catalog.healthy_workers(),
+                worker.location.availability_zone.clone(),
+            )
+        }
+    };
     let mut chosen = Vec::with_capacity(shards.len());
     for shard_id in &shards {
-        let Some(recipient) = recipients
+        let eligible: Vec<_> = recipients
             .iter()
-            .find(|candidate| candidate.worker_id != worker_id)
-        else {
+            .filter(|candidate| candidate.worker_id != worker_id)
+            .cloned()
+            .collect();
+        let Some(recipient) = crate::placement::PlacementAlgorithm::choose_with_preference(
+            &eligible,
+            Some(&preferred_az),
+        ) else {
             return Err(DrainFailure::new(
                 RS_3611,
                 format!("worker {worker_id} cannot drain shard {shard_id}: no active recipient worker is available"),
@@ -661,6 +688,8 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                 tracing::info!(
                     worker_id = %worker_id,
                     address = %reg.address,
+                    host_id = %reg.location.host_id,
+                    availability_zone = %reg.location.availability_zone,
                     headroom = %reg.capacity_headroom,
                     "control: worker registered"
                 );
@@ -668,8 +697,14 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                     let event =
                         AuditEvent::now("control", "worker.registered", worker_id.to_string())
                             .with_detail(format!(
-                                "address={}, headroom={}",
-                                reg.address, reg.capacity_headroom
+                                "address={}, host_id={}, availability_zone={}, headroom={}, same_host_arrow_shm_v1={}, shuffle_codec_v1={}, checkpoint_manifest_codec_v1={}",
+                                reg.address,
+                                reg.location.host_id,
+                                reg.location.availability_zone,
+                                reg.capacity_headroom,
+                                reg.capabilities.same_host_arrow_shm_v1,
+                                reg.capabilities.shuffle_codec_v1,
+                                reg.capabilities.checkpoint_manifest_codec_v1
                             ));
                     let _ = aud.append(&event);
                 }
@@ -1049,7 +1084,7 @@ mod tests {
     use crate::topology::TopologyCatalog;
     use rockstream_types::ids::WorkerId;
     use rockstream_types::topology::{
-        CapacityHeadroom, NodeRole, RaftRoleWire, WorkerMessage, WorkerRegistration,
+        CapacityHeadroom, NodeRole, RaftRoleWire, WorkerLocation, WorkerMessage, WorkerRegistration,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
@@ -1068,6 +1103,21 @@ mod tests {
         let mut resp = String::new();
         reader.read_line(&mut resp).await.unwrap();
         resp
+    }
+
+    fn registration_with_location(
+        worker_id: u64,
+        headroom: f64,
+        host: &str,
+        az: &str,
+    ) -> WorkerRegistration {
+        WorkerRegistration::new(
+            WorkerId(worker_id),
+            NodeRole::Worker,
+            format!("127.0.0.1:{}", 7000 + worker_id),
+            CapacityHeadroom::new(headroom),
+        )
+        .with_location(WorkerLocation::new(host, az))
     }
 
     #[tokio::test]
@@ -1692,5 +1742,33 @@ mod tests {
 
         handle_b.shutdown();
         node_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn drain_prefers_same_az_recipient_before_cross_az() {
+        let catalog = TopologyCatalog::new();
+        let shard_manager = ShardManager::new();
+        catalog.register(&registration_with_location(1, 0.9, "host-a", "az-1"));
+        catalog.register(&registration_with_location(2, 0.9, "host-b", "az-2"));
+        catalog.register(&registration_with_location(3, 0.9, "host-c", "az-1"));
+        shard_manager
+            .acquire(rockstream_types::ids::ShardId(7), WorkerId(1))
+            .unwrap();
+        let drain_state = Arc::new(AsyncMutex::new(DrainState::default()));
+
+        let _ = request_worker_drain(
+            &catalog,
+            &shard_manager,
+            None,
+            None,
+            &drain_state,
+            WorkerId(1),
+        )
+        .await
+        .unwrap();
+
+        let guard = drain_state.lock().await;
+        assert_eq!(guard.queue.len(), 1);
+        assert_eq!(guard.queue[0].recipient_worker_id, WorkerId(3));
     }
 }

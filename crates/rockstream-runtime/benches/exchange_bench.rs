@@ -16,9 +16,15 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{BatchSize, Criterion, Throughput};
 use rockstream_ops::zset::ArrowZSet;
+use rockstream_runtime::exchange::compression_tuner::CompressionTuner;
 use rockstream_runtime::exchange::flow_control::FlowController;
 use rockstream_runtime::exchange::proto::ShuffleAck;
-use rockstream_runtime::exchange::serialization::{deserialize_zset, serialize_zset};
+use rockstream_runtime::exchange::serialization::{
+    deserialize_zset, frame_payload_bytes, serialize_zset,
+};
+use rockstream_types::config::{AutotunerConfig, ExchangeConfig};
+use rockstream_types::exchange::ShuffleCompression;
+use rockstream_types::ids::ExchangeId;
 use tokio::runtime::Runtime;
 
 /// Representative shuffle-batch row count (mirrors `perf_regression.rs`'s
@@ -42,6 +48,24 @@ fn make_kv_batch(rows: usize) -> ArrowZSet {
     )
     .unwrap();
     ArrowZSet::new(data, weights)
+}
+
+fn make_wide_shuffle_batch(rows: usize) -> ArrowZSet {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let k_vals = vec![17_i64; rows];
+    let v_vals: Vec<i64> = (0..rows as i64).map(|i| i % 8).collect();
+    let data = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(k_vals)),
+            Arc::new(Int64Array::from(v_vals)),
+        ],
+    )
+    .unwrap();
+    ArrowZSet::new(data, vec![1; rows])
 }
 
 fn bench_serialize_zset(c: &mut Criterion) {
@@ -93,6 +117,52 @@ fn bench_flow_control_credit_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_transport_codec_claims(c: &mut Criterion) {
+    let batch = make_wide_shuffle_batch(SHUFFLE_BATCH_ROWS * 2);
+    let raw = serialize_zset(&batch).unwrap();
+
+    let mut group = c.benchmark_group("exchange_transport_claims");
+    group.throughput(Throughput::Bytes(raw.len() as u64));
+    group.bench_function("direct_raw_baseline", |b| {
+        b.iter(|| serialize_zset(&batch).unwrap());
+    });
+    group.bench_function("direct_lz4_codec_v1", |b| {
+        b.iter(|| frame_payload_bytes(&raw, ShuffleCompression::Lz4, true).unwrap());
+    });
+    group.bench_function("durable_zstd_codec_v1", |b| {
+        b.iter(|| frame_payload_bytes(&raw, ShuffleCompression::Zstd, true).unwrap());
+    });
+    group.finish();
+}
+
+fn measure_direct_lz4_epoch_cpu_ms(payload: &[u8], epochs: usize) -> u64 {
+    let started = std::time::Instant::now();
+    for _ in 0..epochs {
+        let framed = frame_payload_bytes(payload, ShuffleCompression::Lz4, true).unwrap();
+        criterion::black_box(framed);
+    }
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    (elapsed_ms / epochs as f64).ceil() as u64
+}
+
+fn bench_direct_lz4_epoch_cpu_budget(c: &mut Criterion) {
+    let batch = make_wide_shuffle_batch(SHUFFLE_BATCH_ROWS * 2);
+    let raw = serialize_zset(&batch).unwrap();
+    let exchange = ExchangeConfig::default();
+    let autotuner = AutotunerConfig::default();
+
+    let mut group = c.benchmark_group("exchange_bench_direct_lz4_epoch_cpu_budget");
+    group.throughput(Throughput::Bytes(raw.len() as u64));
+    group.bench_function("direct_lz4_epoch_cpu_ms", |b| {
+        b.iter(|| {
+            let cpu_ms = measure_direct_lz4_epoch_cpu_ms(&raw, 8);
+            let tuner = CompressionTuner::new(exchange.clone(), autotuner.clone());
+            criterion::black_box(tuner.decide(ExchangeId(7), ShuffleCompression::Lz4, cpu_ms))
+        });
+    });
+    group.finish();
+}
+
 fn default_criterion_dir() -> PathBuf {
     rockstream_ops::bench_regression::default_criterion_dir(env!("CARGO_MANIFEST_DIR"))
 }
@@ -102,6 +172,8 @@ fn main() {
     bench_serialize_zset(&mut criterion);
     bench_deserialize_zset(&mut criterion);
     bench_flow_control_credit_throughput(&mut criterion);
+    bench_transport_codec_claims(&mut criterion);
+    bench_direct_lz4_epoch_cpu_budget(&mut criterion);
     criterion.final_summary();
 
     let summary = rockstream_ops::bench_regression::collect_criterion_summary(
@@ -110,6 +182,8 @@ fn main() {
             "exchange_serialize_zset",
             "exchange_deserialize_zset",
             "exchange_flow_control",
+            "exchange_transport_claims",
+            "exchange_bench_direct_lz4_epoch_cpu_budget",
         ],
     );
     println!(

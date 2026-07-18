@@ -12,8 +12,11 @@
 //! actionable `next_steps` text (see [`CliError`]).
 
 use rockstream_types::audit::AuditEvent;
+use rockstream_types::config::RockstreamConfig;
 use rockstream_types::error_code::{ErrorCode, RS_0002, RS_0003};
-use rockstream_types::topology::{ControlMessage, WorkerMessage};
+use rockstream_types::topology::{
+    ControlMessage, WorkerCapabilities, WorkerLocation, WorkerMessage,
+};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,6 +78,12 @@ pub struct StartOptions {
     pub control: Option<String>,
     /// Authentication mode: "off", "oidc", or "mtls".
     pub auth_mode: String,
+    /// Worker locality metadata.
+    pub worker_location: WorkerLocation,
+    /// Worker exchange/checkpoint capability advertisement.
+    pub worker_capabilities: WorkerCapabilities,
+    /// Effective Rockstream configuration for this process.
+    pub config: RockstreamConfig,
     /// Optional metrics server listen address.
     pub metrics_addr: Option<String>,
     /// PostgreSQL wire gateway listen address.
@@ -541,9 +550,15 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
 
         if opts.role == "worker" || opts.role == "all" {
             let url = control_url.as_deref().unwrap_or("127.0.0.1:8000");
-            let (client, handle) = rockstream_runtime::start_worker_client(1, url, &opts.storage)
-                .await
-                .unwrap();
+            let (client, handle) = rockstream_runtime::start_worker_client_with_metadata(
+                1,
+                url,
+                &opts.storage,
+                opts.worker_location.clone(),
+                opts.worker_capabilities,
+            )
+            .await
+            .unwrap();
 
             if opts.role == "all" {
                 // Wait for worker registration handshake
@@ -867,6 +882,9 @@ mod tests {
             role: "all".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -913,6 +931,9 @@ mod tests {
             role: "all".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -935,6 +956,9 @@ mod tests {
             role: "worker".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -959,6 +983,9 @@ mod tests {
             role: "gateway".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -983,6 +1010,9 @@ mod tests {
             role: "frontier".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
             metrics_addr: None,
             listen_addr: None,
             raft_peers: None,
@@ -1027,6 +1057,9 @@ mod tests {
                 role: "control".to_string(),
                 control: None,
                 auth_mode: "off".to_string(),
+                worker_location: WorkerLocation::default(),
+                worker_capabilities: WorkerCapabilities::default(),
+                config: RockstreamConfig::default(),
                 metrics_addr: None,
                 listen_addr: None,
                 raft_peers: None,
@@ -1050,6 +1083,9 @@ mod tests {
                 role: "control".to_string(),
                 control: None,
                 auth_mode: "off".to_string(),
+                worker_location: WorkerLocation::default(),
+                worker_capabilities: WorkerCapabilities::default(),
+                config: RockstreamConfig::default(),
                 metrics_addr: None,
                 listen_addr: None,
                 raft_peers: Some(String::new()),
@@ -1076,6 +1112,9 @@ mod tests {
             role: "control".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
             metrics_addr: None,
             listen_addr: None,
             raft_peers: Some(String::new()),
@@ -1101,6 +1140,9 @@ mod tests {
             role: "control".to_string(),
             control: None,
             auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
             metrics_addr: None,
             listen_addr: None,
             raft_peers: Some(String::new()),

@@ -7,6 +7,8 @@
 use rockstream_types::ids::WorkerId;
 use rockstream_types::topology::WorkerInfo;
 
+const HEADROOM_NEAR_TIE_EPSILON: f64 = 0.01;
+
 /// Result of a placement decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementDecision {
@@ -27,12 +29,31 @@ impl PlacementAlgorithm {
     ///
     /// Returns `None` if `candidates` is empty.
     pub fn choose(candidates: &[WorkerInfo]) -> Option<&WorkerInfo> {
+        Self::choose_with_preference(candidates, None)
+    }
+
+    pub fn choose_with_preference<'a>(
+        candidates: &'a [WorkerInfo],
+        preferred_az: Option<&str>,
+    ) -> Option<&'a WorkerInfo> {
         candidates.iter().max_by(|a, b| {
-            // Compare headroom (higher is better), break ties by worker_id
-            // (lower is better for determinism).
-            let ha = (a.capacity_headroom.fraction() * 1_000_000.0) as u64;
-            let hb = (b.capacity_headroom.fraction() * 1_000_000.0) as u64;
-            ha.cmp(&hb).then_with(|| b.worker_id.0.cmp(&a.worker_id.0))
+            let ha = a.capacity_headroom.fraction();
+            let hb = b.capacity_headroom.fraction();
+            let same_preference = |worker: &WorkerInfo| {
+                preferred_az
+                    .filter(|az| !az.is_empty())
+                    .is_some_and(|az| worker.location.availability_zone == az)
+            };
+            let near_tie = (ha - hb).abs() <= HEADROOM_NEAR_TIE_EPSILON;
+            if near_tie {
+                same_preference(a)
+                    .cmp(&same_preference(b))
+                    .then_with(|| b.worker_id.0.cmp(&a.worker_id.0))
+            } else {
+                let ha = (ha * 1_000_000.0) as u64;
+                let hb = (hb * 1_000_000.0) as u64;
+                ha.cmp(&hb).then_with(|| b.worker_id.0.cmp(&a.worker_id.0))
+            }
         })
     }
 
@@ -56,15 +77,22 @@ mod tests {
     use super::*;
     use rockstream_types::ids::WorkerId;
     use rockstream_types::topology::{
-        CapacityHeadroom, NodeRole, WorkerInfo, WorkerLifecycleState,
+        CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
+        WorkerLocation,
     };
 
     fn make_worker(id: u64, headroom: f64) -> WorkerInfo {
+        make_worker_in_az(id, headroom, "")
+    }
+
+    fn make_worker_in_az(id: u64, headroom: f64, az: &str) -> WorkerInfo {
         WorkerInfo {
             worker_id: WorkerId(id),
             role: NodeRole::Worker,
             address: format!("127.0.0.1:{}", 7000 + id),
             capacity_headroom: CapacityHeadroom::new(headroom),
+            location: WorkerLocation::new(format!("host-{id}"), az),
+            capabilities: WorkerCapabilities::default(),
             registered_at_ms: 0,
             healthy: true,
             lifecycle: WorkerLifecycleState::Active,
@@ -124,5 +152,15 @@ mod tests {
         let workers = vec![make_worker(10, 0.1), make_worker(20, 0.95)];
         let chosen = PlacementAlgorithm::choose(&workers).unwrap();
         assert_eq!(chosen.worker_id, WorkerId(20));
+    }
+
+    #[test]
+    fn placement_prefers_same_az_on_headroom_tie() {
+        let workers = vec![
+            make_worker_in_az(1, 0.80, "az-1"),
+            make_worker_in_az(2, 0.805, "az-2"),
+        ];
+        let chosen = PlacementAlgorithm::choose_with_preference(&workers, Some("az-1")).unwrap();
+        assert_eq!(chosen.worker_id, WorkerId(1));
     }
 }

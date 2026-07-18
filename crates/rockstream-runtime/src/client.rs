@@ -19,7 +19,8 @@ use tokio::time::sleep;
 use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
 use rockstream_types::lease::ShardLease;
 use rockstream_types::topology::{
-    CapacityHeadroom, ControlMessage, NodeRole, WorkerMessage, WorkerRegistration,
+    CapacityHeadroom, ControlMessage, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLocation,
+    WorkerMessage, WorkerRegistration,
 };
 
 use rockstream_storage::ShardDb;
@@ -35,6 +36,7 @@ pub struct ShardState {
 pub struct WorkerClientHandle {
     worker_id: Arc<RwLock<Option<WorkerId>>>,
     active_shards: Arc<RwLock<HashMap<ShardId, ShardState>>>,
+    topology_workers: Arc<RwLock<HashMap<WorkerId, WorkerInfo>>>,
     msg_tx: mpsc::Sender<WorkerMessage>,
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
@@ -61,6 +63,11 @@ impl WorkerClientHandle {
             .values()
             .map(|s| s.lease.clone())
             .collect()
+    }
+
+    /// Latest topology snapshot advertised by the control plane.
+    pub fn topology_snapshot(&self) -> Vec<WorkerInfo> {
+        self.topology_workers.read().values().cloned().collect()
     }
 
     /// Send a request to acquire a shard lease.
@@ -118,17 +125,38 @@ pub async fn start_worker_client(
     control_url: &str,
     storage_dir: &Path,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_metadata(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        WorkerLocation::default(),
+        WorkerCapabilities::default(),
+    )
+    .await
+}
+
+/// Connect to the control plane and start the worker client daemon loop with
+/// explicit locality/capability metadata.
+pub async fn start_worker_client_with_metadata(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
     let stream = TcpStream::connect(control_url).await?;
     let (reader, mut writer) = stream.into_split();
 
     let worker_id = Arc::new(RwLock::new(None));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
+    let topology_workers = Arc::new(RwLock::new(HashMap::new()));
     let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMessage>(32);
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     let handle = WorkerClientHandle {
         worker_id: worker_id.clone(),
         active_shards: active_shards.clone(),
+        topology_workers: topology_workers.clone(),
         msg_tx: msg_tx.clone(),
         fence_waiters: fence_waiters.clone(),
     };
@@ -145,7 +173,9 @@ pub async fn start_worker_client(
             NodeRole::Worker,
             "127.0.0.1:0", // Default loopback
             CapacityHeadroom::FULL,
-        );
+        )
+        .with_location(location.clone())
+        .with_capabilities(capabilities);
         let reg_msg = WorkerMessage::Register(reg);
         let reg_line = serde_json::to_string(&reg_msg).unwrap() + "\n";
         if let Err(e) = writer.write_all(reg_line.as_bytes()).await {
@@ -229,6 +259,11 @@ pub async fn start_worker_client(
                 ControlMessage::Registered { worker_id: wid } => {
                     tracing::info!("Worker client registered successfully as {:?}", wid);
                     *worker_id_clone.write() = Some(wid);
+                }
+                ControlMessage::TopologyChanged { workers } => {
+                    let mut topology = topology_workers.write();
+                    topology.clear();
+                    topology.extend(workers.into_iter().map(|worker| (worker.worker_id, worker)));
                 }
                 ControlMessage::ShardAssigned { lease } => {
                     tracing::info!("Received ShardAssigned lease for {:?}", lease.shard_id);

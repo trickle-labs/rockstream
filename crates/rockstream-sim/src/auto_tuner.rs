@@ -35,6 +35,9 @@ pub struct AutoTuner {
     down_window_count: usize,
     // throttle state
     lag_above_threshold_epochs: u64,
+    compression_disabled: bool,
+    compression_over_budget_windows: usize,
+    compression_under_budget_windows: usize,
 }
 
 impl AutoTuner {
@@ -49,6 +52,9 @@ impl AutoTuner {
             up_window_count: 0,
             down_window_count: 0,
             lag_above_threshold_epochs: 0,
+            compression_disabled: false,
+            compression_over_budget_windows: 0,
+            compression_under_budget_windows: 0,
         }
     }
 
@@ -74,6 +80,9 @@ impl AutoTuner {
             up_window_count: 0,
             down_window_count: 0,
             lag_above_threshold_epochs: 0,
+            compression_disabled: false,
+            compression_over_budget_windows: 0,
+            compression_under_budget_windows: 0,
         }
     }
 
@@ -211,6 +220,30 @@ impl AutoTuner {
         debug_assert!(new_throttle > 0, "throttle must never be 0");
         new_throttle
     }
+
+    pub fn adjust_direct_compression(&mut self, compression_cpu_ms: u64) -> bool {
+        if compression_cpu_ms > self.config.direct_compression_cpu_budget_ms {
+            self.compression_over_budget_windows =
+                self.compression_over_budget_windows.saturating_add(1);
+            self.compression_under_budget_windows = 0;
+            if self.compression_over_budget_windows
+                >= self.config.compression_disable_hysteresis_windows
+            {
+                self.compression_disabled = true;
+            }
+        } else {
+            self.compression_under_budget_windows =
+                self.compression_under_budget_windows.saturating_add(1);
+            self.compression_over_budget_windows = 0;
+            if self.compression_disabled
+                && self.compression_under_budget_windows
+                    >= self.config.compression_reenable_hysteresis_windows
+            {
+                self.compression_disabled = false;
+            }
+        }
+        !self.compression_disabled
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +294,9 @@ mod tests {
             min_parallelism: 1,
             max_parallelism: 32,
             enabled: true,
+            direct_compression_cpu_budget_ms: 5,
+            compression_disable_hysteresis_windows: 2,
+            compression_reenable_hysteresis_windows: 4,
         };
         let mut tuner = AutoTuner::new(config);
 

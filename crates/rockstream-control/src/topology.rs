@@ -249,7 +249,9 @@ impl TopologyPersistentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rockstream_types::topology::{CapacityHeadroom, NodeRole, WorkerRegistration};
+    use rockstream_types::topology::{
+        CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerLocation, WorkerRegistration,
+    };
 
     fn make_reg(id: u64, headroom: f64) -> WorkerRegistration {
         WorkerRegistration::new(
@@ -258,6 +260,15 @@ mod tests {
             format!("127.0.0.1:{}", 7000 + id),
             CapacityHeadroom::new(headroom),
         )
+        .with_location(WorkerLocation::new(
+            format!("host-{id}"),
+            format!("az-{}", id % 2),
+        ))
+        .with_capabilities(WorkerCapabilities {
+            same_host_arrow_shm_v1: true,
+            shuffle_codec_v1: true,
+            checkpoint_manifest_codec_v1: id.is_multiple_of(2),
+        })
     }
 
     #[test]
@@ -271,6 +282,9 @@ mod tests {
         assert_eq!(info.address, "127.0.0.1:7001");
         assert!(info.healthy);
         assert_eq!(info.capacity_headroom.fraction(), 0.8);
+        assert_eq!(info.location.host_id, "host-1");
+        assert_eq!(info.location.availability_zone, "az-1");
+        assert!(info.capabilities.same_host_arrow_shm_v1);
     }
 
     #[test]
@@ -326,10 +340,33 @@ mod tests {
             NodeRole::Worker,
             "127.0.0.1:7003",
             CapacityHeadroom::new(0.95),
-        );
+        )
+        .with_location(WorkerLocation::new("host-3b", "az-1"))
+        .with_capabilities(WorkerCapabilities {
+            same_host_arrow_shm_v1: false,
+            shuffle_codec_v1: true,
+            checkpoint_manifest_codec_v1: true,
+        });
         cat.register(&reg2);
         assert_eq!(cat.len(), 1);
         let info = cat.get(WorkerId(3)).unwrap();
         assert_eq!(info.capacity_headroom.fraction(), 0.95);
+        assert_eq!(info.location.host_id, "host-3b");
+        assert!(!info.capabilities.same_host_arrow_shm_v1);
+    }
+
+    #[tokio::test]
+    async fn topology_catalog_persists_location_and_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let persistent = TopologyPersistentStore::new(store);
+        let worker = WorkerInfo::from_registration(&make_reg(9, 0.75));
+        persistent.save_worker(&worker).await.unwrap();
+        let loaded = persistent.load_all().await.unwrap();
+        assert_eq!(loaded, vec![worker]);
+        assert_eq!(loaded[0].location.host_id, "host-9");
+        assert_eq!(loaded[0].location.availability_zone, "az-1");
+        assert!(loaded[0].capabilities.shuffle_codec_v1);
     }
 }

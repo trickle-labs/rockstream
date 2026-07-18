@@ -18,6 +18,7 @@
 pub mod acl;
 pub mod audit;
 pub mod checkpoint;
+pub mod checkpoint_store;
 pub mod config_deriver;
 pub mod frontier;
 pub mod migration;
@@ -35,6 +36,7 @@ pub mod topology;
 // Re-export commonly used top-level types.
 pub use acl::{AclError, AclStore};
 pub use checkpoint::{CheckpointCoordinator, CoordinatorError, DEFAULT_ALIGNMENT_MAX_CREDITS};
+pub use checkpoint_store::CheckpointManifestStore;
 pub use frontier::{AggregatorError, FrontierAggregator};
 pub use migration::{
     BucketMapVersionTracker, MigrationConsumerFrontierTracker, MigrationCoordinator,

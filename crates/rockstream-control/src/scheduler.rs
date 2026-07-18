@@ -171,6 +171,10 @@ impl ShardScheduler {
             .into_iter()
             .filter(|w| w.worker_id != dead_worker_id)
             .collect();
+        let preferred_az = self
+            .catalog
+            .get(dead_worker_id)
+            .map(|worker| worker.location.availability_zone);
 
         if workers.is_empty() {
             return Ok(Vec::new());
@@ -178,7 +182,9 @@ impl ShardScheduler {
 
         let mut assignments = Vec::with_capacity(freed.len());
         for shard_id in freed {
-            if let Some(winner) = PlacementAlgorithm::choose(&workers) {
+            if let Some(winner) =
+                PlacementAlgorithm::choose_with_preference(&workers, preferred_az.as_deref())
+            {
                 // acquire() should always succeed here because we just released
                 // the shard; no other worker holds it.
                 match self.manager.acquire(shard_id, winner.worker_id) {

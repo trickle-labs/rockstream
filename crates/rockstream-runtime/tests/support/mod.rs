@@ -1,44 +1,19 @@
 use std::sync::Arc;
 
-use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
-use rockstream_control::TopologyPersistentStore;
-use rockstream_types::ids::WorkerId;
-use rockstream_types::topology::{
-    CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
-    WorkerLocation,
-};
 
-fn make_worker() -> WorkerInfo {
-    WorkerInfo {
-        worker_id: WorkerId(7),
-        role: NodeRole::Worker,
-        address: "127.0.0.1:7007".to_string(),
-        capacity_headroom: CapacityHeadroom::FULL,
-        location: WorkerLocation::default(),
-        capabilities: WorkerCapabilities::default(),
-        registered_at_ms: 1,
-        healthy: true,
-        lifecycle: WorkerLifecycleState::Draining {
-            shards_remaining: 2,
-            started_at_ms: 99,
-        },
-    }
-}
+pub const MINIO_USER: &str = "minioadmin";
+pub const MINIO_PASS: &str = "minioadmin";
 
-fn docker_available() -> bool {
+pub fn docker_available() -> bool {
     std::process::Command::new("docker")
         .args(["info"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
+        .map(|status| status.success())
         .unwrap_or(false)
 }
-
-const MINIO_USER: &str = "minioadmin";
-const MINIO_PASS: &str = "minioadmin";
-const MINIO_BUCKET: &str = "rockstream-worker-drain-durability-test";
 
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -97,7 +72,7 @@ fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     (year, month + 1, days + 1, h, m, s)
 }
 
-async fn create_minio_bucket(port: u16, bucket: &str) {
+pub async fn create_minio_bucket(port: u16, bucket: &str) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -135,12 +110,12 @@ async fn create_minio_bucket(port: u16, bucket: &str) {
     assert!(resp.status().is_success() || resp.status().as_u16() == 409);
 }
 
-fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
+pub fn minio_object_store(port: u16, bucket: &str) -> Arc<dyn ObjectStore> {
     use object_store::aws::AmazonS3Builder;
     Arc::new(
         AmazonS3Builder::new()
             .with_endpoint(format!("http://127.0.0.1:{port}"))
-            .with_bucket_name(MINIO_BUCKET)
+            .with_bucket_name(bucket)
             .with_access_key_id(MINIO_USER)
             .with_secret_access_key(MINIO_PASS)
             .with_region("us-east-1")
@@ -149,46 +124,4 @@ fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
             .build()
             .expect("failed to build MinIO object store"),
     )
-}
-
-#[tokio::test]
-async fn draining_state_survives_restart_lfs() {
-    let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-    let persistent_a = TopologyPersistentStore::new(store.clone());
-    let worker = make_worker();
-    persistent_a.save_worker(&worker).await.unwrap();
-
-    let persistent_b = TopologyPersistentStore::new(Arc::new(
-        LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
-    ));
-    assert_eq!(
-        persistent_b.load_worker(worker.worker_id).await.unwrap(),
-        worker
-    );
-}
-
-#[tokio::test]
-async fn draining_state_survives_restart_minio_tc() {
-    if !docker_available() {
-        eprintln!("SKIP draining_state_survives_restart_minio_tc: Docker not available");
-        return;
-    }
-    use testcontainers::runners::AsyncRunner;
-    let container = testcontainers_modules::minio::MinIO::default()
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_BUCKET).await;
-
-    let persistent_a = TopologyPersistentStore::new(minio_object_store(port));
-    let worker = make_worker();
-    persistent_a.save_worker(&worker).await.unwrap();
-    let persistent_b = TopologyPersistentStore::new(minio_object_store(port));
-    assert_eq!(
-        persistent_b.load_worker(worker.worker_id).await.unwrap(),
-        worker
-    );
 }

@@ -202,6 +202,14 @@ struct MetricRegistry {
     scatter_shards_total: AtomicU64,
     scatter_shards_pruned_total: AtomicU64,
     shard_bloom_false_positive_total: AtomicU64,
+    shuffle_shm_bytes_used: AtomicU64,
+    shuffle_shm_segments_in_use: AtomicU64,
+    shuffle_lz4_bytes_saved_total: AtomicU64,
+    shuffle_zstd_bytes_saved_total: AtomicU64,
+    shuffle_cross_az_direct_bytes_total: AtomicU64,
+    shuffle_direct_bytes_total: AtomicU64,
+    shuffle_compression_disabled_total: AtomicU64,
+    shuffle_compression_state_entries: AtomicU64,
 
     // Flush duration metrics
     flush_duration_sum_ms: AtomicU64,
@@ -244,6 +252,14 @@ impl MetricRegistry {
             scatter_shards_total: AtomicU64::new(0),
             scatter_shards_pruned_total: AtomicU64::new(0),
             shard_bloom_false_positive_total: AtomicU64::new(0),
+            shuffle_shm_bytes_used: AtomicU64::new(0),
+            shuffle_shm_segments_in_use: AtomicU64::new(0),
+            shuffle_lz4_bytes_saved_total: AtomicU64::new(0),
+            shuffle_zstd_bytes_saved_total: AtomicU64::new(0),
+            shuffle_cross_az_direct_bytes_total: AtomicU64::new(0),
+            shuffle_direct_bytes_total: AtomicU64::new(0),
+            shuffle_compression_disabled_total: AtomicU64::new(0),
+            shuffle_compression_state_entries: AtomicU64::new(0),
             flush_duration_sum_ms: AtomicU64::new(0),
             flush_duration_count: AtomicU64::new(0),
             flush_duration_last_ms: AtomicU64::new(0),
@@ -527,6 +543,19 @@ pub fn reset_all() {
         reg.scatter_shards_total.store(0, Ordering::Relaxed);
         reg.scatter_shards_pruned_total.store(0, Ordering::Relaxed);
         reg.shard_bloom_false_positive_total
+            .store(0, Ordering::Relaxed);
+        reg.shuffle_shm_bytes_used.store(0, Ordering::Relaxed);
+        reg.shuffle_shm_segments_in_use.store(0, Ordering::Relaxed);
+        reg.shuffle_lz4_bytes_saved_total
+            .store(0, Ordering::Relaxed);
+        reg.shuffle_zstd_bytes_saved_total
+            .store(0, Ordering::Relaxed);
+        reg.shuffle_cross_az_direct_bytes_total
+            .store(0, Ordering::Relaxed);
+        reg.shuffle_direct_bytes_total.store(0, Ordering::Relaxed);
+        reg.shuffle_compression_disabled_total
+            .store(0, Ordering::Relaxed);
+        reg.shuffle_compression_state_entries
             .store(0, Ordering::Relaxed);
         reg.flush_duration_sum_ms.store(0, Ordering::Relaxed);
         reg.flush_duration_count.store(0, Ordering::Relaxed);
@@ -835,6 +864,102 @@ pub fn read_shard_bloom_filter_bytes_used(
         reg.shard_bloom_filter_bytes_used
             .get(&shard_bloom_metric_key(view_id, shard_id, col_idx))
             .map(Counter::get)
+    })
+}
+
+pub fn set_shuffle_shm_bytes_used(bytes: u64) {
+    with_registry(|reg| {
+        reg.shuffle_shm_bytes_used.store(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shuffle_shm_bytes_used() -> u64 {
+    with_registry(|reg| reg.shuffle_shm_bytes_used.load(Ordering::Relaxed))
+}
+
+pub fn set_shuffle_shm_segments_in_use(segments: u64) {
+    with_registry(|reg| {
+        reg.shuffle_shm_segments_in_use
+            .store(segments, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shuffle_shm_segments_in_use() -> u64 {
+    with_registry(|reg| reg.shuffle_shm_segments_in_use.load(Ordering::Relaxed))
+}
+
+pub fn add_shuffle_lz4_bytes_saved_total(bytes: u64) {
+    with_registry(|reg| {
+        reg.shuffle_lz4_bytes_saved_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shuffle_lz4_bytes_saved_total() -> u64 {
+    with_registry(|reg| reg.shuffle_lz4_bytes_saved_total.load(Ordering::Relaxed))
+}
+
+pub fn add_shuffle_zstd_bytes_saved_total(bytes: u64) {
+    with_registry(|reg| {
+        reg.shuffle_zstd_bytes_saved_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shuffle_zstd_bytes_saved_total() -> u64 {
+    with_registry(|reg| reg.shuffle_zstd_bytes_saved_total.load(Ordering::Relaxed))
+}
+
+pub fn add_shuffle_cross_az_direct_bytes_total(bytes: u64) {
+    with_registry(|reg| {
+        reg.shuffle_cross_az_direct_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shuffle_cross_az_direct_bytes_total() -> u64 {
+    with_registry(|reg| {
+        reg.shuffle_cross_az_direct_bytes_total
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn add_shuffle_direct_bytes_total(bytes: u64) {
+    with_registry(|reg| {
+        reg.shuffle_direct_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shuffle_direct_bytes_total() -> u64 {
+    with_registry(|reg| reg.shuffle_direct_bytes_total.load(Ordering::Relaxed))
+}
+
+pub fn inc_shuffle_compression_disabled_total() {
+    with_registry(|reg| {
+        reg.shuffle_compression_disabled_total
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shuffle_compression_disabled_total() -> u64 {
+    with_registry(|reg| {
+        reg.shuffle_compression_disabled_total
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn set_shuffle_compression_state_entries(entries: u64) {
+    with_registry(|reg| {
+        reg.shuffle_compression_state_entries
+            .store(entries, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shuffle_compression_state_entries() -> u64 {
+    with_registry(|reg| {
+        reg.shuffle_compression_state_entries
+            .load(Ordering::Relaxed)
     })
 }
 

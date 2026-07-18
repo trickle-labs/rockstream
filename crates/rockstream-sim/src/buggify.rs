@@ -16,6 +16,7 @@ use rand::SeedableRng;
 thread_local! {
     static BUGGIFY_RNG: RefCell<Option<SmallRng>> = const { RefCell::new(None) };
     static BUGGIFY_ACTIVE: RefCell<bool> = const { RefCell::new(false) };
+    static BUGGIFY_FOCUS: RefCell<Option<&'static str>> = const { RefCell::new(None) };
 }
 
 /// Initialize buggify for the current thread with the given seed.
@@ -34,6 +35,9 @@ pub fn buggify_disable() {
     BUGGIFY_ACTIVE.with(|active| {
         *active.borrow_mut() = false;
     });
+    BUGGIFY_FOCUS.with(|focus| {
+        *focus.borrow_mut() = None;
+    });
 }
 
 /// Check if buggify is currently enabled on this thread.
@@ -41,11 +45,22 @@ pub fn buggify_enabled() -> bool {
     BUGGIFY_ACTIVE.with(|active| *active.borrow())
 }
 
+/// Restrict fault injection to a single fault ID on the current thread.
+pub fn buggify_focus(fault_id: &'static str) {
+    BUGGIFY_FOCUS.with(|focus| {
+        *focus.borrow_mut() = Some(fault_id);
+    });
+}
+
 /// Core buggify check: returns true with the given probability if simulation
 /// is enabled. Always returns false in production builds.
 #[cfg(feature = "simulation")]
 pub fn buggify_check(probability: f64, _fault_id: &'static str) -> bool {
     if !buggify_enabled() {
+        return false;
+    }
+    let focused = BUGGIFY_FOCUS.with(|focus| *focus.borrow());
+    if focused.is_some_and(|fault_id| fault_id != _fault_id) {
         return false;
     }
     BUGGIFY_RNG.with(|rng| {

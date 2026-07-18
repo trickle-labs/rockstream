@@ -13,6 +13,9 @@ pub struct AutotunerConfig {
     pub default_parallelism: usize,
     pub min_parallelism: usize,
     pub max_parallelism: usize,
+    pub direct_compression_cpu_budget_ms: u64,
+    pub compression_disable_hysteresis_windows: usize,
+    pub compression_reenable_hysteresis_windows: usize,
 }
 
 impl Default for AutotunerConfig {
@@ -24,6 +27,9 @@ impl Default for AutotunerConfig {
             default_parallelism: 4,
             min_parallelism: 1,
             max_parallelism: 32,
+            direct_compression_cpu_budget_ms: 5,
+            compression_disable_hysteresis_windows: 2,
+            compression_reenable_hysteresis_windows: 4,
         }
     }
 }
@@ -105,6 +111,31 @@ pub struct ConnectorConfig {
     pub dlq_retention_days: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExchangeConfig {
+    pub exchange_direct_threshold_bytes: usize,
+    pub exchange_spill_threshold_mb: u64,
+    pub exchange_domain_size: usize,
+    pub exchange_force_durable: bool,
+    pub same_host_shm_segment_bytes: usize,
+    pub same_host_shm_segments_per_peer: usize,
+    pub max_exchange_compression_states: usize,
+}
+
+impl Default for ExchangeConfig {
+    fn default() -> Self {
+        Self {
+            exchange_direct_threshold_bytes: 64 * 1024,
+            exchange_spill_threshold_mb: 256,
+            exchange_domain_size: 64,
+            exchange_force_durable: false,
+            same_host_shm_segment_bytes: 8 * 1024 * 1024,
+            same_host_shm_segments_per_peer: 8,
+            max_exchange_compression_states: 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct StorageConfig {
     #[serde(default)]
@@ -116,6 +147,8 @@ pub struct RockstreamConfig {
     pub cluster: ClusterConfig,
     pub worker: WorkerConfig,
     pub connector: ConnectorConfig,
+    #[serde(default)]
+    pub exchange: ExchangeConfig,
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
@@ -153,6 +186,7 @@ impl Default for RockstreamConfig {
                 dlq_warn_threshold: 100,
                 dlq_retention_days: 7,
             },
+            exchange: ExchangeConfig::default(),
             storage: StorageConfig::default(),
             pricing: None,
         }
@@ -169,6 +203,14 @@ mod tests {
         let serialized = default_cfg.to_string().unwrap();
         let deserialized = RockstreamConfig::load_from_str(&serialized).unwrap();
         assert_eq!(default_cfg, deserialized);
+    }
+
+    #[test]
+    fn config_exchange_defaults_roundtrip() {
+        let cfg = RockstreamConfig::default();
+        assert_eq!(cfg.exchange, ExchangeConfig::default());
+        let roundtrip = RockstreamConfig::load_from_str(&cfg.to_string().unwrap()).unwrap();
+        assert_eq!(roundtrip.exchange, ExchangeConfig::default());
     }
 
     #[test]

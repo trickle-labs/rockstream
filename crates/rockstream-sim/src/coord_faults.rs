@@ -65,6 +65,26 @@ pub fn register_coord_faults(model: &mut FaultModel) {
                        loop must still emit a safe split plan for the observed hot shard.",
         category: FaultCategory::Logic,
     });
+    model.register(FaultEntry {
+        id: "exchange.az_metadata_missing",
+        description: "Exchange classifier temporarily loses locality metadata while resolving a \
+                       route; delivery must fall back to the safe legacy-compatible direct path \
+                       without dropping rows.",
+        category: FaultCategory::Logic,
+    });
+    model.register(FaultEntry {
+        id: "exchange.shm_segment_unavailable",
+        description: "Same-host shared-memory segment publish/open fails before ACK; the sender \
+                       must fall back to direct delivery and inbox dedupe must prevent duplicate \
+                       processing.",
+        category: FaultCategory::Io,
+    });
+    model.register(FaultEntry {
+        id: "exchange.domain_rebuild_during_drain",
+        description: "AZ-domain membership rebuild races with a worker drain; same-AZ recipients \
+                       must still be preferred and no frame may be stranded while domains refresh.",
+        category: FaultCategory::Timing,
+    });
 }
 
 /// Fault-model entries registered by `register_coord_faults`.
@@ -77,6 +97,9 @@ pub const COORD_FAULT_IDS: &[&str] = &[
     "split.kill_donor_mid_copy",
     "merge.concurrent_split_race",
     "hotkey.concurrent_bucket_map_bump",
+    "exchange.az_metadata_missing",
+    "exchange.shm_segment_unavailable",
+    "exchange.domain_rebuild_during_drain",
 ];
 
 #[cfg(test)]

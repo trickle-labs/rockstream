@@ -41,6 +41,23 @@ pub enum ExchangePath {
     Durable,
 }
 
+/// Concrete transport chosen for a classified exchange route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExchangeTransport {
+    InProcess,
+    SharedMemory,
+    Grpc,
+    DurableObject,
+}
+
+/// Payload codec associated with a shuffle route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ShuffleCompression {
+    None,
+    Lz4,
+    Zstd,
+}
+
 impl std::fmt::Display for ExchangePath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -105,6 +122,24 @@ mod tests {
         assert_eq!(ExchangePath::Loopback.to_string(), "loopback");
         assert_eq!(ExchangePath::Direct.to_string(), "direct");
         assert_eq!(ExchangePath::Durable.to_string(), "durable");
+    }
+
+    #[test]
+    fn exchange_transport_and_compression_are_serde_roundtrippable() {
+        let transport = ExchangeTransport::SharedMemory;
+        let compression = ShuffleCompression::Zstd;
+        assert_eq!(
+            serde_json::from_str::<ExchangeTransport>(&serde_json::to_string(&transport).unwrap())
+                .unwrap(),
+            transport
+        );
+        assert_eq!(
+            serde_json::from_str::<ShuffleCompression>(
+                &serde_json::to_string(&compression).unwrap()
+            )
+            .unwrap(),
+            compression
+        );
     }
 
     #[test]

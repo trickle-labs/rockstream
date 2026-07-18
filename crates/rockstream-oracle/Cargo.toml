@@ -16,6 +16,7 @@ rockstream-sql = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+rockstream-runtime = { workspace = true }
 proptest = { workspace = true }
 rockstream-gateway = { workspace = true }
 object_store = { workspace = true }
@@ -31,4 +32,3 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
-

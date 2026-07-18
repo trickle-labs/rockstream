@@ -25,6 +25,7 @@ pub struct ExchangeRegistry {
     inlets: Arc<RwLock<HashMap<(u64, u32), ExchangeInlet>>>,
     active_shards: Arc<RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>>,
     cluster_frontier: Arc<std::sync::atomic::AtomicU64>,
+    grpc_frames_received: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for ExchangeRegistry {
@@ -33,6 +34,7 @@ impl Default for ExchangeRegistry {
             inlets: Arc::new(RwLock::new(HashMap::new())),
             active_shards: Arc::new(RwLock::new(HashMap::new())),
             cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            grpc_frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -51,6 +53,7 @@ impl ExchangeRegistry {
             inlets: Arc::new(RwLock::new(HashMap::new())),
             active_shards,
             cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            grpc_frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -97,6 +100,11 @@ impl ExchangeRegistry {
         shards
             .get(&rockstream_types::ids::ShardId(shard_id as u64))
             .and_then(|state| state.db.clone())
+    }
+
+    pub fn grpc_frames_received(&self) -> u64 {
+        self.grpc_frames_received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a local inlet for the given exchange and target shard.
@@ -155,40 +163,55 @@ impl ShuffleService for ShuffleServer {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(frame) => {
+                        registry
+                            .grpc_frames_received
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let inlet_opt = registry.get(frame.exchange_id, frame.target_shard);
                         if let Some(inlet) = inlet_opt {
+                            let mut already_seen = false;
                             if let Some(db) = registry.get_shard_db(frame.target_shard) {
-                                if let Err(e) = crate::exchange::persistence::persist_inbox(
-                                    &db,
+                                let inbox_key = crate::exchange::persistence::inbox_key(
                                     frame.exchange_id,
                                     frame.src_shard,
                                     frame.epoch,
                                     frame.seq,
-                                    &frame.payload,
-                                )
-                                .await
-                                {
-                                    tracing::error!(
-                                        code = %rockstream_types::error_code::RS_0003,
-                                        "Failed to persist incoming shuffle frame to inbox: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                            match deserialize_zset(&frame.payload, inlet.schema.clone()) {
-                                Ok(zset) => {
-                                    if inlet.sender.send(zset).await.is_err() {
-                                        tracing::warn!(
-                                            "Failed to forward shuffle batch to local inlet"
+                                );
+                                already_seen = db.get(&inbox_key).await.ok().flatten().is_some();
+                                if !already_seen {
+                                    if let Err(e) = crate::exchange::persistence::persist_inbox(
+                                        &db,
+                                        frame.exchange_id,
+                                        frame.src_shard,
+                                        frame.epoch,
+                                        frame.seq,
+                                        &frame.payload,
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!(
+                                            code = %rockstream_types::error_code::RS_0003,
+                                            "Failed to persist incoming shuffle frame to inbox: {:?}",
+                                            e
                                         );
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::error!(
-                                        code = %rockstream_types::error_code::RS_3009,
-                                        "Failed to deserialize shuffle payload: {:?}",
-                                        e
-                                    );
+                            }
+                            if !already_seen {
+                                match deserialize_zset(&frame.payload, inlet.schema.clone()) {
+                                    Ok(zset) => {
+                                        if inlet.sender.send(zset).await.is_err() {
+                                            tracing::warn!(
+                                                "Failed to forward shuffle batch to local inlet"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            code = %rockstream_types::error_code::RS_3009,
+                                            "Failed to deserialize shuffle payload: {:?}",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         } else {
@@ -229,6 +252,17 @@ impl ShuffleService for ShuffleServer {
     }
 }
 
+pub fn register_shared_memory_endpoint(
+    worker_id: rockstream_types::ids::WorkerId,
+    registry: ExchangeRegistry,
+) {
+    crate::exchange::shared_memory::register_shared_memory_receiver(worker_id, registry);
+}
+
+pub fn unregister_shared_memory_endpoint(worker_id: rockstream_types::ids::WorkerId) {
+    crate::exchange::shared_memory::unregister_shared_memory_receiver(worker_id);
+}
+
 struct RxStream<T> {
     rx: mpsc::Receiver<T>,
 }
@@ -249,9 +283,129 @@ mod tests {
     use super::*;
     use crate::exchange::flow_control::FlowController;
     use crate::exchange::multiplexer::WorkerStreamMultiplexer;
+    use crate::exchange::persistence::{delete_outbox_if_present, outbox_key};
     use crate::exchange::pool::ShuffleClientPool;
-    use crate::exchange::serialization::serialize_zset;
+    use crate::exchange::serialization::{framed_payload_codec, serialize_zset};
+    use rockstream_storage::shard_db::ShardDb;
+    use rockstream_types::config::ExchangeConfig;
+    use rockstream_types::exchange::ShuffleCompression;
     use rockstream_types::ids::WorkerId;
+    use rockstream_types::lease::ShardLease;
+    use rockstream_types::topology::{
+        CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
+        WorkerLocation,
+    };
+    use std::sync::LazyLock;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// Same-host shared-memory transport tests read/assert the process-global
+    /// `shuffle_shm_bytes_used` / `shuffle_shm_segments_in_use` gauges. Serialize
+    /// these tests (async-aware so the guard can be held across `.await`) so
+    /// concurrent test threads don't observe each other's transient segment
+    /// allocations, mirroring the TEST_LOCK precedent in
+    /// `rockstream_types::metrics::tests`.
+    static SHM_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+    fn worker_info(worker_id: u64, address: String, host_id: &str, az: &str) -> WorkerInfo {
+        worker_info_with_codecs(worker_id, address, host_id, az, true, true)
+    }
+
+    fn worker_info_with_codecs(
+        worker_id: u64,
+        address: String,
+        host_id: &str,
+        az: &str,
+        same_host_shm: bool,
+        shuffle_codec: bool,
+    ) -> WorkerInfo {
+        WorkerInfo {
+            worker_id: WorkerId(worker_id),
+            role: NodeRole::Worker,
+            address,
+            capacity_headroom: CapacityHeadroom::FULL,
+            location: WorkerLocation::new(host_id, az),
+            capabilities: WorkerCapabilities {
+                same_host_arrow_shm_v1: same_host_shm,
+                shuffle_codec_v1: shuffle_codec,
+                checkpoint_manifest_codec_v1: true,
+            },
+            registered_at_ms: 1,
+            healthy: true,
+            lifecycle: WorkerLifecycleState::Active,
+        }
+    }
+
+    async fn shard_db(name: &str) -> (Arc<object_store::memory::InMemory>, ShardDb) {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let db = ShardDb::builder(name, store.clone()).build().await.unwrap();
+        (store, db)
+    }
+
+    fn make_sender_shards(
+        src_db: ShardDb,
+    ) -> Arc<parking_lot::RwLock<HashMap<rockstream_types::ids::ShardId, crate::client::ShardState>>>
+    {
+        let mut shards = HashMap::new();
+        shards.insert(
+            rockstream_types::ids::ShardId(0),
+            crate::client::ShardState {
+                lease: ShardLease::new(
+                    rockstream_types::ids::ShardId(0),
+                    WorkerId(1),
+                    rockstream_types::ids::LeaseToken(1),
+                ),
+                db: Some(src_db),
+            },
+        );
+        Arc::new(parking_lot::RwLock::new(shards))
+    }
+
+    fn make_receiver_registry(target_db: ShardDb) -> (ExchangeRegistry, mpsc::Receiver<ArrowZSet>) {
+        let mut shards = HashMap::new();
+        shards.insert(
+            rockstream_types::ids::ShardId(1),
+            crate::client::ShardState {
+                lease: ShardLease::new(
+                    rockstream_types::ids::ShardId(1),
+                    WorkerId(2),
+                    rockstream_types::ids::LeaseToken(1),
+                ),
+                db: Some(target_db),
+            },
+        );
+        let registry = ExchangeRegistry::with_shards(Arc::new(parking_lot::RwLock::new(shards)));
+        let (tx, rx) = mpsc::channel(10);
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("b", arrow::datatypes::DataType::Int64, false),
+        ]));
+        registry.register(100, 1, tx, schema);
+        (registry, rx)
+    }
+
+    async fn read_only_inbox_payload(db: &ShardDb) -> bytes::Bytes {
+        let entries = db.scan_prefix(&[0x04]).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        entries[0].1.clone()
+    }
+
+    fn make_wide_compressible_zset(rows: usize) -> ArrowZSet {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("b", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let a_vals = vec![7_i64; rows];
+        let b_vals: Vec<i64> = (0..rows).map(|idx| (idx % 8) as i64).collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(a_vals)),
+                Arc::new(arrow::array::Int64Array::from(b_vals)),
+            ],
+        )
+        .unwrap();
+        ArrowZSet::new(batch, vec![1; rows])
+    }
 
     #[tokio::test]
     async fn test_grpc_routing_and_multiplexer() {
@@ -758,5 +912,923 @@ mod tests {
         } else {
             panic!("failed to decode key");
         }
+    }
+
+    #[tokio::test]
+    async fn same_host_shared_memory_fast_path_delivers_exact_rows() {
+        let _shm_guard = SHM_TEST_LOCK.lock().await;
+        let (_src_store, src_db) = shard_db("src-shm-fast").await;
+        let sender_shards = make_sender_shards(src_db.clone());
+        let (registry, mut inlet_rx) = make_receiver_registry(shard_db("dst-shm-fast").await.1);
+        register_shared_memory_endpoint(WorkerId(102), registry.clone());
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            101,
+            "127.0.0.1:8101".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info(
+            102,
+            "127.0.0.1:8102".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(101));
+
+        let zset = ArrowZSet::from_ab_rows(&[(7, 70), (8, 80)], 1);
+        let payload = serialize_zset(&zset).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(102),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 1,
+                    payload: payload.into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let received = inlet_rx.recv().await.unwrap();
+        assert_eq!(received.positive_ab_rows(), vec![(7, 70), (8, 80)]);
+        assert_eq!(
+            rockstream_types::metrics::read_shuffle_shm_segments_in_use(),
+            0
+        );
+        assert_eq!(rockstream_types::metrics::read_shuffle_shm_bytes_used(), 0);
+        unregister_shared_memory_endpoint(WorkerId(102));
+    }
+
+    #[tokio::test]
+    async fn same_host_shared_memory_never_opens_a_grpc_payload_stream() {
+        let _shm_guard = SHM_TEST_LOCK.lock().await;
+        let (_src_store, src_db) = shard_db("src-shm-nogrpc").await;
+        let sender_shards = make_sender_shards(src_db);
+        let (registry, mut inlet_rx) = make_receiver_registry(shard_db("dst-shm-nogrpc").await.1);
+        register_shared_memory_endpoint(WorkerId(104), registry.clone());
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            103,
+            "127.0.0.1:8201".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info(
+            104,
+            "127.0.0.1:8202".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(103));
+
+        let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(1, 10)], 1)).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(104),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 2,
+                    payload: payload.into(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = inlet_rx.recv().await.unwrap();
+        assert_eq!(registry.grpc_frames_received(), 0);
+        unregister_shared_memory_endpoint(WorkerId(104));
+    }
+
+    #[tokio::test]
+    async fn shared_memory_segment_pool_enforces_bound_and_falls_back_to_grpc() {
+        let _shm_guard = SHM_TEST_LOCK.lock().await;
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let (_src_store, src_db) = shard_db("src-shm-fallback").await;
+        let sender_shards = make_sender_shards(src_db);
+        let (registry, mut inlet_rx) = make_receiver_registry(shard_db("dst-shm-fallback").await.1);
+        let server = ShuffleServer::new(registry.clone());
+        let (tx_close, rx_close) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(
+                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                        server,
+                    ),
+                )
+                .serve_with_shutdown(addr, async {
+                    let _ = rx_close.await;
+                })
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        peers.write().insert(WorkerId(2), addr.to_string());
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            1,
+            "127.0.0.1:8301".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info(2, addr.to_string(), "host-a", "az-1"));
+        let config = ExchangeConfig {
+            same_host_shm_segment_bytes: 1,
+            ..ExchangeConfig::default()
+        };
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(1))
+                .with_exchange_config(config);
+
+        let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(5, 50)], 1)).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(2),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 3,
+                    payload: payload.into(),
+                },
+            )
+            .await
+            .unwrap();
+        let received = inlet_rx.recv().await.unwrap();
+        assert_eq!(received.positive_ab_rows(), vec![(5, 50)]);
+        assert_eq!(registry.grpc_frames_received(), 1);
+        assert_eq!(
+            rockstream_types::metrics::read_shuffle_shm_segments_in_use(),
+            0
+        );
+        let _ = tx_close.send(());
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn same_host_shared_memory_ack_deletes_outbox_once() {
+        let _shm_guard = SHM_TEST_LOCK.lock().await;
+        let (_src_store, src_db) = shard_db("src-shm-ack").await;
+        let sender_shards = make_sender_shards(src_db.clone());
+        let (registry, mut inlet_rx) = make_receiver_registry(shard_db("dst-shm-ack").await.1);
+        register_shared_memory_endpoint(WorkerId(106), registry);
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            105,
+            "127.0.0.1:8401".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info(
+            106,
+            "127.0.0.1:8402".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(105));
+
+        let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(9, 90)], 1)).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(106),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 4,
+                    payload: payload.into(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = inlet_rx.recv().await.unwrap();
+        assert!(!delete_outbox_if_present(&src_db, 100, 1, 1, 4)
+            .await
+            .unwrap());
+        assert!(src_db
+            .get(&outbox_key(100, 1, 1, 4))
+            .await
+            .unwrap()
+            .is_none());
+        unregister_shared_memory_endpoint(WorkerId(106));
+    }
+
+    #[tokio::test]
+    async fn same_host_shared_memory_duplicate_delivery_is_deduped_by_inbox() {
+        let _shm_guard = SHM_TEST_LOCK.lock().await;
+        let (_src_store, src_db) = shard_db("src-shm-dedupe").await;
+        let sender_shards = make_sender_shards(src_db);
+        let (registry, mut inlet_rx) = make_receiver_registry(shard_db("dst-shm-dedupe").await.1);
+        register_shared_memory_endpoint(WorkerId(108), registry);
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            107,
+            "127.0.0.1:8501".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info(
+            108,
+            "127.0.0.1:8502".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(107));
+
+        let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(11, 110)], 1)).unwrap();
+        let frame = ShuffleFrame {
+            exchange_id: 100,
+            src_shard: 0,
+            target_shard: 1,
+            epoch: 1,
+            seq: 5,
+            payload: payload.into(),
+        };
+        multiplexer
+            .send_frame(WorkerId(108), frame.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            inlet_rx.recv().await.unwrap().positive_ab_rows(),
+            vec![(11, 110)]
+        );
+        multiplexer.send_frame(WorkerId(108), frame).await.unwrap();
+        tokio::select! {
+            maybe = inlet_rx.recv() => panic!("unexpected duplicate delivery: {:?}", maybe),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+        unregister_shared_memory_endpoint(WorkerId(108));
+    }
+
+    #[tokio::test]
+    async fn same_host_shared_memory_replay_uses_persisted_inbox_after_restart() {
+        let _shm_guard = SHM_TEST_LOCK.lock().await;
+        let (src_store, src_db) = shard_db("src-shm-replay").await;
+        let sender_shards = make_sender_shards(src_db.clone());
+        let (target_store, target_db) = shard_db("dst-shm-replay").await;
+        let (registry, mut inlet_rx) = make_receiver_registry(target_db);
+        register_shared_memory_endpoint(WorkerId(110), registry);
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            109,
+            "127.0.0.1:8601".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info(
+            110,
+            "127.0.0.1:8602".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(109));
+
+        let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(12, 120)], 1)).unwrap();
+        let frame = ShuffleFrame {
+            exchange_id: 100,
+            src_shard: 0,
+            target_shard: 1,
+            epoch: 1,
+            seq: 6,
+            payload: payload.into(),
+        };
+        multiplexer
+            .send_frame(WorkerId(110), frame.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            inlet_rx.recv().await.unwrap().positive_ab_rows(),
+            vec![(12, 120)]
+        );
+
+        unregister_shared_memory_endpoint(WorkerId(110));
+        src_db.close().await.unwrap();
+        let reopened_src = ShardDb::builder("src-shm-replay", src_store)
+            .build()
+            .await
+            .unwrap();
+        let reopened_sender = make_sender_shards(reopened_src);
+        let reopened_target = ShardDb::builder("dst-shm-replay", target_store)
+            .build()
+            .await
+            .unwrap();
+        let (registry2, mut inlet_rx2) = make_receiver_registry(reopened_target);
+        register_shared_memory_endpoint(WorkerId(110), registry2);
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            109,
+            "127.0.0.1:8601".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info(
+            110,
+            "127.0.0.1:8602".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), reopened_sender)
+                .with_src_worker(WorkerId(109));
+        multiplexer.send_frame(WorkerId(110), frame).await.unwrap();
+        tokio::select! {
+            maybe = inlet_rx2.recv() => {
+                panic!("unexpected replay delivery after restart: {:?}", maybe)
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+        unregister_shared_memory_endpoint(WorkerId(110));
+    }
+
+    #[tokio::test]
+    async fn loopback_persistence_writes_lz4_payloads() {
+        let (_src_store, src_db) = shard_db("src-loopback-lz4").await;
+        let (_dst_store, target_db) = shard_db("dst-loopback-lz4").await;
+        let active_shards = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        active_shards.write().insert(
+            rockstream_types::ids::ShardId(0),
+            crate::client::ShardState {
+                lease: ShardLease::new(
+                    rockstream_types::ids::ShardId(0),
+                    WorkerId(1),
+                    rockstream_types::ids::LeaseToken(1),
+                ),
+                db: Some(src_db),
+            },
+        );
+        active_shards.write().insert(
+            rockstream_types::ids::ShardId(1),
+            crate::client::ShardState {
+                lease: ShardLease::new(
+                    rockstream_types::ids::ShardId(1),
+                    WorkerId(1),
+                    rockstream_types::ids::LeaseToken(1),
+                ),
+                db: Some(target_db.clone()),
+            },
+        );
+        let registry = ExchangeRegistry::with_shards(active_shards.clone());
+        let (tx, mut rx) = mpsc::channel(10);
+        registry.register(
+            100,
+            1,
+            tx,
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("b", arrow::datatypes::DataType::Int64, false),
+            ])),
+        );
+        let router = crate::exchange::loopback::LoopbackRouter::new(registry, active_shards);
+        let zset = ArrowZSet::from_ab_rows(&[(21, 210)], 1);
+        router.route_loopback(100, 0, 1, 1, 1, &zset).await.unwrap();
+        let _ = rx.recv().await.unwrap();
+        assert_eq!(
+            framed_payload_codec(&read_only_inbox_payload(&target_db).await),
+            Some(ShuffleCompression::Lz4)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_grpc_writes_lz4_payloads_when_codec_capability_is_present() {
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let (_src_store, src_db) = shard_db("src-direct-lz4").await;
+        let sender_shards = make_sender_shards(src_db);
+        let (_dst_store, target_db) = shard_db("dst-direct-lz4").await;
+        let (registry, mut inlet_rx) = make_receiver_registry(target_db.clone());
+        let server = ShuffleServer::new(registry);
+        let (tx_close, rx_close) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(
+                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                        server,
+                    ),
+                )
+                .serve_with_shutdown(addr, async {
+                    let _ = rx_close.await;
+                })
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        peers.write().insert(WorkerId(202), addr.to_string());
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            201,
+            "127.0.0.1:9201".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info_with_codecs(
+            202,
+            addr.to_string(),
+            "host-b",
+            "az-1",
+            false,
+            true,
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(201));
+        let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(22, 220)], 1)).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(202),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 1,
+                    payload: payload.into(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = inlet_rx.recv().await.unwrap();
+        assert_eq!(
+            framed_payload_codec(&read_only_inbox_payload(&target_db).await),
+            Some(ShuffleCompression::Lz4)
+        );
+        let _ = tx_close.send(());
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn durable_shuffle_writer_writes_zstd_payloads() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (_src_store, src_db) = shard_db("src-durable-zstd").await;
+        let sender_shards = make_sender_shards(src_db);
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            301,
+            "127.0.0.1:9301".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info_with_codecs(
+            302,
+            "127.0.0.1:9302".to_string(),
+            "host-b",
+            "az-2",
+            false,
+            true,
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_object_store(store.clone())
+                .with_src_worker(WorkerId(301));
+        let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(23, 230)], 1)).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(302),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 1,
+                    payload: payload.into(),
+                },
+            )
+            .await
+            .unwrap();
+        let path = object_store::path::Path::from("shuffle/100/1/301/302");
+        let footer =
+            crate::exchange::durable::DurableShuffleReader::read_footer(store.as_ref(), &path)
+                .await
+                .unwrap();
+        let stored = crate::exchange::durable::DurableShuffleReader::read_frame(
+            store.as_ref(),
+            &path,
+            &footer.entries[0],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            framed_payload_codec(&stored),
+            Some(ShuffleCompression::Zstd)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_receives_raw_ipc_until_capability_floor_advances() {
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let (_src_store, src_db) = shard_db("src-direct-legacy").await;
+        let sender_shards = make_sender_shards(src_db);
+        let (_dst_store, target_db) = shard_db("dst-direct-legacy").await;
+        let (registry, mut inlet_rx) = make_receiver_registry(target_db.clone());
+        let server = ShuffleServer::new(registry);
+        let (tx_close, rx_close) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(
+                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                        server,
+                    ),
+                )
+                .serve_with_shutdown(addr, async {
+                    let _ = rx_close.await;
+                })
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        peers.write().insert(WorkerId(402), addr.to_string());
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            401,
+            "127.0.0.1:9401".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info_with_codecs(
+            402,
+            addr.to_string(),
+            "host-b",
+            "az-1",
+            false,
+            false,
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(401));
+        let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(24, 240)], 1)).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(402),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 1,
+                    payload: payload.clone().into(),
+                },
+            )
+            .await
+            .unwrap();
+        let received = inlet_rx.recv().await.unwrap();
+        assert_eq!(received.positive_ab_rows(), vec![(24, 240)]);
+        assert_eq!(
+            read_only_inbox_payload(&target_db).await.as_ref(),
+            &payload[..]
+        );
+        assert_eq!(framed_payload_codec(&payload), None);
+        let _ = tx_close.send(());
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mixed_legacy_and_compressed_shuffle_frames_replay_exactly_once() {
+        let store = object_store::memory::InMemory::new();
+        let path = object_store::path::Path::from("shuffle/100/1/501/502");
+        let raw = serialize_zset(&ArrowZSet::from_ab_rows(&[(31, 310)], 1)).unwrap();
+        let compressed = crate::exchange::serialization::frame_payload_bytes(
+            &serialize_zset(&ArrowZSet::from_ab_rows(&[(32, 320)], 1)).unwrap(),
+            ShuffleCompression::Zstd,
+            true,
+        )
+        .unwrap();
+        let mut writer = crate::exchange::durable::DurableShuffleWriter::new();
+        writer.add_frame(0, 1, 1, &raw).unwrap();
+        writer.add_frame(0, 1, 2, &compressed).unwrap();
+        writer.finish(&store, &path).await.unwrap();
+
+        let (_target_store, target_db) = shard_db("dst-mixed-replay").await;
+        let (registry, mut inlet_rx) = make_receiver_registry(target_db);
+        let multiplexer = WorkerStreamMultiplexer::new(
+            ShuffleClientPool::new(Arc::new(parking_lot::RwLock::new(HashMap::new()))),
+            FlowController::new(),
+        );
+        multiplexer
+            .catch_up_durable(100, 1, WorkerId(501), WorkerId(502), &registry, &store)
+            .await
+            .unwrap();
+        assert_eq!(
+            inlet_rx.recv().await.unwrap().positive_ab_rows(),
+            vec![(31, 310)]
+        );
+        assert_eq!(
+            inlet_rx.recv().await.unwrap().positive_ab_rows(),
+            vec![(32, 320)]
+        );
+        multiplexer
+            .catch_up_durable(100, 1, WorkerId(501), WorkerId(502), &registry, &store)
+            .await
+            .unwrap();
+        tokio::select! {
+            maybe = inlet_rx.recv() => panic!("unexpected duplicate replay delivery: {:?}", maybe),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_az_peers_never_open_direct_grpc_streams() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (_src_store, src_db) = shard_db("src-cross-az").await;
+        let sender_shards = make_sender_shards(src_db);
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            601,
+            "127.0.0.1:9601".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info_with_codecs(
+            602,
+            "127.0.0.1:9602".to_string(),
+            "host-b",
+            "az-2",
+            false,
+            true,
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_object_store(store.clone())
+                .with_src_worker(WorkerId(601));
+        let payload = serialize_zset(&ArrowZSet::from_ab_rows(&[(41, 410)], 1)).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(602),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 1,
+                    payload: payload.into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(multiplexer.connection_count(), 0);
+        let footer = crate::exchange::durable::DurableShuffleReader::read_footer(
+            store.as_ref(),
+            &object_store::path::Path::from("shuffle/100/1/601/602"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(footer.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn proof_wide_shuffle_network_bytes_drop_over_40_percent() {
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let (_src_store, src_db) = shard_db("src-proof-wide-lz4").await;
+        let sender_shards = make_sender_shards(src_db);
+        let (_dst_store, target_db) = shard_db("dst-proof-wide-lz4").await;
+        let (registry, mut inlet_rx) = make_receiver_registry(target_db.clone());
+        let server = ShuffleServer::new(registry);
+        let (tx_close, rx_close) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(
+                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                        server,
+                    ),
+                )
+                .serve_with_shutdown(addr, async {
+                    let _ = rx_close.await;
+                })
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        peers.write().insert(WorkerId(902), addr.to_string());
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            901,
+            "127.0.0.1:9901".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info_with_codecs(
+            902,
+            addr.to_string(),
+            "host-b",
+            "az-1",
+            false,
+            true,
+        ));
+        let exchange_config = ExchangeConfig {
+            exchange_direct_threshold_bytes: usize::MAX,
+            ..ExchangeConfig::default()
+        };
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(901))
+                .with_exchange_config(exchange_config);
+        let zset = make_wide_compressible_zset(16_384);
+        let expected = serialize_zset(&zset).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(902),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 11,
+                    payload: expected.clone().into(),
+                },
+            )
+            .await
+            .unwrap();
+        let received = inlet_rx.recv().await.unwrap();
+        assert_eq!(serialize_zset(&received).unwrap(), expected);
+        let encoded = read_only_inbox_payload(&target_db).await;
+        assert_eq!(
+            framed_payload_codec(&encoded),
+            Some(ShuffleCompression::Lz4)
+        );
+        let raw = expected.len() as f64;
+        let saved = (expected.len() - encoded.len()) as f64;
+        assert!(
+            saved / raw > 0.40,
+            "expected >40% byte savings, raw={raw}, saved={saved}"
+        );
+        let _ = tx_close.send(());
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn proof_cross_az_direct_bytes_drop_to_near_zero() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (_src_store, src_db) = shard_db("src-proof-cross-az").await;
+        let sender_shards = make_sender_shards(src_db);
+        let (_dst_store, target_db) = shard_db("dst-proof-cross-az").await;
+        let (registry, mut inlet_rx) = make_receiver_registry(target_db.clone());
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            911,
+            "127.0.0.1:9911".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info_with_codecs(
+            912,
+            "127.0.0.1:9912".to_string(),
+            "host-b",
+            "az-2",
+            false,
+            true,
+        ));
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_object_store(store.clone())
+                .with_src_worker(WorkerId(911));
+        let zset = make_wide_compressible_zset(8_192);
+        let expected = serialize_zset(&zset).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(912),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 12,
+                    payload: expected.clone().into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(multiplexer.connection_count(), 0);
+        let path = object_store::path::Path::from("shuffle/100/1/911/912");
+        let footer =
+            crate::exchange::durable::DurableShuffleReader::read_footer(store.as_ref(), &path)
+                .await
+                .unwrap();
+        let stored = crate::exchange::durable::DurableShuffleReader::read_frame(
+            store.as_ref(),
+            &path,
+            &footer.entries[0],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            framed_payload_codec(&stored),
+            Some(ShuffleCompression::Zstd)
+        );
+        multiplexer
+            .catch_up_durable(
+                100,
+                1,
+                WorkerId(911),
+                WorkerId(912),
+                &registry,
+                store.as_ref(),
+            )
+            .await
+            .unwrap();
+        let received = inlet_rx.recv().await.unwrap();
+        assert_eq!(serialize_zset(&received).unwrap(), expected);
+        assert_eq!(
+            framed_payload_codec(&read_only_inbox_payload(&target_db).await),
+            Some(ShuffleCompression::Zstd)
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_same_host_shared_memory_cpu_profile_reports_zero_copies() {
+        let _shm_guard = SHM_TEST_LOCK.lock().await;
+        let (_src_store, src_db) = shard_db("src-proof-shm").await;
+        let sender_shards = make_sender_shards(src_db);
+        let (registry, mut inlet_rx) = make_receiver_registry(shard_db("dst-proof-shm").await.1);
+        register_shared_memory_endpoint(WorkerId(922), registry.clone());
+
+        let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let pool = ShuffleClientPool::new(peers);
+        pool.set_local_worker_info(worker_info(
+            921,
+            "127.0.0.1:9921".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        pool.upsert_peer_info(worker_info(
+            922,
+            "127.0.0.1:9922".to_string(),
+            "host-a",
+            "az-1",
+        ));
+        let exchange_config = ExchangeConfig {
+            exchange_direct_threshold_bytes: usize::MAX,
+            ..ExchangeConfig::default()
+        };
+        let multiplexer =
+            WorkerStreamMultiplexer::with_shards(pool, FlowController::new(), sender_shards)
+                .with_src_worker(WorkerId(921))
+                .with_exchange_config(exchange_config);
+        let zset = make_wide_compressible_zset(8_192);
+        let expected = serialize_zset(&zset).unwrap();
+        multiplexer
+            .send_frame(
+                WorkerId(922),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch: 1,
+                    seq: 13,
+                    payload: expected.clone().into(),
+                },
+            )
+            .await
+            .unwrap();
+        let received = inlet_rx.recv().await.unwrap();
+        assert_eq!(serialize_zset(&received).unwrap(), expected);
+        assert_eq!(registry.grpc_frames_received(), 0);
+        unregister_shared_memory_endpoint(WorkerId(922));
     }
 }

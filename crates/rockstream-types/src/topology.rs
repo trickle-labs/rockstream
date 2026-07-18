@@ -75,6 +75,52 @@ impl std::fmt::Display for CapacityHeadroom {
     }
 }
 
+/// Explicit locality metadata advertised by a worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerLocation {
+    /// Stable host identity shared by all worker processes on the same host.
+    #[serde(default)]
+    pub host_id: String,
+    /// Availability zone / failure domain identifier.
+    #[serde(default)]
+    pub availability_zone: String,
+}
+
+impl WorkerLocation {
+    pub fn new(host_id: impl Into<String>, availability_zone: impl Into<String>) -> Self {
+        Self {
+            host_id: host_id.into(),
+            availability_zone: availability_zone.into(),
+        }
+    }
+
+    pub fn has_same_host_as(&self, other: &Self) -> bool {
+        !self.host_id.is_empty() && self.host_id == other.host_id
+    }
+
+    pub fn has_same_az_as(&self, other: &Self) -> bool {
+        !self.availability_zone.is_empty() && self.availability_zone == other.availability_zone
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.host_id.is_empty() && self.availability_zone.is_empty()
+    }
+}
+
+/// Explicit exchange/checkpoint capability bits advertised by a worker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCapabilities {
+    /// Supports same-host Arrow shared-memory shuffle transport.
+    #[serde(default)]
+    pub same_host_arrow_shm_v1: bool,
+    /// Supports shuffle payload codec framing.
+    #[serde(default)]
+    pub shuffle_codec_v1: bool,
+    /// Supports compressed checkpoint-manifest codec framing.
+    #[serde(default)]
+    pub checkpoint_manifest_codec_v1: bool,
+}
+
 /// Registration request sent by a worker to the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRegistration {
@@ -86,6 +132,12 @@ pub struct WorkerRegistration {
     pub address: String,
     /// Current capacity headroom at the time of registration.
     pub capacity_headroom: CapacityHeadroom,
+    /// Worker locality metadata.
+    #[serde(default)]
+    pub location: WorkerLocation,
+    /// Worker feature/capability advertisement.
+    #[serde(default)]
+    pub capabilities: WorkerCapabilities,
     /// Wall-clock timestamp (ms since Unix epoch) when the registration was
     /// sent.
     pub registered_at_ms: u64,
@@ -108,8 +160,20 @@ impl WorkerRegistration {
             role,
             address: address.into(),
             capacity_headroom,
+            location: WorkerLocation::default(),
+            capabilities: WorkerCapabilities::default(),
             registered_at_ms,
         }
+    }
+
+    pub fn with_location(mut self, location: WorkerLocation) -> Self {
+        self.location = location;
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: WorkerCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 }
 
@@ -124,6 +188,12 @@ pub struct WorkerInfo {
     pub address: String,
     /// Most recently reported capacity headroom.
     pub capacity_headroom: CapacityHeadroom,
+    /// Worker locality metadata.
+    #[serde(default)]
+    pub location: WorkerLocation,
+    /// Worker feature/capability advertisement.
+    #[serde(default)]
+    pub capabilities: WorkerCapabilities,
     /// When this worker registered (ms since Unix epoch).
     pub registered_at_ms: u64,
     /// Whether the worker is currently considered healthy.
@@ -141,6 +211,8 @@ impl WorkerInfo {
             role: reg.role,
             address: reg.address.clone(),
             capacity_headroom: reg.capacity_headroom,
+            location: reg.location.clone(),
+            capabilities: reg.capabilities,
             registered_at_ms: reg.registered_at_ms,
             healthy: true,
             lifecycle: WorkerLifecycleState::Active,
@@ -547,17 +619,42 @@ mod tests {
     }
 
     #[test]
-    fn worker_registration_roundtrip() {
+    fn worker_registration_roundtrip_preserves_location_and_capabilities() {
         let reg = WorkerRegistration::new(
             WorkerId(1),
             NodeRole::Worker,
             "127.0.0.1:7001",
             CapacityHeadroom::new(0.8),
-        );
+        )
+        .with_location(WorkerLocation::new("host-a", "az-1"))
+        .with_capabilities(WorkerCapabilities {
+            same_host_arrow_shm_v1: true,
+            shuffle_codec_v1: true,
+            checkpoint_manifest_codec_v1: true,
+        });
         let json = serde_json::to_string(&reg).unwrap();
         let decoded: WorkerRegistration = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.worker_id, WorkerId(1));
         assert_eq!(decoded.address, "127.0.0.1:7001");
+        assert_eq!(decoded.location.host_id, "host-a");
+        assert_eq!(decoded.location.availability_zone, "az-1");
+        assert!(decoded.capabilities.same_host_arrow_shm_v1);
+        assert!(decoded.capabilities.shuffle_codec_v1);
+        assert!(decoded.capabilities.checkpoint_manifest_codec_v1);
+    }
+
+    #[test]
+    fn legacy_worker_registration_defaults_location_and_capabilities() {
+        let legacy = serde_json::json!({
+            "worker_id": 7,
+            "role": "worker",
+            "address": "127.0.0.1:7007",
+            "capacity_headroom": 1.0,
+            "registered_at_ms": 1234
+        });
+        let decoded: WorkerRegistration = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.location, WorkerLocation::default());
+        assert_eq!(decoded.capabilities, WorkerCapabilities::default());
     }
 
     #[test]
@@ -606,10 +703,21 @@ mod tests {
             NodeRole::Worker,
             "10.0.0.1:7005",
             CapacityHeadroom::new(0.6),
-        );
+        )
+        .with_location(WorkerLocation::new("host-z", "az-9"))
+        .with_capabilities(WorkerCapabilities {
+            same_host_arrow_shm_v1: true,
+            shuffle_codec_v1: false,
+            checkpoint_manifest_codec_v1: true,
+        });
         let info = WorkerInfo::from_registration(&reg);
         assert_eq!(info.worker_id, WorkerId(5));
         assert!(info.healthy);
         assert_eq!(info.capacity_headroom.fraction(), 0.6);
+        assert_eq!(info.location.host_id, "host-z");
+        assert_eq!(info.location.availability_zone, "az-9");
+        assert!(info.capabilities.same_host_arrow_shm_v1);
+        assert!(!info.capabilities.shuffle_codec_v1);
+        assert!(info.capabilities.checkpoint_manifest_codec_v1);
     }
 }

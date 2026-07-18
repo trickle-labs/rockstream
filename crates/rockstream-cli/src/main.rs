@@ -7,6 +7,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use rockstream_cli::{request_worker_drain, run_start, StartOptions};
+use rockstream_types::config::RockstreamConfig;
+use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 
 /// RockStream — a cloud-native incremental view maintenance engine with a
 /// PostgreSQL wire access layer.
@@ -44,6 +46,14 @@ enum Command {
         /// Authentication mode.
         #[arg(long, default_value = "off", value_parser = clap::builder::PossibleValuesParser::new(["off", "oidc", "mtls"]))]
         auth: String,
+
+        /// Stable same-host identity advertised during worker registration.
+        #[arg(long)]
+        host_id: Option<String>,
+
+        /// Availability zone advertised during worker registration.
+        #[arg(long)]
+        availability_zone: Option<String>,
 
         /// Metrics HTTP server listen address.
         #[arg(long)]
@@ -113,6 +123,21 @@ enum Command {
         /// preserving exact pre-v0.45.2 single-node behavior.
         #[arg(long)]
         control_shared_storage: Option<std::path::PathBuf>,
+
+        #[arg(long)]
+        exchange_direct_threshold_bytes: Option<usize>,
+        #[arg(long)]
+        exchange_spill_threshold_mb: Option<u64>,
+        #[arg(long)]
+        exchange_domain_size: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        exchange_force_durable: bool,
+        #[arg(long)]
+        same_host_shm_segment_bytes: Option<usize>,
+        #[arg(long)]
+        same_host_shm_segments_per_peer: Option<usize>,
+        #[arg(long)]
+        max_exchange_compression_states: Option<usize>,
     },
     /// Cluster administration commands.
     Cluster {
@@ -158,6 +183,8 @@ fn main() -> ExitCode {
             role,
             control,
             auth,
+            host_id,
+            availability_zone,
             metrics_addr,
             listen,
             raft_peers,
@@ -167,12 +194,55 @@ fn main() -> ExitCode {
             daemon,
             control_bind,
             control_shared_storage,
+            exchange_direct_threshold_bytes,
+            exchange_spill_threshold_mb,
+            exchange_domain_size,
+            exchange_force_durable,
+            same_host_shm_segment_bytes,
+            same_host_shm_segments_per_peer,
+            max_exchange_compression_states,
         } => {
+            let mut config = RockstreamConfig::default();
+            if let Some(value) = exchange_direct_threshold_bytes {
+                config.exchange.exchange_direct_threshold_bytes = value;
+            }
+            if let Some(value) = exchange_spill_threshold_mb {
+                config.exchange.exchange_spill_threshold_mb = value;
+            }
+            if let Some(value) = exchange_domain_size {
+                config.exchange.exchange_domain_size = value;
+            }
+            if exchange_force_durable {
+                config.exchange.exchange_force_durable = true;
+            }
+            if let Some(value) = same_host_shm_segment_bytes {
+                config.exchange.same_host_shm_segment_bytes = value;
+            }
+            if let Some(value) = same_host_shm_segments_per_peer {
+                config.exchange.same_host_shm_segments_per_peer = value;
+            }
+            if let Some(value) = max_exchange_compression_states {
+                config.exchange.max_exchange_compression_states = value;
+            }
             let opts = StartOptions {
                 storage,
                 role,
                 control,
                 auth_mode: auth,
+                worker_location: WorkerLocation::new(
+                    host_id
+                        .or_else(|| std::env::var("HOSTNAME").ok())
+                        .unwrap_or_default(),
+                    availability_zone
+                        .or_else(|| std::env::var("ROCKSTREAM_AVAILABILITY_ZONE").ok())
+                        .unwrap_or_default(),
+                ),
+                worker_capabilities: WorkerCapabilities {
+                    same_host_arrow_shm_v1: true,
+                    shuffle_codec_v1: true,
+                    checkpoint_manifest_codec_v1: true,
+                },
+                config,
                 metrics_addr,
                 listen_addr: Some(listen),
                 raft_peers,
