@@ -521,7 +521,7 @@ impl HopWindowOp {
                 .input_frontier
                 .as_ref()
                 .and_then(|f| f.watermark_ms())
-                .unwrap_or(i64::MIN);
+                .unwrap_or(next.watermark.watermark_ms);
             if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
                 continue;
             }
@@ -738,7 +738,7 @@ impl SessionWindowOp {
                 .input_frontier
                 .as_ref()
                 .and_then(|f| f.watermark_ms())
-                .unwrap_or(i64::MIN);
+                .unwrap_or(next.watermark.watermark_ms);
             if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
                 continue;
             }
