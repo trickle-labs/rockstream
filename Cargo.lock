@@ -5819,6 +5819,7 @@ dependencies = [
  "rockstream-gateway",
  "rockstream-ops",
  "rockstream-oracle",
+ "rockstream-plan",
  "rockstream-runtime",
  "rockstream-sql",
  "rockstream-storage",

@@ -23,6 +23,7 @@ parking_lot = "0.12"
 tokio = { workspace = true, features = ["full", "test-util"] }
 rockstream-oracle = { path = "../rockstream-oracle" }
 rockstream-control = { workspace = true }
+rockstream-plan = { workspace = true }
 rockstream-runtime = { workspace = true }
 rockstream-gateway = { workspace = true }
 rockstream-sql = { workspace = true }
