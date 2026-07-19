@@ -23,6 +23,8 @@ cost-estimation pricing table.
 ```toml
 # rockstream.toml example
 
+recursion_max_iterations = 1024
+
 [cluster]
 min_epoch_ms = 10
 checkpoint_retention_count = 128
@@ -51,6 +53,10 @@ dlq_retention_days = 7
 ```
 
 ## Knobs & Parameters Reference
+
+### Root-level Settings
+
+- **`recursion_max_iterations`** (integer, default: `1024`): Safety cap on recursive fixed-point iterations per epoch before the compiler/runtime fails the epoch conservatively.
 
 ### `[cluster]` Section
 

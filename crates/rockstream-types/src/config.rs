@@ -144,6 +144,8 @@ pub struct StorageConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RockstreamConfig {
+    #[serde(default = "default_recursion_max_iterations")]
+    pub recursion_max_iterations: usize,
     pub cluster: ClusterConfig,
     pub worker: WorkerConfig,
     pub connector: ConnectorConfig,
@@ -153,6 +155,10 @@ pub struct RockstreamConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub pricing: Option<PricingConfig>,
+}
+
+const fn default_recursion_max_iterations() -> usize {
+    1024
 }
 
 impl RockstreamConfig {
@@ -168,6 +174,7 @@ impl RockstreamConfig {
 impl Default for RockstreamConfig {
     fn default() -> Self {
         Self {
+            recursion_max_iterations: default_recursion_max_iterations(),
             cluster: ClusterConfig {
                 min_epoch_ms: 10,
                 checkpoint_retention_count: 128,

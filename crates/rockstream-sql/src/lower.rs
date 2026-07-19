@@ -38,6 +38,7 @@ use rockstream_plan::{
     AggregateExpr, AggregateFunc, BinaryOp, Expr, JoinSemantics, OuterJoinKind, PlanNode,
     WindowExpr, WindowFunc,
 };
+use rockstream_types::config::RockstreamConfig;
 use rockstream_types::ids::OperatorId;
 use std::hash::{Hash, Hasher};
 
@@ -212,11 +213,7 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
             // a filter instead); handle both cases.
             let on = &join.on;
             let on_result = if on.is_empty() {
-                // Semi/anti joins may use the filter field as the join condition.
-                // For now, return RS-1013 if no equi-keys are extractable.
-                Err(SqlError::UnsupportedPlanNode {
-                    node_type: "join_no_equi_condition_semi_anti".to_string(),
-                })
+                extract_join_keys_from_filter(&join.filter, &join.left, &join.right)
             } else {
                 extract_equi_join_keys(on, &join.left, &join.right)
             };
@@ -266,7 +263,7 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
                     // For LeftSemi, on may be empty if DataFusion uses filter.
                     // Try on condition first, else try filter expression for keys.
                     let (left_keys, right_keys) = if on.is_empty() {
-                        extract_semi_anti_keys_from_filter(&join.filter, &join.left, &join.right)?
+                        extract_join_keys_from_filter(&join.filter, &join.left, &join.right)?
                     } else {
                         on_result?
                     };
@@ -275,7 +272,7 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
 
                 JoinType::LeftAnti => {
                     let (left_keys, right_keys) = if on.is_empty() {
-                        extract_semi_anti_keys_from_filter(&join.filter, &join.left, &join.right)?
+                        extract_join_keys_from_filter(&join.filter, &join.left, &join.right)?
                     } else {
                         on_result?
                     };
@@ -351,26 +348,33 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
             })
         }
 
-        // DataFusion 53 lowers scalar `UNNEST(expr)` projections to
-        // `LogicalPlan::Unnest`. In the vendored grammar today, explicit
-        // `CROSS JOIN LATERAL UNNEST(...)` table-function syntax and
-        // `LATERAL (SELECT ...)` are rejected during planning, so there is no
-        // second reachable lateral node shape to lower here yet.
-        LogicalPlan::Unnest(unnest) => {
-            let input = lower(&unnest.input)?;
-            if !unnest.struct_type_columns.is_empty() || unnest.list_type_columns.len() != 1 {
+        LogicalPlan::RecursiveQuery(recursive) => {
+            let base_cols = recursive.static_term.schema().fields().len();
+            let step_cols = recursive.recursive_term.schema().fields().len();
+            let output_cols = plan.schema().fields().len();
+            if base_cols != step_cols || base_cols != output_cols {
                 return Err(SqlError::UnsupportedPlanNode {
                     node_type: format!(
-                        "Unnest:list_cols={},struct_cols={}",
-                        unnest.list_type_columns.len(),
-                        unnest.struct_type_columns.len()
+                        "recursive_query_column_count_mismatch:base={base_cols},step={step_cols},output={output_cols}"
                     ),
                 });
             }
-            let (col, _) = &unnest.list_type_columns[0];
-            Ok(PlanNode::Lateral {
-                input: Box::new(input),
-                func: rockstream_plan::LateralFunc::Unnest { col: *col },
+
+            let classification = classify_recursive_term(&recursive.name, &recursive.recursive_term);
+            if classification.self_references > 1 {
+                return Err(SqlError::UnsupportedPlanNode {
+                    node_type: format!(
+                        "recursive_query_multiple_self_references:name={}",
+                        recursive.name
+                    ),
+                });
+            }
+
+            Ok(PlanNode::Recursion {
+                base: Box::new(lower(&recursive.static_term)?),
+                step: Box::new(lower(&recursive.recursive_term)?),
+                max_iterations: RockstreamConfig::default().recursion_max_iterations,
+                monotone: !recursive.is_distinct && !classification.non_monotone,
             })
         }
 
@@ -736,6 +740,46 @@ fn expr_name(expr: &DfExpr) -> &'static str {
     }
 }
 
+#[derive(Default)]
+struct RecursiveClassification {
+    non_monotone: bool,
+    self_references: usize,
+}
+
+fn classify_recursive_term(recursive_name: &str, plan: &LogicalPlan) -> RecursiveClassification {
+    let mut classification = RecursiveClassification::default();
+    classify_recursive_term_inner(recursive_name, plan, &mut classification);
+    classification
+}
+
+fn classify_recursive_term_inner(
+    recursive_name: &str,
+    plan: &LogicalPlan,
+    classification: &mut RecursiveClassification,
+) {
+    match plan {
+        LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Distinct(_) => {
+            classification.non_monotone = true;
+        }
+        LogicalPlan::Join(join) => {
+            if matches!(
+                join.join_type,
+                JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
+            ) {
+                classification.non_monotone = true;
+            }
+        }
+        LogicalPlan::TableScan(scan) if scan.table_name.table() == recursive_name => {
+            classification.self_references += 1;
+        }
+        _ => {}
+    }
+
+    for input in plan.inputs() {
+        classify_recursive_term_inner(recursive_name, input, classification);
+    }
+}
+
 // ─── Join helpers ────────────────────────────────────────────────────────────
 
 /// Extract equi-join key column indices from DataFusion join condition.
@@ -862,7 +906,7 @@ fn lower_outer_join(
 /// DataFusion sometimes places the equi-condition in the `filter` field for
 /// semi/anti joins instead of the `on` field.  This function extracts the
 /// column indices from the filter if it's a simple equi-expression.
-fn extract_semi_anti_keys_from_filter(
+fn extract_join_keys_from_filter(
     filter: &Option<datafusion::prelude::Expr>,
     left_plan: &LogicalPlan,
     right_plan: &LogicalPlan,
@@ -873,7 +917,7 @@ fn extract_semi_anti_keys_from_filter(
         Some(DfExpr::BinaryExpr(BinaryExpr { left, op, right })) => {
             if *op != datafusion::logical_expr::Operator::Eq {
                 return Err(SqlError::UnsupportedPlanNode {
-                    node_type: "semi_anti_filter_non_eq".to_string(),
+                    node_type: "join_filter_non_eq".to_string(),
                 });
             }
             let left_schema = left_plan.schema();
@@ -882,31 +926,31 @@ fn extract_semi_anti_keys_from_filter(
                 match left.as_ref() {
                     DfExpr::Column(col) => left_schema.index_of_column(col).map_err(|_| {
                         SqlError::UnsupportedPlanNode {
-                            node_type: "semi_anti_column_resolution".to_string(),
+                            node_type: "join_filter_column_resolution".to_string(),
                         }
                     })?,
                     _ => {
                         return Err(SqlError::UnsupportedPlanNode {
-                            node_type: "semi_anti_non_column_key".to_string(),
+                            node_type: "join_filter_non_column_key".to_string(),
                         })
                     }
                 };
             let right_idx = match right.as_ref() {
                 DfExpr::Column(col) => right_schema.index_of_column(col).map_err(|_| {
                     SqlError::UnsupportedPlanNode {
-                        node_type: "semi_anti_column_resolution".to_string(),
+                        node_type: "join_filter_column_resolution".to_string(),
                     }
                 })?,
                 _ => {
                     return Err(SqlError::UnsupportedPlanNode {
-                        node_type: "semi_anti_non_column_key".to_string(),
+                        node_type: "join_filter_non_column_key".to_string(),
                     })
                 }
             };
             Ok((vec![left_idx], vec![right_idx]))
         }
         _ => Err(SqlError::UnsupportedPlanNode {
-            node_type: "semi_anti_no_filter".to_string(),
+            node_type: "join_no_equi_condition".to_string(),
         }),
     }
 }
@@ -1647,6 +1691,192 @@ mod tests {
         );
     }
 
+    fn make_frontend_with_edges() -> crate::frontend::SqlFrontend {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Int64, false),
+            Field::new("dst", DataType::Int64, false),
+        ]));
+        let f = crate::frontend::SqlFrontend::new();
+        f.register_table("edges", schema).unwrap();
+        f
+    }
+
+    fn find_recursion(plan: &PlanNode) -> Option<&PlanNode> {
+        match plan {
+            PlanNode::Recursion { .. } => Some(plan),
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Map { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input, .. }
+            | PlanNode::Window { input, .. }
+            | PlanNode::TumbleWindow { input, .. }
+            | PlanNode::TopK { input, .. }
+            | PlanNode::Lateral { input, .. }
+            | PlanNode::IndexArrange { input, .. } => find_recursion(input),
+            PlanNode::Exchange { child, .. } | PlanNode::ViewSink { child, .. } => {
+                find_recursion(child)
+            }
+            PlanNode::Join { left, right, .. }
+            | PlanNode::InnerJoin { left, right, .. }
+            | PlanNode::OuterJoin { left, right, .. }
+            | PlanNode::Union { left, right }
+            | PlanNode::Intersect { left, right, .. }
+            | PlanNode::Except { left, right, .. } => {
+                find_recursion(left).or_else(|| find_recursion(right))
+            }
+            PlanNode::Source { .. } | PlanNode::Snapshot { .. } | PlanNode::ViewRef { .. } => None,
+        }
+    }
+
+    fn contains_source_named(plan: &PlanNode, needle: &str) -> bool {
+        match plan {
+            PlanNode::Source { name } => name == needle,
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Map { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input, .. }
+            | PlanNode::Window { input, .. }
+            | PlanNode::TumbleWindow { input, .. }
+            | PlanNode::TopK { input, .. }
+            | PlanNode::Lateral { input, .. }
+            | PlanNode::IndexArrange { input, .. } => contains_source_named(input, needle),
+            PlanNode::Exchange { child, .. } | PlanNode::ViewSink { child, .. } => {
+                contains_source_named(child, needle)
+            }
+            PlanNode::Join { left, right, .. }
+            | PlanNode::InnerJoin { left, right, .. }
+            | PlanNode::OuterJoin { left, right, .. }
+            | PlanNode::Union { left, right }
+            | PlanNode::Intersect { left, right, .. }
+            | PlanNode::Except { left, right, .. } => {
+                contains_source_named(left, needle) || contains_source_named(right, needle)
+            }
+            PlanNode::Recursion { base, step, .. } => {
+                contains_source_named(base, needle) || contains_source_named(step, needle)
+            }
+            PlanNode::Snapshot { source_name, .. } => source_name == needle,
+            PlanNode::ViewRef { view_name } => view_name == needle,
+        }
+    }
+
+    fn find_recursive_query(
+        plan: &LogicalPlan,
+    ) -> Option<&datafusion::logical_expr::RecursiveQuery> {
+        match plan {
+            LogicalPlan::RecursiveQuery(recursive) => Some(recursive),
+            _ => plan.inputs().into_iter().find_map(find_recursive_query),
+        }
+    }
+
+    #[tokio::test]
+    async fn lower_with_recursive_transitive_closure_to_recursion_node() {
+        let f = make_frontend_with_edges();
+        let plan = f
+            .sql_to_unoptimized_plan_node(
+                "WITH RECURSIVE reach(src, dst) AS ( \
+                    SELECT src, dst FROM edges \
+                    UNION ALL \
+                    SELECT r.src, e.dst FROM reach r JOIN edges e ON r.dst = e.src \
+                 ) \
+                 SELECT src, dst FROM reach",
+            )
+            .await
+            .expect("recursive transitive closure should lower");
+
+        let recursion = find_recursion(&plan).expect("expected Recursion node in lowered plan");
+        let PlanNode::Recursion {
+            base,
+            step,
+            max_iterations,
+            monotone,
+        } = recursion
+        else {
+            panic!("expected recursion node: {recursion:?}");
+        };
+
+        assert!(*monotone, "transitive closure should be classified monotone");
+        assert_eq!(*max_iterations, 1024);
+        assert!(matches!(base.as_ref(), PlanNode::Project { .. }));
+        assert!(matches!(step.as_ref(), PlanNode::Project { .. }));
+        assert!(
+            contains_source_named(step, "reach"),
+            "recursive step must retain the self-reference source: {step:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_with_recursive_classifies_except_term_as_non_monotone() {
+        let f = make_frontend_with_edges();
+        let plan = f
+            .sql_to_unoptimized_plan_node(
+                "WITH RECURSIVE reach(src, dst) AS ( \
+                    SELECT src, dst FROM edges \
+                    UNION ALL \
+                    (SELECT r.src, e.dst FROM reach r JOIN edges e ON r.dst = e.src \
+                     EXCEPT \
+                     SELECT src, dst FROM edges) \
+                 ) \
+                 SELECT src, dst FROM reach",
+            )
+            .await
+            .expect("recursive EXCEPT query should lower");
+
+        let recursion = find_recursion(&plan).expect("expected Recursion node in lowered plan");
+        let PlanNode::Recursion { monotone, .. } = recursion else {
+            panic!("expected recursion node: {recursion:?}");
+        };
+        assert!(!monotone, "EXCEPT recursive term must be non-monotone");
+    }
+
+    #[tokio::test]
+    async fn lower_with_recursive_rejects_column_count_mismatch() {
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::context::SessionConfig;
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new_with_config(SessionConfig::new());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src", DataType::Int64, false),
+            Field::new("dst", DataType::Int64, false),
+        ]));
+        ctx.register_table("edges", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()))
+            .unwrap();
+
+        let good_plan = ctx
+            .sql(
+                "WITH RECURSIVE reach(src, dst) AS ( \
+                    SELECT src, dst FROM edges \
+                    UNION ALL \
+                    SELECT r.src, e.dst FROM reach r JOIN edges e ON r.dst = e.src \
+                 ) \
+                 SELECT src, dst FROM reach",
+            )
+            .await
+            .unwrap()
+            .into_unoptimized_plan();
+        let one_col_plan = ctx
+            .sql("SELECT src FROM edges")
+            .await
+            .unwrap()
+            .into_unoptimized_plan();
+        let recursive = find_recursive_query(&good_plan).expect("expected RecursiveQuery").clone();
+        let mismatched = LogicalPlan::RecursiveQuery(datafusion::logical_expr::RecursiveQuery {
+            name: recursive.name,
+            static_term: recursive.static_term,
+            recursive_term: Arc::new(one_col_plan),
+            is_distinct: recursive.is_distinct,
+        });
+        let err = lower(&mismatched).expect_err("column-count mismatch must be rejected");
+        assert_eq!(err.error_code().to_string(), "RS-1013");
+        assert!(
+            err.to_string().contains("column_count_mismatch"),
+            "error must identify the recursive shape mismatch: {err}"
+        );
+    }
+
     // ─── Window lowering tests (v0.11 — IVM-7) ───────────────────────────────
 
     fn make_frontend_kv() -> crate::frontend::SqlFrontend {
@@ -1818,4 +2048,5 @@ mod tests {
             "expected RS-1016 error, got: {err_str}"
         );
     }
+
 }
