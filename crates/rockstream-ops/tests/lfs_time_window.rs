@@ -21,7 +21,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
 use rockstream_ops::time_window::{
-    load_tumble_window_state, persist_tumble_window_state, CompactionFilter, TumbleWindowOp,
+    load_hop_window_state, load_tumble_window_state, persist_hop_window_state,
+    persist_tumble_window_state, CompactionFilter, HopWindowOp, TumbleWindowOp,
 };
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_plan::LateDataPolicy;
@@ -322,6 +323,64 @@ async fn lfs_tumble_window_no_early_eviction() {
             "must not evict when frontier < window_end"
         );
 
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn hop_window_state_persists_across_restart() {
+    let dir = TempDir::new().unwrap();
+    let op_id = OperatorId(13);
+    let mut net_state: std::collections::HashMap<(i64, i64, i64), i64> = Default::default();
+
+    {
+        let db = open_shard(&dir).await;
+        let op = HopWindowOp::new(input_schema(), 0, 1000, 500, LateDataPolicy::Drop);
+        let out1 = op
+            .process_epoch(make_input(&[(750, 10, 1), (1250, 20, 1)]), 1)
+            .unwrap();
+        accumulate(&mut net_state, &out1);
+        assert_eq!(
+            op.fill_level(),
+            4,
+            "two rows with overlap=2 produce four live entries"
+        );
+        persist_hop_window_state(&db, &op, op_id).await.unwrap();
+        db.flush().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
+    }
+
+    {
+        let db = open_shard(&dir).await;
+        let op = load_hop_window_state(
+            &db,
+            input_schema(),
+            0,
+            1000,
+            500,
+            LateDataPolicy::Drop,
+            op_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(op.fill_level(), 4, "hop fill level restored after reopen");
+        let out2 = op.process_epoch(make_input(&[(1750, 30, 1)]), 2).unwrap();
+        accumulate(&mut net_state, &out2);
+        let live = live_rows(&net_state);
+        assert!(
+            live.contains(&(1000, 1750, 30)) && live.contains(&(1500, 1750, 30)),
+            "reloaded hop operator must keep overlap semantics"
+        );
         Arc::try_unwrap(db)
             .ok()
             .expect("single owner")

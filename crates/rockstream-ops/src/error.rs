@@ -79,6 +79,14 @@ pub enum OpError {
     #[error("[{code}] TopK buffer overflow: {limit} unique positive-weight rows exceeded in one partition; next_steps: reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add partition columns")]
     TopKBufferOverflow { limit: usize, code: ErrorCode },
 
+    /// Hop-window state exceeded its configured overlap-aware bound.
+    #[error("[{code}] Hop window state bound exceeded ({current}/{limit} rows); next_steps: reduce hop overlap, increase HOP_WINDOW_STATE_LIMIT, or shard the windowed stream more finely")]
+    HopWindowStateOverflow {
+        current: usize,
+        limit: usize,
+        code: ErrorCode,
+    },
+
     /// Monotone recursion received a negative delta.
     #[error("[{code}] Non-monotone delta rejected in monotone recursion; next_steps: mark the recursive query non-monotone or remove retractions from the input stream")]
     RecursionNonMonotoneDelta { code: ErrorCode },
@@ -191,6 +199,15 @@ impl OpError {
         Self::TopKBufferOverflow {
             limit,
             code: RS_1018,
+        }
+    }
+
+    pub fn hop_window_state_overflow(current: usize, limit: usize) -> Self {
+        use rockstream_types::error_code::RS_2023;
+        Self::HopWindowStateOverflow {
+            current,
+            limit,
+            code: RS_2023,
         }
     }
 

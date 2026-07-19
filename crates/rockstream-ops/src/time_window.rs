@@ -8,6 +8,10 @@
 //! Bound: TUMBLE_WINDOW_STATE_LIMIT = 100_000 window × group_key pairs per operator.
 //! Metric: `fill_level()` = total positive-weight rows across all open windows.
 //! Backpressure: epoch backpressure from scheduler when fill_level > TUMBLE_WINDOW_STATE_LIMIT.
+//!
+//! Hop windows use the same keyspace and compaction filter machinery, but with
+//! an overlap-aware bound: `HOP_WINDOW_STATE_LIMIT = 100_000` positive
+//! window×row pairs per operator.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -33,6 +37,7 @@ use crate::zset::ArrowZSet;
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 pub const TUMBLE_WINDOW_STATE_LIMIT: usize = 100_000;
+pub const HOP_WINDOW_STATE_LIMIT: usize = 100_000;
 
 // ─── WatermarkState ──────────────────────────────────────────────────────────
 
@@ -114,6 +119,7 @@ type WindowMap = HashMap<Vec<u8>, (Vec<i64>, i64)>;
 /// Previously-emitted output: group_key_bytes → row_vals.
 type EmittedMap = HashMap<Vec<u8>, Vec<i64>>;
 
+#[derive(Clone)]
 struct TumbleWindowState {
     /// window_id → row entries (positive and negative weight).
     windows: HashMap<i64, WindowMap>,
@@ -128,6 +134,35 @@ struct TumbleWindowState {
 }
 
 impl TumbleWindowState {
+    fn new() -> Self {
+        Self {
+            windows: HashMap::new(),
+            prev_output: HashMap::new(),
+            watermark: WatermarkState::new(),
+            finalized: HashSet::new(),
+            input_frontier: None,
+        }
+    }
+
+    fn total_rows(&self) -> usize {
+        self.windows
+            .values()
+            .flat_map(|m| m.values())
+            .filter(|(_, w)| *w > 0)
+            .count()
+    }
+}
+
+#[derive(Clone)]
+struct HopWindowState {
+    windows: HashMap<i64, WindowMap>,
+    prev_output: HashMap<i64, EmittedMap>,
+    watermark: WatermarkState,
+    finalized: HashSet<i64>,
+    input_frontier: Option<rockstream_types::frontier::FreshnessToken>,
+}
+
+impl HopWindowState {
     fn new() -> Self {
         Self {
             windows: HashMap::new(),
@@ -326,7 +361,7 @@ impl TumbleWindowOp {
                     out_vals.extend_from_slice(vals);
                     output_rows.push((out_vals, 1));
                 }
-                new_emitted.insert(key.clone(), vals.clone());
+                new_emitted.insert(key.clone(), vals.to_vec());
             }
 
             state.prev_output.insert(window_id, new_emitted);
@@ -369,6 +404,219 @@ impl Operator for TumbleWindowOp {
     }
 }
 
+/// Hopping time-window operator (v0.50).
+///
+/// Assigns each input row to every overlapping fixed-size window that contains
+/// its event timestamp. Windows close when the watermark advances past the
+/// window end. Late rows are handled with the same semantics as tumble windows.
+pub struct HopWindowOp {
+    /// Output schema: [window_id: i64, ...input_cols...]
+    pub schema: SchemaRef,
+    n_input_cols: usize,
+    time_col: usize,
+    window_size_ms: i64,
+    slide_ms: i64,
+    late_data_policy: LateDataPolicy,
+    state: Mutex<HopWindowState>,
+    fill_level: Arc<AtomicUsize>,
+}
+
+impl HopWindowOp {
+    pub fn output_schema(input_schema: &Schema) -> SchemaRef {
+        TumbleWindowOp::output_schema(input_schema)
+    }
+
+    pub fn new(
+        input_schema: SchemaRef,
+        time_col: usize,
+        window_size_ms: i64,
+        slide_ms: i64,
+        late_data_policy: LateDataPolicy,
+    ) -> Self {
+        let schema = Self::output_schema(&input_schema);
+        let n_input_cols = input_schema.fields().len();
+        Self {
+            schema,
+            n_input_cols,
+            time_col,
+            window_size_ms,
+            slide_ms,
+            late_data_policy,
+            state: Mutex::new(HopWindowState::new()),
+            fill_level: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn fill_level(&self) -> usize {
+        self.fill_level.load(Ordering::Relaxed)
+    }
+
+    pub fn watermark_ms(&self) -> i64 {
+        let state = self.state.lock().unwrap();
+        state
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(state.watermark.watermark_ms)
+    }
+
+    pub fn process_epoch(&self, delta: ArrowZSet, _epoch: u64) -> Result<ArrowZSet, OpError> {
+        if delta.is_empty() && delta.frontier.is_none() {
+            return Ok(ArrowZSet::empty(self.schema.clone()));
+        }
+
+        let mut state = self.state.lock().unwrap();
+        let mut next = state.clone();
+        if let Some(ref frontier) = delta.frontier {
+            next.input_frontier = Some(frontier.clone());
+        }
+
+        let mut dirty_windows: HashSet<i64> = HashSet::new();
+        let mut live_rows = next.total_rows();
+
+        for row_idx in 0..delta.num_rows() {
+            let w = delta.weights[row_idx];
+            if w == 0 {
+                continue;
+            }
+            let row_vals = extract_row_vals(&delta.data, row_idx, self.n_input_cols);
+            let event_time_ms = row_vals.get(self.time_col).copied().unwrap_or(0);
+            let current_watermark = next
+                .input_frontier
+                .as_ref()
+                .and_then(|f| f.watermark_ms())
+                .unwrap_or(next.watermark.watermark_ms);
+            if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
+                continue;
+            }
+
+            next.watermark = next.watermark.merge(WatermarkState {
+                watermark_ms: event_time_ms,
+            });
+
+            for window_id in hop_window_ids(event_time_ms, self.window_size_ms, self.slide_ms) {
+                if next.finalized.contains(&window_id) {
+                    continue;
+                }
+                let group_key = encode_row(&row_vals);
+                let window = next.windows.entry(window_id).or_default();
+                let entry = window
+                    .entry(group_key.clone())
+                    .or_insert((row_vals.clone(), 0i64));
+                let previous = entry.1;
+                entry.1 += w;
+                match (previous > 0, entry.1 > 0) {
+                    (false, true) => {
+                        live_rows += 1;
+                        if live_rows > HOP_WINDOW_STATE_LIMIT {
+                            entry.1 = previous;
+                            if previous == 0 {
+                                window.remove(&group_key);
+                            }
+                            return Err(OpError::hop_window_state_overflow(
+                                live_rows,
+                                HOP_WINDOW_STATE_LIMIT,
+                            ));
+                        }
+                    }
+                    (true, false) => {
+                        live_rows = live_rows.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                dirty_windows.insert(window_id);
+            }
+        }
+
+        let watermark_ms = next
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(next.watermark.watermark_ms);
+        let all_windows: Vec<i64> = {
+            let mut ws: HashSet<i64> = dirty_windows.clone();
+            for &wid in next.windows.keys() {
+                if !next.finalized.contains(&wid) && watermark_ms > wid + self.window_size_ms {
+                    ws.insert(wid);
+                }
+            }
+            ws.into_iter().collect()
+        };
+
+        let mut output_rows: Vec<(Vec<i64>, i64)> = Vec::new();
+        for window_id in all_windows {
+            let new_state: HashMap<Vec<u8>, Vec<i64>> = next
+                .windows
+                .get(&window_id)
+                .map(|m| {
+                    m.iter()
+                        .filter(|(_, (_, w))| *w > 0)
+                        .map(|(k, (vals, _))| (k.clone(), vals.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let old_emitted: EmittedMap = next
+                .prev_output
+                .get(&window_id)
+                .cloned()
+                .unwrap_or_default();
+
+            for (key, old_vals) in &old_emitted {
+                if !new_state.contains_key(key) {
+                    let mut out_vals = vec![window_id];
+                    out_vals.extend_from_slice(old_vals);
+                    output_rows.push((out_vals, -1));
+                }
+            }
+
+            let mut new_emitted: EmittedMap = HashMap::new();
+            for (key, vals) in &new_state {
+                if !old_emitted.contains_key(key) {
+                    let mut out_vals = vec![window_id];
+                    out_vals.extend_from_slice(vals);
+                    output_rows.push((out_vals, 1));
+                }
+                new_emitted.insert(key.clone(), vals.clone());
+            }
+
+            next.prev_output.insert(window_id, new_emitted);
+            if watermark_ms > window_id + self.window_size_ms {
+                next.finalized.insert(window_id);
+            }
+        }
+
+        let total = next.total_rows();
+        *state = next;
+        drop(state);
+        self.fill_level.store(total, Ordering::Relaxed);
+        build_output(&self.schema, output_rows)
+    }
+}
+
+impl Operator for HopWindowOp {
+    fn name(&self) -> &str {
+        "HopWindowOp"
+    }
+
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_epoch(delta, 0)
+    }
+
+    fn push_input_frontier(
+        &self,
+        frontier: rockstream_types::frontier::FreshnessToken,
+    ) -> Result<(), OpError> {
+        let mut state = self.state.lock().unwrap();
+        state.input_frontier = Some(frontier);
+        Ok(())
+    }
+
+    fn input_frontier(&self) -> Option<rockstream_types::frontier::FreshnessToken> {
+        let state = self.state.lock().unwrap();
+        state.input_frontier.clone()
+    }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Floor division that correctly handles negative dividends.
@@ -382,6 +630,20 @@ fn floor_div(a: i64, b: i64) -> i64 {
     } else {
         d
     }
+}
+
+fn hop_window_ids(event_time_ms: i64, window_size_ms: i64, slide_ms: i64) -> Vec<i64> {
+    let overlap = window_size_ms / slide_ms;
+    let latest_start = floor_div(event_time_ms, slide_ms) * slide_ms;
+    let mut window_ids = Vec::with_capacity(overlap.max(0) as usize);
+    for offset in 0..overlap {
+        let window_id = latest_start - offset * slide_ms;
+        if event_time_ms >= window_id && event_time_ms < window_id + window_size_ms {
+            window_ids.push(window_id);
+        }
+    }
+    window_ids.sort();
+    window_ids
 }
 
 fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i64> {
@@ -555,6 +817,86 @@ pub async fn load_tumble_window_state(
     Ok(op)
 }
 
+/// Persist HopWindowOp state to a ShardDb using the shared TW keyspace.
+pub async fn persist_hop_window_state(
+    db: &ShardDb,
+    op: &HopWindowOp,
+    op_id: OperatorId,
+) -> Result<(), OpError> {
+    let batch = {
+        let state = op.state.lock().unwrap();
+        let mut batch = WriteBatch::new();
+        let oid = op_id.0;
+        for (&window_id, window_map) in &state.windows {
+            for (group_key, (row_vals, weight)) in window_map {
+                let key = ShardKeyEncoder::tumble_window_key(oid, window_id, group_key);
+                let value = encode_window_value(row_vals, *weight);
+                batch.put(&key, &value);
+            }
+        }
+        let wm_key = ShardKeyEncoder::watermark_key(oid);
+        batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
+        batch
+    };
+
+    db.write_batch(batch).await.map_err(OpError::storage)?;
+    Ok(())
+}
+
+/// Load HopWindowOp state from a ShardDb using the shared TW keyspace.
+pub async fn load_hop_window_state(
+    db: &ShardDb,
+    input_schema: SchemaRef,
+    time_col: usize,
+    window_size_ms: i64,
+    slide_ms: i64,
+    late_data_policy: LateDataPolicy,
+    op_id: OperatorId,
+) -> Result<HopWindowOp, OpError> {
+    let op = HopWindowOp::new(
+        input_schema,
+        time_col,
+        window_size_ms,
+        slide_ms,
+        late_data_policy,
+    );
+    let n_input_cols = op.n_input_cols;
+    let oid = op_id.0;
+    let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
+    let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+    let prefix_len = prefix.len();
+    let wm_key = ShardKeyEncoder::watermark_key(oid);
+    let wm_bytes = db.get(&wm_key).await.ok().flatten();
+
+    let mut st = op.state.lock().unwrap();
+    for (key, value) in entries {
+        if let Some((row_vals, weight)) = decode_window_value(&value, n_input_cols) {
+            if key.len() < prefix_len + 8 {
+                continue;
+            }
+            let window_id =
+                i64::from_be_bytes(key[prefix_len..prefix_len + 8].try_into().unwrap_or([0; 8]));
+            let group_key = key[prefix_len + 8..].to_vec();
+            st.windows
+                .entry(window_id)
+                .or_default()
+                .insert(group_key, (row_vals, weight));
+        }
+    }
+
+    if let Some(bytes) = wm_bytes {
+        if bytes.len() >= 8 {
+            let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+            st.watermark = WatermarkState { watermark_ms: wm };
+        }
+    }
+
+    let total = st.total_rows();
+    drop(st);
+    op.fill_level.store(total, Ordering::Relaxed);
+    Ok(op)
+}
+
 /// Load the persisted watermark for an operator (used by compaction filters).
 pub async fn load_watermark(db: &ShardDb, op_id: OperatorId) -> Result<WatermarkState, OpError> {
     let wm_key = ShardKeyEncoder::watermark_key(op_id.0);
@@ -648,6 +990,23 @@ mod tests {
         rows
     }
 
+    fn batch_hop_rows(
+        rows: &[(i64, i64, i64)],
+        window_size_ms: i64,
+        slide_ms: i64,
+    ) -> Vec<(i64, i64, i64)> {
+        let mut net: HashMap<(i64, i64, i64), i64> = HashMap::new();
+        for &(t, v, w) in rows {
+            if w == 0 {
+                continue;
+            }
+            for window_id in hop_window_ids(t, window_size_ms, slide_ms) {
+                *net.entry((window_id, t, v)).or_insert(0) += w;
+            }
+        }
+        live_rows(&net)
+    }
+
     #[test]
     fn tumble_window_basic_assignment() {
         let window_size_ms = 1000i64;
@@ -731,6 +1090,79 @@ mod tests {
             "late row must not appear in output; got {} rows",
             out3.num_rows()
         );
+    }
+
+    #[test]
+    fn hop_window_assigns_row_to_all_overlapping_windows() {
+        let op = HopWindowOp::new(input_schema(), 0, 1000, 500, LateDataPolicy::Drop);
+        let out = op.process_epoch(make_input(&[(1250, 42, 1)]), 1).unwrap();
+        let mut net: HashMap<(i64, i64, i64), i64> = Default::default();
+        accumulate(&mut net, &out);
+        assert_eq!(live_rows(&net), vec![(500, 1250, 42), (1000, 1250, 42)]);
+        assert_eq!(op.fill_level(), 2);
+    }
+
+    #[test]
+    fn hop_window_matches_batch_oracle_with_overlap() {
+        let window_size_ms = 1000;
+        let slide_ms = 500;
+        let op = HopWindowOp::new(
+            input_schema(),
+            0,
+            window_size_ms,
+            slide_ms,
+            LateDataPolicy::Drop,
+        );
+        let mut net: HashMap<(i64, i64, i64), i64> = Default::default();
+
+        let out1 = op
+            .process_epoch(make_input(&[(250, 10, 1), (1250, 20, 1)]), 1)
+            .unwrap();
+        accumulate(&mut net, &out1);
+
+        let out2 = op
+            .process_epoch(make_input(&[(1250, 20, -1), (1750, 30, 1)]), 2)
+            .unwrap();
+        accumulate(&mut net, &out2);
+
+        let expected = batch_hop_rows(
+            &[(250, 10, 1), (1250, 20, 1), (1750, 30, 1), (1250, 20, -1)],
+            window_size_ms,
+            slide_ms,
+        );
+        assert_eq!(live_rows(&net), expected);
+    }
+
+    #[test]
+    fn hop_window_late_data_policy_matches_tumble_semantics() {
+        let op = HopWindowOp::new(input_schema(), 0, 1000, 500, LateDataPolicy::Drop);
+        op.process_epoch(make_input(&[(100, 10, 1)]), 1).unwrap();
+        op.process_epoch(make_input(&[(2500, 99, 1)]), 2).unwrap();
+        let out = op.process_epoch(make_input(&[(50, 10, 1)]), 3).unwrap();
+        assert!(out.is_empty(), "late hop row must be dropped");
+        assert!(op.watermark_ms() >= 2500);
+    }
+
+    #[test]
+    fn hop_window_state_bound_scales_with_overlap_and_backpressures() {
+        let op = HopWindowOp::new(
+            input_schema(),
+            0,
+            ((HOP_WINDOW_STATE_LIMIT + 1) as i64) * 1000,
+            1000,
+            LateDataPolicy::Drop,
+        );
+        let err = op
+            .process_epoch(make_input(&[(0, 7, 1)]), 1)
+            .expect_err("overlap-aware bound must backpressure");
+        match err {
+            OpError::HopWindowStateOverflow { current, limit, .. } => {
+                assert_eq!(current, HOP_WINDOW_STATE_LIMIT + 1);
+                assert_eq!(limit, HOP_WINDOW_STATE_LIMIT);
+            }
+            other => panic!("expected HopWindowStateOverflow, got {other:?}"),
+        }
+        assert_eq!(op.fill_level(), 0, "overflow must not commit partial state");
     }
 
     #[test]

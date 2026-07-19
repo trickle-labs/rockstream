@@ -44,6 +44,186 @@ mod proptest_oracle {
         ]))
     }
 
+    #[cfg(test)]
+    mod hop_window_oracle {
+        use std::collections::{BTreeMap, HashMap};
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use proptest::prelude::*;
+        use rockstream_ops::time_window::HopWindowOp;
+        use rockstream_ops::zset::ArrowZSet;
+        use rockstream_plan::LateDataPolicy;
+
+        type DeltaRow = (i64, i64, i64);
+
+        fn schema_tv() -> Arc<Schema> {
+            Arc::new(Schema::new(vec![
+                Field::new("t", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ]))
+        }
+
+        fn make_batch(rows: &[DeltaRow]) -> ArrowZSet {
+            let t = Int64Array::from(rows.iter().map(|(t, _, _)| *t).collect::<Vec<_>>());
+            let v = Int64Array::from(rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>());
+            let w = rows.iter().map(|(_, _, w)| *w).collect::<Vec<_>>();
+            let data = RecordBatch::try_new(
+                schema_tv(),
+                vec![Arc::new(t) as ArrayRef, Arc::new(v) as ArrayRef],
+            )
+            .unwrap();
+            ArrowZSet::new(data, w)
+        }
+
+        fn hop_window_ids(event_time_ms: i64, window_size_ms: i64, slide_ms: i64) -> Vec<i64> {
+            let overlap = window_size_ms / slide_ms;
+            let latest_start = event_time_ms.div_euclid(slide_ms) * slide_ms;
+            let mut ids = Vec::with_capacity(overlap.max(0) as usize);
+            for offset in 0..overlap {
+                let window_id = latest_start - offset * slide_ms;
+                if event_time_ms >= window_id && event_time_ms < window_id + window_size_ms {
+                    ids.push(window_id);
+                }
+            }
+            ids.sort();
+            ids
+        }
+
+        fn accumulate_input(
+            state: &mut BTreeMap<(i64, i64), i64>,
+            batch: &ArrowZSet,
+            watermark_ms: &mut i64,
+        ) {
+            if batch.is_empty() {
+                return;
+            }
+            let t = batch
+                .data
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let v = batch
+                .data
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                if t.value(i) < *watermark_ms {
+                    continue;
+                }
+                *watermark_ms = (*watermark_ms).max(t.value(i));
+                let key = (t.value(i), v.value(i));
+                let entry = state.entry(key).or_insert(0);
+                *entry += batch.weights[i];
+                if *entry == 0 {
+                    state.remove(&key);
+                }
+            }
+        }
+
+        fn accumulate_output(state: &mut BTreeMap<(i64, i64, i64), i64>, batch: &ArrowZSet) {
+            if batch.is_empty() {
+                return;
+            }
+            let wid = batch
+                .data
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let t = batch
+                .data
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let v = batch
+                .data
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let key = (wid.value(i), t.value(i), v.value(i));
+                let entry = state.entry(key).or_insert(0);
+                *entry += batch.weights[i];
+                if *entry == 0 {
+                    state.remove(&key);
+                }
+            }
+        }
+
+        fn live_output(state: &BTreeMap<(i64, i64, i64), i64>) -> Vec<(i64, i64, i64)> {
+            state
+                .iter()
+                .filter(|(_, &w)| w > 0)
+                .map(|(&row, _)| row)
+                .collect()
+        }
+
+        fn batch_hop(
+            acc: &BTreeMap<(i64, i64), i64>,
+            window_size_ms: i64,
+            slide_ms: i64,
+        ) -> Vec<(i64, i64, i64)> {
+            let mut out: HashMap<(i64, i64, i64), i64> = HashMap::new();
+            for (&(t, v), &w) in acc {
+                if w <= 0 {
+                    continue;
+                }
+                for window_id in hop_window_ids(t, window_size_ms, slide_ms) {
+                    out.insert((window_id, t, v), 1);
+                }
+            }
+            let mut rows = out.keys().copied().collect::<Vec<_>>();
+            rows.sort();
+            rows
+        }
+
+        fn arb_delta_row() -> impl Strategy<Value = DeltaRow> {
+            (0i64..=2500, 1i64..=20, prop_oneof![Just(1i64), Just(-1i64)])
+                .prop_map(|(t, v, w)| (t, v, w))
+        }
+
+        fn arb_epochs() -> impl Strategy<Value = Vec<Vec<DeltaRow>>> {
+            prop::collection::vec(prop::collection::vec(arb_delta_row(), 0..=4), 1..=6)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2048))]
+
+            #[test]
+            fn oracle_hop_window_matches_batch(epochs in arb_epochs()) {
+                let window_size_ms = 1000;
+                let slide_ms = 500;
+                let op = HopWindowOp::new(schema_tv(), 0, window_size_ms, slide_ms, LateDataPolicy::Drop);
+                let mut input_state = BTreeMap::new();
+                let mut output_state = BTreeMap::new();
+                let mut watermark_ms = i64::MIN;
+
+                for (epoch_idx, epoch_rows) in epochs.iter().enumerate() {
+                    let batch = make_batch(epoch_rows);
+                    accumulate_input(&mut input_state, &batch, &mut watermark_ms);
+                    let out = op
+                        .process_epoch(batch, epoch_idx as u64 + 1)
+                        .map_err(|e| TestCaseError::fail(format!("process_epoch failed: {e}")))?;
+                    accumulate_output(&mut output_state, &out);
+                    prop_assert_eq!(
+                        live_output(&output_state),
+                        batch_hop(&input_state, window_size_ms, slide_ms),
+                        "hop incremental output diverged at epoch {}",
+                        epoch_idx + 1
+                    );
+                }
+            }
+        }
+    }
+
     fn schema_kv_result() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),

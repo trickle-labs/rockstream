@@ -11,7 +11,8 @@ use hmac::{Hmac, Mac};
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use rockstream_ops::time_window::{
-    load_tumble_window_state, persist_tumble_window_state, CompactionFilter, TumbleWindowOp,
+    load_hop_window_state, load_tumble_window_state, persist_hop_window_state,
+    persist_tumble_window_state, CompactionFilter, HopWindowOp, TumbleWindowOp,
 };
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_storage::{keys::ShardKeyEncoder, ShardDb};
@@ -23,6 +24,7 @@ use testcontainers_modules::minio::MinIO;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use rockstream_plan::LateDataPolicy;
 
 const MINIO_USER: &str = "minioadmin";
 const MINIO_PASS: &str = "minioadmin";
@@ -204,7 +206,6 @@ async fn minio_tumble_window_late_data_and_ttl() {
     let op_id = OperatorId(30);
     let window_size_ms = 1000i64;
 
-    use rockstream_plan::LateDataPolicy;
     let op = TumbleWindowOp::new(input_schema(), 0, window_size_ms, LateDataPolicy::Drop);
 
     // Epoch 1: rows in window [0, 1000).
@@ -261,5 +262,67 @@ async fn minio_tumble_window_late_data_and_ttl() {
     assert!(
         !filter.may_delete(&sample_key),
         "must not evict window state when frontier < window_end"
+    );
+}
+
+#[tokio::test]
+async fn hop_window_late_data_and_ttl_on_minio() {
+    if !docker_available() {
+        eprintln!("Docker not available — skipping hop_window_late_data_and_ttl_on_minio");
+        return;
+    }
+
+    let (_container, port) = start_minio().await;
+    let db = open_shard_minio(port, "hop-test").await;
+    let op_id = OperatorId(31);
+    let op = HopWindowOp::new(input_schema(), 0, 1000, 500, LateDataPolicy::Drop);
+
+    let out1 = op
+        .process_epoch(make_input(&[(750, 10, 1), (1250, 20, 1)]), 1)
+        .unwrap();
+    assert_eq!(
+        out1.num_rows(),
+        4,
+        "each row should fan out to two overlapping windows"
+    );
+
+    let _out2 = op.process_epoch(make_input(&[(5000, 99, 1)]), 2).unwrap();
+    assert!(op.watermark_ms() >= 5000);
+
+    persist_hop_window_state(&db, &op, op_id).await.unwrap();
+
+    let late = op.process_epoch(make_input(&[(50, 77, 1)]), 3).unwrap();
+    assert!(
+        late.is_empty(),
+        "late hop row must be dropped on MinIO path"
+    );
+
+    let op2 = load_hop_window_state(
+        &db,
+        input_schema(),
+        0,
+        1000,
+        500,
+        LateDataPolicy::Drop,
+        op_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        op2.fill_level(),
+        op.fill_level(),
+        "hop fill level matches after reload"
+    );
+
+    let sample_key = ShardKeyEncoder::tumble_window_key(op_id.0, 500i64, b"gk");
+    let filter = CompactionFilter {
+        watermark_ms: 5000,
+        window_size_ms: 1000,
+        allowed_lateness_ms: 0,
+        frontier_ms: 1200,
+    };
+    assert!(
+        !filter.may_delete(&sample_key),
+        "hop state must not evict before frontier passes the window end"
     );
 }
