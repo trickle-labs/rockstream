@@ -383,7 +383,8 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
                 });
             }
 
-            let classification = classify_recursive_term(&recursive.name, &recursive.recursive_term);
+            let classification =
+                classify_recursive_term(&recursive.name, &recursive.recursive_term);
             if classification.self_references > 1 {
                 return Err(SqlError::UnsupportedPlanNode {
                     node_type: format!(
@@ -1819,7 +1820,10 @@ mod tests {
             panic!("expected recursion node: {recursion:?}");
         };
 
-        assert!(*monotone, "transitive closure should be classified monotone");
+        assert!(
+            *monotone,
+            "transitive closure should be classified monotone"
+        );
         assert_eq!(*max_iterations, 1024);
         assert!(matches!(base.as_ref(), PlanNode::Project { .. }));
         assert!(matches!(step.as_ref(), PlanNode::Project { .. }));
@@ -1865,8 +1869,11 @@ mod tests {
             Field::new("src", DataType::Int64, false),
             Field::new("dst", DataType::Int64, false),
         ]));
-        ctx.register_table("edges", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()))
-            .unwrap();
+        ctx.register_table(
+            "edges",
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
 
         let good_plan = ctx
             .sql(
@@ -1885,7 +1892,9 @@ mod tests {
             .await
             .unwrap()
             .into_unoptimized_plan();
-        let recursive = find_recursive_query(&good_plan).expect("expected RecursiveQuery").clone();
+        let recursive = find_recursive_query(&good_plan)
+            .expect("expected RecursiveQuery")
+            .clone();
         let mismatched = LogicalPlan::RecursiveQuery(datafusion::logical_expr::RecursiveQuery {
             name: recursive.name,
             static_term: recursive.static_term,
@@ -2071,5 +2080,4 @@ mod tests {
             "expected RS-1016 error, got: {err_str}"
         );
     }
-
 }

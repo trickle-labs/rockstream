@@ -103,14 +103,21 @@ fn distributed_recursion_sim_faults_surface_registered_codes() {
     frontier
         .ingest(ShardFrontierReport {
             shard_id: ShardId(2),
-            epoch: if buggify!("recursion.inner_frontier_stall", 1.0) { 1 } else { 3 },
+            epoch: if buggify!("recursion.inner_frontier_stall", 1.0) {
+                1
+            } else {
+                3
+            },
         })
         .unwrap();
     assert!(frontier.cluster_frontier().epoch.is_some());
 
     let err = op
         .process_distributed_epoch(
-            &[(1, make_input(&[(1, 2, 1)])), (2, ArrowZSet::empty(schema_edges()))],
+            &[
+                (1, make_input(&[(1, 2, 1)])),
+                (2, ArrowZSet::empty(schema_edges())),
+            ],
             &[
                 DistributedShardStatus {
                     shard_id: 1,

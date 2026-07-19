@@ -215,7 +215,12 @@ fn minio_store(port: u16) -> Arc<dyn ObjectStore> {
 }
 
 async fn open_shard_minio(port: u16, path: &str) -> Arc<ShardDb> {
-    Arc::new(ShardDb::builder(path, minio_store(port)).build().await.unwrap())
+    Arc::new(
+        ShardDb::builder(path, minio_store(port))
+            .build()
+            .await
+            .unwrap(),
+    )
 }
 
 #[tokio::test]
