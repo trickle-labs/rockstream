@@ -319,6 +319,28 @@ impl DiffCtx {
                 });
                 Ok(id)
             }
+            PlanNode::HopWindow {
+                input,
+                window_size_ms,
+                slide_ms,
+                late_data_policy,
+                ..
+            } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::HopWindow {
+                        window_size_ms: *window_size_ms,
+                        slide_ms: *slide_ms,
+                        late_data_policy: late_data_policy.clone(),
+                    },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
 
             // ── TopK (v0.12 — IVM-9) ─────────────────────────────────────
             PlanNode::TopK {
@@ -523,6 +545,34 @@ mod tests {
         assert!(tw_op.is_some(), "must contain exactly one TumbleWindow op");
         if let OpKind::TumbleWindow { window_size_ms, .. } = &tw_op.unwrap().kind {
             assert_eq!(*window_size_ms, 1000);
+        }
+    }
+
+    #[test]
+    fn diff_hop_window_emits_hop_window_op() {
+        use rockstream_plan::LateDataPolicy;
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::HopWindow {
+            input: Box::new(src),
+            time_col: 0,
+            window_size_ms: 1000,
+            slide_ms: 250,
+            late_data_policy: LateDataPolicy::Drop,
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        let hop_op = physical
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::HopWindow { .. }));
+        assert!(hop_op.is_some(), "must contain exactly one HopWindow op");
+        if let OpKind::HopWindow {
+            window_size_ms,
+            slide_ms,
+            ..
+        } = &hop_op.unwrap().kind
+        {
+            assert_eq!((*window_size_ms, *slide_ms), (1000, 250));
         }
     }
 

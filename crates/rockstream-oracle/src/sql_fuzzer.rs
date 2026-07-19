@@ -732,7 +732,9 @@ pub fn get_column_count(plan: &PlanNode) -> usize {
             input,
             window_exprs,
         } => get_column_count(input) + window_exprs.len(),
-        PlanNode::TumbleWindow { input, .. } => get_column_count(input),
+        PlanNode::TumbleWindow { input, .. } | PlanNode::HopWindow { input, .. } => {
+            get_column_count(input)
+        }
         PlanNode::TopK { input, .. } => get_column_count(input),
         PlanNode::Recursion { base, .. } => get_column_count(base),
         PlanNode::Snapshot { source_name, .. } => get_column_count(&PlanNode::Source {

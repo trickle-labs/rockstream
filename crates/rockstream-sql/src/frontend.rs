@@ -316,6 +316,7 @@ impl SqlFrontend {
             | PlanNode::Distinct { input, .. }
             | PlanNode::Window { input, .. }
             | PlanNode::TumbleWindow { input, .. }
+            | PlanNode::HopWindow { input, .. }
             | PlanNode::TopK { input, .. }
             | PlanNode::Lateral { input, .. }
             | PlanNode::IndexArrange { input, .. } => 1 + Self::count_plan_nodes(input),
@@ -1401,6 +1402,57 @@ mod tests {
                 partition_by: vec![0],
             }),
             columns: vec![Expr::Column(0), Expr::Column(2)],
+        };
+
+        assert_eq!(sql_plan, expected);
+    }
+
+    #[tokio::test]
+    async fn sql_surface_spike_hop_window_query_compiles() {
+        let frontend = SqlFrontend::new();
+        frontend
+            .register_table(
+                "bid",
+                Arc::new(Schema::new(vec![
+                    Field::new("auction", DataType::Int64, false),
+                    Field::new("bidder", DataType::Int64, false),
+                    Field::new("price", DataType::Int64, false),
+                    Field::new("channel", DataType::Utf8, false),
+                    Field::new("url", DataType::Utf8, false),
+                    Field::new("date_time", DataType::Int64, false),
+                    Field::new("extra", DataType::Utf8, false),
+                ])),
+            )
+            .unwrap();
+
+        let sql_plan = frontend
+            .sql_to_unoptimized_plan_node(
+                "SELECT date_bin(INTERVAL '10 seconds', to_timestamp_millis(date_time - slide_idx * 5000)) as dt, COUNT(*) \
+                 FROM bid CROSS JOIN generate_series(0, 1) AS slide(slide_idx) \
+                 GROUP BY date_bin(INTERVAL '10 seconds', to_timestamp_millis(date_time - slide_idx * 5000))",
+            )
+            .await
+            .expect("hop SQL surface should compile");
+
+        let expected = PlanNode::Project {
+            input: Box::new(PlanNode::Aggregate {
+                input: Box::new(PlanNode::HopWindow {
+                    input: Box::new(PlanNode::Source {
+                        name: "bid".to_string(),
+                    }),
+                    time_col: 5,
+                    window_size_ms: 10000,
+                    slide_ms: 5000,
+                    late_data_policy: rockstream_plan::LateDataPolicy::Drop,
+                }),
+                group_by: vec![Expr::Column(0)],
+                aggregates: vec![AggregateExpr {
+                    func: AggregateFunc::Count,
+                    input: Expr::Literal(1i64.to_be_bytes().to_vec()),
+                    distinct: false,
+                }],
+            }),
+            columns: vec![Expr::Column(0), Expr::Column(1)],
         };
 
         assert_eq!(sql_plan, expected);

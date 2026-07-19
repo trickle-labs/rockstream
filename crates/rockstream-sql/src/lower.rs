@@ -94,6 +94,10 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
         }
 
         LogicalPlan::Aggregate(agg) => {
+            if let Some(hop_plan) = try_lower_hop_window_aggregate(agg)? {
+                return Ok(hop_plan);
+            }
+
             let input = lower(&agg.input)?;
             let input_schema = agg.input.schema();
 
@@ -1205,6 +1209,23 @@ fn resolve_views_and_snapshots(
             window_size_ms,
             late_data_policy,
         },
+        PlanNode::HopWindow {
+            input,
+            time_col,
+            window_size_ms,
+            slide_ms,
+            late_data_policy,
+        } => PlanNode::HopWindow {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            time_col,
+            window_size_ms,
+            slide_ms,
+            late_data_policy,
+        },
         PlanNode::TopK {
             input,
             k,
@@ -1290,6 +1311,107 @@ fn resolve_views_and_snapshots(
 
 // ─── Helper functions for time window and top-k compiling ───────────────────
 
+struct HopTimeSpec {
+    time_col: usize,
+    slide_idx_col: usize,
+    slide_ms: i64,
+}
+
+fn try_lower_hop_window_aggregate(
+    agg: &datafusion::logical_expr::Aggregate,
+) -> Result<Option<PlanNode>, SqlError> {
+    let Some((source_input, slide_idx_col)) = extract_generate_series_hop_input(&agg.input) else {
+        return Ok(None);
+    };
+
+    let mut hop_idx = None;
+    let mut hop_window_size_ms = None;
+    let mut hop_time_spec = None;
+    for (idx, expr) in agg.group_expr.iter().enumerate() {
+        let Some(sf) = find_date_bin(expr) else {
+            continue;
+        };
+        if sf.args.len() < 2 {
+            return Err(SqlError::UnsupportedPlanNode {
+                node_type: "date_bin_missing_args".to_string(),
+            });
+        }
+        let Some(window_size_ms) = extract_interval_ms(&sf.args[0]) else {
+            return Err(SqlError::UnsupportedPlanNode {
+                node_type: "date_bin_invalid_interval".to_string(),
+            });
+        };
+        let Some(time_spec) =
+            extract_hop_time_spec(&sf.args[1], source_input.schema(), agg.input.schema())
+        else {
+            continue;
+        };
+        if time_spec.slide_idx_col != slide_idx_col {
+            continue;
+        }
+        hop_idx = Some(idx);
+        hop_window_size_ms = Some(window_size_ms);
+        hop_time_spec = Some(time_spec);
+        break;
+    }
+
+    let (hop_idx, window_size_ms, time_spec) = match (hop_idx, hop_window_size_ms, hop_time_spec) {
+        (Some(idx), Some(window_size_ms), Some(time_spec)) => (idx, window_size_ms, time_spec),
+        _ => return Ok(None),
+    };
+
+    if time_spec.slide_ms <= 0 || window_size_ms <= time_spec.slide_ms {
+        return Err(SqlError::UnsupportedPlanNode {
+            node_type: format!(
+                "hop_window_invalid_slide:window_size_ms={window_size_ms},slide_ms={}",
+                time_spec.slide_ms
+            ),
+        });
+    }
+    if window_size_ms % time_spec.slide_ms != 0 {
+        return Err(SqlError::UnsupportedPlanNode {
+            node_type: format!(
+                "hop_window_non_integral_overlap:window_size_ms={window_size_ms},slide_ms={}",
+                time_spec.slide_ms
+            ),
+        });
+    }
+
+    let input = lower(source_input)?;
+    let hop_node = PlanNode::HopWindow {
+        input: Box::new(input),
+        time_col: time_spec.time_col,
+        window_size_ms,
+        slide_ms: time_spec.slide_ms,
+        late_data_policy: rockstream_plan::LateDataPolicy::Drop,
+    };
+
+    let source_schema = source_input.schema();
+    let mut group_by = Vec::new();
+    for (i, expr) in agg.group_expr.iter().enumerate() {
+        if i == hop_idx {
+            group_by.push(Expr::Column(0));
+        } else {
+            let mut lowered = lower_expr(expr, source_schema)?;
+            shift_expr_cols(&mut lowered);
+            group_by.push(lowered);
+        }
+    }
+
+    let mut aggregates = Vec::new();
+    for expr in &agg.aggr_expr {
+        let mut lowered = lower_agg_expr(expr, source_schema)?;
+        shift_expr_cols(&mut lowered.input);
+        aggregates.push(lowered);
+    }
+
+    Ok(Some(PlanNode::Aggregate {
+        input: Box::new(hop_node),
+        group_by,
+        aggregates,
+    }))
+}
+
 fn find_date_bin(expr: &DfExpr) -> Option<&datafusion::logical_expr::expr::ScalarFunction> {
     match expr {
         DfExpr::ScalarFunction(sf) if sf.func.name() == "date_bin" => Some(sf),
@@ -1321,6 +1443,103 @@ fn extract_column_index(expr: &DfExpr, schema: &DFSchema) -> Option<usize> {
         DfExpr::Column(col) => schema.index_of_column(col).ok(),
         DfExpr::Cast(cast) => extract_column_index(&cast.expr, schema),
         DfExpr::TryCast(cast) => extract_column_index(&cast.expr, schema),
+        _ => None,
+    }
+}
+
+fn extract_generate_series_hop_input(input: &LogicalPlan) -> Option<(&LogicalPlan, usize)> {
+    let LogicalPlan::Join(join) = input else {
+        return None;
+    };
+    if join.join_type != JoinType::Inner || !join.on.is_empty() || join.filter.is_some() {
+        return None;
+    }
+    let right_input = match join.right.as_ref() {
+        LogicalPlan::SubqueryAlias(alias) => alias.input.as_ref(),
+        other => other,
+    };
+    let LogicalPlan::Projection(proj) = right_input else {
+        return None;
+    };
+    if proj.expr.len() != 1 {
+        return None;
+    }
+    let DfExpr::Alias(alias) = &proj.expr[0] else {
+        return None;
+    };
+    let DfExpr::Column(col) = alias.expr.as_ref() else {
+        return None;
+    };
+    if col.name != "value" {
+        return None;
+    }
+    let LogicalPlan::TableScan(scan) = proj.input.as_ref() else {
+        return None;
+    };
+    if scan.table_name.table() != "generate_series()" {
+        return None;
+    }
+    Some((join.left.as_ref(), join.left.schema().fields().len()))
+}
+
+fn extract_hop_time_spec(
+    expr: &DfExpr,
+    source_schema: &DFSchema,
+    joined_schema: &DFSchema,
+) -> Option<HopTimeSpec> {
+    match expr {
+        DfExpr::Alias(alias) => extract_hop_time_spec(&alias.expr, source_schema, joined_schema),
+        DfExpr::Cast(cast) => extract_hop_time_spec(&cast.expr, source_schema, joined_schema),
+        DfExpr::TryCast(cast) => extract_hop_time_spec(&cast.expr, source_schema, joined_schema),
+        DfExpr::ScalarFunction(sf)
+            if sf.func.name() == "to_timestamp_millis" && sf.args.len() == 1 =>
+        {
+            extract_hop_time_spec(&sf.args[0], source_schema, joined_schema)
+        }
+        DfExpr::BinaryExpr(BinaryExpr { left, op, right }) if *op == DfOp::Minus => {
+            Some(HopTimeSpec {
+                time_col: extract_column_index(left, source_schema)?,
+                slide_idx_col: extract_slide_component(right, joined_schema)?.0,
+                slide_ms: extract_slide_component(right, joined_schema)?.1,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn extract_slide_component(expr: &DfExpr, schema: &DFSchema) -> Option<(usize, i64)> {
+    match expr {
+        DfExpr::Alias(alias) => extract_slide_component(&alias.expr, schema),
+        DfExpr::Cast(cast) => extract_slide_component(&cast.expr, schema),
+        DfExpr::TryCast(cast) => extract_slide_component(&cast.expr, schema),
+        DfExpr::BinaryExpr(BinaryExpr { left, op, right }) if *op == DfOp::Multiply => {
+            if let (Some(col), Some(ms)) = (
+                extract_column_index(left, schema),
+                extract_int64_literal(right),
+            ) {
+                Some((col, ms))
+            } else if let (Some(ms), Some(col)) = (
+                extract_int64_literal(left),
+                extract_column_index(right, schema),
+            ) {
+                Some((col, ms))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_int64_literal(expr: &DfExpr) -> Option<i64> {
+    match expr {
+        DfExpr::Literal(ScalarValue::Int64(Some(v)), _) => Some(*v),
+        DfExpr::Literal(ScalarValue::Int32(Some(v)), _) => Some(*v as i64),
+        DfExpr::Literal(ScalarValue::UInt64(Some(v)), _) => i64::try_from(*v).ok(),
+        DfExpr::Literal(ScalarValue::UInt32(Some(v)), _) => Some(*v as i64),
+        DfExpr::Alias(alias) => extract_int64_literal(&alias.expr),
+        DfExpr::Cast(cast) => extract_int64_literal(&cast.expr),
+        DfExpr::TryCast(cast) => extract_int64_literal(&cast.expr),
         _ => None,
     }
 }
@@ -1735,6 +1954,7 @@ mod tests {
             | PlanNode::Distinct { input, .. }
             | PlanNode::Window { input, .. }
             | PlanNode::TumbleWindow { input, .. }
+            | PlanNode::HopWindow { input, .. }
             | PlanNode::TopK { input, .. }
             | PlanNode::Lateral { input, .. }
             | PlanNode::IndexArrange { input, .. } => find_recursion(input),
@@ -1763,6 +1983,7 @@ mod tests {
             | PlanNode::Distinct { input, .. }
             | PlanNode::Window { input, .. }
             | PlanNode::TumbleWindow { input, .. }
+            | PlanNode::HopWindow { input, .. }
             | PlanNode::TopK { input, .. }
             | PlanNode::Lateral { input, .. }
             | PlanNode::IndexArrange { input, .. } => contains_source_named(input, needle),

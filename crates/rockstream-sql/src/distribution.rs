@@ -349,6 +349,28 @@ fn distribute(plan: PlanNode) -> (PlanNode, DistributionAnnotation) {
                 DistributionAnnotation::unpartitioned(),
             )
         }
+        PlanNode::HopWindow {
+            input,
+            time_col,
+            window_size_ms,
+            slide_ms,
+            late_data_policy,
+        } => {
+            let (new_input, _) = distribute(*input);
+            (
+                PlanNode::HopWindow {
+                    input: Box::new(PlanNode::Exchange {
+                        kind: ExchangeKind::Loopback,
+                        child: Box::new(new_input),
+                    }),
+                    time_col,
+                    window_size_ms,
+                    slide_ms,
+                    late_data_policy,
+                },
+                DistributionAnnotation::unpartitioned(),
+            )
+        }
 
         // TopK (v0.12 — IVM-9): requires hash-partitioned input by partition_by columns.
         PlanNode::TopK {

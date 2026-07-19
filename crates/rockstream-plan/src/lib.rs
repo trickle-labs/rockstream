@@ -161,6 +161,23 @@ pub enum PlanNode {
         /// Policy for rows that arrive after the window has closed.
         late_data_policy: LateDataPolicy,
     },
+    /// Hopping time-window operator (v0.50).
+    ///
+    /// Groups rows into fixed-size, overlapping event-time windows of
+    /// `window_size_ms` milliseconds, advancing every `slide_ms`
+    /// milliseconds. Each row is assigned to every overlapping window that
+    /// contains its event timestamp.
+    HopWindow {
+        input: Box<PlanNode>,
+        /// Column index holding the event timestamp (i64 ms, BE 8 bytes).
+        time_col: usize,
+        /// Duration of each hopping window in milliseconds.
+        window_size_ms: i64,
+        /// Distance in milliseconds between successive window starts.
+        slide_ms: i64,
+        /// Policy for rows that arrive after the window has closed.
+        late_data_policy: LateDataPolicy,
+    },
     /// Top-K operator (v0.21).
     ///
     /// Maintains the top-`k` rows ranked by the column at `rank_col` (i64
@@ -642,6 +659,12 @@ pub enum OpKind {
     /// window when the watermark advances past the window end.
     TumbleWindow {
         window_size_ms: i64,
+        late_data_policy: LateDataPolicy,
+    },
+    /// Hopping time-window operator (v0.50).
+    HopWindow {
+        window_size_ms: i64,
+        slide_ms: i64,
         late_data_policy: LateDataPolicy,
     },
     /// Top-K operator (v0.21).

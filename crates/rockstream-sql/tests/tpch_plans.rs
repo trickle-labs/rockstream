@@ -105,6 +105,7 @@ fn count_inner_joins(plan: &PlanNode) -> usize {
         | PlanNode::Aggregate { input, .. }
         | PlanNode::Window { input, .. }
         | PlanNode::TumbleWindow { input, .. }
+        | PlanNode::HopWindow { input, .. }
         | PlanNode::TopK { input, .. }
         | PlanNode::Lateral { input, .. }
         | PlanNode::ViewSink { child: input, .. }
@@ -135,6 +136,7 @@ fn count_outer_joins(plan: &PlanNode) -> usize {
         | PlanNode::Aggregate { input, .. }
         | PlanNode::Window { input, .. }
         | PlanNode::TumbleWindow { input, .. }
+        | PlanNode::HopWindow { input, .. }
         | PlanNode::TopK { input, .. }
         | PlanNode::Lateral { input, .. }
         | PlanNode::ViewSink { child: input, .. }
