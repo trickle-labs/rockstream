@@ -1385,7 +1385,7 @@ empty and the inner frontier advances past the iteration timestamp. The compiler
 also classifies recursive terms for monotonicity. INSERT-only monotone recursion
 uses semi-naive evaluation. **DRed (delete-and-rederive) was evaluated in v0.22
 and proved unsound under concurrent deletes; non-monotone recursive terms are
-rejected with `RS-1509 recursion.non_monotone_not_supported`.** DRed may be
+rejected with `RS-1009 recursion.non_monotone_not_supported`.** DRed may be
 revisited as a future optimization once the distributed recursion surface
 (Phase 4) stabilizes. Non-monotone or unsupported recursive terms fall back to
 full recomputation. See [IVM.md §11](IVM.md#11-recursion-with-recursive).
@@ -4653,7 +4653,7 @@ RS-1005  connector.watermark_required
 RS-1006  source.no_stable_identity
 RS-1010  view.dependent_inline_view_exists
 RS-1011  view.inline_cycle_detected
-RS-1509  recursion.non_monotone_not_supported
+RS-1009  recursion.non_monotone_not_supported
 RS-2001  view.unsupported_sql_construct
 RS-2002  view.state_budget_exceeded
 RS-2003  isolation.serializable_not_supported

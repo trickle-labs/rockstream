@@ -57,6 +57,9 @@ pub const WM_DISCRIMINATOR: [u8; 2] = [0x57, 0x4D];
 /// Top-K buffer discriminator bytes (v0.12 — IVM-9): ASCII 'T', 'K'.
 pub const TK_DISCRIMINATOR: [u8; 2] = [0x54, 0x4B];
 
+/// Recursion arrangement discriminator bytes (v0.50): ASCII 'R', 'C'.
+pub const RC_DISCRIMINATOR: [u8; 2] = [0x52, 0x43];
+
 /// Left/right side discriminator for join arrangements (v0.8 — IVM-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinSide {
@@ -479,6 +482,30 @@ impl ShardKeyEncoder {
         let mut p = Vec::with_capacity(1 + 2 + 8);
         p.push(ShardPrefix::OpState.as_byte());
         p.extend_from_slice(&TK_DISCRIMINATOR);
+        p.extend_from_slice(&op_id.to_be_bytes());
+        p
+    }
+
+    /// Encode a recursion arrangement entry key.
+    ///
+    /// Format: `[0x01 (OpState)][0x52 0x43 ('RC')][op_id:8][row_hash:16][iteration:4 BE]`
+    pub fn recursion_key(op_id: u64, row_hash: u128, iteration: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 8 + 16 + 4);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.extend_from_slice(&RC_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(&row_hash.to_be_bytes());
+        key.extend_from_slice(&iteration.to_be_bytes());
+        key
+    }
+
+    /// Prefix for scanning all recursion arrangement entries for an operator.
+    ///
+    /// Format: `[0x01][RC][op_id:8]`
+    pub fn recursion_op_prefix(op_id: u64) -> Vec<u8> {
+        let mut p = Vec::with_capacity(1 + 2 + 8);
+        p.push(ShardPrefix::OpState.as_byte());
+        p.extend_from_slice(&RC_DISCRIMINATOR);
         p.extend_from_slice(&op_id.to_be_bytes());
         p
     }

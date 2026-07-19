@@ -40,7 +40,7 @@ pub enum NotMergeSafeReason {
     /// Window ranking functions recompute the entire partition; not merge-safe.
     PartitionRecomputation,
     /// Non-monotone recursive operator: DRed strategy requires read-modify-write.
-    /// The escape hatch rejects non-monotone deltas at runtime with RS-1509.
+    /// The escape hatch rejects non-monotone deltas at runtime with RS-1009.
     RecursionDredRequired,
 }
 

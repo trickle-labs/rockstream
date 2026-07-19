@@ -192,13 +192,13 @@ pub enum PlanNode {
     /// infinite loops on non-convergent non-monotone queries.
     ///
     /// When `monotone = true`, the relation is insert-only: retractions are
-    /// rejected at runtime with `RS-1509`.  Monotone recursion publishes a
+    /// rejected at runtime with `RS-1009`.  Monotone recursion publishes a
     /// `complete_through` token once convergence is reached, enabling
     /// downstream operators to consume partial-progress results safely.
     ///
     /// When `monotone = false`, the DRed (Delete and Re-derive) strategy is
     /// required.  If DRed proves unsound under concurrent deletes the escape
-    /// hatch is active: non-monotone deltas are rejected with `RS-1509` and
+    /// hatch is active: non-monotone deltas are rejected with `RS-1009` and
     /// the operator reports `not_merge_safe_reason=recursion_dred_required`.
     Recursion {
         /// The base relation providing the initial facts.

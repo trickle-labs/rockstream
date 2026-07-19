@@ -355,7 +355,7 @@ partition. Deletes from the current top-K require a prefix scan refill path.
 **Description**: Implements semi-naive recursive evaluation. Monotone
 (insert-only) recursive terms use `WeightAdd/v1` to publish partial progress
 via `complete_through`. Non-monotone recursive terms are rejected at runtime
-with `RS-1509` and annotated `not_merge_safe_reason=recursion_dred_required`.
+with `RS-1009` and annotated `not_merge_safe_reason=recursion_dred_required`.
 
 ---
 

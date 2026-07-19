@@ -78,6 +78,29 @@ pub enum OpError {
     /// TopK buffer overflow: too many unique rows in a single partition.
     #[error("[{code}] TopK buffer overflow: {limit} unique positive-weight rows exceeded in one partition; next_steps: reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add partition columns")]
     TopKBufferOverflow { limit: usize, code: ErrorCode },
+
+    /// Monotone recursion received a negative delta.
+    #[error("[{code}] Non-monotone delta rejected in monotone recursion; next_steps: mark the recursive query non-monotone or remove retractions from the input stream")]
+    RecursionNonMonotoneDelta { code: ErrorCode },
+
+    /// Recursion arrangement exceeded its configured bound.
+    #[error("[{code}] Recursion state bound exceeded ({current}/{limit} rows); next_steps: reduce recursive fan-out, increase RECURSION_STATE_LIMIT, or shard the recursive relation more finely")]
+    RecursionStateOverflow {
+        current: usize,
+        limit: usize,
+        code: ErrorCode,
+    },
+
+    /// Distributed recursion stalled without advancing the inner frontier.
+    #[error("[{code}] Distributed recursion inner frontier stalled; next_steps: inspect slow shards, restart the stalled worker, or allow per-shard recompute fallback")]
+    RecursionInnerFrontierStalled { code: ErrorCode },
+
+    /// Recursion hit its max-iteration safety cap.
+    #[error("[{code}] Recursion max-iteration cap exceeded after {max_iterations} iterations; next_steps: increase recursion_max_iterations or simplify the recursive step to converge faster")]
+    RecursionMaxIterations {
+        max_iterations: usize,
+        code: ErrorCode,
+    },
 }
 
 impl OpError {
@@ -168,6 +191,33 @@ impl OpError {
         Self::TopKBufferOverflow {
             limit,
             code: RS_1018,
+        }
+    }
+
+    pub fn recursion_non_monotone_delta() -> Self {
+        use rockstream_types::error_code::RS_1009;
+        Self::RecursionNonMonotoneDelta { code: RS_1009 }
+    }
+
+    pub fn recursion_state_overflow(current: usize, limit: usize) -> Self {
+        use rockstream_types::error_code::RS_2019;
+        Self::RecursionStateOverflow {
+            current,
+            limit,
+            code: RS_2019,
+        }
+    }
+
+    pub fn recursion_inner_frontier_stalled() -> Self {
+        use rockstream_types::error_code::RS_1512;
+        Self::RecursionInnerFrontierStalled { code: RS_1512 }
+    }
+
+    pub fn recursion_max_iterations(max_iterations: usize) -> Self {
+        use rockstream_types::error_code::RS_1513;
+        Self::RecursionMaxIterations {
+            max_iterations,
+            code: RS_1513,
         }
     }
 }
