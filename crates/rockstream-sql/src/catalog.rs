@@ -56,7 +56,9 @@ fn collect_dependencies(plan: &PlanNode, registered: &HashSet<String>, out: &mut
         PlanNode::Map { input, .. } => collect_dependencies(input, registered, out),
         PlanNode::Aggregate { input, .. } => collect_dependencies(input, registered, out),
         PlanNode::Window { input, .. } => collect_dependencies(input, registered, out),
-        PlanNode::TumbleWindow { input, .. } | PlanNode::HopWindow { input, .. } => {
+        PlanNode::TumbleWindow { input, .. }
+        | PlanNode::HopWindow { input, .. }
+        | PlanNode::SessionWindow { input, .. } => {
             collect_dependencies(input, registered, out)
         }
         PlanNode::TopK { input, .. } => collect_dependencies(input, registered, out),

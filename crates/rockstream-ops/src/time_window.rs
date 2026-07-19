@@ -12,6 +12,10 @@
 //! Hop windows use the same keyspace and compaction filter machinery, but with
 //! an overlap-aware bound: `HOP_WINDOW_STATE_LIMIT = 100_000` positive
 //! window×row pairs per operator.
+//!
+//! Session windows use the same persisted key family, but maintain dynamic
+//! gap-delimited sessions per partition. Their explicit bound is
+//! `SESSION_WINDOW_STATE_LIMIT = 100_000` open-session × group-key pairs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -38,6 +42,7 @@ use crate::zset::ArrowZSet;
 
 pub const TUMBLE_WINDOW_STATE_LIMIT: usize = 100_000;
 pub const HOP_WINDOW_STATE_LIMIT: usize = 100_000;
+pub const SESSION_WINDOW_STATE_LIMIT: usize = 100_000;
 
 // ─── WatermarkState ──────────────────────────────────────────────────────────
 
@@ -179,6 +184,37 @@ impl HopWindowState {
             .flat_map(|m| m.values())
             .filter(|(_, w)| *w > 0)
             .count()
+    }
+}
+
+#[derive(Clone, Default)]
+struct SessionPartitionState {
+    rows: WindowMap,
+    prev_output: EmittedMap,
+    live_session_count: usize,
+}
+
+#[derive(Clone)]
+struct SessionWindowState {
+    partitions: HashMap<Vec<u8>, SessionPartitionState>,
+    watermark: WatermarkState,
+    input_frontier: Option<rockstream_types::frontier::FreshnessToken>,
+}
+
+impl SessionWindowState {
+    fn new() -> Self {
+        Self {
+            partitions: HashMap::new(),
+            watermark: WatermarkState::new(),
+            input_frontier: None,
+        }
+    }
+
+    fn total_sessions(&self) -> usize {
+        self.partitions
+            .values()
+            .map(|partition| partition.live_session_count)
+            .sum()
     }
 }
 
@@ -485,7 +521,7 @@ impl HopWindowOp {
                 .input_frontier
                 .as_ref()
                 .and_then(|f| f.watermark_ms())
-                .unwrap_or(next.watermark.watermark_ms);
+                .unwrap_or(i64::MIN);
             if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
                 continue;
             }
@@ -617,6 +653,199 @@ impl Operator for HopWindowOp {
     }
 }
 
+/// Session time-window operator (v0.50).
+///
+/// Partitions rows by all non-time columns, then assigns each live row to a
+/// gap-delimited session `[session_start, session_end]` inside its partition.
+/// When a newly inserted or retracted row changes session boundaries, the
+/// operator retracts stale tagged rows and emits replacement rows carrying the
+/// new boundaries.
+pub struct SessionWindowOp {
+    /// Output schema: [session_start: i64, session_end: i64, ...input_cols...]
+    pub schema: SchemaRef,
+    n_input_cols: usize,
+    time_col: usize,
+    gap_ms: i64,
+    late_data_policy: LateDataPolicy,
+    state: Mutex<SessionWindowState>,
+    fill_level: Arc<AtomicUsize>,
+}
+
+impl SessionWindowOp {
+    pub fn output_schema(input_schema: &Schema) -> SchemaRef {
+        let mut fields = vec![
+            Field::new("session_start", DataType::Int64, false),
+            Field::new("session_end", DataType::Int64, false),
+        ];
+        for f in input_schema.fields() {
+            fields.push(f.as_ref().clone());
+        }
+        Arc::new(Schema::new(fields))
+    }
+
+    pub fn new(
+        input_schema: SchemaRef,
+        time_col: usize,
+        gap_ms: i64,
+        late_data_policy: LateDataPolicy,
+    ) -> Self {
+        let schema = Self::output_schema(&input_schema);
+        let n_input_cols = input_schema.fields().len();
+        Self {
+            schema,
+            n_input_cols,
+            time_col,
+            gap_ms,
+            late_data_policy,
+            state: Mutex::new(SessionWindowState::new()),
+            fill_level: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn fill_level(&self) -> usize {
+        self.fill_level.load(Ordering::Relaxed)
+    }
+
+    pub fn watermark_ms(&self) -> i64 {
+        let state = self.state.lock().unwrap();
+        state
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(state.watermark.watermark_ms)
+    }
+
+    pub fn process_epoch(&self, delta: ArrowZSet, _epoch: u64) -> Result<ArrowZSet, OpError> {
+        if delta.is_empty() && delta.frontier.is_none() {
+            return Ok(ArrowZSet::empty(self.schema.clone()));
+        }
+
+        let mut state = self.state.lock().unwrap();
+        let mut next = state.clone();
+        if let Some(ref frontier) = delta.frontier {
+            next.input_frontier = Some(frontier.clone());
+        }
+
+        let mut dirty_partitions: HashSet<Vec<u8>> = HashSet::new();
+        for row_idx in 0..delta.num_rows() {
+            let weight = delta.weights[row_idx];
+            if weight == 0 {
+                continue;
+            }
+            let row_vals = extract_row_vals(&delta.data, row_idx, self.n_input_cols);
+            let event_time_ms = row_vals.get(self.time_col).copied().unwrap_or(0);
+            let current_watermark = next
+                .input_frontier
+                .as_ref()
+                .and_then(|f| f.watermark_ms())
+                .unwrap_or(i64::MIN);
+            if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
+                continue;
+            }
+
+            next.watermark = next.watermark.merge(WatermarkState {
+                watermark_ms: event_time_ms,
+            });
+
+            let partition_key = encode_partition_key(&row_vals, self.time_col);
+            let row_key = encode_row(&row_vals);
+            let partition = next.partitions.entry(partition_key.clone()).or_default();
+            let entry = partition
+                .rows
+                .entry(row_key.clone())
+                .or_insert((row_vals.clone(), 0));
+            entry.1 += weight;
+            if entry.1 == 0 {
+                partition.rows.remove(&row_key);
+            }
+            dirty_partitions.insert(partition_key);
+        }
+
+        let mut total_sessions = next.total_sessions();
+        let mut output_rows = Vec::new();
+        for partition_key in dirty_partitions {
+            let partition = next
+                .partitions
+                .get_mut(&partition_key)
+                .expect("dirty partition must exist");
+            total_sessions = total_sessions.saturating_sub(partition.live_session_count);
+
+            let live_rows = partition
+                .rows
+                .values()
+                .filter(|(_, weight)| *weight > 0)
+                .map(|(vals, _)| vals.clone())
+                .collect::<Vec<_>>();
+            let sessions = derive_sessions(&live_rows, self.time_col, self.gap_ms);
+            let session_count = sessions
+                .iter()
+                .map(|(start, end, _)| (*start, *end))
+                .collect::<HashSet<_>>()
+                .len();
+            total_sessions += session_count;
+            if total_sessions > SESSION_WINDOW_STATE_LIMIT {
+                return Err(OpError::session_window_state_overflow(
+                    total_sessions,
+                    SESSION_WINDOW_STATE_LIMIT,
+                ));
+            }
+
+            let mut new_output = EmittedMap::new();
+            for (session_start, session_end, row_vals) in sessions.iter().cloned() {
+                let row_key = encode_row(&row_vals);
+                let mut tagged = vec![session_start, session_end];
+                tagged.extend_from_slice(&row_vals);
+                new_output.insert(row_key, tagged);
+            }
+
+            for (key, old_vals) in &partition.prev_output {
+                match new_output.get(key) {
+                    Some(new_vals) if new_vals == old_vals => {}
+                    _ => output_rows.push((old_vals.clone(), -1)),
+                }
+            }
+            for (key, new_vals) in &new_output {
+                match partition.prev_output.get(key) {
+                    Some(old_vals) if old_vals == new_vals => {}
+                    _ => output_rows.push((new_vals.clone(), 1)),
+                }
+            }
+
+            partition.prev_output = new_output;
+            partition.live_session_count = session_count;
+        }
+
+        *state = next;
+        drop(state);
+        self.fill_level.store(total_sessions, Ordering::Relaxed);
+        build_output(&self.schema, output_rows)
+    }
+}
+
+impl Operator for SessionWindowOp {
+    fn name(&self) -> &str {
+        "SessionWindowOp"
+    }
+
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_epoch(delta, 0)
+    }
+
+    fn push_input_frontier(
+        &self,
+        frontier: rockstream_types::frontier::FreshnessToken,
+    ) -> Result<(), OpError> {
+        let mut state = self.state.lock().unwrap();
+        state.input_frontier = Some(frontier);
+        Ok(())
+    }
+
+    fn input_frontier(&self) -> Option<rockstream_types::frontier::FreshnessToken> {
+        let state = self.state.lock().unwrap();
+        state.input_frontier.clone()
+    }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Floor division that correctly handles negative dividends.
@@ -644,6 +873,48 @@ fn hop_window_ids(event_time_ms: i64, window_size_ms: i64, slide_ms: i64) -> Vec
     }
     window_ids.sort();
     window_ids
+}
+
+fn encode_partition_key(vals: &[i64], time_col: usize) -> Vec<u8> {
+    let mut key = Vec::with_capacity(vals.len().saturating_sub(1) * 8);
+    for (idx, value) in vals.iter().enumerate() {
+        if idx != time_col {
+            key.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    key
+}
+
+fn derive_sessions(rows: &[Vec<i64>], time_col: usize, gap_ms: i64) -> Vec<(i64, i64, Vec<i64>)> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = rows.to_vec();
+    sorted.sort_by_key(|row| (row.get(time_col).copied().unwrap_or(0), row.clone()));
+
+    let mut current_start = sorted[0].get(time_col).copied().unwrap_or(0);
+    let mut current_end = current_start;
+    let mut current_rows = vec![sorted[0].clone()];
+    let mut sessions = Vec::new();
+
+    for row in sorted.into_iter().skip(1) {
+        let event_time_ms = row.get(time_col).copied().unwrap_or(0);
+        if event_time_ms <= current_end.saturating_add(gap_ms) {
+            current_end = current_end.max(event_time_ms);
+            current_rows.push(row);
+            continue;
+        }
+        for session_row in current_rows.drain(..) {
+            sessions.push((current_start, current_end, session_row));
+        }
+        current_start = event_time_ms;
+        current_end = event_time_ms;
+        current_rows.push(row);
+    }
+    for session_row in current_rows {
+        sessions.push((current_start, current_end, session_row));
+    }
+    sessions
 }
 
 fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i64> {
@@ -897,6 +1168,92 @@ pub async fn load_hop_window_state(
     Ok(op)
 }
 
+/// Persist SessionWindowOp state to a ShardDb using the shared TW keyspace.
+pub async fn persist_session_window_state(
+    db: &ShardDb,
+    op: &SessionWindowOp,
+    op_id: OperatorId,
+) -> Result<(), OpError> {
+    let batch = {
+        let state = op.state.lock().unwrap();
+        let mut batch = WriteBatch::new();
+        let oid = op_id.0;
+        for partition in state.partitions.values() {
+            for (row_key, (row_vals, weight)) in &partition.rows {
+                let event_time_ms = row_vals.get(op.time_col).copied().unwrap_or(0);
+                let key = ShardKeyEncoder::tumble_window_key(oid, event_time_ms, row_key);
+                let value = encode_window_value(row_vals, *weight);
+                batch.put(&key, &value);
+            }
+        }
+        let wm_key = ShardKeyEncoder::watermark_key(oid);
+        batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
+        batch
+    };
+    db.write_batch(batch).await.map_err(OpError::storage)?;
+    Ok(())
+}
+
+/// Load SessionWindowOp state from a ShardDb using the shared TW keyspace.
+pub async fn load_session_window_state(
+    db: &ShardDb,
+    input_schema: SchemaRef,
+    time_col: usize,
+    gap_ms: i64,
+    late_data_policy: LateDataPolicy,
+    op_id: OperatorId,
+) -> Result<SessionWindowOp, OpError> {
+    let op = SessionWindowOp::new(input_schema, time_col, gap_ms, late_data_policy);
+    let n_input_cols = op.n_input_cols;
+    let oid = op_id.0;
+    let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
+    let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+    let wm_key = ShardKeyEncoder::watermark_key(oid);
+    let wm_bytes = db.get(&wm_key).await.ok().flatten();
+
+    let mut st = op.state.lock().unwrap();
+    for (_key, value) in entries {
+        if let Some((row_vals, weight)) = decode_window_value(&value, n_input_cols) {
+            let partition_key = encode_partition_key(&row_vals, time_col);
+            let row_key = encode_row(&row_vals);
+            st.partitions
+                .entry(partition_key)
+                .or_default()
+                .rows
+                .insert(row_key, (row_vals, weight));
+        }
+    }
+    if let Some(bytes) = wm_bytes {
+        if bytes.len() >= 8 {
+            let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+            st.watermark = WatermarkState { watermark_ms: wm };
+        }
+    }
+    for partition in st.partitions.values_mut() {
+        let live_rows = partition
+            .rows
+            .values()
+            .filter(|(_, weight)| *weight > 0)
+            .map(|(vals, _)| vals.clone())
+            .collect::<Vec<_>>();
+        let sessions = derive_sessions(&live_rows, time_col, gap_ms);
+        partition.live_session_count = sessions
+            .iter()
+            .map(|(start, end, _)| (*start, *end))
+            .collect::<HashSet<_>>()
+            .len();
+        for (session_start, session_end, row_vals) in sessions {
+            let mut tagged = vec![session_start, session_end];
+            tagged.extend_from_slice(&row_vals);
+            partition.prev_output.insert(encode_row(&row_vals), tagged);
+        }
+    }
+    let total = st.total_sessions();
+    drop(st);
+    op.fill_level.store(total, Ordering::Relaxed);
+    Ok(op)
+}
+
 /// Load the persisted watermark for an operator (used by compaction filters).
 pub async fn load_watermark(db: &ShardDb, op_id: OperatorId) -> Result<WatermarkState, OpError> {
     let wm_key = ShardKeyEncoder::watermark_key(op_id.0);
@@ -990,6 +1347,98 @@ mod tests {
         rows
     }
 
+    fn accumulate_session(state: &mut HashMap<(i64, i64, i64, i64), i64>, zset: &ArrowZSet) {
+        if zset.is_empty() {
+            return;
+        }
+        let session_start = zset
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let session_end = zset
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let t_col = zset
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = zset
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..zset.num_rows() {
+            *state
+                .entry((
+                    session_start.value(i),
+                    session_end.value(i),
+                    t_col.value(i),
+                    v_col.value(i),
+                ))
+                .or_insert(0) += zset.weights[i];
+        }
+    }
+
+    fn live_session_rows(state: &HashMap<(i64, i64, i64, i64), i64>) -> Vec<(i64, i64, i64, i64)> {
+        let mut rows: Vec<_> = state
+            .iter()
+            .filter(|(_, &w)| w > 0)
+            .map(|(&k, _)| k)
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn session_rows(zset: &ArrowZSet) -> Vec<(i64, i64, i64, i64, i64)> {
+        if zset.is_empty() {
+            return Vec::new();
+        }
+        let session_start = zset
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let session_end = zset
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let t_col = zset
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let v_col = zset
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut rows = Vec::new();
+        for i in 0..zset.num_rows() {
+            rows.push((
+                session_start.value(i),
+                session_end.value(i),
+                t_col.value(i),
+                v_col.value(i),
+                zset.weights[i],
+            ));
+        }
+        rows.sort();
+        rows
+    }
+
     fn batch_hop_rows(
         rows: &[(i64, i64, i64)],
         window_size_ms: i64,
@@ -1005,6 +1454,27 @@ mod tests {
             }
         }
         live_rows(&net)
+    }
+
+    fn batch_session_rows(rows: &[(i64, i64, i64)], gap_ms: i64) -> Vec<(i64, i64, i64, i64)> {
+        let mut live_inputs: HashMap<(i64, i64), i64> = HashMap::new();
+        for &(t, v, w) in rows {
+            *live_inputs.entry((t, v)).or_insert(0) += w;
+        }
+        let mut by_partition: HashMap<i64, Vec<Vec<i64>>> = HashMap::new();
+        for ((t, v), weight) in live_inputs {
+            if weight > 0 {
+                by_partition.entry(v).or_default().push(vec![t, v]);
+            }
+        }
+        let mut out = Vec::new();
+        for rows in by_partition.into_values() {
+            for (session_start, session_end, row_vals) in derive_sessions(&rows, 0, gap_ms) {
+                out.push((session_start, session_end, row_vals[0], row_vals[1]));
+            }
+        }
+        out.sort();
+        out
     }
 
     #[test]
@@ -1163,6 +1633,109 @@ mod tests {
             other => panic!("expected HopWindowStateOverflow, got {other:?}"),
         }
         assert_eq!(op.fill_level(), 0, "overflow must not commit partial state");
+    }
+
+    #[test]
+    fn session_window_extends_open_session_within_gap() {
+        let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+        let mut net: HashMap<(i64, i64, i64, i64), i64> = Default::default();
+        accumulate_session(&mut net, &op.process_epoch(make_input(&[(100, 7, 1)]), 1).unwrap());
+        accumulate_session(&mut net, &op.process_epoch(make_input(&[(900, 7, 1)]), 2).unwrap());
+        assert_eq!(
+            live_session_rows(&net),
+            vec![(100, 900, 100, 7), (100, 900, 900, 7)]
+        );
+    }
+
+    #[test]
+    fn session_window_starts_new_session_after_gap() {
+        let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+        let mut net: HashMap<(i64, i64, i64, i64), i64> = Default::default();
+        accumulate_session(&mut net, &op.process_epoch(make_input(&[(100, 7, 1)]), 1).unwrap());
+        accumulate_session(&mut net, &op.process_epoch(make_input(&[(1500, 7, 1)]), 2).unwrap());
+        assert_eq!(
+            live_session_rows(&net),
+            vec![(100, 100, 100, 7), (1500, 1500, 1500, 7)]
+        );
+    }
+
+    #[test]
+    fn session_window_merge_retracts_both_and_emits_replacement() {
+        let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+        let _ = op
+            .process_epoch(make_input(&[(100, 7, 1), (900, 7, 1), (2100, 7, 1), (2500, 7, 1)]), 1)
+            .unwrap();
+        {
+            let state = op.state.lock().unwrap();
+            let partition = state.partitions.values().next().unwrap();
+            assert_eq!(partition.live_session_count, 2);
+        }
+        let out = op.process_epoch(make_input(&[(1500, 7, 1)]), 2).unwrap();
+        let rows = session_rows(&out);
+        {
+            let state = op.state.lock().unwrap();
+            let partition = state.partitions.values().next().unwrap();
+            assert_eq!(
+                partition.live_session_count,
+                1,
+                "rows={:?} prev={:?}",
+                partition.rows.values().collect::<Vec<_>>(),
+                partition.prev_output.values().collect::<Vec<_>>()
+            );
+        }
+        assert!(rows.contains(&(100, 900, 100, 7, -1)), "{rows:?}");
+        assert!(rows.contains(&(100, 900, 900, 7, -1)), "{rows:?}");
+        assert!(rows.contains(&(2100, 2500, 2100, 7, -1)), "{rows:?}");
+        assert!(rows.contains(&(2100, 2500, 2500, 7, -1)), "{rows:?}");
+        assert!(rows.contains(&(100, 2500, 100, 7, 1)), "{rows:?}");
+        assert!(rows.contains(&(100, 2500, 900, 7, 1)), "{rows:?}");
+        assert!(rows.contains(&(100, 2500, 1500, 7, 1)), "{rows:?}");
+        assert!(rows.contains(&(100, 2500, 2100, 7, 1)), "{rows:?}");
+        assert!(rows.contains(&(100, 2500, 2500, 7, 1)), "{rows:?}");
+    }
+
+    #[test]
+    fn session_window_matches_batch_oracle_under_retraction_storm() {
+        let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+        let mut net: HashMap<(i64, i64, i64, i64), i64> = Default::default();
+        let epochs = [
+            vec![(100, 7, 1), (2500, 7, 1), (700, 9, 1)],
+            vec![(1500, 7, 1), (700, 9, -1), (1200, 9, 1)],
+            vec![(100, 7, -1), (2600, 7, 1)],
+        ];
+        let mut input_rows = Vec::new();
+        for (epoch, rows) in epochs.into_iter().enumerate() {
+            input_rows.extend(rows.iter().copied());
+            accumulate_session(
+                &mut net,
+                &op.process_epoch(make_input(rows.as_slice()), epoch as u64 + 1).unwrap(),
+            );
+        }
+        assert_eq!(
+            live_session_rows(&net),
+            batch_session_rows(&input_rows, 1000),
+            "net={:?}",
+            live_session_rows(&net)
+        );
+    }
+
+    #[test]
+    fn session_window_state_bound_backpressures() {
+        let op = SessionWindowOp::new(input_schema(), 0, 0, LateDataPolicy::Drop);
+        let rows: Vec<_> = (0..=SESSION_WINDOW_STATE_LIMIT as i64)
+            .map(|idx| (idx * 10, idx, 1))
+            .collect();
+        let err = op
+            .process_epoch(make_input(rows.as_slice()), 1)
+            .expect_err("session bound must backpressure");
+        match err {
+            OpError::SessionWindowStateOverflow { current, limit, .. } => {
+                assert_eq!(current, SESSION_WINDOW_STATE_LIMIT + 1);
+                assert_eq!(limit, SESSION_WINDOW_STATE_LIMIT);
+            }
+            other => panic!("expected SessionWindowStateOverflow, got {other:?}"),
+        }
+        assert_eq!(op.fill_level(), 0);
     }
 
     #[test]

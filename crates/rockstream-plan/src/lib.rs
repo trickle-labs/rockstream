@@ -178,6 +178,23 @@ pub enum PlanNode {
         /// Policy for rows that arrive after the window has closed.
         late_data_policy: LateDataPolicy,
     },
+    /// Session time-window operator (v0.50).
+    ///
+    /// Groups rows into dynamic, gap-delimited event-time sessions. Rows are
+    /// partitioned by all input columns except `time_col`; within each
+    /// partition, a row joins an existing session when it falls within
+    /// `gap_ms` of that session's current end, otherwise it starts a new
+    /// session. Session boundaries may merge or split as rows arrive or are
+    /// retracted.
+    SessionWindow {
+        input: Box<PlanNode>,
+        /// Column index holding the event timestamp (i64 ms, BE 8 bytes).
+        time_col: usize,
+        /// Maximum allowed inactivity gap inside one session.
+        gap_ms: i64,
+        /// Policy for rows that arrive after the session frontier has closed.
+        late_data_policy: LateDataPolicy,
+    },
     /// Top-K operator (v0.21).
     ///
     /// Maintains the top-`k` rows ranked by the column at `rank_col` (i64
@@ -665,6 +682,11 @@ pub enum OpKind {
     HopWindow {
         window_size_ms: i64,
         slide_ms: i64,
+        late_data_policy: LateDataPolicy,
+    },
+    /// Session time-window operator (v0.50).
+    SessionWindow {
+        gap_ms: i64,
         late_data_policy: LateDataPolicy,
     },
     /// Top-K operator (v0.21).

@@ -1226,6 +1226,21 @@ fn resolve_views_and_snapshots(
             slide_ms,
             late_data_policy,
         },
+        PlanNode::SessionWindow {
+            input,
+            time_col,
+            gap_ms,
+            late_data_policy,
+        } => PlanNode::SessionWindow {
+            input: Box::new(resolve_views_and_snapshots(
+                *input,
+                registered_views,
+                snapshot_sources,
+            )),
+            time_col,
+            gap_ms,
+            late_data_policy,
+        },
         PlanNode::TopK {
             input,
             k,
@@ -1955,6 +1970,7 @@ mod tests {
             | PlanNode::Window { input, .. }
             | PlanNode::TumbleWindow { input, .. }
             | PlanNode::HopWindow { input, .. }
+            | PlanNode::SessionWindow { input, .. }
             | PlanNode::TopK { input, .. }
             | PlanNode::Lateral { input, .. }
             | PlanNode::IndexArrange { input, .. } => find_recursion(input),
@@ -1984,6 +2000,7 @@ mod tests {
             | PlanNode::Window { input, .. }
             | PlanNode::TumbleWindow { input, .. }
             | PlanNode::HopWindow { input, .. }
+            | PlanNode::SessionWindow { input, .. }
             | PlanNode::TopK { input, .. }
             | PlanNode::Lateral { input, .. }
             | PlanNode::IndexArrange { input, .. } => contains_source_named(input, needle),

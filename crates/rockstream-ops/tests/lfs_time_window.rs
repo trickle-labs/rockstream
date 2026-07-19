@@ -21,8 +21,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
 use rockstream_ops::time_window::{
-    load_hop_window_state, load_tumble_window_state, persist_hop_window_state,
-    persist_tumble_window_state, CompactionFilter, HopWindowOp, TumbleWindowOp,
+    load_hop_window_state, load_session_window_state, load_tumble_window_state,
+    persist_hop_window_state, persist_session_window_state, persist_tumble_window_state,
+    CompactionFilter, HopWindowOp, SessionWindowOp, TumbleWindowOp,
 };
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_plan::LateDataPolicy;
@@ -84,6 +85,56 @@ fn accumulate(state: &mut std::collections::HashMap<(i64, i64, i64), i64>, zset:
 }
 
 fn live_rows(state: &std::collections::HashMap<(i64, i64, i64), i64>) -> Vec<(i64, i64, i64)> {
+    let mut rows: Vec<_> = state
+        .iter()
+        .filter(|(_, &w)| w > 0)
+        .map(|(&k, _)| k)
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn accumulate_session(
+    state: &mut std::collections::HashMap<(i64, i64, i64, i64), i64>,
+    zset: &ArrowZSet,
+) {
+    if zset.is_empty() {
+        return;
+    }
+    let start = zset
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let end = zset
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let t = zset
+        .data
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let v = zset
+        .data
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for i in 0..zset.num_rows() {
+        *state
+            .entry((start.value(i), end.value(i), t.value(i), v.value(i)))
+            .or_insert(0) += zset.weights[i];
+    }
+}
+
+fn live_session_rows(
+    state: &std::collections::HashMap<(i64, i64, i64, i64), i64>,
+) -> Vec<(i64, i64, i64, i64)> {
     let mut rows: Vec<_> = state
         .iter()
         .filter(|(_, &w)| w > 0)
@@ -380,6 +431,68 @@ async fn hop_window_state_persists_across_restart() {
         assert!(
             live.contains(&(1000, 1750, 30)) && live.contains(&(1500, 1750, 30)),
             "reloaded hop operator must keep overlap semantics"
+        );
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn session_window_state_persists_and_merges_across_restart() {
+    let dir = TempDir::new().unwrap();
+    let op_id = OperatorId(14);
+    let mut net_state: std::collections::HashMap<(i64, i64, i64, i64), i64> = Default::default();
+
+    {
+        let db = open_shard(&dir).await;
+        let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+        let out1 = op
+            .process_epoch(
+                make_input(&[(100, 7, 1), (900, 7, 1), (2100, 7, 1), (2500, 7, 1)]),
+                1,
+            )
+            .unwrap();
+        accumulate_session(&mut net_state, &out1);
+        assert_eq!(op.fill_level(), 2, "two open sessions before restart");
+        persist_session_window_state(&db, &op, op_id).await.unwrap();
+        db.flush().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
+    }
+
+    {
+        let db = open_shard(&dir).await;
+        let op = load_session_window_state(
+            &db,
+            input_schema(),
+            0,
+            1000,
+            LateDataPolicy::Drop,
+            op_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(op.fill_level(), 2, "session count restored after reopen");
+        let out2 = op.process_epoch(make_input(&[(1500, 7, 1)]), 2).unwrap();
+        accumulate_session(&mut net_state, &out2);
+        assert_eq!(op.fill_level(), 1, "bridge event merges sessions after reopen");
+        assert_eq!(
+            live_session_rows(&net_state),
+            vec![
+                (100, 2500, 100, 7),
+                (100, 2500, 900, 7),
+                (100, 2500, 1500, 7),
+                (100, 2500, 2100, 7),
+                (100, 2500, 2500, 7),
+            ]
         );
         Arc::try_unwrap(db)
             .ok()

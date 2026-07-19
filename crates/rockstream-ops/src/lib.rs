@@ -72,9 +72,10 @@ pub use snapshot::{SnapshotOp, SNAPSHOT_BUFFER_LIMIT};
 pub use source::{GenerateRowsSource, VecDeltaSource};
 pub use task::OperatorTask;
 pub use time_window::{
-    load_hop_window_state, load_tumble_window_state, load_watermark, persist_hop_window_state,
-    persist_tumble_window_state, persist_watermark, CompactionFilter, HopWindowOp, TumbleWindowOp,
-    WatermarkState, HOP_WINDOW_STATE_LIMIT, TUMBLE_WINDOW_STATE_LIMIT,
+    load_hop_window_state, load_session_window_state, load_tumble_window_state, load_watermark,
+    persist_hop_window_state, persist_session_window_state, persist_tumble_window_state,
+    persist_watermark, CompactionFilter, HopWindowOp, SessionWindowOp, TumbleWindowOp,
+    WatermarkState, HOP_WINDOW_STATE_LIMIT, SESSION_WINDOW_STATE_LIMIT, TUMBLE_WINDOW_STATE_LIMIT,
 };
 pub use topk::{load_topk_state, persist_topk_state, TopKOp, TOPK_BUFFER_LIMIT};
 pub use view_ref::{ViewRefOp, VIEW_REF_SCAN_LIMIT_BYTES};

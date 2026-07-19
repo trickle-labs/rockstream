@@ -87,6 +87,14 @@ pub enum OpError {
         code: ErrorCode,
     },
 
+    /// Session-window state exceeded its configured bound.
+    #[error("[{code}] Session window state bound exceeded ({current}/{limit} sessions); next_steps: reduce session cardinality, increase SESSION_WINDOW_STATE_LIMIT, or shard the windowed stream more finely")]
+    SessionWindowStateOverflow {
+        current: usize,
+        limit: usize,
+        code: ErrorCode,
+    },
+
     /// Monotone recursion received a negative delta.
     #[error("[{code}] Non-monotone delta rejected in monotone recursion; next_steps: mark the recursive query non-monotone or remove retractions from the input stream")]
     RecursionNonMonotoneDelta { code: ErrorCode },
@@ -208,6 +216,15 @@ impl OpError {
             current,
             limit,
             code: RS_2023,
+        }
+    }
+
+    pub fn session_window_state_overflow(current: usize, limit: usize) -> Self {
+        use rockstream_types::error_code::RS_2024;
+        Self::SessionWindowStateOverflow {
+            current,
+            limit,
+            code: RS_2024,
         }
     }
 

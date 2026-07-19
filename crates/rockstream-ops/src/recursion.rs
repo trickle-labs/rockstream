@@ -288,6 +288,7 @@ fn collect_source_names_inner(plan: &PlanNode, out: &mut Vec<String>) {
         | PlanNode::Window { input, .. }
         | PlanNode::TumbleWindow { input, .. }
         | PlanNode::HopWindow { input, .. }
+        | PlanNode::SessionWindow { input, .. }
         | PlanNode::TopK { input, .. }
         | PlanNode::Lateral { input, .. }
         | PlanNode::IndexArrange { input, .. } => collect_source_names_inner(input, out),
@@ -522,6 +523,7 @@ fn eval_plan(plan: &PlanNode, bindings: &HashMap<String, Relation>) -> Result<Re
         | PlanNode::Window { .. }
         | PlanNode::TumbleWindow { .. }
         | PlanNode::HopWindow { .. }
+        | PlanNode::SessionWindow { .. }
         | PlanNode::TopK { .. }
         | PlanNode::Lateral { .. }
         | PlanNode::IndexArrange { .. } => Err(OpError::unimplemented(format!(
@@ -540,7 +542,9 @@ fn plan_kind(plan: &PlanNode) -> OpKind {
         PlanNode::Aggregate { .. } => OpKind::Aggregate,
         PlanNode::Distinct { .. } => OpKind::Distinct,
         PlanNode::Window { .. } => unreachable!(),
-        PlanNode::TumbleWindow { .. } | PlanNode::HopWindow { .. } => unreachable!(),
+        PlanNode::TumbleWindow { .. }
+        | PlanNode::HopWindow { .. }
+        | PlanNode::SessionWindow { .. } => unreachable!(),
         PlanNode::TopK { .. } => unreachable!(),
         PlanNode::Recursion {
             max_iterations,

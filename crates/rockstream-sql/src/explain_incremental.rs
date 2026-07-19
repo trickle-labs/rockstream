@@ -342,6 +342,21 @@ fn render_node(plan: &PlanNode, depth: usize, lines: &mut Vec<PlanExplainLine>) 
                 combiner_enabled: false,
             });
         }
+        PlanNode::SessionWindow {
+            input,
+            gap_ms,
+            late_data_policy,
+            ..
+        } => {
+            render_node(input, depth + 1, lines);
+            lines.push(PlanExplainLine {
+                base_line: format!(
+                    "{indent}✓ SessionWindow[{gap_ms}ms]  merge_law=MaxRegister/v1  watermark_policy={late_data_policy:?}"
+                ),
+                metric_key: Some(law_metric_key(MergeLawId(0x1001), "MaxRegister", None)),
+                combiner_enabled: false,
+            });
+        }
 
         // v0.12: TopK (IVM-9)
         PlanNode::TopK {

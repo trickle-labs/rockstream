@@ -11,8 +11,9 @@ use hmac::{Hmac, Mac};
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use rockstream_ops::time_window::{
-    load_hop_window_state, load_tumble_window_state, persist_hop_window_state,
-    persist_tumble_window_state, CompactionFilter, HopWindowOp, TumbleWindowOp,
+    load_hop_window_state, load_session_window_state, load_tumble_window_state,
+    persist_hop_window_state, persist_session_window_state, persist_tumble_window_state,
+    CompactionFilter, HopWindowOp, SessionWindowOp, TumbleWindowOp,
 };
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_storage::{keys::ShardKeyEncoder, ShardDb};
@@ -192,6 +193,56 @@ fn make_input(rows: &[(i64, i64, i64)]) -> ArrowZSet {
     ArrowZSet::new(data, w)
 }
 
+fn accumulate_session(
+    state: &mut std::collections::HashMap<(i64, i64, i64, i64), i64>,
+    zset: &ArrowZSet,
+) {
+    if zset.is_empty() {
+        return;
+    }
+    let start = zset
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let end = zset
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let t = zset
+        .data
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let v = zset
+        .data
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for i in 0..zset.num_rows() {
+        *state
+            .entry((start.value(i), end.value(i), t.value(i), v.value(i)))
+            .or_insert(0) += zset.weights[i];
+    }
+}
+
+fn live_session_rows(
+    state: &std::collections::HashMap<(i64, i64, i64, i64), i64>,
+) -> Vec<(i64, i64, i64, i64)> {
+    let mut rows: Vec<_> = state
+        .iter()
+        .filter(|(_, &w)| w > 0)
+        .map(|(&k, _)| k)
+        .collect();
+    rows.sort();
+    rows
+}
+
 // ─── Test 1: Late data + TTL on MinIO backend ─────────────────────────────
 
 #[tokio::test]
@@ -324,5 +375,46 @@ async fn hop_window_late_data_and_ttl_on_minio() {
     assert!(
         !filter.may_delete(&sample_key),
         "hop state must not evict before frontier passes the window end"
+    );
+}
+
+#[tokio::test]
+async fn session_window_merge_survives_minio_restart() {
+    if !docker_available() {
+        eprintln!("Docker not available — skipping session_window_merge_survives_minio_restart");
+        return;
+    }
+
+    let (_container, port) = start_minio().await;
+    let db = open_shard_minio(port, "session-test").await;
+    let op_id = OperatorId(32);
+    let mut net_state: std::collections::HashMap<(i64, i64, i64, i64), i64> = Default::default();
+
+    let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
+    let out1 = op
+        .process_epoch(
+            make_input(&[(100, 7, 1), (900, 7, 1), (2100, 7, 1), (2500, 7, 1)]),
+            1,
+        )
+        .unwrap();
+    accumulate_session(&mut net_state, &out1);
+    persist_session_window_state(&db, &op, op_id).await.unwrap();
+
+    let op2 = load_session_window_state(&db, input_schema(), 0, 1000, LateDataPolicy::Drop, op_id)
+        .await
+        .unwrap();
+    let out2 = op2.process_epoch(make_input(&[(1500, 7, 1)]), 2).unwrap();
+    accumulate_session(&mut net_state, &out2);
+
+    assert_eq!(op2.fill_level(), 1, "merged session survives MinIO reload");
+    assert_eq!(
+        live_session_rows(&net_state),
+        vec![
+            (100, 2500, 100, 7),
+            (100, 2500, 900, 7),
+            (100, 2500, 1500, 7),
+            (100, 2500, 2100, 7),
+            (100, 2500, 2500, 7),
+        ]
     );
 }

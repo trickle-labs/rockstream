@@ -77,6 +77,10 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
             slide_ms,
             late_data_policy,
         } => format!("HopWindow[{window_size_ms}ms/{slide_ms}ms,{late_data_policy:?}]"),
+        OpKind::SessionWindow {
+            gap_ms,
+            late_data_policy,
+        } => format!("SessionWindow[{gap_ms}ms,{late_data_policy:?}]"),
         OpKind::TopK {
             k,
             rank_col,

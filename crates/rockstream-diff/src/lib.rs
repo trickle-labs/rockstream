@@ -341,6 +341,26 @@ impl DiffCtx {
                 });
                 Ok(id)
             }
+            PlanNode::SessionWindow {
+                input,
+                gap_ms,
+                late_data_policy,
+                ..
+            } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::SessionWindow {
+                        gap_ms: *gap_ms,
+                        late_data_policy: late_data_policy.clone(),
+                    },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
 
             // ── TopK (v0.12 — IVM-9) ─────────────────────────────────────
             PlanNode::TopK {
@@ -573,6 +593,31 @@ mod tests {
         } = &hop_op.unwrap().kind
         {
             assert_eq!((*window_size_ms, *slide_ms), (1000, 250));
+        }
+    }
+
+    #[test]
+    fn diff_session_window_emits_session_window_op() {
+        use rockstream_plan::LateDataPolicy;
+        let src = PlanNode::Source { name: "t".into() };
+        let plan = PlanNode::SessionWindow {
+            input: Box::new(src),
+            time_col: 0,
+            gap_ms: 1000,
+            late_data_policy: LateDataPolicy::Drop,
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        let session_op = physical
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::SessionWindow { .. }));
+        assert!(
+            session_op.is_some(),
+            "must contain exactly one SessionWindow op"
+        );
+        if let OpKind::SessionWindow { gap_ms, .. } = &session_op.unwrap().kind {
+            assert_eq!(*gap_ms, 1000);
         }
     }
 

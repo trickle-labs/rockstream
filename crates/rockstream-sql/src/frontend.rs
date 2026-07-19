@@ -317,6 +317,7 @@ impl SqlFrontend {
             | PlanNode::Window { input, .. }
             | PlanNode::TumbleWindow { input, .. }
             | PlanNode::HopWindow { input, .. }
+            | PlanNode::SessionWindow { input, .. }
             | PlanNode::TopK { input, .. }
             | PlanNode::Lateral { input, .. }
             | PlanNode::IndexArrange { input, .. } => 1 + Self::count_plan_nodes(input),

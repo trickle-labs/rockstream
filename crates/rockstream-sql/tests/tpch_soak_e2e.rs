@@ -429,7 +429,9 @@ fn get_column_count(plan: &PlanNode) -> usize {
             input,
             window_exprs,
         } => get_column_count(input) + window_exprs.len(),
-        PlanNode::TumbleWindow { input, .. } | PlanNode::HopWindow { input, .. } => {
+        PlanNode::TumbleWindow { input, .. }
+        | PlanNode::HopWindow { input, .. }
+        | PlanNode::SessionWindow { input, .. } => {
             get_column_count(input)
         }
         PlanNode::TopK { input, .. } => get_column_count(input),
