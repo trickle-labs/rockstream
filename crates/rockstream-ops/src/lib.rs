@@ -24,6 +24,7 @@ pub mod filter;
 pub mod group_commit;
 pub mod index_arrange;
 pub mod join;
+pub mod lateral;
 pub mod map;
 pub mod minmax;
 pub mod nexmark_regression;
@@ -31,6 +32,7 @@ pub mod op;
 pub mod outer_join;
 pub mod pipeline;
 pub mod project;
+pub mod recursion;
 pub mod scheduler;
 pub mod sink;
 pub mod snapshot;
@@ -54,11 +56,16 @@ pub use error::OpError;
 pub use filter::FilterOp;
 pub use group_commit::{GroupCommit, GROUP_COMMIT_MAX_BATCHES};
 pub use join::JoinOp;
+pub use lateral::LateralOp;
 pub use map::MapOp;
 pub use minmax::{persist_minmax_state, MinMaxKind, MinMaxOp, MinMaxState};
 pub use op::{EpochOutput, Operator};
 pub use outer_join::OuterJoinOp;
 pub use project::ProjectOp;
+pub use recursion::{
+    load_recursion_state, persist_recursion_state, DistributedShardStatus, RecursionOp,
+    RecursionStrategy, RECURSION_STATE_LIMIT,
+};
 pub use scheduler::CreditScheduler;
 pub use sink::ViewSinkOp;
 pub use snapshot::{SnapshotOp, SNAPSHOT_BUFFER_LIMIT};

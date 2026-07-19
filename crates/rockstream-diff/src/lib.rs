@@ -343,6 +343,20 @@ impl DiffCtx {
                 Ok(id)
             }
 
+            // ── Lateral (v0.25) ───────────────────────────────────────────
+            PlanNode::Lateral { input, func } => {
+                let input_id = self.diff_node(input, ops)?;
+                let id = self.next_op_id();
+                ops.push(OpNode {
+                    id,
+                    kind: OpKind::Lateral { func: func.clone() },
+                    merge_law: None,
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                Ok(id)
+            }
+
             // ── Snapshot (v0.13) ──────────────────────────────────────────
             PlanNode::Snapshot {
                 source_name,
@@ -539,6 +553,29 @@ mod tests {
             assert_eq!(*rank_col, 1);
             assert_eq!(*partition_by, vec![0]);
         }
+    }
+
+    #[test]
+    fn diff_lateral_emits_lateral_op() {
+        use rockstream_plan::LateralFunc;
+
+        let plan = PlanNode::Lateral {
+            input: Box::new(PlanNode::Source {
+                name: "docs".into(),
+            }),
+            func: LateralFunc::Unnest { col: 1 },
+        };
+        let mut ctx = DiffCtx::new();
+        let physical = ctx.differentiate(&plan).unwrap();
+        assert_eq!(physical.ops.len(), 2);
+        assert!(matches!(physical.ops[0].kind, OpKind::Source { .. }));
+        assert_eq!(
+            physical.ops[1].kind,
+            OpKind::Lateral {
+                func: LateralFunc::Unnest { col: 1 }
+            }
+        );
+        assert_eq!(physical.ops[1].inputs, vec![OperatorId(0)]);
     }
 
     #[test]

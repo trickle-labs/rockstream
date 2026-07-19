@@ -34,7 +34,9 @@ async fn lower_unnest_json_array_to_lateral_plan_node() {
                     match *input {
                         PlanNode::Project { input, columns } => {
                             assert_eq!(columns, vec![Expr::Column(0), Expr::Column(1)]);
-                            assert!(matches!(*input, PlanNode::Source { ref name } if name == "docs"));
+                            assert!(
+                                matches!(*input, PlanNode::Source { ref name } if name == "docs")
+                            );
                         }
                         other => panic!("expected inner Project under Lateral, got {other:?}"),
                     }

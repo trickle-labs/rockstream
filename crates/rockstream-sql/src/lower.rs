@@ -348,6 +348,29 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
             })
         }
 
+        // DataFusion 53 lowers scalar `UNNEST(expr)` projections to
+        // `LogicalPlan::Unnest`. In the vendored grammar today, explicit
+        // `CROSS JOIN LATERAL UNNEST(...)` table-function syntax and
+        // `LATERAL (SELECT ...)` are rejected during planning, so there is no
+        // second reachable lateral node shape to lower here yet.
+        LogicalPlan::Unnest(unnest) => {
+            let input = lower(&unnest.input)?;
+            if !unnest.struct_type_columns.is_empty() || unnest.list_type_columns.len() != 1 {
+                return Err(SqlError::UnsupportedPlanNode {
+                    node_type: format!(
+                        "Unnest:list_cols={},struct_cols={}",
+                        unnest.list_type_columns.len(),
+                        unnest.struct_type_columns.len()
+                    ),
+                });
+            }
+            let (col, _) = &unnest.list_type_columns[0];
+            Ok(PlanNode::Lateral {
+                input: Box::new(input),
+                func: rockstream_plan::LateralFunc::Unnest { col: *col },
+            })
+        }
+
         LogicalPlan::RecursiveQuery(recursive) => {
             let base_cols = recursive.static_term.schema().fields().len();
             let step_cols = recursive.recursive_term.schema().fields().len();
