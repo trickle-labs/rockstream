@@ -266,6 +266,7 @@ evidence behind every completed version.
 | Wire Protocol Complete ✅ Done | v0.39 | Extended query protocol, full Postgres type OID coverage, ORM driver compatibility, PgBouncer pooling, protocol fuzzing |
 | Wire Protocol End-User Complete ✅ Done | v0.42 | SCRAM/MD5 auth, full transaction/savepoint state machine, LISTEN/NOTIFY, a certified driver-compatibility matrix, and an unmodified reference app running end to end over pgwire |
 | Elastically Scalable | v0.47 | Hot keys split into virtual buckets and shards split before they get too big, entirely in the background; the cluster exports autoscaling signals a standard Kubernetes HPA/KEDA can act on — no manual re-sharding |
+| Public Demo Ready | v0.51.6 | A vanilla, autocommitting psql/ORM/BI-tool connection round-trips data with zero private ritual; ad hoc queries honor WHERE/JOIN/GROUP BY; the gateway serves views through the real incremental engine on one unified data plane instead of a disconnected batch recompute; the wire is TLS-terminated for a standard client |
 | Operationally Complete | v0.57 | Full operator CLI + arrangement debugger, internal mTLS, secrets management, an independent security review, and a proven rolling-upgrade/disaster-recovery path |
 | 1.0 Release | v0.59 | All v0.1–v0.58 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
 
@@ -289,6 +290,7 @@ evidence behind every completed version.
 | 13 | Elastic scaling and skew handling: online shard migration, hot-key virtual buckets, proactive shard splitting, cluster autoscaling signals |
 | 14 | Network efficiency and advanced DML: scatter pruning, zero-copy IPC, AZ-aware shuffle |
 | 15 | Complex analytics and compute tuning: recursive CTEs, lateral joins, hopping/session windows, hot-path optimizations |
+| 15.5 | Standard wire compatibility and the real incremental serving path: standard autocommit/idempotency/immediate-view-population semantics, query-time WHERE/JOIN/GROUP BY execution, gateway+runtime unified into one incrementally-served data plane, TLS termination, binary wire format, bounded session state |
 | 16 | Declarative data governance: inline expectations, lineage diagnostics, dead-letter-queue routing |
 | 17 | Enterprise validation and 1.0 finalization: isolation/validation hooks, the operator CLI + arrangement debugger, mTLS/secrets/security review, rolling-upgrade + disaster-recovery proof, simulator maturity, the v1.0 release candidate |
 
@@ -306,7 +308,7 @@ The project is a Cargo workspace of purpose-built crates:
 | `rockstream-sql` | SQL frontend built on DataFusion |
 | `rockstream-runtime` | Worker process, circuit executor, async scheduler, exchange subsystem |
 | `rockstream-control` | Control-plane service (topology, shard leasing, placement) |
-| `rockstream-gateway` | Postgres wire protocol gateway (Iceberg REST catalog endpoint planned, Phase 12) |
+| `rockstream-gateway` | Postgres wire protocol gateway (Iceberg REST catalog endpoint planned, Phase 12; unifies with `rockstream-runtime`/`-ops`/`-diff` into one incrementally-served data plane at v0.51.3, Phase 15.5) |
 | `rockstream-connectors` | Connector implementations: Kafka source/sink and S3 source are done; a generic exactly-once object-store sink is done; Postgres CDC source and Iceberg/Delta Lake sinks are planned (Phase 12) |
 | `rockstream-oracle` | Batch reference engine and property-test harness (DBSP soundness tests) |
 | `rockstream-sim` | Deterministic simulation harness: `SimRuntime`, `buggify!()`, fault model |

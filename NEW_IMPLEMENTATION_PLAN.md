@@ -151,11 +151,21 @@ phase.
 | 8 | Both | Ingestion connectors & crucible soaks | 72h object-store soak; recovery SLOs under real load |
 | 9 | Both | Operational HTAP ergonomics | Secondary indexes; single-digit-ms point lookups |
 | 10 | Both | Data lake bridge & FinOps | External engines query Iceberg snapshots; >50% TCO reduction |
-| 11 | Both | Elastic scaling & skew handling | Online shard migration proven (FizzBee M6 model); a synthetic hot key is detected and split into virtual buckets without manual intervention; a real k8s HPA/KEDA scale-out/scale-in driven by the cluster's own autoscaling-pressure signal |
-| 12 | Both | Network efficiency & advanced DML | Zero-copy IPC; >90% shard pruning on Bloom filters |
-| 13 | IVM | Complex analytics & compute tuning | Recursive CTEs correct against oracle; +30% DAG throughput |
-| 14 | Both | Declarative data governance | Malformed records never reach ViewSink; DLQ durable |
-| 15 | Both | Enterprise validation & v1.0 finalization | 2-week chaos; zero P0/P1; `v1.0.0` tagged |
+| 10.5 | Both | Elastic scaling & skew handling | Online shard migration proven (FizzBee M6 model); a synthetic hot key is detected and split into virtual buckets without manual intervention; a real k8s HPA/KEDA scale-out/scale-in driven by the cluster's own autoscaling-pressure signal |
+| 11 | Both | Network efficiency & advanced DML | Zero-copy IPC; >90% shard pruning on Bloom filters |
+| 12 | IVM | Complex analytics & compute tuning | Recursive CTEs correct against oracle; +30% DAG throughput |
+| 12.5 | Both | Standard wire compatibility & the real incremental serving path | A vanilla autocommitting psql/ORM connection round-trips data with zero private ritual; ad hoc WHERE/JOIN/GROUP BY execute correctly; the gateway and runtime unify into one data plane serving views incrementally, not via full-table batch recompute |
+| 13 | Both | Declarative data governance | Malformed records never reach ViewSink; DLQ durable |
+| 14 | Both | Enterprise validation & v1.0 finalization | 2-week chaos; zero P0/P1; `v1.0.0` tagged |
+
+**Note on Phase numbering (2026-07-19 fix)**: this table's Elastic Scaling
+row was previously numbered "11" (with every later row shifted +1 to 12–15)
+when it was added by the 2026-07-11 review, but the actual `## Phase N`
+section headings below it were never renumbered to match — they still read
+Phase 11 (Network Efficiency) through Phase 14 (Enterprise Validation). The
+table is now corrected back to decimal insertions (`10.5`, `12.5`) that match
+the real, unchanged section numbers, the same mechanism already used
+elsewhere in this document.
 
 Distribution (Phases 4–6) deliberately precedes the Postgres layer (Phase 7):
 the gateway must serve a correct, fault-tolerant, distributed engine, not a
@@ -584,7 +594,7 @@ shuffle storage.
 
 > A minimal elasticity slice (online shard split at a size threshold and a
 > worker-drain protocol) may be implemented here if needed for the soak, but is
-> otherwise deferred to Phase 11 (Elastic Scaling & Skew Handling;
+> otherwise deferred to Phase 10.5 (Elastic Scaling & Skew Handling;
 > NEW_ROADMAP.md v0.46–v0.47), which covers the full online shard-migration
 > state machine, hot-key virtual buckets, proactive splitting, and skew
 > rebalancing. This was found fully designed in DESIGN.md §10 but scheduled in
@@ -861,6 +871,80 @@ WAL write amplification.
   correctly against the correctness oracle.
 - Throughput on complex DAGs increases by >30% due to reduced WAL write
   amplification.
+
+---
+
+## Phase 12.5 — Standard Wire Compatibility & the Real Incremental Serving Path
+
+**Found missing during the 2026-07-19 live end-to-end review**
+(`IMPLEMENTATION_STATUS_20260719.md`): driving the actual shipped binary
+through a real `psql` client — rather than auditing docs against source, as
+every prior review here did — found the Postgres wire gateway (Phase 7) does
+not yet meet its own exit criteria for a standard, unmodified client, and
+that the gateway's serving path never actually runs the IVM engine this
+plan's other phases build and prove. Both gaps are closed here, immediately
+before the data-governance layer, using the same decimal-phase mechanism as
+Phase 10.5 (Elastic Scaling) so no later phase is renumbered.
+
+**Goal**: Make the front door honest. A vanilla autocommitting `psql`/ORM/
+BI-tool connection must round-trip data with zero private ritual, ad hoc
+queries must actually execute `WHERE`/`JOIN`/`GROUP BY`, and the gateway must
+serve views by running the real, already-proven Z-set/DBSP operator DAG — not
+a disconnected, gateway-local, full-table DataFusion batch recompute.
+
+**Deliverables**
+
+- **Standard write/DDL semantics**: implicit per-statement autocommit outside
+  an explicit `BEGIN`; a server-generated idempotency envelope when the
+  client supplies none (matching this plan's own original Phase 7.2 scoping —
+  a key is required only for a non-idempotent aggregate write, not
+  universally); immediate initial population on `CREATE MATERIALIZED VIEW`;
+  a fix for the no-column-list multi-row `INSERT` phantom-NULL-row bug.
+- **Query-time execution parity**: ad hoc `SELECT`s against tables/views
+  actually evaluate `WHERE`/`JOIN`/`GROUP BY`/subqueries/CTEs, not just
+  projection/`ORDER BY`/`LIMIT`; standard `EXPLAIN` (no `INCREMENTAL` keyword)
+  returns a real plan instead of a one-line stub; `CREATE INDEX` (v0.32's
+  user-facing DDL) becomes genuinely consulted by the query planner.
+- **One data plane**: `rockstream-gateway` takes on real (non-dev)
+  dependencies on `rockstream-runtime`/`rockstream-plan`/`rockstream-ops`/
+  `rockstream-diff`; the two independent SlateDB shards opened by
+  `--role all` today are unified into one; `CREATE VIEW`/
+  `CREATE MATERIALIZED VIEW` compiles through the real lowering →
+  differentiation → runtime pipeline instead of the standalone
+  `view_materializer`.
+- **True incremental serving**: view refresh on the unified data plane
+  becomes a bounded Z-set delta per commit, not a full source-table rescan;
+  the hardcoded single-query Nexmark SESSION-window rewrite is removed in
+  favor of the general `SESSION` operator, enforced by a CI grep-gate against
+  any future hardcoded query text.
+- **Gateway-facing TLS and binary format**: real `SSLRequest` negotiation
+  (making the already-implemented `--auth=mtls` mode functional for the first
+  time) and binary (`FormatCode::Binary`) result encoding for every
+  already-text-supported OID.
+- **Session-state and correctness hardening**: bounded (LRU-evicted)
+  prepared-statement/portal cache with abnormal-disconnect cleanup;
+  `REPEATABLE READ` either genuinely enforced or honestly rejected like
+  `SERIALIZABLE`; `avg` aggregate precision fix.
+
+**Exit criteria** (see `NEW_ROADMAP.md` v0.51.1–v0.51.6 for the full,
+version-by-version proof obligations):
+
+- The exact `IMPLEMENTATION_STATUS_20260719.md` reproduction transcript works
+  verbatim over a vanilla autocommitting `psql` connection, with no `SET`, no
+  manual `COMMIT`, and a materialized view populated immediately at `CREATE`
+  time.
+- An ad hoc `SELECT ... WHERE ...`/`JOIN`/`GROUP BY` against a view or table
+  returns correct, oracle-matching results; standard `EXPLAIN` returns a real
+  plan.
+- `rockstream-gateway`'s `Cargo.toml` depends on `rockstream-runtime`/`-ops`/
+  `-diff` as real dependencies, not only `[dev-dependencies]`; `--role all`
+  opens exactly one data plane; a 1-row change in a 1M-row source table
+  causes proportional, not full-table, view-refresh work on the live serving
+  path.
+- A `psql "sslmode=require"` connection completes a real TLS handshake;
+  `--auth=mtls` authenticates a real client certificate end to end.
+- Prepared-statement/portal state stays bounded under sustained use and is
+  fully reclaimed after an abnormal disconnect.
 
 ---
 

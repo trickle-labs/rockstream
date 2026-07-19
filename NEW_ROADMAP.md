@@ -162,6 +162,7 @@ These names orient readers; they are not calendar commitments.
 | Wire Protocol Complete | v0.39 | Extended query protocol, full Postgres type OID coverage, ORM driver compatibility (SQLAlchemy, Prisma, Hibernate), PgBouncer transaction-mode pooling, protocol fuzzing, and concurrent-connection stress; any standard Postgres driver works without workarounds. |
 | Wire Protocol End-User Complete² | v0.42 | SCRAM-SHA-256/MD5 password auth, driver session bootstrap, full transaction/savepoint state machine, LISTEN/NOTIFY, and a green driver-compatibility matrix (psql, psycopg3, tokio-postgres, pgx, PgJDBC, node-postgres, SQLAlchemy, Prisma); a reference application runs end-to-end over pgwire unmodified, with a ≥90% gateway coverage gate. |
 | Elastically Scalable ✅ Done | v0.47 | Hot keys split into virtual buckets and shards split before they get too big, entirely in the background; the cluster exports `cluster_worker_pressure` so a standard Kubernetes HPA/KEDA can drive worker count — no manual re-sharding, no touching mechanism knobs. |
+| Public Demo Ready | v0.51.6 | A vanilla, autocommitting `psql`/ORM/BI-tool connection round-trips data with zero private ritual (no mandatory `SET`, no manual `COMMIT`, materialized views populate immediately); ad hoc `SELECT`s honor `WHERE`/`JOIN`/`GROUP BY`; the gateway serves views through the real incremental engine on one unified data plane, not a disconnected full-table batch recompute; the wire is TLS-terminated and binary-format-capable for a standard client. |
 | Operationally Complete | v0.57 | The full operator CLI surface (workload/view/schema/source/cluster/resource lifecycle, the IVM arrangement debugger), internal mTLS, secrets management, an independent security review, a proven rolling-upgrade path, and a rehearsed disaster-recovery drill are all done; an operator can run and heal a cluster using only documented commands. |
 | v1.0 Release | v0.59 | All v0.1–v0.58 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged. |
 
@@ -927,6 +928,91 @@ it schedules must be implemented in `rockstream-control`, never in
 | v0.50 | Advanced Streaming Analytics ✅ Done | SQL compiler support for recursive CTEs (`WITH RECURSIVE`) for graph algorithms and fixed-point IVM, lateral joins for nested JSON/arrays, and hopping/session windows. | Transitive closures and sessionization queries incrementally maintain state correctly against the correctness oracle. | Unit, LFS, MinIO, TC |
 | v0.51 | Hot-Path Compute Optimizations | WAL elision for derived intermediate operator shards; link `max_rows_per_quantum` directly to network buffer depth to provide tight backpressure coupling. | Throughput on complex DAGs increases by >30% due to reduced intermediate WAL write amplification. | Unit, LFS, MinIO, TC |
 
+**Live end-to-end wire-protocol review (2026-07-19).** Every review paragraph
+above audited `DESIGN.md`/`NEW_IMPLEMENTATION_PLAN.md` claims against
+`crates/` source. This is the first review to instead drive the actual
+shipped `target/debug/rockstream` binary end-to-end through a real `psql`
+client over the wire, at v0.50 (full report:
+[IMPLEMENTATION_STATUS_20260719.md](IMPLEMENTATION_STATUS_20260719.md)). It
+found the individual building blocks are real and mostly correct — SlateDB
+durability, the broad pgwire surface, and the DBSP/Z-set incremental-operator
+library (`rockstream-ops`) all work and are well-tested in isolation — but
+the *serving path a standard client actually uses* has five blocking
+correctness/usability gaps and one severe architectural gap, none previously
+scheduled:
+
+1. **Autocommit does not persist writes.** A vanilla autocommitting
+   `psql`/ORM/BI-tool connection issuing `INSERT` then `SELECT` as separate
+   statements sees 0 rows with no error, because writes are buffered and only
+   flushed by an explicit `COMMIT` (`crates/rockstream-gateway/src/server.rs`).
+2. **Every write requires the non-standard `SET rockstream.idempotency_key`**
+   (or `source_epoch`) or is rejected with `RS-2007` — with the buffered rows
+   silently discarded while the `INSERT` still reports success. No stock
+   client ever sends this `SET`. `NEW_IMPLEMENTATION_PLAN.md` Phase 7.2's own
+   design only requires this "for a direct write to a non-idempotent
+   aggregate," not universally, so this is an implementation gap against the
+   plan's own stated intent, not a deliberate design choice.
+3. **`CREATE MATERIALIZED VIEW ... AS SELECT ...` performs no initial
+   population** — the view is empty until the *next* commit touches a source
+   table, contradicting both standard PostgreSQL semantics and this plan's own
+   Phase 7.2 exit criterion ("`CREATE MATERIALIZED VIEW mv AS SELECT * FROM v`
+   inlines `v` and starts IVM").
+4. **Query-time `WHERE`/`JOIN`/`GROUP BY`/subqueries/CTEs are silently
+   ignored** on an ad hoc `SELECT` (`read_view_response`, `server.rs` ~line
+   2705, applies only column projection, `ORDER BY`, and `LIMIT`) — a
+   predicate like `SELECT * FROM v WHERE region = 'US'` returns every row.
+5. **Multi-row `INSERT ... VALUES (...), (...)` without an explicit column
+   list produces a single all-`NULL` phantom row** (data loss), verified
+   live — distinct from and not fixed by v0.42.2, which corrected multi-row
+   tuple *splitting* (`parse_insert`/`build_row_key` already parse and key a
+   column-list-free multi-row `VALUES` list correctly, confirmed by
+   `parse_insert_malformed_row_without_column_list_returns_rs2056`); the
+   defect is in the later stage that must resolve positional values against
+   the target table's declared catalog column order when no column list is
+   given, and does not.
+
+**The architectural root cause, and the most important finding in the
+report: the gateway and the real IVM engine are two disconnected data
+planes.** `crates/rockstream-gateway/Cargo.toml` depends on only
+`rockstream-types`, `-storage`, `-sql`, and `-control` — `rockstream-runtime`,
+`rockstream-ops`, and `rockstream-diff` appear only as `[dev-dependencies]`,
+for tests. Running `rockstream start --role all` opens **two independent
+SlateDB shards that never communicate**: a `rockstream-runtime` worker shard
+(which acquires a shard-1 lease a code comment admits is only "to demonstrate
+fencing setup," `crates/rockstream-cli/src/lib.rs` ~line 566) and a separate
+`<storage>/gateway-shard/` that alone serves psql clients (same file, ~line
+223). Views are served by
+`crates/rockstream-gateway/src/view_materializer.rs`, whose own module doc
+already states it performs "batch re-evaluation on every commit — correct and
+simple, not incremental," re-scanning the entire source table through
+DataFusion's in-memory engine on every commit. The well-tested DBSP/Z-set
+operator library this project's headline pitch rests on is proven correct in
+the `rockstream-oracle`/`rockstream-sql` test harnesses but **never runs on
+the live serving path** a psql user actually exercises. A related smell:
+`view_materializer.rs` contains a hardcoded exact-string rewrite
+(`rewrite_session_sql`, ~line 175) for one specific Nexmark SESSION-window
+query.
+
+Closing all of this is what converts RockStream from, in the report's own
+words, "impressive internals with a fragile front door" into a system a
+skeptical public audience can drive with standard `psql`/ORM/BI tooling with
+zero prior knowledge of a private protocol. Added as a new **Phase 15.5 —
+Standard Wire Compatibility & the Real Incremental Serving Path** below
+(inserted between Phase 15 and Phase 16, using the same decimal-version
+mechanism as Phases 11.5/12.5–12.8 so nothing at v0.52 or later is
+renumbered), closing with a new **Public Demo Ready** milestone.
+
+### Phase 15.5 — Standard Wire Compatibility & the Real Incremental Serving Path
+
+| Version | Focus | Scope | Proof | Backends |
+|---|---|---|---|---|
+| v0.51.1 | PostgreSQL-Standard Write & DDL Semantics | Make the front door behave like PostgreSQL for the exact transcript in `IMPLEMENTATION_STATUS_20260719.md`, with zero private ritual. **Implicit autocommit**: outside an explicit `BEGIN`, every statement commits immediately on success (an explicit `BEGIN…COMMIT`/`ROLLBACK` block keeps buffering as today). **Server-generated idempotency envelope**: when a write's session has not `SET rockstream.idempotency_key`/`rockstream.source_epoch`, the gateway generates one internally instead of returning `RS-2007`; the explicit `SET` remains available for a client that needs an idempotency guarantee spanning an explicit multi-statement transaction, matching `NEW_IMPLEMENTATION_PLAN.md` Phase 7.2's original "for a direct write to a non-idempotent aggregate" scoping, which today's code does not honor. **Immediate materialized-view population**: `CREATE MATERIALIZED VIEW ... AS SELECT ...` runs one `view_materializer` pass against current source-table state before returning, instead of waiting for the next commit. **No-column-list multi-row INSERT fix**: when `parse_insert` returns an empty column list, resolve each row's positional values against the target table's catalog-declared column order before writing, eliminating the all-`NULL` phantom-row corruption, reusing the existing `RS-2056` malformed-row error path when the table schema cannot be resolved at all. | The exact `IMPLEMENTATION_STATUS_20260719.md` transcript now works verbatim over a vanilla autocommitting `psql` connection with no `SET` and no explicit `COMMIT`: `CREATE TABLE t (id int, name text); INSERT INTO t VALUES (1, 'alice'); SELECT * FROM t;` returns the one row correctly; a freshly `CREATE MATERIALIZED VIEW`'d view reflects its source table's current data immediately, before any further write; `INSERT INTO t VALUES (3,'carol'),(4,'dave')` (no column list) inserts two correctly-populated rows, not a NULL phantom row (new `insert_no_column_list_multi_row_tests.rs`); the existing 100/100 `gateway_proof_tests` and the explicit-transaction buffering path both remain green. | Unit, LFS, MinIO, TC |
+| v0.51.2 | Query-Time Predicate/Join/Aggregate Execution, Standard EXPLAIN Parity & Real Secondary Indexes | Route ad hoc `SELECT` statements against already-materialized tables/views through the same DataFusion engine the view *definition* already uses at materialization time, so query-time `WHERE`, `JOIN` (across two base tables/views), `GROUP BY`/aggregates, subqueries, and CTEs are actually evaluated instead of only column-projection/`ORDER BY`/`LIMIT` (`read_view_response`, `server.rs` ~line 2705). Standard `EXPLAIN <query>` — the bare syntax every ORM/BI tool actually emits, no `INCREMENTAL` keyword — returns a real DataFusion-generated plan instead of the one-line pushdown/index-annotation stub (`server.rs` ~line 1624); `EXPLAIN INCREMENTAL` (v0.45) is unchanged and remains the enhanced, RockStream-specific extension. Wire the already-tracked `CatalogIndexState::Building`/`Ready` secondary-index metadata (`server.rs` ~line 3183, v0.32) into this new query-time execution path as a real point/range-lookup accelerator, so `CREATE INDEX` (the standard DDL) stops being metadata-only — distinct from and complementary to v0.32's already-shipped *automatic*, system-managed materialized-view indexes. | `SELECT * FROM v WHERE region = 'US'` against mixed-region data returns only matching rows (verified live); an ad hoc two-table `JOIN` and an ad hoc `GROUP BY` (not baked into a view definition) return correct, oracle-matching results; plain `EXPLAIN SELECT ...` returns a real plan tree naming actual scan/filter/join nodes; a `CREATE INDEX idx ON t(col)` that reaches `Ready` measurably avoids a full-table scan for a matching point lookup, at single-digit-millisecond latency matching v0.32's bar (new `query_time_execution_tests.rs`, `create_index_query_planning_tests.rs`). | Unit, LFS, MinIO, TC |
+| v0.51.3 | Gateway↔Runtime Unification: One Data Plane | Close the two-disconnected-data-planes architecture gap at its root. Merge `rockstream start --role all`'s two independent SlateDB shards (the `rockstream-runtime` worker shard and the gateway's own `<storage>/gateway-shard/`) into one data plane: DML written over pgwire is registered as real input to a `rockstream-runtime` worker's operator DAG, and `SELECT` reads the worker's `ViewSink` output, not a gateway-local-only table. `rockstream-gateway`'s `Cargo.toml` takes on genuine non-dev dependencies on `rockstream-runtime`, `rockstream-plan`, `rockstream-ops`, and `rockstream-diff` (promoted out of `[dev-dependencies]`, where they exist only for `gateway_proof_tests`/oracle-style tests today). `CREATE VIEW`/`CREATE MATERIALIZED VIEW` issued over pgwire compiles through the real `rockstream-sql` lowering → `rockstream-plan` `PlanNode`/`OpNode` IR → `rockstream-diff` differentiation → `rockstream-runtime` scheduling pipeline — the machinery already proven correct in the oracle/`rockstream-sql` harnesses since v0.7–v0.14 — instead of the standalone DataFusion `view_materializer`. Purely a plumbing/wiring version: it does not yet make view refresh incremental (v0.51.4); a commit may still trigger a full recompute through the newly-connected real engine. No new FizzBee model is needed — the epoch-commit/frontier/fencing protocols (M1–M4) are unchanged; this version is proven by re-running the full existing `SimRuntime`/FizzBee-paired-assertion regression suite against the unified data plane. | `rockstream start --role all` opens exactly one data plane servicing both the worker DAG and pgwire reads (no second, unreferenced SlateDB shard directory is created); the existing 100/100 `gateway_proof_tests` now execute against the real `rockstream-runtime` worker rather than a gateway-local DataFusion-only path, and still pass 100/100; a live psql `INSERT`→`COMMIT`→`SELECT` round-trip is observably serviced by the real operator DAG; every pre-existing FizzBee-paired `SimRuntime` regression seed and the M1–M4 models still pass unchanged. | Unit, LFS, MinIO, TC |
+| v0.51.4 | True Incremental Maintenance on the Serving Path & Removal of the Hardcoded Nexmark Rewrite | Using v0.51.3's unified data plane, replace `view_materializer.rs`'s full-source-table DataFusion batch re-evaluation-per-commit with genuine incremental maintenance: each commit produces a bounded Z-set delta (not a full re-scan) applied to the view's arranged operator state via the real DAG, and only the resulting delta is written to `view_output/{view}/`. `CREATE MATERIALIZED VIEW`'s immediate initial population (v0.51.1) and every subsequent commit's refresh now go through the exact same incremental code path, eliminating the "two materializer implementations" divergence risk. Remove the hardcoded `rewrite_session_sql` exact-string match for one specific Nexmark SESSION-window query (`view_materializer.rs` ~line 175); session windows must be served through the general `SESSION` operator (v0.50) with no special-cased query text anywhere, enforced by a new grep-based CI check in the style of `scripts/check-invariant-pairs.sh`/`scripts/check-error-codes.sh`. | A commit that changes 1 row out of 1,000,000 in a source table causes measured view-refresh work (operator invocations, rows touched) proportional to the delta, not the source table's full size — a regression benchmark analogous to v0.14's "≥10x speedup vs. batch" oracle proof, this time measured on the live pgwire serving path; the Nexmark q11 SESSION query and an equivalent, differently-worded session-window query both produce results bit-identical to the DataFusion batch oracle with zero hardcoded query-text matching anywhere in `crates/` (new `scripts/check-no-hardcoded-query-rewrites.sh` fails on a deliberately reintroduced exact-string rewrite); all pre-existing Nexmark q0–q22 correctness tests (v0.33–v0.36, v0.50) still pass through the new incremental serving path. | Unit, LFS, MinIO, TC |
+| v0.51.5 | Gateway-Facing TLS Termination & Binary Wire Format | Terminate real TLS at the pgwire gateway. Today `SSLRequest` is unconditionally answered `'N'` (`server.rs` ~line 6346/6419, asserted by `gateway_extended_query_tests.rs`'s own test), so every connection is plaintext and the already-implemented `--auth=mtls` mode (`crates/rockstream-gateway/src/auth.rs`, which extracts a client-certificate CN into a `Principal::CertCn`) can never actually be exercised, since extracting a client cert requires a TLS handshake that never happens — this is the prerequisite that makes that existing auth mode functional at all, distinct from v0.56's *internal* control↔worker/worker↔worker mTLS. Add a `rustls`-based TLS listener (configurable cert/key path in `rockstream.toml`) that negotiates `SSLRequest` with `'S'` and upgrades the connection before startup-message processing continues; `--auth=mtls` validates the negotiated peer certificate. Also implement real binary wire-format encoding (`FormatCode::Binary`) for every OID already supported in text (int2/4/8, float4/8, bool, text/varchar, timestamp(tz), date, time, uuid, numeric, json/jsonb, interval, and the supported array types) instead of silently downgrading to text. | A `psql "sslmode=require"` connection completes a real TLS handshake, and a raw-socket TC test capturing the wire bytes after `SSLRequest` confirms they are encrypted, not plaintext SQL (new `gateway_tls_tests.rs`); `--auth=mtls` end-to-end authenticates a real client certificate over the now-functional TLS channel; a client requesting `FormatCode::Binary` for a result column of every currently-text-supported OID receives correctly binary-encoded values that decode to the identical value as the text-mode response, including NULL and boundary values (new `binary_format_round_trip_tests.rs`). | Unit, LFS, TC |
+| v0.51.6 | Session-State Bounding, Isolation-Level Honesty & Aggregate Correctness | Bound per-connection prepared-statement/portal cache state with LRU eviction (today unbounded) and guarantee cleanup on abnormal disconnect — today only the graceful `DISCARD ALL`/`RESET ALL` path (v0.37) is covered; a dropped TCP connection can leak cached statements/portals. Make `REPEATABLE READ` honest: either genuinely pin and hold the transaction's vector frontier for its duration, as `NEW_IMPLEMENTATION_PLAN.md` Phase 7.1 already specifies ("`BEGIN` captures a vector frontier held for the transaction"), so a concurrent commit is provably invisible mid-transaction, or explicitly reject it with a documented `RS-XXXX` code the same honest way `SERIALIZABLE` already is (`RS-2003`) rather than silently accepting it today without enforcing it. Fix the `avg` aggregate to use correct floating-point/`numeric` division instead of truncating integer division, matching PostgreSQL's `avg()` semantics. | A connection that opens 10,000 prepared statements without `DISCARD ALL` stays bounded in memory with eviction observable via a metric (new `prepared_statement_lru_tests.rs`); a TC test that opens many connections and kills them at the TCP level (no graceful close) shows zero growth in server-side session-state memory after cleanup runs (new `abnormal_disconnect_cleanup_tests.rs`); `REPEATABLE READ` either passes a real concurrent-commit snapshot-isolation anomaly test or is rejected with a correct, documented, tested error code, never silently accepted-but-unenforced; `SELECT avg(qty) FROM ...` on a non-integer-mean input returns the correct fractional average, not a truncated integer (new `avg_aggregate_precision_tests.rs`). | Unit, LFS, MinIO, TC |
+
 ### Phase 16 — Declarative Data Governance
 
 | Version | Focus | Scope | Proof | Backends |
@@ -1031,6 +1117,7 @@ both into one version under schedule pressure.
 | Phase 13 — Elastic Scaling & Skew Handling | v0.46 – v0.47 | M6 shard migration |
 | Phase 14 — Network Efficiency & Advanced DML | v0.48 – v0.49 | Continuous verification |
 | Phase 15 — Complex Analytics & Compute Tuning | v0.50 – v0.51 | Continuous verification |
+| Phase 15.5 — Standard Wire Compatibility & the Real Incremental Serving Path | v0.51.1 – v0.51.6 | Continuous verification (M1–M4 regression re-proof; no new model) |
 | Phase 16 — Declarative Data Governance | v0.52 – v0.53 | Continuous verification |
 | Phase 17 — Enterprise Validation & 1.0 Finalization | v0.54 – v0.59 | Continuous verification + relaxed-bounds sweep at RC1; v0.57 additionally proven by a `SimRuntime` mixed-version scenario |
 
@@ -1041,5 +1128,5 @@ fault-tolerant before the Postgres layer depends on it, ingestion connectors
 and crucible soaks validate real-world pressure before HTAP ergonomics, the
 Nexmark suite certifies end-to-end correctness (including retraction/Z-set semantics) on the full stack,
 PostgreSQL wire protocol hardening (v0.37–v0.39) and end-user certification (v0.40–v0.42) ensure any standard driver works without workarounds and that a complete application can be built on the wire protocol alone,
-and the data lake bridge (with its FizzBee pre-model and simulator fidelity foundation at v0.43), control-plane hardening and multi-tenancy (v0.45.1–v0.45.2), invariant and error-code compliance hardening (v0.45.6–v0.45.7), elastic shard migration and hot-key/skew handling (v0.46–v0.47), network optimizations, complex analytics, and data
+and the data lake bridge (with its FizzBee pre-model and simulator fidelity foundation at v0.43), control-plane hardening and multi-tenancy (v0.45.1–v0.45.2), invariant and error-code compliance hardening (v0.45.6–v0.45.7), elastic shard migration and hot-key/skew handling (v0.46–v0.47), network optimizations, complex analytics, a live end-to-end wire-protocol pass that makes the serving path standard-PostgreSQL-honest and genuinely incremental (v0.51.1–v0.51.6), and data
 governance layers, an operator-grade CLI and arrangement debugger, internal mTLS and secrets management, and a proven rolling-upgrade/disaster-recovery story close out 1.0 through v0.59.
