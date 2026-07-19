@@ -1639,8 +1639,14 @@ mod tests {
     fn session_window_extends_open_session_within_gap() {
         let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
         let mut net: HashMap<(i64, i64, i64, i64), i64> = Default::default();
-        accumulate_session(&mut net, &op.process_epoch(make_input(&[(100, 7, 1)]), 1).unwrap());
-        accumulate_session(&mut net, &op.process_epoch(make_input(&[(900, 7, 1)]), 2).unwrap());
+        accumulate_session(
+            &mut net,
+            &op.process_epoch(make_input(&[(100, 7, 1)]), 1).unwrap(),
+        );
+        accumulate_session(
+            &mut net,
+            &op.process_epoch(make_input(&[(900, 7, 1)]), 2).unwrap(),
+        );
         assert_eq!(
             live_session_rows(&net),
             vec![(100, 900, 100, 7), (100, 900, 900, 7)]
@@ -1651,8 +1657,14 @@ mod tests {
     fn session_window_starts_new_session_after_gap() {
         let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
         let mut net: HashMap<(i64, i64, i64, i64), i64> = Default::default();
-        accumulate_session(&mut net, &op.process_epoch(make_input(&[(100, 7, 1)]), 1).unwrap());
-        accumulate_session(&mut net, &op.process_epoch(make_input(&[(1500, 7, 1)]), 2).unwrap());
+        accumulate_session(
+            &mut net,
+            &op.process_epoch(make_input(&[(100, 7, 1)]), 1).unwrap(),
+        );
+        accumulate_session(
+            &mut net,
+            &op.process_epoch(make_input(&[(1500, 7, 1)]), 2).unwrap(),
+        );
         assert_eq!(
             live_session_rows(&net),
             vec![(100, 100, 100, 7), (1500, 1500, 1500, 7)]
@@ -1663,7 +1675,10 @@ mod tests {
     fn session_window_merge_retracts_both_and_emits_replacement() {
         let op = SessionWindowOp::new(input_schema(), 0, 1000, LateDataPolicy::Drop);
         let _ = op
-            .process_epoch(make_input(&[(100, 7, 1), (900, 7, 1), (2100, 7, 1), (2500, 7, 1)]), 1)
+            .process_epoch(
+                make_input(&[(100, 7, 1), (900, 7, 1), (2100, 7, 1), (2500, 7, 1)]),
+                1,
+            )
             .unwrap();
         {
             let state = op.state.lock().unwrap();
@@ -1708,7 +1723,8 @@ mod tests {
             input_rows.extend(rows.iter().copied());
             accumulate_session(
                 &mut net,
-                &op.process_epoch(make_input(rows.as_slice()), epoch as u64 + 1).unwrap(),
+                &op.process_epoch(make_input(rows.as_slice()), epoch as u64 + 1)
+                    .unwrap(),
             );
         }
         assert_eq!(

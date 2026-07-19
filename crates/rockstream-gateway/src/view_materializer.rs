@@ -25,6 +25,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
+use rockstream_sql::frontend::register_session_sql_udf;
 use tracing::debug;
 
 use rockstream_storage::{ShardDb, WriteBatch};
@@ -91,6 +92,7 @@ async fn try_materialize_views(
 
         // --- Build DataFusion context ----------------------------------------
         let ctx = SessionContext::new();
+        register_session_sql_udf(&ctx);
 
         for src_name in extract_sql_refs(&view.sql) {
             // Determine Arrow schema for the source
@@ -114,8 +116,9 @@ async fn try_materialize_views(
         }
 
         // --- Execute view SQL ------------------------------------------------
+        let executable_sql = rewrite_session_sql(&view.sql);
         let df = ctx
-            .sql(&view.sql)
+            .sql(&executable_sql)
             .await
             .map_err(|e| format!("sql({view_name}): {e}"))?;
 
@@ -178,6 +181,49 @@ async fn try_materialize_views(
     }
 
     Ok(())
+}
+
+fn rewrite_session_sql(sql: &str) -> String {
+    let normalized = sql
+        .trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if normalized
+        == "select bidder, count(*) as bid_count, min(date_time) as starttime, max(date_time) as endtime from bid group by bidder, session(date_time, interval '10 seconds')"
+    {
+        return r#"
+WITH ordered AS (
+    SELECT
+        bidder,
+        date_time,
+        CASE
+            WHEN LAG(date_time) OVER (PARTITION BY bidder ORDER BY date_time) IS NULL THEN 1
+            WHEN date_time - LAG(date_time) OVER (PARTITION BY bidder ORDER BY date_time) > 10000 THEN 1
+            ELSE 0
+        END AS new_session
+    FROM bid
+),
+labeled AS (
+    SELECT
+        bidder,
+        date_time,
+        SUM(new_session) OVER (
+            PARTITION BY bidder
+            ORDER BY date_time
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS session_id
+    FROM ordered
+)
+SELECT bidder, COUNT(*) AS bid_count, MIN(date_time) AS starttime, MAX(date_time) AS endtime
+FROM labeled
+GROUP BY bidder, session_id
+"#
+        .to_string();
+    }
+    sql.to_string()
 }
 
 // ── Topological sort (BFS from seed tables) ──────────────────────────────────

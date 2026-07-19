@@ -17,9 +17,10 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use datafusion::datasource::memory::MemTable;
 use datafusion::execution::context::SessionConfig;
+use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
 use datafusion::prelude::SessionContext;
 
 use rockstream_plan::PlanNode;
@@ -100,6 +101,20 @@ pub struct SqlFrontend {
     snapshot_tables: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+pub fn register_session_sql_udf(ctx: &SessionContext) {
+    let session_udf = create_udf(
+        "session",
+        vec![
+            DataType::Int64,
+            DataType::Interval(IntervalUnit::MonthDayNano),
+        ],
+        DataType::Int64,
+        Volatility::Immutable,
+        std::sync::Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+    );
+    ctx.register_udf(session_udf);
+}
+
 impl Default for SqlFrontend {
     fn default() -> Self {
         Self::new()
@@ -115,6 +130,7 @@ impl SqlFrontend {
     pub fn new() -> Self {
         let config = SessionConfig::new();
         let ctx = SessionContext::new_with_config(config);
+        register_session_sql_udf(&ctx);
         Self {
             ctx,
             snapshot_tables: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1457,5 +1473,68 @@ mod tests {
         };
 
         assert_eq!(sql_plan, expected);
+    }
+
+    #[tokio::test]
+    async fn sql_surface_session_window_query_compiles() {
+        let frontend = SqlFrontend::new();
+        frontend
+            .register_table(
+                "bid",
+                Arc::new(Schema::new(vec![
+                    Field::new("auction", DataType::Int64, false),
+                    Field::new("bidder", DataType::Int64, false),
+                    Field::new("price", DataType::Int64, false),
+                    Field::new("channel", DataType::Utf8, false),
+                    Field::new("url", DataType::Utf8, false),
+                    Field::new("date_time", DataType::Int64, false),
+                    Field::new("extra", DataType::Utf8, false),
+                ])),
+            )
+            .unwrap();
+
+        let sql_plan = frontend
+            .sql_to_unoptimized_plan_node(
+                "SELECT bidder, COUNT(*) as bid_count, MIN(date_time) as starttime, MAX(date_time) as endtime \
+                 FROM bid GROUP BY bidder, SESSION(date_time, INTERVAL '10 seconds')",
+            )
+            .await
+            .expect("session SQL surface should compile");
+
+        fn contains_session_window(plan: &PlanNode) -> bool {
+            match plan {
+                PlanNode::SessionWindow { .. } => true,
+                PlanNode::Filter { input, .. }
+                | PlanNode::Project { input, .. }
+                | PlanNode::Map { input, .. }
+                | PlanNode::Aggregate { input, .. }
+                | PlanNode::Distinct { input, .. }
+                | PlanNode::Window { input, .. }
+                | PlanNode::TumbleWindow { input, .. }
+                | PlanNode::HopWindow { input, .. }
+                | PlanNode::TopK { input, .. }
+                | PlanNode::Lateral { input, .. }
+                | PlanNode::IndexArrange { input, .. } => contains_session_window(input),
+                PlanNode::Exchange { child, .. } | PlanNode::ViewSink { child, .. } => {
+                    contains_session_window(child)
+                }
+                PlanNode::Join { left, right, .. }
+                | PlanNode::InnerJoin { left, right, .. }
+                | PlanNode::OuterJoin { left, right, .. }
+                | PlanNode::Union { left, right }
+                | PlanNode::Intersect { left, right, .. }
+                | PlanNode::Except { left, right, .. } => {
+                    contains_session_window(left) || contains_session_window(right)
+                }
+                PlanNode::Recursion { base, step, .. } => {
+                    contains_session_window(base) || contains_session_window(step)
+                }
+                PlanNode::Source { .. } | PlanNode::Snapshot { .. } | PlanNode::ViewRef { .. } => {
+                    false
+                }
+            }
+        }
+
+        assert!(contains_session_window(&sql_plan), "plan: {sql_plan:?}");
     }
 }

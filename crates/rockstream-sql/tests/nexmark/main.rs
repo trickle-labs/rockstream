@@ -42,6 +42,37 @@ async fn connect_port(port: u16) -> tokio_postgres::Client {
     client
 }
 
+const NEXMARK_Q11_VIEW_SQL: &str =
+    "CREATE VIEW q11 AS SELECT bidder, COUNT(*) as bid_count, MIN(date_time) as starttime, MAX(date_time) as endtime FROM bid GROUP BY bidder, SESSION(date_time, INTERVAL '10 seconds')";
+
+const NEXMARK_Q11_ORACLE_SQL: &str = r#"
+WITH ordered AS (
+    SELECT
+        bidder,
+        date_time,
+        CASE
+            WHEN LAG(date_time) OVER (PARTITION BY bidder ORDER BY date_time) IS NULL THEN 1
+            WHEN date_time - LAG(date_time) OVER (PARTITION BY bidder ORDER BY date_time) > 10000 THEN 1
+            ELSE 0
+        END AS new_session
+    FROM bid
+),
+labeled AS (
+    SELECT
+        bidder,
+        date_time,
+        SUM(new_session) OVER (
+            PARTITION BY bidder
+            ORDER BY date_time
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS session_id
+    FROM ordered
+)
+SELECT bidder, COUNT(*) AS bid_count, MIN(date_time) AS starttime, MAX(date_time) AS endtime
+FROM labeled
+GROUP BY bidder, session_id
+"#;
+
 #[tokio::test]
 async fn test_nexmark_schema_creation_and_catalog() {
     let store = Arc::new(InMemory::new());
@@ -1193,6 +1224,7 @@ async fn test_nexmark_q12_q13_lfs() {
             .await
             .expect("INSERT into side_input failed");
     }
+
     client.simple_query("COMMIT").await.unwrap();
 
     // Define standard CREATE VIEW statements for Nexmark q12–q13
@@ -1519,6 +1551,382 @@ async fn test_nexmark_q12_q13_lfs() {
             "SUBSCRIBE snapshot failed for {view}"
         );
     }
+}
+
+#[tokio::test]
+async fn nexmark_q11_session_bit_identical_to_batch_oracle() {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use object_store::memory::InMemory;
+    use rockstream_gateway::catalog_stubs::CatalogStubs;
+    use rockstream_gateway::server::GatewayServer;
+    use rockstream_storage::ShardDb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("nexmark-q11-lfs-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client.simple_query("CREATE TABLE person (id BIGINT, name VARCHAR, email_address VARCHAR, credit_card VARCHAR, city VARCHAR, state VARCHAR, date_time BIGINT, extra VARCHAR)").await.unwrap();
+    client.simple_query("CREATE TABLE auction (id BIGINT, item_name VARCHAR, description VARCHAR, initial_bid BIGINT, reserve BIGINT, date_time BIGINT, expires BIGINT, seller BIGINT, category BIGINT, extra VARCHAR)").await.unwrap();
+    client.simple_query("CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, date_time BIGINT, extra VARCHAR)").await.unwrap();
+    client.simple_query(NEXMARK_Q11_VIEW_SQL).await.unwrap();
+
+    let mut gen = rockstream_sim::NexmarkGenerator::new(42);
+    let mut bids = Vec::new();
+    let mut inserts = Vec::new();
+    for _ in 0..500 {
+        let event = gen.next().unwrap();
+        if let rockstream_sim::NexmarkEvent::Bid(b) = &event {
+            bids.push(b.clone());
+        }
+        inserts.push(event.to_insert_sql());
+    }
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q11-batch-1'")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN").await.unwrap();
+    for sql in inserts {
+        client.simple_query(&sql).await.unwrap();
+    }
+    client.simple_query("COMMIT").await.unwrap();
+
+    let run_df_oracle = |current_bids: Vec<rockstream_sim::Bid>| async move {
+        let ctx = SessionContext::new();
+        let bid_schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, false),
+            Field::new("bidder", DataType::Int64, false),
+            Field::new("price", DataType::Int64, false),
+            Field::new("channel", DataType::Utf8, false),
+            Field::new("url", DataType::Utf8, false),
+            Field::new("date_time", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, false),
+        ]));
+        let bid_batch = RecordBatch::try_new(
+            bid_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.auction as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.bidder as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.price as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.channel.clone())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.url.clone())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.date_time as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.extra.clone())
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let bid_table = MemTable::try_new(bid_schema, vec![vec![bid_batch]]).unwrap();
+        ctx.register_table("bid", Arc::new(bid_table)).unwrap();
+
+        let df = ctx.sql(NEXMARK_Q11_ORACLE_SQL).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let bidder = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let bid_count = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let start = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let end = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push(format!(
+                    "{}\t{}\t{}\t{}",
+                    bidder.value(row),
+                    bid_count.value(row),
+                    start.value(row),
+                    end.value(row)
+                ));
+            }
+        }
+        rows
+    };
+
+    let psql_res = client.simple_query("SELECT * FROM q11").await.unwrap();
+    let mut psql_rows = Vec::new();
+    for msg in psql_res {
+        if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+            let mut fields = Vec::new();
+            for col in 0..r.len() {
+                fields.push(r.get(col).unwrap_or("NULL").to_string());
+            }
+            psql_rows.push(fields.join("\t"));
+        }
+    }
+
+    let oracle_rows = run_df_oracle(bids).await;
+    assert_eq!(
+        psql_rows.into_iter().collect::<BTreeSet<_>>(),
+        oracle_rows.into_iter().collect::<BTreeSet<_>>(),
+        "bit-identical comparison failed for q11"
+    );
+}
+
+#[tokio::test]
+async fn nexmark_q11_survives_retraction_storm() {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use object_store::memory::InMemory;
+    use rockstream_gateway::catalog_stubs::CatalogStubs;
+    use rockstream_gateway::server::GatewayServer;
+    use rockstream_storage::ShardDb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("nexmark-q11-retractions-lfs-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client.simple_query("CREATE TABLE person (id BIGINT, name VARCHAR, email_address VARCHAR, credit_card VARCHAR, city VARCHAR, state VARCHAR, date_time BIGINT, extra VARCHAR)").await.unwrap();
+    client.simple_query("CREATE TABLE auction (id BIGINT, item_name VARCHAR, description VARCHAR, initial_bid BIGINT, reserve BIGINT, date_time BIGINT, expires BIGINT, seller BIGINT, category BIGINT, extra VARCHAR)").await.unwrap();
+    client.simple_query("CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, date_time BIGINT, extra VARCHAR)").await.unwrap();
+    client.simple_query(NEXMARK_Q11_VIEW_SQL).await.unwrap();
+
+    let mut gen = rockstream_sim::NexmarkGenerator::new(42);
+    let mut bids = Vec::new();
+    let mut inserts = Vec::new();
+    for _ in 0..500 {
+        let event = gen.next().unwrap();
+        if let rockstream_sim::NexmarkEvent::Bid(b) = &event {
+            bids.push(b.clone());
+        }
+        inserts.push(event.to_insert_sql());
+    }
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q11-retraction-base'")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN").await.unwrap();
+    for sql in inserts {
+        client.simple_query(&sql).await.unwrap();
+    }
+    client.simple_query("COMMIT").await.unwrap();
+
+    let run_df_oracle = |current_bids: Vec<rockstream_sim::Bid>| async move {
+        let ctx = SessionContext::new();
+        let bid_schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, false),
+            Field::new("bidder", DataType::Int64, false),
+            Field::new("price", DataType::Int64, false),
+            Field::new("channel", DataType::Utf8, false),
+            Field::new("url", DataType::Utf8, false),
+            Field::new("date_time", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, false),
+        ]));
+        let bid_batch = RecordBatch::try_new(
+            bid_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.auction as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.bidder as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.price as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.channel.clone())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.url.clone())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.date_time as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.extra.clone())
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let bid_table = MemTable::try_new(bid_schema, vec![vec![bid_batch]]).unwrap();
+        ctx.register_table("bid", Arc::new(bid_table)).unwrap();
+
+        let df = ctx.sql(NEXMARK_Q11_ORACLE_SQL).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let bidder = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let bid_count = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let start = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let end = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push(format!(
+                    "{}\t{}\t{}\t{}",
+                    bidder.value(row),
+                    bid_count.value(row),
+                    start.value(row),
+                    end.value(row)
+                ));
+            }
+        }
+        rows
+    };
+
+    let mut remaining_bids = bids.clone();
+    let bids_to_delete: Vec<_> = bids.iter().step_by(10).take(50).cloned().collect();
+    for to_del in &bids_to_delete {
+        if let Some(pos) = remaining_bids.iter().position(|b| {
+            b.auction == to_del.auction
+                && b.bidder == to_del.bidder
+                && b.price == to_del.price
+                && b.channel == to_del.channel
+                && b.url == to_del.url
+                && b.date_time == to_del.date_time
+                && b.extra == to_del.extra
+        }) {
+            remaining_bids.remove(pos);
+        }
+    }
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q11-retractions'")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN").await.unwrap();
+    for b in &bids_to_delete {
+        let sql = format!(
+            "DELETE FROM bid WHERE auction={}, bidder={}, price={}, channel='{}', url='{}', date_time={}, extra='{}'",
+            b.auction, b.bidder, b.price, b.channel, b.url, b.date_time, b.extra
+        );
+        client.simple_query(&sql).await.unwrap();
+    }
+    client.simple_query("COMMIT").await.unwrap();
+
+    let psql_res = client.simple_query("SELECT * FROM q11").await.unwrap();
+    let mut psql_rows = Vec::new();
+    for msg in psql_res {
+        if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+            let mut fields = Vec::new();
+            for col in 0..r.len() {
+                fields.push(r.get(col).unwrap_or("NULL").to_string());
+            }
+            psql_rows.push(fields.join("\t"));
+        }
+    }
+
+    let oracle_rows = run_df_oracle(remaining_bids).await;
+    assert_eq!(
+        psql_rows.into_iter().collect::<BTreeSet<_>>(),
+        oracle_rows.into_iter().collect::<BTreeSet<_>>(),
+        "retraction-storm comparison failed for q11"
+    );
 }
 
 #[tokio::test]
@@ -3806,6 +4214,8 @@ async fn test_nexmark_q12_q22_minio() {
     client.simple_query("COMMIT").await.unwrap();
 
     // Define views
+    client.simple_query(NEXMARK_Q11_VIEW_SQL).await.unwrap();
+
     client
         .simple_query("CREATE VIEW q12 AS SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))")
         .await
@@ -4124,9 +4534,10 @@ async fn test_nexmark_q12_q22_minio() {
 
     // Verify q12–q22 results are bit-identical to the DataFusion batch oracle.
     let views = [
-        "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
+        "q11", "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
     ];
     let oracle_queries = [
+        NEXMARK_Q11_ORACLE_SQL.trim(),
         "SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key",
         "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",

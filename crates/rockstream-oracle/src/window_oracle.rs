@@ -160,7 +160,10 @@ mod proptest_oracle {
                 }
             }
 
-            fn accumulate_output(state: &mut BTreeMap<(i64, i64, i64, i64), i64>, batch: &ArrowZSet) {
+            fn accumulate_output(
+                state: &mut BTreeMap<(i64, i64, i64, i64), i64>,
+                batch: &ArrowZSet,
+            ) {
                 if batch.is_empty() {
                     return;
                 }
@@ -198,7 +201,9 @@ mod proptest_oracle {
                 }
             }
 
-            fn live_output(state: &BTreeMap<(i64, i64, i64, i64), i64>) -> Vec<(i64, i64, i64, i64)> {
+            fn live_output(
+                state: &BTreeMap<(i64, i64, i64, i64), i64>,
+            ) -> Vec<(i64, i64, i64, i64)> {
                 state
                     .iter()
                     .filter(|(_, &w)| w > 0)
@@ -206,7 +211,10 @@ mod proptest_oracle {
                     .collect()
             }
 
-            fn batch_session(acc: &BTreeMap<(i64, i64), i64>, gap_ms: i64) -> Vec<(i64, i64, i64, i64)> {
+            fn batch_session(
+                acc: &BTreeMap<(i64, i64), i64>,
+                gap_ms: i64,
+            ) -> Vec<(i64, i64, i64, i64)> {
                 let mut by_partition: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
                 for (&(k, t), &w) in acc {
                     if w > 0 {

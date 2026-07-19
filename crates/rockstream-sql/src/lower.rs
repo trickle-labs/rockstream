@@ -94,6 +94,9 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
         }
 
         LogicalPlan::Aggregate(agg) => {
+            if let Some(session_plan) = try_lower_session_window_aggregate(agg)? {
+                return Ok(session_plan);
+            }
             if let Some(hop_plan) = try_lower_hop_window_aggregate(agg)? {
                 return Ok(hop_plan);
             }
@@ -1332,6 +1335,111 @@ struct HopTimeSpec {
     slide_ms: i64,
 }
 
+fn try_lower_session_window_aggregate(
+    agg: &datafusion::logical_expr::Aggregate,
+) -> Result<Option<PlanNode>, SqlError> {
+    let input_schema = agg.input.schema();
+    let mut session_idx = None;
+    let mut time_col = None;
+    let mut gap_ms = None;
+    for (idx, expr) in agg.group_expr.iter().enumerate() {
+        let Some(sf) = find_session(expr) else {
+            continue;
+        };
+        if sf.args.len() < 2 {
+            return Err(SqlError::UnsupportedPlanNode {
+                node_type: "session_missing_args".to_string(),
+            });
+        }
+        session_idx = Some(idx);
+        time_col = extract_column_index(&sf.args[0], input_schema);
+        gap_ms = extract_interval_ms(&sf.args[1]);
+        break;
+    }
+    let (session_idx, time_col, gap_ms) = match (session_idx, time_col, gap_ms) {
+        (Some(session_idx), Some(time_col), Some(gap_ms)) => (session_idx, time_col, gap_ms),
+        (None, _, _) => return Ok(None),
+        _ => {
+            return Err(SqlError::UnsupportedPlanNode {
+                node_type: "session_invalid_args".to_string(),
+            })
+        }
+    };
+
+    if agg.aggr_expr.len() != 3
+        || !is_count_aggregate(&agg.aggr_expr[0])
+        || !is_named_aggregate_on_column(&agg.aggr_expr[1], "min", input_schema, time_col)
+        || !is_named_aggregate_on_column(&agg.aggr_expr[2], "max", input_schema, time_col)
+    {
+        return Err(SqlError::UnsupportedPlanNode {
+            node_type: "session_window_requires_count_min_max_shape".to_string(),
+        });
+    }
+
+    let mut partition_cols = Vec::new();
+    for (idx, expr) in agg.group_expr.iter().enumerate() {
+        if idx == session_idx {
+            continue;
+        }
+        partition_cols.push(extract_column_index(expr, input_schema).ok_or_else(|| {
+            SqlError::UnsupportedPlanNode {
+                node_type: "session_partition_requires_column_group_by".to_string(),
+            }
+        })?);
+    }
+
+    let base_input = lower(&agg.input)?;
+    let mut project_columns = partition_cols
+        .iter()
+        .copied()
+        .map(Expr::Column)
+        .collect::<Vec<_>>();
+    project_columns.push(Expr::Column(time_col));
+
+    let session_input = PlanNode::Project {
+        input: Box::new(base_input),
+        columns: project_columns,
+    };
+    let session_node = PlanNode::SessionWindow {
+        input: Box::new(session_input),
+        time_col: partition_cols.len(),
+        gap_ms,
+        late_data_policy: rockstream_plan::LateDataPolicy::Drop,
+    };
+
+    let mut group_by = (0..partition_cols.len())
+        .map(|idx| Expr::Column(idx + 2))
+        .collect::<Vec<_>>();
+    group_by.push(Expr::Column(0));
+    group_by.push(Expr::Column(1));
+
+    let aggregate = PlanNode::Aggregate {
+        input: Box::new(session_node),
+        group_by,
+        aggregates: vec![AggregateExpr {
+            func: AggregateFunc::Count,
+            input: Expr::Literal(1i64.to_be_bytes().to_vec()),
+            distinct: false,
+        }],
+    };
+
+    let session_start_col = partition_cols.len();
+    let session_end_col = partition_cols.len() + 1;
+    let count_col = partition_cols.len() + 2;
+    let mut columns = (0..partition_cols.len())
+        .map(Expr::Column)
+        .collect::<Vec<_>>();
+    columns.push(Expr::Column(session_start_col));
+    columns.push(Expr::Column(count_col));
+    columns.push(Expr::Column(session_start_col));
+    columns.push(Expr::Column(session_end_col));
+
+    Ok(Some(PlanNode::Project {
+        input: Box::new(aggregate),
+        columns,
+    }))
+}
+
 fn try_lower_hop_window_aggregate(
     agg: &datafusion::logical_expr::Aggregate,
 ) -> Result<Option<PlanNode>, SqlError> {
@@ -1433,6 +1541,16 @@ fn find_date_bin(expr: &DfExpr) -> Option<&datafusion::logical_expr::expr::Scala
         DfExpr::Alias(alias) => find_date_bin(&alias.expr),
         DfExpr::Cast(cast) => find_date_bin(&cast.expr),
         DfExpr::TryCast(cast) => find_date_bin(&cast.expr),
+        _ => None,
+    }
+}
+
+fn find_session(expr: &DfExpr) -> Option<&datafusion::logical_expr::expr::ScalarFunction> {
+    match expr {
+        DfExpr::ScalarFunction(sf) if sf.func.name().eq_ignore_ascii_case("session") => Some(sf),
+        DfExpr::Alias(alias) => find_session(&alias.expr),
+        DfExpr::Cast(cast) => find_session(&cast.expr),
+        DfExpr::TryCast(cast) => find_session(&cast.expr),
         _ => None,
     }
 }
@@ -1543,6 +1661,33 @@ fn extract_slide_component(expr: &DfExpr, schema: &DFSchema) -> Option<(usize, i
             }
         }
         _ => None,
+    }
+}
+
+fn is_count_aggregate(expr: &DfExpr) -> bool {
+    match expr {
+        DfExpr::Alias(alias) => is_count_aggregate(&alias.expr),
+        DfExpr::AggregateFunction(AggregateFunction { func, .. }) => {
+            func.name().eq_ignore_ascii_case("count")
+        }
+        _ => false,
+    }
+}
+
+fn is_named_aggregate_on_column(
+    expr: &DfExpr,
+    name: &str,
+    schema: &DFSchema,
+    col_idx: usize,
+) -> bool {
+    match expr {
+        DfExpr::Alias(alias) => is_named_aggregate_on_column(&alias.expr, name, schema, col_idx),
+        DfExpr::AggregateFunction(AggregateFunction { func, params }) => {
+            func.name().eq_ignore_ascii_case(name)
+                && params.args.len() == 1
+                && extract_column_index(&params.args[0], schema) == Some(col_idx)
+        }
+        _ => false,
     }
 }
 

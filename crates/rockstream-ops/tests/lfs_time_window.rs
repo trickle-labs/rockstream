@@ -470,20 +470,18 @@ async fn session_window_state_persists_and_merges_across_restart() {
 
     {
         let db = open_shard(&dir).await;
-        let op = load_session_window_state(
-            &db,
-            input_schema(),
-            0,
-            1000,
-            LateDataPolicy::Drop,
-            op_id,
-        )
-        .await
-        .unwrap();
+        let op =
+            load_session_window_state(&db, input_schema(), 0, 1000, LateDataPolicy::Drop, op_id)
+                .await
+                .unwrap();
         assert_eq!(op.fill_level(), 2, "session count restored after reopen");
         let out2 = op.process_epoch(make_input(&[(1500, 7, 1)]), 2).unwrap();
         accumulate_session(&mut net_state, &out2);
-        assert_eq!(op.fill_level(), 1, "bridge event merges sessions after reopen");
+        assert_eq!(
+            op.fill_level(),
+            1,
+            "bridge event merges sessions after reopen"
+        );
         assert_eq!(
             live_session_rows(&net_state),
             vec![

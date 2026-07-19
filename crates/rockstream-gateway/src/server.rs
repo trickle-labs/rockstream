@@ -354,6 +354,7 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
     }
 
     let ctx = SessionContext::new();
+    rockstream_sql::frontend::register_session_sql_udf(&ctx);
     for view in catalog.list_views() {
         let mut fields = Vec::new();
         for col in &view.columns {
@@ -2237,6 +2238,7 @@ impl GatewayHandler {
         // Build a DataFusion session and register catalog objects as empty MemTables
         // so the planner can resolve any referenced names.
         let ctx = SessionContext::new();
+        rockstream_sql::frontend::register_session_sql_udf(&ctx);
         for view in self.catalog.list_views() {
             let mut fields = Vec::new();
             for col in &view.columns {

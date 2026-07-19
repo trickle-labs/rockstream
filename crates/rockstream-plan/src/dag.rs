@@ -46,9 +46,7 @@ fn collect_refs(plan: &PlanNode, out: &mut Vec<String>) {
         PlanNode::Window { input, .. } => collect_refs(input, out),
         PlanNode::TumbleWindow { input, .. }
         | PlanNode::HopWindow { input, .. }
-        | PlanNode::SessionWindow { input, .. } => {
-            collect_refs(input, out)
-        }
+        | PlanNode::SessionWindow { input, .. } => collect_refs(input, out),
         PlanNode::TopK { input, .. } => collect_refs(input, out),
         PlanNode::Join { left, right, .. }
         | PlanNode::InnerJoin { left, right, .. }
