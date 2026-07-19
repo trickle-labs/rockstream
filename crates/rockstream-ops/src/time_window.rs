@@ -734,11 +734,20 @@ impl SessionWindowOp {
             }
             let row_vals = extract_row_vals(&delta.data, row_idx, self.n_input_cols);
             let event_time_ms = row_vals.get(self.time_col).copied().unwrap_or(0);
+            // Unlike TUMBLE/HOP, session boundaries are data-dependent: an
+            // intervening event may legitimately arrive with a timestamp
+            // earlier than the partition's already-observed watermark while
+            // still being within `gap_ms` of an open session (e.g. the event
+            // that merges two sessions). Only drop against an explicit
+            // upstream frontier watermark, never against our own
+            // accumulated watermark, or merge-triggering events would be
+            // dropped as "late" and sessions would never merge/split
+            // correctly.
             let current_watermark = next
                 .input_frontier
                 .as_ref()
                 .and_then(|f| f.watermark_ms())
-                .unwrap_or(next.watermark.watermark_ms);
+                .unwrap_or(i64::MIN);
             if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
                 continue;
             }
