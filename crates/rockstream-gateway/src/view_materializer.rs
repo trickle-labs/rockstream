@@ -392,7 +392,10 @@ fn arrow_dt_to_catalog_name(dt: &DataType) -> &'static str {
 ///
 /// Values are cast from string to the declared column type.  Rows that cannot
 /// be parsed for a column fall back to `null`.
-fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatch, String> {
+pub(crate) fn tsv_to_record_batch(
+    schema: SchemaRef,
+    rows: &[Vec<u8>],
+) -> Result<RecordBatch, String> {
     let n = rows.len();
     let num_cols = schema.fields().len();
 

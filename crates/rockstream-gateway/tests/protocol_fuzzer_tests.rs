@@ -100,7 +100,11 @@ fn get_server_port() -> u16 {
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 200,
-        timeout: 10_000, // 10s per test case
+        // The test body already enforces a 5s Tokio timeout per generated
+        // sequence. Keeping proptest's fork/timeout watchdog enabled causes
+        // false failures from child-process startup overhead before the first
+        // case runs, so leave the outer watchdog off.
+        timeout: 0,
         ..ProptestConfig::default()
     })]
 

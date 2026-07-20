@@ -181,6 +181,12 @@ pub const RS_2023: ErrorCode = ErrorCode::new(2023);
 /// Session window state exceeded its configured open-session bound (v0.50).
 /// next_steps: "Reduce session cardinality, increase SESSION_WINDOW_STATE_LIMIT, or shard the windowed stream more finely."
 pub const RS_2024: ErrorCode = ErrorCode::new(2024);
+/// Query-time DataFusion source scan exceeded its configured bounded row/byte budget (v0.51.2).
+/// next_steps: "Reduce source-table cardinality, add a LIMIT, or materialize the query into a view."
+pub const RS_2025: ErrorCode = ErrorCode::new(2025);
+/// Query-time DataFusion planning or execution failed for an ad hoc query (v0.51.2).
+/// next_steps: "Simplify the query, validate referenced table/view schemas, or materialize the query into a view."
+pub const RS_2026: ErrorCode = ErrorCode::new(2026);
 
 // 24xx: Auth (v0.26)
 /// Unauthenticated: request missing or carrying invalid credentials.

@@ -104,6 +104,14 @@ pub enum GatewayError {
     #[error("[RS-2564] notify.channel_limit_exceeded: notify channel limit of {limit} exceeded. next_steps: UNLISTEN unused channels.")]
     NotifyChannelLimitExceeded { limit: usize },
 
+    /// [RS-2025] query.query_time_result_set_too_large — query-time DataFusion source scan exceeded its bound.
+    #[error("[RS-2025] query.query_time_result_set_too_large: query result set too large for query-time execution while scanning '{relation}' (row limit {row_limit}). next_steps: Add a LIMIT clause, reduce source-table cardinality, or materialize the query into a view.")]
+    QueryTimeResultSetTooLarge { relation: String, row_limit: usize },
+
+    /// [RS-2026] query.query_time_execution_failed — query-time DataFusion planning/execution failed.
+    #[error("[RS-2026] query.query_time_execution_failed: query-time execution failed: {detail}. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.")]
+    QueryTimeExecutionFailed { detail: String },
+
     #[error("Not supported: {0}")]
     NotSupported(String),
 
@@ -150,6 +158,8 @@ pub fn sqlstate_for(e: &GatewayError) -> &'static str {
         GatewayError::TwoPhaseNotSupported => "0A000",
         GatewayError::SavepointLimitExceeded { .. } => "54000",
         GatewayError::NotifyChannelLimitExceeded { .. } => "54000",
+        GatewayError::QueryTimeResultSetTooLarge { .. } => "54000",
+        GatewayError::QueryTimeExecutionFailed { .. } => "0A000",
         GatewayError::NotSupported(_) => "0A000",
         GatewayError::ParseError(_) => "42601",
         GatewayError::Storage(_) => "XX000",

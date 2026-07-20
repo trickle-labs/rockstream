@@ -4,7 +4,7 @@
 //! pgwire library. The same handler implements both simple and extended query
 //! protocols.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::memory::MemTable;
 use datafusion::prelude::SessionContext;
 use futures::SinkExt;
@@ -708,6 +709,14 @@ pub static SESSION_WAIT_FOR_SATISFIED_MS: std::sync::atomic::AtomicU64 =
 /// Number of wait_for calls that timed out (RS-2012).
 pub static SESSION_WAIT_FOR_TIMEOUT_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Total rows scanned into query-time DataFusion MemTables.
+pub static QUERY_TIME_DATAFUSION_ROWS_SCANNED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Hard per-relation row cap for query-time DataFusion source scans.
+pub const MAX_QUERY_TIME_ROWS: usize = 1_000_000;
+/// Hard per-relation byte cap for query-time DataFusion source scans.
+pub const MAX_QUERY_TIME_SCAN_BYTES: usize = 64 * 1024 * 1024;
 
 // ── S8 WaitResult ─────────────────────────────────────────────────────────────
 
@@ -2114,28 +2123,43 @@ impl GatewayHandler {
                 }
             }
 
-            if let Some(view_name) = extract_view_name_from_select(q) {
-                if !view_name.starts_with("pg_") && !view_name.starts_with("information_schema") {
-                    // S9: search_path-aware resolution for unqualified view names.
-                    // Only applies when search_path was explicitly configured via SET.
-                    let is_qualified = ql.contains(&format!(".{}", view_name.to_lowercase()));
-                    if !is_qualified {
-                        let (search_path, path_was_set) = if let Some(id) = conn_id {
-                            self.sessions
-                                .get(id)
-                                .map(|s| (s.search_path.clone(), s.search_path_set))
-                                .unwrap_or_else(|| ("public".to_string(), false))
-                        } else {
-                            ("public".to_string(), false)
-                        };
-                        if path_was_set {
-                            let path_parts: Vec<&str> =
-                                search_path.split(',').map(|s| s.trim()).collect();
-                            // If the view exists but is not in the search_path, reject.
-                            if self.catalog.get_view(&view_name).is_some()
-                                && self.catalog.resolve_view(&view_name, &path_parts).is_none()
-                            {
-                                return Ok(vec![promote_response(Response::Error(Box::new(
+            if let Some(select_plan) = analyze_select_query(&self.catalog, q) {
+                if let Some(top_level_relation) = &select_plan.top_level_relation {
+                    if select_plan
+                        .top_level_relation_full
+                        .as_deref()
+                        .is_some_and(is_system_relation_name)
+                    {
+                        // Fall through to catalog/system-table handling below.
+                    } else if !top_level_relation.starts_with("pg_")
+                        && !top_level_relation.starts_with("information_schema")
+                        && !select_plan.referenced_tables.is_empty()
+                    {
+                        let view_name = select_plan
+                            .referenced_tables
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| top_level_relation.clone());
+                        // S9: search_path-aware resolution for unqualified view names.
+                        // Only applies when search_path was explicitly configured via SET.
+                        let is_qualified = ql.contains(&format!(".{}", view_name.to_lowercase()));
+                        if !is_qualified {
+                            let (search_path, path_was_set) = if let Some(id) = conn_id {
+                                self.sessions
+                                    .get(id)
+                                    .map(|s| (s.search_path.clone(), s.search_path_set))
+                                    .unwrap_or_else(|| ("public".to_string(), false))
+                            } else {
+                                ("public".to_string(), false)
+                            };
+                            if path_was_set {
+                                let path_parts: Vec<&str> =
+                                    search_path.split(',').map(|s| s.trim()).collect();
+                                // If the view exists but is not in the search_path, reject.
+                                if self.catalog.get_view(&view_name).is_some()
+                                    && self.catalog.resolve_view(&view_name, &path_parts).is_none()
+                                {
+                                    return Ok(vec![promote_response(Response::Error(Box::new(
                                     ErrorInfo::new(
                                         "ERROR".to_string(),
                                         "42P01".to_string(),
@@ -2145,45 +2169,76 @@ impl GatewayHandler {
                                         ),
                                     ),
                                 )))]);
+                                }
                             }
                         }
-                    }
 
-                    // Try index-accelerated point lookup before falling back to full scan.
-                    if let Some(responses) = self.maybe_index_point_lookup(q, &view_name).await? {
-                        return Ok(responses);
-                    }
-                    let limit = extract_limit(q);
-                    let order_by = extract_order_by(q);
-                    // Wrap read in cancellation select (Slice 2)
-                    let mut cancel_token = CANCEL_TOKEN
-                        .try_with(|t| t.clone())
-                        .unwrap_or_else(|_| CancelToken::new());
-                    let read_fut = self.read_view_response(&view_name, limit, order_by, conn_id);
-                    let result = tokio::select! {
-                        res = read_fut => res,
-                        _ = cancel_token.cancelled() => {
-                            Ok(vec![promote_response(Response::Error(Box::new(
-                                ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    "57014".to_string(),
-                                    "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings.".to_string(),
-                                )
-                            )))])
-                        }
-                    };
-                    let is_error = result.is_err()
-                        || result.as_ref().is_ok_and(|v: &Vec<Response<'_>>| {
-                            v.iter().any(|r| matches!(r, Response::Error(_)))
-                        });
-                    if is_error {
-                        if let Some(id) = conn_id {
-                            if let Some(mut session) = self.sessions.get_mut(id) {
-                                session.fail_transaction();
+                        if select_plan.referenced_tables.len() == 1 {
+                            if let Some(responses) =
+                                self.maybe_index_point_lookup(q, &view_name).await?
+                            {
+                                return Ok(responses);
                             }
                         }
+
+                        let result = if select_plan.requires_query_time_datafusion
+                            && self.shard_db.is_some()
+                        {
+                            let mut cancel_token = CANCEL_TOKEN
+                                .try_with(|t| t.clone())
+                                .unwrap_or_else(|_| CancelToken::new());
+                            let query_fut = self.query_time_datafusion_response(
+                                q,
+                                &select_plan.referenced_tables,
+                                conn_id,
+                            );
+                            tokio::select! {
+                                res = query_fut => res,
+                                _ = cancel_token.cancelled() => {
+                                    Ok(vec![promote_response(Response::Error(Box::new(
+                                        ErrorInfo::new(
+                                            "ERROR".to_string(),
+                                            "57014".to_string(),
+                                            "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings.".to_string(),
+                                        )
+                                    )))])
+                                }
+                            }
+                        } else {
+                            let limit = extract_limit(q);
+                            let order_by = extract_order_by(q);
+                            // Wrap read in cancellation select (Slice 2)
+                            let mut cancel_token = CANCEL_TOKEN
+                                .try_with(|t| t.clone())
+                                .unwrap_or_else(|_| CancelToken::new());
+                            let read_fut =
+                                self.read_view_response(&view_name, limit, order_by, conn_id);
+                            tokio::select! {
+                                res = read_fut => res,
+                                _ = cancel_token.cancelled() => {
+                                    Ok(vec![promote_response(Response::Error(Box::new(
+                                        ErrorInfo::new(
+                                            "ERROR".to_string(),
+                                            "57014".to_string(),
+                                            "[RS-2050] query.cancelled: query was cancelled by a client CancelRequest. next_steps: Retry the query or await client timeout settings.".to_string(),
+                                        )
+                                    )))])
+                                }
+                            }
+                        };
+                        let is_error = result.is_err()
+                            || result.as_ref().is_ok_and(|v: &Vec<Response<'_>>| {
+                                v.iter().any(|r| matches!(r, Response::Error(_)))
+                            });
+                        if is_error {
+                            if let Some(id) = conn_id {
+                                if let Some(mut session) = self.sessions.get_mut(id) {
+                                    session.fail_transaction();
+                                }
+                            }
+                        }
+                        return result;
                     }
-                    return result;
                 }
             }
         }
@@ -2229,12 +2284,6 @@ impl GatewayHandler {
     /// Returns `Some(responses)` on success, `None` if DataFusion cannot execute
     /// the query (caller falls through to the `Tag::new("OK")` response).
     async fn try_datafusion_select(&self, q: &str) -> Option<Vec<Response<'static>>> {
-        use datafusion::arrow::array::{
-            Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-            StringArray,
-        };
-        use datafusion::arrow::datatypes::DataType as ArrowDataType;
-
         // Build a DataFusion session and register catalog objects as empty MemTables
         // so the planner can resolve any referenced names.
         let ctx = SessionContext::new();
@@ -2279,149 +2328,15 @@ impl GatewayHandler {
             Err(_) => return None,
         };
 
-        let batches = match df.collect().await {
+        let output_schema = Arc::new(df.schema().as_arrow().clone());
+        let mut batches = match df.collect().await {
             Ok(b) => b,
             Err(_) => return None,
         };
-
         if batches.is_empty() {
-            // Return an empty result set — build schema from the first batch schema if any.
-            return None;
+            batches.push(RecordBatch::new_empty(output_schema));
         }
-
-        // Build FieldInfo list from the Arrow schema of the first batch.
-        let arrow_schema = batches[0].schema();
-        let schema_fields: Vec<FieldInfo> = arrow_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(idx, f)| {
-                let pg_type = match f.data_type() {
-                    ArrowDataType::Int16 => Type::INT2,
-                    ArrowDataType::Int32 => Type::INT4,
-                    ArrowDataType::Int64 => Type::INT8,
-                    ArrowDataType::Float32 => Type::FLOAT4,
-                    ArrowDataType::Float64 => Type::FLOAT8,
-                    ArrowDataType::Boolean => Type::BOOL,
-                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Type::TEXT,
-                    _ => Type::TEXT,
-                };
-                let format = PORTAL_FORMAT
-                    .try_with(|fmt| fmt.format_for(idx))
-                    .unwrap_or(FieldFormat::Text);
-                FieldInfo::new(f.name().clone(), None, None, pg_type, format)
-            })
-            .collect();
-
-        let schema = Arc::new(schema_fields);
-
-        // Collect all rows from all batches into a flat list of string-encoded rows.
-        let mut encoded_rows: Vec<Vec<Option<String>>> = Vec::new();
-        for batch in &batches {
-            let num_rows = batch.num_rows();
-            let num_cols = batch.num_columns();
-            for row_idx in 0..num_rows {
-                let mut row_vals: Vec<Option<String>> = Vec::with_capacity(num_cols);
-                for col_idx in 0..num_cols {
-                    let col = batch.column(col_idx);
-                    if col.is_null(row_idx) {
-                        row_vals.push(None);
-                        continue;
-                    }
-                    let val = match col.data_type() {
-                        ArrowDataType::Int16 => col
-                            .as_any()
-                            .downcast_ref::<Int16Array>()
-                            .map(|a| a.value(row_idx).to_string()),
-                        ArrowDataType::Int32 => col
-                            .as_any()
-                            .downcast_ref::<Int32Array>()
-                            .map(|a| a.value(row_idx).to_string()),
-                        ArrowDataType::Int64 => col
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .map(|a| a.value(row_idx).to_string()),
-                        ArrowDataType::Float32 => col
-                            .as_any()
-                            .downcast_ref::<Float32Array>()
-                            .map(|a| a.value(row_idx).to_string()),
-                        ArrowDataType::Float64 => col
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .map(|a| a.value(row_idx).to_string()),
-                        ArrowDataType::Boolean => {
-                            col.as_any().downcast_ref::<BooleanArray>().map(|a| {
-                                if a.value(row_idx) {
-                                    "t".to_string()
-                                } else {
-                                    "f".to_string()
-                                }
-                            })
-                        }
-                        ArrowDataType::Utf8 => col
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .map(|a| a.value(row_idx).to_string()),
-                        _ => {
-                            // Fallback: cast to StringArray or use debug representation.
-                            col.as_any()
-                                .downcast_ref::<StringArray>()
-                                .map(|a| a.value(row_idx).to_string())
-                        }
-                    };
-                    row_vals.push(val);
-                }
-                encoded_rows.push(row_vals);
-            }
-        }
-
-        let schema_ref = schema.clone();
-        let data_stream = stream::iter(encoded_rows).map(move |row_vals| {
-            let mut encoder = DataRowEncoder::new(schema_ref.clone());
-            for (col_idx, val) in row_vals.iter().enumerate() {
-                let datatype = schema_ref[col_idx].datatype();
-                let encode_res = match *datatype {
-                    Type::INT2 => {
-                        let parsed: Option<i16> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::INT4 => {
-                        let parsed: Option<i32> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::INT8 => {
-                        let parsed: Option<i64> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::FLOAT4 => {
-                        let parsed: Option<f32> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::FLOAT8 => {
-                        let parsed: Option<f64> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::BOOL => {
-                        let parsed: Option<bool> =
-                            val.as_deref().map(|s| s == "t" || s == "true" || s == "1");
-                        encoder.encode_field(&parsed)
-                    }
-                    _ => {
-                        let s: Option<&str> = val.as_deref();
-                        encoder.encode_field(&s)
-                    }
-                };
-                if let Err(e) = encode_res {
-                    return Err(PgWireError::ApiError(Box::new(e)));
-                }
-            }
-            encoder.finish()
-        });
-
-        Some(vec![Response::Query(QueryResponse::new(
-            schema,
-            data_stream,
-        ))])
+        Some(datafusion_batches_to_query_response(&batches))
     }
 
     /// Try to serve a SELECT via an index arrangement point lookup.
@@ -2604,16 +2519,36 @@ impl GatewayHandler {
         ))]))
     }
 
-    /// Read rows from a view and build a pgwire `Response::Query`.
-    /// Enforces ACL (RS-2401) and namespace isolation (RS-2402) when conn_id is provided.
-    async fn read_view_response(
+    async fn query_time_datafusion_response(
         &self,
-        view_name: &str,
-        limit: Option<usize>,
-        order_by: Vec<(String, bool)>,
+        raw_sql: &str,
+        referenced_tables: &[String],
         conn_id: Option<&str>,
     ) -> PgWireResult<Vec<Response<'static>>> {
-        // Get principal and session namespace (v0.26)
+        for relation_name in referenced_tables {
+            if let Some(error_responses) = self.select_access_error_response(relation_name, conn_id)
+            {
+                return Ok(error_responses);
+            }
+        }
+
+        let shard_db = self.shard_db.as_ref().ok_or_else(|| {
+            PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                detail: "query-time execution requires a shard-backed gateway".to_string(),
+            }))
+        })?;
+        let batches =
+            query_time_datafusion_select(&self.catalog, shard_db, raw_sql, referenced_tables)
+                .await
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        Ok(datafusion_batches_to_query_response(&batches))
+    }
+
+    fn select_access_error_response(
+        &self,
+        relation_name: &str,
+        conn_id: Option<&str>,
+    ) -> Option<Vec<Response<'static>>> {
         let (principal, session_namespace) = if let Some(id) = conn_id {
             let session = self.sessions.entry(id.to_string()).or_default();
             (session.principal.clone(), session.current_namespace.clone())
@@ -2621,32 +2556,29 @@ impl GatewayHandler {
             (Principal::System, "public".to_string())
         };
 
-        // ACL check: Viewer role required for SELECT (RS-2401)
         use rockstream_types::acl::Role;
         if !principal.is_system() {
             if let Err(e) = self.acl_store.check(
                 principal.identity(),
                 &session_namespace,
-                Some(view_name),
+                Some(relation_name),
                 Role::Viewer,
             ) {
-                return Ok(vec![promote_response(Response::Error(Box::new(
+                return Some(vec![promote_response(Response::Error(Box::new(
                     ErrorInfo::new("ERROR".to_owned(), "42501".to_owned(), e.to_string()),
                 )))]);
             }
         }
 
-        // Namespace isolation check (RS-2402)
-        if let Some(cv) = self.catalog.get_view(view_name) {
+        if let Some(cv) = self.catalog.get_view(relation_name) {
             let view_ns = &cv.namespace;
             if view_ns != &session_namespace && !principal.is_system() {
-                // Check if principal has Admin in own namespace (can cross-namespace)
                 let is_admin = self
                     .acl_store
                     .check(principal.identity(), &session_namespace, None, Role::Admin)
                     .is_ok();
                 if !is_admin {
-                    return Ok(vec![promote_response(Response::Error(Box::new(
+                    return Some(vec![promote_response(Response::Error(Box::new(
                         ErrorInfo::new(
                             "ERROR".to_owned(),
                             "42501".to_owned(),
@@ -2658,6 +2590,22 @@ impl GatewayHandler {
                     )))]);
                 }
             }
+        }
+
+        None
+    }
+
+    /// Read rows from a view and build a pgwire `Response::Query`.
+    /// Enforces ACL (RS-2401) and namespace isolation (RS-2402) when conn_id is provided.
+    async fn read_view_response(
+        &self,
+        view_name: &str,
+        limit: Option<usize>,
+        order_by: Vec<(String, bool)>,
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
+        if let Some(error_responses) = self.select_access_error_response(view_name, conn_id) {
+            return Ok(error_responses);
         }
 
         let schema_fields: Vec<FieldInfo> = if let Some(cv) = self.catalog.get_view(view_name) {
@@ -4249,8 +4197,7 @@ impl GatewayHandler {
                 ),
             )))]);
         }
-        let table_columns: Vec<String> =
-            known_table_columns.unwrap_or_else(|| cols.clone());
+        let table_columns: Vec<String> = known_table_columns.unwrap_or_else(|| cols.clone());
         // Column list used to resolve VALUES tuples into named fields: the
         // explicit column list if given, otherwise the table's declared
         // column order for positional (no-column-list) INSERTs.
@@ -4366,9 +4313,7 @@ impl GatewayHandler {
                     for row_key in &row_keys {
                         let key = format!("view_output/{table}/{row_key}");
                         if let Some(raw) = shard_db.get(key.as_bytes()).await.map_err(|e| {
-                            PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(
-                                e,
-                            )))
+                            PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
                         })? {
                             let fields: Vec<String> = String::from_utf8_lossy(&raw)
                                 .split('\t')
@@ -6632,6 +6577,793 @@ fn generate_uuid_v4_string() -> String {
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
     )
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnalyzedSelectQuery {
+    top_level_relation: Option<String>,
+    top_level_relation_full: Option<String>,
+    referenced_tables: Vec<String>,
+    requires_query_time_datafusion: bool,
+}
+
+fn is_system_relation_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("pg_") || lower.starts_with("information_schema.")
+}
+
+fn resolve_catalog_relation_name(catalog: &CatalogStubs, raw_name: &str) -> Option<String> {
+    let normalized = raw_name
+        .trim()
+        .trim_matches('"')
+        .rsplit('.')
+        .next()
+        .unwrap_or(raw_name)
+        .trim_matches('"')
+        .to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+    if catalog.get_table(&normalized).is_some() || catalog.get_view(&normalized).is_some() {
+        return Some(normalized);
+    }
+    let lower = normalized.to_ascii_lowercase();
+    if catalog.get_table(&lower).is_some() || catalog.get_view(&lower).is_some() {
+        return Some(lower);
+    }
+    None
+}
+
+fn object_name_to_relation_name(name: &sqlparser::ast::ObjectName) -> (String, String) {
+    let full = name.to_string();
+    let normalized = full
+        .trim()
+        .trim_matches('"')
+        .rsplit('.')
+        .next()
+        .unwrap_or(full.as_str())
+        .trim_matches('"')
+        .to_string();
+    (full, normalized)
+}
+
+fn group_by_is_empty(group_by: &sqlparser::ast::GroupByExpr) -> bool {
+    match group_by {
+        sqlparser::ast::GroupByExpr::All(_) => false,
+        sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) => {
+            exprs.is_empty() && modifiers.is_empty()
+        }
+    }
+}
+
+fn limit_clause_is_plain(limit_clause: &sqlparser::ast::LimitClause) -> bool {
+    use sqlparser::ast::{Expr, LimitClause, Value};
+
+    match limit_clause {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            offset.is_none()
+                && limit_by.is_empty()
+                && limit.as_ref().is_none_or(|expr| {
+                    matches!(
+                        expr,
+                        Expr::Value(v)
+                            if matches!(v.value, Value::Number(_, false))
+                    )
+                })
+        }
+        LimitClause::OffsetCommaLimit { .. } => false,
+    }
+}
+
+fn order_by_is_plain(order_by: &sqlparser::ast::OrderBy) -> bool {
+    use sqlparser::ast::{Expr, OrderByKind};
+
+    if order_by.interpolate.is_some() {
+        return false;
+    }
+    match &order_by.kind {
+        OrderByKind::Expressions(exprs) => exprs.iter().all(|expr| {
+            expr.with_fill.is_none()
+                && matches!(expr.expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        }),
+        OrderByKind::All(_) => false,
+    }
+}
+
+fn projection_item_is_plain(item: &sqlparser::ast::SelectItem) -> bool {
+    use sqlparser::ast::{Expr, SelectItem, SelectItemQualifiedWildcardKind};
+
+    match item {
+        SelectItem::UnnamedExpr(Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        | SelectItem::Wildcard(_) => true,
+        SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(_), options) => {
+            options.opt_exclude.is_none()
+                && options.opt_except.is_none()
+                && options.opt_rename.is_none()
+                && options.opt_replace.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn expr_is_after_fence_predicate(expr: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::{Expr, FunctionArguments};
+
+    match expr {
+        Expr::Nested(inner) => expr_is_after_fence_predicate(inner),
+        Expr::Function(function) => {
+            function
+                .name
+                .to_string()
+                .eq_ignore_ascii_case("rockstream.after_fence")
+                && matches!(&function.args, FunctionArguments::List(arg_list) if arg_list.args.len() == 1)
+        }
+        _ => false,
+    }
+}
+
+fn query_has_non_projection_features(query: &sqlparser::ast::Query) -> bool {
+    if query.with.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+        || query
+            .order_by
+            .as_ref()
+            .is_some_and(|order_by| !order_by_is_plain(order_by))
+        || query
+            .limit_clause
+            .as_ref()
+            .is_some_and(|limit_clause| !limit_clause_is_plain(limit_clause))
+    {
+        return true;
+    }
+
+    match &*query.body {
+        sqlparser::ast::SetExpr::Select(select) => {
+            select.distinct.is_some()
+                || select
+                    .select_modifiers
+                    .as_ref()
+                    .is_some_and(|mods| mods.is_any_set())
+                || select.top.is_some()
+                || select.exclude.is_some()
+                || select.into.is_some()
+                || select.from.len() != 1
+                || select.from.iter().any(|table| !table.joins.is_empty())
+                || !select.lateral_views.is_empty()
+                || select.prewhere.is_some()
+                || select
+                    .selection
+                    .as_ref()
+                    .is_some_and(|expr| !expr_is_after_fence_predicate(expr))
+                || !select.connect_by.is_empty()
+                || !group_by_is_empty(&select.group_by)
+                || !select.cluster_by.is_empty()
+                || !select.distribute_by.is_empty()
+                || !select.sort_by.is_empty()
+                || select.having.is_some()
+                || !select.named_window.is_empty()
+                || select.qualify.is_some()
+                || select.value_table_mode.is_some()
+                || !matches!(select.flavor, sqlparser::ast::SelectFlavor::Standard)
+                || select
+                    .projection
+                    .iter()
+                    .any(|item| !projection_item_is_plain(item))
+        }
+        _ => true,
+    }
+}
+
+fn collect_query_relations(
+    query: &sqlparser::ast::Query,
+    relations: &mut Vec<String>,
+    top_level_relation: &mut Option<String>,
+    top_level_relation_full: &mut Option<String>,
+    is_top_level: bool,
+) {
+    use sqlparser::ast::{
+        FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, TableFactor,
+    };
+
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_query_relations(
+                &cte.query,
+                relations,
+                top_level_relation,
+                top_level_relation_full,
+                false,
+            );
+        }
+    }
+
+    fn visit_expr(
+        expr: &sqlparser::ast::Expr,
+        relations: &mut Vec<String>,
+        top_level_relation: &mut Option<String>,
+        top_level_relation_full: &mut Option<String>,
+    ) {
+        use sqlparser::ast::Expr;
+
+        match expr {
+            Expr::BinaryOp { left, right, .. } => {
+                visit_expr(left, relations, top_level_relation, top_level_relation_full);
+                visit_expr(
+                    right,
+                    relations,
+                    top_level_relation,
+                    top_level_relation_full,
+                );
+            }
+            Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
+                visit_expr(expr, relations, top_level_relation, top_level_relation_full);
+            }
+            Expr::Function(function) => {
+                if let FunctionArguments::List(arg_list) = &function.args {
+                    for arg in &arg_list.args {
+                        match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+                            | FunctionArg::Named {
+                                arg: FunctionArgExpr::Expr(expr),
+                                ..
+                            } => {
+                                visit_expr(
+                                    expr,
+                                    relations,
+                                    top_level_relation,
+                                    top_level_relation_full,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                visit_expr(expr, relations, top_level_relation, top_level_relation_full);
+                for item in list {
+                    visit_expr(item, relations, top_level_relation, top_level_relation_full);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                visit_expr(expr, relations, top_level_relation, top_level_relation_full);
+                visit_expr(low, relations, top_level_relation, top_level_relation_full);
+                visit_expr(high, relations, top_level_relation, top_level_relation_full);
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    visit_expr(
+                        operand,
+                        relations,
+                        top_level_relation,
+                        top_level_relation_full,
+                    );
+                }
+                for condition in conditions {
+                    visit_expr(
+                        &condition.condition,
+                        relations,
+                        top_level_relation,
+                        top_level_relation_full,
+                    );
+                    visit_expr(
+                        &condition.result,
+                        relations,
+                        top_level_relation,
+                        top_level_relation_full,
+                    );
+                }
+                if let Some(else_result) = else_result {
+                    visit_expr(
+                        else_result,
+                        relations,
+                        top_level_relation,
+                        top_level_relation_full,
+                    );
+                }
+            }
+            Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+                collect_query_relations(
+                    subquery,
+                    relations,
+                    top_level_relation,
+                    top_level_relation_full,
+                    false,
+                );
+            }
+            Expr::InSubquery { expr, subquery, .. } => {
+                visit_expr(expr, relations, top_level_relation, top_level_relation_full);
+                collect_query_relations(
+                    subquery,
+                    relations,
+                    top_level_relation,
+                    top_level_relation_full,
+                    false,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_table_factor(
+        relation: &TableFactor,
+        relations: &mut Vec<String>,
+        top_level_relation: &mut Option<String>,
+        top_level_relation_full: &mut Option<String>,
+        capture_top_level: bool,
+    ) {
+        match relation {
+            TableFactor::Table { name, .. } => {
+                let (full, normalized) = object_name_to_relation_name(name);
+                if capture_top_level && top_level_relation.is_none() {
+                    *top_level_relation = Some(normalized.clone());
+                    *top_level_relation_full = Some(full);
+                }
+                relations.push(normalized);
+            }
+            TableFactor::Derived { subquery, .. } => {
+                collect_query_relations(
+                    subquery,
+                    relations,
+                    top_level_relation,
+                    top_level_relation_full,
+                    false,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    match &*query.body {
+        SetExpr::Select(select) => {
+            for projection in &select.projection {
+                match projection {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        visit_expr(expr, relations, top_level_relation, top_level_relation_full);
+                    }
+                    SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {}
+                }
+            }
+            for (idx, table) in select.from.iter().enumerate() {
+                visit_table_factor(
+                    &table.relation,
+                    relations,
+                    top_level_relation,
+                    top_level_relation_full,
+                    is_top_level && idx == 0,
+                );
+                for join in &table.joins {
+                    visit_table_factor(
+                        &join.relation,
+                        relations,
+                        top_level_relation,
+                        top_level_relation_full,
+                        false,
+                    );
+                }
+            }
+            if let Some(selection) = &select.selection {
+                visit_expr(
+                    selection,
+                    relations,
+                    top_level_relation,
+                    top_level_relation_full,
+                );
+            }
+            if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
+                for expr in exprs {
+                    visit_expr(expr, relations, top_level_relation, top_level_relation_full);
+                }
+            }
+            if let Some(having) = &select.having {
+                visit_expr(
+                    having,
+                    relations,
+                    top_level_relation,
+                    top_level_relation_full,
+                );
+            }
+        }
+        SetExpr::Query(subquery) => collect_query_relations(
+            subquery,
+            relations,
+            top_level_relation,
+            top_level_relation_full,
+            false,
+        ),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_set_expr_relations(
+                left,
+                relations,
+                top_level_relation,
+                top_level_relation_full,
+            );
+            collect_set_expr_relations(
+                right,
+                relations,
+                top_level_relation,
+                top_level_relation_full,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn collect_set_expr_relations(
+    set_expr: &sqlparser::ast::SetExpr,
+    relations: &mut Vec<String>,
+    top_level_relation: &mut Option<String>,
+    top_level_relation_full: &mut Option<String>,
+) {
+    match set_expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            let query = sqlparser::ast::Query {
+                with: None,
+                body: Box::new(sqlparser::ast::SetExpr::Select(select.clone())),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            };
+            collect_query_relations(
+                &query,
+                relations,
+                top_level_relation,
+                top_level_relation_full,
+                false,
+            );
+        }
+        sqlparser::ast::SetExpr::Query(query) => collect_query_relations(
+            query,
+            relations,
+            top_level_relation,
+            top_level_relation_full,
+            false,
+        ),
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            collect_set_expr_relations(
+                left,
+                relations,
+                top_level_relation,
+                top_level_relation_full,
+            );
+            collect_set_expr_relations(
+                right,
+                relations,
+                top_level_relation,
+                top_level_relation_full,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn analyze_select_query(catalog: &CatalogStubs, q: &str) -> Option<AnalyzedSelectQuery> {
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let stmt = sqlparser::parser::Parser::parse_sql(&dialect, q)
+        .ok()?
+        .into_iter()
+        .next()?;
+    let sqlparser::ast::Statement::Query(query) = stmt else {
+        return None;
+    };
+
+    let mut top_level_relation = None;
+    let mut top_level_relation_full = None;
+    let mut raw_relations = Vec::new();
+    collect_query_relations(
+        &query,
+        &mut raw_relations,
+        &mut top_level_relation,
+        &mut top_level_relation_full,
+        true,
+    );
+
+    let mut seen = HashSet::new();
+    let referenced_tables = raw_relations
+        .into_iter()
+        .filter_map(|raw_name| resolve_catalog_relation_name(catalog, &raw_name))
+        .filter(|name| seen.insert(name.clone()))
+        .collect();
+
+    Some(AnalyzedSelectQuery {
+        top_level_relation,
+        top_level_relation_full,
+        referenced_tables,
+        requires_query_time_datafusion: query_has_non_projection_features(&query),
+    })
+}
+
+fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response<'static>> {
+    use datafusion::arrow::array::{
+        Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        StringArray,
+    };
+    use datafusion::arrow::datatypes::DataType as ArrowDataType;
+
+    if batches.is_empty() {
+        let schema = Arc::new(Vec::<FieldInfo>::new());
+        let schema_ref = schema.clone();
+        let data_stream = stream::iter(Vec::<Vec<Option<String>>>::new()).map(move |row_vals| {
+            let mut encoder = DataRowEncoder::new(schema_ref.clone());
+            for (col_idx, val) in row_vals.iter().enumerate() {
+                let datatype = schema_ref[col_idx].datatype();
+                let encode_res = match *datatype {
+                    Type::INT2 => {
+                        let parsed: Option<i16> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::INT4 => {
+                        let parsed: Option<i32> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::INT8 => {
+                        let parsed: Option<i64> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::FLOAT4 => {
+                        let parsed: Option<f32> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::FLOAT8 => {
+                        let parsed: Option<f64> = val.as_deref().and_then(|s| s.parse().ok());
+                        encoder.encode_field(&parsed)
+                    }
+                    Type::BOOL => {
+                        let parsed: Option<bool> =
+                            val.as_deref().map(|s| s == "t" || s == "true" || s == "1");
+                        encoder.encode_field(&parsed)
+                    }
+                    _ => {
+                        let s: Option<&str> = val.as_deref();
+                        encoder.encode_field(&s)
+                    }
+                };
+                if let Err(e) = encode_res {
+                    return Err(PgWireError::ApiError(Box::new(e)));
+                }
+            }
+            encoder.finish()
+        });
+        return vec![Response::Query(QueryResponse::new(schema, data_stream))];
+    }
+
+    let arrow_schema = batches[0].schema();
+    let schema_fields: Vec<FieldInfo> = arrow_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, f)| {
+            let pg_type = match f.data_type() {
+                ArrowDataType::Int16 => Type::INT2,
+                ArrowDataType::Int32 => Type::INT4,
+                ArrowDataType::Int64 => Type::INT8,
+                ArrowDataType::Float32 => Type::FLOAT4,
+                ArrowDataType::Float64 => Type::FLOAT8,
+                ArrowDataType::Boolean => Type::BOOL,
+                ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Type::TEXT,
+                _ => Type::TEXT,
+            };
+            let format = PORTAL_FORMAT
+                .try_with(|fmt| fmt.format_for(idx))
+                .unwrap_or(FieldFormat::Text);
+            FieldInfo::new(f.name().clone(), None, None, pg_type, format)
+        })
+        .collect();
+
+    let schema = Arc::new(schema_fields);
+    let mut encoded_rows: Vec<Vec<Option<String>>> = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            let mut row_vals: Vec<Option<String>> = Vec::with_capacity(batch.num_columns());
+            for col_idx in 0..batch.num_columns() {
+                let col = batch.column(col_idx);
+                if col.is_null(row_idx) {
+                    row_vals.push(None);
+                    continue;
+                }
+                let val = match col.data_type() {
+                    ArrowDataType::Int16 => col
+                        .as_any()
+                        .downcast_ref::<Int16Array>()
+                        .map(|a| a.value(row_idx).to_string()),
+                    ArrowDataType::Int32 => col
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .map(|a| a.value(row_idx).to_string()),
+                    ArrowDataType::Int64 => col
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map(|a| a.value(row_idx).to_string()),
+                    ArrowDataType::Float32 => col
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .map(|a| a.value(row_idx).to_string()),
+                    ArrowDataType::Float64 => col
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .map(|a| a.value(row_idx).to_string()),
+                    ArrowDataType::Boolean => {
+                        col.as_any().downcast_ref::<BooleanArray>().map(|a| {
+                            if a.value(row_idx) {
+                                "t".to_string()
+                            } else {
+                                "f".to_string()
+                            }
+                        })
+                    }
+                    ArrowDataType::Utf8 => col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map(|a| a.value(row_idx).to_string()),
+                    _ => col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map(|a| a.value(row_idx).to_string()),
+                };
+                row_vals.push(val);
+            }
+            encoded_rows.push(row_vals);
+        }
+    }
+
+    let schema_ref = schema.clone();
+    let data_stream = stream::iter(encoded_rows).map(move |row_vals| {
+        let mut encoder = DataRowEncoder::new(schema_ref.clone());
+        for (col_idx, val) in row_vals.iter().enumerate() {
+            let datatype = schema_ref[col_idx].datatype();
+            let encode_res = match *datatype {
+                Type::INT2 => {
+                    let parsed: Option<i16> = val.as_deref().and_then(|s| s.parse().ok());
+                    encoder.encode_field(&parsed)
+                }
+                Type::INT4 => {
+                    let parsed: Option<i32> = val.as_deref().and_then(|s| s.parse().ok());
+                    encoder.encode_field(&parsed)
+                }
+                Type::INT8 => {
+                    let parsed: Option<i64> = val.as_deref().and_then(|s| s.parse().ok());
+                    encoder.encode_field(&parsed)
+                }
+                Type::FLOAT4 => {
+                    let parsed: Option<f32> = val.as_deref().and_then(|s| s.parse().ok());
+                    encoder.encode_field(&parsed)
+                }
+                Type::FLOAT8 => {
+                    let parsed: Option<f64> = val.as_deref().and_then(|s| s.parse().ok());
+                    encoder.encode_field(&parsed)
+                }
+                Type::BOOL => {
+                    let parsed: Option<bool> =
+                        val.as_deref().map(|s| s == "t" || s == "true" || s == "1");
+                    encoder.encode_field(&parsed)
+                }
+                _ => {
+                    let s: Option<&str> = val.as_deref();
+                    encoder.encode_field(&s)
+                }
+            };
+            if let Err(e) = encode_res {
+                return Err(PgWireError::ApiError(Box::new(e)));
+            }
+        }
+        encoder.finish()
+    });
+
+    vec![Response::Query(QueryResponse::new(schema, data_stream))]
+}
+
+fn query_time_relation_schema(catalog: &CatalogStubs, relation_name: &str) -> SchemaRef {
+    if let Some(table) = catalog.get_table(relation_name) {
+        let fields: Vec<Field> = table
+            .columns
+            .iter()
+            .map(|column| {
+                Field::new(
+                    &column.name,
+                    string_to_arrow_datatype(&column.data_type),
+                    true,
+                )
+            })
+            .collect();
+        return Arc::new(Schema::new(fields));
+    }
+    if let Some(view) = catalog.get_view(relation_name) {
+        if !view.columns.is_empty() {
+            let fields: Vec<Field> = view
+                .columns
+                .iter()
+                .map(|column| {
+                    Field::new(
+                        &column.name,
+                        string_to_arrow_datatype(&column.data_type),
+                        true,
+                    )
+                })
+                .collect();
+            return Arc::new(Schema::new(fields));
+        }
+    }
+    Arc::new(Schema::new(vec![Field::new(
+        "_value",
+        datafusion::arrow::datatypes::DataType::Utf8,
+        true,
+    )]))
+}
+
+async fn query_time_datafusion_select(
+    catalog: &CatalogStubs,
+    shard_db: &rockstream_storage::ShardDb,
+    raw_sql: &str,
+    referenced_tables: &[String],
+) -> Result<Vec<RecordBatch>, GatewayError> {
+    let ctx = SessionContext::new();
+    rockstream_sql::frontend::register_session_sql_udf(&ctx);
+
+    for relation_name in referenced_tables {
+        let schema = query_time_relation_schema(catalog, relation_name);
+        let prefix = format!("view_output/{relation_name}/");
+        let (rows, truncated) = shard_db
+            .scan_prefix_bounded(prefix.as_bytes(), MAX_QUERY_TIME_SCAN_BYTES)
+            .await?;
+        QUERY_TIME_DATAFUSION_ROWS_SCANNED_TOTAL.fetch_add(rows.len() as u64, Ordering::Relaxed);
+        if truncated || rows.len() > MAX_QUERY_TIME_ROWS {
+            return Err(GatewayError::QueryTimeResultSetTooLarge {
+                relation: relation_name.clone(),
+                row_limit: MAX_QUERY_TIME_ROWS,
+            });
+        }
+        let tsv_rows: Vec<Vec<u8>> = rows.into_iter().map(|(_, value)| value.to_vec()).collect();
+        let batch = crate::view_materializer::tsv_to_record_batch(schema.clone(), &tsv_rows)
+            .unwrap_or_else(|_| RecordBatch::new_empty(schema.clone()));
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).map_err(|e| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("MemTable({relation_name}): {e}"),
+            }
+        })?;
+        ctx.register_table(relation_name.as_str(), Arc::new(mem_table))
+            .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("register({relation_name}): {e}"),
+            })?;
+    }
+
+    let df = ctx
+        .sql(raw_sql)
+        .await
+        .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+            detail: format!("sql: {e}"),
+        })?;
+    let output_schema = Arc::new(df.schema().as_arrow().clone());
+    let mut batches = df
+        .collect()
+        .await
+        .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+            detail: format!("collect: {e}"),
+        })?;
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(output_schema));
+    }
+    Ok(batches)
 }
 
 fn extract_after_fence_token(q: &str) -> Option<FreshnessToken> {
