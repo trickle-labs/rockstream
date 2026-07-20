@@ -208,6 +208,7 @@ struct MetricRegistry {
     shuffle_zstd_bytes_saved_total: AtomicU64,
     shuffle_cross_az_direct_bytes_total: AtomicU64,
     shuffle_direct_bytes_total: AtomicU64,
+    shuffle_rows_in_flight: AtomicU64,
     shuffle_compression_disabled_total: AtomicU64,
     shuffle_compression_state_entries: AtomicU64,
 
@@ -258,6 +259,7 @@ impl MetricRegistry {
             shuffle_zstd_bytes_saved_total: AtomicU64::new(0),
             shuffle_cross_az_direct_bytes_total: AtomicU64::new(0),
             shuffle_direct_bytes_total: AtomicU64::new(0),
+            shuffle_rows_in_flight: AtomicU64::new(0),
             shuffle_compression_disabled_total: AtomicU64::new(0),
             shuffle_compression_state_entries: AtomicU64::new(0),
             flush_duration_sum_ms: AtomicU64::new(0),
@@ -553,6 +555,7 @@ pub fn reset_all() {
         reg.shuffle_cross_az_direct_bytes_total
             .store(0, Ordering::Relaxed);
         reg.shuffle_direct_bytes_total.store(0, Ordering::Relaxed);
+        reg.shuffle_rows_in_flight.store(0, Ordering::Relaxed);
         reg.shuffle_compression_disabled_total
             .store(0, Ordering::Relaxed);
         reg.shuffle_compression_state_entries
@@ -933,6 +936,16 @@ pub fn add_shuffle_direct_bytes_total(bytes: u64) {
 
 pub fn read_shuffle_direct_bytes_total() -> u64 {
     with_registry(|reg| reg.shuffle_direct_bytes_total.load(Ordering::Relaxed))
+}
+
+pub fn set_shuffle_rows_in_flight(rows: u64) {
+    with_registry(|reg| {
+        reg.shuffle_rows_in_flight.store(rows, Ordering::Relaxed);
+    });
+}
+
+pub fn read_shuffle_rows_in_flight() -> u64 {
+    with_registry(|reg| reg.shuffle_rows_in_flight.load(Ordering::Relaxed))
 }
 
 pub fn inc_shuffle_compression_disabled_total() {

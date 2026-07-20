@@ -16,7 +16,7 @@ use rockstream_runtime::exchange::classifier::{
 };
 use rockstream_runtime::exchange::flow_control::FlowController;
 use rockstream_runtime::exchange::multiplexer::WorkerStreamMultiplexer;
-use rockstream_runtime::exchange::persistence::{delete_outbox_if_present, inbox_key};
+use rockstream_runtime::exchange::persistence::delete_outbox_if_present;
 use rockstream_runtime::exchange::pool::ShuffleClientPool;
 use rockstream_runtime::exchange::proto::ShuffleFrame;
 use rockstream_runtime::exchange::serialization::serialize_zset;
@@ -27,7 +27,7 @@ use rockstream_runtime::exchange::service::{
 use rockstream_sim::buggify;
 use rockstream_sim::buggify::{buggify_disable, buggify_focus, buggify_init};
 use rockstream_storage::shard_db::ShardDb;
-use rockstream_types::config::ExchangeConfig;
+use rockstream_types::config::{ExchangeConfig, WorkerConfig};
 use rockstream_types::exchange::{ExchangeAnn, ExchangePath, ExchangeTransport};
 use rockstream_types::ids::{ExchangeId, LeaseToken, ShardId, WorkerId};
 use rockstream_types::lease::ShardLease;
@@ -204,6 +204,7 @@ async fn missing_az_metadata_falls_back_without_row_loss_sim() {
                 epoch: 1,
                 seq: 1,
                 payload: payload.into(),
+                row_count: 2,
             },
         )
         .await
@@ -273,6 +274,7 @@ async fn same_host_shared_memory_peer_crash_falls_back_to_grpc_without_duplicati
         epoch: 1,
         seq: 5,
         payload: payload.into(),
+        row_count: 1,
     };
     multiplexer
         .send_frame(WorkerId(302), frame.clone())
@@ -284,24 +286,152 @@ async fn same_host_shared_memory_peer_crash_falls_back_to_grpc_without_duplicati
     );
     assert_eq!(registry.grpc_frames_received(), 1);
 
+    // The target operator checkpoints epoch 1: its committed frontier is durably
+    // advanced. With v0.51 fast-path WAL elision, the gRPC-fallback delivery
+    // writes no shuffle_inbox/ and replay-dedup relies on the frontier.
+    target_db
+        .commit_epoch(rockstream_types::ids::ShardId(1), 1)
+        .await
+        .unwrap();
+
     multiplexer.send_frame(WorkerId(302), frame).await.unwrap();
     tokio::select! {
         maybe = inlet_rx.recv() => panic!("unexpected duplicate delivery: {:?}", maybe),
         _ = tokio::time::sleep(Duration::from_millis(100)) => {}
     }
+    // Fast-path elision: neither the sender outbox (0x05) nor the receiver inbox
+    // (0x04) is persisted for the successfully delivered gRPC-fallback frame.
     assert_eq!(
         delete_outbox_if_present(&src_db, 100, 1, 1, 5)
             .await
             .unwrap(),
         false
     );
-    assert!(target_db
-        .get(&inbox_key(100, 0, 1, 5))
-        .await
-        .unwrap()
-        .is_some());
+    assert_eq!(src_db.scan_prefix(&[0x05]).await.unwrap().len(), 0);
+    assert_eq!(target_db.scan_prefix(&[0x04]).await.unwrap().len(), 0);
 
     unregister_shared_memory_endpoint(WorkerId(302));
+    let _ = tx_close.send(());
+    server_handle.abort();
+    buggify_disable();
+}
+
+#[tokio::test]
+async fn same_host_shared_memory_quantum_budget_falls_back_without_duplication_sim() {
+    let _guard = SHM_TEST_LOCK.lock().await;
+    buggify_init(5101);
+    buggify_focus("exchange.shm_segment_unavailable");
+    assert!(buggify!("exchange.shm_segment_unavailable", 1.0));
+
+    let addr = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+    let src_db = shard_db("sim-shm-budget-src").await;
+    let sender_shards = make_sender_shards(src_db.clone(), WorkerId(351));
+    let target_db = shard_db("sim-shm-budget-dst").await;
+    let (registry, mut inlet_rx) = make_receiver_registry(target_db.clone(), WorkerId(352));
+    register_shared_memory_endpoint(WorkerId(352), registry.clone());
+    let server = ShuffleServer::new(registry.clone());
+    let (tx_close, rx_close) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(
+                rockstream_runtime::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                    server,
+                ),
+            )
+            .serve_with_shutdown(addr, async {
+                let _ = rx_close.await;
+            })
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    peers.write().insert(WorkerId(352), addr.to_string());
+    let pool = ShuffleClientPool::new(peers);
+    pool.set_local_worker_info(worker_info(
+        351,
+        "127.0.0.1:9351".to_string(),
+        "host-a",
+        "az-1",
+    ));
+    pool.upsert_peer_info(worker_info(352, addr.to_string(), "host-a", "az-1"));
+    let flow_controller = FlowController::with_row_budget(1);
+    let multiplexer =
+        WorkerStreamMultiplexer::with_shards(pool, flow_controller.clone(), sender_shards)
+            .with_src_worker(WorkerId(351))
+            .with_worker_config(WorkerConfig {
+                segment_cache_bytes: 0,
+                max_rows_per_quantum: 1,
+            });
+
+    let frame = ShuffleFrame {
+        exchange_id: 100,
+        src_shard: 0,
+        target_shard: 1,
+        epoch: 1,
+        seq: 5,
+        payload: serialize_zset(&ArrowZSet::from_ab_rows(&[(11, 110)], 1))
+            .unwrap()
+            .into(),
+        row_count: 1,
+    };
+    multiplexer
+        .send_frame(WorkerId(352), frame.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        inlet_rx.recv().await.unwrap().positive_ab_rows(),
+        vec![(11, 110)]
+    );
+    assert_eq!(registry.grpc_frames_received(), 1);
+    tokio::time::timeout(Duration::from_millis(200), async {
+        while flow_controller.rows_in_flight(100, 0, 1) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    target_db.commit_epoch(ShardId(1), 1).await.unwrap();
+    multiplexer.send_frame(WorkerId(352), frame).await.unwrap();
+    tokio::select! {
+        maybe = inlet_rx.recv() => panic!("unexpected duplicate delivery: {:?}", maybe),
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+
+    multiplexer
+        .send_frame(
+            WorkerId(352),
+            ShuffleFrame {
+                exchange_id: 100,
+                src_shard: 0,
+                target_shard: 1,
+                epoch: 2,
+                seq: 6,
+                payload: serialize_zset(&ArrowZSet::from_ab_rows(&[(12, 120)], 1))
+                    .unwrap()
+                    .into(),
+                row_count: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        inlet_rx.recv().await.unwrap().positive_ab_rows(),
+        vec![(12, 120)]
+    );
+    tokio::time::timeout(Duration::from_millis(200), async {
+        while flow_controller.rows_in_flight(100, 0, 1) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    unregister_shared_memory_endpoint(WorkerId(352));
     let _ = tx_close.send(());
     server_handle.abort();
     buggify_disable();
@@ -399,6 +529,7 @@ async fn az_domain_rebuild_during_drain_preserves_delivery_sim() {
                 epoch: 1,
                 seq: 9,
                 payload: payload.into(),
+                row_count: 1,
             },
         )
         .await
@@ -413,4 +544,112 @@ async fn az_domain_rebuild_during_drain_preserves_delivery_sim() {
     server_handle.abort();
     handle.shutdown();
     buggify_disable();
+}
+
+#[tokio::test]
+async fn exchange_domain_rebuild_releases_row_credits_during_drain_sim() {
+    buggify_init(5102);
+    buggify_focus("exchange.domain_rebuild_during_drain");
+    assert!(buggify!("exchange.domain_rebuild_during_drain", 1.0));
+
+    let catalog = TopologyCatalog::new();
+    let manager = ShardManager::new();
+    let store = Arc::new(InMemory::new());
+    let handle = ControlService::new(catalog.clone())
+        .with_shard_manager(manager.clone())
+        .with_topology_store(Arc::new(TopologyPersistentStore::new(store.clone())))
+        .with_migration_store(Arc::new(MigrationPersistentStore::new(store)))
+        .with_auto_drain(true)
+        .start("127.0.0.1:0")
+        .await
+        .unwrap();
+    for reg in [
+        registration_with_location(11, "host-a", "az-1"),
+        registration_with_location(12, "host-b", "az-2"),
+        registration_with_location(13, "host-c", "az-1"),
+    ] {
+        send(handle.addr, &WorkerMessage::Register(reg)).await;
+    }
+    manager.acquire(ShardId(88), WorkerId(11)).unwrap();
+    send(
+        handle.addr,
+        &WorkerMessage::RequestDrain {
+            worker_id: WorkerId(11),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(manager.get(ShardId(88)).unwrap().worker_id, WorkerId(13));
+
+    let src_db = shard_db("sim-drain-budget-src").await;
+    let sender_shards = make_sender_shards(src_db, WorkerId(11));
+    let target_db = shard_db("sim-drain-budget-dst").await;
+    let (registry, mut inlet_rx) = make_receiver_registry(target_db, WorkerId(13));
+    let flow_controller = FlowController::with_row_budget(1);
+    let durable_store = Arc::new(InMemory::new());
+    let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let pool = ShuffleClientPool::new(peers);
+    pool.set_local_worker_info(worker_info(
+        11,
+        "127.0.0.1:9411".to_string(),
+        "host-a",
+        "az-1",
+    ));
+    pool.upsert_peer_info(worker_info(
+        13,
+        "127.0.0.1:9413".to_string(),
+        "host-c",
+        "az-1",
+    ));
+    pool.upsert_peer_info(worker_info(
+        12,
+        "127.0.0.1:9412".to_string(),
+        "host-b",
+        "az-2",
+    ));
+    let multiplexer =
+        WorkerStreamMultiplexer::with_shards(pool, flow_controller.clone(), sender_shards)
+            .with_object_store(durable_store.clone())
+            .with_src_worker(WorkerId(11))
+            .with_worker_config(WorkerConfig {
+                segment_cache_bytes: 0,
+                max_rows_per_quantum: 1,
+            });
+
+    for (epoch, seq, row) in [(1, 9, (21, 210)), (2, 10, (22, 220))] {
+        multiplexer
+            .send_frame(
+                WorkerId(13),
+                ShuffleFrame {
+                    exchange_id: 100,
+                    src_shard: 0,
+                    target_shard: 1,
+                    epoch,
+                    seq,
+                    payload: serialize_zset(&ArrowZSet::from_ab_rows(&[row], 1))
+                        .unwrap()
+                        .into(),
+                    row_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+        multiplexer
+            .catch_up_durable(
+                100,
+                epoch,
+                WorkerId(11),
+                WorkerId(13),
+                &registry,
+                durable_store.as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inlet_rx.recv().await.unwrap().positive_ab_rows(), vec![row]);
+        assert_eq!(flow_controller.rows_in_flight(100, 0, 1), 0);
+    }
+
+    handle.shutdown();
+    buggify_disable();
+    let _ = registry;
 }

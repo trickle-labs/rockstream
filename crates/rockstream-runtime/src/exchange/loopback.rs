@@ -10,7 +10,6 @@ use rockstream_types::ids::ShardId;
 use rockstream_types::ids::{ExchangeId, WorkerId};
 
 use crate::client::ShardState;
-use crate::exchange::persistence::{delete_outbox, persist_inbox, persist_outbox};
 use crate::exchange::serialization::{deserialize_zset, serialize_zset_with_compression};
 use crate::exchange::service::ExchangeRegistry;
 use rockstream_types::exchange::ShuffleCompression;
@@ -92,16 +91,24 @@ impl LoopbackRouter {
         let src_db = self.get_db(ShardId(src_shard as u64))?;
         let target_db = self.get_db(ShardId(target_shard as u64))?;
 
-        // 1. Serialize payload to bytes (Arrow IPC)
+        // 1. Serialize payload to bytes (Arrow IPC) so same-process loopback
+        //    matches the wire-format verification of the network paths.
         let payload = serialize_zset_with_compression(zset, ShuffleCompression::Lz4, true)?;
 
-        // 2. Persist to outbox on the source shard db
-        persist_outbox(&src_db, exchange_id, target_shard, epoch, seq, &payload).await?;
+        // 2. Fast-path shuffle WAL elision (v0.51, Slice 2): the same-worker
+        //    loopback path no longer persists `shuffle_outbox/` on the source
+        //    shard db nor `shuffle_inbox/` on the target shard db. Replay-dedup
+        //    relies on the target shard's committed frontier.
+        let _ = &src_db;
+        let _ = (src_shard, seq);
+        let frontier = crate::exchange::persistence::committed_frontier(&target_db).await?;
+        if epoch <= frontier {
+            // Already reflected in the checkpointed operator state; skip to
+            // avoid duplicate delivery on replay.
+            return Ok(());
+        }
 
-        // 3. Persist to inbox on the target shard db
-        persist_inbox(&target_db, exchange_id, src_shard, epoch, seq, &payload).await?;
-
-        // 4. Look up target inlet
+        // 3. Look up target inlet
         let inlet = self
             .registry
             .get(exchange_id, target_shard)
@@ -112,18 +119,15 @@ impl LoopbackRouter {
                 )
             })?;
 
-        // 5. Deserialize to ensure same-process loopback matches wire format verification
+        // 4. Deserialize to ensure same-process loopback matches wire format verification
         let recovered_zset = deserialize_zset(&payload, inlet.schema.clone())?;
 
-        // 6. Forward to local inlet channel
+        // 5. Forward to local inlet channel
         inlet
             .sender
             .send(recovered_zset)
             .await
             .map_err(|e| format!("Failed to forward to local inlet: {:?}", e))?;
-
-        // 7. Delete from outbox once successfully delivered
-        delete_outbox(&src_db, exchange_id, target_shard, epoch, seq).await?;
 
         Ok(())
     }

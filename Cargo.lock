@@ -5734,6 +5734,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "object_store 0.12.5",
+ "parking_lot",
  "proptest",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -5746,10 +5747,12 @@ dependencies = [
  "rockstream-storage",
  "rockstream-types",
  "sha2 0.10.9",
+ "tempfile",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
  "tokio-postgres",
+ "tonic 0.12.3",
 ]
 
 [[package]]

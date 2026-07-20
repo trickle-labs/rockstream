@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use futures::{Stream, StreamExt};
 use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
-use rockstream_types::config::ExchangeConfig;
+use rockstream_types::config::{ExchangeConfig, WorkerConfig};
 use rockstream_types::exchange::{
     ExchangeAnn, ExchangePath, ExchangeTransport, ShuffleCompression,
 };
@@ -96,6 +96,12 @@ impl WorkerStreamMultiplexer {
     pub fn with_exchange_config(mut self, exchange_config: ExchangeConfig) -> Self {
         self.shared_memory = SharedMemorySegmentPool::new(exchange_config.clone());
         self.exchange_config = exchange_config;
+        self
+    }
+
+    pub fn with_worker_config(self, worker_config: WorkerConfig) -> Self {
+        self.flow_controller
+            .set_row_budget(worker_config.max_rows_per_quantum as u32);
         self
     }
 
@@ -190,6 +196,26 @@ impl WorkerStreamMultiplexer {
         target_worker: WorkerId,
         frame: ShuffleFrame,
     ) -> Result<(), String> {
+        let exchange_id = frame.exchange_id;
+        let src_shard = frame.src_shard;
+        let target_shard = frame.target_shard;
+        let row_count = frame.row_count;
+        self.flow_controller
+            .acquire_credit(exchange_id, src_shard, target_shard, row_count)
+            .await?;
+        let result = self.send_frame_after_credit(target_worker, frame).await;
+        if result.is_err() {
+            self.flow_controller
+                .release_credit(exchange_id, src_shard, target_shard, row_count);
+        }
+        result
+    }
+
+    async fn send_frame_after_credit(
+        &self,
+        target_worker: WorkerId,
+        frame: ShuffleFrame,
+    ) -> Result<(), String> {
         let route = self.classify_route(target_worker, &frame);
         let encoded_payload =
             self.encode_payload_for_route(target_worker, &route, &frame.payload)?;
@@ -231,18 +257,12 @@ impl WorkerStreamMultiplexer {
                 "exchange route used safe fallback because worker locality metadata was unavailable"
             );
         }
-        // Persist to outbox if source shard db is active on this worker
-        if let Some(db) = self.get_shard_db(frame.src_shard) {
-            crate::exchange::persistence::persist_outbox(
-                &db,
-                frame.exchange_id,
-                frame.target_shard,
-                frame.epoch,
-                frame.seq,
-                &frame.payload,
-            )
-            .await?;
-        }
+        // Fast-path shuffle WAL elision (v0.51, Slice 1): a successfully
+        // delivered direct/shared-memory/loopback frame is NOT persisted to the
+        // local `shuffle_outbox/`. Recovery relies on the checkpoint frontier +
+        // source replay + durable object-store fallback, not on fast-path WAL
+        // entries. Only the durable fallback below persists (to the object
+        // store), which remains the explicit recovery path.
 
         let mut fast_path_ok = false;
 
@@ -250,16 +270,6 @@ impl WorkerStreamMultiplexer {
             match self.send_shared_memory_frame(target_worker, &frame).await {
                 Ok(ack) => {
                     self.flow_controller.handle_ack(&ack);
-                    if let Some(db) = self.get_shard_db(ack.src_shard) {
-                        let _ = crate::exchange::persistence::delete_outbox_if_present(
-                            &db,
-                            ack.exchange_id,
-                            ack.target_shard,
-                            ack.epoch,
-                            ack.seq,
-                        )
-                        .await;
-                    }
                     fast_path_ok = true;
                 }
                 Err(error) => {
@@ -303,25 +313,15 @@ impl WorkerStreamMultiplexer {
                         Ok(response) => {
                             let mut response_stream = response.into_inner();
                             let flow_controller = self.flow_controller.clone();
-                            let self_clone = self.clone();
-                            // Spawn task to process ACKs from the peer
+                            // Spawn task to process ACKs from the peer. With
+                            // fast-path WAL elision (v0.51) there is no local
+                            // outbox entry to delete on ACK; the ACK only drives
+                            // flow-control credit release.
                             tokio::spawn(async move {
                                 while let Some(res) = response_stream.next().await {
                                     match res {
                                         Ok(ack) => {
                                             flow_controller.handle_ack(&ack);
-                                            if let Some(db) = self_clone.get_shard_db(ack.src_shard)
-                                            {
-                                                let _ =
-                                                    crate::exchange::persistence::delete_outbox_if_present(
-                                                        &db,
-                                                        ack.exchange_id,
-                                                        ack.target_shard,
-                                                        ack.epoch,
-                                                        ack.seq,
-                                                    )
-                                                    .await;
-                                            }
                                         }
                                         Err(e) => {
                                             tracing::error!(
@@ -446,18 +446,16 @@ impl WorkerStreamMultiplexer {
                     e
                 )
             })?;
+            self.flow_controller.release_credit(
+                frame.exchange_id,
+                frame.src_shard,
+                frame.target_shard,
+                frame.row_count,
+            );
 
-            // Delete from local outbox on successful upload, since delivery is now guaranteed via object store.
-            if let Some(db) = self.get_shard_db(frame.src_shard) {
-                let _ = crate::exchange::persistence::delete_outbox(
-                    &db,
-                    frame.exchange_id,
-                    frame.target_shard,
-                    frame.epoch,
-                    frame.seq,
-                )
-                .await;
-            }
+            // No local outbox to delete: with fast-path WAL elision (v0.51) the
+            // outbox is never written; the durable object upload above is the
+            // persisted recovery path.
         }
 
         Ok(())

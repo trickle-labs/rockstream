@@ -571,11 +571,12 @@ fn test_benchmark_ci_job_exists_and_covers_four_subsystems() {
             job_body.contains(&format!("--tag {tag}")),
             "benchmark job must invoke bench_regression_gate with `--tag {tag}`"
         );
-        let baseline_path = format!("crates/rockstream-{tag}/benches/baseline/v0.45.4-{tag}.json");
         let baseline_path = if tag == "ops" {
             "crates/rockstream-ops/benches/baseline/v0.45.4-ops.json".to_string()
+        } else if tag == "runtime" {
+            "crates/rockstream-runtime/benches/baseline/v0.51-runtime.json".to_string()
         } else {
-            baseline_path
+            format!("crates/rockstream-{tag}/benches/baseline/v0.45.4-{tag}.json")
         };
         assert!(
             job_body.contains(&baseline_path),

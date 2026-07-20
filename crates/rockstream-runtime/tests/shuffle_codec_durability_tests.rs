@@ -159,6 +159,7 @@ async fn exercise_same_host_shm_replay(
     let src_db = reopen_db("shm-src", src_store.clone()).await;
     let sender_shards = make_sender_shards(src_db.clone(), src_worker_id);
     let target_db = reopen_db("shm-dst", target_store.clone()).await;
+    let target_db_handle = target_db.clone();
     let (registry, mut inlet_rx) = make_receiver_registry(target_db, target_worker_id);
     register_shared_memory_endpoint(target_worker_id, registry);
 
@@ -187,6 +188,7 @@ async fn exercise_same_host_shm_replay(
         epoch: 1,
         seq: 6,
         payload: payload.clone().into(),
+        row_count: 1,
     };
     multiplexer
         .send_frame(target_worker_id, frame.clone())
@@ -196,8 +198,19 @@ async fn exercise_same_host_shm_replay(
         inlet_rx.recv().await.unwrap().positive_ab_rows(),
         vec![(12, 120)]
     );
+    // The target operator checkpoints epoch 1: its committed frontier is durably
+    // advanced. With fast-path WAL elision, no shuffle_inbox/ key exists — restart
+    // dedup relies on the committed frontier being restored from durable storage.
+    target_db_handle.commit_epoch(ShardId(1), 1).await.unwrap();
+    // No fast-path shuffle WAL was written on either side.
+    assert_eq!(
+        target_db_handle.scan_prefix(&[0x04]).await.unwrap().len(),
+        0
+    );
+    assert_eq!(src_db.scan_prefix(&[0x05]).await.unwrap().len(), 0);
     unregister_shared_memory_endpoint(target_worker_id);
     src_db.close().await.unwrap();
+    target_db_handle.close().await.unwrap();
 
     let reopened_src = reopen_db("shm-src", src_store).await;
     let reopened_target = reopen_db("shm-dst", target_store).await;
@@ -270,7 +283,7 @@ async fn legacy_and_codec_v1_shuffle_payloads_replay_after_minio_tc_restart() {
 }
 
 #[tokio::test]
-async fn same_host_shm_fast_path_replays_after_lfs_restart() {
+async fn same_host_shm_fast_path_replays_from_frontier_after_lfs_restart_without_shuffle_wal() {
     let dir = tempfile::tempdir().unwrap();
     let src_store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
@@ -280,10 +293,11 @@ async fn same_host_shm_fast_path_replays_after_lfs_restart() {
 }
 
 #[tokio::test]
-async fn same_host_shm_fast_path_replays_after_minio_tc_restart() {
+async fn same_host_shm_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal()
+{
     if !docker_available() {
         eprintln!(
-            "SKIP same_host_shm_fast_path_replays_after_minio_tc_restart: Docker not available"
+            "SKIP same_host_shm_fast_path_replays_from_frontier_after_minio_tc_restart_without_shuffle_wal: Docker not available"
         );
         return;
     }

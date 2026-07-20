@@ -334,8 +334,8 @@ jobs:
         run: cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-storage/benches/baseline/v0.45.4-storage.json --output storage-bench.out --tag storage
       - name: run rockstream-runtime bench
         run: cargo bench -p rockstream-runtime --bench exchange_bench -- --noplot | tee runtime-bench.out
-      - name: compare rockstream-runtime against v0.45.4 baseline
-        run: cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.45.4-runtime.json --output runtime-bench.out --tag runtime
+      - name: compare rockstream-runtime against v0.51 baseline
+        run: cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.51-runtime.json --output runtime-bench.out --tag runtime
       - name: run rockstream-control bench
         run: cargo bench -p rockstream-control --bench frontier_bench -- --noplot | tee control-bench.out
       - name: compare rockstream-control against v0.45.4 baseline

@@ -221,6 +221,15 @@ pub const RS_3021: ErrorCode = ErrorCode::new(3021);
 /// Cluster checkpoint manifest codec is unknown or decompression failed (v0.49).
 /// next_steps: "Verify the control-plane capability floor, inspect control: checkpoints/ payloads for corruption, and complete the rolling upgrade before enabling manifest compression."
 pub const RS_3022: ErrorCode = ErrorCode::new(3022);
+/// Fast-path shuffle frontier read failed while deduplicating a replayed frame (v0.51).
+/// With fast-path shuffle WAL elision, the receiver dedups replayed frames against the
+/// target shard's committed frontier instead of a persisted inbox entry. A failed read
+/// means the receiver could not confirm whether the frame was already reflected.
+/// next_steps: "Inspect target shard storage health and the committed frontier key; the frame was delivered conservatively, so verify downstream idempotency if the shard is unhealthy."
+pub const RS_3023: ErrorCode = ErrorCode::new(3023);
+/// Shuffle frame row budget exceeded the configured `worker.max_rows_per_quantum` bound (v0.51).
+/// next_steps: "Reduce exchange batch size or rechunking, or raise worker.max_rows_per_quantum within the worker memory/network budget."
+pub const RS_3024: ErrorCode = ErrorCode::new(3024);
 /// Pipeline blocked due to object store brownout; local buffer exhausted (v0.36, DESIGN.md §11.7).
 pub const RS_3003: ErrorCode = ErrorCode::new(3003);
 /// Worker drain in progress; new shard assignments rejected (v0.38).
@@ -406,6 +415,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         3017 => "Exchange IPC shuffle decode error",
         3018 => "Exchange loopback route target shard has no active ShardDb",
         3022 => "Cluster checkpoint manifest codec decode error",
+        3023 => "Fast-path shuffle frontier read failed during replay dedup",
+        3024 => "Shuffle frame row budget exceeded worker.max_rows_per_quantum",
         3501 => "Merge-law accumulator wire bytes have the wrong size",
         3604 => "Worker drain in progress; new shard assignments rejected",
         3605 => "Shard load factor exceeds skew threshold; adaptive re-sharding scheduled",
@@ -467,6 +478,7 @@ pub fn severity(code: ErrorCode) -> Severity {
         3017 => Severity::Error,
         3018 => Severity::Error,
         3022 => Severity::Error,
+        3023 => Severity::Warning,
         3501 => Severity::Error,
         5001 => Severity::Fatal,
         5002 => Severity::Fatal,
@@ -545,6 +557,8 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         3017 => "Inspect the Arrow IPC shuffle payload; possible truncation or a version mismatch between the writer and reader.",
         3018 => "Verify the target shard is registered and its ShardDb has been attached before routing; check shard assignment and worker startup order.",
         3022 => "Verify the control-plane capability floor, inspect the stored checkpoint manifest bytes for corruption, and finish the rolling upgrade before re-enabling manifest compression.",
+        3023 => "Inspect target shard storage health and the committed frontier key; the frame was delivered conservatively, so verify downstream idempotency if the shard is unhealthy.",
+        3024 => "Reduce exchange batch size/rechunking or raise worker.max_rows_per_quantum only if the worker can safely absorb a larger in-flight row budget.",
         3501 => "Inspect the stored merge-law accumulator bytes; possible data corruption or an accumulator wire-format version mismatch.",
         3601 => "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation.",
         3602 => "Wait for recovery to complete; monitor shard reassignment and frontier progress via SHOW VIEW STATUS.",
@@ -620,10 +634,10 @@ mod tests {
             RS_1007, RS_1008, RS_1030, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006,
             RS_2007, RS_2008, RS_2014, RS_2015, RS_2016, RS_2017, RS_2018, RS_2021, RS_3003,
             RS_3009, RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016, RS_3017, RS_3018,
-            RS_3022, RS_3501, RS_4001, RS_4002, RS_5001, RS_5002, RS_5003, RS_5030, RS_5031,
-            RS_5032, RS_5035, RS_5036, RS_1512, RS_1513, RS_3601, RS_3602, RS_3603, RS_1701,
-            RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016, RS_1017, RS_1012,
-            RS_1013, RS_1014, RS_8001, // v0.21
+            RS_3022, RS_3023, RS_3024, RS_3501, RS_4001, RS_4002, RS_5001, RS_5002, RS_5003,
+            RS_5030, RS_5031, RS_5032, RS_5035, RS_5036, RS_1512, RS_1513, RS_3601, RS_3602,
+            RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016,
+            RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
             RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_3005, RS_1018, RS_2400, RS_2401,
             RS_2402, // v0.26 auth
             RS_9001, // v0.45.1 admission control

@@ -87,6 +87,7 @@ async fn test_distributed_tpch_connections_bounded() {
             epoch: 1,
             seq: target_shard as u64 + 1,
             payload: payload.into(),
+            row_count: zset.num_rows() as u32,
         };
 
         // Send to Worker 2
@@ -378,6 +379,7 @@ async fn test_durable_shuffle_fallback() {
         epoch: 1,
         seq: 1,
         payload: payload.into(),
+        row_count: zset.num_rows() as u32,
     };
 
     multiplexer.send_frame(WorkerId(2), frame).await.unwrap();

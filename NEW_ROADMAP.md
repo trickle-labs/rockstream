@@ -926,7 +926,7 @@ it schedules must be implemented in `rockstream-control`, never in
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
 | v0.50 | Advanced Streaming Analytics ✅ Done | SQL compiler support for recursive CTEs (`WITH RECURSIVE`) for graph algorithms and fixed-point IVM, lateral joins for nested JSON/arrays, and hopping/session windows. | Transitive closures and sessionization queries incrementally maintain state correctly against the correctness oracle. | Unit, LFS, MinIO, TC |
-| v0.51 | Hot-Path Compute Optimizations | WAL elision for derived intermediate operator shards; link `max_rows_per_quantum` directly to network buffer depth to provide tight backpressure coupling. | Throughput on complex DAGs increases by >30% due to reduced intermediate WAL write amplification. | Unit, LFS, MinIO, TC |
+| v0.51 | Hot-Path Compute Optimizations ✅ Done | WAL elision for derived intermediate operator shards; link `max_rows_per_quantum` directly to network buffer depth to provide tight backpressure coupling. | Throughput on complex DAGs increases by >30% due to reduced intermediate WAL write amplification. | Unit, LFS, MinIO, TC |
 
 **Live end-to-end wire-protocol review (2026-07-19).** Every review paragraph
 above audited `DESIGN.md`/`NEW_IMPLEMENTATION_PLAN.md` claims against

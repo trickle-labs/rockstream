@@ -11,7 +11,7 @@ use crate::exchange::proto::ShuffleFrame;
 use crate::exchange::service::ExchangeRegistry;
 use crate::exchange::{persistence, serialization};
 use rockstream_types::config::ExchangeConfig;
-use rockstream_types::error_code::{RS_3019, RS_3020};
+use rockstream_types::error_code::{RS_3019, RS_3020, RS_3023};
 use rockstream_types::ids::WorkerId;
 
 static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +45,7 @@ pub struct SharedMemoryTicketEnvelope {
     pub target_shard: u32,
     pub epoch: u64,
     pub seq: u64,
+    pub row_count: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,6 +113,7 @@ impl SharedMemorySegmentPool {
             target_shard: frame.target_shard,
             epoch: frame.epoch,
             seq: frame.seq,
+            row_count: frame.row_count,
         })
     }
 
@@ -207,28 +209,23 @@ async fn deliver_ticket(
         .get_shard_db(ticket.target_shard)
         .ok_or_else(|| format!("target shard db not active for worker {worker_id}"))?;
 
-    let inbox_key = persistence::inbox_key(
-        ticket.exchange_id,
-        ticket.src_shard,
-        ticket.epoch,
-        ticket.seq,
-    );
-    let already_seen = target_db
-        .get(&inbox_key)
-        .await
-        .map_err(|e| format!("inbox read failed: {e:?}"))?
-        .is_some();
-    if !already_seen {
-        persistence::persist_inbox(
-            &target_db,
-            ticket.exchange_id,
-            ticket.src_shard,
-            ticket.epoch,
-            ticket.seq,
-            &payload,
-        )
-        .await?;
-
+    // Fast-path shuffle WAL elision (v0.51, Slice 2): same-host shared-memory
+    // delivery no longer persists a `shuffle_inbox/` key. Replay-dedup relies on
+    // the target shard's committed frontier.
+    let already_reflected = match persistence::committed_frontier(&target_db).await {
+        Ok(frontier) => ticket.epoch <= frontier,
+        Err(e) => {
+            tracing::warn!(
+                code = %RS_3023,
+                exchange_id = ticket.exchange_id,
+                target_shard = ticket.target_shard,
+                epoch = ticket.epoch,
+                "failed to read committed frontier for shared-memory replay dedup; delivering conservatively: {e}"
+            );
+            false
+        }
+    };
+    if !already_reflected {
         let zset = serialization::deserialize_zset(&payload, inlet.schema.clone()).map_err(|e| {
             format!(
                 "[{RS_3020}] shared-memory payload decode failed: {e}. Next steps: verify both workers run the same codec-capable build and inspect the payload bytes for corruption."
@@ -247,7 +244,7 @@ async fn deliver_ticket(
         target_shard: ticket.target_shard,
         epoch: ticket.epoch,
         seq: ticket.seq,
-        credit_grant: 1,
+        credit_grant: ticket.row_count.max(1),
     })
 }
 

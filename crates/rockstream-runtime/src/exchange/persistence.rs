@@ -1,6 +1,35 @@
 use rockstream_storage::keys::{ShardKeyEncoder, ShardPrefix};
 use rockstream_storage::shard_db::ShardDb;
 
+/// Reads the committed frontier epoch for a shard.
+///
+/// With fast-path shuffle WAL elision (v0.51), successful direct-gRPC,
+/// same-host shared-memory, and loopback deliveries no longer persist
+/// `shuffle_inbox/` keys. Replay-dedup therefore relies on the shard's durable
+/// committed frontier: any shuffle frame whose `epoch <= committed_frontier` is
+/// already reflected in the checkpointed operator state and must not be
+/// re-delivered after a restart/replay.
+///
+/// The read is best-effort. On a storage read failure it returns `0` (treating
+/// the frame as not-yet-reflected so it is delivered conservatively) and the
+/// caller logs [`rockstream_types::error_code::RS_3023`].
+pub async fn committed_frontier(db: &ShardDb) -> Result<u64, String> {
+    let key = ShardKeyEncoder::frontier_key();
+    let value = db
+        .get(&key)
+        .await
+        .map_err(|e| format!("Failed to read committed frontier: {:?}", e))?;
+    Ok(value
+        .and_then(|bytes| {
+            if bytes.len() == 8 {
+                Some(u64::from_be_bytes(bytes[..8].try_into().unwrap()))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0))
+}
+
 /// Encodes a shuffle outbox key.
 pub fn outbox_key(exchange_id: u64, target_shard: u32, epoch: u64, seq: u64) -> Vec<u8> {
     let mut suffix = Vec::with_capacity(4 + 8 + 8);

@@ -1,0 +1,11 @@
+{
+  "exchange_bench_direct_lz4_epoch_cpu_budget/direct_lz4_epoch_cpu_ms": 142146.20068380513,
+  "exchange_complex_dag_hot_path/legacy_wal_on": 617960474.9,
+  "exchange_complex_dag_hot_path/wal_elided_quantum_coupled": 55419901.38172619,
+  "exchange_deserialize_zset/deserialize": 11880.696722790946,
+  "exchange_flow_control/acquire_ack_pair": 120.79376696293328,
+  "exchange_serialize_zset/serialize": 11190.472045844346,
+  "exchange_transport_claims/direct_lz4_codec_v1": 17769.593267247223,
+  "exchange_transport_claims/direct_raw_baseline": 23639.729365821266,
+  "exchange_transport_claims/durable_zstd_codec_v1": 22872.234896441525
+}
