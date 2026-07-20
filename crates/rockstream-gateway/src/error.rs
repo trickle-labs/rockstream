@@ -30,6 +30,12 @@ pub enum GatewayError {
     },
 
     /// [RS-2007] write.idempotency_key_required.
+    ///
+    /// As of v0.51.1, a COMMIT with neither `SET rockstream.idempotency_key`
+    /// nor `SET rockstream.source_epoch` no longer fails: the server mints a
+    /// fresh CSPRNG-derived idempotency key for that commit instead. This
+    /// variant is retained for protocol/documentation stability but is no
+    /// longer reachable from the normal write-commit path.
     #[error("[RS-2007] write.idempotency_key_required: SET rockstream.idempotency_key = '<key>' or SET rockstream.source_epoch = N before COMMIT.")]
     IdempotencyKeyRequired,
 

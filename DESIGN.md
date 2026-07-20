@@ -1521,7 +1521,9 @@ in [ideas/crdts.md](ideas/crdts.md); the design-level commitments are:
    the built-in catalog property suite must accept it before it can be
    used in a `PlanNode`. Non-idempotent laws written through the
    direct-write gateway require either exact-once source offsets or an
-   idempotency key; a write missing both is rejected with `RS-2007`.
+   idempotency key; if a write carries neither, the gateway mints a
+   fresh server-generated idempotency key for that commit (v0.51.1) so
+   the write still succeeds, rather than rejecting it with `RS-2007`.
 
 8. **Active-active multi-region writes remain a non-goal through 1.0.**
    The law contract is structured so an idempotent join semilattice

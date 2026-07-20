@@ -1192,6 +1192,10 @@ async fn insert_accumulates_in_write_buffer() {
         .await
         .expect("CREATE TABLE failed");
     client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN failed");
+    client
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
         .expect("INSERT failed");
@@ -1220,6 +1224,10 @@ async fn delete_accumulates_in_write_buffer() {
         .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
         .await
         .expect("CREATE TABLE failed");
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN failed");
     client
         .simple_query("DELETE FROM t WHERE id = 1")
         .await
@@ -1250,6 +1258,10 @@ async fn commit_flushes_rows_scannable_via_view_prefix() {
         .simple_query("SET rockstream.idempotency_key = 's4-commit-flush-key'")
         .await
         .expect("SET idempotency_key failed");
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN failed");
     client
         .simple_query("INSERT INTO orders (id, amount) VALUES (42, 99)")
         .await
@@ -1312,6 +1324,10 @@ async fn rollback_discards_write_buffer_no_shard_writes() {
         .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
         .await
         .expect("CREATE TABLE failed");
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN failed");
     client
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
@@ -1674,30 +1690,133 @@ async fn multi_row_insert_malformed_row_returns_rs2056_not_silent_corruption() {
 // v0.24 S6 idempotency tests
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// S6 green gate: COMMIT without idempotency_key or source_epoch returns RS-2007.
+/// v0.51.1 Slice 2 green gate: COMMIT without idempotency_key or source_epoch
+/// no longer returns RS-2007. The gateway mints a server-generated
+/// idempotency envelope for the commit instead, and the write succeeds and
+/// is visible.
 #[tokio::test]
-async fn missing_idempotency_key_returns_rs2007() {
+async fn missing_idempotency_key_autogenerates_envelope_and_commits() {
     let (port, _handle, _shard_db) = start_gateway_with_shard("s6-missing-key").await;
     let client = connect_port(port).await;
 
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN failed");
     client
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
         .expect("INSERT failed");
 
-    // COMMIT without setting idempotency_key or source_epoch → RS-2007
+    // COMMIT without setting idempotency_key or source_epoch now succeeds —
+    // the gateway generates a fresh envelope server-side instead of RS-2007.
     let result = client.simple_query("COMMIT").await;
-    let got_rs2007 = match &result {
-        Err(e) => {
-            if let Some(db_err) = e.as_db_error() {
-                db_err.message().contains("RS-2007")
-            } else {
-                e.to_string().contains("RS-2007")
-            }
-        }
-        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("RS-2007")),
-    };
-    assert!(got_rs2007, "expected RS-2007; got: {result:?}");
+    assert!(
+        result.is_ok(),
+        "expected COMMIT to succeed with a server-generated idempotency envelope; got: {result:?}"
+    );
+
+    let rows = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT failed");
+    let data_rows = data_rows_from(&rows);
+    assert_eq!(
+        data_rows.len(),
+        1,
+        "expected the committed row to be visible, got: {data_rows:?}"
+    );
+    assert_eq!(data_rows[0].get("id"), Some("1"));
+    assert_eq!(data_rows[0].get("val"), Some("hello"));
+}
+
+
+/// v0.51.1 Slice 2 regression: explicit `SET rockstream.idempotency_key` set
+/// once before two INSERTs inside an explicit BEGIN...COMMIT still dedupes a
+/// replayed identical commit — the dedup guarantee spans the whole explicit
+/// multi-statement transaction, not just a single autocommitted statement.
+#[tokio::test]
+async fn explicit_idempotency_key_dedupes_multi_statement_transaction_replay() {
+    let (port, _handle, shard_db) =
+        start_gateway_with_shard("s6-explicit-multi-stmt-replay").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    // First transaction: two inserts under one idempotency key.
+    client
+        .simple_query("SET rockstream.idempotency_key = 'multi-stmt-key-1'")
+        .await
+        .expect("SET failed");
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'alice')")
+        .await
+        .expect("INSERT 1 failed");
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (2, 'bob')")
+        .await
+        .expect("INSERT 2 failed");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT 1 failed");
+
+    shard_db.flush().await.unwrap();
+    let msgs1 = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT 1");
+    let rows1 = data_rows_from(&msgs1);
+    assert_eq!(
+        rows1.len(),
+        2,
+        "expected 2 rows after first commit, got {}",
+        rows1.len()
+    );
+
+    // Replay the exact same key and statements — should be a no-op.
+    client
+        .simple_query("SET rockstream.idempotency_key = 'multi-stmt-key-1'")
+        .await
+        .expect("SET replay failed");
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN replay failed");
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'alice')")
+        .await
+        .expect("INSERT replay 1 failed");
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (2, 'bob')")
+        .await
+        .expect("INSERT replay 2 failed");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT replay failed");
+
+    shard_db.flush().await.unwrap();
+    let msgs2 = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT 2");
+    let rows2 = data_rows_from(&msgs2);
+    assert_eq!(
+        rows2.len(),
+        2,
+        "expected still 2 rows after replayed multi-statement transaction, got {}",
+        rows2.len()
+    );
 }
 
 /// S6 green gate: idempotent replay of a committed write is a no-op.
@@ -1854,30 +1973,49 @@ async fn proof_psql_insert_commit_reflects_in_view() {
     assert_eq!(data_rows[0].get("amount").unwrap_or(""), "500");
 }
 
-/// P2 (S10): A write missing idempotency_key returns RS-2007.
+/// P2 (S10): A write missing idempotency_key no longer returns RS-2007 —
+/// the gateway generates a server-side envelope and the commit succeeds
+/// (v0.51.1 Slice 2).
 #[tokio::test]
-async fn proof_missing_idempotency_returns_rs2007() {
-    let (port, _handle, _shard_db) = start_gateway_with_shard("proof-p2-missing-key").await;
+async fn proof_missing_idempotency_autogenerates_envelope_and_commits() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("proof-p2-missing-key").await;
     let client = connect_port(port).await;
 
-    // Do NOT set idempotency_key
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    // Do NOT set idempotency_key; use an explicit BEGIN so the write stays
+    // buffered until COMMIT, exercising the envelope-generation path.
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN should succeed");
     client
         .simple_query("INSERT INTO orders (id, amount) VALUES (1, 500)")
         .await
         .expect("INSERT should succeed");
 
     let result = client.simple_query("COMMIT").await;
-    let got_rs2007 = match &result {
-        Err(e) => {
-            if let Some(db_err) = e.as_db_error() {
-                db_err.message().contains("RS-2007")
-            } else {
-                e.to_string().contains("RS-2007")
-            }
-        }
-        Ok(msgs) => msgs.iter().any(|m| format!("{m:?}").contains("RS-2007")),
-    };
-    assert!(got_rs2007, "P2: expected RS-2007; got: {result:?}");
+    assert!(
+        result.is_ok(),
+        "P2: expected COMMIT to succeed with a server-generated idempotency envelope; got: {result:?}"
+    );
+
+    shard_db.flush().await.unwrap();
+    let msgs = client
+        .simple_query("SELECT * FROM orders")
+        .await
+        .expect("SELECT orders failed");
+    let data_rows = data_rows_from(&msgs);
+    assert_eq!(
+        data_rows.len(),
+        1,
+        "P2: expected the committed row to be visible, got: {data_rows:?}"
+    );
+    assert_eq!(data_rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(data_rows[0].get("amount").unwrap_or(""), "500");
 }
 
 /// P3a (S8/S10): Idempotent replay on LFS is a no-op.
@@ -3320,6 +3458,10 @@ async fn last_hop_view_materialised_after_commit() {
         .await
         .expect("SET idempotency_key");
     client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN");
+    client
         .simple_query("INSERT INTO orders (id, amount) VALUES (1, 100)")
         .await
         .expect("INSERT row 1");
@@ -3393,6 +3535,10 @@ async fn last_hop_aggregate_view_materialised_after_commit() {
         .simple_query("SET rockstream.idempotency_key = 'last-hop-agg-001'")
         .await
         .expect("SET");
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN");
     // 3 clicks: /home × 2, /pricing × 1
     client
         .simple_query("INSERT INTO clicks (user_id, url, ts) VALUES (1, '/home', 100)")
@@ -3734,6 +3880,10 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
         .await
         .expect("SET idempotency_key 1");
     client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN 1");
+    client
         .simple_query("INSERT INTO campaigns (campaign_id, name, channel, budget) VALUES (1, 'Summer Sale', 'email', 5000)")
         .await
         .expect("INSERT campaign 1");
@@ -3769,6 +3919,10 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
         .simple_query("SET rockstream.idempotency_key = 'tutorial-dag-txn-002'")
         .await
         .expect("SET idempotency_key 2");
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("BEGIN 2");
     client
         .simple_query("INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (101, 1, 300, 1000)")
         .await
@@ -6393,4 +6547,296 @@ fn scatter_pruning_metrics_exported_correctly() {
     assert!(metrics.contains("scatter_shards_total"));
     assert!(metrics.contains("scatter_shards_pruned_total"));
     assert!(metrics.contains("shard_bloom_false_positive_total"));
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v0.51.1 Slice 3 — implicit (standard-PostgreSQL) autocommit
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Slice 3 core Gap-1 regression: a bare `INSERT` (no `RETURNING`, no
+/// explicit `BEGIN`, no `SET`) followed by a `SELECT` in a **separate simple
+/// query round-trip** returns the row — matching standard PostgreSQL
+/// autocommit semantics.
+#[tokio::test]
+async fn bare_insert_autocommits_and_is_visible_in_separate_round_trip() {
+    let (port, _handle, shard_db) = start_gateway_with_shard("s3a-bare-insert-autocommit").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    // No SET, no BEGIN, no RETURNING — a vanilla autocommitting INSERT.
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'alice')")
+        .await
+        .expect("INSERT failed");
+
+    // Separate simple-query round-trip.
+    shard_db.flush().await.unwrap();
+    let msgs = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT t failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected the bare INSERT to autocommit and be visible; got {} rows",
+        rows.len()
+    );
+    assert_eq!(rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(rows[0].get("name").unwrap_or(""), "alice");
+}
+
+/// Slice 3: a bare `UPDATE`/`DELETE` (no `RETURNING`, no explicit `BEGIN`)
+/// autocommits the same way a bare `INSERT` does.
+#[tokio::test]
+async fn bare_update_and_delete_autocommit_and_are_visible_in_separate_round_trip() {
+    let (port, _handle, shard_db) =
+        start_gateway_with_shard("s3a-bare-update-delete-autocommit").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .expect("seed INSERT failed");
+
+    // Bare UPDATE — no RETURNING, no explicit BEGIN — autocommits.
+    // (WHERE must specify every original column value: this gateway resolves
+    // WHERE against the exact row key, not a predicate scan.)
+    client
+        .simple_query("UPDATE t SET name = 'alice2' WHERE id = 1, name = 'alice'")
+        .await
+        .expect("UPDATE failed");
+
+    shard_db.flush().await.unwrap();
+    let after_update_msgs = client
+        .simple_query("SELECT * FROM t ORDER BY id")
+        .await
+        .expect("SELECT after UPDATE failed");
+    let after_update = data_rows_from(&after_update_msgs);
+    assert_eq!(after_update.len(), 2, "expected 2 rows after UPDATE");
+    assert_eq!(after_update[0].get("name").unwrap_or(""), "alice2");
+
+    // Bare DELETE — no RETURNING, no explicit BEGIN — autocommits.
+    client
+        .simple_query("DELETE FROM t WHERE id = 2, name = 'bob'")
+        .await
+        .expect("DELETE failed");
+
+    shard_db.flush().await.unwrap();
+    let after_delete_msgs = client
+        .simple_query("SELECT * FROM t ORDER BY id")
+        .await
+        .expect("SELECT after DELETE failed");
+    let after_delete = data_rows_from(&after_delete_msgs);
+    assert_eq!(
+        after_delete.len(),
+        1,
+        "expected bare DELETE to autocommit, leaving 1 row; got {}",
+        after_delete.len()
+    );
+    assert_eq!(after_delete[0].get("id").unwrap_or(""), "1");
+}
+
+/// Slice 3 regression: an explicit `BEGIN; INSERT; INSERT;` (no `COMMIT`
+/// yet) followed by a `SELECT` in a separate round-trip still returns
+/// **zero** rows — explicit-block buffering is unaffected by autocommit.
+#[tokio::test]
+async fn explicit_begin_block_still_buffers_until_commit() {
+    let (port, _handle, _shard_db) =
+        start_gateway_with_shard("s3a-explicit-begin-still-buffers").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'alice')")
+        .await
+        .expect("INSERT 1 failed");
+    client
+        .simple_query("INSERT INTO t VALUES (2, 'bob')")
+        .await
+        .expect("INSERT 2 failed");
+
+    // No COMMIT yet — separate round-trip SELECT must see zero rows.
+    let msgs = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT t failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(
+        rows.len(),
+        0,
+        "expected explicit BEGIN block to still buffer until COMMIT; got {} rows",
+        rows.len()
+    );
+}
+
+/// v0.51.1 Slice 4: a freshly `CREATE MATERIALIZED VIEW`'d view must reflect
+/// its source table's current data immediately — before any further write —
+/// with no second COMMIT required to see it.
+#[tokio::test]
+async fn create_materialized_view_populates_immediately_without_further_write() {
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("s4-immediate-mv-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("INSERT INTO t (id, name) VALUES (1, 'alice')")
+        .await
+        .expect("INSERT failed");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT failed");
+
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, name FROM t")
+        .await
+        .expect("CREATE MATERIALIZED VIEW failed");
+
+    // No further write on this connection — the view must already be
+    // populated from the immediate synchronous materialization.
+    let msgs = client
+        .simple_query("SELECT * FROM mv")
+        .await
+        .expect("SELECT mv failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected mv to be immediately populated with 1 row; got {}",
+        rows.len()
+    );
+    assert_eq!(rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(rows[0].get("name").unwrap_or(""), "alice");
+}
+
+/// v0.51.1 Slice 4 regression: after immediate population on CREATE, a
+/// further INSERT + COMMIT into the source table still updates the view via
+/// the existing post-commit materialization path (unchanged behavior).
+#[tokio::test]
+async fn create_materialized_view_immediate_population_then_further_insert_updates_view() {
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("s4-immediate-mv-then-insert-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("INSERT INTO t (id, name) VALUES (1, 'alice')")
+        .await
+        .expect("INSERT failed");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT failed");
+
+    client
+        .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, name FROM t")
+        .await
+        .expect("CREATE MATERIALIZED VIEW failed");
+
+    client
+        .simple_query("INSERT INTO t (id, name) VALUES (2, 'bob')")
+        .await
+        .expect("second INSERT failed");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("second COMMIT failed");
+
+    let msgs = client
+        .simple_query("SELECT * FROM mv ORDER BY id")
+        .await
+        .expect("SELECT mv failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected mv to reflect both rows after further insert+commit; got {}",
+        rows.len()
+    );
+    assert_eq!(rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(rows[1].get("id").unwrap_or(""), "2");
+    assert_eq!(rows[1].get("name").unwrap_or(""), "bob");
+}
+
+/// v0.51.1 Slice 5: replay the exact `IMPLEMENTATION_STATUS_20260719.md`
+/// transcript verbatim — a vanilla autocommitting connection, no `SET`, no
+/// explicit `COMMIT` — must return the one row correctly.
+#[tokio::test]
+async fn postgres_standard_transcript_replay_returns_the_row() {
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("s5-transcript-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client
+        .simple_query("CREATE TABLE t (id int, name text)")
+        .await
+        .expect("CREATE TABLE failed");
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'alice')")
+        .await
+        .expect("INSERT failed");
+    let msgs = client
+        .simple_query("SELECT * FROM t")
+        .await
+        .expect("SELECT failed");
+    let rows = data_rows_from(&msgs);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one row from vanilla autocommitting transcript; got {}",
+        rows.len()
+    );
+    assert_eq!(rows[0].get("id").unwrap_or(""), "1");
+    assert_eq!(rows[0].get("name").unwrap_or(""), "alice");
 }

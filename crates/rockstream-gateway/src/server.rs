@@ -1105,7 +1105,7 @@ impl GatewayHandler {
 
     /// Dispatch a synchronous (non-view-read) query and return pgwire responses.
     /// Returns `None` if the query needs async handling (DML, COMMIT, ROLLBACK, SELECT).
-    fn dispatch_sync<'a>(
+    async fn dispatch_sync<'a>(
         &'a self,
         query: &'a str,
         session_info: &crate::catalog_stubs::SessionInfo,
@@ -1218,7 +1218,7 @@ impl GatewayHandler {
             || ql.starts_with("create materialized view ")
             || ql.starts_with("create or replace view ")
         {
-            return Some(self.handle_create_view(q));
+            return Some(self.handle_create_view(q).await);
         }
 
         // REFRESH MATERIALIZED VIEW
@@ -1959,7 +1959,7 @@ impl GatewayHandler {
             return self.handle_drop_workload(query).await;
         }
 
-        if let Some(result) = self.dispatch_sync(query, &session_info) {
+        if let Some(result) = self.dispatch_sync(query, &session_info).await {
             // Promote lifetime — responses from dispatch_sync hold no borrows
             // from `query`, only owned data.
             let result = result.map(|v| v.into_iter().map(promote_response).collect());
@@ -2802,7 +2802,7 @@ impl GatewayHandler {
         ))])
     }
 
-    fn handle_create_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let is_materialized = ql.contains("materialized view");
         let tag = if is_materialized {
@@ -2869,7 +2869,7 @@ impl GatewayHandler {
                     columns: initial_columns,
                     namespace: "public".to_string(),
                 },
-                deps,
+                deps.clone(),
             );
             if let Some(workload_name) = workload_name {
                 self.catalog
@@ -2881,6 +2881,29 @@ impl GatewayHandler {
                     "create_view",
                     &view_name,
                 ));
+            }
+
+            // Immediate materialization: a CREATE MATERIALIZED VIEW must
+            // reflect its source tables' current data before this response
+            // reaches the client — not just on the next COMMIT. Reuses the
+            // exact same post-commit materializer entry point, seeded with
+            // this view's own source tables as the changed set.
+            if is_materialized {
+                if let Some(shard_db) = &self.shard_db {
+                    let changed_tables: std::collections::HashSet<String> =
+                        deps.into_iter().collect();
+                    crate::view_materializer::materialize_views(
+                        &self.catalog,
+                        shard_db,
+                        &changed_tables,
+                    )
+                    .await;
+                    if let Err(e) = shard_db.flush().await {
+                        tracing::warn!(
+                            "post-CREATE-MATERIALIZED-VIEW shard flush failed (non-fatal): {e}"
+                        );
+                    }
+                }
             }
         }
 
@@ -3565,34 +3588,49 @@ impl GatewayHandler {
             )))]);
         };
 
-        // ── Idempotency check ─────────────────────────────────────────────────
-        let (idempotency_key, source_epoch_envelope) = {
+        // ── Idempotency envelope ─────────────────────────────────────────────
+        // A write must carry a dedup envelope so a client-side retry of a
+        // COMMIT can never double-apply it. If neither an explicit
+        // `SET rockstream.idempotency_key` nor `SET rockstream.source_epoch`
+        // was set, the server mints a fresh CSPRNG-derived key here — this is
+        // per-commit and can never collide with a prior key, so (unlike the
+        // explicit-key path) no prior-commit replay lookup is needed for it.
+        let (idempotency_key, _source_epoch_envelope, server_generated) = {
             let session = self.sessions.entry(conn_id.to_string()).or_default();
-            (session.idempotency_key, session.source_epoch_envelope)
+            (
+                session.idempotency_key,
+                session.source_epoch_envelope,
+                session.idempotency_key.is_none() && session.source_epoch_envelope.is_none(),
+            )
         };
-        if idempotency_key.is_none() && source_epoch_envelope.is_none() {
-            entry.clear();
-            return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "23000".to_owned(),
-                "[RS-2007] write.idempotency_key_required: Every write must carry either SET rockstream.idempotency_key or SET rockstream.source_epoch. Next steps: run SET rockstream.idempotency_key = '<unique-key>' before COMMIT.".to_owned(),
-            ))))]);
-        }
-        if let Some(key_hash) = idempotency_key {
-            // Check for prior commit with this key — idempotent replay → noop
-            match shard_db.get_idempotency_epoch(0, key_hash).await {
-                Ok(Some(_prev_epoch)) => {
-                    // Already committed — discard buffer and return COMMIT noop
-                    entry.clear();
-                    return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
-                        "COMMIT",
-                    )))]);
-                }
-                Ok(None) => {} // proceed
-                Err(e) => {
-                    return Err(PgWireError::ApiError(Box::new(
-                        crate::error::GatewayError::Storage(e),
-                    )));
+        let idempotency_key = if server_generated {
+            use rand::RngCore;
+            let mut generated = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut generated);
+            Some(generated)
+        } else {
+            idempotency_key
+        };
+        if !server_generated {
+            if let Some(key_hash) = idempotency_key {
+                // Explicit client key — check for prior commit with this key
+                // (idempotent replay → noop). Server-generated keys skip this
+                // lookup: they are freshly minted per commit and can never
+                // collide with a previous one.
+                match shard_db.get_idempotency_epoch(0, key_hash).await {
+                    Ok(Some(_prev_epoch)) => {
+                        // Already committed — discard buffer and return COMMIT noop
+                        entry.clear();
+                        return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
+                            "COMMIT",
+                        )))]);
+                    }
+                    Ok(None) => {} // proceed
+                    Err(e) => {
+                        return Err(PgWireError::ApiError(Box::new(
+                            crate::error::GatewayError::Storage(e),
+                        )));
+                    }
                 }
             }
         }
@@ -4196,11 +4234,31 @@ impl GatewayHandler {
             }
         };
 
-        let table_columns: Vec<String> = self
+        let known_table_columns: Option<Vec<String>> = self
             .catalog
             .get_table(&table)
-            .map(|ct| ct.columns.into_iter().map(|c| c.name).collect())
-            .unwrap_or_else(|| cols.clone());
+            .map(|ct| ct.columns.into_iter().map(|c| c.name).collect());
+        if cols.is_empty() && known_table_columns.is_none() {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    format!(
+                        "[RS-2056] write.malformed_values_list: INSERT INTO {table} has no column list and the table's schema is unknown. next_steps: Provide an explicit column list, e.g. INSERT INTO {table} (col1, col2) VALUES (...), or create the table before inserting into it."
+                    ),
+                ),
+            )))]);
+        }
+        let table_columns: Vec<String> =
+            known_table_columns.unwrap_or_else(|| cols.clone());
+        // Column list used to resolve VALUES tuples into named fields: the
+        // explicit column list if given, otherwise the table's declared
+        // column order for positional (no-column-list) INSERTs.
+        let insert_cols: Vec<String> = if cols.is_empty() {
+            table_columns.clone()
+        } else {
+            cols.clone()
+        };
         let metadata = self
             .table_insert_metadata
             .get(&table)
@@ -4209,8 +4267,11 @@ impl GatewayHandler {
         let mut returning_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
         let mut row_keys = Vec::with_capacity(rows.len());
         for values in &rows {
-            let mut value_map: HashMap<String, String> =
-                cols.iter().cloned().zip(values.iter().cloned()).collect();
+            let mut value_map: HashMap<String, String> = insert_cols
+                .iter()
+                .cloned()
+                .zip(values.iter().cloned())
+                .collect();
             if let Some(metadata) = &metadata {
                 for (column, kind) in &metadata.generated_columns {
                     if value_map.contains_key(column) {
@@ -4260,67 +4321,72 @@ impl GatewayHandler {
             returning_rows.push(stored_values);
         }
 
-        if returning {
-            let in_explicit_block = conn_id
-                .and_then(|id| self.sessions.get(id))
-                .map(|s| s.in_explicit_block)
-                .unwrap_or(false);
-            let needs_read_back = metadata
-                .as_ref()
-                .is_some_and(|m| !m.generated_columns.is_empty());
-            if !in_explicit_block {
-                let commit_responses = self.handle_commit(conn_id).await?;
-                if commit_responses
-                    .iter()
-                    .any(|response| matches!(response, Response::Error(_)))
-                {
-                    return Ok(commit_responses);
+        // Standard-PostgreSQL autocommit: any statement outside an explicit
+        // `BEGIN...COMMIT`/`ROLLBACK` block commits immediately on success,
+        // whether or not it has a `RETURNING` clause. Inside an explicit
+        // block, buffering is unchanged.
+        let in_explicit_block = conn_id
+            .and_then(|id| self.sessions.get(id))
+            .map(|s| s.in_explicit_block)
+            .unwrap_or(false);
+        if !in_explicit_block {
+            let needs_read_back = returning
+                && metadata
+                    .as_ref()
+                    .is_some_and(|m| !m.generated_columns.is_empty());
+            let commit_responses = self.handle_commit(conn_id).await?;
+            if commit_responses
+                .iter()
+                .any(|response| matches!(response, Response::Error(_)))
+            {
+                return Ok(commit_responses);
+            }
+            if needs_read_back {
+                if let Some(id) = conn_id {
+                    let timeout_ms = self
+                        .sessions
+                        .get(id)
+                        .map(|s| s.session_wait_for_timeout_ms)
+                        .unwrap_or(5_000);
+                    if let Some(token) = self
+                        .sessions
+                        .get(id)
+                        .and_then(|s| s.last_written_epoch.clone())
+                    {
+                        let _ = self.wait_for_epoch(token.source_epoch, timeout_ms).await;
+                    }
                 }
-                if needs_read_back {
-                    if let Some(id) = conn_id {
-                        let timeout_ms = self
-                            .sessions
-                            .get(id)
-                            .map(|s| s.session_wait_for_timeout_ms)
-                            .unwrap_or(5_000);
-                        if let Some(token) = self
-                            .sessions
-                            .get(id)
-                            .and_then(|s| s.last_written_epoch.clone())
-                        {
-                            let _ = self.wait_for_epoch(token.source_epoch, timeout_ms).await;
+                if let Some(shard_db) = &self.shard_db {
+                    let cols_for_read = if table_columns.is_empty() {
+                        cols.clone()
+                    } else {
+                        table_columns.clone()
+                    };
+                    let mut read_back_rows = Vec::with_capacity(row_keys.len());
+                    for row_key in &row_keys {
+                        let key = format!("view_output/{table}/{row_key}");
+                        if let Some(raw) = shard_db.get(key.as_bytes()).await.map_err(|e| {
+                            PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(
+                                e,
+                            )))
+                        })? {
+                            let fields: Vec<String> = String::from_utf8_lossy(&raw)
+                                .split('\t')
+                                .map(|s| s.to_string())
+                                .collect();
+                            let mut row = fields;
+                            row.resize(cols_for_read.len(), String::new());
+                            read_back_rows.push(row);
                         }
                     }
-                    if let Some(shard_db) = &self.shard_db {
-                        let cols_for_read = if table_columns.is_empty() {
-                            cols.clone()
-                        } else {
-                            table_columns.clone()
-                        };
-                        let mut read_back_rows = Vec::with_capacity(row_keys.len());
-                        for row_key in &row_keys {
-                            let key = format!("view_output/{table}/{row_key}");
-                            if let Some(raw) = shard_db.get(key.as_bytes()).await.map_err(|e| {
-                                PgWireError::ApiError(Box::new(
-                                    crate::error::GatewayError::Storage(e),
-                                ))
-                            })? {
-                                let fields: Vec<String> = String::from_utf8_lossy(&raw)
-                                    .split('\t')
-                                    .map(|s| s.to_string())
-                                    .collect();
-                                let mut row = fields;
-                                row.resize(cols_for_read.len(), String::new());
-                                read_back_rows.push(row);
-                            }
-                        }
-                        if !read_back_rows.is_empty() {
-                            returning_rows = read_back_rows;
-                        }
+                    if !read_back_rows.is_empty() {
+                        returning_rows = read_back_rows;
                     }
                 }
             }
+        }
 
+        if returning {
             let schema_fields = if let Some(ct) = self.catalog.get_table(&table) {
                 ct.columns
                     .iter()
@@ -4550,25 +4616,23 @@ impl GatewayHandler {
             }
         }
 
-        if let Some(returning_cols) = &returning_cols {
-            // Slice A3: reuse the INSERT ... RETURNING read-back pattern —
-            // only performed outside an explicit transaction block; inside
-            // one, RETURNING resolves at the eventual COMMIT using the
-            // already-computed merged row (matches INSERT's literal-echo
-            // behavior when no server-side generated value is involved).
-            let in_explicit_block = conn_id
-                .and_then(|id| self.sessions.get(id))
-                .map(|s| s.in_explicit_block)
-                .unwrap_or(false);
-            let mut result_row = new_vals.clone();
-            if !in_explicit_block {
-                let commit_responses = self.handle_commit(conn_id).await?;
-                if commit_responses
-                    .iter()
-                    .any(|response| matches!(response, Response::Error(_)))
-                {
-                    return Ok(commit_responses);
-                }
+        // Standard-PostgreSQL autocommit: any statement outside an explicit
+        // `BEGIN...COMMIT`/`ROLLBACK` block commits immediately on success,
+        // whether or not it has a `RETURNING` clause.
+        let in_explicit_block = conn_id
+            .and_then(|id| self.sessions.get(id))
+            .map(|s| s.in_explicit_block)
+            .unwrap_or(false);
+        let mut result_row = new_vals.clone();
+        if !in_explicit_block {
+            let commit_responses = self.handle_commit(conn_id).await?;
+            if commit_responses
+                .iter()
+                .any(|response| matches!(response, Response::Error(_)))
+            {
+                return Ok(commit_responses);
+            }
+            if returning_cols.is_some() {
                 if let Some(id) = conn_id {
                     let timeout_ms = self
                         .sessions
@@ -4603,6 +4667,13 @@ impl GatewayHandler {
                     )))]);
                 }
             }
+        }
+        if let Some(returning_cols) = &returning_cols {
+            // Slice A3: reuse the INSERT ... RETURNING read-back pattern —
+            // only performed outside an explicit transaction block; inside
+            // one, RETURNING resolves at the eventual COMMIT using the
+            // already-computed merged row (matches INSERT's literal-echo
+            // behavior when no server-side generated value is involved).
             return Ok(vec![self.build_returning_response(
                 &table,
                 &table_columns,
@@ -4709,6 +4780,23 @@ impl GatewayHandler {
                 return Ok(vec![promote_response(Response::Error(Box::new(
                     ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
                 )))]);
+            }
+        }
+
+        // Standard-PostgreSQL autocommit: any statement outside an explicit
+        // `BEGIN...COMMIT`/`ROLLBACK` block commits immediately on success,
+        // whether or not it has a `RETURNING` clause.
+        let in_explicit_block = conn_id
+            .and_then(|id| self.sessions.get(id))
+            .map(|s| s.in_explicit_block)
+            .unwrap_or(false);
+        if !in_explicit_block {
+            let commit_responses = self.handle_commit(conn_id).await?;
+            if commit_responses
+                .iter()
+                .any(|response| matches!(response, Response::Error(_)))
+            {
+                return Ok(commit_responses);
             }
         }
 
