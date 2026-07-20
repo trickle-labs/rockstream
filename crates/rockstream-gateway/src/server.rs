@@ -712,11 +712,26 @@ pub static SESSION_WAIT_FOR_TIMEOUT_TOTAL: std::sync::atomic::AtomicU64 =
 /// Total rows scanned into query-time DataFusion MemTables.
 pub static QUERY_TIME_DATAFUSION_ROWS_SCANNED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Total rows processed by `CREATE INDEX` automatic backfill scans (Slice 5, v0.51.2).
+pub static INDEX_BACKFILL_ROWS_PROCESSED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Number of `CREATE INDEX` backfills currently in progress (gauge, Slice 5, v0.51.2).
+pub static INDEX_BACKFILL_IN_PROGRESS_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Hard per-relation row cap for query-time DataFusion source scans.
 pub const MAX_QUERY_TIME_ROWS: usize = 1_000_000;
 /// Hard per-relation byte cap for query-time DataFusion source scans.
 pub const MAX_QUERY_TIME_SCAN_BYTES: usize = 64 * 1024 * 1024;
+/// Hard row cap for a single `CREATE INDEX` automatic backfill scan (Slice 5,
+/// v0.51.2). A table exceeding this fails backfill with RS-2027 rather than
+/// leaving the index catalog entry stuck in `Building` forever. `CREATE
+/// INDEX` backfill runs synchronously on the issuing session (no
+/// `CONCURRENTLY` support), so this bound also caps how long a single
+/// `CREATE INDEX` statement can block that session.
+pub const MAX_INDEX_BACKFILL_ROWS: usize = 2_000;
+/// Batch size for `CREATE INDEX` automatic backfill scans (Slice 5, v0.51.2).
+pub const INDEX_BACKFILL_BATCH_ROWS: usize = 500;
 
 // ── S8 WaitResult ─────────────────────────────────────────────────────────────
 
@@ -1247,7 +1262,7 @@ impl GatewayHandler {
 
         // CREATE INDEX / DROP INDEX / REBUILD INDEX / MARK INDEX READY — v0.32 pgwire DDL wiring
         if ql.starts_with("create index ") {
-            return Some(self.handle_create_index(q));
+            return Some(self.handle_create_index(q).await);
         }
         if ql.starts_with("drop index ") {
             return Some(self.handle_drop_index(q));
@@ -1706,9 +1721,48 @@ impl GatewayHandler {
 
             let shard_note = build_scatter_explain_note(&self.catalog, inner_sql);
 
-            let plan_text = format!(
-                "Plan: SeqScan → {pushdown_note}{index_note}{sink_note}{shard_note}\nQuery: {inner_sql}"
-            );
+            // Slice 4 (v0.51.2): replace the string-concatenation stub with a
+            // real DataFusion plan tree. Reuses Slice 1's SessionContext +
+            // MemTable registration (`query_time_datafusion_select`) so the
+            // real scan/filter/join node names come from DataFusion's own
+            // `Display` output, not a hand-written string. The pushdown/
+            // index/sink/shard annotations are preserved as extra rows after
+            // the real plan — no information is lost, only the fabricated
+            // "Plan: SeqScan → …" one-liner is removed.
+            let mut plan_rows: Vec<String> = match &self.shard_db {
+                Some(shard_db) => {
+                    let analyzed = analyze_select_query(&self.catalog, inner_sql);
+                    let referenced_tables = analyzed
+                        .as_ref()
+                        .map(|a| a.referenced_tables.clone())
+                        .unwrap_or_default();
+                    match query_time_datafusion_select(
+                        &self.catalog,
+                        shard_db,
+                        &format!("EXPLAIN {inner_sql}"),
+                        &referenced_tables,
+                    )
+                    .await
+                    {
+                        Ok(batches) => explain_batches_to_plan_lines(&batches),
+                        Err(e) => vec![format!("Plan: SeqScan (DataFusion explain failed: {e})")],
+                    }
+                }
+                None => vec!["Plan: SeqScan (no shard backend)".to_string()],
+            };
+            for note in [
+                pushdown_note.to_string(),
+                index_note.clone(),
+                sink_note.clone(),
+                shard_note.clone(),
+            ] {
+                let trimmed = note.trim();
+                if !trimmed.is_empty() {
+                    plan_rows.push(trimmed.to_string());
+                }
+            }
+            plan_rows.push(format!("Query: {inner_sql}"));
+
             let schema = Arc::new(vec![FieldInfo::new(
                 "QUERY PLAN".to_string(),
                 None,
@@ -1716,7 +1770,7 @@ impl GatewayHandler {
                 Type::TEXT,
                 FieldFormat::Text,
             )]);
-            let rows = vec![plan_text];
+            let rows = plan_rows;
             let schema_ref = schema.clone();
             let data_stream = stream::iter(rows).map(move |line| {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
@@ -2179,6 +2233,11 @@ impl GatewayHandler {
                             {
                                 return Ok(responses);
                             }
+                            if let Some(responses) =
+                                self.maybe_index_range_lookup(q, &view_name).await?
+                            {
+                                return Ok(responses);
+                            }
                         }
 
                         let result = if select_plan.requires_query_time_datafusion
@@ -2399,6 +2458,92 @@ impl GatewayHandler {
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
 
+        Ok(Some(self.index_entries_to_response(view_name, entries)?))
+    }
+
+    /// Slice 5 (v0.51.2): range-lookup accelerator sibling of
+    /// `maybe_index_point_lookup`. Scans the bounded sub-set of a `Ready`
+    /// index's `0x03‖op_id‖…` rows whose key-encoded predicate column value
+    /// falls within `[lower, upper]` (inclusive), instead of scanning the
+    /// full table — the "range-lookup accelerator" half of the roadmap's
+    /// Scope wording (v0.32 shipped only equality/point lookups).
+    async fn maybe_index_range_lookup(
+        &self,
+        q: &str,
+        view_name: &str,
+    ) -> PgWireResult<Option<Vec<Response<'static>>>> {
+        let shard_db = match &self.shard_db {
+            Some(db) => db.clone(),
+            None => return Ok(None),
+        };
+
+        let (pred_col, lower, upper) = match extract_where_range(q) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let matching_idx = self
+            .catalog
+            .list_index_names()
+            .into_iter()
+            .find_map(|idx_name| {
+                let entry = self.catalog.get_index(&idx_name)?;
+                if entry.table != view_name {
+                    return None;
+                }
+                if entry.state != crate::catalog_stubs::CatalogIndexState::Ready {
+                    return None;
+                }
+                let op_id = entry.op_id?;
+                if entry.index_cols.first()?.as_str() == pred_col {
+                    Some(op_id)
+                } else {
+                    None
+                }
+            });
+
+        let op_id = match matching_idx {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Bounded sub-scan: only this index's own `0x03‖op_id‖…` key space,
+        // never the full table.
+        let mut op_prefix = Vec::with_capacity(9);
+        op_prefix.push(0x03u8); // ShardPrefix::ViewOutput
+        op_prefix.extend_from_slice(&op_id.to_be_bytes());
+
+        let entries = shard_db
+            .scan_prefix(&op_prefix)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+
+        let filtered: Vec<(bytes::Bytes, bytes::Bytes)> = entries
+            .into_iter()
+            .filter(|(key, _)| {
+                if key.len() < 17 {
+                    return false;
+                }
+                let val_bytes: [u8; 8] = match key[9..17].try_into() {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                let val = i64::from_be_bytes(val_bytes);
+                val >= lower && val <= upper
+            })
+            .collect();
+
+        Ok(Some(self.index_entries_to_response(view_name, filtered)?))
+    }
+
+    /// Shared decode-and-encode logic for both index-accelerated point and
+    /// range lookups: decodes each arrangement value (all columns encoded as
+    /// fixed-width i64 BE) and builds the pgwire `QUERY` response.
+    fn index_entries_to_response(
+        &self,
+        view_name: &str,
+        entries: Vec<(bytes::Bytes, bytes::Bytes)>,
+    ) -> PgWireResult<Vec<Response<'static>>> {
         // Determine column names from the catalog (fall back to positional names).
         let col_names: Vec<String> = if let Some(cv) = self.catalog.get_view(view_name) {
             cv.columns.iter().map(|c| c.name.clone()).collect()
@@ -2513,10 +2658,10 @@ impl GatewayHandler {
             encoder.finish()
         });
 
-        Ok(Some(vec![Response::Query(QueryResponse::new(
+        Ok(vec![Response::Query(QueryResponse::new(
             schema,
             data_stream,
-        ))]))
+        ))])
     }
 
     async fn query_time_datafusion_response(
@@ -3153,9 +3298,15 @@ impl GatewayHandler {
 
     /// Handle `CREATE INDEX <name> ON <table> (<col>, ...) [WHERE <pred>]` — v0.32.
     ///
-    /// Registers the index in `Building` state in the gateway catalog stubs.
-    /// Returns RS-2016 if an index with the same name exists for a different table.
-    fn handle_create_index<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    /// Registers the index in `Building` state in the gateway catalog stubs,
+    /// then (v0.51.2 Slice 5) synchronously backfills it from the table/
+    /// view's already-materialized rows and transitions it to `Ready` — a
+    /// standard `CREATE INDEX` blocks the issuing session until done (no
+    /// `CONCURRENTLY` support in this version's Scope). Returns RS-2016 if an
+    /// index with the same name exists for a different table, or RS-2027 if
+    /// the table exceeds the backfill row-count bound (the index catalog
+    /// entry is removed rather than left stuck in `Building`).
+    async fn handle_create_index(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
         use crate::catalog_stubs::{CatalogIndexEntry, CatalogIndexState};
 
         // Parse: CREATE INDEX <name> ON <table> (<cols>)
@@ -3206,7 +3357,7 @@ impl GatewayHandler {
         let entry = CatalogIndexEntry {
             name: index_name.clone(),
             table: table.clone(),
-            index_cols,
+            index_cols: index_cols.clone(),
             state: CatalogIndexState::Building,
             op_id: None,
         };
@@ -3222,9 +3373,131 @@ impl GatewayHandler {
             )))]);
         }
 
+        if let Err(e) = self.backfill_index(&index_name, &table, &index_cols).await {
+            // Backpressure/error path: never leave the index stuck in
+            // Building — remove the catalog entry so a retry (e.g. after
+            // shrinking the table) starts clean.
+            self.catalog.remove_index(&index_name);
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                crate::error::sqlstate_for(&e).to_owned(),
+                e.to_string(),
+            )))]);
+        }
+
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system".to_string(),
+                "create_index",
+                &index_name,
+            ));
+        }
+
         Ok(vec![Response::Execution(
             Tag::new("CREATE INDEX").with_rows(0),
         )])
+    }
+
+    /// Backfills a `CREATE INDEX` automatic index (v0.51.2 Slice 5): scans
+    /// the target table/view's already-materialized `view_output/{table}/`
+    /// rows in bounded batches, decodes the indexed column plus every other
+    /// column as fixed-width i64 (the encoding `maybe_index_point_lookup`
+    /// already reads), writes `0x03‖op_id(BE8)‖col_val(BE8)` → row bytes into
+    /// `shard_db`, mints a fresh gateway-local `op_id`, and calls
+    /// `catalog.mark_index_ready`. A table whose backfill scan exceeds
+    /// `MAX_INDEX_BACKFILL_ROWS` fails with RS-2027 rather than buffering
+    /// unboundedly or leaving the index half-built.
+    ///
+    /// If there is no shard-backed data plane, or the target table isn't yet
+    /// registered in the catalog (so there is nothing to scan), the index is
+    /// left in `Building` — matching the pre-existing (v0.32) behavior for
+    /// catalog-only harnesses where `MARK INDEX ... READY` remains the only
+    /// path to `Ready`.
+    async fn backfill_index(
+        &self,
+        index_name: &str,
+        table: &str,
+        index_cols: &[String],
+    ) -> Result<(), GatewayError> {
+        let Some(shard_db) = &self.shard_db else {
+            return Ok(());
+        };
+
+        let col_idx = self.catalog.get_table(table).and_then(|t| {
+            t.columns
+                .iter()
+                .position(|c| index_cols.first().is_some_and(|ic| ic.eq_ignore_ascii_case(&c.name)))
+        });
+
+        let Some(col_idx) = col_idx else {
+            return Ok(());
+        };
+
+        INDEX_BACKFILL_IN_PROGRESS_COUNT.fetch_add(1, Ordering::Relaxed);
+        let scan_result = self
+            .backfill_index_scan(shard_db, index_name, table, col_idx)
+            .await;
+        INDEX_BACKFILL_IN_PROGRESS_COUNT.fetch_sub(1, Ordering::Relaxed);
+        let op_id = scan_result?;
+
+        self.catalog.mark_index_ready(index_name, op_id);
+        self.publish_exact_index_stats(table, index_cols).await;
+        Ok(())
+    }
+
+    /// Scans `view_output/{table}/` in bounded batches, encodes each row as
+    /// `0x03‖op_id(BE8)‖col_val(BE8)` → fixed-width-i64-encoded row bytes,
+    /// and writes it into `shard_db`. Returns the minted `op_id` on success.
+    async fn backfill_index_scan(
+        &self,
+        shard_db: &rockstream_storage::ShardDb,
+        index_name: &str,
+        table: &str,
+        col_idx: usize,
+    ) -> Result<u64, GatewayError> {
+        let prefix = format!("view_output/{table}/");
+        let (rows, truncated) = shard_db
+            .scan_prefix_bounded(prefix.as_bytes(), MAX_INDEX_BACKFILL_ROWS * 1024)
+            .await?;
+        if truncated || rows.len() > MAX_INDEX_BACKFILL_ROWS {
+            return Err(GatewayError::IndexBackfillRowLimitExceeded {
+                index_name: index_name.to_string(),
+                table: table.to_string(),
+                row_limit: MAX_INDEX_BACKFILL_ROWS,
+            });
+        }
+
+        let op_id = self.catalog.mint_index_op_id();
+        for batch in rows.chunks(INDEX_BACKFILL_BATCH_ROWS) {
+            for (_, value) in batch {
+                let row_str = String::from_utf8_lossy(value);
+                let fields: Vec<&str> = row_str.split('\t').collect();
+                let Some(col_val) = fields.get(col_idx).and_then(|s| s.parse::<i64>().ok()) else {
+                    continue;
+                };
+                let mut encoded_row = Vec::with_capacity(fields.len() * 8);
+                let mut all_int = true;
+                for f in &fields {
+                    match f.parse::<i64>() {
+                        Ok(v) => encoded_row.extend_from_slice(&v.to_be_bytes()),
+                        Err(_) => {
+                            all_int = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_int {
+                    continue;
+                }
+                let mut key = Vec::with_capacity(17);
+                key.push(0x03u8); // ShardPrefix::ViewOutput
+                key.extend_from_slice(&op_id.to_be_bytes());
+                key.extend_from_slice(&col_val.to_be_bytes());
+                shard_db.put(&key, &encoded_row).await?;
+                INDEX_BACKFILL_ROWS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(op_id)
     }
 
     async fn publish_exact_index_stats(&self, table: &str, index_cols: &[String]) {
@@ -7366,6 +7639,36 @@ async fn query_time_datafusion_select(
     Ok(batches)
 }
 
+/// Flattens a DataFusion `EXPLAIN` result set (columns `plan_type`, `plan`,
+/// one row per plan stage) into plain text lines for the `QUERY PLAN` text
+/// column pgwire response. Reused by Slice 4's standard `EXPLAIN <query>`.
+fn explain_batches_to_plan_lines(batches: &[RecordBatch]) -> Vec<String> {
+    use datafusion::arrow::array::StringArray;
+
+    let mut lines = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            let mut parts: Vec<String> = Vec::with_capacity(batch.num_columns());
+            for col_idx in 0..batch.num_columns() {
+                let col = batch.column(col_idx);
+                if col.is_null(row_idx) {
+                    continue;
+                }
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    parts.push(arr.value(row_idx).to_string());
+                }
+            }
+            if !parts.is_empty() {
+                lines.push(parts.join(": "));
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push("Plan: (no plan produced)".to_string());
+    }
+    lines
+}
+
 fn extract_after_fence_token(q: &str) -> Option<FreshnessToken> {
     let ql = q.to_lowercase();
     let start = ql.find("rockstream.after_fence(")?;
@@ -7543,6 +7846,71 @@ fn extract_where_equality(q: &str) -> Option<(String, i64)> {
         return None;
     }
     Some((col, val))
+}
+
+/// Extract a bounded single-column range predicate from a query's `WHERE`
+/// clause — the "range-lookup accelerator" sibling of `extract_where_equality`
+/// (v0.51.2 Slice 5). Recognizes `col > lo AND col < hi` (and `>=`/`<=`
+/// variants) where both bounds reference the *same* column. Returns
+/// `(column_name, lower_inclusive, upper_inclusive)`. Anything else (OR, NOT,
+/// multi-column AND, no bound on one side) falls through to the normal
+/// full-scan/DataFusion path.
+fn extract_where_range(q: &str) -> Option<(String, i64, i64)> {
+    let ql = q.to_lowercase();
+    let where_pos = ql.find(" where ")?;
+    let after = q[where_pos + 7..].trim();
+    let after_lower = after.to_lowercase();
+    let end = ["order by ", "limit ", ";"]
+        .iter()
+        .filter_map(|kw| after_lower.find(kw))
+        .min()
+        .unwrap_or(after.len());
+    let pred = after[..end].trim();
+
+    if pred.to_lowercase().contains(" or ") || pred.to_lowercase().starts_with("not ") {
+        return None;
+    }
+    let and_pos = pred.to_lowercase().find(" and ")?;
+    let left = pred[..and_pos].trim();
+    let right = pred[and_pos + 5..].trim().trim_end_matches(';');
+    // Reject a third AND clause (multi-predicate ranges are out of scope).
+    if right.to_lowercase().contains(" and ") {
+        return None;
+    }
+
+    fn parse_bound(clause: &str) -> Option<(String, char, bool, i64)> {
+        // Returns (column, operator_char, is_lower_bound, value).
+        for (op, is_lower) in [(">=", true), ("<=", false), (">", true), ("<", false)] {
+            if let Some(pos) = clause.find(op) {
+                let col = clause[..pos].trim().to_lowercase();
+                let val_str = clause[pos + op.len()..].trim();
+                let val: i64 = val_str.parse().ok()?;
+                if col.is_empty() {
+                    return None;
+                }
+                return Some((col, op.chars().next().unwrap(), is_lower, val));
+            }
+        }
+        None
+    }
+
+    let (left_col, left_op, left_is_lower, left_val) = parse_bound(left)?;
+    let (right_col, right_op, right_is_lower, right_val) = parse_bound(right)?;
+    if left_col != right_col || left_is_lower == right_is_lower {
+        return None;
+    }
+    let (lower_val, lower_op, upper_val, upper_op) = if left_is_lower {
+        (left_val, left_op, right_val, right_op)
+    } else {
+        (right_val, right_op, left_val, left_op)
+    };
+    // Normalize exclusive bounds (`>`/`<`) to inclusive i64 bounds.
+    let lower_inclusive = if lower_op == '>' { lower_val + 1 } else { lower_val };
+    let upper_inclusive = if upper_op == '<' { upper_val - 1 } else { upper_val };
+    if lower_inclusive > upper_inclusive {
+        return None;
+    }
+    Some((left_col, lower_inclusive, upper_inclusive))
 }
 
 /// Extract the view name from `COPY <view> TO STDOUT`.

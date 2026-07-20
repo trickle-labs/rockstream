@@ -290,6 +290,10 @@ pub struct CatalogStubs {
     workload_budgets: RwLock<HashMap<String, Arc<WorkloadBudget>>>,
     view_budgets: RwLock<HashMap<String, Arc<StateBudget>>>,
     view_states: RwLock<HashMap<String, ViewState>>,
+    /// Monotonic counter minting gateway-local `op_id`s for `CREATE INDEX`
+    /// automatic backfill (Slice 5, v0.51.2). Not derived from any real
+    /// runtime-DAG `IndexArrangeOp` — see v0.51.2 plan §2 scoping decision.
+    next_index_op_id: std::sync::atomic::AtomicU64,
 }
 
 impl Default for CatalogStubs {
@@ -306,6 +310,7 @@ impl CatalogStubs {
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
+            next_index_op_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -318,12 +323,20 @@ impl CatalogStubs {
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
+            next_index_op_id: std::sync::atomic::AtomicU64::new(1),
         };
         let workloads = workload_catalog.load_all_workloads().await?;
         let mut inner = catalog.inner.write().unwrap();
         inner.workloads = workloads;
         drop(inner);
         Ok(catalog)
+    }
+
+    /// Mints a fresh monotonic `op_id` for a gateway-local index arrangement
+    /// backfilled by `CREATE INDEX` (Slice 5, v0.51.2).
+    pub fn mint_index_op_id(&self) -> u64 {
+        self.next_index_op_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a view in the catalog without dependency tracking.

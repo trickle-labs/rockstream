@@ -112,6 +112,15 @@ pub enum GatewayError {
     #[error("[RS-2026] query.query_time_execution_failed: query-time execution failed: {detail}. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.")]
     QueryTimeExecutionFailed { detail: String },
 
+    /// [RS-2027] index.backfill_row_limit_exceeded — `CREATE INDEX` automatic
+    /// backfill scan exceeded its configured bounded row budget.
+    #[error("[RS-2027] index.backfill_row_limit_exceeded: CREATE INDEX backfill for '{index_name}' on table '{table}' exceeded the row limit ({row_limit} rows). next_steps: Reduce table cardinality before indexing, or drop and recreate the index once the table is smaller.")]
+    IndexBackfillRowLimitExceeded {
+        index_name: String,
+        table: String,
+        row_limit: usize,
+    },
+
     #[error("Not supported: {0}")]
     NotSupported(String),
 
@@ -160,6 +169,7 @@ pub fn sqlstate_for(e: &GatewayError) -> &'static str {
         GatewayError::NotifyChannelLimitExceeded { .. } => "54000",
         GatewayError::QueryTimeResultSetTooLarge { .. } => "54000",
         GatewayError::QueryTimeExecutionFailed { .. } => "0A000",
+        GatewayError::IndexBackfillRowLimitExceeded { .. } => "54000",
         GatewayError::NotSupported(_) => "0A000",
         GatewayError::ParseError(_) => "42601",
         GatewayError::Storage(_) => "XX000",

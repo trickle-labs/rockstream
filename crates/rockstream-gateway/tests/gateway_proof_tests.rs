@@ -6428,10 +6428,15 @@ async fn explain_reports_pruned_shard_count() {
         .await
         .unwrap();
     let rows = data_rows_from(&msgs);
-    assert!(rows[0]
-        .get("QUERY PLAN")
-        .unwrap_or("")
-        .contains("shard_scan: 1/2 shards"));
+    // v0.51.2 Slice 4: real DataFusion plan rows now precede the
+    // shard-pruning annotation row (previously all concatenated into a
+    // single row), so check the joined plan text rather than row 0.
+    let plan_text = rows
+        .iter()
+        .map(|row| row.get("QUERY PLAN").unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan_text.contains("shard_scan: 1/2 shards"));
 }
 
 #[tokio::test]

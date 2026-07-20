@@ -334,3 +334,52 @@ async fn ad_hoc_cte_matches_oracle() {
         ]
     );
 }
+
+#[tokio::test]
+async fn plain_explain_returns_real_plan_tree() {
+    let (port, _handle, _shard_db) = start_gateway_with_shard("query-time-explain").await;
+    let client = connect_port(port).await;
+
+    client
+        .simple_query("CREATE TABLE customers (id BIGINT, name TEXT, region TEXT)")
+        .await
+        .expect("CREATE TABLE customers");
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, customer_id BIGINT)")
+        .await
+        .expect("CREATE TABLE orders");
+
+    let rows = client
+        .simple_query(
+            "EXPLAIN SELECT o.id, c.name \
+             FROM orders o JOIN customers c ON o.customer_id = c.id \
+             WHERE c.region = 'US'",
+        )
+        .await
+        .expect("EXPLAIN query");
+    let rows = data_rows_from(&rows);
+    let plan_text = rows
+        .iter()
+        .map(|row| row.get("QUERY PLAN").unwrap_or("").to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // DataFusion's real `Display` output for a filtered join names actual
+    // plan node types — not the old "Plan: SeqScan → ..." fabricated stub.
+    assert!(
+        plan_text.contains("Filter") || plan_text.contains("filter"),
+        "expected a real Filter node in plan, got: {plan_text}"
+    );
+    assert!(
+        plan_text.to_ascii_lowercase().contains("join"),
+        "expected a real join node in plan, got: {plan_text}"
+    );
+    assert!(
+        plan_text.contains("TableScan") || plan_text.contains("MemTableExec"),
+        "expected a real scan node in plan, got: {plan_text}"
+    );
+    assert!(
+        !plan_text.contains("Query: EXPLAIN SELECT"),
+        "old fabricated stub text must not appear, got: {plan_text}"
+    );
+}

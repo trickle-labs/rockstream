@@ -187,6 +187,10 @@ pub const RS_2025: ErrorCode = ErrorCode::new(2025);
 /// Query-time DataFusion planning or execution failed for an ad hoc query (v0.51.2).
 /// next_steps: "Simplify the query, validate referenced table/view schemas, or materialize the query into a view."
 pub const RS_2026: ErrorCode = ErrorCode::new(2026);
+/// `CREATE INDEX` automatic backfill scan exceeded its configured bounded
+/// row budget (v0.51.2, `index.backfill_row_limit_exceeded`).
+/// next_steps: "Reduce table cardinality before indexing, or drop and recreate the index once the table is smaller."
+pub const RS_2027: ErrorCode = ErrorCode::new(2027);
 
 // 24xx: Auth (v0.26)
 /// Unauthenticated: request missing or carrying invalid credentials.
