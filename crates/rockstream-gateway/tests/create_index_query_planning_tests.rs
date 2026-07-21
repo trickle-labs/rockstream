@@ -66,7 +66,12 @@ fn data_rows_from(
 
 async fn start_gateway_with_shard(
     shard_path: &str,
-) -> (u16, tokio::task::JoinHandle<()>, Arc<ShardDb>, Arc<CatalogStubs>) {
+) -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    Arc<ShardDb>,
+    Arc<CatalogStubs>,
+) {
     let store = Arc::new(InMemory::new());
     let shard_db = Arc::new(ShardDb::builder(shard_path, store).build().await.unwrap());
     let catalog = Arc::new(CatalogStubs::new());
@@ -165,7 +170,12 @@ async fn create_index_point_lookup_under_10ms_p99() {
         .map(|i| format!("INSERT INTO accounts (id, balance) VALUES ({i}, {i})"))
         .collect();
     let statement_refs: Vec<&str> = statements.iter().map(String::as_str).collect();
-    run_fixture_sql(&client, &statement_refs, "create-index-point-lookup-fixture").await;
+    run_fixture_sql(
+        &client,
+        &statement_refs,
+        "create-index-point-lookup-fixture",
+    )
+    .await;
     shard_db.flush().await.unwrap();
 
     client

@@ -135,6 +135,7 @@ async fn test_prepared_statement_caching_and_deallocate() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let (addr, _handle) = start_gateway(catalog).await;
@@ -181,6 +182,7 @@ async fn test_extended_query_pipeline() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let (addr, _handle) = start_gateway(catalog).await;
@@ -318,6 +320,7 @@ async fn test_portal_suspension_max_rows() {
             data_type: "Int64".to_string(),
         }],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let mut rows = Vec::new();

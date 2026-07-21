@@ -249,6 +249,7 @@ async fn start_gateway_for_view(
             .to_string(),
         columns: view_columns,
         namespace: "public".to_string(),
+        op_id: None,
     });
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, Arc::new(catalog), view_reader);
@@ -729,8 +730,7 @@ async fn tpch_q11_lfs_join_aggregate() {
             CatalogColumn { name: "ps_partkey".to_string(), data_type: "Int64".to_string() },
             CatalogColumn { name: "sum_availqty".to_string(), data_type: "Int64".to_string() },
         ],
-        namespace: "public".to_string(),
-    });
+        namespace: "public".to_string(), op_id: None, });
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, Arc::new(catalog), view_reader);
     let (local_addr, _handle) = server.serve_background().await.unwrap();
@@ -853,6 +853,7 @@ async fn tpch_q1_minio_wire_protocol() {
             .to_string(),
         columns: tpch_q1_columns(),
         namespace: "public".to_string(),
+        op_id: None,
     });
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, Arc::new(catalog), view_reader);

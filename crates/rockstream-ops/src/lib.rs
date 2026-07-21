@@ -16,6 +16,7 @@
 
 pub mod aggregate;
 pub mod bench_regression;
+pub mod compile;
 pub mod distinct;
 pub mod embedded;
 pub mod error;
@@ -49,6 +50,7 @@ pub use aggregate::{
     load_frontier, persist_agg_state, persist_bucketed_agg_state, persist_frontier, AggState,
     AggregateOp, BucketedAggregateOp,
 };
+pub use compile::{compile_plan, CompiledView};
 pub use distinct::{
     load_distinct_state, persist_distinct_state, DistinctOp, DualArrangement, ExceptOp, IntersectOp,
 };
@@ -67,7 +69,7 @@ pub use recursion::{
     RecursionStrategy, RECURSION_STATE_LIMIT,
 };
 pub use scheduler::CreditScheduler;
-pub use sink::ViewSinkOp;
+pub use sink::{read_view_output, ColumnValue, ViewSinkOp};
 pub use snapshot::{SnapshotOp, SNAPSHOT_BUFFER_LIMIT};
 pub use source::{GenerateRowsSource, VecDeltaSource};
 pub use task::OperatorTask;

@@ -116,6 +116,7 @@ async fn proof_pg_catalog_schema_reflection_queries() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let (addr, _handle) = start_gateway(catalog).await;
@@ -226,6 +227,7 @@ async fn extended_query_protocol_parse_bind_execute() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let (addr, _handle) = start_gateway(catalog).await;

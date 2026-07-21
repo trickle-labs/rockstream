@@ -69,8 +69,7 @@ async fn positional_values_persisted_lfs() {
     let catalog = Arc::new(CatalogStubs::new());
     let shard_path = "insert-no-column-list-durability-lfs";
 
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
     client
         .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
@@ -99,7 +98,12 @@ async fn positional_values_persisted_lfs() {
             _ => None,
         })
         .collect();
-    assert_eq!(rows.len(), 2, "expected 2 persisted rows, got {}", rows.len());
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected 2 persisted rows, got {}",
+        rows.len()
+    );
     assert_eq!(rows[0].get("id"), Some("3"));
     assert_eq!(rows[0].get("name"), Some("carol"));
     assert_eq!(rows[1].get("id"), Some("4"));

@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::memory::MemTable;
 use datafusion::prelude::SessionContext;
@@ -50,11 +53,12 @@ use tokio::net::TcpListener;
 
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
+use rockstream_ops::{ArrowZSet, ColumnValue};
 use rockstream_sql::SqlFrontend;
 use rockstream_types::config::ScatterPruningConfig;
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
-use rockstream_types::ids::{ShardId, ViewId};
+use rockstream_types::ids::{OperatorId, ShardId, ViewId};
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
 use crate::auth::{
@@ -712,6 +716,9 @@ pub static SESSION_WAIT_FOR_TIMEOUT_TOTAL: std::sync::atomic::AtomicU64 =
 /// Total rows scanned into query-time DataFusion MemTables.
 pub static QUERY_TIME_DATAFUSION_ROWS_SCANNED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Total rows scanned by COMMIT-time full rescans that drive compiled view refresh.
+pub static COMMIT_COMPILED_VIEW_ROWS_SCANNED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Total rows processed by `CREATE INDEX` automatic backfill scans (Slice 5, v0.51.2).
 pub static INDEX_BACKFILL_ROWS_PROCESSED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -852,6 +859,14 @@ pub struct GatewayHandler {
     table_insert_metadata: Arc<DashMap<String, Arc<TableInsertMetadata>>>,
     /// Wall-clock publish timestamp of the most recently advanced shard frontier.
     frontier_published_at_ms: Arc<AtomicU64>,
+    /// Compiled `PlanNode → Operator` pipelines for views registered through
+    /// the v0.51.3 "one data plane" fast path (Slice 3/4), keyed by view
+    /// name. Populated by `handle_create_view` when the view's SELECT
+    /// compiles via `rockstream_ops::compile_plan`; absent for query shapes
+    /// the compiler doesn't yet support (joins, aggregates, windows, ...),
+    /// which keep going through `view_materializer.rs` until Slice 5/6 wire
+    /// COMMIT through the compiled path.
+    compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
 }
 
 impl GatewayHandler {
@@ -878,6 +893,7 @@ impl GatewayHandler {
             pending_notifies: Arc::new(DashMap::new()),
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
+            compiled_views: Arc::new(DashMap::new()),
         }
     }
 
@@ -908,6 +924,7 @@ impl GatewayHandler {
             pending_notifies: Arc::new(DashMap::new()),
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
+            compiled_views: Arc::new(DashMap::new()),
         }
     }
 
@@ -915,6 +932,15 @@ impl GatewayHandler {
     pub fn set_frontier_published_at_ms_for_test(&self, timestamp_ms: u64) {
         self.frontier_published_at_ms
             .store(timestamp_ms, Ordering::SeqCst);
+    }
+
+    /// Whether a compiled operator pipeline (v0.51.3 Slice 4) has been
+    /// registered for `view_name`. Used by tests to confirm `CREATE VIEW`
+    /// routed through the direct operator compiler rather than falling back
+    /// to `view_materializer.rs`.
+    #[doc(hidden)]
+    pub fn has_compiled_view(&self, view_name: &str) -> bool {
+        self.compiled_views.contains_key(view_name)
     }
 
     fn build_explain_frontend(&self) -> Result<SqlFrontend, PgWireError> {
@@ -930,6 +956,189 @@ impl GatewayHandler {
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         }
         Ok(frontend)
+    }
+
+    /// v0.51.3 Slice 4: try to compile `select_sql` (a view's body) directly
+    /// into an executable `Source → [Filter] → [Project|Map] → ViewSink`
+    /// operator chain via `rockstream_ops::compile_plan`.
+    ///
+    /// Registers all known tables/views as DataFusion schemas (reusing
+    /// `build_explain_frontend`'s pattern) so the SQL parses, lowers to a
+    /// `PlanNode` via `SqlFrontend::sql_to_plan_node`, then compiles that
+    /// plan. Returns an error (not a panic) for any SQL that fails to parse
+    /// or lower, or any `PlanNode` shape `compile_plan` doesn't support —
+    /// callers treat this as a normal "not eligible for the fast path" case.
+    async fn try_compile_view(
+        &self,
+        view_name: &str,
+        select_sql: &str,
+        output_column_count: usize,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+    ) -> Result<rockstream_ops::CompiledView, String> {
+        let frontend = self
+            .build_explain_frontend()
+            .map_err(|e| format!("frontend setup failed: {e:?}"))?;
+
+        let view_plan = rockstream_plan::PlanNode::ViewSink {
+            view_name: view_name.to_string(),
+            pk: full_row_pk(output_column_count),
+            child: Box::new(
+                frontend
+                    .sql_to_plan_node(select_sql)
+                    .await
+                    .map_err(|e| format!("sql_to_plan_node: {e}"))?,
+            ),
+        };
+
+        rockstream_ops::compile_plan(&view_plan, shard_db).map_err(|e| format!("compile_plan: {e}"))
+    }
+
+    fn compiled_view_pk(&self, view_name: &str, column_count: usize) -> Vec<usize> {
+        self.compiled_views
+            .get(view_name)
+            .map(|view| view.pk.clone())
+            .unwrap_or_else(|| {
+                if column_count == 0 {
+                    Vec::new()
+                } else {
+                    full_row_pk(column_count)
+                }
+            })
+    }
+
+    async fn read_compiled_view_rows(
+        &self,
+        view_name: &str,
+        view: &crate::catalog_stubs::CatalogView,
+        shard_db: &rockstream_storage::ShardDb,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        let Some(op_id) = view.op_id else {
+            return Ok(Vec::new());
+        };
+        let stored =
+            rockstream_ops::read_view_output(shard_db, OperatorId(op_id), view.columns.len())
+                .await
+                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("read_view_output({view_name}): {e}"),
+                })?;
+        let state = materialize_view_state(
+            stored,
+            &self.compiled_view_pk(view_name, view.columns.len()),
+        );
+        Ok(state
+            .into_values()
+            .flat_map(|(row, count)| {
+                std::iter::repeat_with({
+                    let row = row.clone();
+                    move || column_values_to_tsv_bytes(&row)
+                })
+                .take(count.max(0) as usize)
+            })
+            .collect())
+    }
+
+    async fn scan_relation_rows_bounded(
+        &self,
+        relation_name: &str,
+        shard_db: &rockstream_storage::ShardDb,
+    ) -> Result<Vec<Vec<u8>>, GatewayError> {
+        let prefix = format!("view_output/{relation_name}/");
+        let (rows, truncated) = shard_db
+            .scan_prefix_bounded(prefix.as_bytes(), MAX_QUERY_TIME_SCAN_BYTES)
+            .await?;
+        if truncated || rows.len() > MAX_QUERY_TIME_ROWS {
+            return Err(GatewayError::QueryTimeResultSetTooLarge {
+                relation: relation_name.to_string(),
+                row_limit: MAX_QUERY_TIME_ROWS,
+            });
+        }
+        Ok(rows
+            .into_iter()
+            .map(|(_, value)| value.to_vec())
+            .collect::<Vec<_>>())
+    }
+
+    fn reachable_compiled_views(&self, changed_relations: &HashSet<String>) -> Vec<String> {
+        let mut reachable = changed_relations.clone();
+        let mut ordered = Vec::new();
+        let mut scheduled = HashSet::new();
+        loop {
+            let mut progressed = false;
+            for view in self.catalog.list_views() {
+                if scheduled.contains(&view.name) {
+                    continue;
+                }
+                let deps = self.catalog.get_view_deps(&view.name);
+                if deps.iter().any(|dep| reachable.contains(dep)) {
+                    reachable.insert(view.name.clone());
+                    scheduled.insert(view.name.clone());
+                    if self.compiled_views.contains_key(&view.name) {
+                        ordered.push(view.name.clone());
+                    }
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        ordered
+    }
+
+    async fn recompute_compiled_view(
+        &self,
+        view_name: &str,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let Some(compiled) = self.compiled_views.get(view_name) else {
+            return Ok(());
+        };
+        let deps = self.catalog.get_view_deps(view_name);
+        if deps.is_empty() {
+            return Ok(());
+        }
+        let source_name = deps[0].clone();
+        let source_rows = self
+            .scan_relation_rows_bounded(&source_name, shard_db.as_ref())
+            .await?;
+        COMMIT_COMPILED_VIEW_ROWS_SCANNED_TOTAL
+            .fetch_add(source_rows.len() as u64, Ordering::Relaxed);
+        let source_schema = query_time_relation_schema(&self.catalog, &source_name);
+        let source_batch =
+            crate::view_materializer::tsv_to_record_batch(source_schema.clone(), &source_rows)
+                .unwrap_or_else(|_| RecordBatch::new_empty(source_schema));
+        let input = ArrowZSet::new(source_batch.clone(), vec![1; source_batch.num_rows()]);
+        let output = compiled.pipeline.process(input).map_err(|e| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled pipeline process({view_name}): {e}"),
+            }
+        })?;
+        let old_state = {
+            let catalog_view = self
+                .catalog
+                .get_view(view_name)
+                .ok_or_else(|| GatewayError::ViewNotFound(view_name.to_string()))?;
+            let stored = rockstream_ops::read_view_output(
+                shard_db.as_ref(),
+                compiled.sink_op_id,
+                catalog_view.columns.len(),
+            )
+            .await
+            .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("read old view_output({view_name}): {e}"),
+            })?;
+            materialize_view_state(stored, &compiled.pk)
+        };
+        let new_state = record_batch_to_view_state(&output, &compiled.pk)?;
+        let delta = diff_view_states_to_zset(output.schema(), &old_state, &new_state)?;
+        if !delta.is_empty() {
+            compiled.sink.write_next_epoch(&delta).await.map_err(|e| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("write compiled view_output({view_name}): {e}"),
+                }
+            })?;
+        }
+        Ok(())
     }
 
     fn published_frontier_age_ms(&self) -> Option<u64> {
@@ -2796,11 +3005,25 @@ impl GatewayHandler {
         // ShardReader (DbReader) polls for a new manifest every 1 s and would
         // return stale results until the next poll fires.
         let raw_rows: Vec<Vec<u8>> = if let Some(shard_db) = &self.shard_db {
-            let prefix = format!("view_output/{view_name}/");
-            let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
-                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-            })?;
-            let mut rows: Vec<Vec<u8>> = kvs.into_iter().map(|(_, v)| v.to_vec()).collect();
+            let mut rows: Vec<Vec<u8>> = if let Some(view) = self.catalog.get_view(view_name) {
+                if view.op_id.is_some() {
+                    self.read_compiled_view_rows(view_name, &view, shard_db)
+                        .await
+                        .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+                } else {
+                    let prefix = format!("view_output/{view_name}/");
+                    let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
+                        PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+                    })?;
+                    kvs.into_iter().map(|(_, v)| v.to_vec()).collect()
+                }
+            } else {
+                let prefix = format!("view_output/{view_name}/");
+                let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
+                    PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+                })?;
+                kvs.into_iter().map(|(_, v)| v.to_vec()).collect()
+            };
             // Apply ORDER BY if specified
             if !order_by.is_empty() {
                 // Build column-name → index map from schema_fields
@@ -2961,6 +3184,7 @@ impl GatewayHandler {
                     sql: select_sql,
                     columns: initial_columns,
                     namespace: "public".to_string(),
+                    op_id: None,
                 },
                 deps.clone(),
             );
@@ -2974,6 +3198,51 @@ impl GatewayHandler {
                     "create_view",
                     &view_name,
                 ));
+            }
+
+            // v0.51.3 Slice 4: attempt to compile the view's SELECT directly
+            // into an executable operator chain via the "one data plane"
+            // fast path. Best-effort: any failure (unsupported query shape,
+            // parse error, etc.) is logged and the view keeps `op_id =
+            // None`, falling back to `view_materializer.rs`'s DataFusion
+            // path below for correctness. Requires a shared `ShardDb`
+            // (`--role all`); standalone `--role gateway` has none.
+            if let Some(shard_db) = self.shard_db.clone() {
+                let deps_are_base_tables =
+                    deps.iter().all(|dep| self.catalog.get_table(dep).is_some());
+                if let Some(view) = self.catalog.get_view(&view_name) {
+                    if deps_are_base_tables {
+                        match self
+                            .try_compile_view(&view.name, &view.sql, view.columns.len(), shard_db)
+                            .await
+                        {
+                            Ok(compiled) => {
+                                let op_id = compiled.sink_op_id.0;
+                                self.compiled_views
+                                    .insert(view.name.clone(), Arc::new(compiled));
+                                self.catalog.set_view_op_id(&view.name, op_id);
+                                tracing::debug!(
+                                    view = %view.name,
+                                    op_id,
+                                    "handle_create_view: compiled view through direct operator pipeline"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    view = %view.name,
+                                    error = %e,
+                                    "handle_create_view: view not compilable via direct operator pipeline, falling back to view_materializer"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            view = %view.name,
+                            deps = ?deps,
+                            "handle_create_view: skipping direct operator compilation for view with non-table dependencies"
+                        );
+                    }
+                }
             }
 
             // Immediate materialization: a CREATE MATERIALIZED VIEW must
@@ -2991,6 +3260,16 @@ impl GatewayHandler {
                         &changed_tables,
                     )
                     .await;
+                    if self.compiled_views.contains_key(&view_name) {
+                        if let Err(error) = self.recompute_compiled_view(&view_name, shard_db).await
+                        {
+                            tracing::warn!(
+                                view = %view_name,
+                                error = %error,
+                                "compiled immediate materialization failed after legacy refresh"
+                            );
+                        }
+                    }
                     if let Err(e) = shard_db.flush().await {
                         tracing::warn!(
                             "post-CREATE-MATERIALIZED-VIEW shard flush failed (non-fatal): {e}"
@@ -3424,9 +3703,11 @@ impl GatewayHandler {
         };
 
         let col_idx = self.catalog.get_table(table).and_then(|t| {
-            t.columns
-                .iter()
-                .position(|c| index_cols.first().is_some_and(|ic| ic.eq_ignore_ascii_case(&c.name)))
+            t.columns.iter().position(|c| {
+                index_cols
+                    .first()
+                    .is_some_and(|ic| ic.eq_ignore_ascii_case(&c.name))
+            })
         });
 
         let Some(col_idx) = col_idx else {
@@ -3932,6 +4213,15 @@ impl GatewayHandler {
                 .collect();
             crate::view_materializer::materialize_views(&self.catalog, shard_db, &changed_tables)
                 .await;
+            for view_name in self.reachable_compiled_views(&changed_tables) {
+                if let Err(error) = self.recompute_compiled_view(&view_name, shard_db).await {
+                    tracing::warn!(
+                        view = %view_name,
+                        error = %error,
+                        "compiled view refresh failed after commit; legacy materializer still runs"
+                    );
+                }
+            }
             // Flush the WAL so that materialised view output is immediately
             // visible to the ShardReader (DbReader reads from SSTs, not the
             // in-memory WAL buffer; without a flush the SELECT after COMMIT
@@ -7584,6 +7874,319 @@ fn query_time_relation_schema(catalog: &CatalogStubs, relation_name: &str) -> Sc
     )]))
 }
 
+fn serialize_column_value(value: &ColumnValue) -> String {
+    match value {
+        ColumnValue::Int64(v) => format!("i:{v}"),
+        ColumnValue::Utf8(v) => format!("s:{}:{v}", v.len()),
+        ColumnValue::Boolean(v) => format!("b:{}", u8::from(*v)),
+        ColumnValue::Float64(v) => format!("f:{:016x}", v.to_bits()),
+    }
+}
+
+fn serialize_pk(row: &[ColumnValue], pk: &[usize]) -> String {
+    if pk.is_empty() {
+        return row
+            .iter()
+            .map(serialize_column_value)
+            .collect::<Vec<_>>()
+            .join("|");
+    }
+    pk.iter()
+        .filter_map(|idx| row.get(*idx))
+        .map(serialize_column_value)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn full_row_pk(column_count: usize) -> Vec<usize> {
+    (0..column_count).collect()
+}
+
+fn column_values_to_tsv_bytes(row: &[ColumnValue]) -> Vec<u8> {
+    row.iter()
+        .map(|value| match value {
+            ColumnValue::Int64(v) => v.to_string(),
+            ColumnValue::Utf8(v) => v.clone(),
+            ColumnValue::Boolean(v) => v.to_string(),
+            ColumnValue::Float64(v) => v.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\t")
+        .into_bytes()
+}
+
+type MaterializedViewState = std::collections::BTreeMap<String, (Vec<ColumnValue>, i64)>;
+
+fn materialize_view_state(
+    rows: Vec<(u64, u64, Vec<ColumnValue>, i64)>,
+    pk: &[usize],
+) -> MaterializedViewState {
+    let mut state = std::collections::BTreeMap::new();
+    for (_epoch, _row_idx, row, weight) in rows {
+        let key = serialize_pk(&row, pk);
+        let mut remove_key = false;
+        match state.entry(key.clone()) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let (stored_row, count) = entry.get_mut();
+                *stored_row = row;
+                *count += weight;
+                remove_key = *count == 0;
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                if weight != 0 {
+                    entry.insert((row, weight));
+                }
+            }
+        }
+        if remove_key {
+            state.remove(&key);
+        }
+    }
+    state
+}
+
+fn record_batch_row_to_values(
+    batch: &RecordBatch,
+    row_idx: usize,
+) -> Result<Vec<ColumnValue>, GatewayError> {
+    let mut row = Vec::with_capacity(batch.num_columns());
+    for column in batch.columns() {
+        if column.is_null(row_idx) {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: "compiled views do not support null-valued rows".to_string(),
+            });
+        }
+        let value = match column.data_type() {
+            DataType::Int32 => ColumnValue::Int64(
+                column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                        detail: "Int32 downcast failed".to_string(),
+                    })?
+                    .value(row_idx) as i64,
+            ),
+            DataType::Int64 => ColumnValue::Int64(
+                column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                        detail: "Int64 downcast failed".to_string(),
+                    })?
+                    .value(row_idx),
+            ),
+            DataType::Utf8 => ColumnValue::Utf8(
+                column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                        detail: "Utf8 downcast failed".to_string(),
+                    })?
+                    .value(row_idx)
+                    .to_string(),
+            ),
+            DataType::Boolean => ColumnValue::Boolean(
+                column
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                        detail: "Boolean downcast failed".to_string(),
+                    })?
+                    .value(row_idx),
+            ),
+            DataType::Float64 => ColumnValue::Float64(
+                column
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                        detail: "Float64 downcast failed".to_string(),
+                    })?
+                    .value(row_idx),
+            ),
+            other => {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled views do not support column type {other:?}"),
+                });
+            }
+        };
+        row.push(value);
+    }
+    Ok(row)
+}
+
+fn record_batch_to_view_state(
+    batch: &ArrowZSet,
+    pk: &[usize],
+) -> Result<MaterializedViewState, GatewayError> {
+    let mut state = std::collections::BTreeMap::new();
+    for row_idx in 0..batch.num_rows() {
+        let weight = batch.weights.get(row_idx).copied().unwrap_or_default();
+        if weight <= 0 {
+            continue;
+        }
+        let row = record_batch_row_to_values(&batch.data, row_idx)?;
+        let key = serialize_pk(&row, pk);
+        match state.entry(key) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let (stored_row, count) = entry.get_mut();
+                *stored_row = row;
+                *count += weight;
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((row, weight));
+            }
+        }
+    }
+    Ok(state)
+}
+
+fn build_arrow_arrays(
+    schema: SchemaRef,
+    rows: &[Vec<ColumnValue>],
+) -> Result<Vec<ArrayRef>, GatewayError> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(col_idx, field)| match field.data_type() {
+            DataType::Int32 => {
+                let values: Result<Vec<i32>, GatewayError> = rows
+                    .iter()
+                    .map(|row| {
+                        row.get(col_idx)
+                            .and_then(ColumnValue::as_i64)
+                            .map(|v| v as i32)
+                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                                detail: format!(
+                                    "row {row:?} missing Int32 value at column {col_idx}"
+                                ),
+                            })
+                    })
+                    .collect();
+                Ok(Arc::new(Int32Array::from(values?)) as ArrayRef)
+            }
+            DataType::Int64 => {
+                let values: Result<Vec<i64>, GatewayError> = rows
+                    .iter()
+                    .map(|row| {
+                        row.get(col_idx)
+                            .and_then(ColumnValue::as_i64)
+                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                                detail: format!(
+                                    "row {row:?} missing Int64 value at column {col_idx}"
+                                ),
+                            })
+                    })
+                    .collect();
+                Ok(Arc::new(Int64Array::from(values?)) as ArrayRef)
+            }
+            DataType::Utf8 => {
+                let values: Result<Vec<String>, GatewayError> = rows
+                    .iter()
+                    .map(|row| {
+                        row.get(col_idx)
+                            .and_then(ColumnValue::as_utf8)
+                            .map(|v| v.to_string())
+                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                                detail: format!(
+                                    "row {row:?} missing Utf8 value at column {col_idx}"
+                                ),
+                            })
+                    })
+                    .collect();
+                Ok(Arc::new(StringArray::from(values?)) as ArrayRef)
+            }
+            DataType::Boolean => {
+                let values: Result<Vec<bool>, GatewayError> = rows
+                    .iter()
+                    .map(|row| {
+                        row.get(col_idx)
+                            .and_then(ColumnValue::as_bool)
+                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                                detail: format!(
+                                    "row {row:?} missing Boolean value at column {col_idx}"
+                                ),
+                            })
+                    })
+                    .collect();
+                Ok(Arc::new(BooleanArray::from(values?)) as ArrayRef)
+            }
+            DataType::Float64 => {
+                let values: Result<Vec<f64>, GatewayError> = rows
+                    .iter()
+                    .map(|row| {
+                        row.get(col_idx)
+                            .and_then(ColumnValue::as_f64)
+                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                                detail: format!(
+                                    "row {row:?} missing Float64 value at column {col_idx}"
+                                ),
+                            })
+                    })
+                    .collect();
+                Ok(Arc::new(Float64Array::from(values?)) as ArrayRef)
+            }
+            other => Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled views do not support output type {other:?}"),
+            }),
+        })
+        .collect()
+}
+
+fn diff_view_states_to_zset(
+    schema: SchemaRef,
+    old_state: &MaterializedViewState,
+    new_state: &MaterializedViewState,
+) -> Result<ArrowZSet, GatewayError> {
+    let mut rows = Vec::new();
+    let mut weights = Vec::new();
+    let mut keys = std::collections::BTreeSet::new();
+    keys.extend(old_state.keys().cloned());
+    keys.extend(new_state.keys().cloned());
+    for key in keys {
+        match (old_state.get(&key), new_state.get(&key)) {
+            (Some((old_row, old_count)), Some((new_row, new_count))) if old_row == new_row => {
+                let delta = *new_count - *old_count;
+                if delta != 0 {
+                    rows.push(new_row.clone());
+                    weights.push(delta);
+                }
+            }
+            (Some((old_row, old_count)), Some((new_row, new_count))) => {
+                if *old_count != 0 {
+                    rows.push(old_row.clone());
+                    weights.push(-*old_count);
+                }
+                if *new_count != 0 {
+                    rows.push(new_row.clone());
+                    weights.push(*new_count);
+                }
+            }
+            (Some((old_row, old_count)), None) => {
+                if *old_count != 0 {
+                    rows.push(old_row.clone());
+                    weights.push(-*old_count);
+                }
+            }
+            (None, Some((new_row, new_count))) if *new_count != 0 => {
+                rows.push(new_row.clone());
+                weights.push(*new_count);
+            }
+            _ => {}
+        }
+    }
+    if rows.is_empty() {
+        return Ok(ArrowZSet::empty(schema));
+    }
+    let arrays = build_arrow_arrays(schema.clone(), &rows)?;
+    let batch = RecordBatch::try_new(schema, arrays).map_err(|e| {
+        GatewayError::QueryTimeExecutionFailed {
+            detail: format!("failed to build compiled delta batch: {e}"),
+        }
+    })?;
+    Ok(ArrowZSet::new(batch, weights))
+}
+
 async fn query_time_datafusion_select(
     catalog: &CatalogStubs,
     shard_db: &rockstream_storage::ShardDb,
@@ -7905,8 +8508,16 @@ fn extract_where_range(q: &str) -> Option<(String, i64, i64)> {
         (right_val, right_op, left_val, left_op)
     };
     // Normalize exclusive bounds (`>`/`<`) to inclusive i64 bounds.
-    let lower_inclusive = if lower_op == '>' { lower_val + 1 } else { lower_val };
-    let upper_inclusive = if upper_op == '<' { upper_val - 1 } else { upper_val };
+    let lower_inclusive = if lower_op == '>' {
+        lower_val + 1
+    } else {
+        lower_val
+    };
+    let upper_inclusive = if upper_op == '<' {
+        upper_val - 1
+    } else {
+        upper_val
+    };
     if lower_inclusive > upper_inclusive {
         return None;
     }
@@ -9261,6 +9872,21 @@ mod s4_tests {
         Arc::new(GatewayHandler::new(catalog, reader))
     }
 
+    #[test]
+    fn compiled_view_state_preserves_full_row_multiplicity() {
+        let row = vec![ColumnValue::Int64(1000), ColumnValue::Int64(2000)];
+        let state = materialize_view_state(
+            vec![
+                (0, 0, row.clone(), 1),
+                (0, 1, row.clone(), 1),
+                (1, 0, row.clone(), -1),
+            ],
+            &full_row_pk(row.len()),
+        );
+        assert_eq!(state.len(), 1);
+        assert_eq!(state.values().next(), Some(&(row, 1)));
+    }
+
     /// S4 green gate: namespace_isolation_blocks_cross_access
     /// A non-admin principal in ns-a cannot access a view in ns-b.
     #[tokio::test]
@@ -9276,6 +9902,7 @@ mod s4_tests {
                 data_type: "Int32".to_string(),
             }],
             namespace: "ns-b".to_string(),
+            op_id: None,
         });
 
         // Grant alice Viewer on ns-a only
@@ -9326,6 +9953,7 @@ mod s4_tests {
                 data_type: "Int32".to_string(),
             }],
             namespace: "ns-b".to_string(),
+            op_id: None,
         });
 
         // Grant carol Admin on ns-a (allows cross-namespace)
@@ -9476,6 +10104,7 @@ mod s4_tests {
                 data_type: "Int64".to_string(),
             }],
             namespace: "public".to_string(),
+            op_id: None,
         });
 
         let responses = handler
@@ -9528,6 +10157,7 @@ mod s4_tests {
             sql: "SELECT 1".to_string(),
             columns: vec![],
             namespace: "public".to_string(),
+            op_id: None,
         });
 
         let message = create_sink_error_message(
@@ -9553,6 +10183,7 @@ mod s4_tests {
             sql: "SELECT 1".to_string(),
             columns: vec![],
             namespace: "public".to_string(),
+            op_id: None,
         });
 
         let message = create_sink_error_message(

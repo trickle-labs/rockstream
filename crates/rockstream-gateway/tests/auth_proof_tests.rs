@@ -65,6 +65,7 @@ async fn proof_rbac_denies_cross_namespace_access() {
         sql: "SELECT * FROM t".to_string(),
         columns: vec![],
         namespace: "ns-b".to_string(),
+        op_id: None,
     });
 
     let view_reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);

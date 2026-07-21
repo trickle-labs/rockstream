@@ -117,6 +117,10 @@ pub enum OpError {
         max_iterations: usize,
         code: ErrorCode,
     },
+
+    /// `compile_plan` encountered a `PlanNode` shape it does not support.
+    #[error("[{code}] Plan node not supported by the direct operator compiler: {kind}; next_steps: this query shape requires the DiffCtx/OpNode physical-plan path, not the v0.51.3 fast-path compiler")]
+    UnsupportedPlanNode { kind: String, code: ErrorCode },
 }
 
 impl OpError {
@@ -252,6 +256,14 @@ impl OpError {
         Self::RecursionMaxIterations {
             max_iterations,
             code: RS_1513,
+        }
+    }
+
+    pub fn unsupported_plan_node(kind: impl Into<String>) -> Self {
+        use rockstream_types::error_code::RS_1013;
+        Self::UnsupportedPlanNode {
+            kind: kind.into(),
+            code: RS_1013,
         }
     }
 }

@@ -344,8 +344,10 @@ async fn minio_snapshot_bootstrap_large_scale() {
         key.extend_from_slice(&0u64.to_be_bytes());
         key.extend_from_slice(&(i as u64).to_be_bytes());
 
-        let mut value = Vec::with_capacity(24);
+        let mut value = Vec::with_capacity(26);
+        value.push(0u8); // TAG_INT64
         value.extend_from_slice(&(i as i64).to_be_bytes());
+        value.push(0u8); // TAG_INT64
         value.extend_from_slice(&(i as i64).to_be_bytes());
         value.extend_from_slice(&1i64.to_be_bytes());
         wb.put(&key, &value);

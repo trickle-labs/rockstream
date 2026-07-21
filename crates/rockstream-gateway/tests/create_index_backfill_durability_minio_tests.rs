@@ -117,7 +117,16 @@ fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let dpm: [u32; 12] = [
         31,
         if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month = 0u32;
     for &d in &dpm {
@@ -186,8 +195,7 @@ fn minio_object_store(port: u16, bucket: &str) -> Arc<dyn ObjectStore> {
 
 async fn run_backfilled_index_reconnect_case(store: Arc<dyn ObjectStore>, shard_path: &str) {
     let catalog = Arc::new(CatalogStubs::new());
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
     client
         .simple_query("CREATE TABLE accounts (id BIGINT, balance BIGINT)")
@@ -220,8 +228,7 @@ async fn run_backfilled_index_reconnect_case(store: Arc<dyn ObjectStore>, shard_
     );
     handle.abort();
 
-    let (port2, _handle2, shard_db2) =
-        start_gateway(shard_path, store, catalog.clone()).await;
+    let (port2, _handle2, shard_db2) = start_gateway(shard_path, store, catalog.clone()).await;
     let client2 = connect_port(port2).await;
     shard_db2.flush().await.unwrap();
 
@@ -240,8 +247,7 @@ async fn run_backfilled_index_reconnect_case(store: Arc<dyn ObjectStore>, shard_
 
 async fn run_index_ready_state_restart_case(store: Arc<dyn ObjectStore>, shard_path: &str) {
     let catalog = Arc::new(CatalogStubs::new());
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
     client
         .simple_query("CREATE TABLE readings (id BIGINT, value BIGINT)")
@@ -274,8 +280,7 @@ async fn run_index_ready_state_restart_case(store: Arc<dyn ObjectStore>, shard_p
         .expect("Ready index must carry an op_id before restart");
     handle.abort();
 
-    let (port2, _handle2, shard_db2) =
-        start_gateway(shard_path, store, catalog.clone()).await;
+    let (port2, _handle2, shard_db2) = start_gateway(shard_path, store, catalog.clone()).await;
     let client2 = connect_port(port2).await;
     shard_db2.flush().await.unwrap();
 

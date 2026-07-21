@@ -154,6 +154,13 @@ pub struct CatalogView {
     pub columns: Vec<CatalogColumn>,
     /// Namespace this view belongs to (v0.26). Default: "public".
     pub namespace: String,
+    /// `OperatorId` (as u64) of the compiled `ViewSinkOp` backing this view
+    /// (v0.51.3 Slice 4). Set once `handle_create_view` successfully
+    /// compiles the view's SELECT via `rockstream_ops::compile_plan`.
+    /// `None` means the view's query shape isn't (yet) supported by the
+    /// direct operator compiler and is served via `view_materializer.rs`
+    /// instead.
+    pub op_id: Option<u64>,
 }
 
 /// A table entry registered by `CREATE TABLE` commands.
@@ -504,6 +511,18 @@ impl CatalogStubs {
         if let Some(v) = inner.views.get_mut(view_name) {
             v.columns = columns;
         }
+    }
+
+    /// Set the `OperatorId` (as u64) of the compiled `ViewSinkOp` backing a
+    /// view (v0.51.3 Slice 4). Called by `handle_create_view` once
+    /// `rockstream_ops::compile_plan` succeeds for the view's SELECT.
+    pub fn set_view_op_id(&self, view_name: &str, op_id: u64) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(v) = inner.views.get_mut(view_name) {
+            v.op_id = Some(op_id);
+            return true;
+        }
+        false
     }
 
     /// Return the dependency list for a specific view.
@@ -2350,6 +2369,7 @@ mod tests {
                 sql: "SELECT 1".to_string(),
                 columns: vec![],
                 namespace: "public".to_string(),
+                op_id: None,
             });
             catalog.assign_view_workload(view_name, "fast");
         }

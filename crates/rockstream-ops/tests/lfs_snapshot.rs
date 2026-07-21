@@ -218,8 +218,10 @@ async fn lfs_snapshot_bootstrap_large_scale() {
         key.extend_from_slice(&0u64.to_be_bytes()); // epoch 0
         key.extend_from_slice(&(i as u64).to_be_bytes()); // row index
 
-        let mut value = Vec::with_capacity(24);
+        let mut value = Vec::with_capacity(19);
+        value.push(0u8); // TAG_INT64
         value.extend_from_slice(&(i as i64).to_be_bytes()); // col k
+        value.push(0u8); // TAG_INT64
         value.extend_from_slice(&(i as i64).to_be_bytes()); // col v
         value.extend_from_slice(&1i64.to_be_bytes()); // weight 1
         wb.put(&key, &value);

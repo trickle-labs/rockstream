@@ -59,15 +59,19 @@ impl SnapshotOp {
             if key.len() < 25 {
                 continue;
             }
-            if value.len() < (num_cols + 1) * 8 {
+            // `SnapshotOp` is Int64-only (its schema/`Vec<Vec<i64>>` row
+            // representation predates v0.51.3's multi-type `ViewSinkOp`
+            // encoding). Decode through the shared, type-tagged
+            // `crate::sink::decode_row` and require every column to be
+            // `Int64`; rows with a non-Int64 column (not a supported input
+            // for this operator) are skipped rather than silently
+            // misinterpreted as raw bytes.
+            let Some((cols, w)) = crate::sink::decode_row(&value, num_cols) else {
                 continue;
-            }
-            let mut cols = Vec::with_capacity(num_cols);
-            for c in 0..num_cols {
-                let v = i64::from_be_bytes(value[c * 8..(c + 1) * 8].try_into().unwrap());
-                cols.push(v);
-            }
-            let w = i64::from_be_bytes(value[num_cols * 8..(num_cols + 1) * 8].try_into().unwrap());
+            };
+            let Some(cols): Option<Vec<i64>> = cols.iter().map(|c| c.as_i64()).collect() else {
+                continue;
+            };
             *map.entry(cols).or_insert(0) += w;
         }
 

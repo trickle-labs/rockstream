@@ -249,6 +249,7 @@ async fn test_search_path_unqualified_view() {
             name: "id".to_string(),
             data_type: "Int32".to_string(),
         }],
+        op_id: None,
     });
 
     let role_catalog = Arc::new(RoleCatalog::new());

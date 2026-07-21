@@ -85,15 +85,11 @@ impl Operator for ViewRefOp {
         };
 
         let num_cols = self.schema.fields().len();
-        let expected_len = (num_cols + 1) * 8;
 
         // Parse key-value entries into rows and sort them by row_index.
         let mut sorted_entries = Vec::new();
         for (key, value) in entries {
             if key.len() < 25 {
-                continue;
-            }
-            if value.len() < expected_len {
                 continue;
             }
             // Key format: [prefix:1][op_id:8][epoch:8][row_index:8]
@@ -113,12 +109,23 @@ impl Operator for ViewRefOp {
         let mut cols = vec![Vec::with_capacity(sorted_entries.len()); num_cols];
         let mut weights = Vec::with_capacity(sorted_entries.len());
 
+        // `ViewRefOp` is Int64-only (its schema/output `Int64Array` columns
+        // predate v0.51.3's multi-type `ViewSinkOp` encoding). Decode
+        // through the shared, type-tagged `crate::sink::decode_row` and
+        // require every column to be `Int64`; malformed/non-Int64 rows are
+        // skipped rather than silently misinterpreted as raw bytes.
         for (_, value) in sorted_entries {
-            for c in 0..num_cols {
-                let v = i64::from_be_bytes(value[c * 8..(c + 1) * 8].try_into().unwrap());
+            let Some((decoded_cols, w)) = crate::sink::decode_row(&value, num_cols) else {
+                continue;
+            };
+            let Some(row_vals): Option<Vec<i64>> =
+                decoded_cols.iter().map(|c| c.as_i64()).collect()
+            else {
+                continue;
+            };
+            for (c, v) in row_vals.into_iter().enumerate() {
                 cols[c].push(v);
             }
-            let w = i64::from_be_bytes(value[num_cols * 8..(num_cols + 1) * 8].try_into().unwrap());
             weights.push(w);
         }
 

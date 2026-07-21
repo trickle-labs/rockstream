@@ -522,6 +522,7 @@ async fn copy_out_streams_view_rows() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -681,6 +682,7 @@ async fn proof_psql_select_limit_10_under_10ms_p99() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -864,6 +866,7 @@ async fn _proof_orm_schema_reflection_impl() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
     catalog.add_index(CatalogIndexEntry {
         name: "orders_mv_idx".to_string(),
@@ -1191,10 +1194,7 @@ async fn insert_accumulates_in_write_buffer() {
         .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
         .await
         .expect("CREATE TABLE failed");
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("BEGIN failed");
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
     client
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
@@ -1224,10 +1224,7 @@ async fn delete_accumulates_in_write_buffer() {
         .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
         .await
         .expect("CREATE TABLE failed");
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("BEGIN failed");
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
     client
         .simple_query("DELETE FROM t WHERE id = 1")
         .await
@@ -1258,10 +1255,7 @@ async fn commit_flushes_rows_scannable_via_view_prefix() {
         .simple_query("SET rockstream.idempotency_key = 's4-commit-flush-key'")
         .await
         .expect("SET idempotency_key failed");
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("BEGIN failed");
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
     client
         .simple_query("INSERT INTO orders (id, amount) VALUES (42, 99)")
         .await
@@ -1324,10 +1318,7 @@ async fn rollback_discards_write_buffer_no_shard_writes() {
         .simple_query("CREATE TABLE t (id BIGINT, val TEXT)")
         .await
         .expect("CREATE TABLE failed");
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("BEGIN failed");
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
     client
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
@@ -1704,10 +1695,7 @@ async fn missing_idempotency_key_autogenerates_envelope_and_commits() {
         .await
         .expect("CREATE TABLE failed");
 
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("BEGIN failed");
+    client.simple_query("BEGIN").await.expect("BEGIN failed");
     client
         .simple_query("INSERT INTO t (id, val) VALUES (1, 'hello')")
         .await
@@ -1735,15 +1723,13 @@ async fn missing_idempotency_key_autogenerates_envelope_and_commits() {
     assert_eq!(data_rows[0].get("val"), Some("hello"));
 }
 
-
 /// v0.51.1 Slice 2 regression: explicit `SET rockstream.idempotency_key` set
 /// once before two INSERTs inside an explicit BEGIN...COMMIT still dedupes a
 /// replayed identical commit — the dedup guarantee spans the whole explicit
 /// multi-statement transaction, not just a single autocommitted statement.
 #[tokio::test]
 async fn explicit_idempotency_key_dedupes_multi_statement_transaction_replay() {
-    let (port, _handle, shard_db) =
-        start_gateway_with_shard("s6-explicit-multi-stmt-replay").await;
+    let (port, _handle, shard_db) = start_gateway_with_shard("s6-explicit-multi-stmt-replay").await;
     let client = connect_port(port).await;
 
     client
@@ -2758,6 +2744,7 @@ async fn explain_incremental_matches_frontend_byte_for_byte() {
             data_type: "Int64".to_string(),
         }],
         namespace: "public".to_string(),
+        op_id: None,
     });
     let server = GatewayServer::with_catalog(
         "127.0.0.1:0".parse().unwrap(),
@@ -2835,6 +2822,7 @@ async fn explain_incremental_analyze_reflects_live_view_traffic() {
             data_type: "Int64".to_string(),
         }],
         namespace: "public".to_string(),
+        op_id: None,
     });
     let server = GatewayServer::with_catalog(
         "127.0.0.1:0".parse().unwrap(),
@@ -3457,10 +3445,7 @@ async fn last_hop_view_materialised_after_commit() {
         .simple_query("SET rockstream.idempotency_key = 'last-hop-001'")
         .await
         .expect("SET idempotency_key");
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("BEGIN");
+    client.simple_query("BEGIN").await.expect("BEGIN");
     client
         .simple_query("INSERT INTO orders (id, amount) VALUES (1, 100)")
         .await
@@ -3535,10 +3520,7 @@ async fn last_hop_aggregate_view_materialised_after_commit() {
         .simple_query("SET rockstream.idempotency_key = 'last-hop-agg-001'")
         .await
         .expect("SET");
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("BEGIN");
+    client.simple_query("BEGIN").await.expect("BEGIN");
     // 3 clicks: /home × 2, /pricing × 1
     client
         .simple_query("INSERT INTO clicks (user_id, url, ts) VALUES (1, '/home', 100)")
@@ -3879,10 +3861,7 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
         .simple_query("SET rockstream.idempotency_key = 'tutorial-dag-txn-001'")
         .await
         .expect("SET idempotency_key 1");
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("BEGIN 1");
+    client.simple_query("BEGIN").await.expect("BEGIN 1");
     client
         .simple_query("INSERT INTO campaigns (campaign_id, name, channel, budget) VALUES (1, 'Summer Sale', 'email', 5000)")
         .await
@@ -3919,10 +3898,7 @@ async fn tutorial_dag_three_level_chain_materialises_correctly() {
         .simple_query("SET rockstream.idempotency_key = 'tutorial-dag-txn-002'")
         .await
         .expect("SET idempotency_key 2");
-    client
-        .simple_query("BEGIN")
-        .await
-        .expect("BEGIN 2");
+    client.simple_query("BEGIN").await.expect("BEGIN 2");
     client
         .simple_query("INSERT INTO conversions (conv_id, campaign_id, revenue, ts) VALUES (101, 1, 300, 1000)")
         .await
@@ -4836,6 +4812,7 @@ async fn test_cancel_request_aborts_query() {
             name: "col".to_string(),
             data_type: "Utf8".to_string(),
         }],
+        op_id: None,
     });
 
     let server = GatewayServer::with_catalog(
@@ -4933,6 +4910,7 @@ async fn test_named_cursor_lifecycle() {
             name: "col".to_string(),
             data_type: "Utf8".to_string(),
         }],
+        op_id: None,
     });
 
     let server = GatewayServer::with_catalog(addr, Arc::new(catalog), view_reader);
@@ -5569,6 +5547,7 @@ async fn test_search_path_view_resolution() {
             name: "id".to_string(),
             data_type: "Int32".to_string(),
         }],
+        op_id: None,
     });
 
     let (port, _handle) = start_gateway_noop(catalog).await;
@@ -6715,10 +6694,7 @@ async fn create_materialized_view_populates_immediately_without_further_write() 
         .simple_query("INSERT INTO t (id, name) VALUES (1, 'alice')")
         .await
         .expect("INSERT failed");
-    client
-        .simple_query("COMMIT")
-        .await
-        .expect("COMMIT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
 
     client
         .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, name FROM t")
@@ -6769,10 +6745,7 @@ async fn create_materialized_view_immediate_population_then_further_insert_updat
         .simple_query("INSERT INTO t (id, name) VALUES (1, 'alice')")
         .await
         .expect("INSERT failed");
-    client
-        .simple_query("COMMIT")
-        .await
-        .expect("COMMIT failed");
+    client.simple_query("COMMIT").await.expect("COMMIT failed");
 
     client
         .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id, name FROM t")

@@ -69,8 +69,7 @@ async fn mv_output_persisted_before_next_commit_lfs() {
     let catalog = Arc::new(CatalogStubs::new());
     let shard_path = "mv-immediate-population-durability-lfs";
 
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, _shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
     client
         .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")

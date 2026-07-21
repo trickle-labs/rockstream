@@ -209,9 +209,14 @@ fn validate_role(role: &str) -> Result<(), CliError> {
 /// The caller must be inside a tokio runtime (`#[tokio::test]` or
 /// `rt.block_on`). The gateway serves until the handle is dropped or aborted.
 ///
-/// The gateway storage is initialised under `<opts.storage>/gateway-shard/`
-/// using a `LocalFileSystem`-backed `ShardDb`. An initial `flush()` creates
-/// the manifest so reads succeed immediately even on a fresh node.
+/// This is the **standalone** gateway entry point (`--role gateway`, no
+/// worker in this process): it opens its own `<opts.storage>/gateway-shard/`
+/// directory and `ShardDb`, since there is no worker in this process to
+/// share a shard with. `--role all` instead opens a single shared
+/// `<opts.storage>/shards/0/` shard (via the embedded worker's normal lease
+/// flow) and calls [`start_gateway_with_shard`] directly with it, so no
+/// second, unreferenced `gateway-shard/` directory is ever created for that
+/// role.
 ///
 /// # Errors
 ///
@@ -251,6 +256,26 @@ pub async fn start_gateway(
         })?;
     let shard_db = Arc::new(shard_db);
 
+    start_gateway_with_shard(opts, shard_db, store, "gateway").await
+}
+
+/// Start the PostgreSQL wire gateway against an **already-open** shard
+/// (`shard_db`, backed by `store` rooted at whatever directory `shard_path`
+/// was opened under). Used by `--role all` to serve the exact same shard the
+/// embedded worker's data-plane DAG operates on — one shared `ShardDb`, no
+/// second gateway-local shard directory. [`start_gateway`] (standalone
+/// `--role gateway`) delegates to this after opening its own shard.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] (RS-0003) if the shard cannot be flushed/read or
+/// the listen port is already in use, or RS-0002 for an unparseable address.
+pub async fn start_gateway_with_shard(
+    opts: &StartOptions,
+    shard_db: Arc<rockstream_storage::ShardDb>,
+    store: Arc<dyn object_store::ObjectStore>,
+    shard_path: &str,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), CliError> {
     // Flush to create the initial manifest so ShardReader can open on a fresh node.
     shard_db.flush().await.map_err(|e| {
         CliError::new(
@@ -260,7 +285,7 @@ pub async fn start_gateway(
         )
     })?;
 
-    let reader = rockstream_storage::ShardReader::open("gateway", store)
+    let reader = rockstream_storage::ShardReader::open(shard_path, store)
         .await
         .map_err(|e| {
             CliError::new(
@@ -400,6 +425,14 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         let mut worker_handle = None;
         let mut control_url = opts.control.clone();
         let mut raft_node_guard: Option<rockstream_control::raft::RaftNodeHandleFull> = None;
+        // `--role all` opens exactly one shared shard (id 0) via the
+        // embedded worker's normal lease flow and hands it to the gateway
+        // below, instead of the gateway opening its own `gateway-shard/`
+        // directory — see `start_gateway_with_shard`.
+        let mut shared_gateway_shard: Option<(
+            Arc<rockstream_storage::ShardDb>,
+            Arc<dyn object_store::ObjectStore>,
+        )> = None;
 
         if opts.role == "all" {
             let catalog = rockstream_control::TopologyCatalog::new();
@@ -563,11 +596,38 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             if opts.role == "all" {
                 // Wait for worker registration handshake
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                // Acquire shard 1 lease to demonstrate fencing setup
+                // Acquire the real shard-0 lease through the normal
+                // control-plane lease flow (no demo/bypass lease): this is
+                // the single shard both the worker's data-plane DAG and the
+                // gateway's pgwire reads serve from in `--role all`.
                 let _ = client
-                    .request_shard(rockstream_types::ids::ShardId(1))
+                    .request_shard(rockstream_types::ids::ShardId(0))
                     .await;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // Poll briefly for the ShardAssigned response to be
+                // processed (client.rs opens the ShardDb asynchronously
+                // when it arrives).
+                let mut shard_db = None;
+                for _ in 0..50 {
+                    if let Some(db) = client.get_shard_db(rockstream_types::ids::ShardId(0)) {
+                        shard_db = Some(db);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if let Some(db) = shard_db {
+                    let shard_path = opts.storage.join("shards").join("0");
+                    let store: Arc<dyn object_store::ObjectStore> = Arc::new(
+                        object_store::local::LocalFileSystem::new_with_prefix(&shard_path)
+                            .map_err(|e| {
+                                CliError::new(
+                                    RS_0003,
+                                    format!("failed to open shared shard-0 store: {e}"),
+                                    "Check storage directory permissions.",
+                                )
+                            })?,
+                    );
+                    shared_gateway_shard = Some((Arc::new(db), store));
+                }
             }
             worker_handle = Some(handle);
         }
@@ -591,7 +651,16 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         if serve_gateway {
             // ── Live gateway serve mode ────────────────────────────────────
             // Build the gateway and wait for an OS shutdown signal.
-            match start_gateway(opts).await {
+            // `--role all` serves the single shared shard-0 opened above (no
+            // second `gateway-shard/` directory); standalone `--role
+            // gateway` opens its own shard, since there's no worker sharing
+            // this process with it.
+            let gateway_result = if let Some((shard_db, store)) = shared_gateway_shard.take() {
+                start_gateway_with_shard(opts, shard_db, store, "db").await
+            } else {
+                start_gateway(opts).await
+            };
+            match gateway_result {
                 Ok((local_addr, gw_handle)) => {
                     let _ = audit_log.append(
                         &AuditEvent::now(SYSTEM_ACTOR, "gateway.started", local_addr.to_string())

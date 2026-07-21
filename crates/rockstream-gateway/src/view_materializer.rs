@@ -644,6 +644,7 @@ mod tests {
                 sql: "SELECT id, amount FROM orders WHERE amount > 50".to_string(),
                 columns: vec![],
                 namespace: "public".to_string(),
+                op_id: None,
             },
             vec!["orders".to_string()],
         );
@@ -700,6 +701,7 @@ mod tests {
                 sql: "SELECT url, COUNT(*) AS hits FROM clicks GROUP BY url".to_string(),
                 columns: vec![],
                 namespace: "public".to_string(),
+                op_id: None,
             },
             vec!["clicks".to_string()],
         );

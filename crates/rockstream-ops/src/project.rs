@@ -60,6 +60,13 @@ impl ProjectOp {
     }
 
     /// Apply the projection to a single delta batch.
+    ///
+    /// The output schema is derived per-batch from each expression's actual
+    /// evaluated Arrow type (a bare `Expr::Column(i)` preserves its input
+    /// type — see `eval_to_array` — so `TEXT`/`BOOLEAN`/`DOUBLE` columns
+    /// pass through unchanged; arithmetic expressions remain `Int64`). The
+    /// precomputed `output_schema` (all-`Int64`) is used only for the empty
+    /// batch case, where there is no data to derive types from.
     pub fn apply(&self, input: ArrowZSet) -> Result<ArrowZSet, OpError> {
         if input.is_empty() {
             return Ok(ArrowZSet::empty(self.output_schema.clone()));
@@ -69,8 +76,14 @@ impl ProjectOp {
             .iter()
             .map(|ne| eval_to_array(&ne.expr, &input.data))
             .collect::<Result<Vec<_>, _>>()?;
-        let new_data =
-            RecordBatch::try_new(self.output_schema.clone(), cols).map_err(OpError::arrow)?;
+        let fields: Vec<Field> = self
+            .exprs
+            .iter()
+            .zip(cols.iter())
+            .map(|(ne, col)| Field::new(&ne.name, col.data_type().clone(), false))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let new_data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(new_data, input.weights))
     }
 }

@@ -114,7 +114,7 @@ async fn lfs_pipeline_filter_project_writes_and_persists() {
     // stored: Vec<(epoch, row_idx, [a, c], weight)>
     let stored_rows: BTreeMap<(i64, i64), i64> = stored
         .iter()
-        .map(|(_, _, cols, w)| ((cols[0], cols[1]), *w))
+        .map(|(_, _, cols, w)| ((cols[0].as_i64().unwrap(), cols[1].as_i64().unwrap()), *w))
         .fold(BTreeMap::new(), |mut acc, (k, w)| {
             *acc.entry(k).or_insert(0) += w;
             acc
@@ -145,7 +145,7 @@ async fn lfs_pipeline_filter_project_writes_and_persists() {
         .unwrap();
     let stored_rows2: BTreeMap<(i64, i64), i64> = stored2
         .iter()
-        .map(|(_, _, cols, w)| ((cols[0], cols[1]), *w))
+        .map(|(_, _, cols, w)| ((cols[0].as_i64().unwrap(), cols[1].as_i64().unwrap()), *w))
         .fold(BTreeMap::new(), |mut acc, (k, w)| {
             *acc.entry(k).or_insert(0) += w;
             acc

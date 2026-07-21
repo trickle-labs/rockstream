@@ -152,6 +152,7 @@ mod tests {
             sql: "SELECT 1".to_string(),
             columns: vec![],
             namespace: "public".to_string(),
+            op_id: None,
         });
         catalog.assign_view_workload(view, workload);
         set_pipeline_state_bytes(view, bytes);

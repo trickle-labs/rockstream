@@ -68,8 +68,7 @@ async fn bare_insert_persists_across_reconnect_lfs() {
     let catalog = Arc::new(CatalogStubs::new());
     let shard_path = "autocommit-durability-lfs";
 
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
     client
         .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
@@ -95,7 +94,12 @@ async fn bare_insert_persists_across_reconnect_lfs() {
             _ => None,
         })
         .collect();
-    assert_eq!(rows.len(), 1, "expected 1 persisted row, got {}", rows.len());
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected 1 persisted row, got {}",
+        rows.len()
+    );
     assert_eq!(rows[0].get("id"), Some("1"));
     assert_eq!(rows[0].get("name"), Some("alice"));
 }

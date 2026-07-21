@@ -140,6 +140,7 @@ async fn test_binary_encoding_unit() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let row_data = b"32767\t2147483647\t9223372036854775807\t123.45\t678.901\ttrue".to_vec();
@@ -289,6 +290,7 @@ async fn test_binary_encoding_postgres_comparison() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let row_data = b"32767\t2147483647\t9223372036854775807\t123.45\t678.901\ttrue".to_vec();
@@ -391,6 +393,7 @@ async fn test_orm_conformance() {
             },
         ],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let row_data = b"32767\t2147483647\t9223372036854775807\t123.45\t678.901\ttrue".to_vec();

@@ -78,8 +78,7 @@ async fn backfilled_index_persists_across_reconnect_lfs() {
     let catalog = Arc::new(CatalogStubs::new());
     let shard_path = "create-index-backfill-durability-lfs-reconnect";
 
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
     client
         .simple_query("CREATE TABLE accounts (id BIGINT, balance BIGINT)")
@@ -114,8 +113,7 @@ async fn backfilled_index_persists_across_reconnect_lfs() {
     // durable from the synchronous backfill + flush inside CREATE INDEX.
     handle.abort();
 
-    let (port2, _handle2, shard_db2) =
-        start_gateway(shard_path, store, catalog.clone()).await;
+    let (port2, _handle2, shard_db2) = start_gateway(shard_path, store, catalog.clone()).await;
     let client2 = connect_port(port2).await;
     shard_db2.flush().await.unwrap();
 
@@ -140,8 +138,7 @@ async fn index_ready_state_persists_across_restart_lfs() {
     let catalog = Arc::new(CatalogStubs::new());
     let shard_path = "create-index-backfill-durability-lfs-restart";
 
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
     client
         .simple_query("CREATE TABLE readings (id BIGINT, value BIGINT)")
@@ -174,8 +171,7 @@ async fn index_ready_state_persists_across_restart_lfs() {
         .expect("Ready index must carry an op_id before restart");
     handle.abort();
 
-    let (port2, _handle2, shard_db2) =
-        start_gateway(shard_path, store, catalog.clone()).await;
+    let (port2, _handle2, shard_db2) = start_gateway(shard_path, store, catalog.clone()).await;
     let client2 = connect_port(port2).await;
     shard_db2.flush().await.unwrap();
 

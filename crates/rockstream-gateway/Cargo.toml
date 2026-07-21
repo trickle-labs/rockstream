@@ -32,6 +32,10 @@ rockstream-control.workspace = true
 arrow.workspace = true
 datafusion.workspace = true
 sqlparser.workspace = true
+rockstream-ops.workspace = true
+rockstream-plan.workspace = true
+rockstream-diff.workspace = true
+rockstream-runtime.workspace = true
 
 
 [dev-dependencies]
@@ -41,7 +45,6 @@ object_store = { version = "0.12", features = ["aws"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 rockstream-oracle = { workspace = true }
-rockstream-ops = { workspace = true }
 datafusion = { workspace = true }
 reqwest = { workspace = true }
 hex = { workspace = true }

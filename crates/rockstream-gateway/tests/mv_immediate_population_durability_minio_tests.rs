@@ -106,7 +106,16 @@ fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let dpm: [u32; 12] = [
         31,
         if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month = 0u32;
     for &d in &dpm {
@@ -173,11 +182,9 @@ fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
     )
 }
 
-
 async fn run_mv_immediate_population_restart_case(store: Arc<dyn ObjectStore>, shard_path: &str) {
     let catalog = Arc::new(CatalogStubs::new());
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, _shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
     client
         .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
@@ -229,5 +236,9 @@ async fn mv_output_persisted_before_next_commit_minio() {
         .unwrap();
     let port = container.get_host_port_ipv4(9000).await.unwrap();
     create_minio_bucket(port, MINIO_BUCKET).await;
-    run_mv_immediate_population_restart_case(minio_object_store(port), "mv-immediate-population-durability-minio").await;
+    run_mv_immediate_population_restart_case(
+        minio_object_store(port),
+        "mv-immediate-population-durability-minio",
+    )
+    .await;
 }

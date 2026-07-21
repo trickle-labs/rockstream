@@ -88,6 +88,7 @@ async fn test_refresh_materialized_view_roundtrip() {
             data_type: "Int64".to_string(),
         }],
         namespace: "public".to_string(),
+        op_id: None,
     });
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();

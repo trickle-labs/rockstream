@@ -141,13 +141,29 @@ pub fn eval_bool(expr: &Expr, batch: &RecordBatch) -> Result<Vec<bool>, OpError>
     }
 }
 
-/// Evaluate an expression to an Arrow `Int64Array` column.
+/// Evaluate an expression to an Arrow array column, preserving the
+/// underlying Arrow type for plain column references.
 ///
-/// Convenience wrapper used by `ProjectOp` to build output columns.
+/// v0.51.3 Slice 3: a bare `Expr::Column(i)` (the common `SELECT col FROM
+/// t` pass-through shape every gateway view definition uses) returns the
+/// input column's array unchanged, so non-`Int64` columns (`Utf8`,
+/// `Boolean`, `Float64`) survive a `Filter → Project → ViewSink` pipeline.
+/// Every other expression shape (`Literal`, `BinaryOp`, `ScalarUdf`) is
+/// still evaluated through the `Int64`-only arithmetic path (`eval_i64`) —
+/// no test in the gateway view corpus computes an arithmetic expression
+/// over a non-`Int64` column, so widening that path is not required by
+/// this version's Scope.
 pub fn eval_to_array(
     expr: &Expr,
     batch: &RecordBatch,
 ) -> Result<std::sync::Arc<dyn arrow::array::Array>, OpError> {
+    if let Expr::Column(i) = expr {
+        let n = batch.num_columns();
+        if *i >= n {
+            return Err(OpError::column_out_of_bounds(*i, n));
+        }
+        return Ok(batch.column(*i).clone());
+    }
     let vals = eval_i64(expr, batch)?;
     Ok(std::sync::Arc::new(Int64Array::from(vals)))
 }

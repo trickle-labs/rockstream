@@ -186,8 +186,7 @@ fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
 
 async fn run_bare_insert_restart_case(store: Arc<dyn ObjectStore>, shard_path: &str) {
     let catalog = Arc::new(CatalogStubs::new());
-    let (port, handle, shard_db) =
-        start_gateway(shard_path, store.clone(), catalog.clone()).await;
+    let (port, handle, shard_db) = start_gateway(shard_path, store.clone(), catalog.clone()).await;
     let client = connect_port(port).await;
     client
         .simple_query("CREATE TABLE t (id BIGINT, name TEXT)")
@@ -212,7 +211,12 @@ async fn run_bare_insert_restart_case(store: Arc<dyn ObjectStore>, shard_path: &
             _ => None,
         })
         .collect();
-    assert_eq!(rows.len(), 1, "expected 1 persisted row, got {}", rows.len());
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected 1 persisted row, got {}",
+        rows.len()
+    );
     assert_eq!(rows[0].get("id"), Some("1"));
     assert_eq!(rows[0].get("name"), Some("alice"));
 }

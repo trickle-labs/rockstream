@@ -53,6 +53,7 @@ fn run_contention_scenario(seed: u64) {
         sql: "SELECT 1".to_string(),
         columns: vec![],
         namespace: "public".to_string(),
+        op_id: None,
     });
     catalog.assign_view_workload("high_view", "high");
     catalog.add_view_in_namespace(CatalogView {
@@ -60,6 +61,7 @@ fn run_contention_scenario(seed: u64) {
         sql: "SELECT 1".to_string(),
         columns: vec![],
         namespace: "public".to_string(),
+        op_id: None,
     });
     catalog.assign_view_workload("low_view", "low");
 
