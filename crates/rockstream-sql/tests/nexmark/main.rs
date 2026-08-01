@@ -302,9 +302,9 @@ async fn test_nexmark_ingestion_lfs() {
     fn parse_count(rows: &[tokio_postgres::SimpleQueryMessage]) -> u64 {
         rows.iter()
             .find_map(|m| match m {
-                tokio_postgres::SimpleQueryMessage::Row(r) => {
-                    r.get(0).map(|v| v.parse::<u64>().expect("count column not a u64"))
-                }
+                tokio_postgres::SimpleQueryMessage::Row(r) => r
+                    .get(0)
+                    .map(|v| v.parse::<u64>().expect("count column not a u64")),
                 _ => None,
             })
             .expect("SELECT COUNT(*) returned no row")

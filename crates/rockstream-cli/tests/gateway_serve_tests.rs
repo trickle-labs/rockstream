@@ -164,6 +164,13 @@ async fn gateway_create_view_and_select_succeeds() {
     let (addr, _handle) = start_gateway(&opts).await.expect("start_gateway failed");
     let client = connect_port(addr.port()).await;
 
+    // The view's source must exist as a base table before `CREATE VIEW` can
+    // compile it (v0.51.4's `compile_plan` resolves view deps eagerly).
+    client
+        .simple_query("CREATE TABLE source (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE source failed");
+
     // Register a view.
     client
         .simple_query("CREATE VIEW orders AS SELECT id, amount FROM source")
@@ -187,8 +194,9 @@ async fn gateway_create_view_and_select_succeeds() {
 
 // ── G5: CREATE MATERIALIZED VIEW + cyclic rejection ──────────────────────────
 
-/// G5: CREATE MATERIALIZED VIEW succeeds; a cyclic CREATE VIEW pair is
-/// rejected with RS-1011.  Proves the IVM inlining / cycle-detection path.
+/// G5: CREATE MATERIALIZED VIEW succeeds; a self-referencing (cyclic)
+/// CREATE VIEW is rejected with RS-1011.  Proves the IVM inlining /
+/// cycle-detection path.
 #[tokio::test]
 async fn gateway_cyclic_view_returns_rs_1011() {
     let dir = tempfile::tempdir().unwrap();
@@ -197,21 +205,32 @@ async fn gateway_cyclic_view_returns_rs_1011() {
     let (addr, _handle) = start_gateway(&opts).await.expect("start_gateway failed");
     let client = connect_port(addr.port()).await;
 
+    // The view's source must exist as a base table before `CREATE
+    // MATERIALIZED VIEW` can compile it (v0.51.4's `compile_plan` resolves
+    // view deps eagerly).
+    client
+        .simple_query("CREATE TABLE base (id BIGINT)")
+        .await
+        .expect("CREATE TABLE base failed");
+
     // Non-cyclic MATERIALIZED VIEW — must succeed.
     client
         .simple_query("CREATE MATERIALIZED VIEW mv AS SELECT id FROM base")
         .await
         .expect("CREATE MATERIALIZED VIEW failed");
 
-    // Cyclic pair — must be rejected with RS-1011.
-    client
-        .simple_query("CREATE VIEW a AS SELECT * FROM b")
-        .await
-        .expect("CREATE VIEW a failed");
-
-    let result = client
-        .simple_query("CREATE VIEW b AS SELECT * FROM a")
-        .await;
+    // A self-referencing view is a trivial one-node cycle. Cycle detection
+    // (`detect_cycle_with_new_view`) runs purely against the catalog's
+    // dependency-name graph *before* `compile_plan`'s eager dependency-
+    // existence check, so it still fires here even though v0.51.4's
+    // `compile_plan` no longer tolerates a view forward-referencing a
+    // not-yet-created sibling view (a two-view mutual-forward-reference
+    // pair — the classic way to construct a cycle — now fails earlier,
+    // with RS-1019 "depends on non-base-table relation(s)", on the very
+    // first `CREATE VIEW`, before a true cycle could ever be formed; see
+    // `handle_create_view`'s doc comment on why there is no longer a
+    // DataFusion-materializer fallback for that case).
+    let result = client.simple_query("CREATE VIEW c AS SELECT * FROM c").await;
 
     let got_rs1011 = match &result {
         Err(e) => {
@@ -281,6 +300,13 @@ async fn gateway_subscribe_returns_without_error() {
 
     let (addr, _handle) = start_gateway(&opts).await.expect("start_gateway failed");
     let client = connect_port(addr.port()).await;
+
+    // The view's source must exist as a base table before `CREATE VIEW` can
+    // compile it (v0.51.4's `compile_plan` resolves view deps eagerly).
+    client
+        .simple_query("CREATE TABLE source (ts BIGINT, val BIGINT)")
+        .await
+        .expect("CREATE TABLE source failed");
 
     client
         .simple_query("CREATE VIEW live_feed AS SELECT ts, val FROM source")

@@ -363,7 +363,31 @@ impl TumbleWindowOp {
             state.input_frontier = Some(frontier.clone());
         }
 
+        // Snapshot the watermark once, as of the start of this epoch/commit.
+        // A single `process_epoch` call can carry many rows batched together
+        // from one commit (e.g. dozens of DML statements applied in one
+        // transaction) whose event times are NOT necessarily monotonic
+        // relative to each other — an ordinary streaming source wouldn't do
+        // this, but this operator's caller can. Using a live, per-row
+        // watermark (re-read from `state.watermark`, which the loop below
+        // mutates as it goes) would make the late-data verdict for a row
+        // depend on which *other* rows in the same batch happened to be
+        // processed earlier. Freezing the watermark here makes every row in
+        // this batch judged against the same, prior-epoch-only cutoff,
+        // independent of intra-batch ordering.
+        let epoch_start_watermark = state
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(state.watermark.watermark_ms);
+
         let mut dirty_windows: HashSet<i64> = HashSet::new();
+        // Windows an earlier retraction in *this same* batch has already
+        // reopened (see the closed-window check below for why this
+        // matters — a single `process_epoch` call can batch many rows from
+        // one commit whose relative order doesn't reflect real arrival
+        // order).
+        let mut reopened_this_epoch: HashSet<i64> = HashSet::new();
 
         // ── Apply input delta ────────────────────────────────────────────────
         for row_idx in 0..delta.num_rows() {
@@ -378,38 +402,53 @@ impl TumbleWindowOp {
                 0
             };
 
-            let current_watermark = state
-                .input_frontier
-                .as_ref()
-                .and_then(|f| f.watermark_ms())
-                .unwrap_or(state.watermark.watermark_ms);
-
-            // Late-data check — only applies to genuinely new data (w > 0).
-            // A retraction (w < 0) always corresponds to a row this operator
-            // already accepted earlier (it can only arrive after the matching
-            // insertion was processed), so it must never be dropped as "late"
-            // — doing so would leave the retracted row's effect permanently
-            // baked into an already-emitted window output, silently
-            // corrupting every downstream aggregate forever.
-            if w > 0
-                && event_time_ms < current_watermark
-                && self.late_data_policy == LateDataPolicy::Drop
-            {
-                continue;
-            }
-
             // Assign to window.
             let window_id = floor_div(event_time_ms, self.window_size_ms) * self.window_size_ms;
 
-            // Skip finalized (already-closed) windows for new data only; a
-            // retraction targeting a finalized window must reopen it so the
-            // retract/insert diff below re-emits the correction (same
-            // reasoning as the late-data check above).
-            if state.finalized.contains(&window_id) {
+            // A window is "closed" if either (a) its own close boundary is
+            // already behind the watermark (frozen as of this epoch's
+            // start — see `epoch_start_watermark`'s doc comment), or (b) a
+            // *previous* epoch already explicitly finalized it — unless
+            // this same batch already reopened it via an earlier
+            // retraction, in which case every row targeting it for the
+            // rest of this epoch is treated as belonging to an open window
+            // again (an UPDATE's "new" half, paired with a retraction of
+            // the "old" half processed earlier in this same batch, isn't
+            // stray late data — it's the other half of a correction this
+            // batch has already decided to apply).
+            //
+            // Comparing against *this window's own* close boundary (rather
+            // than just the raw watermark) matters because a much-larger
+            // window (e.g. a 1-day tumble) can have its end boundary far
+            // ahead of the watermark even though many rows inside it have
+            // timestamps behind that same watermark (the watermark tracks
+            // the single latest event time seen across the whole
+            // batch/stream, not this row's own window) — using the raw
+            // watermark would wrongly treat those rows as late. This
+            // formula is exactly the one the output phase below uses to
+            // *set* `finalized`, so it agrees with that bookkeeping even
+            // for a window that was never previously touched (and so never
+            // appeared in `state.finalized` at all).
+            let window_closed = (epoch_start_watermark > window_id + self.window_size_ms
+                || state.finalized.contains(&window_id))
+                && !reopened_this_epoch.contains(&window_id);
+
+            if window_closed {
                 if w > 0 {
-                    continue;
+                    // A retraction (w < 0) always corresponds to a row this
+                    // operator already accepted earlier (it can only arrive
+                    // after the matching insertion was processed), so it
+                    // must never be dropped as "late" — doing so would leave
+                    // the retracted row's effect permanently baked into an
+                    // already-emitted window output, silently corrupting
+                    // every downstream aggregate forever.
+                    if self.late_data_policy == LateDataPolicy::Drop {
+                        continue;
+                    }
+                } else {
+                    state.finalized.remove(&window_id);
+                    reopened_this_epoch.insert(window_id);
                 }
-                state.finalized.remove(&window_id);
             }
 
             // Advance watermark (MaxRegister).
@@ -594,8 +633,23 @@ impl HopWindowOp {
             next.input_frontier = Some(frontier.clone());
         }
 
+        // See `TumbleWindowOp::process_epoch`'s identical fix for the full
+        // rationale: freeze the watermark once, as of this epoch's start,
+        // rather than re-reading it per-row as the loop mutates it — a
+        // later-timestamped row processed earlier in the same batched
+        // commit must not cause an earlier-timestamped (but still current)
+        // row later in the same batch to be wrongly judged "late".
+        let epoch_start_watermark = next
+            .input_frontier
+            .as_ref()
+            .and_then(|f| f.watermark_ms())
+            .unwrap_or(next.watermark.watermark_ms);
+
         let mut dirty_windows: HashSet<i64> = HashSet::new();
         let mut live_rows = next.total_rows();
+        // See `TumbleWindowOp::process_epoch`'s identical mechanism: windows
+        // an earlier retraction in *this same* batch has already reopened.
+        let mut reopened_this_epoch: HashSet<i64> = HashSet::new();
 
         for row_idx in 0..delta.num_rows() {
             let w = delta.weights[row_idx];
@@ -604,31 +658,27 @@ impl HopWindowOp {
             }
             let row_vals = extract_row_vals(&delta.data, row_idx, self.n_input_cols);
             let event_time_ms = row_vals.get(self.time_col).copied().unwrap_or(0);
-            let current_watermark = next
-                .input_frontier
-                .as_ref()
-                .and_then(|f| f.watermark_ms())
-                .unwrap_or(next.watermark.watermark_ms);
-            if w > 0
-                && event_time_ms < current_watermark
-                && self.late_data_policy == LateDataPolicy::Drop
-            {
-                continue;
-            }
 
             next.watermark = next.watermark.merge(WatermarkState {
                 watermark_ms: event_time_ms,
             });
 
             for window_id in hop_window_ids(event_time_ms, self.window_size_ms, self.slide_ms) {
-                // A retraction (w < 0) must reopen an already-finalized
-                // window rather than being dropped — see `TumbleWindowOp`'s
-                // identical fix for the full rationale.
-                if next.finalized.contains(&window_id) {
+                // See `TumbleWindowOp::process_epoch`'s identical check for
+                // the full rationale.
+                let window_closed = (epoch_start_watermark > window_id + self.window_size_ms
+                    || next.finalized.contains(&window_id))
+                    && !reopened_this_epoch.contains(&window_id);
+
+                if window_closed {
                     if w > 0 {
-                        continue;
+                        if self.late_data_policy == LateDataPolicy::Drop {
+                            continue;
+                        }
+                    } else {
+                        next.finalized.remove(&window_id);
+                        reopened_this_epoch.insert(window_id);
                     }
-                    next.finalized.remove(&window_id);
                 }
                 let group_key = encode_row(&row_vals);
                 let window = next.windows.entry(window_id).or_default();

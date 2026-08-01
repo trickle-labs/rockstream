@@ -1364,10 +1364,24 @@ mod tests {
                         name: "bid".to_string(),
                     }),
                     time_col: 5,
-                    window_size_ms: 10000,
+                    // Bucket width is always in raw seconds (interval_ms /
+                    // 1000), independent of the destination TimeUnit — see
+                    // `interval_ms_to_bucket_units`'s doc comment.
+                    window_size_ms: 10,
                     late_data_policy: rockstream_plan::LateDataPolicy::Drop,
                 }),
-                group_by: vec![Expr::Column(0)],
+                group_by: vec![Expr::BinaryOp {
+                    op: rockstream_plan::BinaryOp::Mul,
+                    left: Box::new(Expr::Column(0)),
+                    // `CAST(date_bin(...) AS BIGINT)` reads back the
+                    // `Timestamp`'s internal representation at its own
+                    // resolution (default `Nanosecond` here, since there is
+                    // no explicit destination-`Timestamp` cast in this
+                    // query) — the raw-seconds window id must be scaled up
+                    // by that resolution's units-per-second. See
+                    // `timestamp_display_scale`'s doc comment.
+                    right: Box::new(Expr::Literal(1_000_000_000i64.to_be_bytes().to_vec())),
+                }],
                 aggregates: vec![AggregateExpr {
                     func: AggregateFunc::Count,
                     input: Expr::Literal(1i64.to_be_bytes().to_vec()),

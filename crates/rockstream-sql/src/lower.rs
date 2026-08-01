@@ -593,9 +593,13 @@ fn extract_window_agg_value_col(
     wf: &WindowFunction,
     schema: &datafusion::common::DFSchema,
 ) -> Result<usize, SqlError> {
-    let arg = wf.params.args.first().ok_or_else(|| SqlError::UnsupportedWindowFunction {
-        fn_name: "SLIDING_AGGREGATE_MISSING_ARG".to_string(),
-    })?;
+    let arg = wf
+        .params
+        .args
+        .first()
+        .ok_or_else(|| SqlError::UnsupportedWindowFunction {
+            fn_name: "SLIDING_AGGREGATE_MISSING_ARG".to_string(),
+        })?;
     extract_column_index(arg, schema).ok_or_else(|| SqlError::UnsupportedWindowFunction {
         fn_name: "SLIDING_AGGREGATE_NON_COLUMN_ARG".to_string(),
     })

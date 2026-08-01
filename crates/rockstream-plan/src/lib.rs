@@ -625,14 +625,24 @@ pub enum WindowFunc {
     Rank,
     DenseRank,
     Ntile(u64),
-    Lag { offset: usize },
-    Lead { offset: usize },
+    Lag {
+        offset: usize,
+    },
+    Lead {
+        offset: usize,
+    },
     /// Sum over the trailing `frame_rows` rows (by `order_by`) of `value_col`.
     /// `value_col` is a separate column from `order_by` — e.g. Nexmark q6's
     /// `AVG(price) OVER (PARTITION BY seller ORDER BY date_time ROWS ...)`
     /// averages `price` while ordering by `date_time`, two different columns.
-    SlidingSum { frame_rows: usize, value_col: usize },
-    SlidingAvg { frame_rows: usize, value_col: usize },
+    SlidingSum {
+        frame_rows: usize,
+        value_col: usize,
+    },
+    SlidingAvg {
+        frame_rows: usize,
+        value_col: usize,
+    },
 }
 
 /// Window operator IVM strategy (v0.11 — IVM-7).
