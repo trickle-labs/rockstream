@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use rockstream_plan::Expr;
 
@@ -39,24 +39,12 @@ impl NamedExpr {
 pub struct ProjectOp {
     /// The output expressions with their column names.
     exprs: Vec<NamedExpr>,
-    /// Output schema (derived from `exprs`; all Int64 for v0.4).
-    output_schema: SchemaRef,
 }
 
 impl ProjectOp {
     /// Create a projection operator from named expressions.
-    ///
-    /// For v0.4, all output columns are `Int64`.
     pub fn new(exprs: Vec<NamedExpr>) -> Self {
-        let fields: Vec<Field> = exprs
-            .iter()
-            .map(|ne| Field::new(&ne.name, DataType::Int64, false))
-            .collect();
-        let output_schema = Arc::new(Schema::new(fields));
-        ProjectOp {
-            exprs,
-            output_schema,
-        }
+        ProjectOp { exprs }
     }
 
     /// Apply the projection to a single delta batch.
@@ -64,13 +52,14 @@ impl ProjectOp {
     /// The output schema is derived per-batch from each expression's actual
     /// evaluated Arrow type (a bare `Expr::Column(i)` preserves its input
     /// type — see `eval_to_array` — so `TEXT`/`BOOLEAN`/`DOUBLE` columns
-    /// pass through unchanged; arithmetic expressions remain `Int64`). The
-    /// precomputed `output_schema` (all-`Int64`) is used only for the empty
-    /// batch case, where there is no data to derive types from.
+    /// pass through unchanged; arithmetic expressions remain `Int64`).
+    /// `eval_to_array`'s `Expr::Column` case is a plain array clone, correct
+    /// on a 0-row batch too, so the empty case runs the exact same path as
+    /// non-empty (no separate all-`Int64` shortcut — that used to silently
+    /// mistype a `Utf8`/`Boolean`/`Float64` passthrough column on an empty
+    /// delta, e.g. a join side with a `TEXT` column and no matching rows
+    /// this commit).
     pub fn apply(&self, input: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        if input.is_empty() {
-            return Ok(ArrowZSet::empty(self.output_schema.clone()));
-        }
         let cols: Vec<Arc<dyn arrow::array::Array>> = self
             .exprs
             .iter()

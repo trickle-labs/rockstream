@@ -244,20 +244,45 @@ pub async fn read_view_output(
     op_id: OperatorId,
     num_cols: usize,
 ) -> Result<Vec<(u64, u64, Vec<ColumnValue>, i64)>, OpError> {
-    let prefix = {
-        let mut p = Vec::with_capacity(9);
-        p.push(ShardPrefix::ViewOutput.as_byte());
-        p.extend_from_slice(&op_id.0.to_be_bytes());
-        p
-    };
-
+    let prefix = view_output_prefix(op_id);
     let entries = db
         .scan_prefix_bounded(&prefix, 10_000_000)
         .await
         .map_err(OpError::storage)?;
+    Ok(decode_view_output_entries(entries.0, num_cols))
+}
 
+/// Same as [`read_view_output`] but reads through a read-only `ShardReader`
+/// (v0.51.4 Slice 8 — the multi-shard/cross-process publish-and-scatter-read
+/// path: a standalone `--role gateway` process with no local `ShardDb` reads
+/// a compiled view's output this way, via [`crate::view_directory`]'s
+/// `view_name -> op_id` lookup rather than a shared in-memory catalog).
+pub async fn read_view_output_via_reader(
+    reader: &rockstream_storage::ShardReader,
+    op_id: OperatorId,
+    num_cols: usize,
+) -> Result<Vec<(u64, u64, Vec<ColumnValue>, i64)>, OpError> {
+    let prefix = view_output_prefix(op_id);
+    let entries = reader
+        .scan_prefix(&prefix)
+        .await
+        .map_err(OpError::storage)?;
+    Ok(decode_view_output_entries(entries, num_cols))
+}
+
+fn view_output_prefix(op_id: OperatorId) -> Vec<u8> {
+    let mut p = Vec::with_capacity(9);
+    p.push(ShardPrefix::ViewOutput.as_byte());
+    p.extend_from_slice(&op_id.0.to_be_bytes());
+    p
+}
+
+fn decode_view_output_entries(
+    entries: Vec<(bytes::Bytes, bytes::Bytes)>,
+    num_cols: usize,
+) -> Vec<(u64, u64, Vec<ColumnValue>, i64)> {
     let mut rows = Vec::new();
-    for (key, value) in entries.0 {
+    for (key, value) in entries {
         // key: [prefix:1][op_id:8][epoch:8][row:8] = 25 bytes
         if key.len() < 25 {
             continue;
@@ -273,5 +298,167 @@ pub async fn read_view_output(
         rows.push((epoch, row_idx, cols, weight));
     }
     rows.sort_by_key(|(epoch, row_idx, ..)| (*epoch, *row_idx));
-    Ok(rows)
+    rows
+}
+
+fn serialize_column_value(value: &ColumnValue) -> String {
+    match value {
+        ColumnValue::Int64(v) => format!("i:{v}"),
+        ColumnValue::Utf8(v) => format!("s:{}:{v}", v.len()),
+        ColumnValue::Boolean(v) => format!("b:{}", u8::from(*v)),
+        ColumnValue::Float64(v) => format!("f:{:016x}", v.to_bits()),
+    }
+}
+
+fn serialize_pk(row: &[ColumnValue], pk: &[usize]) -> String {
+    if pk.is_empty() {
+        return row
+            .iter()
+            .map(serialize_column_value)
+            .collect::<Vec<_>>()
+            .join("|");
+    }
+    pk.iter()
+        .filter_map(|idx| row.get(*idx))
+        .map(serialize_column_value)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Collapse a `ViewSinkOp`'s stored `(epoch, row_index, columns, weight)`
+/// delta log into current materialized state, keyed by `pk` (or the whole
+/// row, if `pk` is empty). A row's weight reaching `0` removes it.
+pub type MaterializedViewState = std::collections::BTreeMap<String, (Vec<ColumnValue>, i64)>;
+
+pub fn materialize_view_state(
+    rows: Vec<(u64, u64, Vec<ColumnValue>, i64)>,
+    pk: &[usize],
+) -> MaterializedViewState {
+    let mut state = std::collections::BTreeMap::new();
+    for (_epoch, _row_idx, row, weight) in rows {
+        let key = serialize_pk(&row, pk);
+        let mut remove_key = false;
+        match state.entry(key.clone()) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let (stored_row, count) = entry.get_mut();
+                *stored_row = row;
+                *count += weight;
+                remove_key = *count == 0;
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                if weight != 0 {
+                    entry.insert((row, weight));
+                }
+            }
+        }
+        if remove_key {
+            state.remove(&key);
+        }
+    }
+    state
+}
+
+/// Serialize one materialized-state row as a tab-separated byte string
+/// (the wire format `ViewReader` implementations and pgwire's row encoder
+/// both expect).
+pub fn column_values_to_tsv_bytes(row: &[ColumnValue]) -> Vec<u8> {
+    row.iter()
+        .map(|value| match value {
+            ColumnValue::Int64(v) => v.to_string(),
+            ColumnValue::Utf8(v) => v.clone(),
+            ColumnValue::Boolean(v) => v.to_string(),
+            ColumnValue::Float64(v) => v.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\t")
+        .into_bytes()
+}
+
+// ── View directory: `view_name -> (op_id, num_cols, pk)` ─────────────────────
+//
+// A compiled view's `ViewSinkOp` storage is keyed by `OperatorId`, an
+// in-process-only value at `CREATE VIEW` time — a reader with no shared
+// in-memory catalog (a standalone `--role gateway` process reading a
+// published/remote shard via `ShardReader`, v0.51.4 Slice 8) has no other
+// way to resolve `view_name -> OperatorId`/column count/primary key. This
+// small directory entry, written once per view at compile time, is that
+// resolution path — the multi-shard publish/read mechanism's only
+// remaining dependency on a name-keyed record now that the legacy
+// `view_materializer.rs` (which used to write a whole snapshot under
+// `view_output/{view_name}/`) is gone.
+
+const VIEW_DIRECTORY_TAG: &[u8] = b"vwdir:";
+
+fn view_directory_key(view_name: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + VIEW_DIRECTORY_TAG.len() + view_name.len());
+    k.push(ShardPrefix::ShardMeta.as_byte());
+    k.extend_from_slice(VIEW_DIRECTORY_TAG);
+    k.extend_from_slice(view_name.as_bytes());
+    k
+}
+
+fn encode_view_directory_entry(op_id: OperatorId, num_cols: usize, pk: &[usize]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 4 + 1 + pk.len() * 2);
+    v.extend_from_slice(&op_id.0.to_be_bytes());
+    v.extend_from_slice(&(num_cols as u32).to_be_bytes());
+    v.push(pk.len() as u8);
+    for &idx in pk {
+        v.extend_from_slice(&(idx as u16).to_be_bytes());
+    }
+    v
+}
+
+fn decode_view_directory_entry(bytes: &[u8]) -> Option<(OperatorId, usize, Vec<usize>)> {
+    let op_id = OperatorId(u64::from_be_bytes(bytes.get(0..8)?.try_into().ok()?));
+    let num_cols = u32::from_be_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
+    let pk_len = *bytes.get(12)? as usize;
+    let mut pk = Vec::with_capacity(pk_len);
+    let mut pos = 13usize;
+    for _ in 0..pk_len {
+        let idx = u16::from_be_bytes(bytes.get(pos..pos + 2)?.try_into().ok()?) as usize;
+        pk.push(idx);
+        pos += 2;
+    }
+    Some((op_id, num_cols, pk))
+}
+
+/// Write `view_name`'s directory entry (called once, right after
+/// `compile_plan` succeeds for it at `CREATE VIEW`/`CREATE MATERIALIZED
+/// VIEW` time — the entry never changes afterward, since a compiled view's
+/// column set/primary key is fixed at creation).
+pub async fn write_view_directory_entry(
+    db: &ShardDb,
+    view_name: &str,
+    op_id: OperatorId,
+    num_cols: usize,
+    pk: &[usize],
+) -> Result<(), OpError> {
+    let key = view_directory_key(view_name);
+    let value = encode_view_directory_entry(op_id, num_cols, pk);
+    let mut wb = WriteBatch::new();
+    wb.put(&key, &value);
+    db.write_batch(wb).await.map_err(OpError::storage)
+}
+
+/// Resolve `view_name`'s directory entry directly from a local `ShardDb`
+/// (the same-process read path — see [`read_view_directory_entry_via_reader`]
+/// for the cross-process/multi-shard equivalent).
+pub async fn read_view_directory_entry(
+    db: &ShardDb,
+    view_name: &str,
+) -> Result<Option<(OperatorId, usize, Vec<usize>)>, OpError> {
+    let key = view_directory_key(view_name);
+    let value = db.get(&key).await.map_err(OpError::storage)?;
+    Ok(value.and_then(|bytes| decode_view_directory_entry(&bytes)))
+}
+
+/// Resolve `view_name`'s directory entry through a read-only `ShardReader`
+/// (the cross-process/multi-shard read path).
+pub async fn read_view_directory_entry_via_reader(
+    reader: &rockstream_storage::ShardReader,
+    view_name: &str,
+) -> Result<Option<(OperatorId, usize, Vec<usize>)>, OpError> {
+    let key = view_directory_key(view_name);
+    let value = reader.get(&key).await.map_err(OpError::storage)?;
+    Ok(value.and_then(|bytes| decode_view_directory_entry(&bytes)))
 }

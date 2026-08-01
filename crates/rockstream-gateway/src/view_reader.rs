@@ -84,12 +84,66 @@ pub struct ViewSchema {
 
 /// `HotOnly` implementation backed by a single `ShardReader`.
 ///
-/// Rows are stored under the prefix `view_output/{view_name}/` in the shard,
-/// with each value being a tab-separated line of field values.
+/// v0.51.4 Slice 8: resolves `view_name` through the view directory
+/// (`rockstream_ops::sink::read_view_directory_entry_via_reader` —
+/// `view_name -> (op_id, num_cols, pk)`, written once at `CREATE VIEW` time)
+/// and reads the compiled view's `ViewSinkOp` delta log through it,
+/// materializing current state the same way a local, shard_db-backed read
+/// does (`materialize_view_state`). This is the multi-shard publish/read
+/// path — a standalone `--role gateway` process with no local `ShardDb`
+/// has no other way to resolve a view name to its compiled storage
+/// location. Before this slice, rows were read from a plain
+/// `view_output/{view_name}/` string-keyed prefix written by the now-deleted
+/// `view_materializer.rs`; nothing writes that format anymore.
 pub struct HotOnlyViewReader {
     pub shard_reader: Arc<rockstream_storage::ShardReader>,
     /// The frontier epoch at which this reader was opened (if known).
     pub frontier_epoch: Option<u64>,
+}
+
+impl HotOnlyViewReader {
+    /// Resolve `view_name` to its current materialized rows (TSV-encoded).
+    ///
+    /// Tries the directory-entry-resolved compiled-view format first; if
+    /// `view_name` has no directory entry (never compiled through this
+    /// process's `handle_create_view`, e.g. externally-published or
+    /// pre-seeded data — a legitimate scenario for a reader opened against
+    /// a shard it didn't itself write, and the shape a handful of
+    /// lower-level protocol tests seed directly), falls back to the legacy
+    /// `view_output/{view_name}/` string-keyed prefix scan.
+    async fn materialized_rows(&self, view_name: &str) -> Result<Vec<Vec<u8>>, GatewayError> {
+        let Some((op_id, num_cols, pk)) =
+            rockstream_ops::sink::read_view_directory_entry_via_reader(
+                &self.shard_reader,
+                view_name,
+            )
+            .await
+            .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("read_view_directory_entry({view_name}): {e}"),
+            })?
+        else {
+            let prefix = format!("view_output/{view_name}/");
+            let kvs = self.shard_reader.scan_prefix(prefix.as_bytes()).await?;
+            return Ok(kvs.into_iter().map(|(_k, v)| v.to_vec()).collect());
+        };
+        let stored =
+            rockstream_ops::sink::read_view_output_via_reader(&self.shard_reader, op_id, num_cols)
+                .await
+                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("read_view_output({view_name}): {e}"),
+                })?;
+        let state = rockstream_ops::sink::materialize_view_state(stored, &pk);
+        Ok(state
+            .into_values()
+            .flat_map(|(row, count)| {
+                std::iter::repeat_with({
+                    let row = row.clone();
+                    move || rockstream_ops::sink::column_values_to_tsv_bytes(&row)
+                })
+                .take(count.max(0) as usize)
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -105,10 +159,7 @@ impl ViewReader for HotOnlyViewReader {
                 "TwoTier strategy reserved for Phase 9".to_string(),
             ));
         }
-        let prefix = format!("view_output/{view_name}/");
-        let kvs = self.shard_reader.scan_prefix(prefix.as_bytes()).await?;
-
-        let rows: Vec<Vec<u8>> = kvs.into_iter().map(|(_k, v)| v.to_vec()).collect();
+        let rows = self.materialized_rows(view_name).await?;
         let rows = match limit {
             Some(n) => rows.into_iter().take(n).collect(),
             None => rows,
@@ -116,11 +167,8 @@ impl ViewReader for HotOnlyViewReader {
         Ok(rows)
     }
 
-    /// Streaming implementation: reads incrementally from the shard in
-    /// `ROWS_IN_FLIGHT_BATCH`-sized chunks, bounded by `STREAM_BATCH_BYTES`.
-    ///
-    /// This avoids collecting all rows into memory before sending the first
-    /// DataRow to the client.
+    /// Streaming implementation: chunks the materialized rows into
+    /// `ROWS_IN_FLIGHT_BATCH`-sized, `STREAM_BATCH_BYTES`-bounded batches.
     async fn read_view_stream(
         &self,
         view_name: &str,
@@ -132,8 +180,7 @@ impl ViewReader for HotOnlyViewReader {
                 "TwoTier strategy reserved for Phase 9".to_string(),
             ));
         }
-        let prefix = format!("view_output/{view_name}/");
-        let kvs = self.shard_reader.scan_prefix(prefix.as_bytes()).await?;
+        let rows = self.materialized_rows(view_name).await?;
 
         // Build batches: each batch is at most ROWS_IN_FLIGHT_BATCH rows and
         // at most STREAM_BATCH_BYTES bytes in total per-connection.
@@ -141,8 +188,7 @@ impl ViewReader for HotOnlyViewReader {
         let mut current_batch: Vec<Vec<u8>> = Vec::new();
         let mut current_batch_bytes: usize = 0;
 
-        for (_k, v) in kvs {
-            let row = v.to_vec();
+        for row in rows {
             let row_len = row.len();
             current_batch.push(row);
             current_batch_bytes += row_len;
@@ -169,28 +215,45 @@ impl ViewReader for HotOnlyViewReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use futures::StreamExt;
     use object_store::memory::InMemory;
+    use rockstream_ops::sink::{write_view_directory_entry, ViewSinkOp};
+    use rockstream_ops::ArrowZSet;
     use rockstream_storage::ShardDb;
+    use rockstream_types::ids::OperatorId;
     use std::sync::Arc;
+
+    /// Write `values.len()` rows of a single-column, weight-`1` compiled
+    /// view through `ViewSinkOp` plus its directory entry — the v0.51.4
+    /// Slice 8 replacement for directly `put`-ing rows under the retired
+    /// `view_output/{view_name}/` string-keyed format.
+    async fn write_compiled_view(db: Arc<ShardDb>, view_name: &str, op_id: u64, values: &[i64]) {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let array = Arc::new(Int64Array::from(values.to_vec()));
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+        let weights = vec![1i64; values.len()];
+        let zset = ArrowZSet::new(batch, weights);
+        let sink = ViewSinkOp::new(db.clone(), OperatorId(op_id));
+        sink.write_next_epoch(&zset).await.unwrap();
+        write_view_directory_entry(&db, view_name, OperatorId(op_id), 1, &[0])
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn view_reader_hot_only_reads_from_shard() {
         let store = Arc::new(InMemory::new());
-        let shard_db = ShardDb::builder("test-shard", store.clone())
-            .build()
-            .await
-            .unwrap();
-
-        // Write rows under view_output/my_view/
-        for i in 0u32..5 {
-            let key = format!("view_output/my_view/{:08}", i);
-            let value = format!("row_{i}\t{i}");
-            shard_db
-                .put(key.as_bytes(), value.as_bytes())
+        let shard_db = Arc::new(
+            ShardDb::builder("test-shard", store.clone())
+                .build()
                 .await
-                .unwrap();
-        }
+                .unwrap(),
+        );
+
+        write_compiled_view(shard_db.clone(), "my_view", 1, &[0, 1, 2, 3, 4]).await;
         shard_db.flush().await.unwrap();
 
         // Open a ShardReader
@@ -230,19 +293,15 @@ mod tests {
         let n_rows: usize = 3_500; // > 3 * ROWS_IN_FLIGHT_BATCH is not needed; 3.5 batches
 
         let store = Arc::new(InMemory::new());
-        let shard_db = ShardDb::builder("stream-shard", store.clone())
-            .build()
-            .await
-            .unwrap();
-
-        for i in 0u32..n_rows as u32 {
-            let key = format!("view_output/stream_view/{:08}", i);
-            let value = format!("row_{i}\tvalue_{i}");
-            shard_db
-                .put(key.as_bytes(), value.as_bytes())
+        let shard_db = Arc::new(
+            ShardDb::builder("stream-shard", store.clone())
+                .build()
                 .await
-                .unwrap();
-        }
+                .unwrap(),
+        );
+
+        let values: Vec<i64> = (0..n_rows as i64).collect();
+        write_compiled_view(shard_db.clone(), "stream_view", 1, &values).await;
         shard_db.flush().await.unwrap();
 
         let reader = rockstream_storage::ShardReader::open("stream-shard", store.clone())

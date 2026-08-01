@@ -270,6 +270,78 @@ impl TumbleWindowOp {
         self.fill_level.load(Ordering::Relaxed)
     }
 
+    /// Load persisted state from `db` into this already-constructed
+    /// instance in place (used by `GatewayHandler::recover_compiled_views`
+    /// to restore a recompiled view's arrangement after a process
+    /// restart — keeps the same `Arc<TumbleWindowOp>` already installed in
+    /// the pipeline, unlike `load_tumble_window_state`'s freshly-returned
+    /// instance).
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        let oid = op_id.0;
+        let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
+        let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+        let prefix_len = prefix.len();
+        let wm_key = ShardKeyEncoder::watermark_key(oid);
+        let wm_bytes = db.get(&wm_key).await.ok().flatten();
+
+        let mut st = self.state.lock().unwrap();
+        for (key, value) in entries {
+            if let Some((row_vals, weight)) = decode_window_value(&value, self.n_input_cols) {
+                if key.len() < prefix_len + 8 {
+                    continue;
+                }
+                let window_id = i64::from_be_bytes(
+                    key[prefix_len..prefix_len + 8].try_into().unwrap_or([0; 8]),
+                );
+                let group_key = key[prefix_len + 8..].to_vec();
+                st.windows
+                    .entry(window_id)
+                    .or_default()
+                    .insert(group_key, (row_vals, weight));
+            }
+        }
+        if let Some(bytes) = wm_bytes {
+            if bytes.len() >= 8 {
+                let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+                st.watermark = WatermarkState { watermark_ms: wm };
+            }
+        }
+        // Persisted state only carries raw window contents + watermark, not
+        // `prev_output`/`finalized` (the diff/close bookkeeping
+        // `process_epoch` needs to emit a correct *delta* rather than
+        // re-emitting a window's full content as brand-new inserts on the
+        // next touch). Reconstruct both from invariants that hold for any
+        // window whose content was last correctly synced by `process_epoch`
+        // itself: `prev_output[wid]` always equals `windows[wid]`'s
+        // positive-weight rows as of the last commit that touched it, and a
+        // window is finalized iff the watermark has already passed its
+        // close boundary — both are fully derivable from the just-loaded
+        // `windows`/`watermark_ms`, so nothing needs its own persisted copy.
+        let watermark_ms = st.watermark.watermark_ms;
+        let window_size_ms = self.window_size_ms;
+        let window_ids: Vec<i64> = st.windows.keys().copied().collect();
+        for window_id in window_ids {
+            let positive_rows: EmittedMap = st
+                .windows
+                .get(&window_id)
+                .map(|m| {
+                    m.iter()
+                        .filter(|(_, (_, w))| *w > 0)
+                        .map(|(k, (vals, _))| (k.clone(), vals.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            st.prev_output.insert(window_id, positive_rows);
+            if watermark_ms > window_id + window_size_ms {
+                st.finalized.insert(window_id);
+            }
+        }
+        let total = st.total_rows();
+        drop(st);
+        self.fill_level.store(total, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Current watermark.
     pub fn watermark_ms(&self) -> i64 {
         let state = self.state.lock().unwrap();
@@ -312,17 +384,32 @@ impl TumbleWindowOp {
                 .and_then(|f| f.watermark_ms())
                 .unwrap_or(state.watermark.watermark_ms);
 
-            // Late-data check.
-            if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
+            // Late-data check — only applies to genuinely new data (w > 0).
+            // A retraction (w < 0) always corresponds to a row this operator
+            // already accepted earlier (it can only arrive after the matching
+            // insertion was processed), so it must never be dropped as "late"
+            // — doing so would leave the retracted row's effect permanently
+            // baked into an already-emitted window output, silently
+            // corrupting every downstream aggregate forever.
+            if w > 0
+                && event_time_ms < current_watermark
+                && self.late_data_policy == LateDataPolicy::Drop
+            {
                 continue;
             }
 
             // Assign to window.
             let window_id = floor_div(event_time_ms, self.window_size_ms) * self.window_size_ms;
 
-            // Skip finalized windows (already closed).
+            // Skip finalized (already-closed) windows for new data only; a
+            // retraction targeting a finalized window must reopen it so the
+            // retract/insert diff below re-emits the correction (same
+            // reasoning as the late-data check above).
             if state.finalized.contains(&window_id) {
-                continue;
+                if w > 0 {
+                    continue;
+                }
+                state.finalized.remove(&window_id);
             }
 
             // Advance watermark (MaxRegister).
@@ -522,7 +609,10 @@ impl HopWindowOp {
                 .as_ref()
                 .and_then(|f| f.watermark_ms())
                 .unwrap_or(next.watermark.watermark_ms);
-            if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
+            if w > 0
+                && event_time_ms < current_watermark
+                && self.late_data_policy == LateDataPolicy::Drop
+            {
                 continue;
             }
 
@@ -531,8 +621,14 @@ impl HopWindowOp {
             });
 
             for window_id in hop_window_ids(event_time_ms, self.window_size_ms, self.slide_ms) {
+                // A retraction (w < 0) must reopen an already-finalized
+                // window rather than being dropped — see `TumbleWindowOp`'s
+                // identical fix for the full rationale.
                 if next.finalized.contains(&window_id) {
-                    continue;
+                    if w > 0 {
+                        continue;
+                    }
+                    next.finalized.remove(&window_id);
                 }
                 let group_key = encode_row(&row_vals);
                 let window = next.windows.entry(window_id).or_default();
@@ -706,6 +802,58 @@ impl SessionWindowOp {
         self.fill_level.load(Ordering::Relaxed)
     }
 
+    /// Load persisted state from `db` into this already-constructed
+    /// instance in place — see `TumbleWindowOp::restore_in_place` for why.
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        let oid = op_id.0;
+        let prefix = ShardKeyEncoder::tumble_window_op_prefix(oid);
+        let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+        let wm_key = ShardKeyEncoder::watermark_key(oid);
+        let wm_bytes = db.get(&wm_key).await.ok().flatten();
+
+        let mut st = self.state.lock().unwrap();
+        for (_key, value) in entries {
+            if let Some((row_vals, weight)) = decode_window_value(&value, self.n_input_cols) {
+                let partition_key = encode_partition_key(&row_vals, self.time_col);
+                let row_key = encode_row(&row_vals);
+                st.partitions
+                    .entry(partition_key)
+                    .or_default()
+                    .rows
+                    .insert(row_key, (row_vals, weight));
+            }
+        }
+        if let Some(bytes) = wm_bytes {
+            if bytes.len() >= 8 {
+                let wm = i64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+                st.watermark = WatermarkState { watermark_ms: wm };
+            }
+        }
+        for partition in st.partitions.values_mut() {
+            let live_rows = partition
+                .rows
+                .values()
+                .filter(|(_, weight)| *weight > 0)
+                .map(|(vals, _)| vals.clone())
+                .collect::<Vec<_>>();
+            let sessions = derive_sessions(&live_rows, self.time_col, self.gap_ms);
+            partition.live_session_count = sessions
+                .iter()
+                .map(|(start, end, _)| (*start, *end))
+                .collect::<HashSet<_>>()
+                .len();
+            for (session_start, session_end, row_vals) in sessions {
+                let mut tagged = vec![session_start, session_end];
+                tagged.extend_from_slice(&row_vals);
+                partition.prev_output.insert(encode_row(&row_vals), tagged);
+            }
+        }
+        let total = st.total_sessions();
+        drop(st);
+        self.fill_level.store(total, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn watermark_ms(&self) -> i64 {
         let state = self.state.lock().unwrap();
         state
@@ -748,7 +896,10 @@ impl SessionWindowOp {
                 .as_ref()
                 .and_then(|f| f.watermark_ms())
                 .unwrap_or(i64::MIN);
-            if event_time_ms < current_watermark && self.late_data_policy == LateDataPolicy::Drop {
+            if weight > 0
+                && event_time_ms < current_watermark
+                && self.late_data_policy == LateDataPolicy::Drop
+            {
                 continue;
             }
 
@@ -1354,6 +1505,47 @@ mod tests {
             .collect();
         rows.sort();
         rows
+    }
+
+    /// Regression test for a v0.51.4 fix: a retraction of a row belonging to
+    /// an already-finalized window must always be applied (never dropped by
+    /// the late-data policy), and must not disturb an unrelated, untouched
+    /// group sharing the same window.
+    #[test]
+    fn retraction_reopens_finalized_window_without_disturbing_other_groups() {
+        // window_size_ms = 10; group A = (t=1, v=100), group B = (t=2, v=200),
+        // both land in window 0. A later row (t=1000, v=999) advances the
+        // watermark far enough to finalize window 0.
+        let op = TumbleWindowOp::new(input_schema(), 0, 10, LateDataPolicy::Drop);
+        let mut acc: HashMap<(i64, i64, i64), i64> = HashMap::new();
+
+        let out1 = op
+            .process_epoch(make_input(&[(1, 100, 1), (2, 200, 1), (1000, 999, 1)]), 1)
+            .unwrap();
+        accumulate(&mut acc, &out1);
+        assert_eq!(
+            live_rows(&acc),
+            vec![(0, 1, 100), (0, 2, 200), (1000, 1000, 999)]
+        );
+
+        // Window 0 should now be finalized (watermark 1000 > window_end 10).
+        {
+            let state = op.state.lock().unwrap();
+            assert!(
+                state.finalized.contains(&0),
+                "window 0 should be finalized after epoch 1"
+            );
+        }
+
+        // Retract group B only. Group A must remain untouched/live.
+        let out2 = op.process_epoch(make_input(&[(2, 200, -1)]), 2).unwrap();
+        accumulate(&mut acc, &out2);
+        let live = live_rows(&acc);
+        assert_eq!(
+            live,
+            vec![(0, 1, 100), (1000, 1000, 999)],
+            "group A (t=1,v=100) must survive an unrelated retraction of group B in the same window: {live:?}"
+        );
     }
 
     fn accumulate_session(state: &mut HashMap<(i64, i64, i64, i64), i64>, zset: &ArrowZSet) {

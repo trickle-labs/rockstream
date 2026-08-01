@@ -244,6 +244,23 @@ impl AggregateOp {
         let state = AggState::decode_from_entries(&entries, op_id);
         Ok(Self::with_state(op_id, state))
     }
+
+    /// Load persisted state from `db` into this already-constructed
+    /// instance in place (used by `GatewayHandler::recover_compiled_views`
+    /// to restore a recompiled view's arrangement after a process restart —
+    /// unlike `load_from_storage`, this keeps the same `Arc<AggregateOp>`
+    /// already installed in the pipeline rather than requiring the caller
+    /// to rebuild the pipeline around a freshly-returned instance).
+    pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
+        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, self.op_id.0);
+        let (entries, _truncated) = db
+            .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
+            .await
+            .map_err(OpError::storage)?;
+        let state = AggState::decode_from_entries(&entries, self.op_id);
+        *self.state.lock().expect("AggregateOp mutex poisoned") = state;
+        Ok(())
+    }
 }
 
 impl Operator for AggregateOp {

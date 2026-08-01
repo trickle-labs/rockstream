@@ -33,6 +33,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -46,6 +47,7 @@ rockstream-sim = { workspace = true }
 tokio-postgres = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
+datafusion = { workspace = true }
 
 
 

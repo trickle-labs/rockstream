@@ -12,10 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
-};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::memory::MemTable;
 use datafusion::prelude::SessionContext;
@@ -53,7 +50,8 @@ use tokio::net::TcpListener;
 
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
-use rockstream_ops::{ArrowZSet, ColumnValue};
+use rockstream_ops::sink::{column_values_to_tsv_bytes, materialize_view_state};
+use rockstream_ops::ArrowZSet;
 use rockstream_sql::SqlFrontend;
 use rockstream_types::config::ScatterPruningConfig;
 use rockstream_types::explain::ExplainLevel;
@@ -717,7 +715,24 @@ pub static SESSION_WAIT_FOR_TIMEOUT_TOTAL: std::sync::atomic::AtomicU64 =
 pub static QUERY_TIME_DATAFUSION_ROWS_SCANNED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Total rows scanned by COMMIT-time full rescans that drive compiled view refresh.
+///
+/// Retired by v0.51.4 Slice 0: the compiled-view refresh path no longer
+/// rescans the full source table (`recompute_compiled_view` now consumes the
+/// commit's own row-level `WriteBatch` delta). This counter is kept
+/// read-only-compatible (never incremented again) so any external dashboard
+/// referencing it degrades gracefully to "always zero increase" rather than
+/// disappearing; new code should read `COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL`
+/// instead.
 pub static COMMIT_COMPILED_VIEW_ROWS_SCANNED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Total rows actually fed into a compiled view's pipeline per commit —
+/// v0.51.4 Slice 0. Unlike the retired
+/// `COMMIT_COMPILED_VIEW_ROWS_SCANNED_TOTAL`, this counts only the rows in
+/// the commit's own row-level delta (insert/update/delete), so it is
+/// proportional to the size of the commit, not the size of the source
+/// table. This is the counter `commit_refresh_is_proportional_to_delta_not_table_size`
+/// and Slice 9's regression benchmark assert against.
+pub static COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Total rows processed by `CREATE INDEX` automatic backfill scans (Slice 5, v0.51.2).
 pub static INDEX_BACKFILL_ROWS_PROCESSED_TOTAL: std::sync::atomic::AtomicU64 =
@@ -860,12 +875,13 @@ pub struct GatewayHandler {
     /// Wall-clock publish timestamp of the most recently advanced shard frontier.
     frontier_published_at_ms: Arc<AtomicU64>,
     /// Compiled `PlanNode → Operator` pipelines for views registered through
-    /// the v0.51.3 "one data plane" fast path (Slice 3/4), keyed by view
+    /// the "one data plane" fast path (v0.51.3 Slice 3/4, extended through
+    /// v0.51.4 Slices 1-7 to every Nexmark operator family), keyed by view
     /// name. Populated by `handle_create_view` when the view's SELECT
-    /// compiles via `rockstream_ops::compile_plan`; absent for query shapes
-    /// the compiler doesn't yet support (joins, aggregates, windows, ...),
-    /// which keep going through `view_materializer.rs` until Slice 5/6 wire
-    /// COMMIT through the compiled path.
+    /// compiles via `rockstream_ops::compile_plan`; a shard-backed gateway
+    /// (`--role all`) rejects `CREATE VIEW`/`CREATE MATERIALIZED VIEW`
+    /// outright (`RS-1019`) when compilation fails — there is no
+    /// materializer fallback left (v0.51.4 Slice 8).
     compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
 }
 
@@ -936,8 +952,7 @@ impl GatewayHandler {
 
     /// Whether a compiled operator pipeline (v0.51.3 Slice 4) has been
     /// registered for `view_name`. Used by tests to confirm `CREATE VIEW`
-    /// routed through the direct operator compiler rather than falling back
-    /// to `view_materializer.rs`.
+    /// routed through the direct operator compiler.
     #[doc(hidden)]
     pub fn has_compiled_view(&self, view_name: &str) -> bool {
         self.compiled_views.contains_key(view_name)
@@ -973,6 +988,7 @@ impl GatewayHandler {
         view_name: &str,
         select_sql: &str,
         output_column_count: usize,
+        table_schemas: &HashMap<String, SchemaRef>,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) -> Result<rockstream_ops::CompiledView, String> {
         let frontend = self
@@ -990,7 +1006,128 @@ impl GatewayHandler {
             ),
         };
 
-        rockstream_ops::compile_plan(&view_plan, shard_db).map_err(|e| format!("compile_plan: {e}"))
+        rockstream_ops::compile_plan(&view_plan, shard_db, table_schemas)
+            .map_err(|e| format!("compile_plan: {e}"))
+    }
+
+    /// Same as `try_compile_view`, but reuses `sink_op_id` instead of
+    /// minting a fresh one — see `recover_compiled_views`.
+    async fn try_compile_view_with_sink_id(
+        &self,
+        view_name: &str,
+        select_sql: &str,
+        output_column_count: usize,
+        table_schemas: &HashMap<String, SchemaRef>,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+        sink_op_id: OperatorId,
+    ) -> Result<rockstream_ops::CompiledView, String> {
+        let frontend = self
+            .build_explain_frontend()
+            .map_err(|e| format!("frontend setup failed: {e:?}"))?;
+
+        let view_plan = rockstream_plan::PlanNode::ViewSink {
+            view_name: view_name.to_string(),
+            pk: full_row_pk(output_column_count),
+            child: Box::new(
+                frontend
+                    .sql_to_plan_node(select_sql)
+                    .await
+                    .map_err(|e| format!("sql_to_plan_node: {e}"))?,
+            ),
+        };
+
+        rockstream_ops::compile_plan_with_sink_id(&view_plan, shard_db, table_schemas, sink_op_id)
+            .map_err(|e| format!("compile_plan_with_sink_id: {e}"))
+    }
+
+    /// Recompile every catalog-registered view that already carries a
+    /// durable `op_id` back into this handler's local `compiled_views`
+    /// cache. `compiled_views` (unlike `CatalogView.op_id`) is process-local
+    /// state, populated only by `handle_create_view` — without this step, a
+    /// fresh gateway process (after a restart) would still report a view as
+    /// compiled (`op_id: Some(_)` survives via the catalog) but silently
+    /// stop applying live incremental commits to it, since
+    /// `reachable_compiled_views` only considers views present in this
+    /// (empty, for a fresh process) map. Reuses the view's exact pre-restart
+    /// `sink_op_id` (`try_compile_view_with_sink_id`) and reproduces its
+    /// exact pre-restart internal stage ids (`compile_plan`'s
+    /// `with_view_id_scope`, seeded from the view name) so the recompiled
+    /// pipeline addresses the same storage keys the prior process wrote to.
+    /// A no-op for a gateway with no local `shard_db` (multi-shard
+    /// `--role gateway`, which never populates `compiled_views` at all).
+    pub async fn recover_compiled_views(&self) {
+        let Some(shard_db) = self.shard_db.clone() else {
+            return;
+        };
+        for view in self.catalog.list_views() {
+            let Some(op_id) = view.op_id else {
+                continue;
+            };
+            if self.compiled_views.contains_key(&view.name) {
+                continue;
+            }
+            let inlined_sql =
+                inline_view_dependencies(&view.sql, &self.catalog, MAX_VIEW_INLINE_DEPTH);
+            let compile_deps = extract_sql_refs(&inlined_sql);
+            let deps_are_base_tables = compile_deps
+                .iter()
+                .all(|dep| self.catalog.get_table(dep).is_some());
+            if !deps_are_base_tables {
+                continue;
+            }
+            let table_schemas: HashMap<String, SchemaRef> = compile_deps
+                .iter()
+                .map(|dep| (dep.clone(), query_time_relation_schema(&self.catalog, dep)))
+                .collect();
+            match self
+                .try_compile_view_with_sink_id(
+                    &view.name,
+                    &inlined_sql,
+                    view.columns.len(),
+                    &table_schemas,
+                    shard_db.clone(),
+                    OperatorId(op_id),
+                )
+                .await
+            {
+                Ok(compiled) => {
+                    if let Some(join) = &compiled.join {
+                        if let Err(e) = join.pipeline.restore(&shard_db).await {
+                            tracing::warn!(
+                                view = %view.name,
+                                error = %e,
+                                "recover_compiled_views: failed to restore persisted join \
+                                 arrangement state; recompiled pipeline will start from empty \
+                                 state"
+                            );
+                        }
+                    } else if let Err(e) = compiled.pipeline.restore(&shard_db).await {
+                        tracing::warn!(
+                            view = %view.name,
+                            error = %e,
+                            "recover_compiled_views: failed to restore persisted pipeline \
+                             arrangement state; recompiled pipeline will start from empty state"
+                        );
+                    }
+                    self.compiled_views
+                        .insert(view.name.clone(), Arc::new(compiled));
+                    tracing::info!(
+                        view = %view.name,
+                        op_id,
+                        "recover_compiled_views: recompiled view pipeline after restart"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        view = %view.name,
+                        error = %e,
+                        "recover_compiled_views: failed to recompile a previously-compiled \
+                         view; it will not receive live incremental refresh until CREATE VIEW \
+                         is re-issued"
+                    );
+                }
+            }
+        }
     }
 
     fn compiled_view_pk(&self, view_name: &str, column_count: usize) -> Vec<usize> {
@@ -1058,6 +1195,26 @@ impl GatewayHandler {
             .collect::<Vec<_>>())
     }
 
+    /// Scan `relation_name`'s full current contents and wrap them as a
+    /// weight-`1` `ArrowZSet` — used only for a compiled view's one-time
+    /// initial backfill (`populate_compiled_view_from_scratch`), never for
+    /// per-commit refresh (Slice 0's whole point is that per-commit refresh
+    /// never does this).
+    async fn full_table_zset(
+        &self,
+        relation_name: &str,
+        shard_db: &rockstream_storage::ShardDb,
+    ) -> Result<ArrowZSet, GatewayError> {
+        let rows = self
+            .scan_relation_rows_bounded(relation_name, shard_db)
+            .await?;
+        let schema = query_time_relation_schema(&self.catalog, relation_name);
+        let batch = tsv_to_record_batch(schema.clone(), &rows)
+            .unwrap_or_else(|_| RecordBatch::new_empty(schema));
+        let weights = vec![1; batch.num_rows()];
+        Ok(ArrowZSet::new(batch, weights))
+    }
+
     fn reachable_compiled_views(&self, changed_relations: &HashSet<String>) -> Vec<String> {
         let mut reachable = changed_relations.clone();
         let mut ordered = Vec::new();
@@ -1085,7 +1242,114 @@ impl GatewayHandler {
         ordered
     }
 
+    /// v0.51.4 Slice 0: refresh a compiled view from the commit's own
+    /// row-level delta rather than a full-table rescan.
+    ///
+    /// `ops` is the commit's drained `WriteBatch` DML ops (already known to
+    /// `handle_commit` — no extra read against storage). Only the ops
+    /// touching this view's source table are turned into a signed-weight
+    /// `ArrowZSet` (`+1` insert, `-1` delete, paired `-1`/`+1` update) and
+    /// fed through the compiled pipeline; since the stateless operators
+    /// (`FilterOp`/`ProjectOp`/`MapOp`) are linear (DBSP linear-operator
+    /// rule), the pipeline's output on a true delta *is* the output delta —
+    /// no old/new snapshot diff is needed, unlike the retired full-rescan
+    /// path.
     async fn recompute_compiled_view(
+        &self,
+        view_name: &str,
+        ops: &[DmlOp],
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let Some(compiled) = self.compiled_views.get(view_name) else {
+            return Ok(());
+        };
+
+        // v0.51.4 Slice 3: a join-shaped view has two independent delta
+        // sources (its left and right source tables) instead of one. Build
+        // each side's delta from this commit's own ops (either or both may
+        // be empty — `JoinPipeline::process` handles that correctly, same
+        // as `JoinOp`/`OuterJoinOp`'s underlying bilinear-rule semantics).
+        if let Some(join) = &compiled.join {
+            let left_schema = query_time_relation_schema(&self.catalog, &join.left_source);
+            let right_schema = query_time_relation_schema(&self.catalog, &join.right_source);
+            let left_delta = build_delta_zset_for_table(&join.left_source, ops, left_schema)?;
+            let right_delta = build_delta_zset_for_table(&join.right_source, ops, right_schema)?;
+            if left_delta.is_empty() && right_delta.is_empty() {
+                return Ok(());
+            }
+            COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL.fetch_add(
+                (left_delta.num_rows() + right_delta.num_rows()) as u64,
+                Ordering::Relaxed,
+            );
+            let output = join
+                .pipeline
+                .process(left_delta, right_delta)
+                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled join pipeline process({view_name}): {e}"),
+                })?;
+            if !output.is_empty() {
+                compiled.sink.write_next_epoch(&output).await.map_err(|e| {
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("write compiled view_output({view_name}): {e}"),
+                    }
+                })?;
+            }
+            join.pipeline
+                .persist(shard_db.as_ref())
+                .await
+                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("persist compiled join pipeline state({view_name}): {e}"),
+                })?;
+            return Ok(());
+        }
+
+        let deps = self.catalog.get_view_deps(view_name);
+        if deps.is_empty() {
+            return Ok(());
+        }
+        let source_name = deps[0].clone();
+        let source_schema = query_time_relation_schema(&self.catalog, &source_name);
+        let input = build_delta_zset_for_table(&source_name, ops, source_schema)?;
+        if input.is_empty() {
+            return Ok(());
+        }
+        COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL.fetch_add(input.num_rows() as u64, Ordering::Relaxed);
+        let output = compiled.pipeline.process(input).map_err(|e| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled pipeline process({view_name}): {e}"),
+            }
+        })?;
+        if !output.is_empty() {
+            compiled.sink.write_next_epoch(&output).await.map_err(|e| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("write compiled view_output({view_name}): {e}"),
+                }
+            })?;
+        }
+        // Persist any stateful stage's arrangement (Aggregate/Distinct/
+        // TumbleWindow/HopWindow/Window/TopK — v0.51.4 Slices 1-5). A no-op
+        // for a stateless-only pipeline (Slice 0's q0-q2 shapes).
+        compiled
+            .pipeline
+            .persist(shard_db.as_ref())
+            .await
+            .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("persist compiled pipeline state({view_name}): {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// One-time initial backfill for a freshly-created compiled view
+    /// (materialized *or* plain `CREATE VIEW` — both need to reflect
+    /// already-committed source-table data immediately, see call site): the
+    /// view has no rows yet, so (unlike per-commit refresh, Slice 0) there
+    /// is no smaller row-level delta to consume — the whole source table's
+    /// current contents *are* the initial delta. This is the one
+    /// legitimate remaining use of a full-table scan (bounded by
+    /// `MAX_QUERY_TIME_ROWS`/`MAX_QUERY_TIME_SCAN_BYTES`, same as
+    /// query-time reads); it runs exactly once per view creation, not once
+    /// per commit.
+    async fn populate_compiled_view_from_scratch(
         &self,
         view_name: &str,
         shard_db: &Arc<rockstream_storage::ShardDb>,
@@ -1093,51 +1357,71 @@ impl GatewayHandler {
         let Some(compiled) = self.compiled_views.get(view_name) else {
             return Ok(());
         };
+
+        // v0.51.4 Slice 3: a join-shaped view's initial backfill scans both
+        // source tables' current contents (weight 1 per row) and feeds them
+        // through the join in one shot.
+        if let Some(join) = &compiled.join {
+            let left = self
+                .full_table_zset(&join.left_source, shard_db.as_ref())
+                .await?;
+            let right = self
+                .full_table_zset(&join.right_source, shard_db.as_ref())
+                .await?;
+            if left.is_empty() && right.is_empty() {
+                return Ok(());
+            }
+            let output = join.pipeline.process(left, right).map_err(|e| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled join pipeline process({view_name}): {e}"),
+                }
+            })?;
+            if !output.is_empty() {
+                compiled.sink.write_next_epoch(&output).await.map_err(|e| {
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("write compiled view_output({view_name}): {e}"),
+                    }
+                })?;
+            }
+            join.pipeline
+                .persist(shard_db.as_ref())
+                .await
+                .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("persist compiled join pipeline state({view_name}): {e}"),
+                })?;
+            return Ok(());
+        }
+
         let deps = self.catalog.get_view_deps(view_name);
         if deps.is_empty() {
             return Ok(());
         }
         let source_name = deps[0].clone();
-        let source_rows = self
-            .scan_relation_rows_bounded(&source_name, shard_db.as_ref())
+        let input = self
+            .full_table_zset(&source_name, shard_db.as_ref())
             .await?;
-        COMMIT_COMPILED_VIEW_ROWS_SCANNED_TOTAL
-            .fetch_add(source_rows.len() as u64, Ordering::Relaxed);
-        let source_schema = query_time_relation_schema(&self.catalog, &source_name);
-        let source_batch =
-            crate::view_materializer::tsv_to_record_batch(source_schema.clone(), &source_rows)
-                .unwrap_or_else(|_| RecordBatch::new_empty(source_schema));
-        let input = ArrowZSet::new(source_batch.clone(), vec![1; source_batch.num_rows()]);
+        if input.is_empty() {
+            return Ok(());
+        }
         let output = compiled.pipeline.process(input).map_err(|e| {
             GatewayError::QueryTimeExecutionFailed {
                 detail: format!("compiled pipeline process({view_name}): {e}"),
             }
         })?;
-        let old_state = {
-            let catalog_view = self
-                .catalog
-                .get_view(view_name)
-                .ok_or_else(|| GatewayError::ViewNotFound(view_name.to_string()))?;
-            let stored = rockstream_ops::read_view_output(
-                shard_db.as_ref(),
-                compiled.sink_op_id,
-                catalog_view.columns.len(),
-            )
-            .await
-            .map_err(|e| GatewayError::QueryTimeExecutionFailed {
-                detail: format!("read old view_output({view_name}): {e}"),
-            })?;
-            materialize_view_state(stored, &compiled.pk)
-        };
-        let new_state = record_batch_to_view_state(&output, &compiled.pk)?;
-        let delta = diff_view_states_to_zset(output.schema(), &old_state, &new_state)?;
-        if !delta.is_empty() {
-            compiled.sink.write_next_epoch(&delta).await.map_err(|e| {
+        if !output.is_empty() {
+            compiled.sink.write_next_epoch(&output).await.map_err(|e| {
                 GatewayError::QueryTimeExecutionFailed {
                     detail: format!("write compiled view_output({view_name}): {e}"),
                 }
             })?;
         }
+        compiled
+            .pipeline
+            .persist(shard_db.as_ref())
+            .await
+            .map_err(|e| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("persist compiled pipeline state({view_name}): {e}"),
+            })?;
         Ok(())
     }
 
@@ -3161,15 +3445,12 @@ impl GatewayHandler {
                 }
             }
 
-            // Register view in the catalog.
-            use crate::catalog_stubs::CatalogView;
-
             // Pre-populate column names by static analysis of the SELECT list.
             // This allows `SELECT * FROM view` to return correct column headers
             // even before the first DML commit triggers a full materialization.
             // Types default to Utf8 and are refined to the true Arrow types once
             // the view is first materialized via `update_view_columns`.
-            let initial_columns: Vec<crate::catalog_stubs::CatalogColumn> =
+            let mut initial_columns: Vec<crate::catalog_stubs::CatalogColumn> =
                 infer_select_columns(&select_sql)
                     .into_iter()
                     .map(|name| crate::catalog_stubs::CatalogColumn {
@@ -3177,14 +3458,140 @@ impl GatewayHandler {
                         data_type: "Utf8".to_string(),
                     })
                     .collect();
+            // `infer_select_columns` can't statically name a `SELECT *`
+            // (v0.51.4 Slice 8 finding: this used to self-heal once
+            // `view_materializer.rs`'s DataFusion pass ran and called
+            // `update_view_columns` with the real output schema — that
+            // fallback no longer exists, so a bare `SELECT * FROM t`
+            // view would otherwise register with zero columns forever,
+            // and `SELECT * FROM view` would return zero-column rows).
+            // For the exact-passthrough shape (`SELECT * FROM
+            // <single-base-table>`, e.g. Nexmark q0), the source table's
+            // own already-known column list *is* the view's column list.
+            if initial_columns.is_empty() {
+                let select_list = select_sql
+                    .trim()
+                    .to_lowercase()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if select_list.starts_with("select * from ") && deps.len() == 1 {
+                    if let Some(table) = self.catalog.get_table(&deps[0]) {
+                        initial_columns = table.columns.clone();
+                    }
+                }
+            }
 
+            // v0.51.4 Slice 8: attempt to compile the view's SELECT into an
+            // executable operator chain *before* registering it in the
+            // catalog. There is no DataFusion-materializer fallback left
+            // (`view_materializer.rs` is deleted) — a shard-backed gateway
+            // (`--role all`) either compiles a view for real or the
+            // `CREATE VIEW`/`CREATE MATERIALIZED VIEW` itself fails with a
+            // real, user-visible `RS-1019` error, exactly like any other
+            // unsupported-SQL rejection. A standalone `--role gateway` (no
+            // local `ShardDb`) has nothing to compile against locally and
+            // registers the view unconditionally — its data is served from
+            // elsewhere via `ViewReader` (multi-shard scatter-read), not
+            // this process's own compiled pipeline.
+            let compiled_op_id: Option<u64> = if let Some(shard_db) = self.shard_db.clone() {
+                // v0.51.4 Slice 8: a view-of-view (any dep that's itself a
+                // view, not a base table) is inlined as a subquery before
+                // compilation — the *catalog*'s own dependency graph
+                // (`deps`, used for cycle detection and the reachability
+                // BFS at commit time) still tracks the original, uninlined
+                // names, so a commit to the innermost base table correctly
+                // reaches every view in the chain.
+                let inlined_sql =
+                    inline_view_dependencies(&select_sql, &self.catalog, MAX_VIEW_INLINE_DEPTH);
+                let compile_deps = extract_sql_refs(&inlined_sql);
+                let deps_are_base_tables = compile_deps
+                    .iter()
+                    .all(|dep| self.catalog.get_table(dep).is_some());
+                let compile_result = if deps_are_base_tables {
+                    let table_schemas: HashMap<String, SchemaRef> = compile_deps
+                        .iter()
+                        .map(|dep| (dep.clone(), query_time_relation_schema(&self.catalog, dep)))
+                        .collect();
+                    self.try_compile_view(
+                        &view_name,
+                        &inlined_sql,
+                        initial_columns.len(),
+                        &table_schemas,
+                        shard_db.clone(),
+                    )
+                    .await
+                } else {
+                    Err(format!(
+                        "[RS-1019] view.compile_failed: view depends on non-base-table \
+                         relation(s) {compile_deps:?} that could not be inlined to base \
+                         tables; compile_plan only supports views over base tables \
+                         (directly, or transitively through other views)"
+                    ))
+                };
+                match compile_result {
+                    Ok(compiled) => {
+                        let op_id = compiled.sink_op_id.0;
+                        let pk = compiled.pk.clone();
+                        self.compiled_views
+                            .insert(view_name.clone(), Arc::new(compiled));
+                        tracing::debug!(
+                            view = %view_name,
+                            op_id,
+                            "handle_create_view: compiled view through direct operator pipeline"
+                        );
+                        // v0.51.4 Slice 8: record the view_name -> op_id
+                        // directory entry so a standalone `--role gateway`
+                        // process (no shared in-memory catalog) can resolve
+                        // and read this view's compiled output through
+                        // `ViewReader`/`ShardReader` alone (the multi-shard
+                        // publish/read path — see `rockstream_ops::sink`'s
+                        // view-directory doc comment).
+                        if let Err(e) = rockstream_ops::sink::write_view_directory_entry(
+                            &shard_db,
+                            &view_name,
+                            OperatorId(op_id),
+                            initial_columns.len(),
+                            &pk,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                view = %view_name,
+                                error = %e,
+                                "handle_create_view: failed to write view directory entry \
+                                 (multi-shard/published reads of this view may return no rows)"
+                            );
+                        }
+                        Some(op_id)
+                    }
+                    Err(e) => {
+                        return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "42601".to_owned(),
+                            format!(
+                                "[RS-1019] view.compile_failed: {tag} '{view_name}' could not be \
+                                 compiled into an executable operator pipeline: {e}. Next steps: \
+                                 simplify the query to a supported shape (see \
+                                 docs/language-features.md), or reference only base tables."
+                            ),
+                        )))]);
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Register view in the catalog — only reached once compilation
+            // (when attempted) has already succeeded.
+            use crate::catalog_stubs::CatalogView;
             self.catalog.add_view_with_deps(
                 CatalogView {
                     name: view_name.clone(),
                     sql: select_sql,
                     columns: initial_columns,
                     namespace: "public".to_string(),
-                    op_id: None,
+                    op_id: compiled_op_id,
                 },
                 deps.clone(),
             );
@@ -3200,76 +3607,37 @@ impl GatewayHandler {
                 ));
             }
 
-            // v0.51.3 Slice 4: attempt to compile the view's SELECT directly
-            // into an executable operator chain via the "one data plane"
-            // fast path. Best-effort: any failure (unsupported query shape,
-            // parse error, etc.) is logged and the view keeps `op_id =
-            // None`, falling back to `view_materializer.rs`'s DataFusion
-            // path below for correctness. Requires a shared `ShardDb`
-            // (`--role all`); standalone `--role gateway` has none.
-            if let Some(shard_db) = self.shard_db.clone() {
-                let deps_are_base_tables =
-                    deps.iter().all(|dep| self.catalog.get_table(dep).is_some());
-                if let Some(view) = self.catalog.get_view(&view_name) {
-                    if deps_are_base_tables {
-                        match self
-                            .try_compile_view(&view.name, &view.sql, view.columns.len(), shard_db)
-                            .await
-                        {
-                            Ok(compiled) => {
-                                let op_id = compiled.sink_op_id.0;
-                                self.compiled_views
-                                    .insert(view.name.clone(), Arc::new(compiled));
-                                self.catalog.set_view_op_id(&view.name, op_id);
-                                tracing::debug!(
-                                    view = %view.name,
-                                    op_id,
-                                    "handle_create_view: compiled view through direct operator pipeline"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    view = %view.name,
-                                    error = %e,
-                                    "handle_create_view: view not compilable via direct operator pipeline, falling back to view_materializer"
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            view = %view.name,
-                            deps = ?deps,
-                            "handle_create_view: skipping direct operator compilation for view with non-table dependencies"
+            // Immediate materialization: a view (materialized *or* plain)
+            // must reflect its source tables' already-committed data before
+            // this response reaches the client, not just the next COMMIT —
+            // standard SQL view semantics ("a view is the query over the
+            // *current* state of its base tables"), not something specific
+            // to `MATERIALIZED`. This was previously gated on
+            // `is_materialized` only, which meant a plain `CREATE VIEW`
+            // (e.g. a join over a table that already had committed rows
+            // before the view existed) silently missed that pre-existing
+            // data forever — never exercised by any prior test, since every
+            // prior compiled-view test created the view before any base
+            // table had data. `populate_compiled_view_from_scratch` is a
+            // no-op when every source table is still empty, so this is safe
+            // for the common (empty-at-creation) case too. v0.51.4 Slice 8:
+            // the compiled view's own initial-backfill path is the *only*
+            // population step now — no redundant double-write through a
+            // separately-materialized legacy pass.
+            if let Some(shard_db) = &self.shard_db {
+                if self.compiled_views.contains_key(&view_name) {
+                    if let Err(error) = self
+                        .populate_compiled_view_from_scratch(&view_name, shard_db)
+                        .await
+                    {
+                        tracing::warn!(
+                            view = %view_name,
+                            error = %error,
+                            "compiled immediate materialization failed"
                         );
                     }
                 }
-            }
-
-            // Immediate materialization: a CREATE MATERIALIZED VIEW must
-            // reflect its source tables' current data before this response
-            // reaches the client — not just on the next COMMIT. Reuses the
-            // exact same post-commit materializer entry point, seeded with
-            // this view's own source tables as the changed set.
-            if is_materialized {
-                if let Some(shard_db) = &self.shard_db {
-                    let changed_tables: std::collections::HashSet<String> =
-                        deps.into_iter().collect();
-                    crate::view_materializer::materialize_views(
-                        &self.catalog,
-                        shard_db,
-                        &changed_tables,
-                    )
-                    .await;
-                    if self.compiled_views.contains_key(&view_name) {
-                        if let Err(error) = self.recompute_compiled_view(&view_name, shard_db).await
-                        {
-                            tracing::warn!(
-                                view = %view_name,
-                                error = %error,
-                                "compiled immediate materialization failed after legacy refresh"
-                            );
-                        }
-                    }
+                if is_materialized {
                     if let Err(e) = shard_db.flush().await {
                         tracing::warn!(
                             "post-CREATE-MATERIALIZED-VIEW shard flush failed (non-fatal): {e}"
@@ -4211,14 +4579,15 @@ impl GatewayHandler {
                     DmlOp::Delete { table, .. } => table.clone(),
                 })
                 .collect();
-            crate::view_materializer::materialize_views(&self.catalog, shard_db, &changed_tables)
-                .await;
             for view_name in self.reachable_compiled_views(&changed_tables) {
-                if let Err(error) = self.recompute_compiled_view(&view_name, shard_db).await {
+                if let Err(error) = self
+                    .recompute_compiled_view(&view_name, &ops, shard_db)
+                    .await
+                {
                     tracing::warn!(
                         view = %view_name,
                         error = %error,
-                        "compiled view refresh failed after commit; legacy materializer still runs"
+                        "compiled view refresh failed after commit"
                     );
                 }
             }
@@ -5228,10 +5597,14 @@ impl GatewayHandler {
             .map(|ct| ct.columns.into_iter().map(|c| c.name).collect())
             .unwrap_or_else(|| cols.clone());
 
-        // Only read the pre-image when RETURNING was requested, so a plain
-        // DELETE never pays for an extra read.
+        // Pre-image capture: v0.51.4 Slice 0 needs this for every DELETE (not
+        // just `RETURNING` ones) so the compiled-view refresh path can build
+        // a true row-level delta (weight -1) instead of a full-table
+        // rescan — see `DmlOp::Delete::returning_tsv` doc comment. This is a
+        // single-row `get()` by key, bounded and proportional to one row,
+        // not a table scan.
         let mut captured_row: Option<Vec<String>> = None;
-        if let Some(cols) = &returning_cols {
+        {
             let buffered_existing = conn_id.and_then(|id| {
                 self.write_buffers
                     .get(id)
@@ -5263,14 +5636,15 @@ impl GatewayHandler {
                     row.resize(table_columns.len(), String::new());
                     captured_row = Some(row);
                 }
-                None => {
+                None if returning_cols.is_some() => {
                     return Ok(vec![self.build_returning_response(
                         &table,
                         &table_columns,
-                        cols,
+                        returning_cols.as_ref().expect("checked Some above"),
                         Vec::new(),
                     )]);
                 }
+                None => {}
             }
         }
 
@@ -6919,6 +7293,7 @@ impl GatewayServer {
 
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
+        self.handler.recover_compiled_views().await;
         let factory = Arc::new(GatewayHandlerFactory {
             handler: self.handler.clone(),
         });
@@ -6989,6 +7364,7 @@ impl GatewayServer {
     pub async fn serve_background(
         self,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        self.handler.recover_compiled_views().await;
         let factory = Arc::new(GatewayHandlerFactory {
             handler: self.handler.clone(),
         });
@@ -7874,314 +8250,143 @@ fn query_time_relation_schema(catalog: &CatalogStubs, relation_name: &str) -> Sc
     )]))
 }
 
-fn serialize_column_value(value: &ColumnValue) -> String {
-    match value {
-        ColumnValue::Int64(v) => format!("i:{v}"),
-        ColumnValue::Utf8(v) => format!("s:{}:{v}", v.len()),
-        ColumnValue::Boolean(v) => format!("b:{}", u8::from(*v)),
-        ColumnValue::Float64(v) => format!("f:{:016x}", v.to_bits()),
-    }
-}
-
-fn serialize_pk(row: &[ColumnValue], pk: &[usize]) -> String {
-    if pk.is_empty() {
-        return row
-            .iter()
-            .map(serialize_column_value)
-            .collect::<Vec<_>>()
-            .join("|");
-    }
-    pk.iter()
-        .filter_map(|idx| row.get(*idx))
-        .map(serialize_column_value)
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
 fn full_row_pk(column_count: usize) -> Vec<usize> {
     (0..column_count).collect()
 }
 
-fn column_values_to_tsv_bytes(row: &[ColumnValue]) -> Vec<u8> {
-    row.iter()
-        .map(|value| match value {
-            ColumnValue::Int64(v) => v.to_string(),
-            ColumnValue::Utf8(v) => v.clone(),
-            ColumnValue::Boolean(v) => v.to_string(),
-            ColumnValue::Float64(v) => v.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("\t")
-        .into_bytes()
-}
+/// v0.51.4 Slice 0: build a signed-weight `ArrowZSet` from the commit's own
+/// row-level `DmlOp`s for a single source table — the true delta fed into a
+/// compiled view's pipeline, replacing the retired full-table rescan.
+///
+/// Weights: `+1` per inserted row, `-1` per deleted row (using the delete's
+/// captured pre-image — see `DmlOp::Delete::returning_tsv`, now always
+/// captured, v0.51.4 Slice 0), and a paired `-1`/`+1` for each update (old
+/// row image retracted, new row image asserted). Ops for other tables are
+/// ignored. Table name matching is case-insensitive, matching
+/// `WriteBuffer::current_row_image`'s convention.
+/// Parse a list of tab-separated rows into an Arrow `RecordBatch`.
+///
+/// Values are cast from string to the declared column type. Rows that
+/// cannot be parsed for a column fall back to `null`. (Moved here from the
+/// now-deleted `view_materializer.rs` in v0.51.4 Slice 8 — this is a
+/// generic TSV-storage-format helper used by the query-time read paths
+/// below, independent of that module's retired DataFusion-materializer
+/// logic.)
+fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatch, String> {
+    use datafusion::arrow::array::{
+        ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    };
+    use datafusion::arrow::datatypes::DataType;
 
-type MaterializedViewState = std::collections::BTreeMap<String, (Vec<ColumnValue>, i64)>;
+    let n = rows.len();
+    let num_cols = schema.fields().len();
 
-fn materialize_view_state(
-    rows: Vec<(u64, u64, Vec<ColumnValue>, i64)>,
-    pk: &[usize],
-) -> MaterializedViewState {
-    let mut state = std::collections::BTreeMap::new();
-    for (_epoch, _row_idx, row, weight) in rows {
-        let key = serialize_pk(&row, pk);
-        let mut remove_key = false;
-        match state.entry(key.clone()) {
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let (stored_row, count) = entry.get_mut();
-                *stored_row = row;
-                *count += weight;
-                remove_key = *count == 0;
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                if weight != 0 {
-                    entry.insert((row, weight));
-                }
-            }
-        }
-        if remove_key {
-            state.remove(&key);
+    let mut col_strs: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(n); num_cols];
+    for row in rows {
+        let s = String::from_utf8_lossy(row);
+        let fields: Vec<&str> = s.split('\t').collect();
+        for (i, col) in col_strs.iter_mut().enumerate() {
+            col.push(fields.get(i).map(|v| v.to_string()));
         }
     }
-    state
-}
 
-fn record_batch_row_to_values(
-    batch: &RecordBatch,
-    row_idx: usize,
-) -> Result<Vec<ColumnValue>, GatewayError> {
-    let mut row = Vec::with_capacity(batch.num_columns());
-    for column in batch.columns() {
-        if column.is_null(row_idx) {
-            return Err(GatewayError::QueryTimeExecutionFailed {
-                detail: "compiled views do not support null-valued rows".to_string(),
-            });
-        }
-        let value = match column.data_type() {
-            DataType::Int32 => ColumnValue::Int64(
-                column
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                        detail: "Int32 downcast failed".to_string(),
-                    })?
-                    .value(row_idx) as i64,
-            ),
-            DataType::Int64 => ColumnValue::Int64(
-                column
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                        detail: "Int64 downcast failed".to_string(),
-                    })?
-                    .value(row_idx),
-            ),
-            DataType::Utf8 => ColumnValue::Utf8(
-                column
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                        detail: "Utf8 downcast failed".to_string(),
-                    })?
-                    .value(row_idx)
-                    .to_string(),
-            ),
-            DataType::Boolean => ColumnValue::Boolean(
-                column
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                        detail: "Boolean downcast failed".to_string(),
-                    })?
-                    .value(row_idx),
-            ),
-            DataType::Float64 => ColumnValue::Float64(
-                column
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                        detail: "Float64 downcast failed".to_string(),
-                    })?
-                    .value(row_idx),
-            ),
-            other => {
-                return Err(GatewayError::QueryTimeExecutionFailed {
-                    detail: format!("compiled views do not support column type {other:?}"),
-                });
-            }
-        };
-        row.push(value);
-    }
-    Ok(row)
-}
-
-fn record_batch_to_view_state(
-    batch: &ArrowZSet,
-    pk: &[usize],
-) -> Result<MaterializedViewState, GatewayError> {
-    let mut state = std::collections::BTreeMap::new();
-    for row_idx in 0..batch.num_rows() {
-        let weight = batch.weights.get(row_idx).copied().unwrap_or_default();
-        if weight <= 0 {
-            continue;
-        }
-        let row = record_batch_row_to_values(&batch.data, row_idx)?;
-        let key = serialize_pk(&row, pk);
-        match state.entry(key) {
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let (stored_row, count) = entry.get_mut();
-                *stored_row = row;
-                *count += weight;
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert((row, weight));
-            }
-        }
-    }
-    Ok(state)
-}
-
-fn build_arrow_arrays(
-    schema: SchemaRef,
-    rows: &[Vec<ColumnValue>],
-) -> Result<Vec<ArrayRef>, GatewayError> {
-    schema
+    let arrays: Vec<ArrayRef> = schema
         .fields()
         .iter()
         .enumerate()
-        .map(|(col_idx, field)| match field.data_type() {
+        .map(|(i, field)| match field.data_type() {
             DataType::Int32 => {
-                let values: Result<Vec<i32>, GatewayError> = rows
+                let vals: Vec<Option<i32>> = col_strs[i]
                     .iter()
-                    .map(|row| {
-                        row.get(col_idx)
-                            .and_then(ColumnValue::as_i64)
-                            .map(|v| v as i32)
-                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                                detail: format!(
-                                    "row {row:?} missing Int32 value at column {col_idx}"
-                                ),
-                            })
-                    })
+                    .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
                     .collect();
-                Ok(Arc::new(Int32Array::from(values?)) as ArrayRef)
+                Arc::new(Int32Array::from(vals)) as ArrayRef
             }
             DataType::Int64 => {
-                let values: Result<Vec<i64>, GatewayError> = rows
+                let vals: Vec<Option<i64>> = col_strs[i]
                     .iter()
-                    .map(|row| {
-                        row.get(col_idx)
-                            .and_then(ColumnValue::as_i64)
-                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                                detail: format!(
-                                    "row {row:?} missing Int64 value at column {col_idx}"
-                                ),
-                            })
-                    })
+                    .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
                     .collect();
-                Ok(Arc::new(Int64Array::from(values?)) as ArrayRef)
-            }
-            DataType::Utf8 => {
-                let values: Result<Vec<String>, GatewayError> = rows
-                    .iter()
-                    .map(|row| {
-                        row.get(col_idx)
-                            .and_then(ColumnValue::as_utf8)
-                            .map(|v| v.to_string())
-                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                                detail: format!(
-                                    "row {row:?} missing Utf8 value at column {col_idx}"
-                                ),
-                            })
-                    })
-                    .collect();
-                Ok(Arc::new(StringArray::from(values?)) as ArrayRef)
-            }
-            DataType::Boolean => {
-                let values: Result<Vec<bool>, GatewayError> = rows
-                    .iter()
-                    .map(|row| {
-                        row.get(col_idx)
-                            .and_then(ColumnValue::as_bool)
-                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                                detail: format!(
-                                    "row {row:?} missing Boolean value at column {col_idx}"
-                                ),
-                            })
-                    })
-                    .collect();
-                Ok(Arc::new(BooleanArray::from(values?)) as ArrayRef)
+                Arc::new(Int64Array::from(vals)) as ArrayRef
             }
             DataType::Float64 => {
-                let values: Result<Vec<f64>, GatewayError> = rows
+                let vals: Vec<Option<f64>> = col_strs[i]
                     .iter()
-                    .map(|row| {
-                        row.get(col_idx)
-                            .and_then(ColumnValue::as_f64)
-                            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
-                                detail: format!(
-                                    "row {row:?} missing Float64 value at column {col_idx}"
-                                ),
-                            })
+                    .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
+                    .collect();
+                Arc::new(Float64Array::from(vals)) as ArrayRef
+            }
+            DataType::Boolean => {
+                let vals: Vec<Option<bool>> = col_strs[i]
+                    .iter()
+                    .map(|s| {
+                        s.as_deref()
+                            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "t" | "1"))
                     })
                     .collect();
-                Ok(Arc::new(Float64Array::from(values?)) as ArrayRef)
+                Arc::new(BooleanArray::from(vals)) as ArrayRef
             }
-            other => Err(GatewayError::QueryTimeExecutionFailed {
-                detail: format!("compiled views do not support output type {other:?}"),
-            }),
+            _ => {
+                let vals: Vec<Option<String>> = col_strs[i]
+                    .iter()
+                    .map(|s| s.as_ref().map(|v| v.to_string()))
+                    .collect();
+                Arc::new(StringArray::from(vals)) as ArrayRef
+            }
         })
-        .collect()
+        .collect();
+
+    RecordBatch::try_new(schema, arrays).map_err(|e| e.to_string())
 }
 
-fn diff_view_states_to_zset(
+fn build_delta_zset_for_table(
+    table: &str,
+    ops: &[DmlOp],
     schema: SchemaRef,
-    old_state: &MaterializedViewState,
-    new_state: &MaterializedViewState,
 ) -> Result<ArrowZSet, GatewayError> {
-    let mut rows = Vec::new();
-    let mut weights = Vec::new();
-    let mut keys = std::collections::BTreeSet::new();
-    keys.extend(old_state.keys().cloned());
-    keys.extend(new_state.keys().cloned());
-    for key in keys {
-        match (old_state.get(&key), new_state.get(&key)) {
-            (Some((old_row, old_count)), Some((new_row, new_count))) if old_row == new_row => {
-                let delta = *new_count - *old_count;
-                if delta != 0 {
-                    rows.push(new_row.clone());
-                    weights.push(delta);
-                }
+    let mut tsv_rows: Vec<Vec<u8>> = Vec::new();
+    let mut weights: Vec<i64> = Vec::new();
+    for op in ops {
+        match op {
+            DmlOp::Insert {
+                table: op_table,
+                values_tsv,
+                ..
+            } if op_table.eq_ignore_ascii_case(table) => {
+                tsv_rows.push(values_tsv.clone().into_bytes());
+                weights.push(1);
             }
-            (Some((old_row, old_count)), Some((new_row, new_count))) => {
-                if *old_count != 0 {
-                    rows.push(old_row.clone());
-                    weights.push(-*old_count);
-                }
-                if *new_count != 0 {
-                    rows.push(new_row.clone());
-                    weights.push(*new_count);
-                }
+            DmlOp::Update {
+                table: op_table,
+                old_tsv,
+                new_tsv,
+                ..
+            } if op_table.eq_ignore_ascii_case(table) => {
+                tsv_rows.push(old_tsv.clone().into_bytes());
+                weights.push(-1);
+                tsv_rows.push(new_tsv.clone().into_bytes());
+                weights.push(1);
             }
-            (Some((old_row, old_count)), None) => {
-                if *old_count != 0 {
-                    rows.push(old_row.clone());
-                    weights.push(-*old_count);
-                }
+            DmlOp::Delete {
+                table: op_table,
+                returning_tsv: Some(tsv),
+                ..
+            } if op_table.eq_ignore_ascii_case(table) => {
+                tsv_rows.push(tsv.clone().into_bytes());
+                weights.push(-1);
             }
-            (None, Some((new_row, new_count))) if *new_count != 0 => {
-                rows.push(new_row.clone());
-                weights.push(*new_count);
-            }
+            // A delete with no captured pre-image (e.g. the row never
+            // existed) contributes no delta row — nothing to retract.
+            DmlOp::Delete { .. } => {}
             _ => {}
         }
     }
-    if rows.is_empty() {
+    if tsv_rows.is_empty() {
         return Ok(ArrowZSet::empty(schema));
     }
-    let arrays = build_arrow_arrays(schema.clone(), &rows)?;
-    let batch = RecordBatch::try_new(schema, arrays).map_err(|e| {
+    let batch = tsv_to_record_batch(schema.clone(), &tsv_rows).map_err(|e| {
         GatewayError::QueryTimeExecutionFailed {
-            detail: format!("failed to build compiled delta batch: {e}"),
+            detail: format!("build_delta_zset_for_table({table}): {e}"),
         }
     })?;
     Ok(ArrowZSet::new(batch, weights))
@@ -8210,7 +8415,7 @@ async fn query_time_datafusion_select(
             });
         }
         let tsv_rows: Vec<Vec<u8>> = rows.into_iter().map(|(_, value)| value.to_vec()).collect();
-        let batch = crate::view_materializer::tsv_to_record_batch(schema.clone(), &tsv_rows)
+        let batch = tsv_to_record_batch(schema.clone(), &tsv_rows)
             .unwrap_or_else(|_| RecordBatch::new_empty(schema.clone()));
         let mem_table = MemTable::try_new(schema, vec![vec![batch]]).map_err(|e| {
             GatewayError::QueryTimeExecutionFailed {
@@ -9272,6 +9477,80 @@ fn parse_drop_workload(q: &str) -> Option<String> {
 /// Extract table/view names referenced in FROM and JOIN clauses.
 ///
 /// Used for dependency tracking in CREATE VIEW cycle detection.
+/// Maximum view-of-view chain depth `inline_view_dependencies` will unwind
+/// (cycle detection already runs before this is ever called, so this is
+/// purely a defensive bound against a pathologically deep — but acyclic —
+/// dependency chain, not a correctness requirement).
+const MAX_VIEW_INLINE_DEPTH: usize = 16;
+
+/// v0.51.4 Slice 8: recursively inline every `FROM`/`JOIN` reference to a
+/// VIEW (as opposed to a base table) in `sql` as a `(view.sql)` subquery,
+/// so a view-of-view (e.g. `CREATE VIEW report AS SELECT ... FROM base_tbl
+/// JOIN some_view ON ...`) compiles through `compile_plan` like any other
+/// view — there is no DataFusion-materializer fallback left to serve it
+/// otherwise (Slice 8's whole point). Purely a textual SQL-level rewrite
+/// (same token-scan convention `extract_sql_refs` uses); the referencing
+/// query's own alias for the joined relation (if any) is preserved as the
+/// derived table's alias, since a `(subquery) AS name alias` isn't valid
+/// SQL — only when no alias follows does this substitute the view's own
+/// name as the subquery's alias (so any back-reference to it, e.g. in a
+/// later `WHERE`/`GROUP BY`, keeps resolving).
+fn inline_view_dependencies(sql: &str, catalog: &CatalogStubs, depth_budget: usize) -> String {
+    if depth_budget == 0 {
+        return sql.to_string();
+    }
+    const NO_ALIAS_FOLLOWS: &[&str] = &[
+        "on",
+        "where",
+        "group",
+        "order",
+        "join",
+        "left",
+        "right",
+        "inner",
+        "outer",
+        "cross",
+        "limit",
+        "having",
+        "union",
+        "except",
+        "intersect",
+    ];
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        let tok_lower = tok.to_lowercase();
+        if (tok_lower == "from" || tok_lower == "join") && i + 1 < tokens.len() {
+            let raw_next = tokens[i + 1];
+            let is_subquery = raw_next.starts_with('(');
+            let name = raw_next.trim_matches(|c| c == '"' || c == ',' || c == ';' || c == ')');
+            let name = name.rsplit('.').next().unwrap_or(name);
+            if !is_subquery {
+                if let Some(view) = catalog.get_view(name) {
+                    out.push(tok.to_string());
+                    let inlined = inline_view_dependencies(&view.sql, catalog, depth_budget - 1);
+                    let alias_follows = tokens
+                        .get(i + 2)
+                        .map(|t| !NO_ALIAS_FOLLOWS.contains(&t.to_lowercase().as_str()))
+                        .unwrap_or(false);
+                    if alias_follows {
+                        out.push(format!("({inlined})"));
+                    } else {
+                        out.push(format!("({inlined}) AS {name}"));
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push(tok.to_string());
+        i += 1;
+    }
+    out.join(" ")
+}
+
 fn extract_sql_refs(sql: &str) -> Vec<String> {
     let tokens_orig: Vec<&str> = sql.split_whitespace().collect();
     let tokens_lower: Vec<String> = tokens_orig.iter().map(|t| t.to_lowercase()).collect();
@@ -9283,7 +9562,13 @@ fn extract_sql_refs(sql: &str) -> Vec<String> {
                 if next.starts_with('(') {
                     continue;
                 }
-                let name = next.trim_matches(|c| c == '"' || c == ',' || c == ';');
+                // v0.51.4 Slice 4: strip a trailing `)` too — a `FROM
+                // items)` inside a parenthesized subquery (e.g. `FROM
+                // (SELECT ... FROM items) WHERE ...`) previously left the
+                // dependency name as `"items)"`, which never matched a real
+                // catalog table and silently defeated the direct-operator
+                // compile fast path for every nested-subquery view shape.
+                let name = next.trim_matches(|c| c == '"' || c == ',' || c == ';' || c == ')');
                 let name = name.rsplit('.').next().unwrap_or(name);
                 if !name.is_empty() {
                     deps.push(name.to_string());
@@ -9845,6 +10130,7 @@ mod s4_tests {
     use crate::auth::Principal;
     use crate::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView};
     use crate::view_reader::{ViewReadStrategy, ViewReader};
+    use rockstream_ops::ColumnValue;
     use rockstream_types::acl::{AclEntry, Role};
     use std::sync::Arc;
 

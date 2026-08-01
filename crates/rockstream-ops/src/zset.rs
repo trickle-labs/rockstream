@@ -76,11 +76,14 @@ impl ArrowZSet {
 
     /// Create an empty `ArrowZSet` with the given schema.
     pub fn empty(schema: SchemaRef) -> Self {
+        use arrow::array::{BooleanArray, Float64Array, StringArray};
         let columns: Vec<ArrayRef> = schema
             .fields()
             .iter()
             .map(|f| match f.data_type() {
-                DataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
+                DataType::Utf8 => Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+                DataType::Boolean => Arc::new(BooleanArray::from(Vec::<bool>::new())) as ArrayRef,
+                DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
                 _ => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
             })
             .collect();

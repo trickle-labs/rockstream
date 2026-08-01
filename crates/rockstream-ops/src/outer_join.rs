@@ -1032,6 +1032,9 @@ impl OuterJoinOp {
             }
         }
 
+        if batch.is_empty() {
+            return Ok(());
+        }
         db.write_batch(batch).await.map_err(OpError::storage)
     }
 

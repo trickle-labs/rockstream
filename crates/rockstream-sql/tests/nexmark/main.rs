@@ -297,25 +297,31 @@ async fn test_nexmark_ingestion_lfs() {
     // Commit txn
     client.simple_query("COMMIT").await.expect("COMMIT failed");
 
-    // Verify row counts in each table via SELECT COUNT(*)
+    // Verify row counts in each table via SELECT COUNT(*) (parse the count
+    // value out of the single returned row, not the row count itself).
+    fn parse_count(rows: &[tokio_postgres::SimpleQueryMessage]) -> u64 {
+        rows.iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => {
+                    r.get(0).map(|v| v.parse::<u64>().expect("count column not a u64"))
+                }
+                _ => None,
+            })
+            .expect("SELECT COUNT(*) returned no row")
+    }
+
     let person_rows = client
         .simple_query("SELECT COUNT(*) FROM person")
         .await
         .expect("SELECT COUNT(*) FROM person failed");
-    let person_count = person_rows
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count() as u64;
+    let person_count = parse_count(&person_rows);
     assert_eq!(person_count, expected_persons, "person row count mismatch");
 
     let auction_rows = client
         .simple_query("SELECT COUNT(*) FROM auction")
         .await
         .expect("SELECT COUNT(*) FROM auction failed");
-    let auction_count = auction_rows
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count() as u64;
+    let auction_count = parse_count(&auction_rows);
     assert_eq!(
         auction_count, expected_auctions,
         "auction row count mismatch"
@@ -325,10 +331,7 @@ async fn test_nexmark_ingestion_lfs() {
         .simple_query("SELECT COUNT(*) FROM bid")
         .await
         .expect("SELECT COUNT(*) FROM bid failed");
-    let bid_count = bid_rows
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count() as u64;
+    let bid_count = parse_count(&bid_rows);
     assert_eq!(bid_count, expected_bids, "bid row count mismatch");
 }
 
@@ -700,18 +703,30 @@ async fn test_nexmark_q0_q3_lfs() {
         );
     }
 
-    // In-process SUBSCRIBE change log verification (P3)
+    // In-process SUBSCRIBE change log verification (P3): reads the compiled
+    // view's actual output storage (`view_output`, keyed by `OperatorId` via
+    // the view directory entry — the string-keyed `view_output/{view}/`
+    // layout was retired along with the deleted `view_materializer.rs`).
     for view in &views {
         let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
-        let mut snapshot_rows = Vec::new();
-        let prefix = format!("view_output/{view}/");
-        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
-        for (k, v) in kvs {
-            snapshot_rows.push((
-                bytes::Bytes::copy_from_slice(&k),
-                bytes::Bytes::copy_from_slice(&v),
-            ));
-        }
+        let (op_id, num_cols, pk) =
+            rockstream_ops::sink::read_view_directory_entry(&shard_db, view)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("no view directory entry for {view}"));
+        let rows = rockstream_ops::sink::read_view_output(&shard_db, op_id, num_cols)
+            .await
+            .unwrap();
+        let state = rockstream_ops::sink::materialize_view_state(rows, &pk);
+        let snapshot_rows: Vec<(bytes::Bytes, bytes::Bytes)> = state
+            .into_values()
+            .map(|(row, _weight)| {
+                (
+                    bytes::Bytes::new(),
+                    bytes::Bytes::from(rockstream_ops::sink::column_values_to_tsv_bytes(&row)),
+                )
+            })
+            .collect();
         let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
         assert!(
             !delivered.is_empty() || *view == "q2" || *view == "q3",
@@ -1064,6 +1079,32 @@ async fn test_nexmark_q4_q9_lfs() {
 
     // Verify q4–q9 results are bit-identical to the DataFusion batch oracle.
     let views = ["q4", "q5", "q6", "q7", "q8", "q9"];
+    #[allow(clippy::items_after_statements)]
+    async fn subscribe_snapshot_rows(
+        shard_db: &rockstream_storage::ShardDb,
+        view: &str,
+    ) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let Some((op_id, num_cols, pk)) =
+            rockstream_ops::sink::read_view_directory_entry(shard_db, view)
+                .await
+                .unwrap()
+        else {
+            return Vec::new();
+        };
+        let rows = rockstream_ops::sink::read_view_output(shard_db, op_id, num_cols)
+            .await
+            .unwrap();
+        let state = rockstream_ops::sink::materialize_view_state(rows, &pk);
+        state
+            .into_values()
+            .map(|(row, _weight)| {
+                (
+                    bytes::Bytes::new(),
+                    bytes::Bytes::from(rockstream_ops::sink::column_values_to_tsv_bytes(&row)),
+                )
+            })
+            .collect()
+    }
     let oracle_queries = [
         "SELECT a.category, CAST(AVG(b.price) AS BIGINT) as avg_price FROM auction a JOIN bid b ON a.id = b.auction WHERE b.date_time >= a.date_time AND b.date_time <= a.expires GROUP BY a.category",
         "SELECT auction, num FROM (SELECT auction, num, ROW_NUMBER() OVER (PARTITION BY window_start ORDER BY num DESC) as rn FROM (SELECT auction, COUNT(*) as num, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY auction, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)))) WHERE rn <= 5",
@@ -1105,15 +1146,7 @@ async fn test_nexmark_q4_q9_lfs() {
     // In-process SUBSCRIBE change log verification (P3)
     for view in &views {
         let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
-        let mut snapshot_rows = Vec::new();
-        let prefix = format!("view_output/{view}/");
-        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
-        for (k, v) in kvs {
-            snapshot_rows.push((
-                bytes::Bytes::copy_from_slice(&k),
-                bytes::Bytes::copy_from_slice(&v),
-            ));
-        }
+        let snapshot_rows = subscribe_snapshot_rows(&shard_db, view).await;
         let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
         assert!(
             !delivered.is_empty() || *view == "q5" || *view == "q6" || *view == "q8",
@@ -1499,6 +1532,32 @@ async fn test_nexmark_q12_q13_lfs() {
 
     // Verify q12–q13 results are bit-identical to the DataFusion batch oracle.
     let views = ["q12", "q13"];
+    #[allow(clippy::items_after_statements)]
+    async fn subscribe_snapshot_rows(
+        shard_db: &rockstream_storage::ShardDb,
+        view: &str,
+    ) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let Some((op_id, num_cols, pk)) =
+            rockstream_ops::sink::read_view_directory_entry(shard_db, view)
+                .await
+                .unwrap()
+        else {
+            return Vec::new();
+        };
+        let rows = rockstream_ops::sink::read_view_output(shard_db, op_id, num_cols)
+            .await
+            .unwrap();
+        let state = rockstream_ops::sink::materialize_view_state(rows, &pk);
+        state
+            .into_values()
+            .map(|(row, _weight)| {
+                (
+                    bytes::Bytes::new(),
+                    bytes::Bytes::from(rockstream_ops::sink::column_values_to_tsv_bytes(&row)),
+                )
+            })
+            .collect()
+    }
     let oracle_queries = [
         "SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key"
@@ -1536,15 +1595,7 @@ async fn test_nexmark_q12_q13_lfs() {
     // In-process SUBSCRIBE change log verification (P3)
     for view in &views {
         let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
-        let mut snapshot_rows = Vec::new();
-        let prefix = format!("view_output/{view}/");
-        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
-        for (k, v) in kvs {
-            snapshot_rows.push((
-                bytes::Bytes::copy_from_slice(&k),
-                bytes::Bytes::copy_from_slice(&v),
-            ));
-        }
+        let snapshot_rows = subscribe_snapshot_rows(&shard_db, view).await;
         let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
         assert!(
             !delivered.is_empty(),
@@ -1585,6 +1636,12 @@ async fn nexmark_q11_session_bit_identical_to_batch_oracle() {
     client.simple_query("CREATE TABLE auction (id BIGINT, item_name VARCHAR, description VARCHAR, initial_bid BIGINT, reserve BIGINT, date_time BIGINT, expires BIGINT, seller BIGINT, category BIGINT, extra VARCHAR)").await.unwrap();
     client.simple_query("CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, date_time BIGINT, extra VARCHAR)").await.unwrap();
     client.simple_query(NEXMARK_Q11_VIEW_SQL).await.unwrap();
+    // v0.51.4 Slice 6: q11's SESSION-window query now compiles through the
+    // direct operator pipeline instead of falling back to view_materializer.rs.
+    assert!(
+        catalog.get_view("q11").unwrap().op_id.is_some(),
+        "q11 should compile via compile_plan (Slice 6 composite group-by key wiring)"
+    );
 
     let mut gen = rockstream_sim::NexmarkGenerator::new(42);
     let mut bids = Vec::new();
@@ -1726,6 +1783,198 @@ async fn nexmark_q11_session_bit_identical_to_batch_oracle() {
     );
 }
 
+/// v0.51.4 Slice 6: same SESSION-window semantics as q11 but a differently-
+/// worded SQL surface (different column aliases, a no-op `WHERE 1 = 1`,
+/// extra whitespace/casing) — proves there is no exact-string dependency
+/// left anywhere (`rewrite_session_sql`'s exact-match hardcode is deleted;
+/// this query must still compile through `compile_plan`/`StatefulPipeline`
+/// like q11 itself, not fall back to a string-matched rewrite).
+#[tokio::test]
+async fn nexmark_q11_differently_worded_session_query_bit_identical_to_batch_oracle() {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use object_store::memory::InMemory;
+    use rockstream_gateway::catalog_stubs::CatalogStubs;
+    use rockstream_gateway::server::GatewayServer;
+    use rockstream_storage::ShardDb;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    const NEXMARK_Q11_VARIANT_VIEW_SQL: &str = "CREATE VIEW q11v AS \
+        SELECT bidder, COUNT(*) AS cnt, MIN(date_time) AS start_ts, \
+        MAX(date_time)   AS   end_ts FROM bid WHERE 1 = 1 \
+        GROUP BY bidder, SESSION(date_time, INTERVAL '10 seconds')";
+
+    let store = Arc::new(InMemory::new());
+    let shard_db = Arc::new(
+        ShardDb::builder("nexmark-q11-variant-lfs-shard", store.clone())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let catalog = Arc::new(CatalogStubs::new());
+    let view_reader = Arc::new(NoopViewReader);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GatewayServer::with_shard_db(addr, catalog.clone(), view_reader, shard_db.clone());
+    let (local_addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(local_addr.port()).await;
+
+    client.simple_query("CREATE TABLE person (id BIGINT, name VARCHAR, email_address VARCHAR, credit_card VARCHAR, city VARCHAR, state VARCHAR, date_time BIGINT, extra VARCHAR)").await.unwrap();
+    client.simple_query("CREATE TABLE auction (id BIGINT, item_name VARCHAR, description VARCHAR, initial_bid BIGINT, reserve BIGINT, date_time BIGINT, expires BIGINT, seller BIGINT, category BIGINT, extra VARCHAR)").await.unwrap();
+    client.simple_query("CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, date_time BIGINT, extra VARCHAR)").await.unwrap();
+    client
+        .simple_query(NEXMARK_Q11_VARIANT_VIEW_SQL)
+        .await
+        .unwrap();
+    assert!(
+        catalog.get_view("q11v").unwrap().op_id.is_some(),
+        "a differently-worded SESSION query should compile via compile_plan just like q11, \
+         with no exact-string dependency on q11's own wording"
+    );
+
+    let mut gen = rockstream_sim::NexmarkGenerator::new(43);
+    let mut bids = Vec::new();
+    let mut inserts = Vec::new();
+    for _ in 0..500 {
+        let event = gen.next().unwrap();
+        if let rockstream_sim::NexmarkEvent::Bid(b) = &event {
+            bids.push(b.clone());
+        }
+        inserts.push(event.to_insert_sql());
+    }
+
+    client
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q11-variant-batch-1'")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN").await.unwrap();
+    for sql in inserts {
+        client.simple_query(&sql).await.unwrap();
+    }
+    client.simple_query("COMMIT").await.unwrap();
+
+    let run_df_oracle = |current_bids: Vec<rockstream_sim::Bid>| async move {
+        let ctx = SessionContext::new();
+        let bid_schema = Arc::new(Schema::new(vec![
+            Field::new("auction", DataType::Int64, false),
+            Field::new("bidder", DataType::Int64, false),
+            Field::new("price", DataType::Int64, false),
+            Field::new("channel", DataType::Utf8, false),
+            Field::new("url", DataType::Utf8, false),
+            Field::new("date_time", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, false),
+        ]));
+        let bid_batch = RecordBatch::try_new(
+            bid_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.auction as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.bidder as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.price as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.channel.clone())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.url.clone())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.date_time as i64)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    current_bids
+                        .iter()
+                        .map(|b| b.extra.clone())
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let bid_table = MemTable::try_new(bid_schema, vec![vec![bid_batch]]).unwrap();
+        ctx.register_table("bid", Arc::new(bid_table)).unwrap();
+
+        let df = ctx.sql(NEXMARK_Q11_ORACLE_SQL).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let bidder = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let bid_count = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let start = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let end = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push(format!(
+                    "{}\t{}\t{}\t{}",
+                    bidder.value(row),
+                    bid_count.value(row),
+                    start.value(row),
+                    end.value(row)
+                ));
+            }
+        }
+        rows
+    };
+
+    let psql_res = client.simple_query("SELECT * FROM q11v").await.unwrap();
+    let mut psql_rows = Vec::new();
+    for msg in psql_res {
+        if let tokio_postgres::SimpleQueryMessage::Row(r) = msg {
+            let mut fields = Vec::new();
+            for col in 0..r.len() {
+                fields.push(r.get(col).unwrap_or("NULL").to_string());
+            }
+            psql_rows.push(fields.join("\t"));
+        }
+    }
+
+    let oracle_rows = run_df_oracle(bids).await;
+    assert_eq!(
+        psql_rows.into_iter().collect::<BTreeSet<_>>(),
+        oracle_rows.into_iter().collect::<BTreeSet<_>>(),
+        "bit-identical comparison failed for differently-worded q11 variant"
+    );
+}
+
 #[tokio::test]
 async fn nexmark_q11_survives_retraction_storm() {
     use arrow::array::{Int64Array, StringArray};
@@ -1758,6 +2007,12 @@ async fn nexmark_q11_survives_retraction_storm() {
     client.simple_query("CREATE TABLE auction (id BIGINT, item_name VARCHAR, description VARCHAR, initial_bid BIGINT, reserve BIGINT, date_time BIGINT, expires BIGINT, seller BIGINT, category BIGINT, extra VARCHAR)").await.unwrap();
     client.simple_query("CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, date_time BIGINT, extra VARCHAR)").await.unwrap();
     client.simple_query(NEXMARK_Q11_VIEW_SQL).await.unwrap();
+    // v0.51.4 Slice 6: q11's SESSION-window query now compiles through the
+    // direct operator pipeline instead of falling back to view_materializer.rs.
+    assert!(
+        catalog.get_view("q11").unwrap().op_id.is_some(),
+        "q11 should compile via compile_plan (Slice 6 composite group-by key wiring)"
+    );
 
     let mut gen = rockstream_sim::NexmarkGenerator::new(42);
     let mut bids = Vec::new();
@@ -2013,11 +2268,29 @@ async fn test_nexmark_q14_q15_lfs() {
         .simple_query("CREATE VIEW q14 AS SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid")
         .await
         .expect("CREATE VIEW q14 failed");
+    // v0.51.4 Slice 7: q14's CASE/regexp_replace/length/split_part expressions
+    // now compile through the direct operator pipeline instead of falling
+    // back to view_materializer.rs.
+    assert!(
+        catalog.get_view("q14").unwrap().op_id.is_some(),
+        "q14 should compile via compile_plan (Slice 7 Case/scalar-udf wiring)"
+    );
 
     client
         .simple_query("CREATE VIEW q15 AS SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))")
         .await
         .expect("CREATE VIEW q15 failed");
+    // q15's 3-aggregate `GROUP BY date_bin(...)` shape used to hit a
+    // `TumbleWindowOp`/`date_bin` timestamp-precision gap (the batch
+    // oracle's `CAST(.. AS TIMESTAMP)` treats the raw column as *seconds*,
+    // not milliseconds, regardless of destination `TimeUnit` — see
+    // `interval_ms_to_bucket_units`/`timestamp_display_scale` in
+    // `rockstream-sql/src/lower.rs`); now fixed, so it compiles like every
+    // other Slice 8 multi-aggregate composition.
+    assert!(
+        catalog.get_view("q15").unwrap().op_id.is_some(),
+        "q15 should compile via compile_plan (date_bin/timestamp gap fixed)"
+    );
 
     // Generate 500 events
     let mut gen = rockstream_sim::NexmarkGenerator::new(42);
@@ -2258,6 +2531,32 @@ async fn test_nexmark_q14_q15_lfs() {
 
     // Verify q14–q15 results are bit-identical to the DataFusion batch oracle.
     let views = ["q14", "q15"];
+    #[allow(clippy::items_after_statements)]
+    async fn subscribe_snapshot_rows(
+        shard_db: &rockstream_storage::ShardDb,
+        view: &str,
+    ) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let Some((op_id, num_cols, pk)) =
+            rockstream_ops::sink::read_view_directory_entry(shard_db, view)
+                .await
+                .unwrap()
+        else {
+            return Vec::new();
+        };
+        let rows = rockstream_ops::sink::read_view_output(shard_db, op_id, num_cols)
+            .await
+            .unwrap();
+        let state = rockstream_ops::sink::materialize_view_state(rows, &pk);
+        state
+            .into_values()
+            .map(|(row, _weight)| {
+                (
+                    bytes::Bytes::new(),
+                    bytes::Bytes::from(rockstream_ops::sink::column_values_to_tsv_bytes(&row)),
+                )
+            })
+            .collect()
+    }
     let oracle_queries = [
         "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
         "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))"
@@ -2295,15 +2594,7 @@ async fn test_nexmark_q14_q15_lfs() {
     // In-process SUBSCRIBE change log verification (P3)
     for view in &views {
         let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
-        let mut snapshot_rows = Vec::new();
-        let prefix = format!("view_output/{view}/");
-        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
-        for (k, v) in kvs {
-            snapshot_rows.push((
-                bytes::Bytes::copy_from_slice(&k),
-                bytes::Bytes::copy_from_slice(&v),
-            ));
-        }
+        let snapshot_rows = subscribe_snapshot_rows(&shard_db, view).await;
         let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
         assert!(
             !delivered.is_empty(),
@@ -2641,6 +2932,32 @@ async fn test_nexmark_q16_q17_lfs() {
 
     // Verify q16–q17 results are bit-identical to the DataFusion batch oracle.
     let views = ["q16", "q17"];
+    #[allow(clippy::items_after_statements)]
+    async fn subscribe_snapshot_rows(
+        shard_db: &rockstream_storage::ShardDb,
+        view: &str,
+    ) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let Some((op_id, num_cols, pk)) =
+            rockstream_ops::sink::read_view_directory_entry(shard_db, view)
+                .await
+                .unwrap()
+        else {
+            return Vec::new();
+        };
+        let rows = rockstream_ops::sink::read_view_output(shard_db, op_id, num_cols)
+            .await
+            .unwrap();
+        let state = rockstream_ops::sink::materialize_view_state(rows, &pk);
+        state
+            .into_values()
+            .map(|(row, _weight)| {
+                (
+                    bytes::Bytes::new(),
+                    bytes::Bytes::from(rockstream_ops::sink::column_values_to_tsv_bytes(&row)),
+                )
+            })
+            .collect()
+    }
     let oracle_queries = [
         "SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))"
@@ -2678,15 +2995,7 @@ async fn test_nexmark_q16_q17_lfs() {
     // In-process SUBSCRIBE change log verification (P3)
     for view in &views {
         let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
-        let mut snapshot_rows = Vec::new();
-        let prefix = format!("view_output/{view}/");
-        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
-        for (k, v) in kvs {
-            snapshot_rows.push((
-                bytes::Bytes::copy_from_slice(&k),
-                bytes::Bytes::copy_from_slice(&v),
-            ));
-        }
+        let snapshot_rows = subscribe_snapshot_rows(&shard_db, view).await;
         let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
         assert!(
             !delivered.is_empty(),
@@ -3043,6 +3352,32 @@ async fn test_nexmark_q18_q19_lfs() {
     };
 
     let views = ["q18", "q19"];
+    #[allow(clippy::items_after_statements)]
+    async fn subscribe_snapshot_rows(
+        shard_db: &rockstream_storage::ShardDb,
+        view: &str,
+    ) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let Some((op_id, num_cols, pk)) =
+            rockstream_ops::sink::read_view_directory_entry(shard_db, view)
+                .await
+                .unwrap()
+        else {
+            return Vec::new();
+        };
+        let rows = rockstream_ops::sink::read_view_output(shard_db, op_id, num_cols)
+            .await
+            .unwrap();
+        let state = rockstream_ops::sink::materialize_view_state(rows, &pk);
+        state
+            .into_values()
+            .map(|(row, _weight)| {
+                (
+                    bytes::Bytes::new(),
+                    bytes::Bytes::from(rockstream_ops::sink::column_values_to_tsv_bytes(&row)),
+                )
+            })
+            .collect()
+    }
     let oracle_queries = [
         "SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1",
         "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) as rn FROM bid ) WHERE rn <= 10"
@@ -3142,15 +3477,7 @@ async fn test_nexmark_q18_q19_lfs() {
     // In-process SUBSCRIBE change log verification (P3)
     for view in &views {
         let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
-        let mut snapshot_rows = Vec::new();
-        let prefix = format!("view_output/{view}/");
-        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
-        for (k, v) in kvs {
-            snapshot_rows.push((
-                bytes::Bytes::copy_from_slice(&k),
-                bytes::Bytes::copy_from_slice(&v),
-            ));
-        }
+        let snapshot_rows = subscribe_snapshot_rows(&shard_db, view).await;
         let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
         assert!(
             !delivered.is_empty(),
@@ -3248,6 +3575,13 @@ async fn test_nexmark_q20_q22_lfs() {
         .simple_query("CREATE VIEW q21 AS SELECT auction, bidder, CASE WHEN regexp_replace(channel, 'google|facebook', 'social') = 'social' THEN 'social_media' ELSE 'other' END as channel_id FROM bid")
         .await
         .expect("CREATE VIEW q21 failed");
+    // v0.51.4 Slice 7: q21/q22's CASE/regexp_replace/split_part expressions
+    // now compile through the direct operator pipeline instead of falling
+    // back to view_materializer.rs.
+    assert!(
+        catalog.get_view("q21").unwrap().op_id.is_some(),
+        "q21 should compile via compile_plan (Slice 7 Case/scalar-udf wiring)"
+    );
 
     client
         .simple_query(
@@ -3255,6 +3589,10 @@ async fn test_nexmark_q20_q22_lfs() {
         )
         .await
         .expect("CREATE VIEW q22 failed");
+    assert!(
+        catalog.get_view("q22").unwrap().op_id.is_some(),
+        "q22 should compile via compile_plan (Slice 7 Case/scalar-udf wiring)"
+    );
 
     // Generate 500 events
     let mut gen = rockstream_sim::NexmarkGenerator::new(42);
@@ -3526,18 +3864,36 @@ async fn test_nexmark_q20_q22_lfs() {
     }
 
     // In-process SUBSCRIBE change log verification (P3)
+    #[allow(clippy::items_after_statements)]
+    async fn subscribe_snapshot_rows(
+        shard_db: &rockstream_storage::ShardDb,
+        view: &str,
+    ) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let Some((op_id, num_cols, pk)) =
+            rockstream_ops::sink::read_view_directory_entry(shard_db, view)
+                .await
+                .unwrap()
+        else {
+            return Vec::new();
+        };
+        let rows = rockstream_ops::sink::read_view_output(shard_db, op_id, num_cols)
+            .await
+            .unwrap();
+        let state = rockstream_ops::sink::materialize_view_state(rows, &pk);
+        state
+            .into_values()
+            .map(|(row, _weight)| {
+                (
+                    bytes::Bytes::new(),
+                    bytes::Bytes::from(rockstream_ops::sink::column_values_to_tsv_bytes(&row)),
+                )
+            })
+            .collect()
+    }
     for view in &views {
         let req = parse_subscribe(&format!("SUBSCRIBE {view} AS OF NOW WITH SNAPSHOT")).unwrap();
-        let mut snapshot_rows = Vec::new();
-        let prefix = format!("view_output/{view}/");
-        let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.unwrap();
-        let has_rows = !kvs.is_empty();
-        for (k, v) in kvs {
-            snapshot_rows.push((
-                bytes::Bytes::copy_from_slice(&k),
-                bytes::Bytes::copy_from_slice(&v),
-            ));
-        }
+        let snapshot_rows = subscribe_snapshot_rows(&shard_db, view).await;
+        let has_rows = !snapshot_rows.is_empty();
         let delivered = deliver_snapshot(snapshot_rows, 1, &req, &[]);
         if has_rows {
             assert!(
@@ -4215,6 +4571,12 @@ async fn test_nexmark_q12_q22_minio() {
 
     // Define views
     client.simple_query(NEXMARK_Q11_VIEW_SQL).await.unwrap();
+    // v0.51.4 Slice 6: q11's SESSION-window query now compiles through the
+    // direct operator pipeline instead of falling back to view_materializer.rs.
+    assert!(
+        catalog.get_view("q11").unwrap().op_id.is_some(),
+        "q11 should compile via compile_plan (Slice 6 composite group-by key wiring)"
+    );
 
     client
         .simple_query("CREATE VIEW q12 AS SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))")

@@ -510,6 +510,9 @@ impl JoinOp {
             }
         }
 
+        if batch.is_empty() {
+            return Ok(());
+        }
         db.write_batch(batch).await.map_err(OpError::storage)
     }
 
@@ -579,6 +582,61 @@ impl JoinOp {
             left_staged: Mutex::new(StagedDelta::default()),
             right_staged: Mutex::new(StagedDelta::default()),
         })
+    }
+
+    /// Load persisted left/right arrangement state from `db` into this
+    /// already-constructed instance in place (used by
+    /// `GatewayHandler::recover_compiled_views` to restore a recompiled
+    /// join view's dual arrangements after a process restart — keeps the
+    /// same `Arc<JoinOp>` already installed in the pipeline, unlike
+    /// `load_from_storage`'s freshly-returned instance).
+    pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
+        let mut st = JoinState::new();
+
+        let left_prefix = ShardKeyEncoder::join_arr_op_prefix(JoinSide::Left, self.op_id.0);
+        let left_entries = db
+            .scan_prefix(&left_prefix)
+            .await
+            .map_err(OpError::storage)?;
+        for (key, value) in left_entries {
+            if key.len() < 11 + 16 {
+                continue;
+            }
+            let join_key = key[11..key.len() - 16].to_vec();
+            let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
+            let row_bytes = value.to_vec();
+            st.left_arr.entry(join_key).or_default().insert(
+                row_id,
+                ArrRow {
+                    row_bytes,
+                    weight: 1,
+                },
+            );
+        }
+
+        let right_prefix = ShardKeyEncoder::join_arr_op_prefix(JoinSide::Right, self.op_id.0);
+        let right_entries = db
+            .scan_prefix(&right_prefix)
+            .await
+            .map_err(OpError::storage)?;
+        for (key, value) in right_entries {
+            if key.len() < 11 + 16 {
+                continue;
+            }
+            let join_key = key[11..key.len() - 16].to_vec();
+            let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
+            let row_bytes = value.to_vec();
+            st.right_arr.entry(join_key).or_default().insert(
+                row_id,
+                ArrRow {
+                    row_bytes,
+                    weight: 1,
+                },
+            );
+        }
+
+        *self.state.lock().expect("JoinOp mutex poisoned") = st;
+        Ok(())
     }
 
     /// Operator ID.

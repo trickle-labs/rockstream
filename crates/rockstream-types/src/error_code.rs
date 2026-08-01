@@ -116,6 +116,10 @@ pub const RS_1017: ErrorCode = ErrorCode::new(1017);
 /// TopK buffer overflow: more unique rows than TOPK_BUFFER_LIMIT arrived in one partition.
 /// next_steps: reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add partition columns.
 pub const RS_1018: ErrorCode = ErrorCode::new(1018);
+/// A `CREATE VIEW`/`CREATE MATERIALIZED VIEW`'s query could not be compiled
+/// into an executable operator pipeline (v0.51.4 Slice 8 — there is no
+/// DataFusion-materializer fallback left to silently serve it from).
+pub const RS_1019: ErrorCode = ErrorCode::new(1019);
 
 // 17xx: Lease management
 /// Shard is already leased by a different worker; acquire rejected (v0.29).
@@ -393,6 +397,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         1016 => "Aggregate running sum overflowed i64",
         1017 => "MIN/MAX multiset retraction underflow: value has no positive weight",
         1018 => "TopK buffer overflow: too many unique rows in a single partition",
+        1019 => "View query could not be compiled into an executable operator pipeline",
         1512 => "Inner-frontier stall in distributed recursion; per-shard recompute triggered",
         1513 => "Distributed recursion max-iteration cap exceeded without convergence",
         3601 => "Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded",
@@ -532,6 +537,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1016 => "Reduce value magnitudes or switch to a wider numeric type.",
         1017 => "Ensure every retraction is matched by a prior insertion; check source event ordering and idempotency.",
         1018 => "Reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add more partition columns.",
+        1019 => "Simplify the query to a supported shape (see docs/language-features.md), or reference only base tables — views over other views are not yet compiled.",
         1512 => "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs.",
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
         1701 => "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead.",
@@ -654,6 +660,7 @@ mod tests {
             RS_1731, // v0.45.2 control-plane leader-only write gating (M7-S2)
             RS_8002, RS_8003, // v0.45.6 frontier-lease publisher fencing (M2-S3)
             RS_2013, RS_2022, // v0.48 UPDATE/DELETE RETURNING (Track A)
+            RS_1019, // v0.51.4 Slice 8 — CREATE VIEW compile-failure is a real error
         ];
         for code in codes {
             assert_ne!(

@@ -188,8 +188,11 @@ fn eval_window_batch(
                 }
             }
 
-            WindowFunc::SlidingSum { frame_rows } => {
-                let val_col = expr.order_by.first().copied().unwrap_or(0);
+            WindowFunc::SlidingSum {
+                frame_rows,
+                value_col,
+            } => {
+                let val_col = *value_col;
                 for i in 0..n {
                     let start = if i + 1 >= *frame_rows {
                         i + 1 - frame_rows
@@ -209,8 +212,11 @@ fn eval_window_batch(
                 }
             }
 
-            WindowFunc::SlidingAvg { frame_rows } => {
-                let val_col = expr.order_by.first().copied().unwrap_or(0);
+            WindowFunc::SlidingAvg {
+                frame_rows,
+                value_col,
+            } => {
+                let val_col = *value_col;
                 for i in 0..n {
                     let start = if i + 1 >= *frame_rows {
                         i + 1 - frame_rows
@@ -593,6 +599,9 @@ pub async fn persist_window_state(
         batch
     };
 
+    if batch.is_empty() {
+        return Ok(());
+    }
     db.write_batch(batch).await.map_err(OpError::storage)?;
     Ok(())
 }
@@ -808,7 +817,10 @@ mod tests {
 
     fn sliding_sum_expr(frame_rows: usize) -> WindowExpr {
         WindowExpr {
-            func: WindowFunc::SlidingSum { frame_rows },
+            func: WindowFunc::SlidingSum {
+                frame_rows,
+                value_col: 1,
+            },
             partition_by: vec![],
             order_by: vec![1],
         }
@@ -816,7 +828,10 @@ mod tests {
 
     fn sliding_avg_expr(frame_rows: usize) -> WindowExpr {
         WindowExpr {
-            func: WindowFunc::SlidingAvg { frame_rows },
+            func: WindowFunc::SlidingAvg {
+                frame_rows,
+                value_col: 1,
+            },
             partition_by: vec![],
             order_by: vec![1],
         }

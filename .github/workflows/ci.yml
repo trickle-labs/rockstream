@@ -40,6 +40,10 @@ jobs:
         run: bash scripts/check-invariant-pairs.sh
       - name: invariant-pairs checker self-test
         run: bash scripts/check-invariant-pairs.test.sh
+      - name: no-hardcoded-query-rewrites cross-check
+        run: bash scripts/check-no-hardcoded-query-rewrites.sh
+      - name: no-hardcoded-query-rewrites checker self-test
+        run: bash scripts/check-no-hardcoded-query-rewrites.test.sh
       - name: exit criteria sign-offs
         run: bash scripts/check-exit-criteria.sh
       - name: path-coupling check

@@ -432,7 +432,35 @@ pub enum Expr {
         /// Argument expressions evaluated from the input row.
         args: Vec<Expr>,
     },
+    /// A searched `CASE WHEN <bool-expr> THEN <expr> ... ELSE <expr> END`
+    /// expression (v0.51.4, Slice 7).
+    ///
+    /// Only the searched form (no base `CASE <expr> WHEN ...`) is
+    /// represented; DataFusion's optional simple-form base expression is
+    /// rejected during lowering (`rockstream-sql/src/lower.rs`). A missing
+    /// `ELSE` (e.g. Nexmark q15's `COUNT(DISTINCT CASE WHEN ... THEN bidder
+    /// END)`) is lowered with `else_expr` set to
+    /// `Literal(CASE_MISSING_ELSE_SENTINEL)` rather than rejected — see that
+    /// constant's doc comment.
+    Case {
+        /// Ordered `(when, then)` branches; the first branch whose `when`
+        /// evaluates to `true` for a row determines that row's `then` value.
+        when_then: Vec<(Expr, Expr)>,
+        /// Value used when no `when` branch matched.
+        else_expr: Box<Expr>,
+    },
 }
+
+/// Sentinel `Int64` value substituted for a `CASE WHEN ... THEN ... END` with
+/// no `ELSE` clause (v0.51.4, Slice 6/8) — e.g. Nexmark q15's
+/// `COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder
+/// END)`. The plan IR has no `NULL`/nullability representation, so a row
+/// whose `CASE` matches no branch is tagged with this value rather than
+/// silently defaulting to `0` (a legitimate `bidder`/data value); callers
+/// that need "no branch matched" semantics (e.g. `compile_plan`'s
+/// multi-aggregate composition, which filters this sentinel out before
+/// `COUNT(DISTINCT ...)`) must check for it explicitly.
+pub const CASE_MISSING_ELSE_SENTINEL: i64 = i64::MIN;
 
 /// Binary operators for expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,8 +627,12 @@ pub enum WindowFunc {
     Ntile(u64),
     Lag { offset: usize },
     Lead { offset: usize },
-    SlidingSum { frame_rows: usize },
-    SlidingAvg { frame_rows: usize },
+    /// Sum over the trailing `frame_rows` rows (by `order_by`) of `value_col`.
+    /// `value_col` is a separate column from `order_by` — e.g. Nexmark q6's
+    /// `AVG(price) OVER (PARTITION BY seller ORDER BY date_time ROWS ...)`
+    /// averages `price` while ordering by `date_time`, two different columns.
+    SlidingSum { frame_rows: usize, value_col: usize },
+    SlidingAvg { frame_rows: usize, value_col: usize },
 }
 
 /// Window operator IVM strategy (v0.11 — IVM-7).

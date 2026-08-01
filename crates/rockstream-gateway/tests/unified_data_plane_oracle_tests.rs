@@ -8,7 +8,7 @@
 //! `ViewSinkOp` persistence round-trip to the exact same multiset the
 //! naive (non-incremental) filter+project computation would produce.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
@@ -92,7 +92,8 @@ async fn compiled_view_incremental_output_equals_batch_oracle() {
         }),
     };
 
-    let compiled = compile_plan(&plan, db.clone()).expect("plan should compile");
+    let table_schemas: HashMap<String, Arc<Schema>> = [("t".to_string(), source_schema())].into();
+    let compiled = compile_plan(&plan, db.clone(), &table_schemas).expect("plan should compile");
     assert_eq!(compiled.view_name, "big_orders");
     assert_eq!(compiled.pk, vec![0]);
 
@@ -188,7 +189,8 @@ async fn compile_plan_rejects_unsupported_node_with_rs_error_code() {
         }),
     };
 
-    let result = compile_plan(&plan, db);
+    let table_schemas: HashMap<String, Arc<Schema>> = [("t".to_string(), source_schema())].into();
+    let result = compile_plan(&plan, db, &table_schemas);
     let err = match result {
         Ok(compiled) => {
             drop(compiled);

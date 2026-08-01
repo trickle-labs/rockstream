@@ -801,7 +801,7 @@ mod proptest_oracle {
         #[test]
         fn oracle_window_sliding_sum_50k(epochs in arb_epochs(8, 6)) {
             let expr = WindowExpr {
-                func: WindowFunc::SlidingSum { frame_rows: 3 },
+                func: WindowFunc::SlidingSum { frame_rows: 3, value_col: 1 },
                 partition_by: vec![0],
                 order_by: vec![1],
             };

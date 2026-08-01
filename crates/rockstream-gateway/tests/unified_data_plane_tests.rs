@@ -10,7 +10,7 @@ use std::sync::Arc;
 use object_store::local::LocalFileSystem;
 use rockstream_gateway::{
     catalog_stubs::{CatalogColumn, CatalogStubs, CatalogTable},
-    server::COMMIT_COMPILED_VIEW_ROWS_SCANNED_TOTAL,
+    server::COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL,
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -137,7 +137,7 @@ async fn insert_commit_select_round_trip_serviced_by_real_operator_dag() {
         .expect("CREATE MATERIALIZED VIEW should succeed");
     assert!(handler.has_compiled_view("big_orders"));
 
-    let before = COMMIT_COMPILED_VIEW_ROWS_SCANNED_TOTAL.load(Ordering::Relaxed);
+    let before = COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL.load(Ordering::Relaxed);
     client
         .simple_query("INSERT INTO orders (id, amount) VALUES (1, 150)")
         .await
@@ -162,8 +162,8 @@ async fn insert_commit_select_round_trip_serviced_by_real_operator_dag() {
     assert_eq!(rows[0].get("id"), Some("1"));
     assert_eq!(rows[0].get("amount"), Some("150"));
     assert!(
-        COMMIT_COMPILED_VIEW_ROWS_SCANNED_TOTAL.load(Ordering::Relaxed) > before,
-        "compiled COMMIT path should increment COMMIT_COMPILED_VIEW_ROWS_SCANNED_TOTAL"
+        COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL.load(Ordering::Relaxed) > before,
+        "compiled COMMIT path should increment COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL"
     );
 
     let op_id = catalog
@@ -179,5 +179,77 @@ async fn insert_commit_select_round_trip_serviced_by_real_operator_dag() {
             *weight > 0 && cols[0].as_i64() == Some(1) && cols[1].as_i64() == Some(150)
         }),
         "compiled sink output should contain the inserted row"
+    );
+}
+
+/// v0.51.4 Slice 0 exit test: the compiled-view COMMIT refresh path costs
+/// work proportional to the commit's own delta, not the source table's full
+/// size. Populates 10,000 rows in one commit (expect the delta counter to
+/// jump by ~10,000), then commits a single additional row and asserts the
+/// counter increases by exactly 1 — not by ~10,001, which is what the
+/// retired full-table-rescan path would have done.
+#[tokio::test]
+async fn commit_refresh_is_proportional_to_delta_not_table_size() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let shard_db = Arc::new(
+        ShardDb::builder("unified-data-plane-proportionality", store)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+        shard_db.clone(),
+    );
+    let handler = server.handler().clone();
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect_port(addr.port()).await;
+
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+        .await
+        .expect("CREATE TABLE should succeed");
+    client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW big_orders AS SELECT id, amount FROM orders WHERE amount > 100",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW should succeed");
+    assert!(handler.has_compiled_view("big_orders"));
+
+    const N: i64 = 10_000;
+    let values: Vec<String> = (1..=N).map(|i| format!("({i}, 150)")).collect();
+    let insert_sql = format!(
+        "INSERT INTO orders (id, amount) VALUES {}",
+        values.join(",")
+    );
+
+    let before_bulk = COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL.load(Ordering::Relaxed);
+    client
+        .simple_query(&insert_sql)
+        .await
+        .expect("bulk INSERT should succeed");
+    let after_bulk = COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL.load(Ordering::Relaxed);
+    let bulk_delta = after_bulk - before_bulk;
+    assert!(
+        (N as u64..=N as u64 + 5).contains(&bulk_delta),
+        "expected the bulk commit's refresh delta to be ~{N} rows, got {bulk_delta}"
+    );
+
+    let before_single = after_bulk;
+    client
+        .simple_query("INSERT INTO orders (id, amount) VALUES (999999, 150)")
+        .await
+        .expect("single-row INSERT should succeed");
+    let after_single = COMMIT_VIEW_REFRESH_DELTA_ROWS_TOTAL.load(Ordering::Relaxed);
+    let single_delta = after_single - before_single;
+    assert_eq!(
+        single_delta, 1,
+        "a single-row commit against a 10,000-row table must cost exactly 1 delta row, \
+         not ~{N} (that would mean the refresh is still rescanning the full table)"
     );
 }

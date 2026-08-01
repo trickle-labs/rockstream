@@ -26,6 +26,7 @@ pub mod group_commit;
 pub mod index_arrange;
 pub mod join;
 pub mod lateral;
+pub mod live_exec;
 pub mod map;
 pub mod minmax;
 pub mod nexmark_regression;
@@ -50,7 +51,7 @@ pub use aggregate::{
     load_frontier, persist_agg_state, persist_bucketed_agg_state, persist_frontier, AggState,
     AggregateOp, BucketedAggregateOp,
 };
-pub use compile::{compile_plan, CompiledView};
+pub use compile::{compile_plan, compile_plan_with_sink_id, CompiledView};
 pub use distinct::{
     load_distinct_state, persist_distinct_state, DistinctOp, DualArrangement, ExceptOp, IntersectOp,
 };
@@ -59,6 +60,10 @@ pub use filter::FilterOp;
 pub use group_commit::{GroupCommit, GROUP_COMMIT_MAX_BATCHES};
 pub use join::JoinOp;
 pub use lateral::LateralOp;
+pub use live_exec::{
+    int64_schema, next_stateful_op_id, GroupKeyPacker, JoinKind, JoinPipeline, Stage,
+    StatefulPipeline,
+};
 pub use map::MapOp;
 pub use minmax::{persist_minmax_state, MinMaxKind, MinMaxOp, MinMaxState};
 pub use op::{EpochOutput, Operator};

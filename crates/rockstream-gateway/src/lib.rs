@@ -28,7 +28,6 @@ pub mod server;
 pub mod session;
 pub mod subscribe_handler;
 pub mod subscribe_parser;
-pub mod view_materializer;
 pub mod view_reader;
 pub mod write_buffer;
 

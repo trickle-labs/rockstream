@@ -725,7 +725,7 @@ mod tests {
         let plan = PlanNode::Window {
             input: Box::new(src),
             window_exprs: vec![WindowExpr {
-                func: WindowFunc::SlidingSum { frame_rows: 3 },
+                func: WindowFunc::SlidingSum { frame_rows: 3, value_col: 1 },
                 partition_by: vec![0],
                 order_by: vec![1],
             }],

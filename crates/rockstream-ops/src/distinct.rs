@@ -524,6 +524,9 @@ pub async fn persist_distinct_state(
         batch
     };
 
+    if batch.is_empty() {
+        return Ok(());
+    }
     db.write_batch(batch).await.map_err(OpError::storage)?;
     Ok(())
 }

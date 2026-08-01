@@ -156,10 +156,13 @@ pub struct CatalogView {
     pub namespace: String,
     /// `OperatorId` (as u64) of the compiled `ViewSinkOp` backing this view
     /// (v0.51.3 Slice 4). Set once `handle_create_view` successfully
-    /// compiles the view's SELECT via `rockstream_ops::compile_plan`.
-    /// `None` means the view's query shape isn't (yet) supported by the
-    /// direct operator compiler and is served via `view_materializer.rs`
-    /// instead.
+    /// compiles the view's SELECT via `rockstream_ops::compile_plan` — a
+    /// shard-backed gateway (`--role all`) either has this `Some` or the
+    /// `CREATE VIEW` itself failed with `RS-1019` (v0.51.4 Slice 8; there
+    /// is no materializer fallback left to silently serve an uncompiled
+    /// view). `None` only occurs for a standalone `--role gateway` process
+    /// (no local `ShardDb` to compile against) whose view data is served
+    /// from elsewhere via `ViewReader`.
     pub op_id: Option<u64>,
 }
 

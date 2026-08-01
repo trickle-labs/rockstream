@@ -81,6 +81,25 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
             if let Some(topk_plan) = try_lower_topk_pattern(proj)? {
                 return Ok(topk_plan);
             }
+            // v0.51.4 Slice 6: `SESSION(...)` in `GROUP BY` is special-cased
+            // (`try_lower_session_window_aggregate`) to emit a `PlanNode`
+            // whose output columns *are already* the exact `bidder,
+            // bid_count, starttime, endtime` select list — DataFusion's
+            // wrapping `Projection` over the `Aggregate` still exists in the
+            // `LogicalPlan`, but its `proj.expr` `Column` references resolve
+            // against DataFusion's *own* Aggregate schema (`group_expr` +
+            // every `aggr_expr`, e.g. 2 + 3 = 5 columns for q11), which is
+            // wider than what the special-cased lowering actually produces
+            // (4 columns — one shared `Count`, not separate `Count`/`Min`/
+            // `Max`). Re-lowering `proj.expr` against that mismatched schema
+            // would reference out-of-bounds columns, so this returns the
+            // special-cased plan directly instead, skipping the redundant
+            // (and incompatible) outer projection.
+            if let LogicalPlan::Aggregate(inner_agg) = proj.input.as_ref() {
+                if let Some(session_plan) = try_lower_session_window_aggregate(inner_agg)? {
+                    return Ok(session_plan);
+                }
+            }
             let input = lower(&proj.input)?;
             let columns = proj
                 .expr
@@ -131,6 +150,19 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
                             node_type: "date_bin_invalid_time_col".to_string(),
                         }
                     })?;
+                // Bucket width must be in the same "seconds" domain the
+                // batch oracle's `CAST(.. AS TIMESTAMP)` implies (see
+                // `timestamp_display_scale`'s doc comment), not raw
+                // milliseconds.
+                let window_size_ms = interval_ms_to_bucket_units(window_size_ms);
+                // The window-id column (`Expr::Column(0)` below) is exposed
+                // directly whenever the SQL surface re-selects
+                // `date_bin(...)` (e.g. `CAST(date_bin(...) AS BIGINT) AS
+                // window_start`) — DataFusion's `CAST(ts AS BIGINT)` reads
+                // back the destination `TimeUnit`'s internal representation,
+                // so the raw bucket-start (in seconds) must be scaled up to
+                // match.
+                let display_scale = timestamp_display_scale(&sf.args[1]);
 
                 let tumble_node = PlanNode::TumbleWindow {
                     input: Box::new(input),
@@ -143,7 +175,11 @@ pub fn lower(plan: &LogicalPlan) -> Result<PlanNode, SqlError> {
                 let mut group_by = Vec::new();
                 for (i, e) in agg.group_expr.iter().enumerate() {
                     if i == tumble_idx {
-                        group_by.push(Expr::Column(0));
+                        group_by.push(Expr::BinaryOp {
+                            op: BinaryOp::Mul,
+                            left: Box::new(Expr::Column(0)),
+                            right: Box::new(Expr::Literal(display_scale.to_be_bytes().to_vec())),
+                        });
                     } else {
                         let mut lowered_e = lower_expr(e, input_schema)?;
                         shift_expr_cols(&mut lowered_e);
@@ -446,6 +482,23 @@ fn lower_window_expr(
         })
         .collect::<Vec<usize>>();
 
+    // v0.51.4 Slice 4: `WindowOp::RowNumber`/`Rank`/`DenseRank` (`rockstream-
+    // ops/src/window.rs`) always rank in ascending order of the order-by
+    // column(s) — a pre-existing operator constraint (its `order_by` is just
+    // column indices, no direction). An `ORDER BY ... DESC` window function
+    // lowered through this generic path (i.e. not the specialized
+    // nested-`Aggregate` shape `try_lower_topk_pattern` detects, which
+    // builds `PlanNode::TopK` directly with `TopKOp`'s own, correct
+    // descending-rank semantics) would silently rank ascending instead of
+    // descending — reject it here so the query falls back to
+    // `view_materializer.rs`'s DataFusion path instead of compiling to a
+    // wrong answer.
+    if wf.params.order_by.iter().any(|sort| !sort.asc) {
+        return Err(SqlError::UnsupportedPlanNode {
+            node_type: "window_expr:order_by_desc_not_supported_by_generic_window_path".to_string(),
+        });
+    }
+
     let order_by = wf
         .params
         .order_by
@@ -469,7 +522,7 @@ fn lower_window_expr(
 
 fn lower_window_func(
     wf: &WindowFunction,
-    _schema: &datafusion::common::DFSchema,
+    schema: &datafusion::common::DFSchema,
     order_by: &[usize],
 ) -> Result<WindowFunc, SqlError> {
     match &wf.fun {
@@ -516,14 +569,36 @@ fn lower_window_func(
                 }
             };
             match udaf.name() {
-                "sum" | "SUM" => Ok(WindowFunc::SlidingSum { frame_rows }),
-                "avg" | "AVG" | "mean" => Ok(WindowFunc::SlidingAvg { frame_rows }),
+                "sum" | "SUM" => Ok(WindowFunc::SlidingSum {
+                    frame_rows,
+                    value_col: extract_window_agg_value_col(wf, schema)?,
+                }),
+                "avg" | "AVG" | "mean" => Ok(WindowFunc::SlidingAvg {
+                    frame_rows,
+                    value_col: extract_window_agg_value_col(wf, schema)?,
+                }),
                 name => Err(SqlError::UnsupportedWindowFunction {
                     fn_name: name.to_uppercase(),
                 }),
             }
         }
     }
+}
+
+/// Resolve a sliding-aggregate window function's own argument (e.g. `price`
+/// in `AVG(price) OVER (...)`) to a column index against `schema` — a
+/// separate column from `order_by` (e.g. `date_time`), which only
+/// determines row order, not which value is being aggregated.
+fn extract_window_agg_value_col(
+    wf: &WindowFunction,
+    schema: &datafusion::common::DFSchema,
+) -> Result<usize, SqlError> {
+    let arg = wf.params.args.first().ok_or_else(|| SqlError::UnsupportedWindowFunction {
+        fn_name: "SLIDING_AGGREGATE_MISSING_ARG".to_string(),
+    })?;
+    extract_column_index(arg, schema).ok_or_else(|| SqlError::UnsupportedWindowFunction {
+        fn_name: "SLIDING_AGGREGATE_NON_COLUMN_ARG".to_string(),
+    })
 }
 
 /// Extract offset from LAG/LEAD args (args[1] is the offset literal).
@@ -579,6 +654,66 @@ pub fn lower_expr(expr: &DfExpr, schema: &DFSchema) -> Result<Expr, SqlError> {
         // Strip casts that don't change the logical value (e.g. Int32→Int64).
         DfExpr::Cast(cast) => lower_expr(&cast.expr, schema),
         DfExpr::TryCast(cast) => lower_expr(&cast.expr, schema),
+
+        // Searched `CASE WHEN <bool> THEN <expr> ... ELSE <expr> END`
+        // (v0.51.4, Slice 7). The simple/base form (`CASE x WHEN ...`,
+        // `case.expr.is_some()`) is not used by Nexmark and is rejected here.
+        DfExpr::Case(case) => {
+            if case.expr.is_some() {
+                return Err(SqlError::UnsupportedPlanNode {
+                    node_type: "expr:Case(simple-form-base-expr)".to_string(),
+                });
+            }
+            let when_then = case
+                .when_then_expr
+                .iter()
+                .map(|(when, then)| {
+                    let w = lower_expr(when, schema)?;
+                    let t = lower_expr(then, schema)?;
+                    Ok((w, t))
+                })
+                .collect::<Result<Vec<_>, SqlError>>()?;
+            // A missing `ELSE` (e.g. Nexmark q15's `COUNT(DISTINCT CASE WHEN
+            // ... THEN bidder END)`) is tagged with a reserved sentinel value
+            // rather than rejected — see `CASE_MISSING_ELSE_SENTINEL`'s doc
+            // comment. `compile_plan`'s multi-aggregate composition filters
+            // this sentinel out before `COUNT(DISTINCT ...)`.
+            let else_expr = match &case.else_expr {
+                Some(e) => lower_expr(e, schema)?,
+                None => Expr::Literal(
+                    rockstream_plan::CASE_MISSING_ELSE_SENTINEL
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
+            };
+            Ok(Expr::Case {
+                when_then,
+                else_expr: Box::new(else_expr),
+            })
+        }
+
+        // Scalar functions used by Nexmark q14/q21/q22 (v0.51.4, Slice 7).
+        // DataFusion's SQL parser lowers the `length(...)` call to a scalar
+        // function literally named `character_length`, not `length` — the
+        // two are normalized to the same `Expr::ScalarUdf` name here since
+        // `rockstream-ops`'s evaluator only implements one such function.
+        DfExpr::ScalarFunction(sf)
+            if matches!(
+                sf.func.name(),
+                "regexp_replace" | "split_part" | "length" | "character_length" | "replace"
+            ) =>
+        {
+            let name = match sf.func.name() {
+                "character_length" => "length".to_string(),
+                other => other.to_lowercase(),
+            };
+            let args = sf
+                .args
+                .iter()
+                .map(|a| lower_expr(a, schema))
+                .collect::<Result<Vec<_>, SqlError>>()?;
+            Ok(Expr::ScalarUdf { name, args })
+        }
 
         other => Err(SqlError::UnsupportedPlanNode {
             node_type: format!("expr:{}", expr_name(other)),
@@ -1423,13 +1558,19 @@ fn try_lower_session_window_aggregate(
         }],
     };
 
+    // The `Aggregate` node above outputs `(group_by columns..., count)` in
+    // order, i.e. `(partition_cols..., session_start, session_end, count)` —
+    // `count_col` is `bid_count`, `session_start_col`/`session_end_col`
+    // double as `MIN(date_time)`/`MAX(date_time)` (a session's start/end are
+    // by construction its earliest/latest event time), matching the
+    // `bidder, bid_count, starttime, endtime` column order Nexmark q11 asks
+    // for — no separate MIN/MAX aggregate is computed.
     let session_start_col = partition_cols.len();
     let session_end_col = partition_cols.len() + 1;
     let count_col = partition_cols.len() + 2;
     let mut columns = (0..partition_cols.len())
         .map(Expr::Column)
         .collect::<Vec<_>>();
-    columns.push(Expr::Column(session_start_col));
     columns.push(Expr::Column(count_col));
     columns.push(Expr::Column(session_start_col));
     columns.push(Expr::Column(session_end_col));
@@ -1569,6 +1710,65 @@ fn extract_interval_ms(expr: &DfExpr) -> Option<i64> {
         DfExpr::TryCast(cast) => extract_interval_ms(&cast.expr),
         _ => None,
     }
+}
+
+/// `date_bin(interval, time_expr)`'s `time_expr` is almost always
+/// `CAST(some_bigint_col AS TIMESTAMP)`. Arrow/DataFusion's numeric→
+/// `Timestamp` cast kernel treats the source integer as a count of
+/// **seconds** since the epoch (the common SQL `to_timestamp`-style
+/// convention), regardless of the destination `TimeUnit` — it is *not* a
+/// bare bit-reinterpretation. So a `BIGINT` column holding millisecond
+/// values (this repo's Nexmark `date_time` columns), cast to
+/// `Timestamp(Nanosecond, None)` (DataFusion's default, unit-less
+/// `TIMESTAMP` SQL type), is silently reinterpreted by the DataFusion
+/// batch-oracle path as "the column's raw value, but in **seconds**" — 1000x
+/// coarser than the compiled path's `window_size_ms`-based arithmetic
+/// assumed. This caused a real, previously-undiagnosed correctness gap: the
+/// compiled `TumbleWindow` path bucketed rows using `window_size_ms`
+/// directly against the raw (millisecond-valued) column, while the oracle
+/// bucketed the *same* raw value pretending it was seconds — 1000x
+/// different bucket boundaries, producing completely different (and thus
+/// mismatching) window assignments; confirmed empirically (window bucket
+/// widths derived from the oracle's `CAST(date_bin(...) AS BIGINT)` output
+/// are consistent with `floor(raw_value / interval_seconds) * interval_seconds`,
+/// then represented internally at the target `TimeUnit`'s resolution).
+///
+/// Two fixes are needed for bit-for-bit oracle agreement:
+/// 1. [`interval_ms_to_bucket_units`] — the *bucket width* fed to
+///    `TumbleWindowOp` must be `interval_ms / 1000` (seconds), not
+///    `interval_ms`, since the raw column is always treated as seconds by
+///    the cast — independent of the destination `TimeUnit`.
+/// 2. [`timestamp_display_scale`] — the *displayed* window-start value
+///    (e.g. `CAST(date_bin(...) AS BIGINT) AS window_start`) must be
+///    multiplied by the destination `TimeUnit`'s units-per-second (e.g.
+///    `1_000_000_000` for the default `Nanosecond`), since `CAST(ts AS
+///    BIGINT)` reads back the `Timestamp`'s *internal* representation at
+///    that resolution, not the original seconds value.
+fn timestamp_display_scale(expr: &DfExpr) -> i64 {
+    match expr {
+        DfExpr::Cast(cast) => match &cast.data_type {
+            arrow::datatypes::DataType::Timestamp(unit, _) => match unit {
+                arrow::datatypes::TimeUnit::Second => 1,
+                arrow::datatypes::TimeUnit::Millisecond => 1_000,
+                arrow::datatypes::TimeUnit::Microsecond => 1_000_000,
+                arrow::datatypes::TimeUnit::Nanosecond => 1_000_000_000,
+            },
+            _ => timestamp_display_scale(&cast.expr),
+        },
+        DfExpr::TryCast(cast) => timestamp_display_scale(&cast.expr),
+        // Unqualified SQL `TIMESTAMP` (no explicit `Cast` found, e.g. an
+        // already-`Timestamp`-typed column) defaults to DataFusion's own
+        // default resolution, `Nanosecond`.
+        _ => 1_000_000_000,
+    }
+}
+
+/// Convert `interval_ms` (as returned by [`extract_interval_ms`]) into the
+/// bucket-width unit `time_expr`'s cast-to-seconds semantics implies (see
+/// [`timestamp_display_scale`]'s doc comment) — always seconds, regardless
+/// of the destination `TimeUnit`.
+fn interval_ms_to_bucket_units(interval_ms: i64) -> i64 {
+    interval_ms / 1_000
 }
 
 fn extract_column_index(expr: &DfExpr, schema: &DFSchema) -> Option<usize> {
@@ -1718,6 +1918,16 @@ fn shift_expr_cols(expr: &mut Expr) {
                 shift_expr_cols(arg);
             }
         }
+        Expr::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (when, then) in when_then {
+                shift_expr_cols(when);
+                shift_expr_cols(then);
+            }
+            shift_expr_cols(else_expr);
+        }
         Expr::Literal(_) => {}
     }
 }
@@ -1738,51 +1948,27 @@ fn try_lower_topk_pattern(
     let (rn_col, k) = match &filter.predicate {
         DfExpr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
             datafusion::logical_expr::Operator::LtEq => {
-                if let DfExpr::Column(col) = left.as_ref() {
-                    if let DfExpr::Literal(ScalarValue::Int64(Some(k_val)), _) = right.as_ref() {
-                        (col, *k_val)
-                    } else if let DfExpr::Literal(ScalarValue::Int32(Some(k_val)), _) =
-                        right.as_ref()
-                    {
-                        (col, *k_val as i64)
-                    } else {
-                        return Ok(None);
-                    }
-                } else if let DfExpr::Column(col) = right.as_ref() {
-                    if let DfExpr::Literal(ScalarValue::Int64(Some(k_val)), _) = left.as_ref() {
-                        (col, *k_val)
-                    } else if let DfExpr::Literal(ScalarValue::Int32(Some(k_val)), _) =
-                        left.as_ref()
-                    {
-                        (col, *k_val as i64)
-                    } else {
-                        return Ok(None);
-                    }
+                if let (DfExpr::Column(col), Some(k_val)) =
+                    (left.as_ref(), extract_int64_literal(right))
+                {
+                    (col, k_val)
+                } else if let (DfExpr::Column(col), Some(k_val)) =
+                    (right.as_ref(), extract_int64_literal(left))
+                {
+                    (col, k_val)
                 } else {
                     return Ok(None);
                 }
             }
             datafusion::logical_expr::Operator::Lt => {
-                if let DfExpr::Column(col) = left.as_ref() {
-                    if let DfExpr::Literal(ScalarValue::Int64(Some(k_val)), _) = right.as_ref() {
-                        (col, *k_val - 1)
-                    } else if let DfExpr::Literal(ScalarValue::Int32(Some(k_val)), _) =
-                        right.as_ref()
-                    {
-                        (col, (*k_val - 1) as i64)
-                    } else {
-                        return Ok(None);
-                    }
-                } else if let DfExpr::Column(col) = right.as_ref() {
-                    if let DfExpr::Literal(ScalarValue::Int64(Some(k_val)), _) = left.as_ref() {
-                        (col, *k_val - 1)
-                    } else if let DfExpr::Literal(ScalarValue::Int32(Some(k_val)), _) =
-                        left.as_ref()
-                    {
-                        (col, (*k_val - 1) as i64)
-                    } else {
-                        return Ok(None);
-                    }
+                if let (DfExpr::Column(col), Some(k_val)) =
+                    (left.as_ref(), extract_int64_literal(right))
+                {
+                    (col, k_val - 1)
+                } else if let (DfExpr::Column(col), Some(k_val)) =
+                    (right.as_ref(), extract_int64_literal(left))
+                {
+                    (col, k_val - 1)
                 } else {
                     return Ok(None);
                 }
@@ -1803,31 +1989,41 @@ fn try_lower_topk_pattern(
         inner_input = &alias.input;
     }
 
+    // DataFusion's optimizer sometimes fuses away the inner `Projection`
+    // that names the window function's result (e.g. `... as rn`) when it's
+    // a pure passthrough — the `Filter` then wraps the `Window` node
+    // directly. `proj` is `None` in that case; `window_output_idx` is then
+    // just `rn_col_idx` itself (both are indices into the same schema,
+    // `filter.input.schema()`, since there's no intervening `Projection` to
+    // remap through).
     let proj = match inner_input {
-        LogicalPlan::Projection(p) => p,
+        LogicalPlan::Projection(p) => Some(p),
+        LogicalPlan::Window(_) => None,
         _ => return Ok(None),
     };
 
-    let expr = &proj.expr[rn_col_idx];
-    let window_col = match expr {
-        DfExpr::Alias(alias) => &alias.expr,
-        other => other,
+    let window_output_idx = match proj {
+        Some(proj) => {
+            let expr = &proj.expr[rn_col_idx];
+            let window_col = match expr {
+                DfExpr::Alias(alias) => &alias.expr,
+                other => other,
+            };
+            let col = match window_col {
+                DfExpr::Column(col) => col,
+                _ => return Ok(None),
+            };
+            proj.input
+                .schema()
+                .index_of_column(col)
+                .map_err(|e| SqlError::UnsupportedPlanNode {
+                    node_type: format!("column_resolution_window:{e}"),
+                })?
+        }
+        None => rn_col_idx,
     };
 
-    let col = match window_col {
-        DfExpr::Column(col) => col,
-        _ => return Ok(None),
-    };
-
-    let window_output_idx =
-        proj.input
-            .schema()
-            .index_of_column(col)
-            .map_err(|e| SqlError::UnsupportedPlanNode {
-                node_type: format!("column_resolution_window:{e}"),
-            })?;
-
-    let mut window_plan = proj.input.as_ref();
+    let mut window_plan = proj.map_or(inner_input, |p| p.input.as_ref());
     while let LogicalPlan::SubqueryAlias(alias) = window_plan {
         window_plan = &alias.input;
     }
@@ -1918,8 +2114,22 @@ fn try_lower_topk_pattern(
                 node_type: format!("column_resolution_outer_proj:{e}"),
             }
         })?;
-        let inner_expr = &proj.expr[outer_col_idx];
-        let lowered = lower_expr(inner_expr, w.input.schema())?;
+        let lowered = match proj {
+            Some(proj) => lower_expr(&proj.expr[outer_col_idx], w.input.schema())?,
+            // No intervening `Projection`: the `Window` node passes every
+            // input column through unchanged at its original index, so
+            // `outer_col_idx` (already checked `< input_fields_count` above
+            // for the `rn` column's own resolution, but here it ranges over
+            // every *other* selected column too) directly addresses
+            // `w.input.schema()` — reject if it would (impossibly) resolve
+            // to the window-function's own output column instead.
+            None => {
+                if outer_col_idx >= input_fields_count {
+                    return Ok(None);
+                }
+                Expr::Column(outer_col_idx)
+            }
+        };
         columns.push(lowered);
     }
 
@@ -2441,9 +2651,12 @@ mod tests {
         assert!(
             matches!(
                 exprs[0].func,
-                rockstream_plan::WindowFunc::SlidingSum { frame_rows: 3 }
+                rockstream_plan::WindowFunc::SlidingSum {
+                    frame_rows: 3,
+                    value_col: 1
+                }
             ),
-            "expected SlidingSum{{frame_rows:3}}, got {:?}",
+            "expected SlidingSum{{frame_rows:3, value_col:1}}, got {:?}",
             exprs[0].func
         );
     }
