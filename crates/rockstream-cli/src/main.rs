@@ -138,6 +138,20 @@ enum Command {
         same_host_shm_segments_per_peer: Option<usize>,
         #[arg(long)]
         max_exchange_compression_states: Option<usize>,
+
+        /// v0.51.5: path to the PEM-encoded server certificate (chain) for
+        /// gateway-facing TLS termination. Requires `--tls-key-path`.
+        #[arg(long)]
+        tls_cert_path: Option<std::path::PathBuf>,
+        /// v0.51.5: path to the PEM-encoded private key matching
+        /// `--tls-cert-path`.
+        #[arg(long)]
+        tls_key_path: Option<std::path::PathBuf>,
+        /// v0.51.5: path to the PEM-encoded CA certificate used to validate
+        /// client certificates for `--auth=mtls`. Required whenever
+        /// `--auth=mtls` is set.
+        #[arg(long)]
+        tls_ca_cert_path: Option<std::path::PathBuf>,
     },
     /// Cluster administration commands.
     Cluster {
@@ -201,6 +215,9 @@ fn main() -> ExitCode {
             same_host_shm_segment_bytes,
             same_host_shm_segments_per_peer,
             max_exchange_compression_states,
+            tls_cert_path,
+            tls_key_path,
+            tls_ca_cert_path,
         } => {
             let mut config = RockstreamConfig::default();
             if let Some(value) = exchange_direct_threshold_bytes {
@@ -223,6 +240,15 @@ fn main() -> ExitCode {
             }
             if let Some(value) = max_exchange_compression_states {
                 config.exchange.max_exchange_compression_states = value;
+            }
+            if let Some(value) = tls_cert_path {
+                config.gateway.tls_cert_path = Some(value);
+            }
+            if let Some(value) = tls_key_path {
+                config.gateway.tls_key_path = Some(value);
+            }
+            if let Some(value) = tls_ca_cert_path {
+                config.gateway.tls_ca_cert_path = Some(value);
             }
             let opts = StartOptions {
                 storage,

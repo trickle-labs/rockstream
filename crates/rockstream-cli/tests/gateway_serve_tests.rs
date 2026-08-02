@@ -230,7 +230,9 @@ async fn gateway_cyclic_view_returns_rs_1011() {
     // first `CREATE VIEW`, before a true cycle could ever be formed; see
     // `handle_create_view`'s doc comment on why there is no longer a
     // DataFusion-materializer fallback for that case).
-    let result = client.simple_query("CREATE VIEW c AS SELECT * FROM c").await;
+    let result = client
+        .simple_query("CREATE VIEW c AS SELECT * FROM c")
+        .await;
 
     let got_rs1011 = match &result {
         Err(e) => {

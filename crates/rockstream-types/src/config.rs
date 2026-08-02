@@ -142,6 +142,26 @@ pub struct StorageConfig {
     pub tiering: StorageTieringConfig,
 }
 
+/// v0.51.5: gateway-facing (client SQL-port) TLS termination configuration.
+/// Distinct from any *internal* control<->worker/worker<->worker mTLS.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GatewayConfig {
+    /// Path to the PEM-encoded server certificate (chain) presented during
+    /// the TLS handshake. `None` (the default) means TLS is not configured
+    /// and the gateway keeps its pre-v0.51.5 plaintext-refusal `SSLRequest`
+    /// behavior.
+    #[serde(default)]
+    pub tls_cert_path: Option<std::path::PathBuf>,
+    /// Path to the PEM-encoded private key matching `tls_cert_path`.
+    #[serde(default)]
+    pub tls_key_path: Option<std::path::PathBuf>,
+    /// Path to the PEM-encoded CA certificate used to validate client
+    /// certificates for `--auth=mtls`. Required (fails fast at startup if
+    /// missing) whenever `--auth=mtls` is set.
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<std::path::PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RockstreamConfig {
     #[serde(default = "default_recursion_max_iterations")]
@@ -155,6 +175,8 @@ pub struct RockstreamConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub pricing: Option<PricingConfig>,
+    #[serde(default)]
+    pub gateway: GatewayConfig,
 }
 
 const fn default_recursion_max_iterations() -> usize {
@@ -196,6 +218,7 @@ impl Default for RockstreamConfig {
             exchange: ExchangeConfig::default(),
             storage: StorageConfig::default(),
             pricing: None,
+            gateway: GatewayConfig::default(),
         }
     }
 }
@@ -236,6 +259,27 @@ mod tests {
                 .shard_stats_max_age_checkpoints,
             5
         );
+    }
+
+    #[test]
+    fn config_gateway_tls_defaults_roundtrip() {
+        let cfg = RockstreamConfig::default();
+        assert_eq!(cfg.gateway, GatewayConfig::default());
+        assert_eq!(cfg.gateway.tls_cert_path, None);
+        assert_eq!(cfg.gateway.tls_key_path, None);
+        assert_eq!(cfg.gateway.tls_ca_cert_path, None);
+        let roundtrip = RockstreamConfig::load_from_str(&cfg.to_string().unwrap()).unwrap();
+        assert_eq!(roundtrip.gateway, GatewayConfig::default());
+    }
+
+    #[test]
+    fn config_gateway_tls_paths_roundtrip() {
+        let mut cfg = RockstreamConfig::default();
+        cfg.gateway.tls_cert_path = Some(std::path::PathBuf::from("/etc/rockstream/tls/cert.pem"));
+        cfg.gateway.tls_key_path = Some(std::path::PathBuf::from("/etc/rockstream/tls/key.pem"));
+        cfg.gateway.tls_ca_cert_path = Some(std::path::PathBuf::from("/etc/rockstream/tls/ca.pem"));
+        let roundtrip = RockstreamConfig::load_from_str(&cfg.to_string().unwrap()).unwrap();
+        assert_eq!(roundtrip.gateway, cfg.gateway);
     }
 
     #[test]

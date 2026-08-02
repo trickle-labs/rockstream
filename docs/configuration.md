@@ -89,6 +89,17 @@ corresponding field; retention is governed solely by
 - **`dlq_warn_threshold`** (integer, default: `100`): The hourly rate threshold of dead-letter-queue inserts before triggering proactive `RS-1004` warnings.
 - **`dlq_retention_days`** (integer, default: `7`): The number of days dead-letter-queue entries are retained before being eligible for GC.
 
+### `[gateway]` Section (optional)
+
+Omitted by default (`GatewayConfig::default()`'s three path fields are all
+`None`) — the client-facing SQL-port gateway serves plaintext and answers
+`SSLRequest` with `'N'` (refused) exactly as it did before v0.51.5, unless
+TLS is explicitly configured.
+
+- **`tls_cert_path`** (string, default: `None`): Filesystem path to the PEM-encoded server certificate (chain) presented during the TLS handshake. Unset disables gateway TLS termination.
+- **`tls_key_path`** (string, default: `None`): Filesystem path to the PEM-encoded private key matching `tls_cert_path`.
+- **`tls_ca_cert_path`** (string, default: `None`): Filesystem path to the PEM-encoded CA certificate used to validate client certificates for `--auth=mtls`. Required whenever `--auth=mtls` is set; the gateway fails fast at startup if `--auth=mtls` is given without this.
+
 ### `[storage.tiering]` Section (optional)
 
 Omitted by default (`StorageConfig::default()`'s `tiering` field is

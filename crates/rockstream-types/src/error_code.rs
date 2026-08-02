@@ -203,6 +203,23 @@ pub const RS_2400: ErrorCode = ErrorCode::new(2400);
 pub const RS_2401: ErrorCode = ErrorCode::new(2401);
 /// Namespace access denied: cross-namespace access attempt by non-admin principal.
 pub const RS_2402: ErrorCode = ErrorCode::new(2402);
+/// `--auth=mtls` configured without `tls_ca_cert_path`; the gateway refuses
+/// to start rather than silently accepting an unauthenticated identity
+/// (v0.51.5, `auth.mtls_requires_ca_cert`).
+/// next_steps: "Set --tls-ca-cert-path (or gateway.tls_ca_cert_path in rockstream.toml) to the CA that signs client certificates."
+pub const RS_2403: ErrorCode = ErrorCode::new(2403);
+/// `--auth=mtls` connection reached the application layer with no verified
+/// client certificate CN recorded for its peer address (v0.51.5,
+/// `auth.mtls_no_verified_cert`). The old spoofable `cn` startup-parameter
+/// path has been removed; only a real TLS client-cert handshake can
+/// authenticate.
+/// next_steps: "Connect with a client certificate signed by the configured CA over sslmode=verify-full; a bare TCP or TLS connection without a client cert cannot use --auth=mtls."
+pub const RS_2404: ErrorCode = ErrorCode::new(2404);
+/// Gateway TLS certificate/key material configured via `tls_cert_path`/
+/// `tls_key_path`/`tls_ca_cert_path` failed to load or parse (v0.51.5,
+/// `auth.tls_config_invalid`).
+/// next_steps: "Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process."
+pub const RS_2405: ErrorCode = ErrorCode::new(2405);
 
 // 3xxx: Merge / arrangement
 /// Merge operand malformed (fail-closed: never silently overwrites).
@@ -364,6 +381,9 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2400 => "auth.unauthenticated",
         2401 => "auth.permission_denied",
         2402 => "auth.namespace_access_denied",
+        2403 => "auth.mtls_requires_ca_cert",
+        2404 => "auth.mtls_no_verified_cert",
+        2405 => "auth.tls_config_invalid",
         1014 => "workload.has_assigned_views",
         9001 => "admission_control.rejected",
         1731 => "control.not_leader",
@@ -473,6 +493,9 @@ pub fn description(code: ErrorCode) -> &'static str {
         2400 => "Unauthenticated: request missing or carrying invalid credentials",
         2401 => "Permission denied: authenticated principal lacks required RBAC role",
         2402 => "Namespace access denied: cross-namespace access attempt by non-admin principal",
+        2403 => "--auth=mtls configured without tls_ca_cert_path; gateway refused to start",
+        2404 => "mTLS connection has no verified client certificate CN for its peer address",
+        2405 => "Gateway TLS certificate/key/CA material failed to load or parse",
         _ => "Unknown error",
     }
 }
@@ -507,6 +530,9 @@ pub fn severity(code: ErrorCode) -> Severity {
         6001 => Severity::Warning,
         2017 => Severity::Warning,
         2018 => Severity::Warning,
+        2403 => Severity::Fatal,
+        2404 => Severity::Fatal,
+        2405 => Severity::Fatal,
         _ => Severity::Error,
     }
 }
@@ -610,6 +636,9 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2400 => "Provide valid credentials (Bearer token or mTLS certificate)",
         2401 => "Request elevated RBAC role from an admin or contact the namespace owner",
         2402 => "Switch to the correct namespace with SET search_path or request cross-namespace admin role",
+        2403 => "Set --tls-ca-cert-path (or gateway.tls_ca_cert_path in rockstream.toml) to the CA that signs client certificates.",
+        2404 => "Connect with a client certificate signed by the configured CA over sslmode=verify-full; a bare TCP or TLS connection without a client cert cannot use --auth=mtls.",
+        2405 => "Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process.",
         _ => "See documentation for this error code.",
     }
 }
@@ -661,6 +690,7 @@ mod tests {
             RS_8002, RS_8003, // v0.45.6 frontier-lease publisher fencing (M2-S3)
             RS_2013, RS_2022, // v0.48 UPDATE/DELETE RETURNING (Track A)
             RS_1019, // v0.51.4 Slice 8 — CREATE VIEW compile-failure is a real error
+            RS_2403, RS_2404, RS_2405, // v0.51.5 gateway TLS/mTLS
         ];
         for code in codes {
             assert_ne!(
@@ -694,6 +724,30 @@ mod tests {
         assert_eq!(slug(RS_2400), "auth.unauthenticated");
         assert_eq!(slug(RS_2401), "auth.permission_denied");
         assert_eq!(slug(RS_2402), "auth.namespace_access_denied");
+    }
+
+    /// v0.51.5 gateway TLS/mTLS error codes.
+    #[test]
+    fn gateway_tls_error_codes_registered() {
+        assert_eq!(RS_2403.value(), 2403);
+        assert_eq!(RS_2404.value(), 2404);
+        assert_eq!(RS_2405.value(), 2405);
+
+        assert_eq!(slug(RS_2403), "auth.mtls_requires_ca_cert");
+        assert_eq!(slug(RS_2404), "auth.mtls_no_verified_cert");
+        assert_eq!(slug(RS_2405), "auth.tls_config_invalid");
+
+        assert_ne!(description(RS_2403), "Unknown error");
+        assert_ne!(description(RS_2404), "Unknown error");
+        assert_ne!(description(RS_2405), "Unknown error");
+
+        assert_eq!(severity(RS_2403), Severity::Fatal);
+        assert_eq!(severity(RS_2404), Severity::Fatal);
+        assert_eq!(severity(RS_2405), Severity::Fatal);
+
+        assert!(next_steps(RS_2403).contains("tls-ca-cert-path"));
+        assert!(next_steps(RS_2404).contains("client certificate"));
+        assert!(next_steps(RS_2405).contains("PEM-encoded"));
     }
 
     #[test]

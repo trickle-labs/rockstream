@@ -118,6 +118,11 @@ tokio::task_local! {
     pub static CONN_ID: String;
     pub static PORTAL_FORMAT: pgwire::api::portal::Format;
     pub static CANCEL_TOKEN: CancelToken;
+    /// v0.51.5: the connecting peer's socket address, set once per accepted
+    /// connection before the TLS handshake begins. Read synchronously by
+    /// `crate::tls::MtlsCnExtractingVerifier::verify_client_cert`, which runs
+    /// deep inside rustls's handshake state machine but on this same task.
+    pub static PEER_ADDR: std::net::SocketAddr;
 }
 
 // ── S1 Custom Parameter Provider ──────────────────────────────────────────────
@@ -819,6 +824,516 @@ fn pg_type_from_oid(oid: i32) -> Type {
         2951 => Type::UUID_ARRAY,
         _ => Type::TEXT,
     }
+}
+
+// ── Binary-format-aware field encoding ────────────────────────────────────────
+//
+// Every SELECT response path (row-store, view-reader, and query-time
+// DataFusion) stores/produces column values as plain UTF-8 text and must
+// encode them per the client's negotiated `FieldFormat` (text or binary).
+// `DataRowEncoder::encode_field` dispatches to the correct wire
+// representation based on the *Rust type* passed to it (via `ToSql`), not
+// the target Postgres OID — passing a bare `&str`/`Option<&str>` always
+// produces a text-format value, even when the client asked for binary. So
+// for every OID with a native binary format we must first parse the text
+// into the matching typed Rust value before calling `encode_field`.
+//
+// This function is shared by all 4 SELECT dispatch sites so that adding a
+// new OID's binary support (Slices 6-11) only requires touching one place.
+
+/// Parse a `TIMESTAMP` (no time zone) text value into `chrono::NaiveDateTime`.
+/// Accepts both `"YYYY-MM-DD HH:MM:SS[.ffffff]"` and ISO-8601
+/// `"YYYY-MM-DDTHH:MM:SS[.ffffff]"` forms.
+fn parse_pg_timestamp(s: &str) -> Option<chrono::NaiveDateTime> {
+    let s = s.trim();
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
+        .ok()
+}
+
+/// Parse a `TIMESTAMPTZ` text value into `chrono::DateTime<Utc>`. Accepts an
+/// explicit UTC offset (e.g. `"+00"`, `"+00:00"`, `"Z"`); if none is present
+/// the value is treated as already being in UTC (matching this gateway's
+/// existing text-format behavior of passing the raw string through
+/// unchanged).
+fn parse_pg_timestamptz(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z") {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    parse_pg_timestamp(s)
+        .map(|naive| chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc))
+}
+
+/// Parse a `DATE` text value (`"YYYY-MM-DD"`) into `chrono::NaiveDate`.
+fn parse_pg_date(s: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()
+}
+
+/// Parse a `TIME` text value (`"HH:MM:SS[.ffffff]"`) into `chrono::NaiveTime`.
+fn parse_pg_time(s: &str) -> Option<chrono::NaiveTime> {
+    chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M:%S%.f").ok()
+}
+
+/// Parse a `UUID` text value into `uuid::Uuid`.
+fn parse_pg_uuid(s: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(s.trim()).ok()
+}
+
+/// Newtype wrapping `uuid::Uuid` so this crate (not `pgwire` or `uuid`) owns
+/// the impl of `pgwire`'s `ToSqlText` trait -- neither upstream crate
+/// implements it for `uuid::Uuid`, so passing a bare `Option<uuid::Uuid>` to
+/// `encoder.encode_field` fails to compile (`ToSqlText` is a supertrait
+/// bound). Binary encoding delegates to `uuid::Uuid`'s own `ToSql` impl
+/// (`postgres-types`' `with-uuid-1` feature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PgUuid(uuid::Uuid);
+
+impl postgres_types::ToSql for PgUuid {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        self.0.to_sql(ty, out)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <uuid::Uuid as postgres_types::ToSql>::accepts(ty)
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgUuid {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(self.0.to_string().as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// Parse a `JSON`/`JSONB` text value into `serde_json::Value`.
+fn parse_pg_json(s: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(s).ok()
+}
+
+/// Newtype wrapping `serde_json::Value` so this crate owns the `ToSqlText`
+/// impl (`pgwire` implements it for neither `serde_json::Value` nor
+/// `postgres_types::Json<T>`). Binary encoding delegates to
+/// `serde_json::Value`'s own `ToSql` impl, which already writes the correct
+/// representation for both OIDs -- a plain UTF-8 JSON document for `JSON`,
+/// and the same document prefixed with the JSONB version byte (`0x01`) when
+/// `ty == Type::JSONB` (confirmed from `postgres_types::serde_json_1`
+/// source).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PgJson(serde_json::Value);
+
+impl postgres_types::ToSql for PgJson {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        self.0.to_sql(ty, out)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <serde_json::Value as postgres_types::ToSql>::accepts(ty)
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgJson {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        let text = serde_json::to_string(&self.0)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Sync + Send>)?;
+        out.extend_from_slice(text.as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// A Postgres `INTERVAL` value in its 3-component (months, days,
+/// microseconds) binary representation. `postgres_types` has no built-in
+/// interval type, so this crate implements the wire format by hand: the
+/// binary layout is `[microseconds: i64][days: i32][months: i32]`, all in
+/// network (big-endian) byte order (see Postgres's `interval_send`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PgInterval {
+    pub months: i32,
+    pub days: i32,
+    pub microseconds: i64,
+}
+
+impl postgres_types::ToSql for PgInterval {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        use bytes::BufMut;
+        out.put_i64(self.microseconds);
+        out.put_i32(self.days);
+        out.put_i32(self.months);
+        Ok(postgres_types::IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::INTERVAL)
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl<'a> postgres_types::FromSql<'a> for PgInterval {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<PgInterval, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() != 16 {
+            return Err("invalid interval binary length".into());
+        }
+        let microseconds = i64::from_be_bytes(raw[0..8].try_into().unwrap());
+        let days = i32::from_be_bytes(raw[8..12].try_into().unwrap());
+        let months = i32::from_be_bytes(raw[12..16].try_into().unwrap());
+        Ok(PgInterval {
+            months,
+            days,
+            microseconds,
+        })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::INTERVAL)
+    }
+}
+
+impl pgwire::types::ToSqlText for PgInterval {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        let years = self.months / 12;
+        let months = self.months % 12;
+        let mut micros = self.microseconds;
+        let negative_time = micros < 0;
+        if negative_time {
+            micros = -micros;
+        }
+        let hours = micros / 3_600_000_000;
+        micros %= 3_600_000_000;
+        let minutes = micros / 60_000_000;
+        micros %= 60_000_000;
+        let seconds = micros / 1_000_000;
+        let frac = micros % 1_000_000;
+        let mut parts = Vec::new();
+        if years != 0 {
+            parts.push(format!(
+                "{years} year{}",
+                if years.abs() == 1 { "" } else { "s" }
+            ));
+        }
+        if months != 0 {
+            parts.push(format!(
+                "{months} mon{}",
+                if months.abs() == 1 { "" } else { "s" }
+            ));
+        }
+        if self.days != 0 {
+            parts.push(format!(
+                "{} day{}",
+                self.days,
+                if self.days.abs() == 1 { "" } else { "s" }
+            ));
+        }
+        let sign = if negative_time { "-" } else { "" };
+        let time_str = if frac != 0 {
+            format!("{sign}{hours:02}:{minutes:02}:{seconds:02}.{frac:06}")
+        } else {
+            format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
+        };
+        if !time_str.is_empty() && (time_str != "00:00:00" || parts.is_empty()) {
+            parts.push(time_str);
+        }
+        out.extend_from_slice(parts.join(" ").as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// Parse a textual `INTERVAL` literal (e.g. `"1 year 2 mons 3 days
+/// 04:05:06.123456"`, `"-5 days"`, `"00:00:00"`) into a `PgInterval`. Accepts
+/// any subset/ordering of `<n> year(s)`, `<n> mon(s)`/`<n> month(s)`,
+/// `<n> day(s)` components followed by an optional `[-]HH:MM:SS[.ffffff]`
+/// clock component.
+fn parse_pg_interval(s: &str) -> Option<PgInterval> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut months = 0i32;
+    let mut days = 0i32;
+    let mut microseconds = 0i64;
+    let mut saw_any = false;
+
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        if let Ok(n) = tok.parse::<i64>() {
+            if i + 1 < tokens.len() {
+                let unit = tokens[i + 1].to_ascii_lowercase();
+                if unit.starts_with("year") {
+                    months += (n as i32) * 12;
+                    saw_any = true;
+                    i += 2;
+                    continue;
+                } else if unit.starts_with("mon") {
+                    months += n as i32;
+                    saw_any = true;
+                    i += 2;
+                    continue;
+                } else if unit.starts_with("day") {
+                    days += n as i32;
+                    saw_any = true;
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+        } else if tok.contains(':') {
+            let neg = tok.starts_with('-');
+            let clock = tok.trim_start_matches('-').trim_start_matches('+');
+            let parts: Vec<&str> = clock.split(':').collect();
+            if parts.len() < 2 {
+                return None;
+            }
+            let hours: i64 = parts[0].parse().ok()?;
+            let minutes: i64 = parts[1].parse().ok()?;
+            let seconds_f: f64 = if parts.len() > 2 {
+                parts[2].parse().ok()?
+            } else {
+                0.0
+            };
+            let whole_seconds = seconds_f.trunc() as i64;
+            let frac_micros = ((seconds_f.fract()) * 1_000_000.0).round() as i64;
+            let mut total = hours * 3_600_000_000
+                + minutes * 60_000_000
+                + whole_seconds * 1_000_000
+                + frac_micros;
+            if neg {
+                total = -total;
+            }
+            microseconds += total;
+            saw_any = true;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    if !saw_any {
+        return None;
+    }
+    Some(PgInterval {
+        months,
+        days,
+        microseconds,
+    })
+}
+
+/// Parse a Postgres array text literal (`"{a,b,c}"`, with `NULL` and
+/// double-quoted/escaped elements per Postgres's array-output rules) into a
+/// vector of optional element text (`None` == array element `NULL`), then
+/// apply `parse_elem` to every non-`NULL` element. Returns `None` (encoded as
+/// SQL `NULL` by the caller) if the outer literal is malformed or any
+/// element fails to parse -- mirroring `encode_typed_field`'s existing
+/// parse-failure-becomes-`NULL` behavior for every other type below.
+fn parse_pg_array<T>(s: &str, parse_elem: impl Fn(&str) -> Option<T>) -> Option<Vec<Option<T>>> {
+    let elems = parse_pg_array_text(s)?;
+    let mut out = Vec::with_capacity(elems.len());
+    for e in elems {
+        match e {
+            None => out.push(None),
+            Some(v) => out.push(Some(parse_elem(&v)?)),
+        }
+    }
+    Some(out)
+}
+
+/// Split a `"{...}"` array text literal into its element strings (`None` for
+/// an unquoted `NULL`), honoring double-quoted elements with `\`-escapes.
+fn parse_pg_array_text(s: &str) -> Option<Vec<Option<String>>> {
+    let s = s.trim();
+    if !s.starts_with('{') || !s.ends_with('}') {
+        return None;
+    }
+    let inner = &s[1..s.len() - 1];
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut elems = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut was_quoted = false;
+    let chars: Vec<char> = inner.chars().collect();
+    let mut i = 0;
+    let push_elem = |elems: &mut Vec<Option<String>>, current: &str, was_quoted: bool| {
+        let trimmed = current.trim();
+        if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
+            elems.push(None);
+        } else {
+            elems.push(Some(trimmed.to_string()));
+        }
+    };
+    while i < chars.len() {
+        match chars[i] {
+            '"' if !in_quote => {
+                in_quote = true;
+                was_quoted = true;
+                i += 1;
+            }
+            '"' if in_quote => {
+                in_quote = false;
+                i += 1;
+            }
+            '\\' if in_quote && i + 1 < chars.len() => {
+                current.push(chars[i + 1]);
+                i += 2;
+            }
+            ',' if !in_quote => {
+                push_elem(&mut elems, &current, was_quoted);
+                current = String::new();
+                was_quoted = false;
+                i += 1;
+            }
+            c => {
+                current.push(c);
+                i += 1;
+            }
+        }
+    }
+    push_elem(&mut elems, &current, was_quoted);
+    Some(elems)
+}
+
+/// Encode one field's already-extracted text value (`None` == SQL `NULL`)
+/// into `encoder`, using the Rust type matching `datatype` so that binary-
+/// format results are correctly encoded and not just passed through as text.
+fn encode_typed_field(
+    encoder: &mut DataRowEncoder,
+    datatype: &Type,
+    val: Option<&str>,
+) -> PgWireResult<()> {
+    let encode_res = match *datatype {
+        Type::INT2 => {
+            let parsed = val.and_then(|s| s.parse::<i16>().ok());
+            encoder.encode_field(&parsed)
+        }
+        Type::INT4 => {
+            let parsed = val.and_then(|s| s.parse::<i32>().ok());
+            encoder.encode_field(&parsed)
+        }
+        Type::INT8 => {
+            let parsed = val.and_then(|s| s.parse::<i64>().ok());
+            encoder.encode_field(&parsed)
+        }
+        Type::FLOAT4 => {
+            let parsed = val.and_then(|s| s.parse::<f32>().ok());
+            encoder.encode_field(&parsed)
+        }
+        Type::FLOAT8 => {
+            let parsed = val.and_then(|s| s.parse::<f64>().ok());
+            encoder.encode_field(&parsed)
+        }
+        Type::BOOL => {
+            // An empty string is this row-store's "no value" sentinel (see
+            // `parse_value_list`), used identically to a parse failure for
+            // numeric/date/time types above -- unlike those, a bare
+            // `.map()` over `Some("")` would produce `Some(false)` instead
+            // of propagating `NULL`, so it must be filtered out first.
+            let parsed = val
+                .filter(|s| !s.is_empty())
+                .map(|s| s == "t" || s == "true" || s == "1");
+            encoder.encode_field(&parsed)
+        }
+        Type::TIMESTAMP => {
+            let parsed = val.and_then(parse_pg_timestamp);
+            encoder.encode_field(&parsed)
+        }
+        Type::TIMESTAMPTZ => {
+            let parsed = val.and_then(parse_pg_timestamptz);
+            encoder.encode_field(&parsed)
+        }
+        Type::DATE => {
+            let parsed = val.and_then(parse_pg_date);
+            encoder.encode_field(&parsed)
+        }
+        Type::TIME => {
+            let parsed = val.and_then(parse_pg_time);
+            encoder.encode_field(&parsed)
+        }
+        Type::UUID => {
+            let parsed = val.and_then(parse_pg_uuid).map(PgUuid);
+            encoder.encode_field(&parsed)
+        }
+        Type::NUMERIC => {
+            let parsed = val.and_then(|s| s.trim().parse::<rust_decimal::Decimal>().ok());
+            encoder.encode_field(&parsed)
+        }
+        Type::JSON | Type::JSONB => {
+            let parsed = val.and_then(parse_pg_json).map(PgJson);
+            encoder.encode_field(&parsed)
+        }
+        Type::INTERVAL => {
+            let parsed = val.and_then(parse_pg_interval);
+            encoder.encode_field(&parsed)
+        }
+        Type::INT4_ARRAY => {
+            let parsed = val.and_then(|s| parse_pg_array(s, |e| e.parse::<i32>().ok()));
+            encoder.encode_field(&parsed)
+        }
+        Type::INT8_ARRAY => {
+            let parsed = val.and_then(|s| parse_pg_array(s, |e| e.parse::<i64>().ok()));
+            encoder.encode_field(&parsed)
+        }
+        Type::TEXT_ARRAY => {
+            let parsed = val.and_then(|s| parse_pg_array(s, |e| Some(e.to_string())));
+            encoder.encode_field(&parsed)
+        }
+        Type::FLOAT8_ARRAY => {
+            let parsed = val.and_then(|s| parse_pg_array(s, |e| e.parse::<f64>().ok()));
+            encoder.encode_field(&parsed)
+        }
+        Type::BOOL_ARRAY => {
+            let parsed = val.and_then(|s| {
+                parse_pg_array(s, |e| {
+                    if e.is_empty() {
+                        None
+                    } else {
+                        Some(e == "t" || e == "true" || e == "1")
+                    }
+                })
+            });
+            encoder.encode_field(&parsed)
+        }
+        Type::UUID_ARRAY => {
+            let parsed = val.and_then(|s| parse_pg_array(s, |e| parse_pg_uuid(e).map(PgUuid)));
+            encoder.encode_field(&parsed)
+        }
+        _ => encoder.encode_field(&val),
+    };
+    encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)))
 }
 
 #[derive(Debug, Clone)]
@@ -3119,34 +3634,7 @@ impl GatewayHandler {
             for i in 0..col_count {
                 let val: Option<&str> = fields.get(i).copied();
                 let datatype = schema_ref[i].datatype();
-                let encode_res = match *datatype {
-                    Type::INT2 => {
-                        let parsed = val.and_then(|s| s.parse::<i16>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::INT4 => {
-                        let parsed = val.and_then(|s| s.parse::<i32>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::INT8 => {
-                        let parsed = val.and_then(|s| s.parse::<i64>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::FLOAT4 => {
-                        let parsed = val.and_then(|s| s.parse::<f32>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::FLOAT8 => {
-                        let parsed = val.and_then(|s| s.parse::<f64>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::BOOL => {
-                        let parsed = val.map(|s| s == "t" || s == "true" || s == "1");
-                        encoder.encode_field(&parsed)
-                    }
-                    _ => encoder.encode_field(&val),
-                };
-                encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                encode_typed_field(&mut encoder, datatype, val)?;
             }
             encoder.finish()
         });
@@ -3364,34 +3852,7 @@ impl GatewayHandler {
             for i in 0..col_count {
                 let val: Option<&str> = fields.get(i).copied();
                 let datatype = schema_ref[i].datatype();
-                let encode_res = match *datatype {
-                    Type::INT2 => {
-                        let parsed = val.and_then(|s| s.parse::<i16>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::INT4 => {
-                        let parsed = val.and_then(|s| s.parse::<i32>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::INT8 => {
-                        let parsed = val.and_then(|s| s.parse::<i64>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::FLOAT4 => {
-                        let parsed = val.and_then(|s| s.parse::<f32>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::FLOAT8 => {
-                        let parsed = val.and_then(|s| s.parse::<f64>().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::BOOL => {
-                        let parsed = val.map(|s| s == "t" || s == "true" || s == "1");
-                        encoder.encode_field(&parsed)
-                    }
-                    _ => encoder.encode_field(&val),
-                };
-                encode_res.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                encode_typed_field(&mut encoder, datatype, val)?;
             }
             encoder.finish()
         });
@@ -5955,15 +6416,27 @@ impl StartupHandler for GatewayHandler {
                     }
                 }
                 AuthMode::Mtls => {
-                    let cn = startup
-                        .parameters
-                        .iter()
-                        .find(|(k, _)| k.to_lowercase() == "cn")
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    client
-                        .metadata_mut()
-                        .insert("_rs_principal".to_string(), format!("cert:{cn}"));
+                    // v0.51.5: the old spoofable `cn` startup-parameter stub
+                    // has been removed. The CN is now only ever the Subject
+                    // CN of a real, CA-validated TLS client certificate,
+                    // recorded by `MtlsCnExtractingVerifier` during the TLS
+                    // handshake and looked up here by peer socket address.
+                    match crate::tls::lookup_mtls_cn(&client.socket_addr()) {
+                        Some(cn) => {
+                            client
+                                .metadata_mut()
+                                .insert("_rs_principal".to_string(), format!("cert:{cn}"));
+                        }
+                        None => {
+                            return Err(pgwire::error::PgWireError::UserError(Box::new(
+                                pgwire::error::ErrorInfo::new(
+                                    "FATAL".to_string(),
+                                    "28000".to_string(),
+                                    "[RS-2404] auth.mtls_no_verified_cert: no verified client certificate CN for this connection. next_steps: Connect with a client certificate signed by the configured CA over sslmode=verify-full; a bare TCP or TLS connection without a client cert cannot use --auth=mtls.".to_string(),
+                                ),
+                            )));
+                        }
+                    }
                 }
                 AuthMode::Scram => {
                     if let Ok(conn_id) = CONN_ID.try_with(|id| id.clone()) {
@@ -6416,6 +6889,8 @@ impl SimpleQueryHandler for GatewayHandler {
                     Principal::Jwt {
                         sub: sub.to_string(),
                     }
+                } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
+                    Principal::CertCn { cn: cn.to_string() }
                 } else {
                     Principal::System
                 };
@@ -6866,6 +7341,8 @@ impl ExtendedQueryHandler for GatewayHandler {
                     Principal::Jwt {
                         sub: sub.to_string(),
                     }
+                } else if let Some(cn) = raw_principal.strip_prefix("cert:") {
+                    Principal::CertCn { cn: cn.to_string() }
                 } else {
                     Principal::System
                 };
@@ -7191,6 +7668,9 @@ impl PgWireServerHandlers for GatewayHandlerFactory {
 pub struct GatewayServer {
     addr: std::net::SocketAddr,
     handler: Arc<GatewayHandler>,
+    /// v0.51.5: gateway-facing TLS acceptor. `None` (the default) preserves
+    /// the pre-v0.51.5 plaintext-refusal `SSLRequest` behavior.
+    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
 }
 
 impl GatewayServer {
@@ -7200,6 +7680,7 @@ impl GatewayServer {
         GatewayServer {
             addr,
             handler: Arc::new(GatewayHandler::new(catalog, view_reader)),
+            tls_acceptor: None,
         }
     }
 
@@ -7212,6 +7693,7 @@ impl GatewayServer {
         GatewayServer {
             addr,
             handler: Arc::new(GatewayHandler::new(catalog, view_reader)),
+            tls_acceptor: None,
         }
     }
 
@@ -7229,6 +7711,7 @@ impl GatewayServer {
                 view_reader,
                 shard_db,
             )),
+            tls_acceptor: None,
         }
     }
 
@@ -7245,6 +7728,7 @@ impl GatewayServer {
         GatewayServer {
             addr,
             handler: Arc::new(handler),
+            tls_acceptor: None,
         }
     }
 
@@ -7261,6 +7745,7 @@ impl GatewayServer {
         GatewayServer {
             addr,
             handler: Arc::new(handler),
+            tls_acceptor: None,
         }
     }
 
@@ -7278,6 +7763,49 @@ impl GatewayServer {
         GatewayServer {
             addr,
             handler: Arc::new(handler),
+            tls_acceptor: None,
+        }
+    }
+
+    /// v0.51.5: enable gateway-facing TLS termination (and, when
+    /// `ca_cert_path` is `Some`, mTLS client-certificate authentication).
+    /// Fails fast (returns `Err`, refuses to start) if `--auth=mtls` is
+    /// configured on this server's handler but `ca_cert_path` is `None` —
+    /// mTLS without TLS is a startup misconfiguration, not a runtime
+    /// fallback.
+    pub fn with_tls(
+        mut self,
+        cert_path: &std::path::Path,
+        key_path: &std::path::Path,
+        ca_cert_path: Option<&std::path::Path>,
+    ) -> Result<Self, crate::tls::GatewayTlsError> {
+        crate::tls::require_ca_cert_for_mtls(
+            self.handler.auth_mode == AuthMode::Mtls,
+            ca_cert_path,
+        )?;
+        self.tls_acceptor = Some(crate::tls::build_tls_acceptor(
+            cert_path,
+            key_path,
+            ca_cert_path,
+        )?);
+        Ok(self)
+    }
+
+    /// Create a gateway with mTLS auth enabled and TLS already configured
+    /// (for auth integration tests exercising the mTLS startup branch
+    /// without going through the CLI).
+    pub fn with_shard_db_and_mtls_auth(
+        addr: std::net::SocketAddr,
+        catalog: Arc<CatalogStubs>,
+        view_reader: Arc<dyn ViewReader>,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+    ) -> Self {
+        let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
+        handler.auth_mode = AuthMode::Mtls;
+        GatewayServer {
+            addr,
+            handler: Arc::new(handler),
+            tls_acceptor: None,
         }
     }
 
@@ -7285,7 +7813,6 @@ impl GatewayServer {
     pub fn handler(&self) -> &Arc<GatewayHandler> {
         &self.handler
     }
-
     /// Return a reference to the handler's catalog stubs (for seeding in tests).
     pub fn catalog(&self) -> &Arc<CatalogStubs> {
         &self.handler.catalog
@@ -7301,103 +7828,32 @@ impl GatewayServer {
         let listener = TcpListener::bind(self.addr).await?;
         tracing::info!("Gateway listening on {}", self.addr);
         loop {
-            let (socket, _peer) = listener.accept().await?;
+            let (socket, peer) = listener.accept().await?;
             let factory_ref = factory.clone();
             let registry_ref = registry.clone();
+            let tls_acceptor_ref = self.tls_acceptor.clone();
             use rand::Rng;
             let conn_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
             let cancel_token = CancelToken::new();
             let token_for_task = cancel_token.clone();
             tokio::spawn(CANCEL_TOKEN.scope(
                 token_for_task,
-                CONN_ID.scope(conn_id, async move {
-                    let mut socket = socket;
-                    let mut buf = [0u8; 16];
-                    if let Ok(n) = socket.peek(&mut buf).await {
-                        // SSLRequest: [0,0,0,8, 4,210,22,47]
-                        if n >= 8 && buf[..8] == [0, 0, 0, 8, 4, 210, 22, 47] {
-                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                            let mut ssl_buf = [0u8; 8];
-                            let _ = socket.read_exact(&mut ssl_buf).await;
-                            let _ = socket.write_all(b"N").await;
-                            let _ = socket.flush().await;
-                        }
-                        // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
-                        else if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
-                            use tokio::io::AsyncReadExt;
-                            let mut cancel_buf = [0u8; 16];
-                            let _ = socket.read_exact(&mut cancel_buf).await;
-                            let pid = u32::from_be_bytes([
-                                cancel_buf[8],
-                                cancel_buf[9],
-                                cancel_buf[10],
-                                cancel_buf[11],
-                            ]);
-                            let secret = u32::from_be_bytes([
-                                cancel_buf[12],
-                                cancel_buf[13],
-                                cancel_buf[14],
-                                cancel_buf[15],
-                            ]);
-                            if let Some(token) = registry_ref.get(&(pid, secret)) {
-                                token.cancel();
-                            }
-                            return; // CancelRequest connections don't do further work
-                        }
-                    }
-                    if let Err(e) =
-                        pgwire::tokio::process_socket(socket, None, factory_ref.clone()).await
-                    {
-                        tracing::debug!("gateway connection error: {e}");
-                    }
-                    // Cleanup LISTEN subscriptions on disconnect.
-                    let cid = CONN_ID.with(|id| id.clone());
-                    factory_ref.handler.notify_registry.unsubscribe_all(&cid);
-                    factory_ref.handler.pending_notifies.remove(&cid);
-                }),
-            ));
-        }
-    }
-
-    /// Bind to `addr`, return the actual local address (useful for port 0 tests),
-    /// and serve connections in a background task.
-    pub async fn serve_background(
-        self,
-    ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
-        self.handler.recover_compiled_views().await;
-        let factory = Arc::new(GatewayHandlerFactory {
-            handler: self.handler.clone(),
-        });
-        let registry = self.handler.cancellation_registry.clone();
-        let listener = TcpListener::bind(self.addr).await?;
-        let local_addr = listener.local_addr()?;
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((socket, _peer)) = listener.accept().await else {
-                    break;
-                };
-                let factory_ref = factory.clone();
-                let registry_ref = registry.clone();
-                use rand::Rng;
-                let conn_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
-                let cancel_token = CancelToken::new();
-                let token_for_task = cancel_token.clone();
-                tokio::spawn(CANCEL_TOKEN.scope(
-                    token_for_task,
-                    CONN_ID.scope(conn_id, async move {
+                CONN_ID.scope(
+                    conn_id,
+                    PEER_ADDR.scope(peer, async move {
                         let mut socket = socket;
+                        let peer_addr = peer;
                         let mut buf = [0u8; 16];
+                        // Only the CancelRequest peek is intercepted here — pgwire
+                        // has no equivalent, this is a rockstream-only extension.
+                        // SSLRequest is left for pgwire::tokio::process_socket's
+                        // own peek_for_sslrequest, which answers 'S'/real TLS
+                        // handshake when tls_acceptor_ref is Some, or 'N' (byte-
+                        // for-byte the pre-v0.51.5 plaintext-refusal behavior)
+                        // when it is None.
                         if let Ok(n) = socket.peek(&mut buf).await {
-                            // SSLRequest: [0,0,0,8, 4,210,22,47]
-                            if n >= 8 && buf[..8] == [0, 0, 0, 8, 4, 210, 22, 47] {
-                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                                let mut ssl_buf = [0u8; 8];
-                                let _ = socket.read_exact(&mut ssl_buf).await;
-                                let _ = socket.write_all(b"N").await;
-                                let _ = socket.flush().await;
-                            }
                             // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
-                            else if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
+                            if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
                                 use tokio::io::AsyncReadExt;
                                 let mut cancel_buf = [0u8; 16];
                                 let _ = socket.read_exact(&mut cancel_buf).await;
@@ -7419,16 +7875,107 @@ impl GatewayServer {
                                 return; // CancelRequest connections don't do further work
                             }
                         }
-                        if let Err(e) =
-                            pgwire::tokio::process_socket(socket, None, factory_ref.clone()).await
+                        if let Err(e) = pgwire::tokio::process_socket(
+                            socket,
+                            tls_acceptor_ref.clone(),
+                            factory_ref.clone(),
+                        )
+                        .await
                         {
                             tracing::debug!("gateway connection error: {e}");
                         }
+                        crate::tls::remove_mtls_cn(&peer_addr);
                         // Cleanup LISTEN subscriptions on disconnect.
                         let cid = CONN_ID.with(|id| id.clone());
                         factory_ref.handler.notify_registry.unsubscribe_all(&cid);
                         factory_ref.handler.pending_notifies.remove(&cid);
                     }),
+                ),
+            ));
+        }
+    }
+
+    /// Bind to `addr`, return the actual local address (useful for port 0 tests),
+    /// and serve connections in a background task.
+    pub async fn serve_background(
+        self,
+    ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        self.handler.recover_compiled_views().await;
+        let factory = Arc::new(GatewayHandlerFactory {
+            handler: self.handler.clone(),
+        });
+        let registry = self.handler.cancellation_registry.clone();
+        let tls_acceptor = self.tls_acceptor.clone();
+        let listener = TcpListener::bind(self.addr).await?;
+        let local_addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((socket, peer)) = listener.accept().await else {
+                    break;
+                };
+                let factory_ref = factory.clone();
+                let registry_ref = registry.clone();
+                let tls_acceptor_ref = tls_acceptor.clone();
+                use rand::Rng;
+                let conn_id = format!("{:032x}", rand::thread_rng().gen::<u128>());
+                let cancel_token = CancelToken::new();
+                let token_for_task = cancel_token.clone();
+                tokio::spawn(CANCEL_TOKEN.scope(
+                    token_for_task,
+                    CONN_ID.scope(
+                        conn_id,
+                        PEER_ADDR.scope(peer, async move {
+                            let mut socket = socket;
+                            let peer_addr = peer;
+                            let mut buf = [0u8; 16];
+                            // Only the CancelRequest peek is intercepted here —
+                            // pgwire has no equivalent, this is a rockstream-only
+                            // extension. SSLRequest is left for
+                            // pgwire::tokio::process_socket's own
+                            // peek_for_sslrequest, which answers 'S'/real TLS
+                            // handshake when tls_acceptor_ref is Some, or 'N'
+                            // (byte-for-byte the pre-v0.51.5 plaintext-refusal
+                            // behavior) when it is None.
+                            if let Ok(n) = socket.peek(&mut buf).await {
+                                // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
+                                if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
+                                    use tokio::io::AsyncReadExt;
+                                    let mut cancel_buf = [0u8; 16];
+                                    let _ = socket.read_exact(&mut cancel_buf).await;
+                                    let pid = u32::from_be_bytes([
+                                        cancel_buf[8],
+                                        cancel_buf[9],
+                                        cancel_buf[10],
+                                        cancel_buf[11],
+                                    ]);
+                                    let secret = u32::from_be_bytes([
+                                        cancel_buf[12],
+                                        cancel_buf[13],
+                                        cancel_buf[14],
+                                        cancel_buf[15],
+                                    ]);
+                                    if let Some(token) = registry_ref.get(&(pid, secret)) {
+                                        token.cancel();
+                                    }
+                                    return; // CancelRequest connections don't do further work
+                                }
+                            }
+                            if let Err(e) = pgwire::tokio::process_socket(
+                                socket,
+                                tls_acceptor_ref.clone(),
+                                factory_ref.clone(),
+                            )
+                            .await
+                            {
+                                tracing::debug!("gateway connection error: {e}");
+                            }
+                            crate::tls::remove_mtls_cn(&peer_addr);
+                            // Cleanup LISTEN subscriptions on disconnect.
+                            let cid = CONN_ID.with(|id| id.clone());
+                            factory_ref.handler.notify_registry.unsubscribe_all(&cid);
+                            factory_ref.handler.pending_notifies.remove(&cid);
+                        }),
+                    ),
                 ));
             }
         });
@@ -8047,40 +8594,7 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
             let mut encoder = DataRowEncoder::new(schema_ref.clone());
             for (col_idx, val) in row_vals.iter().enumerate() {
                 let datatype = schema_ref[col_idx].datatype();
-                let encode_res = match *datatype {
-                    Type::INT2 => {
-                        let parsed: Option<i16> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::INT4 => {
-                        let parsed: Option<i32> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::INT8 => {
-                        let parsed: Option<i64> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::FLOAT4 => {
-                        let parsed: Option<f32> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::FLOAT8 => {
-                        let parsed: Option<f64> = val.as_deref().and_then(|s| s.parse().ok());
-                        encoder.encode_field(&parsed)
-                    }
-                    Type::BOOL => {
-                        let parsed: Option<bool> =
-                            val.as_deref().map(|s| s == "t" || s == "true" || s == "1");
-                        encoder.encode_field(&parsed)
-                    }
-                    _ => {
-                        let s: Option<&str> = val.as_deref();
-                        encoder.encode_field(&s)
-                    }
-                };
-                if let Err(e) = encode_res {
-                    return Err(PgWireError::ApiError(Box::new(e)));
-                }
+                encode_typed_field(&mut encoder, datatype, val.as_deref())?;
             }
             encoder.finish()
         });
@@ -8171,40 +8685,7 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
         let mut encoder = DataRowEncoder::new(schema_ref.clone());
         for (col_idx, val) in row_vals.iter().enumerate() {
             let datatype = schema_ref[col_idx].datatype();
-            let encode_res = match *datatype {
-                Type::INT2 => {
-                    let parsed: Option<i16> = val.as_deref().and_then(|s| s.parse().ok());
-                    encoder.encode_field(&parsed)
-                }
-                Type::INT4 => {
-                    let parsed: Option<i32> = val.as_deref().and_then(|s| s.parse().ok());
-                    encoder.encode_field(&parsed)
-                }
-                Type::INT8 => {
-                    let parsed: Option<i64> = val.as_deref().and_then(|s| s.parse().ok());
-                    encoder.encode_field(&parsed)
-                }
-                Type::FLOAT4 => {
-                    let parsed: Option<f32> = val.as_deref().and_then(|s| s.parse().ok());
-                    encoder.encode_field(&parsed)
-                }
-                Type::FLOAT8 => {
-                    let parsed: Option<f64> = val.as_deref().and_then(|s| s.parse().ok());
-                    encoder.encode_field(&parsed)
-                }
-                Type::BOOL => {
-                    let parsed: Option<bool> =
-                        val.as_deref().map(|s| s == "t" || s == "true" || s == "1");
-                    encoder.encode_field(&parsed)
-                }
-                _ => {
-                    let s: Option<&str> = val.as_deref();
-                    encoder.encode_field(&s)
-                }
-            };
-            if let Err(e) = encode_res {
-                return Err(PgWireError::ApiError(Box::new(e)));
-            }
+            encode_typed_field(&mut encoder, datatype, val.as_deref())?;
         }
         encoder.finish()
     });
@@ -8757,6 +9238,30 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
         if let Some(cv) = catalog.get_view(&view_name) {
             let select_cols = infer_select_columns(q);
             let res: Vec<FieldInfo> = cv
+                .columns
+                .iter()
+                .filter(|c| select_cols.is_empty() || select_cols.contains(&c.name.to_lowercase()))
+                .map(|c| {
+                    let oid = arrow_type_to_pg_oid(&c.data_type);
+                    FieldInfo::new(
+                        c.name.clone(),
+                        None,
+                        None,
+                        pg_type_from_oid(oid),
+                        FieldFormat::Text,
+                    )
+                })
+                .collect();
+            return res;
+        }
+        // Raw (non-view) catalog tables use the same extended-query Describe
+        // path as views: RowDescription's field list/types must match what
+        // `do_query`'s row-store SELECT dispatch (`arrow_type_to_pg_oid` +
+        // `pg_type_from_oid`) actually encodes, or tokio-postgres's client
+        // rejects the response with "DataRow field count does not match".
+        if let Some(ct) = catalog.get_table(&view_name) {
+            let select_cols = infer_select_columns(q);
+            let res: Vec<FieldInfo> = ct
                 .columns
                 .iter()
                 .filter(|c| select_cols.is_empty() || select_cols.contains(&c.name.to_lowercase()))
@@ -9717,14 +10222,27 @@ fn pg_type_to_arrow(pg_type: &str) -> &'static str {
     match pg_type {
         "BIGINT" | "INT8" => "Int64",
         "INT" | "INT4" | "INTEGER" => "Int32",
-        "SMALLINT" | "INT2" => "Int32",
+        "SMALLINT" | "INT2" => "Int16",
         "TEXT" | "VARCHAR" | "CHARACTER VARYING" => "Utf8",
         "FLOAT8" | "DOUBLE PRECISION" | "FLOAT" => "Float64",
-        "FLOAT4" | "REAL" => "Float64",
+        "FLOAT4" | "REAL" => "Float32",
         "BOOL" | "BOOLEAN" => "Boolean",
         "BYTEA" => "Binary",
         "TIMESTAMP" => "Timestamp",
+        "TIMESTAMPTZ" => "TimestampTz",
+        "DATE" => "Date32",
+        "TIME" => "Time32",
         "UUID" => "UUID",
+        "NUMERIC" | "DECIMAL" => "Decimal",
+        "JSON" => "Json",
+        "JSONB" => "Jsonb",
+        "INTERVAL" => "Interval",
+        "INT4[]" | "INTEGER[]" | "INT[]" => "_int4",
+        "INT8[]" | "BIGINT[]" => "_int8",
+        "TEXT[]" | "VARCHAR[]" | "CHARACTER VARYING[]" => "_text",
+        "FLOAT8[]" | "DOUBLE PRECISION[]" | "FLOAT[]" => "_float8",
+        "BOOL[]" | "BOOLEAN[]" => "_bool",
+        "UUID[]" => "_uuid",
         _ => "Utf8",
     }
 }
@@ -10084,16 +10602,36 @@ fn parse_kv_list(s: &str) -> Vec<(String, String)> {
 /// Parse a comma-separated VALUES list, respecting single-quoted strings.
 ///
 /// Handles: `'text value', 42, NULL, 'it''s'`
+///
+/// A bare (unquoted) `NULL` keyword is normalized to an empty string, the
+/// same "no value" sentinel already used everywhere else in this row-store
+/// (e.g. `value_map.get(col).cloned().unwrap_or_default()`) — otherwise the
+/// literal 4-character text `"NULL"` would be stored and returned as if it
+/// were a real value (visible as a bug in `encode_typed_field`'s `BOOL` arm,
+/// where a stored `"NULL"` string doesn't parse-fail the way it does for
+/// numeric/date types, and would decode as `false` instead of SQL `NULL`).
+/// A *quoted* `'NULL'` string literal is left untouched, since that is a
+/// genuine text value, not the NULL keyword.
 fn parse_value_list(s: &str) -> Vec<String> {
     let mut values = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
+    let mut was_quoted = false;
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
+    let push_value = |values: &mut Vec<String>, current: &str, was_quoted: bool| {
+        let trimmed = current.trim();
+        if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
+            values.push(String::new());
+        } else {
+            values.push(trimmed.to_string());
+        }
+    };
     while i < chars.len() {
         match chars[i] {
             '\'' if !in_quote => {
                 in_quote = true;
+                was_quoted = true;
                 i += 1;
             }
             '\'' if in_quote => {
@@ -10107,8 +10645,9 @@ fn parse_value_list(s: &str) -> Vec<String> {
                 }
             }
             ',' if !in_quote => {
-                values.push(current.trim().to_string());
+                push_value(&mut values, &current, was_quoted);
                 current = String::new();
+                was_quoted = false;
                 i += 1;
             }
             c => {
@@ -10118,8 +10657,8 @@ fn parse_value_list(s: &str) -> Vec<String> {
         }
     }
     let last = current.trim().to_string();
-    if !last.is_empty() {
-        values.push(last);
+    if !last.is_empty() || was_quoted {
+        push_value(&mut values, &current, was_quoted);
     }
     values
 }

@@ -28,6 +28,7 @@ pub mod server;
 pub mod session;
 pub mod subscribe_handler;
 pub mod subscribe_parser;
+pub mod tls;
 pub mod view_reader;
 pub mod write_buffer;
 
