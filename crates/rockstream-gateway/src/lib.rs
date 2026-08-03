@@ -33,6 +33,7 @@ pub mod view_reader;
 pub mod write_buffer;
 
 pub use error::GatewayError;
+pub use role_catalog::RoleCatalog;
 pub use server::{ConnectionStateTotals, GatewayServer, MAX_CONNECTIONS};
 pub use session::{CursorState, TxStatus, MAX_CURSORS_PER_CONNECTION};
 pub use view_reader::{

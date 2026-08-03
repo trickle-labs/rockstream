@@ -312,8 +312,57 @@ pub async fn start_gateway_with_shard(
         )
     })?;
 
-    let server =
-        rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db);
+    let auth_mode_str = opts.auth_mode.trim().to_lowercase();
+    tracing::info!("Gateway server starting with auth mode: {}", auth_mode_str);
+
+    let server = match auth_mode_str.as_str() {
+        "off" | "" => {
+            rockstream_gateway::GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db)
+        }
+        "scram" => {
+            let role_catalog = Arc::new(rockstream_gateway::RoleCatalog::new());
+            rockstream_gateway::GatewayServer::with_shard_db_and_scram_auth(
+                addr,
+                catalog,
+                view_reader,
+                shard_db,
+                role_catalog,
+            )
+        }
+        "md5" => {
+            let role_catalog = Arc::new(rockstream_gateway::RoleCatalog::new());
+            rockstream_gateway::GatewayServer::with_shard_db_and_md5_auth(
+                addr,
+                catalog,
+                view_reader,
+                shard_db,
+                role_catalog,
+            )
+        }
+        "oidc" => {
+            let secret = b"rockstream-default-jwt-secret";
+            rockstream_gateway::GatewayServer::with_shard_db_and_auth(
+                addr,
+                catalog,
+                view_reader,
+                shard_db,
+                secret,
+            )
+        }
+        "mtls" => rockstream_gateway::GatewayServer::with_shard_db_and_mtls_auth(
+            addr,
+            catalog,
+            view_reader,
+            shard_db,
+        ),
+        _ => {
+            return Err(CliError::new(
+                RS_0002,
+                format!("unknown auth mode `{}`", opts.auth_mode),
+                "Pass --auth with one of: off, scram, md5, oidc, mtls.",
+            ));
+        }
+    };
 
     server.serve_background().await.map_err(|e| {
         CliError::new(
@@ -333,6 +382,16 @@ pub async fn start_gateway_with_shard(
 pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let started_ms = now_ms();
     validate_role(&opts.role)?;
+
+    let auth_mode_norm = opts.auth_mode.trim().to_lowercase();
+    let valid_auth_modes = ["off", "scram", "md5", "oidc", "mtls", ""];
+    if !valid_auth_modes.contains(&auth_mode_norm.as_str()) {
+        return Err(CliError::new(
+            RS_0002,
+            format!("unknown auth mode `{}`", opts.auth_mode),
+            "Pass --auth with one of: off, scram, md5, oidc, mtls.",
+        ));
+    }
 
     // Worker requires a control URL to register with the control plane.
     // Gateway can run in standalone mode without a control URL.

@@ -142,7 +142,7 @@ fn cluster_utilization(catalog: &CatalogStubs) -> u64 {
 mod tests {
     use super::*;
     use crate::catalog_stubs::CatalogView;
-    use rockstream_types::metrics::{reset_all, set_pipeline_state_bytes};
+    use rockstream_types::metrics::{reset_all, set_pipeline_state_bytes, METRICS_TEST_LOCK};
     use rockstream_types::workload::{WorkloadDef, WorkloadPriority};
     use tempfile::NamedTempFile;
 
@@ -160,6 +160,7 @@ mod tests {
 
     #[test]
     fn admits_outright_when_capacity_available() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
         reset_all();
         let catalog = CatalogStubs::new();
         catalog.add_workload(WorkloadDef::new("fast").with_priority(WorkloadPriority::HIGH));
@@ -169,6 +170,7 @@ mod tests {
 
     #[test]
     fn pauses_lower_priority_workload_to_make_room() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
         reset_all();
         let tmp = NamedTempFile::new().unwrap();
         let log = FileAuditLog::open(tmp.path()).unwrap();
@@ -199,6 +201,7 @@ mod tests {
 
     #[test]
     fn rejects_when_no_lower_priority_capacity_available() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
         reset_all();
         let tmp = NamedTempFile::new().unwrap();
         let log = FileAuditLog::open(tmp.path()).unwrap();
@@ -222,6 +225,7 @@ mod tests {
 
     #[test]
     fn does_not_pause_equal_or_higher_priority_workloads() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
         reset_all();
         let catalog = CatalogStubs::new();
         catalog.add_workload(WorkloadDef::new("high").with_priority(WorkloadPriority::HIGH));

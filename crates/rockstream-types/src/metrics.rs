@@ -631,6 +631,10 @@ pub fn read_total_workload_memory() -> u64 {
     with_registry(|reg| reg.workload_memory_bytes.values().map(Counter::get).sum())
 }
 
+/// Shared test lock for serialising tests that reset or mutate the process-global metrics REGISTRY.
+pub static METRICS_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 /// Record additional bytes written to storage for a shard, along with the
 /// logical bytes that produced them.
 pub fn record_compaction_write(

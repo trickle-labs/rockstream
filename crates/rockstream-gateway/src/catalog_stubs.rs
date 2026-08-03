@@ -2352,12 +2352,15 @@ mod tests {
     use super::*;
 
     use rockstream_control::audit::FileAuditLog;
-    use rockstream_types::metrics::{read_workload_memory, reset_all, set_state_budget};
+    use rockstream_types::metrics::{
+        read_workload_memory, reset_all, set_state_budget, METRICS_TEST_LOCK,
+    };
     use rockstream_types::workload::{MemoryLimit, WorkloadDef};
     use tempfile::NamedTempFile;
 
     #[test]
     fn workload_memory_limit_transitions_views_and_audits() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
         reset_all();
         set_state_budget(1_000);
 

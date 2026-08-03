@@ -3261,13 +3261,29 @@ impl GatewayHandler {
                         // Fall through to catalog/system-table handling below.
                     } else if !top_level_relation.starts_with("pg_")
                         && !top_level_relation.starts_with("information_schema")
-                        && !select_plan.referenced_tables.is_empty()
                     {
-                        let view_name = select_plan
+                        let target_rel = select_plan
                             .referenced_tables
                             .first()
                             .cloned()
                             .unwrap_or_else(|| top_level_relation.clone());
+
+                        let has_view = self.catalog.get_view(&target_rel).is_some();
+                        let has_table = self.catalog.get_table(&target_rel).is_some();
+                        if !has_view && !has_table {
+                            return Ok(vec![promote_response(Response::Error(Box::new(
+                                ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "42P01".to_string(),
+                                    format!(
+                                        "[RS-1004] relation.does_not_exist: relation \"{}\" does not exist. next_steps: Ensure table or view has been created and check search_path.",
+                                        target_rel
+                                    ),
+                                ),
+                            )))]);
+                        }
+
+                        let view_name = target_rel;
                         // S9: search_path-aware resolution for unqualified view names.
                         // Only applies when search_path was explicitly configured via SET.
                         let is_qualified = ql.contains(&format!(".{}", view_name.to_lowercase()));
@@ -5664,6 +5680,18 @@ impl GatewayHandler {
         } else {
             cols.clone()
         };
+        if self.catalog.get_table(&table).is_none() && !insert_cols.is_empty() {
+            self.catalog.add_table(CatalogTable {
+                name: table.clone(),
+                columns: insert_cols
+                    .iter()
+                    .map(|c| CatalogColumn {
+                        name: c.clone(),
+                        data_type: "Utf8".to_string(),
+                    })
+                    .collect(),
+            });
+        }
         let metadata = self
             .table_insert_metadata
             .get(&table)
@@ -7763,6 +7791,69 @@ impl PgWireServerHandlers for GatewayHandlerFactory {
     }
 }
 
+async fn relay_negotiated_3_2_connection(
+    mut client_socket: tokio::net::TcpStream,
+    full_msg: Vec<u8>,
+    tls_acceptor_ref: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    factory_ref: Arc<GatewayHandlerFactory>,
+    peer_addr: std::net::SocketAddr,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("Failed to bind local relay listener: {e}");
+            return;
+        }
+    };
+    let local_addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("Failed to get local relay addr: {e}");
+            return;
+        }
+    };
+
+    let connect_fut = tokio::net::TcpStream::connect(local_addr);
+    let accept_fut = listener.accept();
+
+    let (local_client, (mut local_server, _)) = match tokio::try_join!(connect_fut, accept_fut) {
+        Ok(res) => (res.0, res.1),
+        Err(e) => {
+            tracing::error!("Failed to set up local relay streams: {e}");
+            return;
+        }
+    };
+
+    let pgwire_task = tokio::spawn(async move {
+        let res =
+            pgwire::tokio::process_socket(local_client, tls_acceptor_ref, factory_ref.clone())
+                .await;
+        (res, factory_ref)
+    });
+
+    if local_server.write_all(&full_msg).await.is_err() {
+        return;
+    }
+    if local_server.flush().await.is_err() {
+        return;
+    }
+
+    let _ = tokio::io::copy_bidirectional(&mut client_socket, &mut local_server).await;
+
+    if let Ok((res, factory_ref)) = pgwire_task.await {
+        if let Err(e) = res {
+            tracing::debug!("gateway connection error: {e}");
+        }
+        crate::tls::remove_mtls_cn(&peer_addr);
+        let cid = CONN_ID.with(|id| id.clone());
+        factory_ref.handler.notify_registry.unsubscribe_all(&cid);
+        factory_ref.handler.pending_notifies.remove(&cid);
+        cleanup_connection_state(&factory_ref.handler, &cid);
+    }
+}
+
 // ── GatewayServer ─────────────────────────────────────────────────────────────
 
 /// A running PostgreSQL-wire-protocol server.
@@ -7850,6 +7941,42 @@ impl GatewayServer {
         }
     }
 
+    /// Create a gateway with SCRAM-SHA-256 auth, ShardDb, and RoleCatalog.
+    pub fn with_shard_db_and_scram_auth(
+        addr: std::net::SocketAddr,
+        catalog: Arc<CatalogStubs>,
+        view_reader: Arc<dyn ViewReader>,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+        role_catalog: Arc<RoleCatalog>,
+    ) -> Self {
+        let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
+        handler.auth_mode = AuthMode::Scram;
+        handler.role_catalog = role_catalog;
+        GatewayServer {
+            addr,
+            handler: Arc::new(handler),
+            tls_acceptor: None,
+        }
+    }
+
+    /// Create a gateway with MD5 auth, ShardDb, and RoleCatalog.
+    pub fn with_shard_db_and_md5_auth(
+        addr: std::net::SocketAddr,
+        catalog: Arc<CatalogStubs>,
+        view_reader: Arc<dyn ViewReader>,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+        role_catalog: Arc<RoleCatalog>,
+    ) -> Self {
+        let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
+        handler.auth_mode = AuthMode::Md5;
+        handler.role_catalog = role_catalog;
+        GatewayServer {
+            addr,
+            handler: Arc::new(handler),
+            tls_acceptor: None,
+        }
+    }
+
     /// Create a gateway with OIDC auth enabled (for auth integration tests).
     pub fn with_shard_db_and_auth(
         addr: std::net::SocketAddr,
@@ -7914,7 +8041,6 @@ impl GatewayServer {
     pub fn handler(&self) -> &Arc<GatewayHandler> {
         &self.handler
     }
-    /// Return a reference to the handler's catalog stubs (for seeding in tests).
     pub fn catalog(&self) -> &Arc<CatalogStubs> {
         &self.handler.catalog
     }
@@ -7945,13 +8071,6 @@ impl GatewayServer {
                         let mut socket = socket;
                         let peer_addr = peer;
                         let mut buf = [0u8; 16];
-                        // Only the CancelRequest peek is intercepted here — pgwire
-                        // has no equivalent, this is a rockstream-only extension.
-                        // SSLRequest is left for pgwire::tokio::process_socket's
-                        // own peek_for_sslrequest, which answers 'S'/real TLS
-                        // handshake when tls_acceptor_ref is Some, or 'N' (byte-
-                        // for-byte the pre-v0.51.5 plaintext-refusal behavior)
-                        // when it is None.
                         if let Ok(n) = socket.peek(&mut buf).await {
                             // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
                             if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
@@ -7976,6 +8095,95 @@ impl GatewayServer {
                                 return; // CancelRequest connections don't do further work
                             }
                         }
+
+                        let mut peek_buf = [0u8; 8];
+                        if let Ok(8) = socket.peek(&mut peek_buf).await {
+                            if tls_acceptor_ref.is_none()
+                                && peek_buf != [0, 0, 0, 8, 4, 210, 22, 47]
+                            {
+                                let msg_len = u32::from_be_bytes([
+                                    peek_buf[0],
+                                    peek_buf[1],
+                                    peek_buf[2],
+                                    peek_buf[3],
+                                ]) as usize;
+                                let version = u32::from_be_bytes([
+                                    peek_buf[4],
+                                    peek_buf[5],
+                                    peek_buf[6],
+                                    peek_buf[7],
+                                ]);
+                                let major = (version >> 16) as u16;
+                                let minor = (version & 0xffff) as u16;
+                                if major == 3 && minor > 0 && (8..=100_000).contains(&msg_len) {
+                                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                    let mut full_msg = vec![0u8; msg_len];
+                                    if socket.read_exact(&mut full_msg).await.is_ok() {
+                                        // Parse _pq_.* parameters for NegotiateProtocolVersion ('v')
+                                        let mut pq_options = Vec::new();
+                                        let mut idx = 8;
+                                        while idx < full_msg.len() {
+                                            let key_start = idx;
+                                            while idx < full_msg.len() && full_msg[idx] != 0 {
+                                                idx += 1;
+                                            }
+                                            if idx >= full_msg.len() {
+                                                break;
+                                            }
+                                            let key =
+                                                String::from_utf8_lossy(&full_msg[key_start..idx])
+                                                    .to_string();
+                                            idx += 1;
+                                            if key.is_empty() {
+                                                break;
+                                            }
+                                            while idx < full_msg.len() && full_msg[idx] != 0 {
+                                                idx += 1;
+                                            }
+                                            if idx < full_msg.len() {
+                                                idx += 1;
+                                            }
+                                            if key.starts_with("_pq_.") {
+                                                pq_options.push(key);
+                                            }
+                                        }
+
+                                        // Send NegotiateProtocolVersion ('v') specifying minor version 0
+                                        let mut payload = Vec::new();
+                                        payload.extend_from_slice(&0u32.to_be_bytes()); // minor ver 0
+                                        payload.extend_from_slice(
+                                            &(pq_options.len() as u32).to_be_bytes(),
+                                        );
+                                        for opt in &pq_options {
+                                            payload.extend_from_slice(opt.as_bytes());
+                                            payload.push(0);
+                                        }
+                                        let neg_len = (4 + payload.len()) as u32;
+                                        let mut neg_msg = Vec::new();
+                                        neg_msg.push(b'v');
+                                        neg_msg.extend_from_slice(&neg_len.to_be_bytes());
+                                        neg_msg.extend_from_slice(&payload);
+
+                                        let _ = socket.write_all(&neg_msg).await;
+                                        let _ = socket.flush().await;
+
+                                        // Downgrade requested version in full_msg to 196608 (3.0)
+                                        full_msg[4..8].copy_from_slice(&196608u32.to_be_bytes());
+
+                                        relay_negotiated_3_2_connection(
+                                            socket,
+                                            full_msg,
+                                            tls_acceptor_ref,
+                                            factory_ref,
+                                            peer_addr,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
                         if let Err(e) = pgwire::tokio::process_socket(
                             socket,
                             tls_acceptor_ref.clone(),
@@ -8039,14 +8247,6 @@ impl GatewayServer {
                             let mut socket = socket;
                             let peer_addr = peer;
                             let mut buf = [0u8; 16];
-                            // Only the CancelRequest peek is intercepted here —
-                            // pgwire has no equivalent, this is a rockstream-only
-                            // extension. SSLRequest is left for
-                            // pgwire::tokio::process_socket's own
-                            // peek_for_sslrequest, which answers 'S'/real TLS
-                            // handshake when tls_acceptor_ref is Some, or 'N'
-                            // (byte-for-byte the pre-v0.51.5 plaintext-refusal
-                            // behavior) when it is None.
                             if let Ok(n) = socket.peek(&mut buf).await {
                                 // CancelRequest: [0,0,0,16, 4,210,22,46, pid(4), secret(4)]
                                 if n >= 16 && buf[..8] == [0, 0, 0, 16, 4, 210, 22, 46] {
@@ -8071,6 +8271,97 @@ impl GatewayServer {
                                     return; // CancelRequest connections don't do further work
                                 }
                             }
+
+                            let mut peek_buf = [0u8; 8];
+                            if let Ok(8) = socket.peek(&mut peek_buf).await {
+                                if tls_acceptor_ref.is_none()
+                                    && peek_buf != [0, 0, 0, 8, 4, 210, 22, 47]
+                                {
+                                    let msg_len = u32::from_be_bytes([
+                                        peek_buf[0],
+                                        peek_buf[1],
+                                        peek_buf[2],
+                                        peek_buf[3],
+                                    ]) as usize;
+                                    let version = u32::from_be_bytes([
+                                        peek_buf[4],
+                                        peek_buf[5],
+                                        peek_buf[6],
+                                        peek_buf[7],
+                                    ]);
+                                    let major = (version >> 16) as u16;
+                                    let minor = (version & 0xffff) as u16;
+                                    if major == 3 && minor > 0 && (8..=100_000).contains(&msg_len) {
+                                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                        let mut full_msg = vec![0u8; msg_len];
+                                        if socket.read_exact(&mut full_msg).await.is_ok() {
+                                            // Parse _pq_.* parameters for NegotiateProtocolVersion ('v')
+                                            let mut pq_options = Vec::new();
+                                            let mut idx = 8;
+                                            while idx < full_msg.len() {
+                                                let key_start = idx;
+                                                while idx < full_msg.len() && full_msg[idx] != 0 {
+                                                    idx += 1;
+                                                }
+                                                if idx >= full_msg.len() {
+                                                    break;
+                                                }
+                                                let key = String::from_utf8_lossy(
+                                                    &full_msg[key_start..idx],
+                                                )
+                                                .to_string();
+                                                idx += 1;
+                                                if key.is_empty() {
+                                                    break;
+                                                }
+                                                while idx < full_msg.len() && full_msg[idx] != 0 {
+                                                    idx += 1;
+                                                }
+                                                if idx < full_msg.len() {
+                                                    idx += 1;
+                                                }
+                                                if key.starts_with("_pq_.") {
+                                                    pq_options.push(key);
+                                                }
+                                            }
+
+                                            // Send NegotiateProtocolVersion ('v') specifying minor version 0
+                                            let mut payload = Vec::new();
+                                            payload.extend_from_slice(&0u32.to_be_bytes()); // minor ver 0
+                                            payload.extend_from_slice(
+                                                &(pq_options.len() as u32).to_be_bytes(),
+                                            );
+                                            for opt in &pq_options {
+                                                payload.extend_from_slice(opt.as_bytes());
+                                                payload.push(0);
+                                            }
+                                            let neg_len = (4 + payload.len()) as u32;
+                                            let mut neg_msg = Vec::new();
+                                            neg_msg.push(b'v');
+                                            neg_msg.extend_from_slice(&neg_len.to_be_bytes());
+                                            neg_msg.extend_from_slice(&payload);
+
+                                            let _ = socket.write_all(&neg_msg).await;
+                                            let _ = socket.flush().await;
+
+                                            // Downgrade requested version in full_msg to 196608 (3.0)
+                                            full_msg[4..8]
+                                                .copy_from_slice(&196608u32.to_be_bytes());
+
+                                            relay_negotiated_3_2_connection(
+                                                socket,
+                                                full_msg,
+                                                tls_acceptor_ref,
+                                                factory_ref,
+                                                peer_addr,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+
                             if let Err(e) = pgwire::tokio::process_socket(
                                 socket,
                                 tls_acceptor_ref.clone(),

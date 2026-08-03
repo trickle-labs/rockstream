@@ -2412,6 +2412,11 @@ async fn session_wait_for_bounded_by_timeout() {
     let (port, _handle, _shard_db) = start_gateway_with_shard("wait-for-bounded").await;
     let client = connect_port(port).await;
 
+    client
+        .simple_query("INSERT INTO t (id, val) VALUES (1, 'x')")
+        .await
+        .unwrap();
+
     // 50 ms timeout, impossible epoch.
     client
         .simple_query("SET rockstream.session_wait_for_timeout_ms = '50'")

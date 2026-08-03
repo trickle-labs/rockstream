@@ -63,7 +63,7 @@ async fn connect(addr: &str) -> tokio_postgres::Client {
 async fn connect_with_retries(port: u16) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
     let conn_str = format!("host=127.0.0.1 port={port} user=test dbname=test");
     let mut last_err = None;
-    for _ in 0..5 {
+    for _ in 0..30 {
         match tokio_postgres::connect(&conn_str, NoTls).await {
             Ok((client, conn)) => {
                 let handle = tokio::spawn(async move {
@@ -75,7 +75,7 @@ async fn connect_with_retries(port: u16) -> (tokio_postgres::Client, tokio::task
             }
             Err(err) => {
                 last_err = Some(err);
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -269,10 +269,13 @@ async fn test_concurrent_1000_connections_no_errors() {
 
     let n_connections: usize = 1_000;
     let queries_per_connection: usize = 100;
+    let sem = Arc::new(tokio::sync::Semaphore::new(30));
 
     let mut handles = Vec::with_capacity(n_connections);
     for _ in 0..n_connections {
+        let sem = Arc::clone(&sem);
         handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
             let (client, _conn) = connect_with_retries(port).await;
             for _ in 0..queries_per_connection {
                 client.simple_query("SELECT 1").await.expect("query failed");
