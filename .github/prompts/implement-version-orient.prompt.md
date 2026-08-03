@@ -45,20 +45,33 @@ description: "Phase 0–1: Validate input and orient — confirm version exists,
 ## Phase 1: Orient
 
 1. **Read only the `${input:version}` row** from NEW_ROADMAP.md.
-2. **Check** `sign-offs/` for any prior version with deferred items overlapping
-   this version's Scope. List any found items explicitly.
+2. **Extended Deferred-Item Audit** (three-pass scan):
+   - **Pass A**: Read every prior sign-off for items marked: "deferred", "TODO", 
+     "stub", "placeholder", "out-of-scope". List any that overlap this version's Scope.
+   - **Pass B**: Grep codebase for `// TODO`, `unimplemented!()`, `panic!("not yet")`, 
+     `FIXME:` in files this version likely touches (compiler, gateway, ops, plan, storage).
+   - **Pass C** (SQL features only): For every feature claimed "implemented" in 
+     `docs/language-features.md`, verify it appears in actual source:
+     - Parser: `rtk grep "<keyword>" crates/rockstream-sql/src/`
+     - Dispatch: `rtk grep "<keyword>" crates/rockstream-gateway/src/server.rs`
+     - Lowering: `rtk grep "<keyword>" crates/rockstream-sql/src/lower.rs`
+     - If a claimed-implemented feature has **zero matches** in dispatch/parser/lowering, 
+       it is an undocumented deferral — list it.
+   - Report all three categories: explicit deferrals, code TODOs, and implicit (undocumented) deferrals.
 3. **Restate**, in your own words, the **exact proof obligations** for this
    version. List every concrete claim in the Proof column as a checkable
    assertion. This list is your contract — nothing is "done" until every item
    is independently verifiable.
-4. **Confirm** the deferred-item audit is complete.
+4. **Confirm** the extended deferred-item audit is complete and all categories reported.
 
 ---
 
 ## Exit
 
+If any undocumented deferrals (Pass C findings) are discovered, they must be picked up and implemented in this version — do not defer. Confirm this explicitly before proceeding.
+
 Output **exactly** this message and nothing else:
 
-> "Phases 0–1 done. Proof obligations restated above. Run `/implement-version-plan` with version `${input:version}` to continue."
+> "Phases 0–1 done. Proof obligations restated above. Extended audit (explicit deferrals, code TODOs, undocumented gaps) complete. Run `/implement-version-plan` with version `${input:version}` to continue."
 
 Stop. Do not proceed further.

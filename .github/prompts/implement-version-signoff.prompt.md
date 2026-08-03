@@ -45,6 +45,11 @@ Finish with a concise report containing:
     `rtk cargo test --workspace` all pass.
   - New behavior has unit tests **plus** oracle/property, LFS, MinIO, and/or
     TestContainers tests.
+  - **SQL/wire-protocol features** additionally have:
+    - **Reachability tests** (e2e pgwire): Raw SQL/command sent through actual dispatcher, callable from `psql`
+    - **Negative tests**: Invalid input returns `RS-XXXX` error with actionable text (not silent empty response or wrong answer)
+    - **Dispatch-wiring verification**: Every path in Phase 2 audit (parser → dispatcher → executor → response) is tested as actually connected; grep output proving it or test name proving it
+    - **Coverage matrix tests**: Every cell (key_type × value_type × aggregate, etc.) has a passing test
   - Every user/operator-visible failure has an `RS-XXXX` code with actionable text.
   - Every control-plane action writes an audit event.
   - Every new performance claim has a `criterion` benchmark or measurement note.

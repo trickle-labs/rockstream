@@ -23,6 +23,10 @@ test mapping before running any proofs.
 
 Satisfy every rung the version's **Backends** and **Proof** require:
 
+- **Reachability / e2e pgwire** (SQL/wire-protocol features): Every SQL feature must pass an **end-to-end test sending raw SQL through the actual dispatcher**, proving it's callable from `psql` or a standard client without importing private modules. This is independent of unit-test coverage.
+- **Negative/error handling**: Every SQL/wire feature must pass explicit negative tests — invalid input must return an `RS-XXXX` error with actionable text, never a silent empty response or wrong answer.
+- **Dispatch-wiring audit verification**: Every path in the Phase 2 dispatch-wiring audit must be tested as actually connected (grep output or test proof that parser → dispatcher → executor → response encoder are all wired). Report any path still MISSING as a Phase 4 failure.
+- **Coverage matrix**: Every cell in the Phase 2 coverage matrix (key_type × value_type × aggregate, etc.) must pass a test. A cell without a test is a Phase 4 gap.
 - **Oracle / property**: Every new operator passes `incremental == batch` over
   randomized insert/update/delete/retract sequences at the scenario count the
   Proof names. Use the DataFusion batch reference in `rockstream-oracle`.
@@ -44,16 +48,26 @@ Satisfy every rung the version's **Backends** and **Proof** require:
   results. A soak is a gate, not a loophole.
 
 For every Proof claim, capture concrete evidence (test name, command, CI output,
-benchmark number, seed, or measurement note).
+benchmark number, seed, or measurement note). For SQL/wire features, additionally capture:
+- Test file name and test function name for reachability test (e2e pgwire)
+- Test file name and test function name for negative tests (error handling)
+- Grep output or test proof showing each dispatch-wiring path is connected
 
 ---
 
 ## Exit
 
-Once all Proof claims have passed and evidence is collected:
+Once all Proof claims have passed and evidence is collected, verify no Phase 4 gaps remain:
+
+- [ ] **Reachability tests** (e2e pgwire): Every SQL/wire feature has a test sending raw SQL through the dispatcher
+- [ ] **Negative tests**: Every SQL/wire feature has tests for invalid input returning proper `RS-XXXX`
+- [ ] **Dispatch-wiring audit**: Every path in Phase 2 audit is proven connected (grep or test output)
+- [ ] **Coverage matrix**: Every cell has a passing test
+- [ ] All other Proof obligations met (oracle, LFS, MinIO, SimRuntime, benchmarks, soak, etc.)
 
 1. Write the proof evidence table to `.claude/${input:version}-evidence.md` —
    each claim, the test/command that proves it, and pass/fail with output excerpt.
+   For SQL/wire features, include dispatch-wiring verification and reachability test output.
 2. Output **exactly** this message and nothing else:
-   > "Phase 4 done. Evidence saved to `.claude/${input:version}-evidence.md`. Run `/compact` now, then run `/implement-version-signoff` with version `${input:version}`."
+   > "Phase 4 done. All Proof claims passing (including reachability, negative tests, and dispatch-wiring verification). Evidence saved to `.claude/${input:version}-evidence.md`. Run `/compact` now, then run `/implement-version-signoff` with version `${input:version}`."
 3. Stop. Do not proceed. Do not read any further prompt files.
