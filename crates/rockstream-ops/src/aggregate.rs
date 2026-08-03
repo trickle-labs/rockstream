@@ -292,12 +292,29 @@ impl Operator for AggregateOp {
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
-        let v_col = delta
-            .data
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
+        let v_raw = delta.data.column(1);
+        let v_col_owned = if let Some(arr) = v_raw.as_any().downcast_ref::<Int64Array>() {
+            arr.clone()
+        } else if let Ok(cast_arr) = arrow::compute::cast(v_raw.as_ref(), &DataType::Int64) {
+            cast_arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .cloned()
+                .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?
+        } else if let Ok(cast_arr) = arrow::compute::cast(v_raw.as_ref(), &DataType::Float64) {
+            let f_arr = cast_arr
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
+            let ints: Vec<i64> = (0..f_arr.len()).map(|r| f_arr.value(r) as i64).collect();
+            Int64Array::from(ints)
+        } else {
+            return Err(OpError::column_type_mismatch(
+                "Int64",
+                format!("{:?}", v_raw.data_type()),
+            ));
+        };
+        let v_col = &v_col_owned;
 
         let n = delta.num_rows();
 

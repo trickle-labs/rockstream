@@ -1568,8 +1568,16 @@ impl GatewayHandler {
             ),
         };
 
-        rockstream_ops::compile_plan(&view_plan, shard_db, table_schemas)
-            .map_err(|e| format!("compile_plan: {e}"))
+        match rockstream_ops::compile_plan(&view_plan, shard_db, table_schemas) {
+            Ok(compiled) => Ok(compiled),
+            Err(compile_err) => {
+                let mut diff_ctx = rockstream_diff::DiffCtx::new();
+                let _physical_plan = diff_ctx
+                    .differentiate(&view_plan)
+                    .map_err(|e| format!("DiffCtx physical plan lowering failed: {e:?}"))?;
+                Err(format!("compile_plan: {compile_err}"))
+            }
+        }
     }
 
     /// Same as `try_compile_view`, but reuses `sink_op_id` instead of
@@ -1598,8 +1606,21 @@ impl GatewayHandler {
             ),
         };
 
-        rockstream_ops::compile_plan_with_sink_id(&view_plan, shard_db, table_schemas, sink_op_id)
-            .map_err(|e| format!("compile_plan_with_sink_id: {e}"))
+        match rockstream_ops::compile_plan_with_sink_id(
+            &view_plan,
+            shard_db,
+            table_schemas,
+            sink_op_id,
+        ) {
+            Ok(compiled) => Ok(compiled),
+            Err(compile_err) => {
+                let mut diff_ctx = rockstream_diff::DiffCtx::new();
+                let _physical_plan = diff_ctx
+                    .differentiate(&view_plan)
+                    .map_err(|e| format!("DiffCtx physical plan lowering failed: {e:?}"))?;
+                Err(format!("compile_plan_with_sink_id: {compile_err}"))
+            }
+        }
     }
 
     /// Recompile every catalog-registered view that already carries a

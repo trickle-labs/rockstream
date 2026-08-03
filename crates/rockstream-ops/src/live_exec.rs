@@ -191,10 +191,7 @@ impl Stage {
         match self {
             Stage::Stateless(_) => Ok(()),
             Stage::Aggregate(op) => persist_agg_state(db, op).await,
-            // No restart-persistence wiring yet for `MinMax` (not among
-            // this version's Durability Slices) — same documented scope
-            // as `Utf8*Pack`/`KeyPack` below.
-            Stage::MinMax(_, _) => Ok(()),
+            Stage::MinMax(op, _) => crate::minmax::persist_minmax_state(db, op).await,
             Stage::Distinct(op, id) => persist_distinct_state(db, op, *id).await,
             Stage::TumbleWindow(op, id) => persist_tumble_window_state(db, op, *id).await,
             Stage::HopWindow(op, id) => persist_hop_window_state(db, op, *id).await,
@@ -249,6 +246,8 @@ impl Stage {
             // `KeyUnpack` stage shares the same `Arc<GroupKeyPacker>`, so
             // restoring once via `KeyPack`'s id is sufficient.
             Stage::KeyPack(packer, id) => packer.restore_in_place(db, *id).await,
+            Stage::MinMax(op, _) => op.restore_in_place(db).await,
+            Stage::MultiAggregate(op) => Box::pin(op.restore_in_place(db)).await,
             _ => Ok(()),
         }
     }
@@ -274,6 +273,7 @@ pub struct GroupKeyPacker {
     n_key_cols: usize,
     forward: Mutex<HashMap<Vec<u8>, i64>>,
     reverse: Mutex<HashMap<i64, Vec<i64>>>,
+    reverse_slices: Mutex<HashMap<i64, Vec<ArrayRef>>>,
     next_id: Mutex<i64>,
 }
 
@@ -283,6 +283,7 @@ impl GroupKeyPacker {
             n_key_cols,
             forward: Mutex::new(HashMap::new()),
             reverse: Mutex::new(HashMap::new()),
+            reverse_slices: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
         }
     }
@@ -346,6 +347,7 @@ impl GroupKeyPacker {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn encode_tuple(vals: &[i64]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(vals.len() * 8);
         for v in vals {
@@ -354,6 +356,7 @@ impl GroupKeyPacker {
         buf
     }
 
+    #[allow(dead_code)]
     fn surrogate_for(&self, key_vals: &[i64]) -> i64 {
         let encoded = Self::encode_tuple(key_vals);
         let mut forward = self.forward.lock().unwrap();
@@ -369,36 +372,117 @@ impl GroupKeyPacker {
         id
     }
 
+    fn encode_array_row_key(col: &dyn arrow::array::Array, row: usize, buf: &mut Vec<u8>) {
+        if col.is_null(row) {
+            buf.push(0);
+            return;
+        }
+        buf.push(1);
+        use arrow::array::*;
+        if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<Int16Array>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<Int8Array>() {
+            buf.push(a.value(row) as u8);
+        } else if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<UInt16Array>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<UInt8Array>() {
+            buf.push(a.value(row));
+        } else if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+            buf.extend_from_slice(&a.value(row).to_bits().to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
+            buf.extend_from_slice(&a.value(row).to_bits().to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+            let s = a.value(row);
+            buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<Date32Array>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
+            buf.push(if a.value(row) { 1 } else { 0 });
+        } else if let Some(a) = col.as_any().downcast_ref::<Decimal128Array>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<TimestampSecondArray>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<TimestampMillisecondArray>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else if let Some(a) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
+            buf.extend_from_slice(&a.value(row).to_be_bytes());
+        } else {
+            let s = format!("{:?}", col.as_any());
+            buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+    }
+
     /// `(k0, .., k_{n-1}, v)` rows → `(surrogate_k, v)` rows, one-to-one,
     /// preserving row order and weight.
     pub fn pack(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
         let n = self.n_key_cols;
         let mut surrogate_keys: Vec<i64> = Vec::with_capacity(delta.num_rows());
-        let mut values: Vec<i64> = Vec::with_capacity(delta.num_rows());
-        let cols: Vec<&Int64Array> = delta
-            .data
-            .columns()
-            .iter()
-            .map(|c| {
-                c.as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("Int64 column")
-            })
-            .collect();
+        let mut forward = self.forward.lock().unwrap();
+        let mut reverse = self.reverse.lock().unwrap();
+        let mut reverse_slices = self.reverse_slices.lock().unwrap();
+        let mut next_id = self.next_id.lock().unwrap();
+
         for row in 0..delta.num_rows() {
-            let key_vals: Vec<i64> = (0..n).map(|i| cols[i].value(row)).collect();
-            surrogate_keys.push(self.surrogate_for(&key_vals));
-            values.push(cols.get(n).map(|c| c.value(row)).unwrap_or(0));
+            let mut encoded = Vec::new();
+            for i in 0..n {
+                Self::encode_array_row_key(delta.data.column(i).as_ref(), row, &mut encoded);
+            }
+            let id = if let Some(&existing_id) = forward.get(&encoded) {
+                existing_id
+            } else {
+                let id = *next_id;
+                *next_id += 1;
+                forward.insert(encoded, id);
+
+                let key_slices: Vec<ArrayRef> =
+                    (0..n).map(|i| delta.data.column(i).slice(row, 1)).collect();
+                reverse_slices.insert(id, key_slices);
+
+                let mut int64_vals = Vec::new();
+                let mut all_int64 = true;
+                for i in 0..n {
+                    if let Some(col) = delta.data.column(i).as_any().downcast_ref::<Int64Array>() {
+                        int64_vals.push(col.value(row));
+                    } else {
+                        all_int64 = false;
+                        break;
+                    }
+                }
+                if all_int64 {
+                    reverse.insert(id, int64_vals);
+                }
+                id
+            };
+            surrogate_keys.push(id);
         }
+
+        let val_col = if delta.data.num_columns() > n {
+            delta.data.column(n).clone()
+        } else {
+            Arc::new(Int64Array::from(vec![0; delta.num_rows()])) as ArrayRef
+        };
+
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Int64, false),
+            Field::new("v", val_col.data_type().clone(), false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int64Array::from(surrogate_keys)) as ArrayRef,
-                Arc::new(Int64Array::from(values)) as ArrayRef,
+                val_col,
             ],
         )
         .map_err(OpError::arrow)?;
@@ -407,12 +491,6 @@ impl GroupKeyPacker {
 
     /// `(surrogate_k, sum, count, avg)` rows → `(k0, .., k_{n-1}, sum,
     /// count, avg)` rows, one-to-one, preserving row order and weight.
-    ///
-    /// Each "rest" (non-key) input column is preserved in its own Arrow
-    /// type: `AggregateOp`'s `sum`/`count` columns are `Int64`, but its
-    /// `avg` column is `Float64` (v0.51.6 Slice 4 — correct floating-point
-    /// division). `MinMaxOp`'s single `extremum_v` rest column is `Int64`.
-    /// The surrogate key column itself (`cols[0]`) is always `Int64`.
     pub fn unpack(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
         let n = self.n_key_cols;
         let surrogate_col = delta
@@ -421,25 +499,62 @@ impl GroupKeyPacker {
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("Int64 surrogate key column");
+        let num_rows = delta.num_rows();
+
+        let reverse_slices = self.reverse_slices.lock().unwrap();
         let reverse = self.reverse.lock().unwrap();
-        let mut key_cols: Vec<Vec<i64>> = vec![Vec::with_capacity(delta.num_rows()); n];
-        for row in 0..delta.num_rows() {
-            let surrogate = surrogate_col.value(row);
-            let orig = reverse
-                .get(&surrogate)
-                .cloned()
-                .unwrap_or_else(|| vec![0; n]);
-            for (i, v) in orig.into_iter().enumerate().take(n) {
-                key_cols[i].push(v);
+
+        let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(n);
+        let mut key_fields: Vec<Field> = Vec::with_capacity(n);
+
+        if num_rows == 0 {
+            for i in 0..n {
+                let sample_slice = reverse_slices.values().find_map(|v| v.get(i).cloned());
+                let dt = sample_slice
+                    .as_ref()
+                    .map(|s| s.data_type().clone())
+                    .unwrap_or(DataType::Int64);
+                key_fields.push(Field::new(format!("k{i}"), dt.clone(), false));
+                key_cols.push(arrow::array::new_empty_array(&dt));
+            }
+        } else {
+            for i in 0..n {
+                let mut slices_col_i: Vec<ArrayRef> = Vec::with_capacity(num_rows);
+                let mut fallback_dt: Option<DataType> = None;
+                for row in 0..num_rows {
+                    let surrogate = surrogate_col.value(row);
+                    if let Some(slices) = reverse_slices.get(&surrogate) {
+                        if fallback_dt.is_none() {
+                            fallback_dt = Some(slices[i].data_type().clone());
+                        }
+                        slices_col_i.push(slices[i].clone());
+                    } else if let Some(orig_i64) = reverse.get(&surrogate) {
+                        let val = orig_i64.get(i).copied().unwrap_or(0);
+                        let arr = Arc::new(Int64Array::from(vec![val])) as ArrayRef;
+                        if fallback_dt.is_none() {
+                            fallback_dt = Some(DataType::Int64);
+                        }
+                        slices_col_i.push(arr);
+                    } else {
+                        let dt = fallback_dt.clone().unwrap_or(DataType::Int64);
+                        slices_col_i.push(arrow::array::new_empty_array(&dt));
+                    }
+                }
+                let col_refs: Vec<&dyn arrow::array::Array> =
+                    slices_col_i.iter().map(|s| s.as_ref()).collect();
+                let concat_col = arrow::compute::concat(&col_refs).map_err(OpError::arrow)?;
+                key_fields.push(Field::new(
+                    format!("k{i}"),
+                    concat_col.data_type().clone(),
+                    false,
+                ));
+                key_cols.push(concat_col);
             }
         }
-        let mut fields: Vec<Field> = (0..n)
-            .map(|i| Field::new(format!("k{i}"), DataType::Int64, false))
-            .collect();
-        let mut arrays: Vec<ArrayRef> = key_cols
-            .into_iter()
-            .map(|c| Arc::new(Int64Array::from(c)) as ArrayRef)
-            .collect();
+
+        let mut fields = key_fields;
+        let mut arrays = key_cols;
+
         // Rest columns (everything after the surrogate key) are passed
         // through unchanged, preserving each column's own Arrow type.
         for (i, col) in delta.data.columns().iter().enumerate().skip(1) {
@@ -923,6 +1038,16 @@ impl MultiAggregatePipeline {
         }
         for join in &self.joins {
             join.persist_state(db).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
+        for lane in &self.lanes {
+            lane.restore(db).await?;
+        }
+        for join in &self.joins {
+            join.restore_in_place(db).await?;
         }
         Ok(())
     }

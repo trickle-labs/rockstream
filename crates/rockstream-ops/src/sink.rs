@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, Float64Array, Int64Array};
 use arrow::datatypes::DataType;
 use rockstream_storage::{ShardDb, ShardPrefix, WriteBatch};
 use rockstream_types::ids::OperatorId;
@@ -116,10 +116,90 @@ impl ViewSinkOp {
                     buf.push(TAG_INT64);
                     buf.extend_from_slice(&arr.value(row).to_be_bytes());
                 }
+                DataType::Int32 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int32Array>()
+                        .expect("ViewSink: column typed Int32 but downcast failed");
+                    buf.push(TAG_INT64);
+                    buf.extend_from_slice(&(arr.value(row) as i64).to_be_bytes());
+                }
+                DataType::Int16 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int16Array>()
+                        .expect("ViewSink: column typed Int16 but downcast failed");
+                    buf.push(TAG_INT64);
+                    buf.extend_from_slice(&(arr.value(row) as i64).to_be_bytes());
+                }
+                DataType::Int8 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int8Array>()
+                        .expect("ViewSink: column typed Int8 but downcast failed");
+                    buf.push(TAG_INT64);
+                    buf.extend_from_slice(&(arr.value(row) as i64).to_be_bytes());
+                }
+                DataType::UInt64 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt64Array>()
+                        .expect("ViewSink: column typed UInt64 but downcast failed");
+                    buf.push(TAG_INT64);
+                    buf.extend_from_slice(&(arr.value(row) as i64).to_be_bytes());
+                }
+                DataType::UInt32 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt32Array>()
+                        .expect("ViewSink: column typed UInt32 but downcast failed");
+                    buf.push(TAG_INT64);
+                    buf.extend_from_slice(&(arr.value(row) as i64).to_be_bytes());
+                }
+                DataType::UInt16 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt16Array>()
+                        .expect("ViewSink: column typed UInt16 but downcast failed");
+                    buf.push(TAG_INT64);
+                    buf.extend_from_slice(&(arr.value(row) as i64).to_be_bytes());
+                }
+                DataType::UInt8 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt8Array>()
+                        .expect("ViewSink: column typed UInt8 but downcast failed");
+                    buf.push(TAG_INT64);
+                    buf.extend_from_slice(&(arr.value(row) as i64).to_be_bytes());
+                }
+                DataType::Date32 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::Date32Array>()
+                        .expect("ViewSink: column typed Date32 but downcast failed");
+                    buf.push(TAG_INT64);
+                    buf.extend_from_slice(&(arr.value(row) as i64).to_be_bytes());
+                }
+                DataType::Float64 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .expect("ViewSink: column typed Float64 but downcast failed");
+                    buf.push(TAG_FLOAT64);
+                    buf.extend_from_slice(&arr.value(row).to_bits().to_be_bytes());
+                }
+                DataType::Float32 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::Float32Array>()
+                        .expect("ViewSink: column typed Float32 but downcast failed");
+                    buf.push(TAG_FLOAT64);
+                    buf.extend_from_slice(&(arr.value(row) as f64).to_bits().to_be_bytes());
+                }
                 DataType::Utf8 => {
                     let arr = col
                         .as_any()
-                        .downcast_ref::<StringArray>()
+                        .downcast_ref::<arrow::array::StringArray>()
                         .expect("ViewSink: column typed Utf8 but downcast failed");
                     let s = arr.value(row);
                     buf.push(TAG_UTF8);
@@ -129,18 +209,10 @@ impl ViewSinkOp {
                 DataType::Boolean => {
                     let arr = col
                         .as_any()
-                        .downcast_ref::<BooleanArray>()
+                        .downcast_ref::<arrow::array::BooleanArray>()
                         .expect("ViewSink: column typed Boolean but downcast failed");
                     buf.push(TAG_BOOLEAN);
                     buf.push(if arr.value(row) { 1 } else { 0 });
-                }
-                DataType::Float64 => {
-                    let arr = col
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .expect("ViewSink: column typed Float64 but downcast failed");
-                    buf.push(TAG_FLOAT64);
-                    buf.extend_from_slice(&arr.value(row).to_bits().to_be_bytes());
                 }
                 other => panic!("ViewSink: unsupported column type {other:?}"),
             }

@@ -278,6 +278,14 @@ impl MinMaxOp {
             .true_extremum(group_key)
     }
 
+    /// Restore MinMaxOp state from `db` into this instance in place.
+    pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
+        let loaded = Self::load_from_storage(db, self.op_id, self.kind).await?;
+        let loaded_state = loaded.state.into_inner().expect("MinMaxOp mutex poisoned");
+        *self.state.lock().expect("MinMaxOp mutex poisoned") = loaded_state;
+        Ok(())
+    }
+
     /// Encode multiset state as a `WriteBatch` for persistence.
     pub fn multiset_write_batch(&self) -> WriteBatch {
         self.state
@@ -387,12 +395,22 @@ impl Operator for MinMaxOp {
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
-        let v_col = delta
-            .data
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?;
+        let v_raw = delta.data.column(1);
+        let v_col_owned = if let Some(arr) = v_raw.as_any().downcast_ref::<Int64Array>() {
+            arr.clone()
+        } else if let Ok(cast_arr) = arrow::compute::cast(v_raw.as_ref(), &DataType::Int64) {
+            cast_arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .cloned()
+                .ok_or_else(|| OpError::column_type_mismatch("Int64", "other"))?
+        } else {
+            return Err(OpError::column_type_mismatch(
+                "Int64",
+                format!("{:?}", v_raw.data_type()),
+            ));
+        };
+        let v_col = &v_col_owned;
 
         let n = delta.num_rows();
         let mut out_k: Vec<i64> = Vec::with_capacity(n * 2);

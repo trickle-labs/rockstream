@@ -1133,6 +1133,14 @@ impl OuterJoinOp {
             right_staged: Mutex::new(StagedDelta::default()),
         })
     }
+
+    /// Restore OuterJoinOp state from `db` into this instance in place.
+    pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
+        let loaded = Self::load_from_storage(db, self.op_id, self.kind).await?;
+        let loaded_st = loaded.state.into_inner().unwrap();
+        *self.state.lock().unwrap() = loaded_st;
+        Ok(())
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

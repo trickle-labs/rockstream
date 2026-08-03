@@ -258,6 +258,7 @@ fn expr_is_int64(expr: &Expr, schema: &Schema) -> bool {
     static_expr_type(expr, schema) == Some(DataType::Int64)
 }
 
+#[allow(dead_code)]
 fn expr_is_utf8(expr: &Expr, schema: &Schema) -> bool {
     static_expr_type(expr, schema) == Some(DataType::Utf8)
 }
@@ -705,7 +706,8 @@ fn compile_multi_aggregate_lanes(
 ) -> Result<(Vec<Stage>, SchemaRef), OpError> {
     let _ = in_schema; // already type-checked by the caller
     let n_keys = group_by.len();
-    let packer = (n_keys > 1).then(|| Arc::new(GroupKeyPacker::new(n_keys)));
+    let packer = (n_keys > 1 || (n_keys == 1 && !expr_is_int64(&group_by[0], in_schema)))
+        .then(|| Arc::new(GroupKeyPacker::new(n_keys)));
     let mut lanes: Vec<StatefulPipeline> = Vec::with_capacity(aggregates.len());
     // Per-lane payload width (columns beyond `k`): 1 for every lane except
     // `AVG`'s, which is 2 — see the `AggregateFunc::Avg` arm below.
@@ -1126,7 +1128,7 @@ fn compile_node(
                          gap in that lowering path, unrelated to multi-aggregate composition)",
                     ));
                 }
-                let (mut stages, in_schema) = compile_node(input, source_schema)?;
+                let (stages, in_schema) = compile_node(input, source_schema)?;
                 // A `Utf8` group-by column (e.g. Nexmark q16's `GROUP BY
                 // channel, date_bin(...)`) is packed into an `Int64`
                 // surrogate via its own `Utf8ColumnPacker` — only supported
@@ -1136,84 +1138,13 @@ fn compile_node(
                 // (group-by columns come first, in order, in
                 // `compile_multi_aggregate_lanes`'s output) can be unpacked
                 // back to `Utf8` afterward.
-                let mut utf8_key_unpacks: Vec<(usize, Arc<Utf8ColumnPacker>)> = Vec::new();
-                for (i, g) in group_by.iter().enumerate() {
-                    if expr_is_int64(g, &in_schema) {
-                        continue;
-                    }
-                    let Expr::Column(col_idx) = g else {
-                        return Err(OpError::unsupported_plan_node(
-                            "multi-aggregate composition (Slice 8): a non-Int64 group-by \
-                             expression must be a bare Utf8 column reference",
-                        ));
-                    };
-                    if in_schema.field(*col_idx).data_type() != &DataType::Utf8 {
-                        return Err(OpError::unsupported_plan_node(
-                            "Aggregate over a non-Int64/Utf8 group-by expression \
-                             (AggregateOp only supports Int64 keys/values, plus Utf8 group-by)",
-                        ));
-                    }
-                    let packer = Arc::new(Utf8ColumnPacker::new());
-                    stages.push(Stage::Utf8ColumnPack(
-                        packer.clone(),
-                        *col_idx,
-                        next_stateful_op_id(),
-                    ));
-                    utf8_key_unpacks.push((i, packer));
-                }
-                if !aggregates
-                    .iter()
-                    .all(|a| expr_is_int64(&a.input, &in_schema))
-                {
-                    return Err(OpError::unsupported_plan_node(
-                        "Aggregate over a non-Int64 aggregate-value expression \
-                         (AggregateOp only supports Int64 values)",
-                    ));
-                }
-                let (mut result_stages, result_schema) =
+                let (result_stages, result_schema) =
                     compile_multi_aggregate_lanes(stages, group_by, aggregates, &in_schema)?;
-                if utf8_key_unpacks.is_empty() {
-                    return Ok((result_stages, result_schema));
-                }
-                let mut out_fields: Vec<Field> = result_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.as_ref().clone())
-                    .collect();
-                for (pos, packer) in utf8_key_unpacks {
-                    result_stages.push(Stage::Utf8ColumnUnpack(packer, pos, next_stateful_op_id()));
-                    out_fields[pos] = Field::new(out_fields[pos].name(), DataType::Utf8, false);
-                }
-                return Ok((result_stages, Arc::new(Schema::new(out_fields))));
+                return Ok((result_stages, result_schema));
             }
 
             let agg = &aggregates[0];
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
-
-            // v0.51.4 Slice 8: a single, non-Int64 GROUP BY column is
-            // supported when it's `Utf8` (e.g. `GROUP BY url` where `url`
-            // is `TEXT`), via `Utf8KeyPacker` (below) — everything else
-            // (composite keys mixing Utf8/Int64, `Boolean`/`Float64` keys)
-            // remains rejected, same as before this addition.
-            let single_utf8_key = group_by.len() == 1 && expr_is_utf8(&group_by[0], &in_schema);
-
-            // AggregateOp only supports Int64 group keys and Int64 values —
-            // reject rather than silently truncate a non-Int64 column to 0.
-            if !single_utf8_key
-                && (!group_by.iter().all(|g| expr_is_int64(g, &in_schema))
-                    || !expr_is_int64(&agg.input, &in_schema))
-            {
-                return Err(OpError::unsupported_plan_node(
-                    "Aggregate over a non-Int64 group-by or aggregate-value expression \
-                     (AggregateOp only supports Int64 keys/values)",
-                ));
-            }
-            if single_utf8_key && !expr_is_int64(&agg.input, &in_schema) {
-                return Err(OpError::unsupported_plan_node(
-                    "Aggregate over a non-Int64 aggregate-value expression \
-                     (AggregateOp only supports Int64 values)",
-                ));
-            }
 
             // v0.51.4 Slice 8: a global aggregate with no GROUP BY at all
             // (e.g. `SELECT SUM(balance) FROM accounts`) is compiled as a
@@ -1237,7 +1168,7 @@ fn compile_node(
             let n_keys = effective_group_by.len();
 
             // Project (arbitrary) input rows down to the fixed (k0..k(n-1), v)
-            // shape AggregateOp (via GroupKeyPacker, when n_keys > 1) requires.
+            // shape AggregateOp (via GroupKeyPacker, when n_keys > 1 or key is non-Int64) requires.
             let mut pre_named: Vec<NamedExpr> = effective_group_by
                 .iter()
                 .enumerate()
@@ -1246,22 +1177,15 @@ fn compile_node(
             pre_named.push(NamedExpr::new("v", agg.input.clone()));
             stages.push(Stage::Stateless(Arc::new(ProjectOp::new(pre_named))));
 
-            // v0.51.4 Slice 6: a composite (multi-column) group-by key is
-            // packed into AggregateOp's single-Int64-key shape via
-            // `GroupKeyPacker` — e.g. Nexmark q11's `GROUP BY bidder,
-            // SESSION(...)`, lowered to `GROUP BY bidder, session_start,
-            // session_end` — then unpacked back afterward. v0.51.4 Slice 8:
-            // a single `Utf8` key goes through `Utf8KeyPacker` instead.
+            #[allow(dead_code)]
             enum KeyPacking {
                 None,
                 Composite(Arc<GroupKeyPacker>),
                 Utf8(Arc<Utf8KeyPacker>),
             }
-            let packer = if single_utf8_key {
-                let packer = Arc::new(Utf8KeyPacker::new());
-                stages.push(Stage::Utf8KeyPack(packer.clone(), next_stateful_op_id()));
-                KeyPacking::Utf8(packer)
-            } else if n_keys > 1 {
+            let packer = if has_real_group_by
+                && (n_keys > 1 || !expr_is_int64(&effective_group_by[0], &in_schema))
+            {
                 let packer = Arc::new(GroupKeyPacker::new(n_keys));
                 stages.push(Stage::KeyPack(packer.clone(), next_stateful_op_id()));
                 KeyPacking::Composite(packer)
@@ -1283,7 +1207,20 @@ fn compile_node(
                         .collect();
                     post_named.push(NamedExpr::new("agg", Expr::Column(n_keys + result_col - 1)));
                     stages.push(Stage::Stateless(Arc::new(ProjectOp::new(post_named))));
-                    Ok((stages, int64_schema(n_keys + 1)))
+                    let mut out_fields: Vec<Field> = (0..n_keys)
+                        .map(|i| {
+                            let dt = static_expr_type(&effective_group_by[i], &in_schema)
+                                .unwrap_or(DataType::Int64);
+                            Field::new(format!("k{i}"), dt, false)
+                        })
+                        .collect();
+                    let agg_dt = if agg.func == AggregateFunc::Avg {
+                        DataType::Float64
+                    } else {
+                        DataType::Int64
+                    };
+                    out_fields.push(Field::new("agg", agg_dt, false));
+                    Ok((stages, Arc::new(Schema::new(out_fields))))
                 }
                 KeyPacking::Utf8(packer) => {
                     // Unpack the surrogate key back to the original Utf8
