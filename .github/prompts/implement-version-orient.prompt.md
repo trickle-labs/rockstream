@@ -56,8 +56,11 @@ description: "Phase 0–1: Validate input and orient — confirm version exists,
      - Dispatch: `rtk grep "<keyword>" crates/rockstream-gateway/src/server.rs`
      - Lowering: `rtk grep "<keyword>" crates/rockstream-sql/src/lower.rs`
      - If a claimed-implemented feature has **zero matches** in dispatch/parser/lowering, 
-       it is an undocumented deferral — list it.
+       it is an undocumented deferral — list it, and mark whether it overlaps this
+       version's Scope.
    - Report all three categories: explicit deferrals, code TODOs, and implicit (undocumented) deferrals.
+     For each, state explicitly whether it overlaps this version's Scope — this
+     determines whether Phase 2 must fix it now (see Exit below).
 3. **Restate**, in your own words, the **exact proof obligations** for this
    version. List every concrete claim in the Proof column as a checkable
    assertion. This list is your contract — nothing is "done" until every item
@@ -68,7 +71,12 @@ description: "Phase 0–1: Validate input and orient — confirm version exists,
 
 ## Exit
 
-If any undocumented deferrals (Pass C findings) are discovered, they must be picked up and implemented in this version — do not defer. Confirm this explicitly before proceeding.
+Any undocumented deferral (Pass C finding) that **overlaps this version's Scope**
+must be picked up and implemented in this version — do not defer. Any Pass C
+finding that does **not** overlap this version's Scope must still be reported by
+name (never silently dropped) and flagged for a follow-up version — do not
+expand this version's Scope to cover unrelated pre-existing gaps. Confirm this
+explicitly before proceeding.
 
 Output **exactly** this message and nothing else:
 

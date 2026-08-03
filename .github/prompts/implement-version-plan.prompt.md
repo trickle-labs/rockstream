@@ -33,7 +33,11 @@ obligations agreed. Start by reading the `${input:version}` row from
 ## Phase 2: Plan
 
 1. **Deferred-Item Audit**: List every deferred/out-of-scope item from prior
-   versions that overlaps this version's Scope. Any undocumented deferral found in Phase 1 must be included here as "must implement this version".
+   versions that overlaps this version's Scope. Any undocumented deferral found
+   in Phase 1 that overlaps this version's Scope must be included here as
+   "must implement this version"; any that does not overlap must be listed
+   separately as "out-of-scope — flag for follow-up version", not silently
+   dropped and not force-included here.
 2. **Dispatch-Wiring Audit** (SQL/wire-protocol features only):
    - For every SQL keyword, command, or operator the Scope claims to add:
      - List every code path it **must** traverse (parser → dispatcher → executor → response encoder)
