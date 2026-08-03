@@ -17,14 +17,17 @@
 //! 2. **Batch side**: accumulate the input Z-set (key = `(k, v)`, weight =
 //!    net weight).  For each group k with positive net count, compute
 //!    `SUM(v) = Σ v*weight(k,v)` and `COUNT(*) = Σ weight(k,v)` directly,
-//!    then `avg_v = sum_v / count` (truncating integer division).
+//!    then `avg_v = sum_v as f64 / count as f64` (correct floating-point
+//!    division — v0.51.6 Slice 4, matching `sum_count.rs`'s
+//!    `avg_from_sum_count` semantics).
 //!
 //! 3. **DataFusion validation**: the batch reference is validated against a
-//!    real SQL engine using `SELECT k, SUM(v), COUNT(*), SUM(v)/COUNT(*) AS avg_v
-//!    FROM t GROUP BY k ORDER BY k` on the expanded input rows.
+//!    real SQL engine using `SELECT k, SUM(v), COUNT(*), CAST(SUM(v) AS
+//!    DOUBLE) / COUNT(*) AS avg_v FROM t GROUP BY k ORDER BY k` on the
+//!    expanded input rows.
 //!
 //! 4. **Property test**: `proptest` runs ≥100k random delta sequences asserting
-//!    `incremental == batch`.
+//!    `incremental == batch` (avg compared within `f64::EPSILON`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,6 +36,7 @@ use rockstream_ops::aggregate::AggregateOp;
 use rockstream_ops::op::Operator;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::ids::OperatorId;
+use rockstream_types::laws::sum_count::avg_from_sum_count;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -68,10 +72,10 @@ fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
 /// values are:
 ///   - `count  = Σ_{v} weight(k, v)` (must be > 0 for the group to appear)
 ///   - `sum_v  = Σ_{v} v * weight(k, v)`
-///   - `avg_v  = sum_v / count` (truncating integer division)
+///   - `avg_v  = sum_v as f64 / count as f64` (correct floating-point division)
 ///
 /// Returns a sorted `Vec<(k, sum_v, count, avg_v)>`.
-fn batch_reference(input_acc: &BTreeMap<(i64, i64), i64>) -> Vec<(i64, i64, i64, i64)> {
+fn batch_reference(input_acc: &BTreeMap<(i64, i64), i64>) -> Vec<(i64, i64, i64, f64)> {
     // Group by k.
     let mut groups: BTreeMap<i64, (i64, i64)> = BTreeMap::new(); // k → (sum, count)
     for (&(k, v), &w) in input_acc {
@@ -80,10 +84,17 @@ fn batch_reference(input_acc: &BTreeMap<(i64, i64), i64>) -> Vec<(i64, i64, i64,
         entry.1 += w; // count += weight
     }
     // Keep only groups with positive net count.
-    let mut result: Vec<(i64, i64, i64, i64)> = groups
+    let mut result: Vec<(i64, i64, i64, f64)> = groups
         .into_iter()
         .filter(|(_, (_, count))| *count > 0)
-        .map(|(k, (sum, count))| (k, sum, count, sum / count))
+        .map(|(k, (sum, count))| {
+            (
+                k,
+                sum,
+                count,
+                avg_from_sum_count(sum, count).expect("count > 0 guaranteed by filter above"),
+            )
+        })
         .collect();
     result.sort_by_key(|(k, _, _, _)| *k);
     result
@@ -94,8 +105,8 @@ fn batch_reference(input_acc: &BTreeMap<(i64, i64), i64>) -> Vec<(i64, i64, i64,
 /// Run epochs through `AggregateOp` and return the accumulated output state.
 ///
 /// Returns the sorted set of `(k, sum_v, count, avg_v)` live groups.
-fn incremental_output(epochs: &[Vec<(i64, i64, i64)>]) -> Vec<(i64, i64, i64, i64)> {
-    use arrow::array::Int64Array;
+fn incremental_output(epochs: &[Vec<(i64, i64, i64)>]) -> Vec<(i64, i64, i64, f64)> {
+    use arrow::array::{Float64Array, Int64Array};
 
     let op = AggregateOp::new(OperatorId(0));
 
@@ -108,7 +119,7 @@ fn incremental_output(epochs: &[Vec<(i64, i64, i64)>]) -> Vec<(i64, i64, i64, i6
     //
     // Strategy: maintain a map k → (sum_v, count, avg_v) by applying the
     // output Z-set deltas.
-    let mut state: BTreeMap<i64, (i64, i64, i64)> = BTreeMap::new();
+    let mut state: BTreeMap<i64, (i64, i64, f64)> = BTreeMap::new();
 
     for epoch in epochs {
         if epoch.is_empty() {
@@ -143,7 +154,7 @@ fn incremental_output(epochs: &[Vec<(i64, i64, i64)>]) -> Vec<(i64, i64, i64, i6
             .data
             .column(3)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<Float64Array>()
             .unwrap();
         for i in 0..output.num_rows() {
             let k = k_col.value(i);
@@ -159,7 +170,7 @@ fn incremental_output(epochs: &[Vec<(i64, i64, i64)>]) -> Vec<(i64, i64, i64, i6
         }
     }
 
-    let mut result: Vec<(i64, i64, i64, i64)> = state
+    let mut result: Vec<(i64, i64, i64, f64)> = state
         .into_iter()
         .map(|(k, (sum, count, avg))| (k, sum, count, avg))
         .collect();
@@ -195,28 +206,42 @@ pub fn assert_oracle_aggregate(epochs: &[Vec<(i64, i64, i64)>]) {
     inc.sort_by_key(|(k, _, _, _)| *k);
 
     assert_eq!(
-        inc,
-        batch,
-        "Aggregate oracle property FAILED: incremental != batch\n\
+        inc.len(),
+        batch.len(),
+        "Aggregate oracle property FAILED: incremental != batch (different group counts)\n\
          Query: SELECT k, SUM(v), COUNT(*), SUM(v)/COUNT(*) AS avg_v FROM t GROUP BY k\n\
          incremental ({} groups): {inc:?}\n\
          batch      ({} groups): {batch:?}",
         inc.len(),
         batch.len()
     );
+    for ((ik, isum, icount, iavg), (bk, bsum, bcount, bavg)) in inc.iter().zip(batch.iter()) {
+        assert_eq!(
+            (ik, isum, icount),
+            (bk, bsum, bcount),
+            "Aggregate oracle property FAILED: (k, sum, count) mismatch\n\
+             incremental: {inc:?}\nbatch: {batch:?}"
+        );
+        assert!(
+            (iavg - bavg).abs() < f64::EPSILON,
+            "Aggregate oracle property FAILED: avg mismatch for k={ik}: \
+             incremental avg={iavg}, batch avg={bavg}\n\
+             incremental: {inc:?}\nbatch: {batch:?}"
+        );
+    }
 }
 
 // ─── DataFusion validation ────────────────────────────────────────────────────
 
-/// Run `SELECT k, SUM(v), COUNT(*), SUM(v)/COUNT(*) FROM t GROUP BY k ORDER BY k`
-/// in DataFusion on the given rows.
+/// Run `SELECT k, SUM(v), COUNT(*), CAST(SUM(v) AS DOUBLE) / COUNT(*) FROM t
+/// GROUP BY k ORDER BY k` in DataFusion on the given rows.
 ///
 /// `rows` is a list of `(k, v)` pairs where each pair represents one row in
 /// the table (weight = 1 implicitly — DataFusion doesn't know about Z-sets).
 pub async fn run_datafusion_aggregate(
     rows: &[(i64, i64)],
-) -> datafusion::error::Result<Vec<(i64, i64, i64, i64)>> {
-    use arrow::array::{Int64Array, RecordBatch};
+) -> datafusion::error::Result<Vec<(i64, i64, i64, f64)>> {
+    use arrow::array::{Float64Array, Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;
 
@@ -240,9 +265,13 @@ pub async fn run_datafusion_aggregate(
     let ctx = SessionContext::new();
     let mem_table = datafusion::datasource::memory::MemTable::try_new(schema, vec![vec![batch]])?;
     ctx.register_table("t", Arc::new(mem_table))?;
-    // Integer division: SUM(v)/COUNT(*) on Int64 columns gives Int64 (truncating).
+    // Correct floating-point division: cast the numerator to DOUBLE before
+    // dividing so SUM(v)/COUNT(*) doesn't truncate (v0.51.6 Slice 4).
     let df = ctx
-        .sql("SELECT k, SUM(v), COUNT(*), SUM(v)/COUNT(*) AS avg_v FROM t GROUP BY k ORDER BY k")
+        .sql(
+            "SELECT k, SUM(v), COUNT(*), CAST(SUM(v) AS DOUBLE) / COUNT(*) AS avg_v \
+             FROM t GROUP BY k ORDER BY k",
+        )
         .await?;
     let batches = df.collect().await?;
     let mut result = Vec::new();
@@ -250,7 +279,7 @@ pub async fn run_datafusion_aggregate(
         let k_col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let s_col = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         let c_col = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
-        let a_col = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        let a_col = b.column(3).as_any().downcast_ref::<Float64Array>().unwrap();
         for i in 0..b.num_rows() {
             result.push((
                 k_col.value(i),
@@ -282,26 +311,26 @@ mod tests {
     #[test]
     fn oracle_aggregate_single_insert() {
         // One row: k=1, v=10.
-        // Expected: [(k=1, sum=10, count=1, avg=10)]
+        // Expected: [(k=1, sum=10, count=1, avg=10.0)]
         assert_oracle_aggregate(&[vec![(1, 10, 1)]]);
         let result = incremental_output(&[vec![(1, 10, 1)]]);
         assert_eq!(
             result,
-            vec![(1, 10, 1, 10)],
-            "single insert k=1 v=10: expected (k=1, sum=10, count=1, avg=10)"
+            vec![(1, 10, 1, 10.0)],
+            "single insert k=1 v=10: expected (k=1, sum=10, count=1, avg=10.0)"
         );
     }
 
     #[test]
     fn oracle_aggregate_two_groups() {
-        // k=1: v=10 + v=5 → sum=15, count=2, avg=7 (truncating integer div)
-        // k=2: v=20        → sum=20, count=1, avg=20
+        // k=1: v=10 + v=5 → sum=15, count=2, avg=7.5 (correct fractional division)
+        // k=2: v=20        → sum=20, count=1, avg=20.0
         assert_oracle_aggregate(&[vec![(1, 10, 1), (2, 20, 1), (1, 5, 1)]]);
         let result = incremental_output(&[vec![(1, 10, 1), (2, 20, 1), (1, 5, 1)]]);
         assert_eq!(
             result,
-            vec![(1, 15, 2, 7), (2, 20, 1, 20)],
-            "two_groups: expected [(1,15,2,7),(2,20,1,20)]"
+            vec![(1, 15, 2, 7.5), (2, 20, 1, 20.0)],
+            "two_groups: expected [(1,15,2,7.5),(2,20,1,20.0)]"
         );
     }
 
@@ -332,26 +361,26 @@ mod tests {
     #[test]
     fn oracle_aggregate_update_via_delete_insert() {
         // "Update" v=5 to v=9 for k=1.
-        // Final state: k=1 sum=9, count=1, avg=9.
+        // Final state: k=1 sum=9, count=1, avg=9.0.
         assert_oracle_aggregate(&[vec![(1, 5, 1)], vec![(1, 5, -1), (1, 9, 1)]]);
         let result = incremental_output(&[vec![(1, 5, 1)], vec![(1, 5, -1), (1, 9, 1)]]);
         assert_eq!(
             result,
-            vec![(1, 9, 1, 9)],
-            "update (delete+insert): expected k=1 sum=9 count=1 avg=9"
+            vec![(1, 9, 1, 9.0)],
+            "update (delete+insert): expected k=1 sum=9 count=1 avg=9.0"
         );
     }
 
     #[test]
     fn oracle_aggregate_negative_values() {
-        // k=1: v=-3, v=-5 → sum=-8, count=2, avg=-4
-        // k=2: v=4         → sum=4,  count=1, avg=4
+        // k=1: v=-3, v=-5 → sum=-8, count=2, avg=-4.0
+        // k=2: v=4         → sum=4,  count=1, avg=4.0
         assert_oracle_aggregate(&[vec![(1, -3, 1), (1, -5, 1), (2, 4, 1)]]);
         let result = incremental_output(&[vec![(1, -3, 1), (1, -5, 1), (2, 4, 1)]]);
         assert_eq!(
             result,
-            vec![(1, -8, 2, -4), (2, 4, 1, 4)],
-            "negative values: expected [(1,-8,2,-4),(2,4,1,4)]"
+            vec![(1, -8, 2, -4.0), (2, 4, 1, 4.0)],
+            "negative values: expected [(1,-8,2,-4.0),(2,4,1,4.0)]"
         );
     }
 
@@ -361,7 +390,7 @@ mod tests {
         // epoch 1: k=1 v=20, k=2 v=5 → k=1 sum=30 count=2, k=2 sum=5 count=1
         // epoch 2: k=2 v=5 deleted   → k=2 disappears
         // epoch 3: k=1 v=10 deleted  → k=1 sum=20 count=1
-        // Final: [(k=1, sum=20, count=1, avg=20)]
+        // Final: [(k=1, sum=20, count=1, avg=20.0)]
         assert_oracle_aggregate(&[
             vec![(1, 10, 1)],
             vec![(1, 20, 1), (2, 5, 1)],
@@ -376,20 +405,20 @@ mod tests {
         ]);
         assert_eq!(
             result,
-            vec![(1, 20, 1, 20)],
-            "multiple_epochs: expected [(1,20,1,20)]"
+            vec![(1, 20, 1, 20.0)],
+            "multiple_epochs: expected [(1,20,1,20.0)]"
         );
     }
 
     #[test]
     fn oracle_aggregate_group_deletion_and_resurrection() {
         // k=1 v=10 inserted, then deleted, then re-inserted with v=20.
-        // Final: k=1 sum=20, count=1, avg=20.
+        // Final: k=1 sum=20, count=1, avg=20.0.
         assert_oracle_aggregate(&[vec![(1, 10, 1)], vec![(1, 10, -1)], vec![(1, 20, 1)]]);
         let result = incremental_output(&[vec![(1, 10, 1)], vec![(1, 10, -1)], vec![(1, 20, 1)]]);
         assert_eq!(
             result,
-            vec![(1, 20, 1, 20)],
+            vec![(1, 20, 1, 20.0)],
             "group deletion+resurrection: expected k=1 sum=20"
         );
     }
@@ -397,14 +426,29 @@ mod tests {
     #[test]
     fn oracle_aggregate_multi_group_partial_deletion() {
         // k=1: 3 copies of v=5 → insert 3, delete 1 → 2 copies left.
-        // Final: k=1 sum=10, count=2, avg=5.
+        // Final: k=1 sum=10, count=2, avg=5.0.
         assert_oracle_aggregate(&[vec![(1, 5, 1), (1, 5, 1), (1, 5, 1)], vec![(1, 5, -1)]]);
         let result = incremental_output(&[vec![(1, 5, 1), (1, 5, 1), (1, 5, 1)], vec![(1, 5, -1)]]);
         assert_eq!(
             result,
-            vec![(1, 10, 2, 5)],
-            "partial deletion: expected k=1 sum=10 count=2 avg=5"
+            vec![(1, 10, 2, 5.0)],
+            "partial deletion: expected k=1 sum=10 count=2 avg=5.0"
         );
+    }
+
+    #[test]
+    fn oracle_aggregate_genuinely_fractional_average() {
+        // k=1: v=1, v=2, v=4 → sum=7, count=3, avg=7/3 (not truncated to 2).
+        assert_oracle_aggregate(&[vec![(1, 1, 1), (1, 2, 1), (1, 4, 1)]]);
+        let result = incremental_output(&[vec![(1, 1, 1), (1, 2, 1), (1, 4, 1)]]);
+        assert_eq!(result.len(), 1);
+        let (k, sum, count, avg) = result[0];
+        assert_eq!((k, sum, count), (1, 7, 3));
+        assert!(
+            (avg - (7.0 / 3.0)).abs() < f64::EPSILON,
+            "expected avg ~= 7/3, got {avg}"
+        );
+        assert_ne!(avg, 2.0, "avg must not be truncated to an integer");
     }
 
     // ── DataFusion validation test ─────────────────────────────────────────
@@ -427,16 +471,30 @@ mod tests {
             df_result, batch,
             "DataFusion and batch reference disagree\ndf={df_result:?}\nbatch={batch:?}"
         );
-        // k=1: sum=12, count=2, avg=6; k=2: sum=10, count=1, avg=10.
-        assert_eq!(df_result, vec![(1, 12, 2, 6), (2, 10, 1, 10)]);
+        // k=1: sum=12, count=2, avg=6.0; k=2: sum=10, count=1, avg=10.0.
+        assert_eq!(df_result, vec![(1, 12, 2, 6.0), (2, 10, 1, 10.0)]);
     }
 
     #[tokio::test]
     async fn oracle_datafusion_validates_negative_avg() {
-        // k=1: v=-7 (3 copies) → sum=-21, count=3, avg=-7.
+        // k=1: v=-7 (3 copies) → sum=-21, count=3, avg=-7.0.
         let rows = vec![(1i64, -7i64), (1, -7), (1, -7)];
         let df_result = run_datafusion_aggregate(&rows).await.unwrap();
-        assert_eq!(df_result, vec![(1, -21, 3, -7)]);
+        assert_eq!(df_result, vec![(1, -21, 3, -7.0)]);
+    }
+
+    #[tokio::test]
+    async fn oracle_datafusion_validates_genuinely_fractional_avg() {
+        // k=1: v=1, v=2, v=4 → sum=7, count=3, avg=7/3 (not an exact integer).
+        let rows = vec![(1i64, 1i64), (1, 2), (1, 4)];
+        let df_result = run_datafusion_aggregate(&rows).await.unwrap();
+        assert_eq!(df_result.len(), 1);
+        let (k, sum, count, avg) = df_result[0];
+        assert_eq!((k, sum, count), (1, 7, 3));
+        assert!(
+            (avg - (7.0 / 3.0)).abs() < f64::EPSILON,
+            "expected DataFusion avg ~= 7/3, got {avg}"
+        );
     }
 
     // ── Proptest randomized oracle (100k scenarios) ────────────────────────

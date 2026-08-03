@@ -4,6 +4,7 @@
 //! `tokio-postgres` to exercise SSL downgrade, prepared statements, parameter
 //! inference, describe, and limit/bound checks.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -197,94 +198,68 @@ async fn test_extended_query_pipeline() {
 }
 
 #[tokio::test]
-async fn test_prepared_statements_limit() {
+async fn test_prepared_statements_lru_eviction() {
     let (addr, _handle) = start_gateway(CatalogStubs::new()).await;
     let client = connect(&addr).await;
 
-    // Prepare 1001 unique queries to exceed the limit of 1000.
-    // Store statements in a vector to prevent them from being dropped (which sends Close commands).
-    let mut exceeded = false;
+    let evicted_before =
+        rockstream_gateway::server::PREPARED_STATEMENTS_EVICTED_COUNT.load(Ordering::Relaxed);
+
+    // Prepare 1005 unique queries against a bound of 1000: v0.51.6 Slice 1
+    // replaces the old hard-cap-and-error behavior with LRU eviction, so
+    // every prepare must succeed and none should return RS-2600.
     let mut statements = Vec::new();
     for i in 0..1005 {
         let sql = format!("SELECT 1 -- query_uniq_{}", i);
         let res = client.prepare(&sql).await;
-        if i < 1000 {
-            assert!(res.is_ok(), "Failed to prepare statement at index {}", i);
-            statements.push(res.unwrap());
-        } else {
-            assert!(res.is_err(), "Expected 1001st statement prepare to fail");
-            let err = res.unwrap_err();
-            // Verify PostgreSQL error code 53200 (Insufficient Resources)
-            assert_eq!(err.code().map(|c| c.code()), Some("53200"));
-            let msg = err
-                .as_db_error()
-                .map(|e| e.message().to_string())
-                .unwrap_or_else(|| err.to_string());
-            assert!(
-                msg.contains("RS-2600"),
-                "Expected custom RS-2600 error code in: {}",
-                msg
-            );
-            assert!(
-                msg.contains("next_steps"),
-                "Expected next_steps description in: {}",
-                msg
-            );
-            exceeded = true;
-            break;
-        }
+        assert!(
+            res.is_ok(),
+            "prepare {} should succeed under LRU eviction, got: {:?}",
+            i,
+            res.err()
+        );
+        statements.push(res.unwrap());
     }
+
+    let evicted_after =
+        rockstream_gateway::server::PREPARED_STATEMENTS_EVICTED_COUNT.load(Ordering::Relaxed);
     assert!(
-        exceeded,
-        "Prepared statements limit of 1000 was not reached"
+        evicted_after - evicted_before >= 5,
+        "expected at least 5 prepared statements evicted, got {}",
+        evicted_after - evicted_before
     );
 }
 
 #[tokio::test]
-async fn test_portals_limit() {
+async fn test_portals_lru_eviction() {
     let (addr, _handle) = start_gateway(CatalogStubs::new()).await;
     let mut client = connect(&addr).await;
 
     let transaction = client.transaction().await.unwrap();
     let stmt = transaction.prepare("SELECT 1").await.unwrap();
 
-    let mut exceeded = false;
+    let evicted_before = rockstream_gateway::server::PORTALS_EVICTED_COUNT.load(Ordering::Relaxed);
+
+    // Bind 1005 portals against a bound of 1000: every bind must succeed
+    // (LRU eviction, not a hard error) since v0.51.6 Slice 1.
     let mut _portals = Vec::new();
     for i in 0..1005 {
         let res = transaction.bind(&stmt, &[]).await;
-        match res {
-            Ok(portal) => {
-                assert!(
-                    i < 1000,
-                    "Should not succeed in binding portal at index {}",
-                    i
-                );
-                _portals.push(portal);
-            }
-            Err(err) => {
-                assert!(i >= 1000, "Portal bind failed prematurely at index {}", i);
-                // Verify PostgreSQL error code 53200 (Insufficient Resources)
-                assert_eq!(err.code().map(|c| c.code()), Some("53200"));
-                let msg = err
-                    .as_db_error()
-                    .map(|e| e.message().to_string())
-                    .unwrap_or_else(|| err.to_string());
-                assert!(
-                    msg.contains("RS-2601"),
-                    "Expected custom RS-2601 error code in: {}",
-                    msg
-                );
-                assert!(
-                    msg.contains("next_steps"),
-                    "Expected next_steps description in: {}",
-                    msg
-                );
-                exceeded = true;
-                break;
-            }
-        }
+        assert!(
+            res.is_ok(),
+            "bind {} should succeed under LRU eviction, got: {:?}",
+            i,
+            res.err()
+        );
+        _portals.push(res.unwrap());
     }
-    assert!(exceeded, "Portals limit of 1000 was not reached");
+
+    let evicted_after = rockstream_gateway::server::PORTALS_EVICTED_COUNT.load(Ordering::Relaxed);
+    assert!(
+        evicted_after - evicted_before >= 5,
+        "expected at least 5 portals evicted, got {}",
+        evicted_after - evicted_before
+    );
 }
 
 // ── S5: Portal Suspension with max_rows ───────────────────────────────────────

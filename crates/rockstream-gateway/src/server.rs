@@ -705,6 +705,19 @@ pub static PREPARED_STATEMENTS_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static PORTALS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// v0.51.6 Slice 1: bound on prepared statements/portals per connection.
+/// Exceeding this bound no longer errors (`RS-2600`/`RS-2601`) — the
+/// least-recently-used entry is evicted instead.
+pub const MAX_PREPARED_STATEMENTS_PER_CONN: usize = 1000;
+pub const MAX_PORTALS_PER_CONN: usize = 1000;
+
+/// Cumulative count of prepared statements evicted via LRU (v0.51.6 Slice 1).
+pub static PREPARED_STATEMENTS_EVICTED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Cumulative count of portals evicted via LRU (v0.51.6 Slice 1).
+pub static PORTALS_EVICTED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // ── S9 metrics ────────────────────────────────────────────────────────────────
 
 /// Total number of session RYW / explicit wait_for triggers.
@@ -1344,6 +1357,18 @@ pub struct PortalState {
     pub offset: usize,
 }
 
+/// Fill-level snapshot of every per-connection state map on `GatewayHandler`
+/// (v0.51.6 Slice 2). See `GatewayHandler::connection_state_totals`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionStateTotals {
+    pub prepared_statement_conns: usize,
+    pub active_portal_conns: usize,
+    pub portal_states: usize,
+    pub sessions: usize,
+    pub write_buffers: usize,
+    pub copy_states: usize,
+}
+
 // ── GatewayHandler ────────────────────────────────────────────────────────────
 
 /// Core handler shared across all pgwire protocol phases.
@@ -1353,8 +1378,14 @@ pub struct GatewayHandler {
     catalog: Arc<CatalogStubs>,
     view_reader: Arc<dyn ViewReader>,
     query_parser: Arc<PreparedStatementCache>,
-    prepared_statements: Arc<DashMap<String, std::collections::HashSet<String>>>,
-    active_portals: Arc<DashMap<String, std::collections::HashSet<String>>>,
+    /// Per-connection prepared-statement name cache, bounded at
+    /// `MAX_PREPARED_STATEMENTS_PER_CONN` with LRU eviction (v0.51.6 Slice 1):
+    /// opening more than the bound without `DISCARD ALL`/`DEALLOCATE` evicts
+    /// the least-recently-used statement instead of erroring.
+    prepared_statements: Arc<DashMap<String, lru::LruCache<String, ()>>>,
+    /// Per-connection portal name cache, bounded at `MAX_PORTALS_PER_CONN`
+    /// with LRU eviction (v0.51.6 Slice 1), mirroring `prepared_statements`.
+    active_portals: Arc<DashMap<String, lru::LruCache<String, ()>>>,
     portal_states: Arc<DashMap<(String, String), PortalState>>, // (conn_id, portal_name) -> PortalState
     /// Per-connection write buffers keyed by connection ID.
     /// Bound: WRITE_BUFFER_LIMIT_BYTES per connection (64 MiB).
@@ -1401,6 +1432,22 @@ pub struct GatewayHandler {
 }
 
 impl GatewayHandler {
+    /// Fill-level snapshot of every per-connection state map (v0.51.6
+    /// Slice 2). Used to prove abnormal-disconnect cleanup (raw TCP kill,
+    /// not graceful `Terminate`/`DISCARD ALL`) removes all per-connection
+    /// state rather than leaking it — none of these DashMaps previously had
+    /// an observable fill-level metric of their own.
+    pub fn connection_state_totals(&self) -> ConnectionStateTotals {
+        ConnectionStateTotals {
+            prepared_statement_conns: self.prepared_statements.len(),
+            active_portal_conns: self.active_portals.len(),
+            portal_states: self.portal_states.len(),
+            sessions: self.sessions.len(),
+            write_buffers: self.write_buffers.len(),
+            copy_states: self.copy_states.len(),
+        }
+    }
+
     pub fn new(catalog: Arc<CatalogStubs>, view_reader: Arc<dyn ViewReader>) -> Self {
         GatewayHandler {
             catalog: catalog.clone(),
@@ -2095,7 +2142,7 @@ impl GatewayHandler {
             } else {
                 let stmt_name = name_part.trim_matches('"').trim_matches('\'');
                 if let Some(mut stmts) = self.prepared_statements.get_mut(conn_id) {
-                    stmts.remove(stmt_name);
+                    stmts.pop(stmt_name);
                 }
             }
             return Ok(vec![Response::Execution(Tag::new("DEALLOCATE"))]);
@@ -2150,7 +2197,16 @@ impl GatewayHandler {
             return Some(Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "25001".to_owned(),
-                "[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED or REPEATABLE READ".to_owned(),
+                "[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED".to_owned(),
+            )))]));
+        }
+
+        // REPEATABLE READ → RS-2004
+        if ql.contains("repeatable read") && ql.contains("isolation") {
+            return Some(Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "25001".to_owned(),
+                "[RS-2004] isolation.repeatable_read_not_supported: REPEATABLE READ isolation is not supported; use READ COMMITTED".to_owned(),
             )))]));
         }
 
@@ -2326,6 +2382,26 @@ impl GatewayHandler {
 
         // ── BEGIN — with idempotency (already in transaction → silent succeed) ──
         if ql == "begin" || ql == "begin;" || ql.starts_with("begin ") {
+            // BEGIN ISOLATION LEVEL SERIALIZABLE / REPEATABLE READ → RS-2003 / RS-2004,
+            // the same honest rejection dispatch_sync applies to SET TRANSACTION.
+            if ql.contains("isolation") && ql.contains("serializable") {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "25001".to_owned(),
+                        "[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED".to_owned(),
+                    ),
+                )))]);
+            }
+            if ql.contains("isolation") && ql.contains("repeatable read") {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "25001".to_owned(),
+                        "[RS-2004] isolation.repeatable_read_not_supported: REPEATABLE READ isolation is not supported; use READ COMMITTED".to_owned(),
+                    ),
+                )))]);
+            }
             if let Some(id) = conn_id {
                 let tx_status = self
                     .sessions
@@ -2341,11 +2417,6 @@ impl GatewayHandler {
                 }
                 let mut session = self.sessions.entry(id.to_string()).or_default();
                 session.begin_explicit();
-                let current_frontier = self
-                    .shard_db
-                    .as_ref()
-                    .map(|db| db.last_epoch().load(std::sync::atomic::Ordering::Acquire));
-                session.begin(current_frontier);
             }
             return Ok(vec![promote_response(Response::TransactionStart(
                 Tag::new("BEGIN"),
@@ -2794,16 +2865,11 @@ impl GatewayHandler {
         // S6: SET TRANSACTION ISOLATION LEVEL / SET TRANSACTION READ ONLY|WRITE
         if ql.starts_with("set transaction") || ql.starts_with("set local transaction") {
             if ql.contains("isolation level") {
-                if ql.contains("serializable") {
-                    // Fall through to dispatch_sync which returns RS-2003.
+                if ql.contains("serializable") || ql.contains("repeatable read") {
+                    // Fall through to dispatch_sync which returns RS-2003/RS-2004.
                 } else if let Some(id) = conn_id {
-                    let level = if ql.contains("repeatable read") {
-                        crate::session::IsolationLevel::RepeatableRead
-                    } else {
-                        crate::session::IsolationLevel::ReadCommitted
-                    };
                     let mut session = self.sessions.entry(id.to_string()).or_default();
-                    session.isolation_level = level;
+                    session.isolation_level = crate::session::IsolationLevel::ReadCommitted;
                     return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
                 } else {
                     return Ok(vec![promote_response(Response::Execution(Tag::new("SET")))]);
@@ -5114,7 +5180,7 @@ impl GatewayHandler {
 
     /// DISCARD ALL: reset all session state for connection pooler compatibility.
     /// Clears: cursors, prepared statements, portals, write buffer, idempotency key,
-    /// source_epoch_envelope, wait_for_token, pinned_frontier, TxStatus → Idle.
+    /// source_epoch_envelope, wait_for_token, TxStatus → Idle.
     fn handle_discard_all(&self, conn_id: Option<&str>) -> PgWireResult<Vec<Response<'static>>> {
         if let Some(id) = conn_id {
             // Clear write buffer
@@ -5146,7 +5212,6 @@ impl GatewayHandler {
                 session.max_staleness = None;
                 session.frontier_age_ms = None;
                 session.pending_notice = None;
-                session.pinned_frontier = None;
                 session.tx_status = crate::session::TxStatus::Idle;
                 session.search_path = "public".to_string();
                 session.current_namespace = "public".to_string();
@@ -6964,16 +7029,29 @@ impl ExtendedQueryHandler for GatewayHandler {
             .unwrap_or_else(|| "unknown".to_string());
         let stmt_name = message.name.clone().unwrap_or_default();
 
-        // Check prepared statements limit
+        // Bound prepared statements per connection with LRU eviction
+        // (v0.51.6 Slice 1) instead of hard-erroring at the cap.
         {
-            let mut conn_stmts = self.prepared_statements.entry(conn_id.clone()).or_default();
-            if conn_stmts.len() >= 1000 && !conn_stmts.contains(&stmt_name) {
-                let err: PgWireError =
-                    GatewayError::PreparedStatementsLimitExceeded { limit: 1000 }.into();
-                return Err(err);
+            let mut conn_stmts = self
+                .prepared_statements
+                .entry(conn_id.clone())
+                .or_insert_with(|| {
+                    lru::LruCache::new(
+                        std::num::NonZeroUsize::new(MAX_PREPARED_STATEMENTS_PER_CONN).unwrap(),
+                    )
+                });
+            let is_new = !conn_stmts.contains(&stmt_name);
+            if is_new && conn_stmts.len() >= MAX_PREPARED_STATEMENTS_PER_CONN {
+                if let Some((evicted_name, _)) = conn_stmts.pop_lru() {
+                    client.portal_store().rm_statement(&evicted_name);
+                    PREPARED_STATEMENTS_COUNT.fetch_sub(1, Ordering::Relaxed);
+                    PREPARED_STATEMENTS_EVICTED_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            conn_stmts.insert(stmt_name.clone());
-            PREPARED_STATEMENTS_COUNT.fetch_add(1, Ordering::Relaxed);
+            conn_stmts.put(stmt_name.clone(), ());
+            if is_new {
+                PREPARED_STATEMENTS_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         let parser = self.query_parser();
@@ -7015,21 +7093,44 @@ impl ExtendedQueryHandler for GatewayHandler {
             .unwrap_or_else(|| "unknown".to_string());
         let portal_name = message.portal_name.clone().unwrap_or_default();
 
-        // Check portals limit
+        // Bound portals per connection with LRU eviction (v0.51.6 Slice 1)
+        // instead of hard-erroring at the cap.
         {
-            let mut conn_portals = self.active_portals.entry(conn_id.clone()).or_default();
-            if conn_portals.len() >= 1000 && !conn_portals.contains(&portal_name) {
-                let err: PgWireError = GatewayError::PortalsLimitExceeded { limit: 1000 }.into();
-                return Err(err);
+            let mut conn_portals =
+                self.active_portals
+                    .entry(conn_id.clone())
+                    .or_insert_with(|| {
+                        lru::LruCache::new(
+                            std::num::NonZeroUsize::new(MAX_PORTALS_PER_CONN).unwrap(),
+                        )
+                    });
+            let is_new = !conn_portals.contains(&portal_name);
+            if is_new && conn_portals.len() >= MAX_PORTALS_PER_CONN {
+                if let Some((evicted_name, _)) = conn_portals.pop_lru() {
+                    client.portal_store().rm_portal(&evicted_name);
+                    self.portal_states
+                        .remove(&(conn_id.clone(), evicted_name.clone()));
+                    PORTALS_COUNT.fetch_sub(1, Ordering::Relaxed);
+                    PORTALS_EVICTED_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            conn_portals.insert(portal_name.clone());
-            PORTALS_COUNT.fetch_add(1, Ordering::Relaxed);
+            conn_portals.put(portal_name.clone(), ());
+            if is_new {
+                PORTALS_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         let statement_name = message
             .statement_name
             .as_deref()
             .unwrap_or(pgwire::api::DEFAULT_NAME);
+
+        // Binding a portal to a statement counts as use of that statement —
+        // promote it to most-recently-used so it isn't evicted while a live
+        // portal still depends on it (v0.51.6 Slice 1).
+        if let Some(mut stmts) = self.prepared_statements.get_mut(&conn_id) {
+            stmts.get(statement_name);
+        }
 
         if let Some(statement) = client.portal_store().get_statement(statement_name) {
             let portal = Portal::try_new(&message, statement)?;
@@ -7062,7 +7163,7 @@ impl ExtendedQueryHandler for GatewayHandler {
             TARGET_TYPE_BYTE_STATEMENT => {
                 client.portal_store().rm_statement(name);
                 if let Some(mut stmts) = self.prepared_statements.get_mut(&conn_id) {
-                    if stmts.remove(name) {
+                    if stmts.pop(name).is_some() {
                         PREPARED_STATEMENTS_COUNT.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
@@ -7070,7 +7171,7 @@ impl ExtendedQueryHandler for GatewayHandler {
             TARGET_TYPE_BYTE_PORTAL => {
                 client.portal_store().rm_portal(name);
                 if let Some(mut portals) = self.active_portals.get_mut(&conn_id) {
-                    if portals.remove(name) {
+                    if portals.pop(name).is_some() {
                         PORTALS_COUNT.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
@@ -7885,10 +7986,20 @@ impl GatewayServer {
                             tracing::debug!("gateway connection error: {e}");
                         }
                         crate::tls::remove_mtls_cn(&peer_addr);
-                        // Cleanup LISTEN subscriptions on disconnect.
+                        // Cleanup on disconnect — runs unconditionally on
+                        // BOTH graceful close and I/O error/EOF (abnormal,
+                        // dropped-TCP disconnect), so this is the single
+                        // correct hook for all per-connection state
+                        // (v0.51.6 Slice 2). This must remove every
+                        // per-connection map, not just LISTEN subscriptions,
+                        // or a client that never sends DISCARD ALL/Terminate
+                        // (e.g. a TCP-level kill) leaks prepared statements,
+                        // portals, session state, write buffers, and COPY
+                        // state forever.
                         let cid = CONN_ID.with(|id| id.clone());
                         factory_ref.handler.notify_registry.unsubscribe_all(&cid);
                         factory_ref.handler.pending_notifies.remove(&cid);
+                        cleanup_connection_state(&factory_ref.handler, &cid);
                     }),
                 ),
             ));
@@ -7970,10 +8081,14 @@ impl GatewayServer {
                                 tracing::debug!("gateway connection error: {e}");
                             }
                             crate::tls::remove_mtls_cn(&peer_addr);
-                            // Cleanup LISTEN subscriptions on disconnect.
+                            // Cleanup on disconnect — runs unconditionally on
+                            // BOTH graceful close and I/O error/EOF (abnormal,
+                            // dropped-TCP disconnect); see `serve()` for the
+                            // full rationale (v0.51.6 Slice 2).
                             let cid = CONN_ID.with(|id| id.clone());
                             factory_ref.handler.notify_registry.unsubscribe_all(&cid);
                             factory_ref.handler.pending_notifies.remove(&cid);
+                            cleanup_connection_state(&factory_ref.handler, &cid);
                         }),
                     ),
                 ));
@@ -7981,6 +8096,27 @@ impl GatewayServer {
         });
         Ok((local_addr, handle))
     }
+}
+
+/// Remove every per-connection state map entry for `conn_id` (v0.51.6
+/// Slice 2). Called unconditionally after `pgwire::tokio::process_socket`
+/// returns in both `serve()` and `serve_background()` — on graceful close
+/// **and** on abnormal disconnect (dropped TCP, I/O error/EOF) — so a
+/// well-behaved-but-never-`DISCARD ALL`'d client that simply vanishes (e.g.
+/// killed at the raw-socket level) does not leak state forever. This
+/// complements `handle_discard_all`, which covers only the graceful
+/// `DISCARD ALL`/`RESET ALL` path (since v0.37/v0.39).
+fn cleanup_connection_state(handler: &GatewayHandler, conn_id: &str) {
+    if let Some((_, stmts)) = handler.prepared_statements.remove(conn_id) {
+        PREPARED_STATEMENTS_COUNT.fetch_sub(stmts.len() as u64, Ordering::Relaxed);
+    }
+    if let Some((_, portals)) = handler.active_portals.remove(conn_id) {
+        PORTALS_COUNT.fetch_sub(portals.len() as u64, Ordering::Relaxed);
+    }
+    handler.portal_states.retain(|k, _| k.0 != conn_id);
+    handler.sessions.remove(conn_id);
+    handler.write_buffers.remove(conn_id);
+    handler.copy_states.remove(conn_id);
 }
 
 // ── Query helpers ─────────────────────────────────────────────────────────────

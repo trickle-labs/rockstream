@@ -33,7 +33,7 @@ pub mod view_reader;
 pub mod write_buffer;
 
 pub use error::GatewayError;
-pub use server::{GatewayServer, MAX_CONNECTIONS};
+pub use server::{ConnectionStateTotals, GatewayServer, MAX_CONNECTIONS};
 pub use session::{CursorState, TxStatus, MAX_CURSORS_PER_CONNECTION};
 pub use view_reader::{
     HotOnlyViewReader, ViewReadStrategy, ViewReader, ROWS_IN_FLIGHT_BATCH, STREAM_BATCH_BYTES,

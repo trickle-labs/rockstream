@@ -118,16 +118,25 @@ pub fn decode_sum_count(bytes: &[u8]) -> Result<(i64, i64), String> {
     parse_sum_count(bytes)
 }
 
-/// Compute the average from a `SumCount/v1` accumulator.
+/// Compute the average from an in-memory `(sum, count)` pair.
 ///
-/// Returns `None` if the count is zero (undefined average).
-pub fn aggregate_avg(bytes: &[u8]) -> Option<f64> {
-    let (sum, count) = parse_sum_count(bytes).ok()?;
+/// Returns `None` if the count is zero (undefined average). Shared by the
+/// `SumCount/v1` wire-format helper below and by `AggregateOp`'s live
+/// `avg` computation so both paths use identical floating-point semantics.
+pub fn avg_from_sum_count(sum: i64, count: i64) -> Option<f64> {
     if count == 0 {
         None
     } else {
         Some(sum as f64 / count as f64)
     }
+}
+
+/// Compute the average from a `SumCount/v1` accumulator.
+///
+/// Returns `None` if the count is zero (undefined average).
+pub fn aggregate_avg(bytes: &[u8]) -> Option<f64> {
+    let (sum, count) = parse_sum_count(bytes).ok()?;
+    avg_from_sum_count(sum, count)
 }
 
 fn parse_sum_count(bytes: &[u8]) -> Result<(i64, i64), String> {

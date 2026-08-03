@@ -816,7 +816,7 @@ async fn test_nexmark_q4_q9_lfs() {
 
     // Define standard CREATE VIEW statements for Nexmark q4–q9
     client
-        .simple_query("CREATE VIEW q4 AS SELECT a.category, CAST(AVG(b.price) AS BIGINT) as avg_price FROM auction a JOIN bid b ON a.id = b.auction WHERE b.date_time >= a.date_time AND b.date_time <= a.expires GROUP BY a.category")
+        .simple_query("CREATE VIEW q4 AS SELECT a.category, AVG(b.price) as avg_price FROM auction a JOIN bid b ON a.id = b.auction WHERE b.date_time >= a.date_time AND b.date_time <= a.expires GROUP BY a.category")
         .await
         .expect("CREATE VIEW q4 failed");
 
@@ -1062,7 +1062,7 @@ async fn test_nexmark_q4_q9_lfs() {
                         } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-                            (a.value(row) as i64).to_string()
+                            a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
                             a.value(row).to_string()
                         } else {
@@ -1106,7 +1106,7 @@ async fn test_nexmark_q4_q9_lfs() {
             .collect()
     }
     let oracle_queries = [
-        "SELECT a.category, CAST(AVG(b.price) AS BIGINT) as avg_price FROM auction a JOIN bid b ON a.id = b.auction WHERE b.date_time >= a.date_time AND b.date_time <= a.expires GROUP BY a.category",
+        "SELECT a.category, AVG(b.price) as avg_price FROM auction a JOIN bid b ON a.id = b.auction WHERE b.date_time >= a.date_time AND b.date_time <= a.expires GROUP BY a.category",
         "SELECT auction, num FROM (SELECT auction, num, ROW_NUMBER() OVER (PARTITION BY window_start ORDER BY num DESC) as rn FROM (SELECT auction, COUNT(*) as num, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY auction, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)))) WHERE rn <= 5",
         "SELECT seller, CAST(AVG(price) OVER (PARTITION BY seller ORDER BY date_time ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS BIGINT) as avg_price FROM (SELECT a.seller, b.price, b.date_time FROM auction a JOIN bid b ON a.id = b.auction)",
         "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, MAX(price) as max_price FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
@@ -1510,7 +1510,7 @@ async fn test_nexmark_q12_q13_lfs() {
                         } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-                            (a.value(row) as i64).to_string()
+                            a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array
@@ -2509,7 +2509,7 @@ async fn test_nexmark_q14_q15_lfs() {
                         } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-                            (a.value(row) as i64).to_string()
+                            a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array
@@ -2689,7 +2689,7 @@ async fn test_nexmark_q16_q17_lfs() {
         .expect("CREATE VIEW q16 failed");
 
     client
-        .simple_query("CREATE VIEW q17 AS SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))")
+        .simple_query("CREATE VIEW q17 AS SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, AVG(price) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))")
         .await
         .expect("CREATE VIEW q17 failed");
 
@@ -2910,7 +2910,7 @@ async fn test_nexmark_q16_q17_lfs() {
                         } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-                            (a.value(row) as i64).to_string()
+                            a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array
@@ -2960,7 +2960,7 @@ async fn test_nexmark_q16_q17_lfs() {
     }
     let oracle_queries = [
         "SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
-        "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))"
+        "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, AVG(price) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))"
     ];
 
     for (view, query) in views.iter().zip(oracle_queries.iter()) {
@@ -3331,7 +3331,7 @@ async fn test_nexmark_q18_q19_lfs() {
                         } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-                            (a.value(row) as i64).to_string()
+                            a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array
@@ -3811,7 +3811,7 @@ async fn test_nexmark_q20_q22_lfs() {
                         } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-                            (a.value(row) as i64).to_string()
+                            a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array
@@ -4026,7 +4026,7 @@ async fn test_nexmark_q0_q9_minio() {
         .expect("CREATE VIEW q3 failed");
 
     client
-        .simple_query("CREATE VIEW q4 AS SELECT a.category, CAST(AVG(b.price) AS BIGINT) as avg_price FROM auction a JOIN bid b ON a.id = b.auction WHERE b.date_time >= a.date_time AND b.date_time <= a.expires GROUP BY a.category")
+        .simple_query("CREATE VIEW q4 AS SELECT a.category, AVG(b.price) as avg_price FROM auction a JOIN bid b ON a.id = b.auction WHERE b.date_time >= a.date_time AND b.date_time <= a.expires GROUP BY a.category")
         .await
         .expect("CREATE VIEW q4 failed");
 
@@ -4272,7 +4272,7 @@ async fn test_nexmark_q0_q9_minio() {
                         } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-                            (a.value(row) as i64).to_string()
+                            a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
                             a.value(row).to_string()
                         } else {
@@ -4294,7 +4294,7 @@ async fn test_nexmark_q0_q9_minio() {
         "SELECT auction, bidder, price * 90 / 100 AS price, channel, url, date_time, extra FROM bid",
         "SELECT auction, price, date_time FROM bid WHERE auction % 123 = 0",
         "SELECT p.name, p.city, p.state, a.id FROM auction a JOIN person p ON a.seller = p.id WHERE (p.state = 'OR' OR p.state = 'ID' OR p.state = 'CA') AND a.category = 10",
-        "SELECT a.category, CAST(AVG(b.price) AS BIGINT) as avg_price FROM auction a JOIN bid b ON a.id = b.auction WHERE b.date_time >= a.date_time AND b.date_time <= a.expires GROUP BY a.category",
+        "SELECT a.category, AVG(b.price) as avg_price FROM auction a JOIN bid b ON a.id = b.auction WHERE b.date_time >= a.date_time AND b.date_time <= a.expires GROUP BY a.category",
         "SELECT auction, num FROM (SELECT auction, num, ROW_NUMBER() OVER (PARTITION BY window_start ORDER BY num DESC) as rn FROM (SELECT auction, COUNT(*) as num, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY auction, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)))) WHERE rn <= 5",
         "SELECT seller, CAST(AVG(price) OVER (PARTITION BY seller ORDER BY date_time ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS BIGINT) as avg_price FROM (SELECT a.seller, b.price, b.date_time FROM auction a JOIN bid b ON a.id = b.auction)",
         "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, MAX(price) as max_price FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
@@ -4604,7 +4604,7 @@ async fn test_nexmark_q12_q22_minio() {
         .unwrap();
 
     client
-        .simple_query("CREATE VIEW q17 AS SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))")
+        .simple_query("CREATE VIEW q17 AS SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, AVG(price) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))")
         .await
         .unwrap();
 
@@ -4874,7 +4874,7 @@ async fn test_nexmark_q12_q22_minio() {
                         } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-                            (a.value(row) as i64).to_string()
+                            a.value(row).to_string()
                         } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
                             a.value(row).to_string()
                         } else if let Some(a) = array
@@ -4905,7 +4905,7 @@ async fn test_nexmark_q12_q22_minio() {
         "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
         "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
-        "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
+        "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, AVG(price) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1",
         "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) as rn FROM bid ) WHERE rn <= 10",
         "SELECT b.auction, b.bidder, b.price, b.date_time, a.category FROM bid b JOIN auction a ON b.auction = a.id WHERE a.category = 10",

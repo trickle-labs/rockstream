@@ -24,6 +24,7 @@ rockstream-storage.workspace = true
 rockstream-sql.workspace = true
 rand.workspace = true
 dashmap.workspace = true
+lru.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 base64 = "0.22"

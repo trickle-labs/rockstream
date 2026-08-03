@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
@@ -154,7 +154,7 @@ fn make_batch(rows: &[(i64, i64, i64)]) -> rockstream_ops::ArrowZSet {
     rockstream_ops::ArrowZSet::new(data, rows.iter().map(|(_, _, w)| *w).collect())
 }
 
-fn extract_rows(batch: &rockstream_ops::ArrowZSet) -> Vec<(i64, i64, i64, i64, i64)> {
+fn extract_rows(batch: &rockstream_ops::ArrowZSet) -> Vec<(i64, i64, i64, f64, i64)> {
     let k = batch
         .data
         .column(0)
@@ -177,7 +177,7 @@ fn extract_rows(batch: &rockstream_ops::ArrowZSet) -> Vec<(i64, i64, i64, i64, i
         .data
         .column(3)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Float64Array>()
         .unwrap();
     let mut rows = Vec::new();
     for index in 0..batch.num_rows() {

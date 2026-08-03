@@ -707,6 +707,15 @@ fn compile_multi_aggregate_lanes(
     let n_keys = group_by.len();
     let packer = (n_keys > 1).then(|| Arc::new(GroupKeyPacker::new(n_keys)));
     let mut lanes: Vec<StatefulPipeline> = Vec::with_capacity(aggregates.len());
+    // Per-lane payload width (columns beyond `k`): 1 for every lane except
+    // `AVG`'s, which is 2 — see the `AggregateFunc::Avg` arm below.
+    let mut lane_widths: Vec<usize> = Vec::with_capacity(aggregates.len());
+    // Maps each *original* aggregate (in `aggregates` order) to how
+    // `MultiAggregatePipeline::process` extracts its final output column
+    // from the cascade-joined accumulator's payload columns (0-indexed,
+    // counting from the first payload column after `k`).
+    let mut finalize: Vec<crate::live_exec::FinalizeCol> = Vec::with_capacity(aggregates.len());
+    let mut next_payload_idx = 0usize;
     for agg in aggregates {
         let mut pre_named: Vec<NamedExpr> = group_by
             .iter()
@@ -738,13 +747,38 @@ fn compile_multi_aggregate_lanes(
             }))));
         }
         let result_col = compile_aggregate_body(&mut lane_stages, agg)?;
-        // AggregateOp always emits (k, sum_v, count, avg_v); project down to
-        // this lane's own (k, agg) shape so every lane has an identical,
-        // joinable 2-column output.
-        lane_stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
-            NamedExpr::new("k", Expr::Column(0)),
-            NamedExpr::new("agg", Expr::Column(result_col)),
-        ]))));
+        if agg.func == AggregateFunc::Avg {
+            // v0.51.6 Slice 4: `OuterJoinOp`'s persisted arrangement is
+            // `Int64`-only (see its module doc) — it cannot carry the
+            // genuinely-`Float64` `avg_v` `AggregateOp` already computes
+            // through the cascade join. Instead, this lane forwards the raw
+            // `(k, sum_v, count)` `Int64` pair; `MultiAggregatePipeline`
+            // combines them into one true `Float64` avg column via
+            // `avg_from_sum_count` *after* the whole join cascade
+            // completes, so every intermediate join stays Int64-only.
+            lane_stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                NamedExpr::new("k", Expr::Column(0)),
+                NamedExpr::new("sum", Expr::Column(1)),
+                NamedExpr::new("count", Expr::Column(2)),
+            ]))));
+            lane_widths.push(2);
+            finalize.push(crate::live_exec::FinalizeCol::Avg {
+                sum_idx: next_payload_idx,
+                count_idx: next_payload_idx + 1,
+            });
+            next_payload_idx += 2;
+        } else {
+            // AggregateOp/MinMaxOp always emit `(k, agg, ..)`; project down
+            // to this lane's own `(k, agg)` shape so every non-`AVG` lane
+            // has an identical, joinable 2-column output.
+            lane_stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                NamedExpr::new("k", Expr::Column(0)),
+                NamedExpr::new("agg", Expr::Column(result_col)),
+            ]))));
+            lane_widths.push(1);
+            finalize.push(crate::live_exec::FinalizeCol::Direct(next_payload_idx));
+            next_payload_idx += 1;
+        }
         let mut pipeline = StatefulPipeline::new();
         for stage in lane_stages {
             pipeline = pipeline.push(stage);
@@ -752,22 +786,22 @@ fn compile_multi_aggregate_lanes(
         lanes.push(pipeline);
     }
 
-    // Cascade-join the N lanes' (k, agg_i) outputs: after joining i lanes,
-    // the accumulator has (i + 1) columns (k, agg_0, .., agg_{i-1}); each
-    // join adds one more lane's 2-column (k, agg_i) output on the right,
-    // widening the accumulator by exactly 1 (the join's own duplicate right-
-    // side key column is dropped by `MultiAggregatePipeline::process`).
-    // A *left* outer join, not an inner join: a group with e.g. a nonzero
-    // `SUM` but zero rows for a later `COUNT(DISTINCT CASE WHEN ...)` lane
-    // must still appear with that aggregate reported as `0`, matching SQL's
-    // `GROUP BY` semantics — see `MultiAggregatePipeline`'s doc comment.
-    let mut joins = Vec::with_capacity(aggregates.len().saturating_sub(1));
-    // `acc_n_cols` tracks the running accumulator's column count (not just
-    // loop position), needed to construct each `OuterJoinOp` with the
-    // correct left-side width — not a plain `enumerate()` counter.
-    let mut acc_n_cols = 2usize;
-    #[allow(clippy::explicit_counter_loop)]
-    for _ in 1..aggregates.len() {
+    // Cascade-join the lanes' `(k, ..)` outputs: after joining lanes
+    // `0..=i`, the accumulator has `1 + Σ lane_widths[0..=i]` columns; each
+    // join adds one more lane's `(k, payload..)` output on the right,
+    // widening the accumulator by that lane's `lane_widths[i]` (the join's
+    // own duplicate right-side key column is dropped by
+    // `MultiAggregatePipeline::process`). A *left* outer join, not an inner
+    // join: a group with e.g. a nonzero `SUM` but zero rows for a later
+    // `COUNT(DISTINCT CASE WHEN ...)` lane must still appear with that
+    // aggregate reported as `0`, matching SQL's `GROUP BY` semantics — see
+    // `MultiAggregatePipeline`'s doc comment.
+    let mut joins = Vec::with_capacity(lanes.len().saturating_sub(1));
+    // `acc_n_cols` tracks the running accumulator's column count (`k` plus
+    // every lane payload joined so far), needed to construct each
+    // `OuterJoinOp` with the correct left-side width.
+    let mut acc_n_cols = 1 + lane_widths[0];
+    for &w in &lane_widths[1..] {
         let join_op_id = next_stateful_op_id();
         joins.push(Arc::new(OuterJoinOp::with_schema(
             join_op_id,
@@ -775,22 +809,35 @@ fn compile_multi_aggregate_lanes(
             vec![0],
             vec![0],
             acc_n_cols,
-            2,
+            1 + w,
         )));
-        acc_n_cols += 1;
+        acc_n_cols += w;
     }
 
     let mut stages = shared_stages;
     stages.push(Stage::MultiAggregate(Arc::new(
-        crate::live_exec::MultiAggregatePipeline::new(lanes, joins),
+        crate::live_exec::MultiAggregatePipeline::new(lanes, lane_widths, joins, finalize),
     )));
+    // Output schema: `n_keys` Int64 key columns, then one column per
+    // aggregate — `Float64` for `AVG` (Slice 4), `Int64` for everything
+    // else (`SUM`/`COUNT`/`MIN`/`MAX`).
+    let out_fields: Vec<Field> = (0..n_keys)
+        .map(|i| Field::new(format!("c{i}"), DataType::Int64, false))
+        .chain(aggregates.iter().enumerate().map(|(i, agg)| {
+            let dt = if agg.func == AggregateFunc::Avg {
+                DataType::Float64
+            } else {
+                DataType::Int64
+            };
+            Field::new(format!("c{}", n_keys + i), dt, false)
+        }))
+        .collect();
+    let out_schema: SchemaRef = Arc::new(Schema::new(out_fields));
     if let Some(packer) = packer {
         // Unpack the shared surrogate key back to (k0..k(n-1), agg_0..agg_{N-1}).
         stages.push(Stage::KeyUnpack(packer, next_stateful_op_id()));
-        Ok((stages, int64_schema(n_keys + aggregates.len())))
-    } else {
-        Ok((stages, int64_schema(aggregates.len() + 1)))
     }
+    Ok((stages, out_schema))
 }
 
 /// Recursively compile `node` (everything under `ViewSink`) into an ordered

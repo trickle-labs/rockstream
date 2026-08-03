@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{ArrayRef, Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
@@ -618,7 +618,7 @@ impl ExecNode {
                         .data
                         .column(3)
                         .as_any()
-                        .downcast_ref::<Int64Array>()
+                        .downcast_ref::<Float64Array>()
                         .unwrap();
 
                     let agg_vals: Vec<i64> = match func {
@@ -629,7 +629,14 @@ impl ExecNode {
                             (0..raw_out.num_rows()).map(|i| sum_arr.value(i)).collect()
                         }
                         AggregateFunc::Avg => {
-                            (0..raw_out.num_rows()).map(|i| avg_arr.value(i)).collect()
+                            // v0.51.6 Slice 4: `avg_v` is genuinely `Float64`
+                            // now; this fuzzer compares every aggregate as
+                            // `Int64` (the DataFusion oracle side is also
+                            // `CAST`-truncated to `Int64` in `run_df_batch`),
+                            // so truncate here to keep both sides consistent.
+                            (0..raw_out.num_rows())
+                                .map(|i| avg_arr.value(i) as i64)
+                                .collect()
                         }
                         _ => (0..raw_out.num_rows()).map(|i| sum_arr.value(i)).collect(),
                     };

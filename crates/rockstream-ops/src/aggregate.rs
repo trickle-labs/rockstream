@@ -17,8 +17,8 @@
 //!
 //! ## Output schema
 //!
-//! Four Int64 columns: `k`, `sum_v`, `count`, `avg_v`
-//! where `avg_v = sum_v / count` (truncating integer division).
+//! `k` (Int64, group key), `sum_v` (Int64), `count` (Int64), `avg_v`
+//! (Float64, `avg_v = sum_v / count` as correct floating-point division).
 //!
 //! ## State persistence
 //!
@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{ArrayRef, Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use tracing::debug;
@@ -44,6 +44,7 @@ use tracing::debug;
 use rockstream_plan::virtual_bucket::route_virtual_bucket;
 use rockstream_storage::{ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::laws::sum_count::avg_from_sum_count;
 
 use crate::error::OpError;
 use crate::op::Operator;
@@ -57,7 +58,7 @@ fn output_schema() -> SchemaRef {
         Field::new("k", DataType::Int64, false),
         Field::new("sum_v", DataType::Int64, false),
         Field::new("count", DataType::Int64, false),
-        Field::new("avg_v", DataType::Int64, false),
+        Field::new("avg_v", DataType::Float64, false),
     ]))
 }
 
@@ -190,7 +191,7 @@ impl AggState {
 /// Stateful incremental aggregate operator.
 ///
 /// Input:  two Int64 columns `(k, v)`.
-/// Output: four Int64 columns `(k, sum_v, count, avg_v)`.
+/// Output: `(k, sum_v, count, avg_v)` — first three columns Int64, `avg_v` Float64.
 ///
 /// Uses interior mutability (`Mutex`) so it satisfies `Operator: &self`.
 pub struct AggregateOp {
@@ -328,7 +329,7 @@ impl Operator for AggregateOp {
         let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
         let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
         let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_avg: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_avg: Vec<f64> = Vec::with_capacity(order.len() * 2);
         let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
 
         let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
@@ -345,7 +346,7 @@ impl Operator for AggregateOp {
 
             // Retract old aggregate row.
             if let Some((old_sum, old_count)) = old_state {
-                let old_avg = old_sum / old_count;
+                let old_avg = avg_from_sum_count(old_sum, old_count).unwrap_or(0.0);
                 out_k.push(k);
                 out_sum.push(old_sum);
                 out_count.push(old_count);
@@ -355,7 +356,7 @@ impl Operator for AggregateOp {
 
             // Insert new aggregate row.
             if let Some((new_sum, new_count)) = new_state {
-                let new_avg = new_sum / new_count;
+                let new_avg = avg_from_sum_count(new_sum, new_count).unwrap_or(0.0);
                 out_k.push(k);
                 out_sum.push(new_sum);
                 out_count.push(new_count);
@@ -398,7 +399,7 @@ impl Operator for AggregateOp {
             Arc::new(Int64Array::from(out_k)),
             Arc::new(Int64Array::from(out_sum)),
             Arc::new(Int64Array::from(out_count)),
-            Arc::new(Int64Array::from(out_avg)),
+            Arc::new(Float64Array::from(out_avg)),
         ];
         let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(data, out_weights))
@@ -548,7 +549,7 @@ impl Operator for BucketedAggregateOp {
         let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
         let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
         let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
-        let mut out_avg: Vec<i64> = Vec::with_capacity(order.len() * 2);
+        let mut out_avg: Vec<f64> = Vec::with_capacity(order.len() * 2);
         let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
 
         let mut combined = self
@@ -608,14 +609,14 @@ impl Operator for BucketedAggregateOp {
                 out_k.push(k);
                 out_sum.push(old_sum);
                 out_count.push(old_count);
-                out_avg.push(old_sum / old_count);
+                out_avg.push(avg_from_sum_count(old_sum, old_count).unwrap_or(0.0));
                 out_weights.push(-1);
             }
             if let Some((new_sum, new_count)) = new_state {
                 out_k.push(k);
                 out_sum.push(new_sum);
                 out_count.push(new_count);
-                out_avg.push(new_sum / new_count);
+                out_avg.push(avg_from_sum_count(new_sum, new_count).unwrap_or(0.0));
                 out_weights.push(1);
             }
         }
@@ -649,7 +650,7 @@ impl Operator for BucketedAggregateOp {
                 Arc::new(Int64Array::from(out_k)) as ArrayRef,
                 Arc::new(Int64Array::from(out_sum)) as ArrayRef,
                 Arc::new(Int64Array::from(out_count)) as ArrayRef,
-                Arc::new(Int64Array::from(out_avg)) as ArrayRef,
+                Arc::new(Float64Array::from(out_avg)) as ArrayRef,
             ],
         )
         .map_err(OpError::arrow)?;
@@ -836,7 +837,7 @@ mod tests {
         ArrowZSet::new(data, weights)
     }
 
-    fn extract_rows(batch: &ArrowZSet) -> Vec<(i64, i64, i64, i64, i64)> {
+    fn extract_rows(batch: &ArrowZSet) -> Vec<(i64, i64, i64, f64, i64)> {
         // (k, sum_v, count, avg_v, weight)
         let k_col = batch
             .data
@@ -860,7 +861,7 @@ mod tests {
             .data
             .column(3)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<Float64Array>()
             .unwrap();
         (0..batch.num_rows())
             .map(|i| {
@@ -882,7 +883,7 @@ mod tests {
         let out = op.process_delta(delta).unwrap();
         let rows = extract_rows(&out);
         // No retraction; one insertion of (k=1, sum=10, count=1, avg=10).
-        assert_eq!(rows, vec![(1, 10, 1, 10, 1)]);
+        assert_eq!(rows, vec![(1, 10, 1, 10.0, 1)]);
         assert_eq!(op.live_groups(), 1);
     }
 
@@ -896,11 +897,11 @@ mod tests {
         let rows = extract_rows(&out);
         // Retract (k=1, sum=10, count=1) and insert (k=1, sum=16, count=2, avg=8).
         assert!(
-            rows.contains(&(1, 10, 1, 10, -1)),
+            rows.contains(&(1, 10, 1, 10.0, -1)),
             "missing retraction: {rows:?}"
         );
         assert!(
-            rows.contains(&(1, 16, 2, 8, 1)),
+            rows.contains(&(1, 16, 2, 8.0, 1)),
             "missing insertion: {rows:?}"
         );
         assert_eq!(op.live_groups(), 1);
@@ -913,7 +914,7 @@ mod tests {
         let out = op.process_delta(make_batch(&[(1, 10, -1)])).unwrap();
         let rows = extract_rows(&out);
         // Retraction of (k=1, sum=10, count=1); no new insertion.
-        assert_eq!(rows, vec![(1, 10, 1, 10, -1)]);
+        assert_eq!(rows, vec![(1, 10, 1, 10.0, -1)]);
         assert_eq!(op.live_groups(), 0);
     }
 
@@ -927,15 +928,15 @@ mod tests {
         // Process k=2,v=20: no old → insert (k=2, sum=20, count=1, avg=20).
         // Process k=1,v=3: old=(5,1) → retract (k=1,5,1,5,-1), insert (k=1,8,2,4,+1).
         assert!(
-            rows.contains(&(2, 20, 1, 20, 1)),
+            rows.contains(&(2, 20, 1, 20.0, 1)),
             "k=2 insert missing: {rows:?}"
         );
         assert!(
-            rows.contains(&(1, 5, 1, 5, -1)),
+            rows.contains(&(1, 5, 1, 5.0, -1)),
             "k=1 first retract missing: {rows:?}"
         );
         assert!(
-            rows.contains(&(1, 8, 2, 4, 1)),
+            rows.contains(&(1, 8, 2, 4.0, 1)),
             "k=1 final insert missing: {rows:?}"
         );
         assert_eq!(op.live_groups(), 2);
@@ -965,18 +966,33 @@ mod tests {
     }
 
     #[test]
-    fn avg_truncates_toward_zero() {
+    fn avg_computes_correct_fractional_average() {
         let op = AggregateOp::new(OperatorId(0));
-        // Insert 3 rows for k=1 with v=-7,-7,-7 → sum=-21, count=3, avg=-7.
+        // Insert 3 rows for k=1 with v=-7,-7,-7 → sum=-21, count=3, avg=-7.0 (exact).
         let _ = op.process_delta(make_batch(&[(1, -7, 1)])).unwrap();
         let _ = op.process_delta(make_batch(&[(1, -7, 1)])).unwrap();
         let out = op.process_delta(make_batch(&[(1, -7, 1)])).unwrap();
-        // After 3 inserts: sum=-21, count=3, avg=-7. Last output is (+1 new row).
         let rows = extract_rows(&out);
         let new_row = rows.iter().find(|r| r.4 == 1).expect("no +1 row");
         assert_eq!(new_row.1, -21); // sum
         assert_eq!(new_row.2, 3); // count
-        assert_eq!(new_row.3, -7); // avg = -21/3
+        assert_eq!(new_row.3, -7.0); // avg = -21.0 / 3.0, exact
+
+        // Genuinely fractional case: sum=10, count=3 → avg = 10.0/3.0, not truncated to 3.
+        let op2 = AggregateOp::new(OperatorId(1));
+        let _ = op2.process_delta(make_batch(&[(1, 1, 1)])).unwrap();
+        let _ = op2.process_delta(make_batch(&[(1, 2, 1)])).unwrap();
+        let out2 = op2.process_delta(make_batch(&[(1, 4, 1)])).unwrap();
+        let rows2 = extract_rows(&out2);
+        let new_row2 = rows2.iter().find(|r| r.4 == 1).expect("no +1 row");
+        assert_eq!(new_row2.1, 7); // sum = 1 + 2 + 4
+        assert_eq!(new_row2.2, 3); // count
+        assert!(
+            (new_row2.3 - (7.0 / 3.0)).abs() < f64::EPSILON,
+            "expected avg ~= 7/3, got {}",
+            new_row2.3
+        );
+        assert_ne!(new_row2.3, 2.0, "avg must not be truncated to an integer");
     }
 
     #[test]

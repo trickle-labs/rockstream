@@ -8,6 +8,9 @@ pub enum GatewayError {
     #[error("[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED or REPEATABLE READ")]
     SerializableNotSupported,
 
+    #[error("[RS-2004] isolation.repeatable_read_not_supported: REPEATABLE READ isolation is not supported; use READ COMMITTED")]
+    RepeatableReadNotSupported,
+
     #[error("[RS-2600] limit.prepared_statements_exceeded: prepared statement limit of {limit} exceeded for this connection. next_steps: Deallocate unused prepared statements using DEALLOCATE.")]
     PreparedStatementsLimitExceeded { limit: usize },
 
@@ -147,6 +150,7 @@ impl From<pgwire::error::PgWireError> for GatewayError {
 pub fn sqlstate_for(e: &GatewayError) -> &'static str {
     match e {
         GatewayError::SerializableNotSupported => "25001",
+        GatewayError::RepeatableReadNotSupported => "25001",
         GatewayError::PreparedStatementsLimitExceeded { .. } => "53200",
         GatewayError::PortalsLimitExceeded { .. } => "53200",
         GatewayError::ViewNotFound(_) => "42P01",

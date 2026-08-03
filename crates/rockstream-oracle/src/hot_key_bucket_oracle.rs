@@ -31,8 +31,8 @@ fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
     ArrowZSet::new(data, weights)
 }
 
-fn apply_output(state: &mut BTreeMap<i64, (i64, i64, i64)>, output: &ArrowZSet) {
-    use arrow::array::Int64Array;
+fn apply_output(state: &mut BTreeMap<i64, (i64, i64, f64)>, output: &ArrowZSet) {
+    use arrow::array::{Float64Array, Int64Array};
 
     if output.is_empty() {
         return;
@@ -56,11 +56,13 @@ fn apply_output(state: &mut BTreeMap<i64, (i64, i64, i64)>, output: &ArrowZSet) 
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
+    // v0.51.6 Slice 4: `avg_v` (column 3) is genuinely `Float64` now (true
+    // floating-point division), not `Int64` (truncating division).
     let a_col = output
         .data
         .column(3)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Float64Array>()
         .unwrap();
     for i in 0..output.num_rows() {
         let row = (s_col.value(i), c_col.value(i), a_col.value(i));
@@ -75,7 +77,7 @@ fn apply_output(state: &mut BTreeMap<i64, (i64, i64, i64)>, output: &ArrowZSet) 
 fn run_final_state<O: Operator>(
     operator: &O,
     epochs: &[Vec<(i64, i64, i64)>],
-) -> Vec<(i64, i64, i64, i64)> {
+) -> Vec<(i64, i64, i64, f64)> {
     let mut state = BTreeMap::new();
     for epoch in epochs {
         let output = operator.process_delta(make_kv_batch(epoch)).unwrap();

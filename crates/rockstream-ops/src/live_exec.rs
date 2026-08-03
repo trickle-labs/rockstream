@@ -407,24 +407,24 @@ impl GroupKeyPacker {
 
     /// `(surrogate_k, sum, count, avg)` rows → `(k0, .., k_{n-1}, sum,
     /// count, avg)` rows, one-to-one, preserving row order and weight.
+    ///
+    /// Each "rest" (non-key) input column is preserved in its own Arrow
+    /// type: `AggregateOp`'s `sum`/`count` columns are `Int64`, but its
+    /// `avg` column is `Float64` (v0.51.6 Slice 4 — correct floating-point
+    /// division). `MinMaxOp`'s single `extremum_v` rest column is `Int64`.
+    /// The surrogate key column itself (`cols[0]`) is always `Int64`.
     pub fn unpack(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
         let n = self.n_key_cols;
-        let cols: Vec<&Int64Array> = delta
+        let surrogate_col = delta
             .data
-            .columns()
-            .iter()
-            .map(|c| {
-                c.as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("Int64 column")
-            })
-            .collect();
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 surrogate key column");
         let reverse = self.reverse.lock().unwrap();
         let mut key_cols: Vec<Vec<i64>> = vec![Vec::with_capacity(delta.num_rows()); n];
-        let mut rest_cols: Vec<Vec<i64>> =
-            vec![Vec::with_capacity(delta.num_rows()); cols.len().saturating_sub(1)];
         for row in 0..delta.num_rows() {
-            let surrogate = cols[0].value(row);
+            let surrogate = surrogate_col.value(row);
             let orig = reverse
                 .get(&surrogate)
                 .cloned()
@@ -432,26 +432,25 @@ impl GroupKeyPacker {
             for (i, v) in orig.into_iter().enumerate().take(n) {
                 key_cols[i].push(v);
             }
-            for (i, col) in cols.iter().enumerate().skip(1) {
-                rest_cols[i - 1].push(col.value(row));
-            }
         }
         let mut fields: Vec<Field> = (0..n)
             .map(|i| Field::new(format!("k{i}"), DataType::Int64, false))
             .collect();
-        for i in 0..rest_cols.len() {
-            fields.push(Field::new(format!("r{i}"), DataType::Int64, false));
-        }
-        let schema: SchemaRef = Arc::new(Schema::new(fields));
         let mut arrays: Vec<ArrayRef> = key_cols
             .into_iter()
             .map(|c| Arc::new(Int64Array::from(c)) as ArrayRef)
             .collect();
-        arrays.extend(
-            rest_cols
-                .into_iter()
-                .map(|c| Arc::new(Int64Array::from(c)) as ArrayRef),
-        );
+        // Rest columns (everything after the surrogate key) are passed
+        // through unchanged, preserving each column's own Arrow type.
+        for (i, col) in delta.data.columns().iter().enumerate().skip(1) {
+            fields.push(Field::new(
+                format!("r{}", i - 1),
+                col.data_type().clone(),
+                false,
+            ));
+            arrays.push(col.clone());
+        }
+        let schema: SchemaRef = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, arrays).map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(batch, delta.weights.clone()))
     }
@@ -540,39 +539,34 @@ impl Utf8KeyPacker {
     /// `(surrogate_k, sum, count, avg)` rows → `(k: Utf8, sum, count, avg)`
     /// rows, one-to-one, preserving row order and weight.
     pub fn unpack(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        let cols: Vec<&Int64Array> = delta
+        let surrogate_col = delta
             .data
-            .columns()
-            .iter()
-            .map(|c| {
-                c.as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("Int64 column")
-            })
-            .collect();
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 surrogate key column");
         let reverse = self.reverse.lock().unwrap();
         let mut keys: Vec<String> = Vec::with_capacity(delta.num_rows());
-        let mut rest_cols: Vec<Vec<i64>> =
-            vec![Vec::with_capacity(delta.num_rows()); cols.len().saturating_sub(1)];
         for row in 0..delta.num_rows() {
-            let surrogate = cols[0].value(row);
+            let surrogate = surrogate_col.value(row);
             keys.push(reverse.get(&surrogate).cloned().unwrap_or_default());
-            for (i, col) in cols.iter().enumerate().skip(1) {
-                rest_cols[i - 1].push(col.value(row));
-            }
         }
         let mut fields: Vec<Field> = vec![Field::new("k", DataType::Utf8, false)];
-        for i in 0..rest_cols.len() {
-            fields.push(Field::new(format!("r{i}"), DataType::Int64, false));
-        }
-        let schema: SchemaRef = Arc::new(Schema::new(fields));
         let mut arrays: Vec<ArrayRef> =
             vec![Arc::new(arrow::array::StringArray::from(keys)) as ArrayRef];
-        arrays.extend(
-            rest_cols
-                .into_iter()
-                .map(|c| Arc::new(Int64Array::from(c)) as ArrayRef),
-        );
+        // Rest columns (everything after the surrogate key) are passed
+        // through unchanged, preserving each column's own Arrow type — e.g.
+        // `AVG`'s genuinely `Float64` output (v0.51.6 Slice 4), not just
+        // `Int64` (matches `GroupKeyPacker::unpack`'s identical fix above).
+        for (i, col) in delta.data.columns().iter().enumerate().skip(1) {
+            fields.push(Field::new(
+                format!("r{}", i - 1),
+                col.data_type().clone(),
+                false,
+            ));
+            arrays.push(col.clone());
+        }
+        let schema: SchemaRef = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, arrays).map_err(OpError::arrow)?;
         Ok(ArrowZSet::new(batch, delta.weights.clone()))
     }
@@ -763,10 +757,28 @@ impl StatefulPipeline {
     }
 }
 
+/// How `MultiAggregatePipeline::process` extracts one final output column
+/// from the cascade-joined accumulator's payload columns (0-indexed,
+/// counting from the first payload column after `k`) — see
+/// `compile_multi_aggregate_lanes` in `compile.rs`.
+#[derive(Debug, Clone, Copy)]
+pub enum FinalizeCol {
+    /// Pass the payload column at this index through unchanged.
+    Direct(usize),
+    /// v0.51.6 Slice 4: combine a `(sum, count)` `Int64` pair — forwarded
+    /// through the join cascade instead of `AggregateOp`'s already-`Float64`
+    /// `avg_v` (see the `AggregateFunc::Avg` arm in `compile.rs`) because
+    /// `OuterJoinOp`'s persisted arrangement is `Int64`-only — into one true
+    /// `Float64` avg column via `avg_from_sum_count`.
+    Avg { sum_idx: usize, count_idx: usize },
+}
+
 /// v0.51.4 Slice 8: composes `N` independent single-aggregate "lanes" —
-/// each its own `StatefulPipeline` producing `(k, agg_i)` from the same
+/// each its own `StatefulPipeline` producing `(k, payload..)` from the same
 /// shared input delta — into one `(k, agg_0, .., agg_{N-1})` row per group,
-/// by cascade-joining the lanes' outputs on `k` via `OuterJoinOp` (`Left`).
+/// by cascade-joining the lanes' outputs on `k` via `OuterJoinOp` (`Left`),
+/// then finalizing each lane's payload into its aggregate's true output
+/// value via `finalize` (see `FinalizeCol`).
 ///
 /// Built for Nexmark q15's `SUM(...)`, `COUNT(DISTINCT ...)` x2 all `GROUP
 /// BY date_bin(...)` shape (`compile_multi_aggregate_lanes` in `compile.rs`)
@@ -778,18 +790,39 @@ impl StatefulPipeline {
 /// contributing to *any* aggregate appears in the result), not be dropped
 /// the way an inner join would. `OuterJoinOp` NULL-pads an unmatched side
 /// with `0i64` (see its module doc), which is exactly `COUNT`/`SUM`'s
-/// identity element for "no matching rows".
+/// identity element for "no matching rows" (and, for `AVG`'s forwarded
+/// `sum`/`count` pair, `avg_from_sum_count(0, 0)` — a genuinely
+/// no-matching-rows group — is defined to be `0.0`, matching `AggregateOp`'s
+/// own convention).
 pub struct MultiAggregatePipeline {
     lanes: Vec<StatefulPipeline>,
+    /// Payload width (columns beyond `k`) of each lane's output, in the same
+    /// order as `lanes` — 1 for every lane except `AVG`'s (2: `sum`, `count`).
+    lane_widths: Vec<usize>,
     /// `joins.len() == lanes.len() - 1`; `joins[i]` combines the running
     /// accumulator (lanes `0..=i`, already joined) with `lanes[i + 1]`'s
     /// output.
     joins: Vec<Arc<OuterJoinOp>>,
+    /// One entry per *original* aggregate (`aggregates` order in
+    /// `compile_multi_aggregate_lanes`), describing how to build that
+    /// aggregate's final output column from the fully joined accumulator's
+    /// payload columns.
+    finalize: Vec<FinalizeCol>,
 }
 
 impl MultiAggregatePipeline {
-    pub fn new(lanes: Vec<StatefulPipeline>, joins: Vec<Arc<OuterJoinOp>>) -> Self {
-        MultiAggregatePipeline { lanes, joins }
+    pub fn new(
+        lanes: Vec<StatefulPipeline>,
+        lane_widths: Vec<usize>,
+        joins: Vec<Arc<OuterJoinOp>>,
+        finalize: Vec<FinalizeCol>,
+    ) -> Self {
+        MultiAggregatePipeline {
+            lanes,
+            lane_widths,
+            joins,
+            finalize,
+        }
     }
 
     /// Drop column `drop_idx` from `zset`, keeping every other column in
@@ -805,6 +838,59 @@ impl MultiAggregatePipeline {
         crate::project::ProjectOp::new(exprs).process_delta(zset)
     }
 
+    /// Build the final `(k, agg_0, .., agg_{N-1})` row from the fully
+    /// cascade-joined accumulator's `(k, payload_0, .., payload_{M-1})`
+    /// columns, per `self.finalize` — see `FinalizeCol`.
+    fn finalize_row(&self, acc: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        use arrow::array::{Float64Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let k_col = acc.data.column(0).clone();
+        let mut fields: Vec<Field> = vec![Field::new("k", DataType::Int64, false)];
+        let mut cols: Vec<ArrayRef> = vec![k_col];
+        for (i, col_kind) in self.finalize.iter().enumerate() {
+            match *col_kind {
+                FinalizeCol::Direct(idx) => {
+                    let col = acc.data.column(1 + idx).clone();
+                    fields.push(Field::new(
+                        format!("agg{i}"),
+                        col.data_type().clone(),
+                        false,
+                    ));
+                    cols.push(col);
+                }
+                FinalizeCol::Avg { sum_idx, count_idx } => {
+                    let sum_col = acc
+                        .data
+                        .column(1 + sum_idx)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("AVG lane sum column must be Int64");
+                    let count_col = acc
+                        .data
+                        .column(1 + count_idx)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("AVG lane count column must be Int64");
+                    let avgs: Vec<f64> = (0..acc.data.num_rows())
+                        .map(|row| {
+                            rockstream_types::laws::sum_count::avg_from_sum_count(
+                                sum_col.value(row),
+                                count_col.value(row),
+                            )
+                            .unwrap_or(0.0)
+                        })
+                        .collect();
+                    fields.push(Field::new(format!("agg{i}"), DataType::Float64, false));
+                    cols.push(Arc::new(Float64Array::from(avgs)) as ArrayRef);
+                }
+            }
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
+        Ok(ArrowZSet::new(data, acc.weights))
+    }
+
     pub fn process(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
         let mut lane_outputs: Vec<ArrowZSet> = Vec::with_capacity(self.lanes.len());
         for lane in &self.lanes {
@@ -814,16 +900,21 @@ impl MultiAggregatePipeline {
         let mut acc = lane_iter.next().ok_or_else(|| {
             OpError::unsupported_plan_node("MultiAggregatePipeline requires at least one lane")
         })?;
-        let mut acc_n_cols = 2usize; // (k, agg_0)
-        #[allow(clippy::explicit_counter_loop)]
-        for (join, right) in self.joins.iter().zip(lane_iter) {
+        // `acc_n_cols` tracks the running accumulator's column count (`k`
+        // plus every lane payload joined so far).
+        let mut acc_n_cols = 1 + self.lane_widths[0];
+        for (join, (right, &w)) in self
+            .joins
+            .iter()
+            .zip(lane_iter.by_ref().zip(self.lane_widths[1..].iter()))
+        {
             let joined = join.process_epoch(acc, right)?;
-            // joined = (acc_cols.., right_k, right_agg) — drop the
+            // joined = (acc_cols.., right_k, right_payload..) — drop the
             // duplicate right-side key column at position acc_n_cols.
             acc = Self::drop_column(joined, acc_n_cols)?;
-            acc_n_cols += 1;
+            acc_n_cols += w;
         }
-        Ok(acc)
+        self.finalize_row(acc)
     }
 
     pub async fn persist(&self, db: &ShardDb) -> Result<(), OpError> {
