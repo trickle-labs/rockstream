@@ -66,6 +66,17 @@ pub trait ViewReader: Send + Sync {
 
     /// The current published frontier epoch (None if no data written yet).
     fn published_frontier(&self) -> Option<u64>;
+
+    /// Read-only inspection of an intermediate Z-set arrangement key.
+    /// Returns `Ok(Some((weight, epoch)))` if found, or `Ok(None)` if key does not exist.
+    async fn peek_arrangement(
+        &self,
+        _view_name: &str,
+        _op_id: u64,
+        _key: &str,
+    ) -> Result<Option<(i64, u64)>, GatewayError> {
+        Ok(None)
+    }
 }
 
 /// Column metadata for a view.
@@ -209,6 +220,36 @@ impl ViewReader for HotOnlyViewReader {
 
     fn published_frontier(&self) -> Option<u64> {
         self.frontier_epoch
+    }
+
+    async fn peek_arrangement(
+        &self,
+        _view_name: &str,
+        op_id: u64,
+        key: &str,
+    ) -> Result<Option<(i64, u64)>, GatewayError> {
+        let epoch = self.published_frontier().unwrap_or(0);
+        let mut db_key = Vec::with_capacity(9 + key.len());
+        db_key.push(0x01);
+        db_key.extend_from_slice(&op_id.to_be_bytes());
+        if let Ok(num_key) = key.parse::<i64>() {
+            db_key.extend_from_slice(&num_key.to_be_bytes());
+        } else {
+            db_key.extend_from_slice(key.as_bytes());
+        }
+
+        if let Some(val) = self.shard_reader.get(&db_key).await? {
+            let weight = if val.len() >= 16 {
+                i64::from_be_bytes(val[8..16].try_into().unwrap_or([0; 8]))
+            } else if val.len() >= 8 {
+                i64::from_be_bytes(val[0..8].try_into().unwrap_or([0; 8]))
+            } else {
+                1i64
+            };
+            Ok(Some((weight, epoch)))
+        } else {
+            Ok(None)
+        }
     }
 }
 

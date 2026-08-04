@@ -1,9 +1,9 @@
 //! Worker-side prospective quota enforcement and batch shedding (v0.51.10).
 
-use std::sync::Arc;
 use rockstream_types::ids::WorkloadId;
 use rockstream_types::state_budget::{DistributedQuotaLedger, QuotaGuard, StateBudgetError};
 use rockstream_types::view_lifecycle::ViewState;
+use std::sync::Arc;
 
 /// Worker-side prospective quota manager.
 /// Enforces workload memory limits and parallelism bounds BEFORE batch arrangement memory allocation.
@@ -44,7 +44,8 @@ impl WorkerQuotaManager {
         requested_bytes: u64,
         parallelism: u32,
     ) -> Result<QuotaGuard, StateBudgetError> {
-        self.ledger.try_acquire_batch(workload_id, requested_bytes, parallelism)
+        self.ledger
+            .try_acquire_batch(workload_id, requested_bytes, parallelism)
     }
 
     /// Handle prospective batch rejection: returns `ViewState::OverBudgetRejected`
@@ -72,7 +73,9 @@ mod tests {
     #[test]
     fn prospective_batch_allocation_and_rejection() {
         let mgr = WorkerQuotaManager::new();
-        mgr.ledger().register_workload(WorkloadId(1), 1024, 4).unwrap();
+        mgr.ledger()
+            .register_workload(WorkloadId(1), 1024, 4)
+            .unwrap();
 
         // 512 bytes succeeds
         let guard = mgr.try_allocate_batch(WorkloadId(1), 512, 1);

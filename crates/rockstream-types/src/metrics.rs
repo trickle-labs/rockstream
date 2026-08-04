@@ -217,6 +217,30 @@ struct MetricRegistry {
     flush_duration_count: AtomicU64,
     flush_duration_last_ms: AtomicU64,
     operator_runtime: HashMap<OperatorId, OperatorRuntimeWindow>,
+    operator_frontiers: HashMap<(String, OperatorId, u32), OperatorFrontierEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct OperatorFrontierEntry {
+    view_name: String,
+    op_id: OperatorId,
+    shard_id: u32,
+    frontier_epoch: u64,
+    is_source: bool,
+    _updated_at: SystemTime,
+}
+
+/// Snapshot of operator/shard frontier status for pipeline stall diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorFrontierSnapshot {
+    pub view_name: String,
+    pub op_id: OperatorId,
+    pub shard_id: u32,
+    pub frontier_epoch: u64,
+    pub is_source: bool,
+    pub is_slowest_input: bool,
+    pub is_holding_back_commit: bool,
+    pub lag_behind_max_ms: u64,
 }
 
 impl MetricRegistry {
@@ -266,6 +290,7 @@ impl MetricRegistry {
             flush_duration_count: AtomicU64::new(0),
             flush_duration_last_ms: AtomicU64::new(0),
             operator_runtime: HashMap::new(),
+            operator_frontiers: HashMap::new(),
         }
     }
 }
@@ -506,6 +531,126 @@ pub fn operator_rmw_totals(operator_id: OperatorId) -> (u64, u64) {
     })
 }
 
+const MAX_FRONTIER_ENTRIES: usize = 4096;
+
+pub fn record_operator_frontier(
+    view_name: &str,
+    op_id: OperatorId,
+    shard_id: u32,
+    frontier_epoch: u64,
+    is_source: bool,
+) {
+    record_operator_frontier_at(
+        view_name,
+        op_id,
+        shard_id,
+        frontier_epoch,
+        is_source,
+        SystemTime::now(),
+    );
+}
+
+pub fn record_operator_frontier_at(
+    view_name: &str,
+    op_id: OperatorId,
+    shard_id: u32,
+    frontier_epoch: u64,
+    is_source: bool,
+    at: SystemTime,
+) {
+    with_registry(|reg| {
+        let key = (view_name.to_string(), op_id, shard_id);
+        if reg.operator_frontiers.len() >= MAX_FRONTIER_ENTRIES
+            && !reg.operator_frontiers.contains_key(&key)
+        {
+            reg.operator_frontiers.clear();
+        }
+        reg.operator_frontiers.insert(
+            key,
+            OperatorFrontierEntry {
+                view_name: view_name.to_string(),
+                op_id,
+                shard_id,
+                frontier_epoch,
+                is_source,
+                _updated_at: at,
+            },
+        );
+    });
+}
+
+pub fn pipeline_stall_report(view_filter: Option<&str>) -> Vec<OperatorFrontierSnapshot> {
+    with_registry(|reg| pipeline_stall_report_from_map(&reg.operator_frontiers, view_filter))
+}
+
+fn pipeline_stall_report_from_map(
+    operator_frontiers: &HashMap<(String, OperatorId, u32), OperatorFrontierEntry>,
+    view_filter: Option<&str>,
+) -> Vec<OperatorFrontierSnapshot> {
+    let matching_entries: Vec<_> = operator_frontiers
+        .values()
+        .filter(|e| {
+            if let Some(vf) = view_filter {
+                e.view_name.eq_ignore_ascii_case(vf)
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+
+    if matching_entries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut by_view: HashMap<String, Vec<OperatorFrontierEntry>> = HashMap::new();
+    for entry in matching_entries {
+        by_view
+            .entry(entry.view_name.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    let mut snapshots = Vec::new();
+    for (v_name, entries) in by_view {
+        let max_epoch = entries.iter().map(|e| e.frontier_epoch).max().unwrap_or(0);
+        let min_epoch = entries.iter().map(|e| e.frontier_epoch).min().unwrap_or(0);
+
+        let source_min_epoch = entries
+            .iter()
+            .filter(|e| e.is_source)
+            .map(|e| e.frontier_epoch)
+            .min();
+
+        for entry in entries {
+            let is_slowest_input =
+                entry.is_source && (source_min_epoch == Some(entry.frontier_epoch));
+            let is_holding_back_commit =
+                (entry.frontier_epoch == min_epoch) && (min_epoch < max_epoch);
+            let lag_behind_max_ms = (max_epoch.saturating_sub(entry.frontier_epoch)) * 1000;
+
+            snapshots.push(OperatorFrontierSnapshot {
+                view_name: v_name.clone(),
+                op_id: entry.op_id,
+                shard_id: entry.shard_id,
+                frontier_epoch: entry.frontier_epoch,
+                is_source: entry.is_source,
+                is_slowest_input,
+                is_holding_back_commit,
+                lag_behind_max_ms,
+            });
+        }
+    }
+
+    snapshots.sort_by(|a, b| {
+        a.view_name
+            .cmp(&b.view_name)
+            .then_with(|| a.op_id.0.cmp(&b.op_id.0))
+            .then_with(|| a.shard_id.cmp(&b.shard_id))
+    });
+    snapshots
+}
+
 // ─── reset_all ───────────────────────────────────────────────────────────────
 
 /// Reset all counters to zero.
@@ -541,6 +686,7 @@ pub fn reset_all() {
         reg.placed_shard_count.store(0, Ordering::Relaxed);
         reg.session_staleness_exceeded_total.clear();
         reg.session_frontier_age_ms.clear();
+        reg.operator_frontiers.clear();
         reg.shard_bloom_filter_bytes_used.clear();
         reg.scatter_shards_total.store(0, Ordering::Relaxed);
         reg.scatter_shards_pruned_total.store(0, Ordering::Relaxed);
@@ -1335,9 +1481,45 @@ pub fn generate_prometheus_metrics() -> String {
         out.push_str("# HELP slatedb_manifest_write_total Total manifest writes.\n");
         out.push_str("# TYPE slatedb_manifest_write_total counter\n");
         out.push_str(&format!(
-            "slatedb_manifest_write_total {}\n",
+            "slatedb_manifest_write_total {}\n\n",
             reg.manifest_writes.load(Ordering::Relaxed)
         ));
+
+        // 18. Stall diagnostics metrics
+        let stall_snapshots = pipeline_stall_report_from_map(&reg.operator_frontiers, None);
+        if !stall_snapshots.is_empty() {
+            out.push_str("# HELP rockstream_operator_frontier_epoch Gauge showing current frontier epoch per operator and shard.\n");
+            out.push_str("# TYPE rockstream_operator_frontier_epoch gauge\n");
+            for s in &stall_snapshots {
+                out.push_str(&format!(
+                    "rockstream_operator_frontier_epoch{{view_name=\"{}\",op_id=\"{}\",shard_id=\"{}\"}} {}\n",
+                    s.view_name, s.op_id.0, s.shard_id, s.frontier_epoch
+                ));
+            }
+            out.push('\n');
+
+            out.push_str("# HELP rockstream_pipeline_slowest_input_epoch Gauge showing frontier epoch of the slowest input source operator.\n");
+            out.push_str("# TYPE rockstream_pipeline_slowest_input_epoch gauge\n");
+            for s in &stall_snapshots {
+                if s.is_slowest_input {
+                    out.push_str(&format!(
+                        "rockstream_pipeline_slowest_input_epoch{{view_name=\"{}\",op_id=\"{}\",shard_id=\"{}\"}} {}\n",
+                        s.view_name, s.op_id.0, s.shard_id, s.frontier_epoch
+                    ));
+                }
+            }
+            out.push('\n');
+
+            out.push_str("# HELP rockstream_pipeline_holding_back_frontier Gauge indicating whether an operator/shard is holding back commit.\n");
+            out.push_str("# TYPE rockstream_pipeline_holding_back_frontier gauge\n");
+            for s in &stall_snapshots {
+                out.push_str(&format!(
+                    "rockstream_pipeline_holding_back_frontier{{view_name=\"{}\",op_id=\"{}\",shard_id=\"{}\"}} {}\n",
+                    s.view_name, s.op_id.0, s.shard_id, if s.is_holding_back_commit { 1 } else { 0 }
+                ));
+            }
+            out.push('\n');
+        }
     });
     out
 }

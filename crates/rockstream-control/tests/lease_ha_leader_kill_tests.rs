@@ -1,9 +1,9 @@
 //! Consensus-replicated lease HA leader kill drill integration tests (v0.51.10).
 
-use std::sync::Arc;
-use std::time::Duration;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 
 use rockstream_control::raft::{spawn_raft_node, RaftConfig};

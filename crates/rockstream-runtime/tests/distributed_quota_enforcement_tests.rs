@@ -1,11 +1,11 @@
 //! Integration tests for prospective worker-side quota enforcement and multi-worker isolation (v0.51.10).
 
-use std::sync::Arc;
-use std::time::Duration;
 use rockstream_runtime::WorkerQuotaManager;
 use rockstream_types::ids::WorkloadId;
 use rockstream_types::state_budget::DistributedQuotaLedger;
 use rockstream_types::view_lifecycle::ViewState;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Test 1: Prospective worker-side rejection for a hostile tenant allocating 10x MEMORY_LIMIT.
 /// Proves that over-limit batches are rejected BEFORE batch memory allocation, producing `OverBudgetRejected`.
@@ -19,7 +19,9 @@ async fn test_hostile_tenant_prospective_rejection_multi_worker() {
     let memory_limit_bytes = 10_000u64;
 
     // Register hostile workload with 10k limit
-    ledger.register_workload(hostile_workload, memory_limit_bytes, 8).unwrap();
+    ledger
+        .register_workload(hostile_workload, memory_limit_bytes, 8)
+        .unwrap();
 
     // Worker 1 allocates 8,000 bytes (within 10k limit)
     let _guard1 = worker1_quota
@@ -50,17 +52,27 @@ async fn test_well_behaved_tenant_slo_preserved_under_noisy_neighbor() {
     let well_behaved_workload = WorkloadId(1);
     let hostile_workload = WorkloadId(2);
 
-    ledger.register_workload(well_behaved_workload, 50_000, 4).unwrap();
-    ledger.register_workload(hostile_workload, 10_000, 4).unwrap();
+    ledger
+        .register_workload(well_behaved_workload, 50_000, 4)
+        .unwrap();
+    ledger
+        .register_workload(hostile_workload, 10_000, 4)
+        .unwrap();
 
     // Hostile tenant attempts continuous batch flooding (10x limit = 100,000 bytes)
     let mut hostile_rejections = 0;
     for _ in 0..50 {
-        if worker.try_allocate_batch(hostile_workload, 100_000, 1).is_err() {
+        if worker
+            .try_allocate_batch(hostile_workload, 100_000, 1)
+            .is_err()
+        {
             hostile_rejections += 1;
         }
     }
-    assert_eq!(hostile_rejections, 50, "All 50 hostile batch allocations must be prospectively rejected");
+    assert_eq!(
+        hostile_rejections, 50,
+        "All 50 hostile batch allocations must be prospectively rejected"
+    );
 
     // Well-behaved tenant executes workload within 1.0x limit (20,000 bytes out of 50,000)
     let start_time = std::time::Instant::now();
@@ -87,7 +99,9 @@ async fn test_cross_worker_quota_coordination() {
         .collect();
 
     let shared_workload = WorkloadId(100);
-    ledger.register_workload(shared_workload, 40_000, 10).unwrap();
+    ledger
+        .register_workload(shared_workload, 40_000, 10)
+        .unwrap();
 
     // Each worker acquires 10,000 bytes
     let mut guards = Vec::new();

@@ -452,8 +452,12 @@ impl DistributedQuotaLedger {
         self.entries
             .entry(workload_id)
             .and_modify(|entry| {
-                entry.memory_limit_bytes.store(memory_limit_bytes, Ordering::Relaxed);
-                entry.max_parallelism.store(max_parallelism as u64, Ordering::Relaxed);
+                entry
+                    .memory_limit_bytes
+                    .store(memory_limit_bytes, Ordering::Relaxed);
+                entry
+                    .max_parallelism
+                    .store(max_parallelism as u64, Ordering::Relaxed);
             })
             .or_insert_with(|| {
                 Arc::new(WorkloadQuotaLedgerEntry::new(
@@ -499,17 +503,23 @@ impl DistributedQuotaLedger {
                             requested_bytes,
                         });
                     }
-                    if entry.current_memory_bytes.compare_exchange_weak(
-                        current,
-                        proposed,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ).is_ok() {
+                    if entry
+                        .current_memory_bytes
+                        .compare_exchange_weak(
+                            current,
+                            proposed,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
                         break;
                     }
                 }
             } else {
-                entry.current_memory_bytes.fetch_add(requested_bytes, Ordering::Relaxed);
+                entry
+                    .current_memory_bytes
+                    .fetch_add(requested_bytes, Ordering::Relaxed);
             }
 
             let max_p = entry.max_parallelism.load(Ordering::Relaxed);
@@ -519,7 +529,9 @@ impl DistributedQuotaLedger {
                     let proposed_p = current_p.saturating_add(parallelism as u64);
                     if proposed_p > max_p {
                         if memory_limit > 0 {
-                            entry.current_memory_bytes.fetch_sub(requested_bytes, Ordering::Relaxed);
+                            entry
+                                .current_memory_bytes
+                                .fetch_sub(requested_bytes, Ordering::Relaxed);
                         }
                         self.total_rejections.fetch_add(1, Ordering::Relaxed);
                         return Err(StateBudgetError {
@@ -529,17 +541,23 @@ impl DistributedQuotaLedger {
                             requested_bytes: parallelism as u64,
                         });
                     }
-                    if entry.current_parallelism.compare_exchange_weak(
-                        current_p,
-                        proposed_p,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ).is_ok() {
+                    if entry
+                        .current_parallelism
+                        .compare_exchange_weak(
+                            current_p,
+                            proposed_p,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
                         break;
                     }
                 }
             } else {
-                entry.current_parallelism.fetch_add(parallelism as u64, Ordering::Relaxed);
+                entry
+                    .current_parallelism
+                    .fetch_add(parallelism as u64, Ordering::Relaxed);
             }
         }
         self.total_reservations.fetch_add(1, Ordering::Relaxed);
@@ -558,24 +576,27 @@ impl DistributedQuotaLedger {
             loop {
                 let current = entry.current_memory_bytes.load(Ordering::Relaxed);
                 let proposed = current.saturating_sub(bytes);
-                if entry.current_memory_bytes.compare_exchange_weak(
-                    current,
-                    proposed,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ).is_ok() {
+                if entry
+                    .current_memory_bytes
+                    .compare_exchange_weak(current, proposed, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
                     break;
                 }
             }
             loop {
                 let current_p = entry.current_parallelism.load(Ordering::Relaxed);
                 let proposed_p = current_p.saturating_sub(parallelism as u64);
-                if entry.current_parallelism.compare_exchange_weak(
-                    current_p,
-                    proposed_p,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ).is_ok() {
+                if entry
+                    .current_parallelism
+                    .compare_exchange_weak(
+                        current_p,
+                        proposed_p,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
                     break;
                 }
             }
@@ -760,7 +781,9 @@ mod tests {
         assert_eq!(ledger.total_reservations(), 1);
 
         // Batch 2: 500 bytes -> exceeds memory limit 1000 (600 + 500 = 1100 > 1000)
-        let err = ledger.try_acquire_batch(WorkloadId(101), 500, 1).unwrap_err();
+        let err = ledger
+            .try_acquire_batch(WorkloadId(101), 500, 1)
+            .unwrap_err();
         assert_eq!(err.operator_name, "workload-101");
         assert_eq!(ledger.total_rejections(), 1);
 
@@ -775,10 +798,14 @@ mod tests {
     #[test]
     fn distributed_quota_ledger_parallelism_cap() {
         let ledger = Arc::new(DistributedQuotaLedger::new());
-        ledger.register_workload(WorkloadId(202), 10_000, 2).unwrap();
+        ledger
+            .register_workload(WorkloadId(202), 10_000, 2)
+            .unwrap();
 
         let _g1 = ledger.try_acquire_batch(WorkloadId(202), 100, 2).unwrap();
-        let err = ledger.try_acquire_batch(WorkloadId(202), 100, 1).unwrap_err();
+        let err = ledger
+            .try_acquire_batch(WorkloadId(202), 100, 1)
+            .unwrap_err();
         assert_eq!(err.operator_name, "workload-parallelism-202");
     }
 

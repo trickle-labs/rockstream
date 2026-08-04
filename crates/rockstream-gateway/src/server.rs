@@ -2964,6 +2964,179 @@ impl GatewayHandler {
         }
 
         // S8: SHOW <key> — return from session GUC params or session fields.
+        if ql.trim_end_matches(';') == "show pipeline stalls"
+            || ql.trim_end_matches(';') == "show frontiers"
+        {
+            let cols = vec![
+                "view_name".to_string(),
+                "op_id".to_string(),
+                "shard_id".to_string(),
+                "frontier_epoch".to_string(),
+                "is_slowest_input".to_string(),
+                "is_holding_back_commit".to_string(),
+                "lag_behind_max_ms".to_string(),
+            ];
+            let snapshots = rockstream_types::metrics::pipeline_stall_report(None);
+            let rows = snapshots
+                .into_iter()
+                .map(|s| {
+                    vec![
+                        Some(s.view_name),
+                        Some(s.op_id.0.to_string()),
+                        Some(s.shard_id.to_string()),
+                        Some(s.frontier_epoch.to_string()),
+                        Some(s.is_slowest_input.to_string()),
+                        Some(s.is_holding_back_commit.to_string()),
+                        Some(s.lag_behind_max_ms.to_string()),
+                    ]
+                })
+                .collect();
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                CatalogResponse::Rows {
+                    columns: cols,
+                    rows,
+                },
+            ))]);
+        }
+        if ql.starts_with("show pipeline stalls for ") {
+            let view_name = q["show pipeline stalls for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            if self.catalog.get_view(view_name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-1001] view.not_found: view '{view_name}' does not exist. Next steps: check SHOW VIEWS for active pipelines"
+                    ),
+                ))))]);
+            }
+            let cols = vec![
+                "view_name".to_string(),
+                "op_id".to_string(),
+                "shard_id".to_string(),
+                "frontier_epoch".to_string(),
+                "is_slowest_input".to_string(),
+                "is_holding_back_commit".to_string(),
+                "lag_behind_max_ms".to_string(),
+            ];
+            let snapshots = rockstream_types::metrics::pipeline_stall_report(Some(view_name));
+            let rows = snapshots
+                .into_iter()
+                .map(|s| {
+                    vec![
+                        Some(s.view_name),
+                        Some(s.op_id.0.to_string()),
+                        Some(s.shard_id.to_string()),
+                        Some(s.frontier_epoch.to_string()),
+                        Some(s.is_slowest_input.to_string()),
+                        Some(s.is_holding_back_commit.to_string()),
+                        Some(s.lag_behind_max_ms.to_string()),
+                    ]
+                })
+                .collect();
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                CatalogResponse::Rows {
+                    columns: cols,
+                    rows,
+                },
+            ))]);
+        }
+        if ql.starts_with("show arrangement ") {
+            let rest = q["show arrangement ".len()..].trim().trim_end_matches(';');
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            if tokens.len() < 3 {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    "[RS-2001] syntax.error: SHOW ARRANGEMENT requires <view_name> <op_id> <key>. Next steps: specify view_name, op_id, and key".to_owned(),
+                ))))]);
+            }
+            let view_name = tokens[0].trim_matches('"');
+            let op_id_str = tokens[1];
+            let key_str = tokens[2].trim_matches('\'').trim_matches('"');
+
+            if self.catalog.get_view(view_name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-1001] view.not_found: view '{view_name}' does not exist. Next steps: check SHOW VIEWS for active pipelines"
+                    ),
+                ))))]);
+            }
+
+            let op_id: u64 = match op_id_str.parse() {
+                Ok(id) => id,
+                Err(_) => {
+                    return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        format!(
+                            "[RS-2001] syntax.error: invalid op_id '{op_id_str}'. Next steps: specify a numeric operator ID"
+                        ),
+                    ))))]);
+                }
+            };
+
+            let cols = vec![
+                "view_name".to_string(),
+                "op_id".to_string(),
+                "key".to_string(),
+                "weight".to_string(),
+                "epoch".to_string(),
+            ];
+
+            let mut rows = Vec::new();
+            if let Some(shard_db) = &self.shard_db {
+                let mut db_key = Vec::with_capacity(9 + key_str.len());
+                db_key.push(0x01);
+                db_key.extend_from_slice(&op_id.to_be_bytes());
+                if let Ok(num_key) = key_str.parse::<i64>() {
+                    db_key.extend_from_slice(&num_key.to_be_bytes());
+                } else {
+                    db_key.extend_from_slice(key_str.as_bytes());
+                }
+
+                if let Ok(Some(val)) = shard_db.get(&db_key).await {
+                    let weight = if val.len() >= 16 {
+                        i64::from_be_bytes(val[8..16].try_into().unwrap_or([0; 8]))
+                    } else if val.len() >= 8 {
+                        i64::from_be_bytes(val[0..8].try_into().unwrap_or([0; 8]))
+                    } else {
+                        1i64
+                    };
+                    let published_epoch = self.view_reader.published_frontier().unwrap_or(0);
+                    rows.push(vec![
+                        Some(view_name.to_string()),
+                        Some(op_id.to_string()),
+                        Some(key_str.to_string()),
+                        Some(weight.to_string()),
+                        Some(published_epoch.to_string()),
+                    ]);
+                }
+            } else if let Ok(Some((weight, epoch))) = self
+                .view_reader
+                .peek_arrangement(view_name, op_id, key_str)
+                .await
+            {
+                rows.push(vec![
+                    Some(view_name.to_string()),
+                    Some(op_id.to_string()),
+                    Some(key_str.to_string()),
+                    Some(weight.to_string()),
+                    Some(epoch.to_string()),
+                ]);
+            }
+
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                CatalogResponse::Rows {
+                    columns: cols,
+                    rows,
+                },
+            ))]);
+        }
         if ql.trim_end_matches(';') == "show sources" {
             return Ok(vec![promote_response(catalog_resp_to_response(
                 self.catalog.sources_response(),

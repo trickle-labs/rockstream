@@ -11,7 +11,7 @@ fn test_no_mock_source_connector_comments() {
     for entry in fs::read_dir(&src_dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
-        if path.is_file() && path.extension().map_or(false, |ext| ext == "rs") {
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
             let content = fs::read_to_string(&path).unwrap();
             for (line_no, line) in content.lines().enumerate() {
                 let lower = line.to_lowercase();
