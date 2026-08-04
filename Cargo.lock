@@ -6876,6 +6876,7 @@ dependencies = [
  "antichain",
  "arrow",
  "bytes",
+ "dashmap",
  "lru 0.18.0",
  "serde",
  "serde_json",

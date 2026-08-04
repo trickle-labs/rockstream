@@ -375,6 +375,263 @@ impl StateBudget {
 /// Alias for `StateBudget` as used by operators.
 pub type StateBudgetMeter = StateBudget;
 
+// ─── DistributedQuotaLedger ───────────────────────────────────────────────
+
+/// Upper bound on the number of tracked workloads in the distributed quota ledger.
+pub const DEFAULT_MAX_WORKLOADS: usize = 10_000;
+
+/// Entry in the distributed quota ledger for a single workload.
+#[derive(Debug)]
+pub struct WorkloadQuotaLedgerEntry {
+    pub workload_id: WorkloadId,
+    pub memory_limit_bytes: AtomicU64,
+    pub max_parallelism: AtomicU64,
+    pub current_memory_bytes: AtomicU64,
+    pub current_parallelism: AtomicU64,
+}
+
+impl WorkloadQuotaLedgerEntry {
+    pub fn new(workload_id: WorkloadId, memory_limit_bytes: u64, max_parallelism: u32) -> Self {
+        Self {
+            workload_id,
+            memory_limit_bytes: AtomicU64::new(memory_limit_bytes),
+            max_parallelism: AtomicU64::new(max_parallelism as u64),
+            current_memory_bytes: AtomicU64::new(0),
+            current_parallelism: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Thread-safe distributed quota ledger for prospective worker-side quota consultation
+/// before arrangement state allocation and batch processing.
+#[derive(Debug)]
+pub struct DistributedQuotaLedger {
+    entries: dashmap::DashMap<WorkloadId, Arc<WorkloadQuotaLedgerEntry>>,
+    max_workloads: usize,
+    total_reservations: AtomicU64,
+    total_rejections: AtomicU64,
+}
+
+impl Default for DistributedQuotaLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DistributedQuotaLedger {
+    /// Create a new `DistributedQuotaLedger` with default workload bound (10,000).
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_WORKLOADS)
+    }
+
+    /// Create a `DistributedQuotaLedger` with a custom maximum workloads capacity bound.
+    pub fn with_capacity(max_workloads: usize) -> Self {
+        Self {
+            entries: dashmap::DashMap::new(),
+            max_workloads,
+            total_reservations: AtomicU64::new(0),
+            total_rejections: AtomicU64::new(0),
+        }
+    }
+
+    /// Register or update a workload's quota parameters.
+    pub fn register_workload(
+        &self,
+        workload_id: WorkloadId,
+        memory_limit_bytes: u64,
+        max_parallelism: u32,
+    ) -> Result<(), StateBudgetError> {
+        if !self.entries.contains_key(&workload_id) && self.entries.len() >= self.max_workloads {
+            return Err(StateBudgetError {
+                operator_name: format!("ledger-capacity-{}", workload_id.0),
+                max_bytes: self.max_workloads as u64,
+                current_bytes: self.entries.len() as u64,
+                requested_bytes: 1,
+            });
+        }
+        self.entries
+            .entry(workload_id)
+            .and_modify(|entry| {
+                entry.memory_limit_bytes.store(memory_limit_bytes, Ordering::Relaxed);
+                entry.max_parallelism.store(max_parallelism as u64, Ordering::Relaxed);
+            })
+            .or_insert_with(|| {
+                Arc::new(WorkloadQuotaLedgerEntry::new(
+                    workload_id,
+                    memory_limit_bytes,
+                    max_parallelism,
+                ))
+            });
+        Ok(())
+    }
+
+    /// Unregister a workload from the ledger.
+    pub fn unregister_workload(&self, workload_id: WorkloadId) {
+        self.entries.remove(&workload_id);
+    }
+
+    /// Retrieve entry for a workload if registered.
+    pub fn get_entry(&self, workload_id: WorkloadId) -> Option<Arc<WorkloadQuotaLedgerEntry>> {
+        self.entries.get(&workload_id).map(|r| r.value().clone())
+    }
+
+    /// Prospective check and acquisition for a batch arrangement allocation.
+    /// Checks workload `memory_limit` and `max_parallelism` BEFORE batch allocation.
+    pub fn try_acquire_batch(
+        self: &Arc<Self>,
+        workload_id: WorkloadId,
+        requested_bytes: u64,
+        parallelism: u32,
+    ) -> Result<QuotaGuard, StateBudgetError> {
+        let entry = self.entries.get(&workload_id).map(|r| r.value().clone());
+        if let Some(entry) = entry {
+            let memory_limit = entry.memory_limit_bytes.load(Ordering::Relaxed);
+            if memory_limit > 0 {
+                loop {
+                    let current = entry.current_memory_bytes.load(Ordering::Relaxed);
+                    let proposed = current.saturating_add(requested_bytes);
+                    if proposed > memory_limit {
+                        self.total_rejections.fetch_add(1, Ordering::Relaxed);
+                        return Err(StateBudgetError {
+                            operator_name: format!("workload-{}", workload_id.0),
+                            max_bytes: memory_limit,
+                            current_bytes: current,
+                            requested_bytes,
+                        });
+                    }
+                    if entry.current_memory_bytes.compare_exchange_weak(
+                        current,
+                        proposed,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ).is_ok() {
+                        break;
+                    }
+                }
+            } else {
+                entry.current_memory_bytes.fetch_add(requested_bytes, Ordering::Relaxed);
+            }
+
+            let max_p = entry.max_parallelism.load(Ordering::Relaxed);
+            if max_p > 0 {
+                loop {
+                    let current_p = entry.current_parallelism.load(Ordering::Relaxed);
+                    let proposed_p = current_p.saturating_add(parallelism as u64);
+                    if proposed_p > max_p {
+                        if memory_limit > 0 {
+                            entry.current_memory_bytes.fetch_sub(requested_bytes, Ordering::Relaxed);
+                        }
+                        self.total_rejections.fetch_add(1, Ordering::Relaxed);
+                        return Err(StateBudgetError {
+                            operator_name: format!("workload-parallelism-{}", workload_id.0),
+                            max_bytes: max_p,
+                            current_bytes: current_p,
+                            requested_bytes: parallelism as u64,
+                        });
+                    }
+                    if entry.current_parallelism.compare_exchange_weak(
+                        current_p,
+                        proposed_p,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ).is_ok() {
+                        break;
+                    }
+                }
+            } else {
+                entry.current_parallelism.fetch_add(parallelism as u64, Ordering::Relaxed);
+            }
+        }
+        self.total_reservations.fetch_add(1, Ordering::Relaxed);
+        Ok(QuotaGuard {
+            ledger: Some(self.clone()),
+            workload_id,
+            bytes: requested_bytes,
+            parallelism,
+            released: false,
+        })
+    }
+
+    /// Release batch resources from the ledger.
+    pub fn release_batch(&self, workload_id: WorkloadId, bytes: u64, parallelism: u32) {
+        if let Some(entry) = self.entries.get(&workload_id) {
+            loop {
+                let current = entry.current_memory_bytes.load(Ordering::Relaxed);
+                let proposed = current.saturating_sub(bytes);
+                if entry.current_memory_bytes.compare_exchange_weak(
+                    current,
+                    proposed,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ).is_ok() {
+                    break;
+                }
+            }
+            loop {
+                let current_p = entry.current_parallelism.load(Ordering::Relaxed);
+                let proposed_p = current_p.saturating_sub(parallelism as u64);
+                if entry.current_parallelism.compare_exchange_weak(
+                    current_p,
+                    proposed_p,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ).is_ok() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Get current fill level / utilization fraction for a workload.
+    pub fn utilization(&self, workload_id: WorkloadId) -> Option<f64> {
+        let entry = self.entries.get(&workload_id)?;
+        let limit = entry.memory_limit_bytes.load(Ordering::Relaxed);
+        if limit == 0 {
+            return Some(0.0);
+        }
+        let current = entry.current_memory_bytes.load(Ordering::Relaxed);
+        Some(current as f64 / limit as f64)
+    }
+
+    /// Total successful prospective reservations.
+    pub fn total_reservations(&self) -> u64 {
+        self.total_reservations.load(Ordering::Relaxed)
+    }
+
+    /// Total prospective rejections.
+    pub fn total_rejections(&self) -> u64 {
+        self.total_rejections.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII Guard for prospective quota batch reservation. Automatically releases resources when dropped.
+#[derive(Debug)]
+pub struct QuotaGuard {
+    ledger: Option<Arc<DistributedQuotaLedger>>,
+    workload_id: WorkloadId,
+    bytes: u64,
+    parallelism: u32,
+    released: bool,
+}
+
+impl QuotaGuard {
+    /// Explicitly release quota reservation without dropping.
+    pub fn release(&mut self) {
+        if !self.released {
+            if let Some(ref ledger) = self.ledger {
+                ledger.release_batch(self.workload_id, self.bytes, self.parallelism);
+            }
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for QuotaGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -491,5 +748,45 @@ mod tests {
         // Release works correctly
         b1.release(400);
         assert_eq!(wl.current_bytes(), 400);
+    }
+
+    #[test]
+    fn distributed_quota_ledger_prospective_rejection() {
+        let ledger = Arc::new(DistributedQuotaLedger::new());
+        ledger.register_workload(WorkloadId(101), 1000, 2).unwrap();
+
+        // Batch 1: 600 bytes, parallelism 1 -> succeeds
+        let mut guard1 = ledger.try_acquire_batch(WorkloadId(101), 600, 1).unwrap();
+        assert_eq!(ledger.total_reservations(), 1);
+
+        // Batch 2: 500 bytes -> exceeds memory limit 1000 (600 + 500 = 1100 > 1000)
+        let err = ledger.try_acquire_batch(WorkloadId(101), 500, 1).unwrap_err();
+        assert_eq!(err.operator_name, "workload-101");
+        assert_eq!(ledger.total_rejections(), 1);
+
+        // Release guard1 (600 bytes)
+        guard1.release();
+
+        // Batch 3: 500 bytes -> succeeds now
+        let _guard2 = ledger.try_acquire_batch(WorkloadId(101), 500, 1).unwrap();
+        assert_eq!(ledger.total_reservations(), 2);
+    }
+
+    #[test]
+    fn distributed_quota_ledger_parallelism_cap() {
+        let ledger = Arc::new(DistributedQuotaLedger::new());
+        ledger.register_workload(WorkloadId(202), 10_000, 2).unwrap();
+
+        let _g1 = ledger.try_acquire_batch(WorkloadId(202), 100, 2).unwrap();
+        let err = ledger.try_acquire_batch(WorkloadId(202), 100, 1).unwrap_err();
+        assert_eq!(err.operator_name, "workload-parallelism-202");
+    }
+
+    #[test]
+    fn distributed_quota_ledger_bounded_capacity() {
+        let ledger = Arc::new(DistributedQuotaLedger::with_capacity(2));
+        assert!(ledger.register_workload(WorkloadId(1), 100, 1).is_ok());
+        assert!(ledger.register_workload(WorkloadId(2), 100, 1).is_ok());
+        assert!(ledger.register_workload(WorkloadId(3), 100, 1).is_err());
     }
 }

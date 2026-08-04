@@ -25,6 +25,8 @@ pub enum ViewState {
     Paused,
     /// The view exceeded its workload memory limit and is running in a relaxed mode.
     OverBudgetRelaxed,
+    /// The view exceeded its workload memory limit and rejected incoming batches prospectively.
+    OverBudgetRejected,
     /// The view is currently backfilling from the given starting epoch.
     BackfillingFromEpoch(u64),
 }
@@ -45,6 +47,11 @@ impl ViewState {
         matches!(self, Self::OverBudgetRelaxed)
     }
 
+    /// Returns true if the view is in over-budget rejected state.
+    pub fn is_over_budget_rejected(&self) -> bool {
+        matches!(self, Self::OverBudgetRejected)
+    }
+
     /// Returns true if the view is backfilling.
     pub fn is_backfilling(&self) -> bool {
         matches!(self, Self::BackfillingFromEpoch(_))
@@ -57,6 +64,7 @@ impl std::fmt::Display for ViewState {
             Self::Running => write!(f, "RUNNING"),
             Self::Paused => write!(f, "PAUSED"),
             Self::OverBudgetRelaxed => write!(f, "OVER_BUDGET_RELAXED"),
+            Self::OverBudgetRejected => write!(f, "OVER_BUDGET_REJECTED"),
             Self::BackfillingFromEpoch(epoch) => write!(f, "BACKFILLING(from epoch {epoch})"),
         }
     }

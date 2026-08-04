@@ -1771,4 +1771,68 @@ mod tests {
         assert_eq!(guard.queue.len(), 1);
         assert_eq!(guard.queue[0].recipient_worker_id, WorkerId(3));
     }
+
+    #[tokio::test]
+    async fn test_lease_grant_raft_replication() {
+        use crate::raft::{spawn_raft_node, RaftConfig};
+        use crate::shard::ShardPersistentStore;
+        use object_store::memory::InMemory;
+        use rockstream_types::ids::ShardId;
+
+        let shared_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+
+        // Spawn Raft leader node
+        let node_leader = spawn_raft_node(
+            "127.0.0.1:0",
+            RaftConfig::new(0, Vec::new(), true),
+            shared_store.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(node_leader.handle.is_leader());
+        assert!(node_leader.handle.require_leader().is_ok());
+
+        let catalog = TopologyCatalog::new();
+        let manager = ShardManager::new();
+        let store = Arc::new(ShardPersistentStore::new(shared_store.clone()));
+        let svc = ControlService::new(catalog)
+            .with_shard_manager(manager.clone())
+            .with_raft(node_leader.handle.clone())
+            .with_shard_store(store.clone());
+        let handle = svc.start("127.0.0.1:0").await.unwrap();
+
+        let mut stream = TcpStream::connect(handle.addr).await.unwrap();
+        let reg = WorkerRegistration::new(
+            WorkerId(101),
+            NodeRole::Worker,
+            "127.0.0.1:9101",
+            CapacityHeadroom::FULL,
+        );
+        let _ = send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
+
+        // Issue lease request to leader
+        let req = WorkerMessage::RequestShard {
+            worker_id: WorkerId(101),
+            shard_id: ShardId(42),
+        };
+        let resp = send_and_recv(&mut stream, &req).await;
+        let reply: ControlMessage = serde_json::from_str(resp.trim()).unwrap();
+
+        if let ControlMessage::ShardAssigned { lease } = reply {
+            assert_eq!(lease.shard_id, ShardId(42));
+            assert_eq!(lease.worker_id, WorkerId(101));
+        } else {
+            panic!("Expected ShardAssigned, got: {reply:?}");
+        }
+
+        // Verify lease state is persisted into shared Raft store and can be restored
+        let snapshot = store.load().await;
+        assert_eq!(snapshot.leases.len(), 1);
+        let persisted_lease = snapshot.leases.get(&ShardId(42)).unwrap();
+        assert_eq!(persisted_lease.worker_id, WorkerId(101));
+
+        handle.shutdown();
+        node_leader.shutdown();
+    }
 }

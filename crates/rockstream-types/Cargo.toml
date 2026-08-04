@@ -13,6 +13,7 @@ bytes = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+dashmap = { workspace = true }
 lru = "0.18.0"
 
 [dev-dependencies]

@@ -29,6 +29,9 @@ pub use recovery::{
     RecoveryDriver, RecoveryError, RecoveryProgress, DEFAULT_SHARD_RECOVERY_BUDGET,
 };
 
+pub mod quota;
+pub use quota::WorkerQuotaManager;
+
 #[cfg(test)]
 mod tests {
     use super::*;
