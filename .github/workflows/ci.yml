@@ -64,7 +64,7 @@ jobs:
             git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=50
             base_sha=$(git merge-base "origin/${{ github.event.pull_request.base.ref }}" HEAD)
             changed=$(git diff --name-only "$base_sha"...HEAD)
-            if echo "$changed" | grep -qE '^(formal/|DESIGN\.md|crates/rockstream-(runtime|control|connectors|storage)/)'; then
+            if echo "$changed" | grep -qE '^(formal/|DESIGN\.md|crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types)/)'; then
               echo "run=true" >> "$GITHUB_OUTPUT"
             else
               echo "run=false" >> "$GITHUB_OUTPUT"
@@ -130,7 +130,7 @@ jobs:
       # MAX_WRITE_ATTEMPTS=2 — the pre-implementation gate for v0.45.2's
       # `rockstream-control` Raft group, per the binding v0.18 rule that
       # S0 (the model) must be green before S1+ (implementation) is written.
-      - name: Formal verify — smoke, M1, M2, M3, M4, M5, M7 (hard gate)
+      - name: Formal verify — smoke, M1, M2, M3, M4, M5, M7, edge models (hard gate)
         if: steps.filter.outputs.run == 'true'
         run: |
           fizz formal/smoke.fizz
@@ -140,6 +140,8 @@ jobs:
           fizz formal/m4_self_fencing.fizz
           fizz formal/m5_cold_tier_sink.fizz
           fizz formal/m7_control_plane_ha.fizz
+          fizz formal/edge_quota_exhaustion.fizz
+          fizz formal/edge_late_data.fizz
 
   coverage:
     name: Coverage

@@ -95,6 +95,14 @@ pub enum OpError {
         code: ErrorCode,
     },
 
+    /// Late-data side-channel queue exceeded its configured bound.
+    #[error("[{code}] Late-data side-channel queue full ({current}/{limit} rows); next_steps: drain the configured late-data sink, reduce late-event volume, or increase TUMBLE_WINDOW_LATE_ROUTE_LIMIT after verifying available capacity")]
+    LateRouteOverflow {
+        current: usize,
+        limit: usize,
+        code: ErrorCode,
+    },
+
     /// Monotone recursion received a negative delta.
     #[error("[{code}] Non-monotone delta rejected in monotone recursion; next_steps: mark the recursive query non-monotone or remove retractions from the input stream")]
     RecursionNonMonotoneDelta { code: ErrorCode },
@@ -229,6 +237,15 @@ impl OpError {
             current,
             limit,
             code: RS_2024,
+        }
+    }
+
+    pub fn late_route_overflow(current: usize, limit: usize) -> Self {
+        use rockstream_types::error_code::RS_2028;
+        Self::LateRouteOverflow {
+            current,
+            limit,
+            code: RS_2028,
         }
     }
 

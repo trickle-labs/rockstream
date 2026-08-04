@@ -31,7 +31,7 @@ pub use fault_injecting_store::FaultInjectingObjectStore;
 pub use iceberg_sink::IcebergSink;
 pub use kafka_sink::KafkaSink;
 pub use kafka_source::KafkaSource;
-pub use object_store_sink::ObjectStoreSink;
+pub use object_store_sink::{ObjectStoreSink, OBJECT_STORE_SINK_MAX_PENDING_EPOCHS};
 pub use s3_source::S3Source;
 pub use sink_connector::{
     assert_commit_pointer_atomic, assert_epoch_committed_only_after_cluster_checkpoint,
@@ -39,7 +39,8 @@ pub use sink_connector::{
     assert_recovery_dispatch_idempotent, SinkConnector, SinkError,
 };
 pub use source_connector::{
-    PollDeltaResult, SnapshotStream, SourceConnector, SourceError, WatermarkCapability,
+    validate_window_watermark, PollDeltaResult, SnapshotStream, SourceConnector, SourceError,
+    SourcePollLifecycle, WatermarkCapability, WindowWatermarkPolicy,
 };
 pub use source_epoch::{OffsetToken, SourceEpochEntry, SourceEpochRegistry};
 

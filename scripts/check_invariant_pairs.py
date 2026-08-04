@@ -26,7 +26,7 @@ from pathlib import Path
 ASSERTION_RE = re.compile(
     r"^(?:always(?: eventually)?|exists) assertion ([A-Za-z0-9_]+):", re.MULTILINE
 )
-ID_RE = re.compile(r"(COV_M\d+|M\d+_(?:S|L)\d+)")
+ID_RE = re.compile(r"(COV_M\d+|M\d+_(?:S|L)\d+|EDGE_[A-Z]+)")
 ASSERT_MACRO_RE = re.compile(r"\b(?:debug_)?assert!\s*\(")
 INVARIANT_BY_CONSTRUCTION_RE = re.compile(r"INVARIANT-BY-CONSTRUCTION:")
 
@@ -34,6 +34,13 @@ INVARIANT_BY_CONSTRUCTION_RE = re.compile(r"INVARIANT-BY-CONSTRUCTION:")
 # site (case (a)). Wide enough to cover this repo's multi-line panic
 # messages and their preceding doc comments.
 PROXIMITY_WINDOW = 8
+REQUIRED_EDGE_IDS = {
+    "EDGE-QUOTA",
+    "EDGE-SOURCEFAIL",
+    "EDGE-BROWNOUT",
+    "EDGE-MISCONFIG",
+    "EDGE-LATE",
+}
 
 
 def extract_ids(formal_dir: Path) -> set[str]:
@@ -44,7 +51,7 @@ def extract_ids(formal_dir: Path) -> set[str]:
             name = match.group(1)
             for id_match in ID_RE.finditer(name):
                 ids.add(id_match.group(1).replace("_", "-"))
-    return ids
+    return ids | REQUIRED_EDGE_IDS
 
 
 def load_rust_files(crates_dir: Path) -> list[tuple[Path, list[str]]]:
@@ -65,8 +72,10 @@ def is_covered(invariant_id: str, rust_files: list[tuple[Path, list[str]]]) -> b
         mentions = [i for i, line in enumerate(lines) if invariant_id in line]
         if not mentions:
             continue
-        # Case (b): INVARIANT-BY-CONSTRUCTION comment referencing this ID.
-        if any(INVARIANT_BY_CONSTRUCTION_RE.search(lines[i]) for i in mentions):
+        # Recovery guarantees must have a runtime assertion; waivers are not a proof.
+        if not invariant_id.startswith("EDGE-") and any(
+            INVARIANT_BY_CONSTRUCTION_RE.search(lines[i]) for i in mentions
+        ):
             return True
         # Case (a): a real assert!/debug_assert! site referencing it — this
         # repo's convention is to embed the ID directly in the assert!'s

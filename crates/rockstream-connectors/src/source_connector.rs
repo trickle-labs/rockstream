@@ -8,11 +8,13 @@
 //! - `pause` / `resume`: controls lifecycle state.
 //! - `partition_filter_support`: declares if the connector supports partition pushdown.
 
-use crate::source_epoch::OffsetToken;
+use crate::source_epoch::{OffsetToken, SourceEpochRegistry};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use rockstream_types::connector::PartitionFilter;
+use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::{Epoch, EventTimeWatermark};
+use std::collections::BTreeMap;
 
 /// Error from a source connector operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +29,8 @@ pub enum SourceError {
     CommitOffsetFailed { epoch: Epoch, reason: String },
     /// Generic source I/O error.
     Io(String),
+    /// A windowed view requires an explicit compatible watermark policy.
+    WatermarkRequired { reason: String },
 }
 
 impl std::fmt::Display for SourceError {
@@ -48,6 +52,10 @@ impl std::fmt::Display for SourceError {
                 )
             }
             Self::Io(msg) => write!(f, "RS-4001: source I/O error: {msg}"),
+            Self::WatermarkRequired { reason } => write!(
+                f,
+                "RS-1005: connector.watermark_required: {reason}. Next steps: declare a compatible WATERMARK policy before registering the windowed view"
+            ),
         }
     }
 }
@@ -63,6 +71,38 @@ pub enum WatermarkCapability {
     ExternalHint,
     /// Connector cannot produce a watermark under any conditions.
     None,
+}
+
+/// Explicit window-closing policy selected for a source-backed window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowWatermarkPolicy {
+    Native,
+    ProcessingTime,
+    External,
+    Disabled,
+}
+
+/// Reject a window configuration before source registration or worker allocation.
+pub fn validate_window_watermark(
+    capability: WatermarkCapability,
+    policy: Option<WindowWatermarkPolicy>,
+) -> Result<(), SourceError> {
+    match (capability, policy) {
+        (_, None) => Err(SourceError::WatermarkRequired {
+            reason: "windowed sources cannot omit WATERMARK".to_string(),
+        }),
+        (WatermarkCapability::Native, Some(WindowWatermarkPolicy::Native))
+        | (_, Some(WindowWatermarkPolicy::ProcessingTime | WindowWatermarkPolicy::Disabled))
+        | (WatermarkCapability::ExternalHint, Some(WindowWatermarkPolicy::External)) => Ok(()),
+        (WatermarkCapability::None, Some(WindowWatermarkPolicy::Native))
+        | (WatermarkCapability::None, Some(WindowWatermarkPolicy::External))
+        | (WatermarkCapability::ExternalHint, Some(WindowWatermarkPolicy::Native))
+        | (WatermarkCapability::Native, Some(WindowWatermarkPolicy::External)) => {
+            Err(SourceError::WatermarkRequired {
+                reason: format!("source capability {capability:?} is incompatible with {policy:?}"),
+            })
+        }
+    }
 }
 
 /// A stream of record batches for the initial snapshot (§13.3).
@@ -135,6 +175,112 @@ pub trait SourceConnector: Send + Sync {
     /// Returns whether this source connector supports partition filter pushdown.
     fn partition_filter_support(&self) -> bool {
         false
+    }
+
+    /// Declares the source's event-time watermark capability.
+    fn watermark_capability(&self) -> WatermarkCapability {
+        WatermarkCapability::None
+    }
+}
+
+/// Owns source polling lifecycle state so failed polls cannot advance a
+/// committed offset. The registry records the durable recovery token per epoch.
+pub struct SourcePollLifecycle<S: SourceConnector> {
+    source: S,
+    committed_offset: OffsetToken,
+    source_epochs: SourceEpochRegistry,
+    paused: bool,
+}
+
+impl<S: SourceConnector> SourcePollLifecycle<S> {
+    /// Start polling from a previously committed source token.
+    pub fn new(source: S, connector_id: ConnectorId, committed_offset: OffsetToken) -> Self {
+        Self {
+            source,
+            committed_offset,
+            source_epochs: SourceEpochRegistry::new(connector_id),
+            paused: false,
+        }
+    }
+
+    /// Poll without committing the returned offset. On failure the source is
+    /// paused before the error is returned, preserving the recovery token.
+    pub fn poll(
+        &mut self,
+        max_bytes: usize,
+        credits_available: usize,
+        partition_filter: Option<PartitionFilter>,
+    ) -> Result<PollDeltaResult, SourceError> {
+        if self.paused {
+            return Err(SourceError::Io(
+                "source is paused after a failed poll; call resume before polling again"
+                    .to_string(),
+            ));
+        }
+        match self.source.poll_delta(
+            self.committed_offset.clone(),
+            max_bytes,
+            credits_available,
+            partition_filter,
+        ) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.source.pause(error.to_string())?;
+                self.paused = true;
+                assert!(
+                    self.paused,
+                    "EDGE-SOURCEFAIL: a failed poll must pause before any offset can commit"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Durably commit a successful poll's token and source epoch together.
+    pub fn commit(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+        if self.paused {
+            return Err(SourceError::Io(
+                "source is paused after a failed poll; call resume before committing".to_string(),
+            ));
+        }
+        self.source.commit_offset(epoch, offset.clone())?;
+        let entry = self
+            .source_epochs
+            .prepare_commit(BTreeMap::from([(0, offset.clone())]));
+        assert_eq!(
+            entry.source_epoch, epoch,
+            "EDGE-SOURCEFAIL: a recovered offset must be committed at its prepared source epoch"
+        );
+        self.source_epochs.commit_epoch(entry);
+        self.committed_offset = offset;
+        Ok(())
+    }
+
+    /// Resume a source only after its failure has been handled.
+    pub fn resume(&mut self) -> Result<(), SourceError> {
+        self.source.resume()?;
+        self.paused = false;
+        Ok(())
+    }
+
+    /// The last durable recovery token.
+    pub fn committed_offset(&self) -> &OffsetToken {
+        &self.committed_offset
+    }
+
+    /// Whether a failed poll currently prevents further normal operation.
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Access the bounded source-epoch registry for recovery inspection.
+    pub fn source_epochs(&self) -> &SourceEpochRegistry {
+        &self.source_epochs
+    }
+
+    /// Return the owned connector after the lifecycle is no longer needed.
+    pub fn into_inner(self) -> S {
+        self.source
     }
 }
 

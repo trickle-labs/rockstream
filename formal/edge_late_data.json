@@ -1,0 +1,903 @@
+{
+  "sourceInfo": {
+    "fileName": "edge_late_data.fizz",
+    "start": {
+      "line": 3,
+      "column": 1
+    },
+    "end": {
+      "line": 39
+    }
+  },
+  "invariants": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 34,
+          "column": 1
+        },
+        "end": {
+          "line": 37
+        }
+      },
+      "name": "EDGE_LATE_CompactionIsSnapshotSafe",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 35,
+            "column": 5
+          },
+          "end": {
+            "line": 37
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 35,
+                "column": 5
+              },
+              "end": {
+                "line": 37
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 35,
+                  "column": 5
+                },
+                "end": {
+                  "line": 35,
+                  "column": 124
+                }
+              },
+              "pyExpr": "not state_compacted or (watermark >= WINDOW_END + ALLOWED_LATENESS and frontier >= WINDOW_END + ALLOWED_LATENESS)",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 35,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 35,
+                    "column": 124
+                  }
+                },
+                "pyExpr": "not state_compacted or (watermark >= WINDOW_END + ALLOWED_LATENESS and frontier >= WINDOW_END + ALLOWED_LATENESS)"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def EDGE_LATE_CompactionIsSnapshotSafe():\n    return not state_compacted or (watermark >= WINDOW_END + ALLOWED_LATENESS and frontier >= WINDOW_END + ALLOWED_LATENESS)\n\n"
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 37,
+          "column": 1
+        },
+        "end": {
+          "line": 39
+        }
+      },
+      "name": "EDGE_LATE_RowsFollowDeclaredPolicy",
+      "temporalOperators": [
+        "always"
+      ],
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 38,
+            "column": 5
+          },
+          "end": {
+            "line": 39
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 38,
+                "column": 5
+              },
+              "end": {
+                "line": 39
+              }
+            },
+            "returnStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 38,
+                  "column": 5
+                },
+                "end": {
+                  "line": 38,
+                  "column": 61
+                }
+              },
+              "pyExpr": "accepted_late_rows >= 0 and dropped_late_rows >= 0",
+              "expr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 38,
+                    "column": 12
+                  },
+                  "end": {
+                    "line": 38,
+                    "column": 61
+                  }
+                },
+                "pyExpr": "accepted_late_rows >= 0 and dropped_late_rows >= 0"
+              }
+            }
+          }
+        ]
+      },
+      "pyCode": "def EDGE_LATE_RowsFollowDeclaredPolicy():\n    return accepted_late_rows >= 0 and dropped_late_rows >= 0\n"
+    }
+  ],
+  "actions": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 6,
+          "column": 1
+        },
+        "end": {
+          "line": 13
+        }
+      },
+      "name": "Init",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "level": "FAIRNESS_LEVEL_STRONG"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 7,
+            "column": 5
+          },
+          "end": {
+            "line": 13
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 7,
+                "column": 5
+              },
+              "end": {
+                "line": 8,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 7,
+                  "column": 5
+                },
+                "end": {
+                  "line": 7,
+                  "column": 17
+                }
+              },
+              "code": "watermark = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 8,
+                "column": 5
+              },
+              "end": {
+                "line": 9,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 8,
+                  "column": 5
+                },
+                "end": {
+                  "line": 8,
+                  "column": 16
+                }
+              },
+              "code": "frontier = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 9,
+                "column": 5
+              },
+              "end": {
+                "line": 10,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 9,
+                  "column": 5
+                },
+                "end": {
+                  "line": 9,
+                  "column": 27
+                }
+              },
+              "code": "state_compacted = False"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 10,
+                "column": 5
+              },
+              "end": {
+                "line": 11,
+                "column": 4
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 10,
+                  "column": 5
+                },
+                "end": {
+                  "line": 10,
+                  "column": 26
+                }
+              },
+              "code": "accepted_late_rows = 0"
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 11,
+                "column": 5
+              },
+              "end": {
+                "line": 13
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 11,
+                  "column": 5
+                },
+                "end": {
+                  "line": 11,
+                  "column": 25
+                }
+              },
+              "code": "dropped_late_rows = 0"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 13,
+          "column": 1
+        },
+        "end": {
+          "line": 17
+        }
+      },
+      "name": "AdvanceWatermark",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 13,
+            "column": 8
+          },
+          "end": {
+            "line": 13,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 14,
+            "column": 5
+          },
+          "end": {
+            "line": 17
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 14,
+                "column": 5
+              },
+              "end": {
+                "line": 15,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 14,
+                  "column": 5
+                },
+                "end": {
+                  "line": 14,
+                  "column": 53
+                }
+              },
+              "condition": "watermark < WINDOW_END + ALLOWED_LATENESS",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 14,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 14,
+                    "column": 53
+                  }
+                },
+                "pyExpr": "watermark < WINDOW_END + ALLOWED_LATENESS"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 15,
+                "column": 5
+              },
+              "end": {
+                "line": 17
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 15,
+                  "column": 5
+                },
+                "end": {
+                  "line": 15,
+                  "column": 29
+                }
+              },
+              "code": "watermark = watermark + 1"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 17,
+          "column": 1
+        },
+        "end": {
+          "line": 21
+        }
+      },
+      "name": "AdvanceFrontier",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 17,
+            "column": 8
+          },
+          "end": {
+            "line": 17,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 18,
+            "column": 5
+          },
+          "end": {
+            "line": 21
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 18,
+                "column": 5
+              },
+              "end": {
+                "line": 19,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 18,
+                  "column": 5
+                },
+                "end": {
+                  "line": 18,
+                  "column": 52
+                }
+              },
+              "condition": "frontier < WINDOW_END + ALLOWED_LATENESS",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 18,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 18,
+                    "column": 52
+                  }
+                },
+                "pyExpr": "frontier < WINDOW_END + ALLOWED_LATENESS"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 19,
+                "column": 5
+              },
+              "end": {
+                "line": 21
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 19,
+                  "column": 5
+                },
+                "end": {
+                  "line": 19,
+                  "column": 27
+                }
+              },
+              "code": "frontier = frontier + 1"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 21,
+          "column": 1
+        },
+        "end": {
+          "line": 26
+        }
+      },
+      "name": "Compact",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 21,
+            "column": 8
+          },
+          "end": {
+            "line": 21,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 22,
+            "column": 5
+          },
+          "end": {
+            "line": 26
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 22,
+                "column": 5
+              },
+              "end": {
+                "line": 23,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 22,
+                  "column": 5
+                },
+                "end": {
+                  "line": 22,
+                  "column": 54
+                }
+              },
+              "condition": "watermark >= WINDOW_END + ALLOWED_LATENESS",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 22,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 22,
+                    "column": 54
+                  }
+                },
+                "pyExpr": "watermark >= WINDOW_END + ALLOWED_LATENESS"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 23,
+                "column": 5
+              },
+              "end": {
+                "line": 24,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 23,
+                  "column": 5
+                },
+                "end": {
+                  "line": 23,
+                  "column": 53
+                }
+              },
+              "condition": "frontier >= WINDOW_END + ALLOWED_LATENESS",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 23,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 23,
+                    "column": 53
+                  }
+                },
+                "pyExpr": "frontier >= WINDOW_END + ALLOWED_LATENESS"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 24,
+                "column": 5
+              },
+              "end": {
+                "line": 26
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 24,
+                  "column": 5
+                },
+                "end": {
+                  "line": 24,
+                  "column": 26
+                }
+              },
+              "code": "state_compacted = True"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 26,
+          "column": 1
+        },
+        "end": {
+          "line": 30
+        }
+      },
+      "name": "ReceiveLateWithinLateness",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 26,
+            "column": 8
+          },
+          "end": {
+            "line": 26,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 27,
+            "column": 5
+          },
+          "end": {
+            "line": 30
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 27,
+                "column": 5
+              },
+              "end": {
+                "line": 28,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 27,
+                  "column": 5
+                },
+                "end": {
+                  "line": 27,
+                  "column": 31
+                }
+              },
+              "condition": "not state_compacted",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 27,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 27,
+                    "column": 31
+                  }
+                },
+                "pyExpr": "not state_compacted"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 28,
+                "column": 5
+              },
+              "end": {
+                "line": 30
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 28,
+                  "column": 5
+                },
+                "end": {
+                  "line": 28,
+                  "column": 47
+                }
+              },
+              "code": "accepted_late_rows = accepted_late_rows + 1"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 30,
+          "column": 1
+        },
+        "end": {
+          "line": 34
+        }
+      },
+      "name": "ReceiveLateBeyondLateness",
+      "flow": "FLOW_ATOMIC",
+      "fairness": {
+        "sourceInfo": {
+          "start": {
+            "line": 30,
+            "column": 8
+          },
+          "end": {
+            "line": 30,
+            "column": 11
+          }
+        },
+        "level": "FAIRNESS_LEVEL_WEAK"
+      },
+      "block": {
+        "sourceInfo": {
+          "start": {
+            "line": 31,
+            "column": 5
+          },
+          "end": {
+            "line": 34
+          }
+        },
+        "flow": "FLOW_ATOMIC",
+        "stmts": [
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 31,
+                "column": 5
+              },
+              "end": {
+                "line": 32,
+                "column": 4
+              }
+            },
+            "requireStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 31,
+                  "column": 5
+                },
+                "end": {
+                  "line": 31,
+                  "column": 31
+                }
+              },
+              "condition": "not state_compacted",
+              "conditionExpr": {
+                "sourceInfo": {
+                  "start": {
+                    "line": 31,
+                    "column": 13
+                  },
+                  "end": {
+                    "line": 31,
+                    "column": 31
+                  }
+                },
+                "pyExpr": "not state_compacted"
+              }
+            }
+          },
+          {
+            "sourceInfo": {
+              "start": {
+                "line": 32,
+                "column": 5
+              },
+              "end": {
+                "line": 34
+              }
+            },
+            "pyStmt": {
+              "sourceInfo": {
+                "start": {
+                  "line": 32,
+                  "column": 5
+                },
+                "end": {
+                  "line": 32,
+                  "column": 45
+                }
+              },
+              "code": "dropped_late_rows = dropped_late_rows + 1"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "stmts": [
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 3,
+          "column": 1
+        },
+        "end": {
+          "line": 4
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 3,
+            "column": 1
+          },
+          "end": {
+            "line": 3,
+            "column": 15
+          }
+        },
+        "code": "WINDOW_END = 10"
+      }
+    },
+    {
+      "sourceInfo": {
+        "start": {
+          "line": 4,
+          "column": 1
+        },
+        "end": {
+          "line": 6
+        }
+      },
+      "pyStmt": {
+        "sourceInfo": {
+          "start": {
+            "line": 4,
+            "column": 1
+          },
+          "end": {
+            "line": 4,
+            "column": 20
+          }
+        },
+        "code": "ALLOWED_LATENESS = 2"
+      }
+    }
+  ],
+  "frontMatter": {}
+}

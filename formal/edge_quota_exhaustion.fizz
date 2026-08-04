@@ -1,0 +1,47 @@
+# Two workers contend for one bounded reservation. Releasing an accepted
+# reservation makes capacity available to a rejected worker.
+MAX_BYTES = 1
+MAX_PARALLELISM = 1
+
+action Init:
+    reserved_bytes = 0
+    reserved_parallelism = 0
+    worker_0_accepted = False
+    worker_1_accepted = False
+    worker_1_rejected = False
+    worker_0_released = False
+
+atomic fair action ReserveWorker0:
+    require not worker_0_accepted
+    require reserved_bytes + 1 <= MAX_BYTES
+    require reserved_parallelism + 1 <= MAX_PARALLELISM
+    reserved_bytes = reserved_bytes + 1
+    reserved_parallelism = reserved_parallelism + 1
+    worker_0_accepted = True
+
+atomic fair action RejectWorker1:
+    require worker_0_accepted
+    require not worker_1_accepted
+    require reserved_bytes + 1 > MAX_BYTES
+    worker_1_rejected = True
+
+atomic fair action ReleaseWorker0:
+    require worker_0_accepted
+    require not worker_0_released
+    reserved_bytes = reserved_bytes - 1
+    reserved_parallelism = reserved_parallelism - 1
+    worker_0_released = True
+
+atomic fair action RetryWorker1:
+    require worker_1_rejected
+    require worker_0_released
+    require not worker_1_accepted
+    reserved_bytes = reserved_bytes + 1
+    reserved_parallelism = reserved_parallelism + 1
+    worker_1_accepted = True
+
+always assertion EDGE_QUOTA_ReservationWithinBounds:
+    return reserved_bytes <= MAX_BYTES and reserved_parallelism <= MAX_PARALLELISM
+
+always eventually assertion EDGE_QUOTA_RejectedWorkRetriesAfterRelease:
+    return not worker_1_rejected or worker_1_accepted

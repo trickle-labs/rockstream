@@ -609,3 +609,59 @@ fn test_makefile_has_bench_baseline_update_target_not_invoked_by_ci() {
         "ci.yml must never invoke `bench-baseline-update` — it is a human-triggered-only step"
     );
 }
+
+fn formal_verify_runs_for_path(path: &str) -> bool {
+    path == "DESIGN.md"
+        || path.starts_with("formal/")
+        || [
+            "runtime",
+            "control",
+            "connectors",
+            "storage",
+            "sim",
+            "ops",
+            "gateway",
+            "sql",
+            "types",
+        ]
+        .iter()
+        .any(|crate_name| path.starts_with(&format!("crates/rockstream-{crate_name}/")))
+}
+
+#[test]
+fn formal_verify_path_filter_runs_for_each_edge_covered_crate() {
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let ci = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
+    assert!(
+        ci.contains(
+            "crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types)/"
+        ),
+        "formal-verify must use the EDGE-covered crate path filter"
+    );
+    let paths = [
+        "formal/edge_quota_exhaustion.fizz",
+        "crates/rockstream-sim/tests/edge_case_recovery_tests.rs",
+        "crates/rockstream-ops/src/time_window.rs",
+        "crates/rockstream-gateway/src/lib.rs",
+        "crates/rockstream-sql/src/lib.rs",
+        "crates/rockstream-types/src/state_budget.rs",
+    ];
+    assert_eq!(
+        paths.map(formal_verify_runs_for_path),
+        [true, true, true, true, true, true],
+        "every EDGE-covered path must trigger formal-verify"
+    );
+}
+
+#[test]
+fn formal_verify_path_filter_ignores_uncovered_path() {
+    assert!(
+        !formal_verify_runs_for_path("docs/architecture-notes.md"),
+        "an unrelated documentation path must not trigger formal-verify"
+    );
+}

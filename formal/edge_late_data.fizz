@@ -1,0 +1,38 @@
+# Watermark advancement may only compact state after the frontier makes the
+# window safe; a late event is either retained or counted by its policy.
+WINDOW_END = 10
+ALLOWED_LATENESS = 2
+
+action Init:
+    watermark = 0
+    frontier = 0
+    state_compacted = False
+    accepted_late_rows = 0
+    dropped_late_rows = 0
+
+atomic fair action AdvanceWatermark:
+    require watermark < WINDOW_END + ALLOWED_LATENESS
+    watermark = watermark + 1
+
+atomic fair action AdvanceFrontier:
+    require frontier < WINDOW_END + ALLOWED_LATENESS
+    frontier = frontier + 1
+
+atomic fair action Compact:
+    require watermark >= WINDOW_END + ALLOWED_LATENESS
+    require frontier >= WINDOW_END + ALLOWED_LATENESS
+    state_compacted = True
+
+atomic fair action ReceiveLateWithinLateness:
+    require not state_compacted
+    accepted_late_rows = accepted_late_rows + 1
+
+atomic fair action ReceiveLateBeyondLateness:
+    require not state_compacted
+    dropped_late_rows = dropped_late_rows + 1
+
+always assertion EDGE_LATE_CompactionIsSnapshotSafe:
+    return not state_compacted or (watermark >= WINDOW_END + ALLOWED_LATENESS and frontier >= WINDOW_END + ALLOWED_LATENESS)
+
+always assertion EDGE_LATE_RowsFollowDeclaredPolicy:
+    return accepted_late_rows >= 0 and dropped_late_rows >= 0

@@ -195,6 +195,8 @@ pub const RS_2026: ErrorCode = ErrorCode::new(2026);
 /// row budget (v0.51.2, `index.backfill_row_limit_exceeded`).
 /// next_steps: "Reduce table cardinality before indexing, or drop and recreate the index once the table is smaller."
 pub const RS_2027: ErrorCode = ErrorCode::new(2027);
+/// Late-data side-channel queue reached its bounded capacity (v0.51.12).
+pub const RS_2028: ErrorCode = ErrorCode::new(2028);
 
 // 24xx: Auth (v0.26)
 /// Unauthenticated: request missing or carrying invalid credentials.
@@ -496,6 +498,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         2022 => "UPDATE/DELETE RETURNING clause is malformed",
         2023 => "Hop window state exceeded its configured overlap-aware bound",
         2024 => "Session window state exceeded its configured open-session bound",
+        2028 => "Late-data side-channel queue reached its configured bound",
         2013 => "Transaction RETURNING read-back could not find the row at the current frontier",
         2400 => "Unauthenticated: request missing or carrying invalid credentials",
         2401 => "Permission denied: authenticated principal lacks required RBAC role",
@@ -594,6 +597,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2022 => "Check RETURNING syntax; it must be RETURNING * or RETURNING <col>[, <col>...] with no trailing content.",
         2023 => "Reduce hop overlap, increase HOP_WINDOW_STATE_LIMIT, or shard the windowed stream more finely.",
         2024 => "Reduce session cardinality, increase SESSION_WINDOW_STATE_LIMIT, or shard the windowed stream more finely.",
+        2028 => "Drain the configured late-data sink, reduce late-event volume, or increase TUMBLE_WINDOW_LATE_ROUTE_LIMIT after verifying available capacity.",
         2013 => "Retry the write; if the row is consistently missing, check that the frontier used for the read-back has advanced past the commit epoch.",
         3003 => "Reduce input rate or increase local_buffer_max_epochs; check object store availability.",
         3009 => "Inspect the stored arrangement value; possible data corruption or law version mismatch.",
@@ -698,6 +702,7 @@ mod tests {
             RS_2013, RS_2022, // v0.48 UPDATE/DELETE RETURNING (Track A)
             RS_1019, // v0.51.4 Slice 8 — CREATE VIEW compile-failure is a real error
             RS_2403, RS_2404, RS_2405, // v0.51.5 gateway TLS/mTLS
+            RS_2028, // v0.51.12 bounded late-data side-channel
         ];
         for code in codes {
             assert_ne!(

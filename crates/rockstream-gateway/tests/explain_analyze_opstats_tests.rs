@@ -1,6 +1,6 @@
 //! Tests for `EXPLAIN INCREMENTAL ANALYZE` live operator statistics integration (v0.51.11).
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use tokio_postgres::NoTls;
 
@@ -9,6 +9,9 @@ use rockstream_gateway::server::GatewayServer;
 use rockstream_gateway::view_reader::ViewReadStrategy;
 use rockstream_gateway::GatewayError;
 use rockstream_types::ids::OperatorId;
+
+static OPSTATS_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 struct DummyViewReader;
 
@@ -60,6 +63,7 @@ fn data_rows_from(msgs: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Vec<Option
 
 #[tokio::test]
 async fn test_explain_analyze_opstats_aggregate() {
+    let _guard = OPSTATS_TEST_LOCK.lock().await;
     rockstream_types::metrics::reset_all();
     rockstream_types::metrics::record_operator_runtime_sample_at(
         OperatorId(1),
@@ -120,6 +124,7 @@ async fn test_explain_analyze_opstats_aggregate() {
 
 #[tokio::test]
 async fn test_explain_analyze_opstats_join() {
+    let _guard = OPSTATS_TEST_LOCK.lock().await;
     rockstream_types::metrics::reset_all();
     rockstream_types::metrics::record_operator_runtime_sample_at(
         OperatorId(1),
@@ -175,6 +180,7 @@ async fn test_explain_analyze_opstats_join() {
 
 #[tokio::test]
 async fn test_explain_analyze_opstats_distinct_minmax() {
+    let _guard = OPSTATS_TEST_LOCK.lock().await;
     rockstream_types::metrics::reset_all();
     rockstream_types::metrics::record_operator_runtime_sample_at(
         OperatorId(1),
@@ -220,6 +226,7 @@ async fn test_explain_analyze_opstats_distinct_minmax() {
 
 #[tokio::test]
 async fn test_explain_analyze_opstats_oracle_property() {
+    let _guard = OPSTATS_TEST_LOCK.lock().await;
     rockstream_types::metrics::reset_all();
     let sample_rows = 1200;
     let sample_reads = 85;

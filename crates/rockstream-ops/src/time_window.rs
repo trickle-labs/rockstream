@@ -41,6 +41,8 @@ use crate::zset::ArrowZSet;
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 pub const TUMBLE_WINDOW_STATE_LIMIT: usize = 100_000;
+/// Maximum late rows retained for a `RouteToSink` side channel before backpressure.
+pub const TUMBLE_WINDOW_LATE_ROUTE_LIMIT: usize = 100_000;
 pub const HOP_WINDOW_STATE_LIMIT: usize = 100_000;
 pub const SESSION_WINDOW_STATE_LIMIT: usize = 100_000;
 
@@ -112,7 +114,12 @@ impl CompactionFilter {
         // Condition 2: frontier gate — input frontier has advanced past window_end.
         let frontier_satisfied = self.frontier_ms > window_end;
 
-        ttl_satisfied && frontier_satisfied
+        let may_delete = ttl_satisfied && frontier_satisfied;
+        assert!(
+            !may_delete || (ttl_satisfied && frontier_satisfied),
+            "EDGE-LATE: compaction requires both watermark-plus-lateness and frontier admission"
+        );
+        may_delete
     }
 }
 
@@ -234,6 +241,9 @@ pub struct TumbleWindowOp {
     late_data_policy: LateDataPolicy,
     state: Mutex<TumbleWindowState>,
     fill_level: Arc<AtomicUsize>,
+    /// Bounded exact rows awaiting delivery to a RouteToSink side channel.
+    late_route_rows: Mutex<Vec<Vec<i64>>>,
+    late_route_fill_level: Arc<AtomicUsize>,
 }
 
 impl TumbleWindowOp {
@@ -263,11 +273,23 @@ impl TumbleWindowOp {
             late_data_policy,
             state: Mutex::new(TumbleWindowState::new()),
             fill_level: Arc::new(AtomicUsize::new(0)),
+            late_route_rows: Mutex::new(Vec::new()),
+            late_route_fill_level: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn fill_level(&self) -> usize {
         self.fill_level.load(Ordering::Relaxed)
+    }
+
+    /// Fill-level metric for the bounded `RouteToSink` late-data side channel.
+    pub fn late_route_fill_level(&self) -> usize {
+        self.late_route_fill_level.load(Ordering::Relaxed)
+    }
+
+    /// Exact late rows routed to the configured side channel, in arrival order.
+    pub fn routed_late_rows(&self) -> Vec<Vec<i64>> {
+        self.late_route_rows.lock().unwrap().clone()
     }
 
     /// Load persisted state from `db` into this already-constructed
@@ -442,6 +464,27 @@ impl TumbleWindowOp {
                     // the retracted row's effect permanently baked into an
                     // already-emitted window output, silently corrupting
                     // every downstream aggregate forever.
+                    assert!(
+                        matches!(
+                            self.late_data_policy,
+                            LateDataPolicy::Drop
+                                | LateDataPolicy::Update
+                                | LateDataPolicy::RouteToSink { .. }
+                        ),
+                        "EDGE-LATE: every late row must follow a declared policy"
+                    );
+                    if matches!(self.late_data_policy, LateDataPolicy::RouteToSink { .. }) {
+                        let mut routed = self.late_route_rows.lock().unwrap();
+                        if routed.len() >= TUMBLE_WINDOW_LATE_ROUTE_LIMIT {
+                            return Err(OpError::late_route_overflow(
+                                routed.len(),
+                                TUMBLE_WINDOW_LATE_ROUTE_LIMIT,
+                            ));
+                        }
+                        routed.push(row_vals.clone());
+                        self.late_route_fill_level
+                            .store(routed.len(), Ordering::Relaxed);
+                    }
                     if self.late_data_policy == LateDataPolicy::Drop {
                         continue;
                     }

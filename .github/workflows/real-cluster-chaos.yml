@@ -1,0 +1,44 @@
+name: Real Cluster Chaos Soak
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * 0"
+  pull_request:
+    paths:
+      - "crates/rockstream-connectors/**"
+      - "crates/rockstream-control/**"
+      - "crates/rockstream-gateway/**"
+      - "crates/rockstream-ops/**"
+      - "crates/rockstream-runtime/**"
+      - "crates/rockstream-sim/**"
+      - "crates/rockstream-storage/**"
+      - "formal/edge_*.fizz"
+      - "Dockerfile"
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - name: Require Docker
+        run: docker info
+      - name: Build unified-binary test image
+        run: docker build -t rockstream-tc-test:latest .
+      - name: Run Kafka/MinIO recovery SLO proof
+        env:
+          ROCKSTREAM_CHAOS_ARTIFACT_DIR: target/real-cluster-chaos
+        run: cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle -- --exact
+      - name: Upload real-cluster chaos artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-cluster-chaos-slo-summary
+          path: target/real-cluster-chaos/
+          if-no-files-found: error
+      - name: Append chaos summary to job summary
+        if: always()
+        run: cat target/real-cluster-chaos/real-cluster-chaos-summary.md >> "$GITHUB_STEP_SUMMARY"

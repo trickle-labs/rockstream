@@ -18,7 +18,7 @@
 //! which operator family it regresses in.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use object_store::local::LocalFileSystem;
 use rockstream_gateway::{
@@ -33,6 +33,9 @@ use tokio_postgres::NoTls;
 
 const TOTAL_ROWS: i64 = 1_000_000;
 const CHUNK_SIZE: i64 = 50_000;
+
+static VIEW_REFRESH_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 struct NoopViewReader;
 
@@ -103,6 +106,7 @@ fn assert_o1_refresh(before: u64, after: u64, total: i64, family: &str) {
 
 #[tokio::test]
 async fn stateless_project_view_refresh_is_o1_at_1m_rows() {
+    let _guard = VIEW_REFRESH_TEST_LOCK.lock().await;
     let catalog = Arc::new(CatalogStubs::new());
     let dir = TempDir::new().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
@@ -150,6 +154,7 @@ async fn stateless_project_view_refresh_is_o1_at_1m_rows() {
 
 #[tokio::test]
 async fn aggregate_view_refresh_is_o1_at_1m_rows() {
+    let _guard = VIEW_REFRESH_TEST_LOCK.lock().await;
     let catalog = Arc::new(CatalogStubs::new());
     let dir = TempDir::new().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
@@ -197,6 +202,7 @@ async fn aggregate_view_refresh_is_o1_at_1m_rows() {
 
 #[tokio::test]
 async fn join_view_refresh_is_o1_at_1m_rows() {
+    let _guard = VIEW_REFRESH_TEST_LOCK.lock().await;
     let catalog = Arc::new(CatalogStubs::new());
     let dir = TempDir::new().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
@@ -256,6 +262,7 @@ async fn join_view_refresh_is_o1_at_1m_rows() {
 
 #[tokio::test]
 async fn session_window_view_refresh_is_o1_at_1m_rows() {
+    let _guard = VIEW_REFRESH_TEST_LOCK.lock().await;
     let catalog = Arc::new(CatalogStubs::new());
     let dir = TempDir::new().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());

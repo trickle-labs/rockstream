@@ -44,8 +44,33 @@ impl WorkerQuotaManager {
         requested_bytes: u64,
         parallelism: u32,
     ) -> Result<QuotaGuard, StateBudgetError> {
-        self.ledger
-            .try_acquire_batch(workload_id, requested_bytes, parallelism)
+        let reservation = self
+            .ledger
+            .try_acquire_batch(workload_id, requested_bytes, parallelism);
+        let within_bounds = self.ledger.get_entry(workload_id).is_none_or(|entry| {
+            let memory_limit = entry
+                .memory_limit_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallelism_limit = entry
+                .max_parallelism
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let memory_ok = memory_limit == 0
+                || entry
+                    .current_memory_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    <= memory_limit;
+            let parallelism_ok = parallelism_limit == 0
+                || entry
+                    .current_parallelism
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    <= parallelism_limit;
+            memory_ok && parallelism_ok
+        });
+        assert!(
+            reservation.is_err() || within_bounds,
+            "EDGE-QUOTA: accepted reservation must remain within memory and parallelism bounds"
+        );
+        reservation
     }
 
     /// Handle prospective batch rejection: returns `ViewState::OverBudgetRejected`

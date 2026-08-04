@@ -1016,7 +1016,7 @@ impl<'a> postgres_types::FromSql<'a> for PgInterval {
         raw: &'a [u8],
     ) -> Result<PgInterval, Box<dyn std::error::Error + Sync + Send>> {
         if raw.len() != 16 {
-            return Err("invalid interval binary length".into());
+            return Err("[RS-0001] invalid interval binary length; next_steps: send the 16-byte PostgreSQL INTERVAL binary representation".into());
         }
         let microseconds = i64::from_be_bytes(raw[0..8].try_into().unwrap());
         let days = i32::from_be_bytes(raw[8..12].try_into().unwrap());
@@ -1556,7 +1556,7 @@ impl GatewayHandler {
     ) -> Result<rockstream_ops::CompiledView, String> {
         let frontend = self
             .build_explain_frontend()
-            .map_err(|e| format!("frontend setup failed: {e:?}"))?;
+            .map_err(|e| format!("[RS-1019] frontend setup failed: {e:?}; next_steps: simplify the view query or verify its source schemas"))?;
 
         let view_plan = rockstream_plan::PlanNode::ViewSink {
             view_name: view_name.to_string(),
@@ -1575,8 +1575,8 @@ impl GatewayHandler {
                 let mut diff_ctx = rockstream_diff::DiffCtx::new();
                 let _physical_plan = diff_ctx
                     .differentiate(&view_plan)
-                    .map_err(|e| format!("DiffCtx physical plan lowering failed: {e:?}"))?;
-                Err(format!("compile_plan: {compile_err}"))
+                    .map_err(|e| format!("[RS-1019] DiffCtx physical plan lowering failed: {e:?}; next_steps: simplify the view query or verify its source schemas"))?;
+                Err(format!("[RS-1019] compile_plan: {compile_err}; next_steps: simplify the view query or verify its source schemas"))
             }
         }
     }
@@ -1594,7 +1594,7 @@ impl GatewayHandler {
     ) -> Result<rockstream_ops::CompiledView, String> {
         let frontend = self
             .build_explain_frontend()
-            .map_err(|e| format!("frontend setup failed: {e:?}"))?;
+            .map_err(|e| format!("[RS-1019] frontend setup failed: {e:?}; next_steps: simplify the view query or verify its source schemas"))?;
 
         let view_plan = rockstream_plan::PlanNode::ViewSink {
             view_name: view_name.to_string(),
@@ -1618,8 +1618,8 @@ impl GatewayHandler {
                 let mut diff_ctx = rockstream_diff::DiffCtx::new();
                 let _physical_plan = diff_ctx
                     .differentiate(&view_plan)
-                    .map_err(|e| format!("DiffCtx physical plan lowering failed: {e:?}"))?;
-                Err(format!("compile_plan_with_sink_id: {compile_err}"))
+                    .map_err(|e| format!("[RS-1019] DiffCtx physical plan lowering failed: {e:?}; next_steps: simplify the view query or verify its source schemas"))?;
+                Err(format!("[RS-1019] compile_plan_with_sink_id: {compile_err}; next_steps: simplify the view query or verify its source schemas"))
             }
         }
     }
@@ -8126,14 +8126,14 @@ async fn relay_negotiated_3_2_connection(
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("Failed to bind local relay listener: {e}");
+            tracing::error!("[RS-0001] Failed to bind local relay listener: {e}; next_steps: retry the connection or inspect local socket limits");
             return;
         }
     };
     let local_addr = match listener.local_addr() {
         Ok(a) => a,
         Err(e) => {
-            tracing::error!("Failed to get local relay addr: {e}");
+            tracing::error!("[RS-0001] Failed to get local relay addr: {e}; next_steps: retry the connection or inspect local socket limits");
             return;
         }
     };
@@ -8144,7 +8144,7 @@ async fn relay_negotiated_3_2_connection(
     let (local_client, (mut local_server, _)) = match tokio::try_join!(connect_fut, accept_fut) {
         Ok(res) => (res.0, res.1),
         Err(e) => {
-            tracing::error!("Failed to set up local relay streams: {e}");
+            tracing::error!("[RS-0001] Failed to set up local relay streams: {e}; next_steps: retry the connection or inspect local socket limits");
             return;
         }
     };

@@ -155,6 +155,10 @@ impl SinkConnector for ObjectStoreSink {
 
     fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError> {
         if self.backpressure_active() {
+            assert!(
+                self.pending_epochs_count >= self.max_pending_epochs,
+                "EDGE-BROWNOUT: backpressure may only reject at the named pending-epoch cap"
+            );
             return Err(SinkError::PreCommitFailed {
                 epoch,
                 reason: format!(
@@ -171,6 +175,10 @@ impl SinkConnector for ObjectStoreSink {
         let payload = vec![0xABu8; row_count.max(1)];
         self.pending.insert(epoch, payload);
         self.pending_epochs_count += 1;
+        assert!(
+            self.pending_epochs_count <= self.max_pending_epochs,
+            "EDGE-BROWNOUT: accepted pre-commits must remain within the pending-epoch cap"
+        );
         Ok(SinkState::PreCommitted {
             staged_rows: row_count,
             pending_handle: pending_path.into_bytes(),
