@@ -45,12 +45,12 @@ chrono.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true
 postgres-types.workspace = true
+object_store = { version = "0.12", features = ["aws"] }
 
 
 [dev-dependencies]
 tokio-postgres.workspace = true
 tempfile.workspace = true
-object_store = { version = "0.12", features = ["aws"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 rockstream-oracle = { workspace = true }

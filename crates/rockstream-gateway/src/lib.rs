@@ -34,7 +34,13 @@ pub mod write_buffer;
 
 pub use error::GatewayError;
 pub use role_catalog::RoleCatalog;
-pub use server::{ConnectionStateTotals, GatewayServer, MAX_CONNECTIONS};
+pub use server::{
+    query_time_scatter_fill_levels, query_time_scatter_peak_fill_levels, ConnectionStateTotals,
+    GatewayServer, QueryTimeScatterBudget, QueryTimeScatterFillLevels, QueryTimeShardReaderSpec,
+    QueryTimeShardTopology, QueryTimeShardTopologyProvider, MAX_CONNECTIONS,
+    QUERY_TIME_SCATTER_MAX_CONCURRENT_SHARD_BATCHES, QUERY_TIME_SCATTER_MAX_IN_FLIGHT_BYTES,
+    QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS,
+};
 pub use session::{CursorState, TxStatus, MAX_CURSORS_PER_CONNECTION};
 pub use view_reader::{
     HotOnlyViewReader, ViewReadStrategy, ViewReader, ROWS_IN_FLIGHT_BATCH, STREAM_BATCH_BYTES,

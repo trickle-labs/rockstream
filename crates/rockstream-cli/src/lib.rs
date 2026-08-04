@@ -143,6 +143,11 @@ pub struct StartOptions {
     /// each other's persisted term/vote on restart. It always lives under
     /// this node's own private `--storage`/`raft` directory.
     pub control_shared_storage: Option<PathBuf>,
+    /// Root directories for every non-local shard that owns query-time
+    /// relations. Each directory must contain the same logical SlateDB shard
+    /// path as the local gateway shard (normally `db`). The gateway refreshes
+    /// all of them and accepts a query only at a common durable frontier.
+    pub query_time_shard_dirs: Vec<PathBuf>,
 }
 
 /// The result of a successful `rockstream start` no-op run.
@@ -285,7 +290,7 @@ pub async fn start_gateway_with_shard(
         )
     })?;
 
-    let reader = rockstream_storage::ShardReader::open(shard_path, store)
+    let reader = rockstream_storage::ShardReader::open(shard_path, store.clone())
         .await
         .map_err(|e| {
             CliError::new(
@@ -302,6 +307,30 @@ pub async fn start_gateway_with_shard(
         });
 
     let catalog = Arc::new(rockstream_gateway::catalog_stubs::CatalogStubs::new());
+
+    let mut topology_readers = vec![rockstream_gateway::QueryTimeShardReaderSpec::new(
+        shard_path, store,
+    )];
+    for shard_dir in &opts.query_time_shard_dirs {
+        let shard_store: Arc<dyn object_store::ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(shard_dir).map_err(|e| {
+                CliError::new(
+                    RS_0003,
+                    format!(
+                        "query-time shard storage init failed for {}: {e}",
+                        shard_dir.display()
+                    ),
+                    "Pass --query-time-shard-dir for every readable owning shard directory.",
+                )
+            })?,
+        );
+        topology_readers.push(rockstream_gateway::QueryTimeShardReaderSpec::new(
+            shard_path,
+            shard_store,
+        ));
+    }
+    let topology_provider =
+        rockstream_gateway::QueryTimeShardTopologyProvider::new(topology_readers);
 
     let listen = opts.listen_addr.as_deref().unwrap_or("127.0.0.1:5432");
     let addr: std::net::SocketAddr = listen.parse().map_err(|e| {
@@ -364,13 +393,17 @@ pub async fn start_gateway_with_shard(
         }
     };
 
-    server.serve_background().await.map_err(|e| {
-        CliError::new(
-            RS_0003,
-            format!("failed to bind gateway on {listen}: {e}"),
-            "Check that the port is not already in use.",
-        )
-    })
+    server
+        .with_query_time_shard_topology_provider(topology_provider)
+        .serve_background()
+        .await
+        .map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("failed to bind gateway on {listen}: {e}"),
+                "Check that the port is not already in use.",
+            )
+        })
 }
 
 /// Run `rockstream start`.
@@ -1022,6 +1055,7 @@ mod tests {
             daemon: false,
             control_bind: None,
             control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
         };
         let outcome = run_start(&opts).unwrap();
 
@@ -1071,6 +1105,7 @@ mod tests {
             daemon: false,
             control_bind: None,
             control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
         };
         run_start(&opts).unwrap();
         assert!(nested.join("audit.jsonl").exists());
@@ -1096,6 +1131,7 @@ mod tests {
             daemon: false,
             control_bind: None,
             control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -1123,6 +1159,7 @@ mod tests {
             daemon: false,
             control_bind: None,
             control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
         };
         // Should succeed: gateway + no listen_addr → no-op path
         let outcome = run_start(&opts).unwrap();
@@ -1150,6 +1187,7 @@ mod tests {
             daemon: false,
             control_bind: None,
             control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -1197,6 +1235,7 @@ mod tests {
                 daemon: false,
                 control_bind: None,
                 control_shared_storage: None,
+                query_time_shard_dirs: Vec::new(),
             };
             let outcome = run_start(&opts).unwrap();
             assert!(outcome.events_written >= 2);
@@ -1223,6 +1262,7 @@ mod tests {
                 daemon: false,
                 control_bind: None,
                 control_shared_storage: None,
+                query_time_shard_dirs: Vec::new(),
             };
             let outcome = run_start(&opts).unwrap();
             assert!(outcome.events_written >= 2);
@@ -1252,6 +1292,7 @@ mod tests {
             daemon: false,
             control_bind: None,
             control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -1280,6 +1321,7 @@ mod tests {
             daemon: false,
             control_bind: None,
             control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");

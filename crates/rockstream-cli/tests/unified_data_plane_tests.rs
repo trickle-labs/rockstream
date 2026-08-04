@@ -31,6 +31,7 @@ fn all_role_opts(storage: &Path, listen_addr: &str) -> StartOptions {
         daemon: false,
         control_bind: None,
         control_shared_storage: None,
+        query_time_shard_dirs: Vec::new(),
     }
 }
 

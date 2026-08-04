@@ -316,6 +316,41 @@ async fn reader_scan_prefix() {
     assert_eq!(results.len(), 2);
 }
 
+#[tokio::test]
+async fn reader_scan_prefix_pages_obeys_exact_row_and_byte_bounds() {
+    let store = Arc::new(InMemory::new());
+    let db = ShardDb::builder("test/reader_scan_pages", store.clone())
+        .build()
+        .await
+        .unwrap();
+    db.put(b"pfx_a", b"aa").await.unwrap();
+    db.put(b"pfx_b", b"bb").await.unwrap();
+    db.put(b"pfx_c", b"cc").await.unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+
+    let reader = crate::reader::ShardReader::open("test/reader_scan_pages", store)
+        .await
+        .unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let scan = tokio::spawn(async move {
+        reader.scan_prefix_pages(b"pfx_", 2, 12, sender).await;
+    });
+    let mut pages = Vec::new();
+    while let Some(page) = receiver.recv().await {
+        pages.push(page.unwrap());
+    }
+    scan.await.unwrap();
+    assert_eq!(
+        pages,
+        vec![
+            vec![(Bytes::from("pfx_a"), Bytes::from("aa"))],
+            vec![(Bytes::from("pfx_b"), Bytes::from("bb"))],
+            vec![(Bytes::from("pfx_c"), Bytes::from("cc"))],
+        ]
+    );
+}
+
 // === Catalog Key Namespace Dimension ===
 
 #[tokio::test]

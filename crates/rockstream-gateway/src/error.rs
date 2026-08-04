@@ -111,6 +111,29 @@ pub enum GatewayError {
     #[error("[RS-2025] query.query_time_result_set_too_large: query result set too large for query-time execution while scanning '{relation}' (row limit {row_limit}). next_steps: Add a LIMIT clause, reduce source-table cardinality, or materialize the query into a view.")]
     QueryTimeResultSetTooLarge { relation: String, row_limit: usize },
 
+    /// [RS-2028] query.query_time_scatter_topology_unavailable — a query-time
+    /// relation cannot safely fall back to the gateway-local shard.
+    #[error("[RS-2028] query.query_time_scatter_topology_unavailable: query-time execution has no complete pinned shard-reader topology. next_steps: Configure every owning shard reader at one cluster frontier, then retry the query.")]
+    QueryTimeScatterTopologyUnavailable,
+
+    /// [RS-2030] query.query_time_scatter_frontier_mismatch — configured
+    /// query-time shards do not expose one common durable frontier.
+    #[error("[RS-2030] query.query_time_scatter_frontier_mismatch: shard reader '{shard_path}' is at frontier {actual}, but the selected query frontier is {expected}. next_steps: Wait for every owning shard to reach the same frontier, then retry the query.")]
+    QueryTimeScatterFrontierMismatch {
+        shard_path: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    /// [RS-2029] query.query_time_scatter_budget_exceeded — the explicit
+    /// pathological scan budget was reached before a complete response existed.
+    #[error("[RS-2029] query.query_time_scatter_budget_exceeded: query-time scatter scan for '{relation}' exceeded the pathological budget ({row_limit} rows or {byte_limit} bytes). next_steps: Narrow the predicate, add a LIMIT, or materialize the query into a view.")]
+    QueryTimeScatterBudgetExceeded {
+        relation: String,
+        row_limit: usize,
+        byte_limit: usize,
+    },
+
     /// [RS-2026] query.query_time_execution_failed — query-time DataFusion planning/execution failed.
     #[error("[RS-2026] query.query_time_execution_failed: query-time execution failed: {detail}. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view.")]
     QueryTimeExecutionFailed { detail: String },
@@ -172,6 +195,9 @@ pub fn sqlstate_for(e: &GatewayError) -> &'static str {
         GatewayError::SavepointLimitExceeded { .. } => "54000",
         GatewayError::NotifyChannelLimitExceeded { .. } => "54000",
         GatewayError::QueryTimeResultSetTooLarge { .. } => "54000",
+        GatewayError::QueryTimeScatterTopologyUnavailable => "55000",
+        GatewayError::QueryTimeScatterFrontierMismatch { .. } => "55000",
+        GatewayError::QueryTimeScatterBudgetExceeded { .. } => "54000",
         GatewayError::QueryTimeExecutionFailed { .. } => "0A000",
         GatewayError::IndexBackfillRowLimitExceeded { .. } => "54000",
         GatewayError::NotSupported(_) => "0A000",

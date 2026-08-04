@@ -8,6 +8,7 @@ use bytes::Bytes;
 use object_store::ObjectStore;
 use slatedb::config::DbReaderOptions;
 use slatedb::DbReader;
+use tokio::sync::mpsc;
 
 use crate::error::StorageError;
 
@@ -17,6 +18,7 @@ use crate::error::StorageError;
 /// with ongoing writes to the shard.
 pub struct ShardReader {
     reader: DbReader,
+    path: String,
 }
 
 impl ShardReader {
@@ -25,8 +27,11 @@ impl ShardReader {
         path: impl Into<String>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self, StorageError> {
-        let reader = DbReader::builder(path.into(), object_store).build().await?;
-        Ok(Self { reader })
+        let path = path.into();
+        let reader = DbReader::builder(path.clone(), object_store)
+            .build()
+            .await?;
+        Ok(Self { reader, path })
     }
 
     /// Open a reader with custom options.
@@ -35,11 +40,17 @@ impl ShardReader {
         object_store: Arc<dyn ObjectStore>,
         options: DbReaderOptions,
     ) -> Result<Self, StorageError> {
-        let reader = DbReader::builder(path.into(), object_store)
+        let path = path.into();
+        let reader = DbReader::builder(path.clone(), object_store)
             .with_options(options)
             .build()
             .await?;
-        Ok(Self { reader })
+        Ok(Self { reader, path })
+    }
+
+    /// Return the storage path this snapshot reader was opened against.
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     /// Get the value for a key from the snapshot.
@@ -71,5 +82,62 @@ impl ShardReader {
             results.push((entry.key, entry.value));
         }
         Ok(results)
+    }
+
+    /// Send prefix-scan pages through a bounded channel.
+    ///
+    /// Each page contains at most `max_rows` entries and `max_bytes` bytes of
+    /// key/value payload.  The channel capacity is supplied by the caller so
+    /// readers naturally stop at the consumer's backpressure boundary instead
+    /// of accumulating a relation in memory.
+    pub async fn scan_prefix_pages(
+        &self,
+        prefix: &[u8],
+        max_rows: usize,
+        max_bytes: usize,
+        sender: mpsc::Sender<Result<Vec<(Bytes, Bytes)>, StorageError>>,
+    ) {
+        let sender = sender;
+        let mut page = Vec::with_capacity(max_rows);
+        let mut page_bytes = 0usize;
+        let mut iter = match self.reader.scan_prefix(prefix).await {
+            Ok(iter) => iter,
+            Err(error) => {
+                let _ = sender.send(Err(error.into())).await;
+                return;
+            }
+        };
+        loop {
+            let entry = match iter.next().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = sender.send(Err(error.into())).await;
+                    return;
+                }
+            };
+            let entry_bytes = entry.key.len() + entry.value.len();
+            if entry_bytes > max_bytes {
+                let _ = sender
+                    .send(Err(StorageError::Unsupported(format!(
+                        "prefix scan entry is {entry_bytes} bytes, above page budget {max_bytes}"
+                    ))))
+                    .await;
+                return;
+            }
+            if !page.is_empty()
+                && (page.len() == max_rows || page_bytes.saturating_add(entry_bytes) > max_bytes)
+            {
+                if sender.send(Ok(std::mem::take(&mut page))).await.is_err() {
+                    return;
+                }
+                page_bytes = 0;
+            }
+            page_bytes = page_bytes.saturating_add(entry_bytes);
+            page.push((entry.key, entry.value));
+        }
+        if !page.is_empty() {
+            let _ = sender.send(Ok(page)).await;
+        }
     }
 }

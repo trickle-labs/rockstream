@@ -6,15 +6,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::DashMap;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::streaming::StreamingTable;
 use datafusion::datasource::memory::MemTable;
+use datafusion::error::DataFusionError;
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::PartitionStream;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::SinkExt;
 use futures::{stream, Sink, StreamExt};
@@ -760,10 +767,75 @@ pub static INDEX_BACKFILL_ROWS_PROCESSED_TOTAL: std::sync::atomic::AtomicU64 =
 pub static INDEX_BACKFILL_IN_PROGRESS_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Hard per-relation row cap for query-time DataFusion source scans.
-pub const MAX_QUERY_TIME_ROWS: usize = 1_000_000;
-/// Hard per-relation byte cap for query-time DataFusion source scans.
-pub const MAX_QUERY_TIME_SCAN_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum rows buffered by the query-time scatter source before backpressure.
+pub const QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS: usize = 16_384;
+/// Maximum key/value bytes buffered by the query-time scatter source.
+pub const QUERY_TIME_SCATTER_MAX_IN_FLIGHT_BYTES: usize = 8 * 1024 * 1024;
+/// The bounded scheduler runs one shard page at a time; this keeps a complete
+/// relation streamed without retaining a merged cross-shard vector.
+pub const QUERY_TIME_SCATTER_MAX_CONCURRENT_SHARD_BATCHES: usize = 1;
+/// Explicit ceiling for genuinely pathological scans, deliberately far above
+/// the retired one-million-row / 64-MiB compatibility caps.
+pub const QUERY_TIME_SCATTER_PATHOLOGICAL_ROW_LIMIT: usize = 100_000_000;
+/// Explicit byte ceiling paired with `QUERY_TIME_SCATTER_PATHOLOGICAL_ROW_LIMIT`.
+pub const QUERY_TIME_SCATTER_PATHOLOGICAL_BYTE_LIMIT: usize = 32 * 1024 * 1024 * 1024;
+/// Bound for the separate compiled-view source refresh path; this is not used
+/// by ad hoc query-time execution.
+pub const MAX_COMPILED_VIEW_SOURCE_ROWS: usize = 1_000_000;
+/// Byte bound paired with `MAX_COMPILED_VIEW_SOURCE_ROWS`.
+pub const MAX_COMPILED_VIEW_SOURCE_SCAN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Observable current fill-levels for the bounded query-time scatter source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryTimeScatterFillLevels {
+    pub rows: usize,
+    pub bytes: usize,
+    pub batches: usize,
+}
+
+/// Explicit resource ceiling for one query-time scatter execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryTimeScatterBudget {
+    pub row_limit: usize,
+    pub byte_limit: usize,
+}
+
+impl Default for QueryTimeScatterBudget {
+    fn default() -> Self {
+        Self {
+            row_limit: QUERY_TIME_SCATTER_PATHOLOGICAL_ROW_LIMIT,
+            byte_limit: QUERY_TIME_SCATTER_PATHOLOGICAL_BYTE_LIMIT,
+        }
+    }
+}
+
+pub static QUERY_TIME_SCATTER_ROWS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+pub static QUERY_TIME_SCATTER_BYTES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+pub static QUERY_TIME_SCATTER_BATCHES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// High-water marks for the same source. These make its backpressure bounds
+/// auditable after a query has completed and the current gauges return to zero.
+pub static QUERY_TIME_SCATTER_PEAK_ROWS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+pub static QUERY_TIME_SCATTER_PEAK_BYTES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+pub static QUERY_TIME_SCATTER_PEAK_BATCHES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static QUERY_TIME_SCATTER_BATCH_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(QUERY_TIME_SCATTER_MAX_CONCURRENT_SHARD_BATCHES);
+
+pub fn query_time_scatter_fill_levels() -> QueryTimeScatterFillLevels {
+    QueryTimeScatterFillLevels {
+        rows: QUERY_TIME_SCATTER_ROWS_IN_FLIGHT.load(Ordering::Relaxed),
+        bytes: QUERY_TIME_SCATTER_BYTES_IN_FLIGHT.load(Ordering::Relaxed),
+        batches: QUERY_TIME_SCATTER_BATCHES_IN_FLIGHT.load(Ordering::Relaxed),
+    }
+}
+
+/// Return the high-water fill levels observed by the query-time scatter source.
+pub fn query_time_scatter_peak_fill_levels() -> QueryTimeScatterFillLevels {
+    QueryTimeScatterFillLevels {
+        rows: QUERY_TIME_SCATTER_PEAK_ROWS_IN_FLIGHT.load(Ordering::Relaxed),
+        bytes: QUERY_TIME_SCATTER_PEAK_BYTES_IN_FLIGHT.load(Ordering::Relaxed),
+        batches: QUERY_TIME_SCATTER_PEAK_BATCHES_IN_FLIGHT.load(Ordering::Relaxed),
+    }
+}
 /// Hard row cap for a single `CREATE INDEX` automatic backfill scan (Slice 5,
 /// v0.51.2). A table exceeding this fails backfill with RS-2027 rather than
 /// leaving the index catalog entry stuck in `Building` forever. `CREATE
@@ -1372,6 +1444,142 @@ pub struct ConnectionStateTotals {
 
 // ── GatewayHandler ────────────────────────────────────────────────────────────
 
+/// The complete set of readers that owns a query-time relation at one pinned
+/// cluster frontier.  Supplying this dependency is the distributed gateway
+/// wiring: a handler may not silently reduce a configured topology to its
+/// local shard.
+#[derive(Clone)]
+pub struct QueryTimeShardTopology {
+    readers: Vec<Arc<rockstream_storage::ShardReader>>,
+    pinned_frontier: u64,
+    query_time_scatter_budget: QueryTimeScatterBudget,
+}
+
+/// One durable shard source owned by the query-time topology provider.
+#[derive(Clone)]
+pub struct QueryTimeShardReaderSpec {
+    path: String,
+    object_store: Arc<dyn object_store::ObjectStore>,
+}
+
+impl QueryTimeShardReaderSpec {
+    pub fn new(path: impl Into<String>, object_store: Arc<dyn object_store::ObjectStore>) -> Self {
+        Self {
+            path: path.into(),
+            object_store,
+        }
+    }
+}
+
+/// Refreshes every configured owning shard and selects a common durable
+/// frontier for each query-time execution. It deliberately fails closed when
+/// even one shard is missing or ahead/behind the selected frontier.
+#[derive(Clone)]
+pub struct QueryTimeShardTopologyProvider {
+    readers: Vec<QueryTimeShardReaderSpec>,
+    query_time_scatter_budget: QueryTimeScatterBudget,
+}
+
+impl QueryTimeShardTopologyProvider {
+    pub fn new(readers: Vec<QueryTimeShardReaderSpec>) -> Self {
+        Self {
+            readers,
+            query_time_scatter_budget: QueryTimeScatterBudget::default(),
+        }
+    }
+
+    pub fn with_query_time_scatter_budget(
+        readers: Vec<QueryTimeShardReaderSpec>,
+        query_time_scatter_budget: QueryTimeScatterBudget,
+    ) -> Self {
+        Self {
+            readers,
+            query_time_scatter_budget,
+        }
+    }
+
+    pub async fn refresh(&self) -> Result<QueryTimeShardTopology, GatewayError> {
+        if self.readers.is_empty() {
+            return Err(GatewayError::QueryTimeScatterTopologyUnavailable);
+        }
+        let readers = futures::future::try_join_all(self.readers.iter().map(|reader| async {
+            rockstream_storage::ShardReader::open(reader.path.clone(), reader.object_store.clone())
+                .await
+        }))
+        .await
+        .map_err(|_| GatewayError::QueryTimeScatterTopologyUnavailable)?
+        .into_iter()
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+        let frontier_key = rockstream_storage::ShardKeyEncoder::frontier_key();
+        let mut pinned_frontier = None;
+        for reader in &readers {
+            let frontier = match reader
+                .get(&frontier_key)
+                .await
+                .map_err(|_| GatewayError::QueryTimeScatterTopologyUnavailable)?
+            {
+                Some(bytes) if bytes.len() == 8 => {
+                    u64::from_be_bytes(bytes[..8].try_into().expect("checked length"))
+                }
+                Some(_) => return Err(GatewayError::QueryTimeScatterTopologyUnavailable),
+                None => 0,
+            };
+            if let Some(expected) = pinned_frontier {
+                if frontier != expected {
+                    return Err(GatewayError::QueryTimeScatterFrontierMismatch {
+                        shard_path: reader.path().to_string(),
+                        expected,
+                        actual: frontier,
+                    });
+                }
+            } else {
+                pinned_frontier = Some(frontier);
+            }
+        }
+        Ok(QueryTimeShardTopology::with_query_time_scatter_budget(
+            readers,
+            pinned_frontier.unwrap_or(0),
+            self.query_time_scatter_budget,
+        ))
+    }
+}
+
+impl QueryTimeShardTopology {
+    pub fn new(readers: Vec<Arc<rockstream_storage::ShardReader>>, pinned_frontier: u64) -> Self {
+        Self {
+            readers,
+            pinned_frontier,
+            query_time_scatter_budget: QueryTimeScatterBudget::default(),
+        }
+    }
+
+    /// Build a topology with an explicit per-query scatter budget.
+    pub fn with_query_time_scatter_budget(
+        readers: Vec<Arc<rockstream_storage::ShardReader>>,
+        pinned_frontier: u64,
+        query_time_scatter_budget: QueryTimeScatterBudget,
+    ) -> Self {
+        Self {
+            readers,
+            pinned_frontier,
+            query_time_scatter_budget,
+        }
+    }
+
+    pub fn pinned_frontier(&self) -> u64 {
+        self.pinned_frontier
+    }
+
+    pub fn reader_count(&self) -> usize {
+        self.readers.len()
+    }
+
+    pub fn query_time_scatter_budget(&self) -> QueryTimeScatterBudget {
+        self.query_time_scatter_budget
+    }
+}
+
 /// Core handler shared across all pgwire protocol phases.
 ///
 /// `Arc<GatewayHandler>` is the `PgWireServerHandlers` factory.
@@ -1398,6 +1606,13 @@ pub struct GatewayHandler {
     pub sessions: Arc<DashMap<String, SessionState>>,
     /// Optional ShardDb for direct-write DML commits.
     shard_db: Option<Arc<rockstream_storage::ShardDb>>,
+    /// Optional distributed query-time topology. A configured topology is
+    /// always used in full; it is never reduced to the gateway-local shard.
+    query_time_shard_topology: Option<Arc<QueryTimeShardTopology>>,
+    /// Dynamic production provider. Unlike a test topology, this refreshes
+    /// all configured owning readers and validates their shared frontier on
+    /// every query-time request.
+    query_time_shard_topology_provider: Option<Arc<QueryTimeShardTopologyProvider>>,
     /// Authentication mode for this gateway instance.
     auth_mode: AuthMode,
     /// Optional JWT verifier (populated when auth_mode == Oidc).
@@ -1461,6 +1676,8 @@ impl GatewayHandler {
             copy_states: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             shard_db: None,
+            query_time_shard_topology: None,
+            query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
             jwt_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
@@ -1492,6 +1709,8 @@ impl GatewayHandler {
             copy_states: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             shard_db: Some(shard_db),
+            query_time_shard_topology: None,
+            query_time_shard_topology_provider: None,
             auth_mode: AuthMode::Off,
             jwt_verifier: None,
             role_catalog: Arc::new(RoleCatalog::new()),
@@ -1505,6 +1724,22 @@ impl GatewayHandler {
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Inject the complete pinned shard-reader topology used by query-time
+    /// DataFusion reads. Production constructors retain this dependency and
+    /// auth wrappers operate on the same handler instance.
+    pub fn with_query_time_shard_topology(mut self, topology: QueryTimeShardTopology) -> Self {
+        self.query_time_shard_topology = Some(Arc::new(topology));
+        self
+    }
+
+    pub fn with_query_time_shard_topology_provider(
+        mut self,
+        provider: QueryTimeShardTopologyProvider,
+    ) -> Self {
+        self.query_time_shard_topology_provider = Some(Arc::new(provider));
+        self
     }
 
     #[doc(hidden)]
@@ -1765,12 +2000,12 @@ impl GatewayHandler {
     ) -> Result<Vec<Vec<u8>>, GatewayError> {
         let prefix = format!("view_output/{relation_name}/");
         let (rows, truncated) = shard_db
-            .scan_prefix_bounded(prefix.as_bytes(), MAX_QUERY_TIME_SCAN_BYTES)
+            .scan_prefix_bounded(prefix.as_bytes(), MAX_COMPILED_VIEW_SOURCE_SCAN_BYTES)
             .await?;
-        if truncated || rows.len() > MAX_QUERY_TIME_ROWS {
+        if truncated || rows.len() > MAX_COMPILED_VIEW_SOURCE_ROWS {
             return Err(GatewayError::QueryTimeResultSetTooLarge {
                 relation: relation_name.to_string(),
-                row_limit: MAX_QUERY_TIME_ROWS,
+                row_limit: MAX_COMPILED_VIEW_SOURCE_ROWS,
             });
         }
         Ok(rows
@@ -1930,7 +2165,7 @@ impl GatewayHandler {
     /// is no smaller row-level delta to consume — the whole source table's
     /// current contents *are* the initial delta. This is the one
     /// legitimate remaining use of a full-table scan (bounded by
-    /// `MAX_QUERY_TIME_ROWS`/`MAX_QUERY_TIME_SCAN_BYTES`, same as
+    /// `MAX_COMPILED_VIEW_SOURCE_ROWS`/`MAX_COMPILED_VIEW_SOURCE_SCAN_BYTES`, same as
     /// query-time reads); it runs exactly once per view creation, not once
     /// per commit.
     async fn populate_compiled_view_from_scratch(
@@ -2839,8 +3074,8 @@ impl GatewayHandler {
             // index/sink/shard annotations are preserved as extra rows after
             // the real plan — no information is lost, only the fabricated
             // "Plan: SeqScan → …" one-liner is removed.
-            let mut plan_rows: Vec<String> = match &self.shard_db {
-                Some(shard_db) => {
+            let mut plan_rows: Vec<String> = match self.query_time_shard_topology().await {
+                Ok(topology) => {
                     let analyzed = analyze_select_query(&self.catalog, inner_sql);
                     let referenced_tables = analyzed
                         .as_ref()
@@ -2848,7 +3083,7 @@ impl GatewayHandler {
                         .unwrap_or_default();
                     match query_time_datafusion_select(
                         &self.catalog,
-                        shard_db,
+                        &topology,
                         &format!("EXPLAIN {inner_sql}"),
                         &referenced_tables,
                     )
@@ -2858,7 +3093,9 @@ impl GatewayHandler {
                         Err(e) => vec![format!("Plan: SeqScan (DataFusion explain failed: {e})")],
                     }
                 }
-                None => vec!["Plan: SeqScan (no shard backend)".to_string()],
+                Err(e) => vec![format!(
+                    "Plan: SeqScan (query-time scatter unavailable: {e})"
+                )],
             };
             for note in [
                 pushdown_note.to_string(),
@@ -3973,16 +4210,59 @@ impl GatewayHandler {
             }
         }
 
-        let shard_db = self.shard_db.as_ref().ok_or_else(|| {
-            PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
-                detail: "query-time execution requires a shard-backed gateway".to_string(),
-            }))
-        })?;
-        let batches =
-            query_time_datafusion_select(&self.catalog, shard_db, raw_sql, referenced_tables)
-                .await
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        let topology = match self.query_time_shard_topology().await {
+            Ok(topology) => topology,
+            Err(error) => return Ok(query_time_error_response(error)),
+        };
+        let batches = match query_time_datafusion_select(
+            &self.catalog,
+            &topology,
+            raw_sql,
+            referenced_tables,
+        )
+        .await
+        {
+            Ok(batches) => batches,
+            Err(error) => return Ok(query_time_error_response(error)),
+        };
         Ok(datafusion_batches_to_query_response(&batches))
+    }
+
+    async fn query_time_shard_topology(&self) -> Result<QueryTimeShardTopology, GatewayError> {
+        if let Some(provider) = &self.query_time_shard_topology_provider {
+            return provider.refresh().await;
+        }
+        if let Some(topology) = &self.query_time_shard_topology {
+            if topology.readers.is_empty()
+                || self.shard_db.as_ref().is_some_and(|shard_db| {
+                    !topology
+                        .readers
+                        .iter()
+                        .any(|reader| reader.path() == shard_db.path())
+                })
+            {
+                return Err(GatewayError::QueryTimeScatterTopologyUnavailable);
+            }
+            return Ok((**topology).clone());
+        }
+
+        // A shard-backed single-node gateway has exactly one known owner. Turn
+        // it into the same reader topology as the distributed path; a gateway
+        // without either dependency fails closed instead of reading a local
+        // shard as an implicit partial answer.
+        let shard_db = self
+            .shard_db
+            .as_ref()
+            .ok_or(GatewayError::QueryTimeScatterTopologyUnavailable)?;
+        let reader = rockstream_storage::ShardReader::open(
+            shard_db.path().to_string(),
+            shard_db.object_store(),
+        )
+        .await?;
+        Ok(QueryTimeShardTopology::new(
+            vec![Arc::new(reader)],
+            shard_db.last_epoch().load(Ordering::SeqCst),
+        ))
     }
 
     fn select_access_error_response(
@@ -8189,6 +8469,29 @@ pub struct GatewayServer {
 }
 
 impl GatewayServer {
+    /// Attach the complete pinned shard-reader topology to a server created by
+    /// any constructor, including the authentication-bearing constructors.
+    /// Query-time execution keeps that topology intact rather than reverting to
+    /// the local shard after authentication wrapping.
+    pub fn with_query_time_shard_topology(mut self, topology: QueryTimeShardTopology) -> Self {
+        Arc::get_mut(&mut self.handler)
+            .expect("GatewayServer construction keeps the handler uniquely owned")
+            .query_time_shard_topology = Some(Arc::new(topology));
+        self
+    }
+
+    /// Attach a dynamic production topology provider. It refreshes all owning
+    /// readers and validates one common frontier per query-time request.
+    pub fn with_query_time_shard_topology_provider(
+        mut self,
+        provider: QueryTimeShardTopologyProvider,
+    ) -> Self {
+        Arc::get_mut(&mut self.handler)
+            .expect("GatewayServer construction keeps the handler uniquely owned")
+            .query_time_shard_topology_provider = Some(Arc::new(provider));
+        self
+    }
+
     /// Create a new gateway server listening on `addr`.
     pub fn new(addr: std::net::SocketAddr, view_reader: Arc<dyn ViewReader>) -> Self {
         let catalog = Arc::new(CatalogStubs::new());
@@ -8228,6 +8531,19 @@ impl GatewayServer {
             )),
             tls_acceptor: None,
         }
+    }
+
+    /// Create a shard-backed gateway whose query-time reads scatter across the
+    /// supplied complete pinned topology.
+    pub fn with_shard_db_and_query_time_shard_topology(
+        addr: std::net::SocketAddr,
+        catalog: Arc<CatalogStubs>,
+        view_reader: Arc<dyn ViewReader>,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+        topology: QueryTimeShardTopology,
+    ) -> Self {
+        GatewayServer::with_shard_db(addr, catalog, view_reader, shard_db)
+            .with_query_time_shard_topology(topology)
     }
 
     /// Create a gateway with SCRAM-SHA-256 auth and a pre-populated RoleCatalog.
@@ -9626,7 +9942,7 @@ fn build_delta_zset_for_table(
 
 async fn query_time_datafusion_select(
     catalog: &CatalogStubs,
-    shard_db: &rockstream_storage::ShardDb,
+    topology: &QueryTimeShardTopology,
     raw_sql: &str,
     referenced_tables: &[String],
 ) -> Result<Vec<RecordBatch>, GatewayError> {
@@ -9635,26 +9951,20 @@ async fn query_time_datafusion_select(
 
     for relation_name in referenced_tables {
         let schema = query_time_relation_schema(catalog, relation_name);
-        let prefix = format!("view_output/{relation_name}/");
-        let (rows, truncated) = shard_db
-            .scan_prefix_bounded(prefix.as_bytes(), MAX_QUERY_TIME_SCAN_BYTES)
-            .await?;
-        QUERY_TIME_DATAFUSION_ROWS_SCANNED_TOTAL.fetch_add(rows.len() as u64, Ordering::Relaxed);
-        if truncated || rows.len() > MAX_QUERY_TIME_ROWS {
-            return Err(GatewayError::QueryTimeResultSetTooLarge {
-                relation: relation_name.clone(),
-                row_limit: MAX_QUERY_TIME_ROWS,
-            });
-        }
-        let tsv_rows: Vec<Vec<u8>> = rows.into_iter().map(|(_, value)| value.to_vec()).collect();
-        let batch = tsv_to_record_batch(schema.clone(), &tsv_rows)
-            .unwrap_or_else(|_| RecordBatch::new_empty(schema.clone()));
-        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).map_err(|e| {
+        let partition = QueryTimeScatterPartition {
+            schema: schema.clone(),
+            relation: relation_name.clone(),
+            readers: topology.readers.clone(),
+            metrics: Arc::new(QueryTimeScatterMetrics::new(
+                topology.query_time_scatter_budget,
+            )),
+        };
+        let table = StreamingTable::try_new(schema, vec![Arc::new(partition)]).map_err(|e| {
             GatewayError::QueryTimeExecutionFailed {
-                detail: format!("MemTable({relation_name}): {e}"),
+                detail: format!("StreamingTable({relation_name}): {e}"),
             }
         })?;
-        ctx.register_table(relation_name.as_str(), Arc::new(mem_table))
+        ctx.register_table(relation_name.as_str(), Arc::new(table))
             .map_err(|e| GatewayError::QueryTimeExecutionFailed {
                 detail: format!("register({relation_name}): {e}"),
             })?;
@@ -9667,16 +9977,244 @@ async fn query_time_datafusion_select(
             detail: format!("sql: {e}"),
         })?;
     let output_schema = Arc::new(df.schema().as_arrow().clone());
-    let mut batches = df
-        .collect()
-        .await
-        .map_err(|e| GatewayError::QueryTimeExecutionFailed {
-            detail: format!("collect: {e}"),
-        })?;
+    let mut batches = df.collect().await.map_err(|e| {
+        query_time_datafusion_error(e, referenced_tables, topology.query_time_scatter_budget)
+    })?;
     if batches.is_empty() {
         batches.push(RecordBatch::new_empty(output_schema));
     }
     Ok(batches)
+}
+
+#[derive(Debug, Default)]
+struct QueryTimeScatterMetrics {
+    rows_in_flight: AtomicUsize,
+    bytes_in_flight: AtomicUsize,
+    batches_in_flight: AtomicUsize,
+    total_rows: AtomicUsize,
+    total_bytes: AtomicUsize,
+    budget: QueryTimeScatterBudget,
+}
+
+impl QueryTimeScatterMetrics {
+    fn new(budget: QueryTimeScatterBudget) -> Self {
+        Self {
+            budget,
+            ..Self::default()
+        }
+    }
+
+    fn reserve(&self, rows: usize, bytes: usize) -> bool {
+        let previous_rows = self.total_rows.fetch_add(rows, Ordering::Relaxed);
+        let previous_bytes = self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if previous_rows.saturating_add(rows) > self.budget.row_limit
+            || previous_bytes.saturating_add(bytes) > self.budget.byte_limit
+        {
+            self.total_rows.fetch_sub(rows, Ordering::Relaxed);
+            self.total_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            return false;
+        }
+        self.rows_in_flight.fetch_add(rows, Ordering::Relaxed);
+        self.bytes_in_flight.fetch_add(bytes, Ordering::Relaxed);
+        self.batches_in_flight.fetch_add(1, Ordering::Relaxed);
+        QUERY_TIME_SCATTER_ROWS_IN_FLIGHT.fetch_add(rows, Ordering::Relaxed);
+        QUERY_TIME_SCATTER_BYTES_IN_FLIGHT.fetch_add(bytes, Ordering::Relaxed);
+        QUERY_TIME_SCATTER_BATCHES_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        update_scatter_peak(
+            &QUERY_TIME_SCATTER_PEAK_ROWS_IN_FLIGHT,
+            QUERY_TIME_SCATTER_ROWS_IN_FLIGHT.load(Ordering::Relaxed),
+        );
+        update_scatter_peak(
+            &QUERY_TIME_SCATTER_PEAK_BYTES_IN_FLIGHT,
+            QUERY_TIME_SCATTER_BYTES_IN_FLIGHT.load(Ordering::Relaxed),
+        );
+        update_scatter_peak(
+            &QUERY_TIME_SCATTER_PEAK_BATCHES_IN_FLIGHT,
+            QUERY_TIME_SCATTER_BATCHES_IN_FLIGHT.load(Ordering::Relaxed),
+        );
+        true
+    }
+
+    fn release(&self, rows: usize, bytes: usize) {
+        if rows != 0 || bytes != 0 {
+            self.rows_in_flight.fetch_sub(rows, Ordering::Relaxed);
+            self.bytes_in_flight.fetch_sub(bytes, Ordering::Relaxed);
+            self.batches_in_flight.fetch_sub(1, Ordering::Relaxed);
+            QUERY_TIME_SCATTER_ROWS_IN_FLIGHT.fetch_sub(rows, Ordering::Relaxed);
+            QUERY_TIME_SCATTER_BYTES_IN_FLIGHT.fetch_sub(bytes, Ordering::Relaxed);
+            QUERY_TIME_SCATTER_BATCHES_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn update_scatter_peak(peak: &AtomicUsize, value: usize) {
+    let mut observed = peak.load(Ordering::Relaxed);
+    while value > observed {
+        match peak.compare_exchange_weak(observed, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
+struct QueryTimeScatterPartition {
+    schema: SchemaRef,
+    relation: String,
+    readers: Vec<Arc<rockstream_storage::ShardReader>>,
+    metrics: Arc<QueryTimeScatterMetrics>,
+}
+
+impl Debug for QueryTimeScatterPartition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueryTimeScatterPartition")
+            .field("relation", &self.relation)
+            .field("reader_count", &self.readers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+struct QueryTimeScatterStreamState {
+    schema: SchemaRef,
+    relation: String,
+    readers: Vec<Arc<rockstream_storage::ShardReader>>,
+    prefix: Vec<u8>,
+    next_reader: usize,
+    receiver: Option<
+        tokio::sync::mpsc::Receiver<Result<Vec<(Bytes, Bytes)>, rockstream_storage::StorageError>>,
+    >,
+    metrics: Arc<QueryTimeScatterMetrics>,
+    current_rows: usize,
+    current_bytes: usize,
+    batch_permit: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+impl PartitionStream for QueryTimeScatterPartition {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let state = QueryTimeScatterStreamState {
+            schema: self.schema.clone(),
+            relation: self.relation.clone(),
+            readers: self.readers.clone(),
+            prefix: format!("view_output/{}/", self.relation).into_bytes(),
+            next_reader: 0,
+            receiver: None,
+            metrics: self.metrics.clone(),
+            current_rows: 0,
+            current_bytes: 0,
+            batch_permit: None,
+        };
+        let stream = futures::stream::unfold(state, |mut state| async move {
+            state
+                .metrics
+                .release(state.current_rows, state.current_bytes);
+            state.batch_permit.take();
+            state.current_rows = 0;
+            state.current_bytes = 0;
+            loop {
+                if state.receiver.is_none() {
+                    let Some(reader) = state.readers.get(state.next_reader).cloned() else {
+                        return None;
+                    };
+                    state.next_reader += 1;
+                    let (sender, receiver) =
+                        tokio::sync::mpsc::channel(QUERY_TIME_SCATTER_MAX_CONCURRENT_SHARD_BATCHES);
+                    let prefix = state.prefix.clone();
+                    tokio::spawn(async move {
+                        reader
+                            .scan_prefix_pages(
+                                &prefix,
+                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_ROWS,
+                                QUERY_TIME_SCATTER_MAX_IN_FLIGHT_BYTES,
+                                sender,
+                            )
+                            .await;
+                    });
+                    state.receiver = Some(receiver);
+                }
+                let receiver = state.receiver.as_mut().expect("initialized above");
+                if state.batch_permit.is_none() {
+                    state.batch_permit = Some(
+                        QUERY_TIME_SCATTER_BATCH_PERMITS
+                            .acquire()
+                            .await
+                            .expect("static semaphore is never closed"),
+                    );
+                }
+                match receiver.recv().await {
+                    Some(Ok(page)) => {
+                        let rows = page.len();
+                        let bytes = page
+                            .iter()
+                            .map(|(key, value)| key.len() + value.len())
+                            .sum();
+                        if !state.metrics.reserve(rows, bytes) {
+                            return Some((
+                                Err(DataFusionError::Execution(format!(
+                                    "[RS-2029] query-time scatter budget exceeded while scanning '{}'",
+                                    state.relation
+                                ))),
+                                state,
+                            ));
+                        }
+                        let tsv_rows: Vec<Vec<u8>> =
+                            page.into_iter().map(|(_, value)| value.to_vec()).collect();
+                        let batch = match tsv_to_record_batch(state.schema.clone(), &tsv_rows) {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                state.metrics.release(rows, bytes);
+                                return Some((
+                                    Err(DataFusionError::Execution(format!(
+                                        "query-time scatter could not decode relation '{}': {error}",
+                                        state.relation
+                                    ))),
+                                    state,
+                                ));
+                            }
+                        };
+                        QUERY_TIME_DATAFUSION_ROWS_SCANNED_TOTAL
+                            .fetch_add(rows as u64, Ordering::Relaxed);
+                        state.current_rows = rows;
+                        state.current_bytes = bytes;
+                        return Some((Ok(batch), state));
+                    }
+                    Some(Err(error)) => {
+                        return Some((Err(DataFusionError::Execution(error.to_string())), state));
+                    }
+                    None => state.receiver = None,
+                }
+            }
+        });
+        Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
+    }
+}
+
+fn query_time_datafusion_error(
+    error: DataFusionError,
+    referenced_tables: &[String],
+    budget: QueryTimeScatterBudget,
+) -> GatewayError {
+    if error.to_string().contains("[RS-2029]") {
+        return GatewayError::QueryTimeScatterBudgetExceeded {
+            relation: referenced_tables.first().cloned().unwrap_or_default(),
+            row_limit: budget.row_limit,
+            byte_limit: budget.byte_limit,
+        };
+    }
+    GatewayError::QueryTimeExecutionFailed {
+        detail: format!("collect: {error}"),
+    }
+}
+
+fn query_time_error_response(error: GatewayError) -> Vec<Response<'static>> {
+    vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        crate::error::sqlstate_for(&error).to_owned(),
+        error.to_string(),
+    ))))]
 }
 
 /// Flattens a DataFusion `EXPLAIN` result set (columns `plan_type`, `plan`,

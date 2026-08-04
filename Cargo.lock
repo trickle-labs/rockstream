@@ -6784,6 +6784,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "futures",
  "hex",
  "hmac 0.12.1",
  "object_store 0.12.5",
@@ -6806,6 +6807,7 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "tokio-postgres",
  "tonic 0.12.3",
 ]
 

@@ -79,6 +79,7 @@ fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes:
 #[derive(Clone)]
 pub struct ShardDb {
     db: Db,
+    path: String,
     object_store: Arc<dyn ObjectStore>,
     last_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -156,6 +157,7 @@ impl ShardDbBuilder {
         };
         Ok(ShardDb {
             db,
+            path: self.path,
             object_store: self.object_store,
             last_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
         })
@@ -163,6 +165,11 @@ impl ShardDbBuilder {
 }
 
 impl ShardDb {
+    /// Return the SlateDB path used to open this shard.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
     /// Get the underlying object store.
     pub fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.object_store.clone()

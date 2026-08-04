@@ -124,6 +124,11 @@ enum Command {
         #[arg(long)]
         control_shared_storage: Option<std::path::PathBuf>,
 
+        /// Root directory of a non-local shard included in every query-time
+        /// scatter read. Repeat once for each additional owning shard.
+        #[arg(long = "query-time-shard-dir")]
+        query_time_shard_dirs: Vec<std::path::PathBuf>,
+
         #[arg(long)]
         exchange_direct_threshold_bytes: Option<usize>,
         #[arg(long)]
@@ -208,6 +213,7 @@ fn main() -> ExitCode {
             daemon,
             control_bind,
             control_shared_storage,
+            query_time_shard_dirs,
             exchange_direct_threshold_bytes,
             exchange_spill_threshold_mb,
             exchange_domain_size,
@@ -278,6 +284,7 @@ fn main() -> ExitCode {
                 daemon,
                 control_bind,
                 control_shared_storage,
+                query_time_shard_dirs,
             };
             match run_start(&opts) {
                 Ok(outcome) => {

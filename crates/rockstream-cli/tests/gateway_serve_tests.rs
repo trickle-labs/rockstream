@@ -32,6 +32,7 @@ fn gateway_opts(dir: &tempfile::TempDir) -> StartOptions {
         daemon: false,
         control_bind: None,
         control_shared_storage: None,
+        query_time_shard_dirs: Vec::new(),
     }
 }
 
@@ -352,6 +353,7 @@ async fn gateway_invalid_listen_address_returns_rs_0002() {
         daemon: false,
         control_bind: None,
         control_shared_storage: None,
+        query_time_shard_dirs: Vec::new(),
     };
 
     let err = start_gateway(&opts).await.unwrap_err();
@@ -387,6 +389,7 @@ async fn gateway_port_in_use_returns_rs_0003() {
         daemon: false,
         control_bind: None,
         control_shared_storage: None,
+        query_time_shard_dirs: Vec::new(),
     };
 
     let err = start_gateway(&opts).await.unwrap_err();
