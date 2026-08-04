@@ -1,4 +1,4 @@
-//! Mock Kafka source connector mimicking a multi-partition consumer group (§13.3).
+//! Kafka source connector supporting multi-partition consumer groups (§13.3).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -224,6 +224,18 @@ pub struct CatalogSinkEntry {
     pub state: String,
 }
 
+/// A source entry registered via `CREATE SOURCE` through the pgwire layer.
+#[derive(Debug, Clone)]
+pub struct CatalogSourceEntry {
+    pub name: String,
+    pub source_type: String,
+    pub options: HashMap<String, String>,
+    pub format: String,
+    pub status: String,
+    pub live_offset: String,
+    pub live_lag: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CatalogViewResourceUsageEntry {
     pub view_name: String,
@@ -280,6 +292,9 @@ struct CatalogStubsInner {
     indexes: HashMap<String, CatalogIndexEntry>,
     /// Keyed by sink name (from CREATE SINK). v0.44.
     sinks: HashMap<String, CatalogSinkEntry>,
+    /// Keyed by source name (from CREATE SOURCE). v0.51.9.
+    sources: HashMap<String, CatalogSourceEntry>,
+
     /// Keyed by workload name.
     workloads: HashMap<String, WorkloadDef>,
     /// View name → workload name.
@@ -713,6 +728,96 @@ impl CatalogStubs {
         sinks
     }
 
+    // ── Source catalog (v0.51.9 pgwire DDL wiring) ───────────────────────────
+
+    /// Register a new source. Returns `false` if a source with the same name already exists.
+    pub fn add_source(&self, entry: CatalogSourceEntry) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.sources.contains_key(&entry.name) {
+            return false;
+        }
+        inner.sources.insert(entry.name.clone(), entry);
+        true
+    }
+
+    /// Look up a source by name.
+    pub fn get_source(&self, name: &str) -> Option<CatalogSourceEntry> {
+        let inner = self.inner.read().unwrap();
+        inner.sources.get(name).cloned()
+    }
+
+    /// Update the status of an existing source ("OK", "PAUSED").
+    pub fn update_source_status(&self, name: &str, status: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(s) = inner.sources.get_mut(name) {
+            s.status = status.to_string();
+            return true;
+        }
+        false
+    }
+
+    /// Remove a source entry (DROP SOURCE).
+    pub fn remove_source(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        inner.sources.remove(name).is_some()
+    }
+
+    /// List all registered sources.
+    pub fn list_sources(&self) -> Vec<CatalogSourceEntry> {
+        let inner = self.inner.read().unwrap();
+        let mut sources: Vec<CatalogSourceEntry> = inner.sources.values().cloned().collect();
+        sources.sort_by(|a, b| a.name.cmp(&b.name));
+        sources
+    }
+
+    pub fn sources_response(&self) -> CatalogResponse {
+        let sources = self.list_sources();
+        let rows = sources
+            .into_iter()
+            .map(|s| {
+                vec![
+                    Some(s.name),
+                    Some(s.source_type),
+                    Some(s.format),
+                    Some(s.status),
+                    Some(s.live_offset),
+                    Some(s.live_lag.to_string()),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: show_sources_columns(),
+            rows,
+        }
+    }
+
+    pub fn source_status_response(&self, name_filter: Option<&str>) -> CatalogResponse {
+        let sources = self.list_sources();
+        let rows = sources
+            .into_iter()
+            .filter(|s| match name_filter {
+                Some(name) => s.name.eq_ignore_ascii_case(name),
+                None => true,
+            })
+            .map(|s| {
+                let opts_json = serde_json::to_string(&s.options).unwrap_or_default();
+                vec![
+                    Some(s.name),
+                    Some(s.source_type),
+                    Some(s.format),
+                    Some(s.status),
+                    Some(s.live_offset),
+                    Some(s.live_lag.to_string()),
+                    Some(opts_json),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: show_source_status_columns(),
+            rows,
+        }
+    }
+
     /// Dispatch a query string to a catalog handler. Returns `Some(rows)` if
     /// this is a recognized catalog query, `None` if the query should be
     /// forwarded to the normal query path.
@@ -934,6 +1039,21 @@ impl CatalogStubs {
                 })
                 .collect();
             return Some(CatalogResponse::rows(cols, rows));
+        }
+
+        if ql.trim_end_matches(';') == "show sources" {
+            return Some(self.sources_response());
+        }
+        if ql.trim_end_matches(';') == "show source status" {
+            return Some(self.source_status_response(None));
+        }
+        if ql.starts_with("show source status for ") {
+            let source_name = q["show source status for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            self.get_source(source_name)?;
+            return Some(self.source_status_response(Some(source_name)));
         }
 
         // S7: SHOW client_encoding / SHOW server_encoding
@@ -2239,6 +2359,29 @@ pub(crate) fn workload_resource_usage_columns() -> Vec<String> {
     ]
 }
 
+pub(crate) fn show_sources_columns() -> Vec<String> {
+    vec![
+        "name".to_string(),
+        "type".to_string(),
+        "format".to_string(),
+        "status".to_string(),
+        "offset".to_string(),
+        "lag".to_string(),
+    ]
+}
+
+pub(crate) fn show_source_status_columns() -> Vec<String> {
+    vec![
+        "name".to_string(),
+        "type".to_string(),
+        "format".to_string(),
+        "status".to_string(),
+        "live_offset".to_string(),
+        "live_lag".to_string(),
+        "options".to_string(),
+    ]
+}
+
 fn fmt_bool(value: bool) -> Option<String> {
     Some(if value { "true" } else { "false" }.to_string())
 }
@@ -2412,5 +2555,44 @@ mod tests {
                 "workload.memory_limit_recovered".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_source_catalog_registration() {
+        let catalog = CatalogStubs::new();
+        let mut opts = HashMap::new();
+        opts.insert(
+            "bootstrap.servers".to_string(),
+            "localhost:9092".to_string(),
+        );
+        opts.insert("topic".to_string(), "test_events".to_string());
+
+        let source = CatalogSourceEntry {
+            name: "kafka_test".to_string(),
+            source_type: "kafka".to_string(),
+            options: opts,
+            format: "json".to_string(),
+            status: "OK".to_string(),
+            live_offset: "0".to_string(),
+            live_lag: 0,
+        };
+
+        assert!(catalog.add_source(source.clone()));
+        assert!(!catalog.add_source(source.clone()));
+
+        let fetched = catalog.get_source("kafka_test").unwrap();
+        assert_eq!(fetched.source_type, "kafka");
+        assert_eq!(fetched.format, "json");
+        assert_eq!(fetched.status, "OK");
+
+        assert!(catalog.update_source_status("kafka_test", "PAUSED"));
+        assert_eq!(catalog.get_source("kafka_test").unwrap().status, "PAUSED");
+
+        let sources = catalog.list_sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "kafka_test");
+
+        assert!(catalog.remove_source("kafka_test"));
+        assert!(catalog.get_source("kafka_test").is_none());
     }
 }

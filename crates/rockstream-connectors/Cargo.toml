@@ -26,6 +26,11 @@ futures = { workspace = true }
 tokio = { workspace = true }
 iceberg = { workspace = true }
 deltalake = { workspace = true }
+rdkafka = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+csv = { workspace = true }
+
 
 [dev-dependencies]
 rockstream-ops = { path = "../rockstream-ops" }

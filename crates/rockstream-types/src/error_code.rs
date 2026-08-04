@@ -301,6 +301,13 @@ pub const RS_4005: ErrorCode = ErrorCode::new(4005);
 pub const RS_4006: ErrorCode = ErrorCode::new(4006);
 /// CREATE SINK DDL parse or validation failed.
 pub const RS_4007: ErrorCode = ErrorCode::new(4007);
+/// CREATE SOURCE DDL parse or validation failed.
+pub const RS_4008: ErrorCode = ErrorCode::new(4008);
+/// Source not found.
+pub const RS_4009: ErrorCode = ErrorCode::new(4009);
+/// Source already exists.
+pub const RS_4010: ErrorCode = ErrorCode::new(4010);
+
 /// Self-fencing configuration invalid: self_fence_after must satisfy
 /// dead_after < self_fence_after < 2 × shard_recovery_budget.
 pub const RS_3005: ErrorCode = ErrorCode::new(3005);

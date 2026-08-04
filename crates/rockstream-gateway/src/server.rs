@@ -64,9 +64,10 @@ use crate::auth::{
     JwtVerifier, Principal,
 };
 use crate::catalog_stubs::{
-    arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogStubs,
-    CatalogTable,
+    arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
+    CatalogStubs, CatalogTable,
 };
+
 use crate::copy_state::{
     CopyState, COPY_IN_BUFFER_ROWS, COPY_IN_FLUSH_BYTES, MAX_COPY_IN_BATCH_ROWS,
 };
@@ -2345,7 +2346,16 @@ impl GatewayHandler {
             return Some(self.handle_create_sink(q));
         }
 
+        // CREATE SOURCE / ALTER SOURCE / DROP SOURCE — v0.51.9 pgwire DDL wiring
+        if ql.starts_with("create source ") {
+            return Some(self.handle_create_source(q));
+        }
+        if ql.starts_with("alter source ") || ql.starts_with("drop source ") {
+            return Some(self.handle_alter_source(q));
+        }
+
         // CREATE INDEX / DROP INDEX / REBUILD INDEX / MARK INDEX READY — v0.32 pgwire DDL wiring
+
         if ql.starts_with("create index ") {
             return Some(self.handle_create_index(q).await);
         }
@@ -2954,6 +2964,35 @@ impl GatewayHandler {
         }
 
         // S8: SHOW <key> — return from session GUC params or session fields.
+        if ql.trim_end_matches(';') == "show sources" {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.sources_response(),
+            ))]);
+        }
+        if ql.trim_end_matches(';') == "show source status" {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.source_status_response(None),
+            ))]);
+        }
+        if ql.starts_with("show source status for ") {
+            let source_name = q["show source status for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            if self.catalog.get_source(source_name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-4009] source.not_found: source '{}' does not exist. Next steps: run CREATE SOURCE ... to create it.",
+                        source_name
+                    ),
+                ))))]);
+            }
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.source_status_response(Some(source_name)),
+            ))]);
+        }
         if ql.trim_end_matches(';') == "show resource usage" {
             return Ok(vec![catalog_resp_to_response(
                 self.catalog.view_resource_usage(&[]),
@@ -4505,6 +4544,96 @@ impl GatewayHandler {
         Ok(vec![Response::Execution(
             Tag::new("CREATE SINK").with_rows(0),
         )])
+    }
+
+    fn handle_create_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let parsed = match parse_create_source_ddl(q) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(vec![create_source_error_response(message)]),
+        };
+
+        if self.catalog.get_source(&parsed.name).is_some() {
+            return Ok(vec![create_source_error_response(format!(
+                "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                parsed.name
+            ))]);
+        }
+
+        let entry = CatalogSourceEntry {
+            name: parsed.name.clone(),
+            source_type: parsed.source_type,
+            options: parsed.options,
+            format: parsed.format,
+            status: "OK".to_string(),
+            live_offset: "0".to_string(),
+            live_lag: 0,
+        };
+
+        let _ = self.catalog.add_source(entry);
+
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "create_source",
+                &parsed.name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("CREATE SOURCE").with_rows(0),
+        )])
+    }
+
+    fn handle_alter_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let parsed = match parse_alter_source_ddl(q) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(vec![create_source_error_response(message)]),
+        };
+
+        if self.catalog.get_source(&parsed.name).is_none() {
+            return Ok(vec![create_source_error_response(format!(
+                "[RS-4009] source.not_found: source '{}' does not exist. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
+                parsed.name
+            ))]);
+        }
+
+        let tag_name = match parsed.action {
+            AlterSourceAction::Pause => {
+                self.catalog.update_source_status(&parsed.name, "PAUSED");
+                if let Some(log) = &self.audit_log {
+                    let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                        "system",
+                        "alter_source.pause",
+                        &parsed.name,
+                    ));
+                }
+                "ALTER SOURCE"
+            }
+            AlterSourceAction::Resume => {
+                self.catalog.update_source_status(&parsed.name, "OK");
+                if let Some(log) = &self.audit_log {
+                    let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                        "system",
+                        "alter_source.resume",
+                        &parsed.name,
+                    ));
+                }
+                "ALTER SOURCE"
+            }
+            AlterSourceAction::Drop => {
+                self.catalog.remove_source(&parsed.name);
+                if let Some(log) = &self.audit_log {
+                    let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                        "system",
+                        "alter_source.drop",
+                        &parsed.name,
+                    ));
+                }
+                "DROP SOURCE"
+            }
+        };
+
+        Ok(vec![Response::Execution(Tag::new(tag_name).with_rows(0))])
     }
 
     /// Handle `CREATE INDEX <name> ON <table> (<col>, ...) [WHERE <pred>]` — v0.32.
@@ -8458,11 +8587,12 @@ fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
                 for field in &row {
                     encoder
-                        .encode_field(field)
+                        .encode_field(&field.as_deref())
                         .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
                 }
                 encoder.finish()
             });
+
             Response::Query(QueryResponse::new(schema, stream))
         }
     }
@@ -10141,6 +10271,191 @@ fn parse_sql_single_quoted_string(input: &str) -> Result<(String, usize), String
     Err(format!(
         "[RS-4007] unterminated string literal. Next steps: {CREATE_SINK_NEXT_STEPS}"
     ))
+}
+
+const CREATE_SOURCE_NEXT_STEPS: &str =
+    "syntax: CREATE SOURCE <name> TYPE kafka|s3 (...options...) FORMAT json|avro|csv";
+const ALTER_SOURCE_NEXT_STEPS: &str = "syntax: ALTER SOURCE <name> {PAUSE|RESUME|DROP}";
+
+fn create_source_error_response(message: String) -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "42601".to_owned(),
+        message,
+    )))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedCreateSource {
+    name: String,
+    source_type: String,
+    options: std::collections::HashMap<String, String>,
+    format: String,
+}
+
+fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
+    let trimmed = q.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("create source ") {
+        return Err(format!(
+            "[RS-4008] CREATE SOURCE statement must start with CREATE SOURCE. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+        ));
+    }
+
+    let after_create = trimmed["CREATE SOURCE".len()..].trim();
+    let after_create_lower = after_create.to_lowercase();
+    let type_pos = after_create_lower.find(" type ").ok_or_else(|| {
+        format!(
+            "[RS-4008] CREATE SOURCE requires TYPE clause. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+        )
+    })?;
+
+    let name = after_create[..type_pos]
+        .trim()
+        .trim_matches('"')
+        .to_lowercase();
+    if name.is_empty() {
+        return Err(format!(
+            "[RS-4008] CREATE SOURCE requires a source name. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+        ));
+    }
+
+    let after_type = after_create[type_pos + " type ".len()..].trim();
+    let after_type_lower = after_type.to_lowercase();
+
+    let format_pos = after_type_lower.find(" format ").ok_or_else(|| {
+        format!(
+            "[RS-4008] CREATE SOURCE requires FORMAT clause. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+        )
+    })?;
+
+    let type_and_opts = after_type[..format_pos].trim();
+    let format_str = after_type[format_pos + " format ".len()..]
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_lowercase();
+
+    if !matches!(format_str.as_str(), "json" | "avro" | "csv") {
+        return Err(format!(
+            "[RS-4008] CREATE SOURCE format '{}' is invalid; expected json|avro|csv. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+            format_str
+        ));
+    }
+
+    let (source_type, options_str) = if let Some(open_paren) = type_and_opts.find('(') {
+        let st = type_and_opts[..open_paren].trim().to_lowercase();
+        let close_paren = type_and_opts.rfind(')').unwrap_or(type_and_opts.len());
+        let opts = &type_and_opts[open_paren + 1..close_paren];
+        (st, opts)
+    } else {
+        (type_and_opts.trim().to_lowercase(), "")
+    };
+
+    if !matches!(source_type.as_str(), "kafka" | "s3") {
+        return Err(format!(
+            "[RS-4008] CREATE SOURCE type '{}' is invalid; expected kafka|s3. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+            source_type
+        ));
+    }
+
+    let mut options = std::collections::HashMap::new();
+    if !options_str.trim().is_empty() {
+        for pair in options_str.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some(eq) = pair.find('=') {
+                let k = pair[..eq]
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+                let v = pair[eq + 1..]
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+                options.insert(k, v);
+            }
+        }
+    }
+
+    Ok(ParsedCreateSource {
+        name,
+        source_type,
+        options,
+        format: format_str,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AlterSourceAction {
+    Pause,
+    Resume,
+    Drop,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedAlterSource {
+    name: String,
+    action: AlterSourceAction,
+}
+
+fn parse_alter_source_ddl(q: &str) -> Result<ParsedAlterSource, String> {
+    let trimmed = q.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+
+    if lower.starts_with("drop source ") {
+        let name = trimmed["DROP SOURCE".len()..]
+            .trim()
+            .trim_matches('"')
+            .to_lowercase();
+        if name.is_empty() {
+            return Err(format!(
+                "[RS-4008] DROP SOURCE requires a source name. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
+            ));
+        }
+        return Ok(ParsedAlterSource {
+            name,
+            action: AlterSourceAction::Drop,
+        });
+    }
+
+    if !lower.starts_with("alter source ") {
+        return Err(format!(
+            "[RS-4008] ALTER SOURCE statement must start with ALTER SOURCE or DROP SOURCE. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
+        ));
+    }
+
+    let after_alter = trimmed["ALTER SOURCE".len()..].trim();
+    let tokens: Vec<&str> = after_alter.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return Err(format!(
+            "[RS-4008] ALTER SOURCE requires source name and action (PAUSE|RESUME|DROP). Next steps: {ALTER_SOURCE_NEXT_STEPS}"
+        ));
+    }
+
+    let action_str = tokens.last().unwrap().to_lowercase();
+    let name = tokens[..tokens.len() - 1]
+        .join(" ")
+        .trim_matches('"')
+        .to_lowercase();
+
+    let action = match action_str.as_str() {
+        "pause" => AlterSourceAction::Pause,
+        "resume" => AlterSourceAction::Resume,
+        "drop" => AlterSourceAction::Drop,
+        _ => {
+            return Err(format!(
+                "[RS-4008] ALTER SOURCE action '{}' is invalid; expected PAUSE|RESUME|DROP. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
+                action_str
+            ));
+        }
+    };
+
+    Ok(ParsedAlterSource { name, action })
 }
 
 fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {

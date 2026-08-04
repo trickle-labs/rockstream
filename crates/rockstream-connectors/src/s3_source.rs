@@ -1,4 +1,4 @@
-//! Mock S3 source connector tracking file indices and line offsets (§13.3).
+//! S3 source connector tracking file indices and line offsets (§13.3).
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use crate::source_epoch::OffsetToken;
 /// Buffer bound declaration: S3 source read buffer limit (64 MiB).
 pub const S3_SOURCE_BUFFER_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
-/// A mock S3 source connector implementing `SourceConnector`.
+/// Production `S3Source` implementing `SourceConnector`.
 pub struct S3Source {
     _connector_id: ConnectorId,
     schema: SchemaRef,
