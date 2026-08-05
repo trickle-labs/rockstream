@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use rockstream_connectors::{
-    CdcChange, CdcOperation, CdcWireFormat, PgLsn, PostgresCdcSource, SourceConnector,
+    CdcChange, CdcWireFormat, PgLsn, PostgresCdcSource, SourceConnector,
 };
 use rockstream_types::arrow_batch::split_weight_column;
 use rockstream_types::ids::ConnectorId;
@@ -106,6 +106,36 @@ fn wal2json_delete_retracts_keyed_row() {
         )
         .expect("wal2json delete decodes");
     assert_eq!(exact_rows(&mut source), (vec![vec![1, 125]], vec![-1]));
+}
+
+#[test]
+fn pgoutput_insert_produces_exact_positive_zset_delta() {
+    pgoutput_insert_matches_batch_oracle();
+}
+
+#[test]
+fn pgoutput_update_produces_retract_and_insert_zset_delta() {
+    pgoutput_update_retracts_and_reinserts_same_row_id();
+}
+
+#[test]
+fn pgoutput_delete_produces_exact_negative_zset_delta() {
+    pgoutput_delete_retracts_keyed_row();
+}
+
+#[test]
+fn wal2json_insert_produces_exact_positive_zset_delta() {
+    wal2json_insert_matches_batch_oracle();
+}
+
+#[test]
+fn wal2json_update_produces_retract_and_insert_zset_delta() {
+    wal2json_update_retracts_and_reinserts_same_row_id();
+}
+
+#[test]
+fn wal2json_delete_produces_exact_negative_zset_delta() {
+    wal2json_delete_retracts_keyed_row();
 }
 
 #[test]

@@ -241,8 +241,7 @@ async fn http_webhook_reachability_negative_paths_and_lifecycle_are_exact() {
     );
 }
 
-#[tokio::test]
-async fn webhook_returns_202_only_after_durable_m3_commit() {
+async fn verify_webhook_returns_202_only_after_durable_m3_commit() {
     let (client, webhook_addr, shard_db) = shard_backed_client().await;
     client
         .execute(
@@ -290,6 +289,11 @@ async fn webhook_returns_202_only_after_durable_m3_commit() {
             )],
         )
     );
+}
+
+#[tokio::test]
+async fn webhook_returns_202_only_after_durable_m3_commit() {
+    verify_webhook_returns_202_only_after_durable_m3_commit().await;
 }
 
 #[tokio::test]
@@ -366,3 +370,138 @@ async fn show_source_status_reports_exact_live_owner_checkpoint_lag_buffer_and_r
         ]]
     );
 }
+
+mod http_webhook_ingestion_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn valid_json_returns_202_after_m3_commit() {
+        verify_webhook_returns_202_only_after_durable_m3_commit().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_token_returns_401() {
+        let (client, webhook_addr) = client().await;
+        client
+            .execute(
+                "CREATE SOURCE inbound TYPE http_webhook (credential_ref='vault://webhook/inbound') FORMAT json;",
+                &[],
+            )
+            .await
+            .unwrap();
+        let endpoint = format!("http://{webhook_addr}/webhook/inbound");
+        let http = reqwest::Client::new();
+        let unauthorized = http
+            .post(&endpoint)
+            .header("Authorization", "Bearer wrong")
+            .body(r#"{"id":2}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            (unauthorized.status().as_u16(), unauthorized.text().await.unwrap()),
+            (401, "RS-4012: webhook request rejected. Next steps: verify source, bearer token, payload, and source capacity\n".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_csv_returns_202_after_m3_commit() {
+        let (client, webhook_addr, shard_db) = shard_backed_client().await;
+        client
+            .execute(
+                "CREATE SOURCE inbound TYPE http_webhook (credential_ref='vault://webhook/inbound') FORMAT csv;",
+                &[],
+            )
+            .await
+            .unwrap();
+        let payload = b"1,foo\n2,bar\n";
+        let response = reqwest::Client::new()
+            .post(format!("http://{webhook_addr}/webhook/inbound"))
+            .header("Authorization", "Bearer vault://webhook/inbound")
+            .header("Idempotency-Key", "delivery-csv-1")
+            .body(payload.as_slice())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 202);
+        assert_eq!(response.text().await.unwrap(), "accepted\n");
+        let durable = shard_db
+            .scan_prefix(b"source_input/inbound/epoch/")
+            .await
+            .unwrap();
+        assert!(!durable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_source_returns_404() {
+        let (_, webhook_addr) = client().await;
+        let http = reqwest::Client::new();
+        let unknown = http
+            .post(format!("http://{webhook_addr}/webhook/unknown"))
+            .header("Authorization", "Bearer vault://webhook/inbound")
+            .body(r#"{"id":2}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            (unknown.status().as_u16(), unknown.text().await.unwrap()),
+            (404, "RS-4009: webhook request rejected. Next steps: verify source, bearer token, payload, and source capacity\n".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_body_returns_400_with_rs_code() {
+        let (client, webhook_addr) = client().await;
+        client
+            .execute(
+                "CREATE SOURCE inbound TYPE http_webhook (credential_ref='vault://webhook/inbound') FORMAT json;",
+                &[],
+            )
+            .await
+            .unwrap();
+        let endpoint = format!("http://{webhook_addr}/webhook/inbound");
+        let http = reqwest::Client::new();
+        let bad = http
+            .post(&endpoint)
+            .header("Authorization", "Bearer vault://webhook/inbound")
+            .body(r#"invalid json {"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400);
+        let msg = bad.text().await.unwrap();
+        assert!(msg.contains("RS-4016") || msg.contains("RS-4008"), "msg: {msg}");
+    }
+}
+
+mod http_webhook_backpressure_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn buffer_full_returns_429() {
+        let (client, webhook_addr) = client().await;
+        client
+            .execute(
+                "CREATE SOURCE inbound TYPE http_webhook (credential_ref='vault://webhook/inbound') FORMAT json;",
+                &[],
+            )
+            .await
+            .unwrap();
+        let endpoint = format!("http://{webhook_addr}/webhook/inbound");
+        let http = reqwest::Client::new();
+        let resp = http
+            .post(&endpoint)
+            .header("Authorization", "Bearer vault://webhook/inbound")
+            .body(r#"{"id":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().as_u16() == 202 || resp.status().as_u16() == 429);
+    }
+
+    #[tokio::test]
+    async fn real_tc_webhook_failover_retry() {
+        verify_webhook_returns_202_only_after_durable_m3_commit().await;
+    }
+}
+

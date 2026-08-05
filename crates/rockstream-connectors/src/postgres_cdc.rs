@@ -146,6 +146,7 @@ pub struct PostgresCdcSource {
     format: CdcWireFormat,
     queued: VecDeque<QueuedChange>,
     queued_bytes: usize,
+    snapshot_batches: Vec<RecordBatch>,
     manually_paused: bool,
     replication_read_paused: bool,
     wal_lag_bytes: u64,
@@ -167,6 +168,7 @@ impl PostgresCdcSource {
             format,
             queued: VecDeque::new(),
             queued_bytes: 0,
+            snapshot_batches: Vec::new(),
             manually_paused: false,
             replication_read_paused: false,
             wal_lag_bytes: 0,
@@ -174,6 +176,10 @@ impl PostgresCdcSource {
             status: PostgresCdcStatus::Running,
             committed: None,
         }
+    }
+
+    pub fn set_snapshot_batches(&mut self, batches: Vec<RecordBatch>) {
+        self.snapshot_batches = batches;
     }
 
     pub fn decode_and_enqueue(&mut self, payload: &[u8]) -> Result<(), SourceError> {
@@ -364,7 +370,8 @@ impl SourceConnector for PostgresCdcSource {
         _frontier: Epoch,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
-        Ok(SnapshotStream::new(Vec::new()))
+        let batches = std::mem::take(&mut self.snapshot_batches);
+        Ok(SnapshotStream::new(batches))
     }
 
     fn poll_delta(

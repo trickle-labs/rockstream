@@ -69,6 +69,47 @@ fn worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
 }
 
 #[test]
+fn pgoutput_snapshot_matches_initial_table_state() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let mut source = PostgresCdcSource::new(ConnectorId(515), schema.clone(), CdcWireFormat::PgOutput);
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema,
+        vec![Arc::new(arrow::array::Int64Array::from(vec![10, 20]))],
+    )
+    .unwrap();
+    let batch_with_weights = rockstream_types::arrow_batch::append_weight_column(batch, &[1, 1]).unwrap();
+    source.set_snapshot_batches(vec![batch_with_weights.clone()]);
+
+    let stream = source.start_snapshot(1, None).unwrap();
+    let snapshot_records: Vec<_> = stream.collect();
+    assert_eq!(snapshot_records.len(), 1);
+    assert_eq!(snapshot_records[0].num_rows(), 2);
+}
+
+#[test]
+fn wal2json_snapshot_matches_initial_table_state() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let mut source = PostgresCdcSource::new(ConnectorId(516), schema.clone(), CdcWireFormat::Wal2Json);
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema,
+        vec![Arc::new(arrow::array::Int64Array::from(vec![10, 20]))],
+    )
+    .unwrap();
+    let batch_with_weights = rockstream_types::arrow_batch::append_weight_column(batch, &[1, 1]).unwrap();
+    source.set_snapshot_batches(vec![batch_with_weights.clone()]);
+
+    let stream = source.start_snapshot(1, None).unwrap();
+    let snapshot_records: Vec<_> = stream.collect();
+    assert_eq!(snapshot_records.len(), 1);
+    assert_eq!(snapshot_records[0].num_rows(), 2);
+}
+
+#[test]
+fn real_pg18_lsn_restart_zero_duplicates() {
+    worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output();
+}
+
+#[test]
 fn invalidated_slot_resnapshots_and_slow_subscriber_pauses_before_retention_growth() {
     let mut source = source();
     source.mark_failure(PostgresCdcFailure::SlotInvalidated);

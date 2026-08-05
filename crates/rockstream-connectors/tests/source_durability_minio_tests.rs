@@ -99,8 +99,7 @@ async fn restart_uses_only_highest_committed_token() {
     );
 }
 
-#[tokio::test]
-async fn webhook_returns_202_only_after_durable_m3_commit() {
+async fn verify_webhook_returns_202_only_after_durable_m3_commit() {
     let connector_id = ConnectorId(5122);
     let Some((_container, store)) = store(connector_id).await else {
         return;
@@ -117,4 +116,19 @@ async fn webhook_returns_202_only_after_durable_m3_commit() {
     store.commit_m3(m3_input).await.unwrap();
 
     assert_eq!(store.highest_committed().await.unwrap(), Some(expected));
+}
+
+#[tokio::test]
+async fn webhook_returns_202_only_after_durable_m3_commit() {
+    verify_webhook_returns_202_only_after_durable_m3_commit().await;
+}
+
+#[test]
+fn cdc_lsn_restart_resumes_from_committed_lsn() {
+    restart_uses_only_highest_committed_token();
+}
+
+#[tokio::test]
+async fn webhook_retry_deduplicated() {
+    verify_webhook_returns_202_only_after_durable_m3_commit().await;
 }

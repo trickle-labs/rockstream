@@ -10267,6 +10267,7 @@ impl Debug for QueryTimeScatterPartition {
     }
 }
 
+// Complex state holding readers, schema, and futures stream.
 #[allow(clippy::type_complexity)]
 struct QueryTimeScatterStreamState {
     schema: SchemaRef,

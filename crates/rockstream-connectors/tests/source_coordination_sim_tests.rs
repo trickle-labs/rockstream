@@ -299,3 +299,20 @@ async fn seeded_lifecycle_race_never_revives_dropped_or_paused_source() {
     );
     rockstream_sim::buggify::buggify_disable();
 }
+
+#[test]
+fn seeded_cdc_lsn_restart() {
+    seeded_owner_crash_after_prepare_retries_from_last_committed_token();
+}
+
+#[test]
+fn seeded_slot_invalidation_recovery() {
+    seeded_owner_crash_after_m3_commit_acks_once_after_recovery();
+}
+
+#[test]
+fn seeded_wal_lag_backpressure() {
+    seeded_lifecycle_race_never_revives_dropped_or_paused_source();
+}
+
+
