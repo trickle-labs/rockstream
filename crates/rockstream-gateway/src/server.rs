@@ -82,6 +82,9 @@ use crate::notify_registry::NotifyRegistry;
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
+use crate::webhook_source::{
+    HttpWebhookSource, WebhookFormat, WebhookResult, HTTP_WEBHOOK_MAX_REQUEST_BYTES,
+};
 use crate::write_buffer::{DmlOp, WriteBuffer};
 use crate::GatewayError;
 use pgwire::messages::response::NotificationResponse;
@@ -1645,6 +1648,9 @@ pub struct GatewayHandler {
     /// outright (`RS-1019`) when compilation fails — there is no
     /// materializer fallback left (v0.51.4 Slice 8).
     compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
+    /// Runtime-only webhook credentials and bounded epoch buffers.  Entries
+    /// are installed and removed with the catalog source lifecycle.
+    webhook_sources: Arc<DashMap<String, Arc<std::sync::Mutex<HttpWebhookSource>>>>,
 }
 
 impl GatewayHandler {
@@ -1662,6 +1668,38 @@ impl GatewayHandler {
             write_buffers: self.write_buffers.len(),
             copy_states: self.copy_states.len(),
         }
+    }
+
+    fn accept_webhook(
+        &self,
+        source_name: &str,
+        token: &[u8],
+        delivery_id: Option<&str>,
+        payload: &[u8],
+    ) -> WebhookResult {
+        let Some(source_entry) = self.catalog.get_source(source_name) else {
+            return WebhookResult::NotFound;
+        };
+        if source_entry.source_type != "http_webhook" {
+            return WebhookResult::NotFound;
+        }
+        let Some(source) = self.webhook_sources.get(source_name) else {
+            return WebhookResult::NotFound;
+        };
+        let mut source = source.lock().expect("webhook source lock");
+        let result = source.accept(token, delivery_id, payload);
+        if result == WebhookResult::Accepted {
+            // The source epoch is committed before the success response.  The
+            // full M3 input binding consumes this committed epoch; retries see
+            // the durable source identity and cannot apply it twice.
+            let committed = source.commit_next().expect("accepted epoch is queued");
+            self.catalog.update_source_runtime(
+                source_name,
+                committed.digest,
+                source.buffered_epochs() as u64,
+            );
+        }
+        result
     }
 
     pub fn new(catalog: Arc<CatalogStubs>, view_reader: Arc<dyn ViewReader>) -> Self {
@@ -1690,6 +1728,7 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            webhook_sources: Arc::new(DashMap::new()),
         }
     }
 
@@ -1723,6 +1762,7 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            webhook_sources: Arc::new(DashMap::new()),
         }
     }
 
@@ -5014,15 +5054,35 @@ impl GatewayHandler {
 
         let entry = CatalogSourceEntry {
             name: parsed.name.clone(),
-            source_type: parsed.source_type,
-            options: parsed.options,
-            format: parsed.format,
+            source_type: parsed.source_type.clone(),
+            options: parsed.options.clone(),
+            format: parsed.format.clone(),
             status: "OK".to_string(),
             live_offset: "0".to_string(),
             live_lag: 0,
         };
 
-        let _ = self.catalog.add_source(entry);
+        if !self.catalog.add_source(entry) {
+            return Ok(vec![create_source_error_response(format!(
+                "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                parsed.name
+            ))]);
+        }
+        if parsed.source_type == "http_webhook" {
+            // A credential reference is catalog-safe metadata.  The listener
+            // keeps its verifier only in runtime memory and never returns it
+            // through SHOW SOURCE STATUS.
+            let format = WebhookFormat::parse(&parsed.format)
+                .expect("DDL validation permits only JSON or CSV webhook formats");
+            let token = parsed
+                .options
+                .get("credential_ref")
+                .expect("validated credential ref");
+            self.webhook_sources.insert(
+                parsed.name.clone(),
+                Arc::new(std::sync::Mutex::new(HttpWebhookSource::new(token, format))),
+            );
+        }
 
         if let Some(log) = &self.audit_log {
             let _ = log.append(&rockstream_types::audit::AuditEvent::now(
@@ -5053,6 +5113,9 @@ impl GatewayHandler {
         let tag_name = match parsed.action {
             AlterSourceAction::Pause => {
                 self.catalog.update_source_status(&parsed.name, "PAUSED");
+                if let Some(source) = self.webhook_sources.get(&parsed.name) {
+                    source.lock().expect("webhook source lock").set_paused(true);
+                }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                         "system",
@@ -5064,6 +5127,12 @@ impl GatewayHandler {
             }
             AlterSourceAction::Resume => {
                 self.catalog.update_source_status(&parsed.name, "OK");
+                if let Some(source) = self.webhook_sources.get(&parsed.name) {
+                    source
+                        .lock()
+                        .expect("webhook source lock")
+                        .set_paused(false);
+                }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                         "system",
@@ -5075,6 +5144,7 @@ impl GatewayHandler {
             }
             AlterSourceAction::Drop => {
                 self.catalog.remove_source(&parsed.name);
+                self.webhook_sources.remove(&parsed.name);
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                         "system",
@@ -5083,6 +5153,30 @@ impl GatewayHandler {
                     ));
                 }
                 "DROP SOURCE"
+            }
+            AlterSourceAction::AdvanceWatermark(watermark) => {
+                let Some(source) = self.webhook_sources.get(&parsed.name) else {
+                    return Ok(vec![create_source_error_response(format!(
+                        "[RS-4016] ALTER SOURCE ADVANCE WATERMARK is supported only for http_webhook sources. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
+                    ))]);
+                };
+                if let Err(message) = source
+                    .lock()
+                    .expect("webhook source lock")
+                    .advance_watermark(watermark)
+                {
+                    return Ok(vec![create_source_error_response(message.to_string())]);
+                }
+                self.catalog
+                    .update_source_runtime(&parsed.name, watermark.to_string(), 0);
+                if let Some(log) = &self.audit_log {
+                    let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                        "system",
+                        "alter_source.advance_watermark",
+                        &parsed.name,
+                    ));
+                }
+                "ALTER SOURCE"
             }
         };
 
@@ -8684,6 +8778,58 @@ impl GatewayServer {
         &self.handler.catalog
     }
 
+    /// Bind the independent HTTP webhook listener.  It intentionally does not
+    /// share the pgwire socket: only `POST /webhook/<source>` is accepted.
+    pub async fn serve_webhook_background(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+        let handler = self.handler.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let _ = serve_webhook_connection(socket, handler).await;
+                });
+            }
+        });
+        Ok((local_addr, task))
+    }
+
+    /// Start pgwire and webhook listeners together for the single Rockstream
+    /// binary.  Both listeners share the same gateway handler and catalog.
+    pub async fn serve_background_with_webhook(
+        self,
+        webhook_addr: std::net::SocketAddr,
+    ) -> std::io::Result<(
+        std::net::SocketAddr,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let (webhook_addr, webhook_handle) = self.serve_webhook_background(webhook_addr).await?;
+        let (pgwire_addr, pgwire_handle) = self.serve_background().await?;
+        Ok((pgwire_addr, webhook_addr, pgwire_handle, webhook_handle))
+    }
+
+    /// Test and embedding hook for routing one already-authenticated webhook
+    /// request through the same source lifecycle as the TCP HTTP listener.
+    pub fn accept_webhook(
+        &self,
+        source_name: &str,
+        token: &[u8],
+        delivery_id: Option<&str>,
+        payload: &[u8],
+    ) -> WebhookResult {
+        self.handler
+            .accept_webhook(source_name, token, delivery_id, payload)
+    }
+
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
         self.handler.recover_compiled_views().await;
@@ -10985,8 +11131,9 @@ fn parse_sql_single_quoted_string(input: &str) -> Result<(String, usize), String
 }
 
 const CREATE_SOURCE_NEXT_STEPS: &str =
-    "syntax: CREATE SOURCE <name> TYPE kafka|s3 (...options...) FORMAT json|avro|csv";
-const ALTER_SOURCE_NEXT_STEPS: &str = "syntax: ALTER SOURCE <name> {PAUSE|RESUME|DROP}";
+    "syntax: CREATE SOURCE <name> TYPE kafka|s3|postgres_cdc|http_webhook (...options...) FORMAT json|avro|csv|pgoutput|wal2json; postgres_cdc requires credential_ref, publication, and slot; http_webhook requires credential_ref";
+const ALTER_SOURCE_NEXT_STEPS: &str =
+    "syntax: ALTER SOURCE <name> {PAUSE|RESUME|DROP|ADVANCE WATERMARK <u64>}";
 
 fn create_source_error_response(message: String) -> Response<'static> {
     Response::Error(Box::new(ErrorInfo::new(
@@ -11047,13 +11194,6 @@ fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
         .trim_matches('\'')
         .to_lowercase();
 
-    if !matches!(format_str.as_str(), "json" | "avro" | "csv") {
-        return Err(format!(
-            "[RS-4008] CREATE SOURCE format '{}' is invalid; expected json|avro|csv. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
-            format_str
-        ));
-    }
-
     let (source_type, options_str) = if let Some(open_paren) = type_and_opts.find('(') {
         let st = type_and_opts[..open_paren].trim().to_lowercase();
         let close_paren = type_and_opts.rfind(')').unwrap_or(type_and_opts.len());
@@ -11062,13 +11202,6 @@ fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
     } else {
         (type_and_opts.trim().to_lowercase(), "")
     };
-
-    if !matches!(source_type.as_str(), "kafka" | "s3") {
-        return Err(format!(
-            "[RS-4008] CREATE SOURCE type '{}' is invalid; expected kafka|s3. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
-            source_type
-        ));
-    }
 
     let mut options = std::collections::HashMap::new();
     if !options_str.trim().is_empty() {
@@ -11082,7 +11215,7 @@ fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
                     .trim()
                     .trim_matches('"')
                     .trim_matches('\'')
-                    .to_string();
+                    .to_lowercase();
                 let v = pair[eq + 1..]
                     .trim()
                     .trim_matches('"')
@@ -11093,6 +11226,25 @@ fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
         }
     }
 
+    let allowed_format = match source_type.as_str() {
+        "kafka" | "s3" => matches!(format_str.as_str(), "json" | "avro" | "csv"),
+        "postgres_cdc" => matches!(format_str.as_str(), "pgoutput" | "wal2json"),
+        "http_webhook" => matches!(format_str.as_str(), "json" | "csv"),
+        _ => {
+            return Err(format!(
+                "[RS-4008] CREATE SOURCE type '{}' is invalid; expected kafka|s3|postgres_cdc|http_webhook. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                source_type
+            ));
+        }
+    };
+    if !allowed_format {
+        return Err(format!(
+            "[RS-4008] CREATE SOURCE format '{}' is invalid for type '{}'. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+            format_str, source_type
+        ));
+    }
+    validate_typed_source_options(&source_type, &options)?;
+
     Ok(ParsedCreateSource {
         name,
         source_type,
@@ -11101,17 +11253,173 @@ fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
     })
 }
 
+/// Enforce that catalogued source configuration contains only credential
+/// references.  Resolving a reference belongs to the runtime worker, never to
+/// SQL parsing or a SHOW response.
+fn validate_typed_source_options(
+    source_type: &str,
+    options: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    if source_type != "postgres_cdc" && source_type != "http_webhook" {
+        return Ok(());
+    }
+    for key in ["password", "token", "secret", "api_key", "authorization"] {
+        if options.contains_key(key) {
+            return Err(format!(
+                "[RS-4008] CREATE SOURCE option '{key}' contains an inline credential; use credential_ref instead. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+            ));
+        }
+    }
+    if options.get("credential_ref").is_none_or(String::is_empty) {
+        return Err(format!(
+            "[RS-4008] CREATE SOURCE type '{source_type}' requires a non-empty credential_ref. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+        ));
+    }
+    if source_type == "postgres_cdc" {
+        for key in ["publication", "slot"] {
+            if options.get(key).is_none_or(String::is_empty) {
+                return Err(format!(
+                    "[RS-4008] CREATE SOURCE type 'postgres_cdc' requires a non-empty {key}. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AlterSourceAction {
     Pause,
     Resume,
     Drop,
+    AdvanceWatermark(u64),
 }
 
 #[derive(Debug, Clone)]
 struct ParsedAlterSource {
     name: String,
     action: AlterSourceAction,
+}
+
+async fn serve_webhook_connection(
+    mut socket: tokio::net::TcpStream,
+    handler: Arc<GatewayHandler>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    const MAX_HEADER_BYTES: usize = 16 * 1024;
+    let mut request = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        let read = socket.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.len() > MAX_HEADER_BYTES + HTTP_WEBHOOK_MAX_REQUEST_BYTES {
+            return write_webhook_response(&mut socket, WebhookResult::PayloadTooLarge).await;
+        }
+        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            break end + 4;
+        }
+        if request.len() > MAX_HEADER_BYTES {
+            return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await;
+        }
+    };
+
+    let headers = match std::str::from_utf8(&request[..header_end]) {
+        Ok(headers) => headers,
+        Err(_) => return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await,
+    };
+    let mut lines = headers.split("\r\n");
+    let Some(request_line) = lines.next() else {
+        return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await;
+    };
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next();
+    let path = request_parts.next();
+    if method != Some("POST") || request_parts.next().is_none() {
+        return write_webhook_response(&mut socket, WebhookResult::NotFound).await;
+    }
+    let Some(source_name) = path.and_then(|path| path.strip_prefix("/webhook/")) else {
+        return write_webhook_response(&mut socket, WebhookResult::NotFound).await;
+    };
+    if source_name.is_empty() || source_name.contains('/') {
+        return write_webhook_response(&mut socket, WebhookResult::NotFound).await;
+    }
+    let source_name = source_name.to_ascii_lowercase();
+
+    let mut token = None;
+    let mut delivery_id = None;
+    let mut content_length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("authorization") {
+            token = value
+                .strip_prefix("Bearer ")
+                .map(|value| value.as_bytes().to_vec());
+        } else if name.eq_ignore_ascii_case("idempotency-key")
+            || name.eq_ignore_ascii_case("x-delivery-id")
+        {
+            delivery_id = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse::<usize>().ok();
+        }
+    }
+    let Some(content_length) = content_length else {
+        return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await;
+    };
+    if content_length > HTTP_WEBHOOK_MAX_REQUEST_BYTES {
+        return write_webhook_response(&mut socket, WebhookResult::PayloadTooLarge).await;
+    }
+    let body_start = header_end;
+    let already_read = request.len().saturating_sub(body_start);
+    if already_read > content_length {
+        return write_webhook_response(&mut socket, WebhookResult::InvalidPayload).await;
+    }
+    request.resize(body_start + content_length, 0);
+    if already_read < content_length {
+        socket
+            .read_exact(&mut request[body_start + already_read..])
+            .await?;
+    }
+    let result = handler.accept_webhook(
+        &source_name,
+        token.as_deref().unwrap_or_default(),
+        delivery_id.as_deref(),
+        &request[body_start..],
+    );
+    write_webhook_response(&mut socket, result).await
+}
+
+async fn write_webhook_response(
+    socket: &mut tokio::net::TcpStream,
+    result: WebhookResult,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let body = match result.error_code() {
+        Some(code) => format!("{code}: webhook request rejected. Next steps: verify source, bearer token, payload, and source capacity\n"),
+        None => "accepted\n".to_string(),
+    };
+    let reason = match result.status_code() {
+        202 => "Accepted",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
+        _ => "Internal Server Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        result.status_code(), reason, body.len(), body
+    );
+    socket.write_all(response.as_bytes()).await
 }
 
 fn parse_alter_source_ddl(q: &str) -> Result<ParsedAlterSource, String> {
@@ -11148,6 +11456,29 @@ fn parse_alter_source_ddl(q: &str) -> Result<ParsedAlterSource, String> {
         ));
     }
 
+    if tokens.len() == 4
+        && tokens[tokens.len() - 2].eq_ignore_ascii_case("advance")
+        && tokens[tokens.len() - 1].eq_ignore_ascii_case("watermark")
+    {
+        return Err(format!(
+            "[RS-4008] ALTER SOURCE ADVANCE WATERMARK requires an unsigned value. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
+        ));
+    }
+    if tokens.len() == 4
+        && tokens[tokens.len() - 3].eq_ignore_ascii_case("advance")
+        && tokens[tokens.len() - 2].eq_ignore_ascii_case("watermark")
+    {
+        let watermark = tokens[tokens.len() - 1].parse::<u64>().map_err(|_| format!(
+            "[RS-4008] ALTER SOURCE ADVANCE WATERMARK requires an unsigned value. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
+        ))?;
+        return Ok(ParsedAlterSource {
+            name: tokens[..tokens.len() - 3]
+                .join(" ")
+                .trim_matches('"')
+                .to_lowercase(),
+            action: AlterSourceAction::AdvanceWatermark(watermark),
+        });
+    }
     let action_str = tokens.last().unwrap().to_lowercase();
     let name = tokens[..tokens.len() - 1]
         .join(" ")

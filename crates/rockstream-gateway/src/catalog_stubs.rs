@@ -236,6 +236,16 @@ pub struct CatalogSourceEntry {
     pub live_lag: u64,
 }
 
+/// Live source registration kept with the catalog under the same lock.  This
+/// prevents a `CREATE SOURCE` from becoming visible before its lifecycle state
+/// exists, and makes `SHOW SOURCE STATUS` read runtime rather than stale DDL.
+#[derive(Debug, Clone)]
+struct CatalogSourceRuntimeEntry {
+    status: String,
+    live_offset: String,
+    live_lag: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CatalogViewResourceUsageEntry {
     pub view_name: String,
@@ -294,6 +304,8 @@ struct CatalogStubsInner {
     sinks: HashMap<String, CatalogSinkEntry>,
     /// Keyed by source name (from CREATE SOURCE). v0.51.9.
     sources: HashMap<String, CatalogSourceEntry>,
+    /// Keyed by source name; registered/removed atomically with `sources`.
+    source_runtime: HashMap<String, CatalogSourceRuntimeEntry>,
 
     /// Keyed by workload name.
     workloads: HashMap<String, WorkloadDef>,
@@ -736,6 +748,14 @@ impl CatalogStubs {
         if inner.sources.contains_key(&entry.name) {
             return false;
         }
+        inner.source_runtime.insert(
+            entry.name.clone(),
+            CatalogSourceRuntimeEntry {
+                status: entry.status.clone(),
+                live_offset: entry.live_offset.clone(),
+                live_lag: entry.live_lag,
+            },
+        );
         inner.sources.insert(entry.name.clone(), entry);
         true
     }
@@ -743,29 +763,69 @@ impl CatalogStubs {
     /// Look up a source by name.
     pub fn get_source(&self, name: &str) -> Option<CatalogSourceEntry> {
         let inner = self.inner.read().unwrap();
-        inner.sources.get(name).cloned()
+        let mut source = inner.sources.get(name)?.clone();
+        let runtime = inner.source_runtime.get(name)?;
+        source.status = runtime.status.clone();
+        source.live_offset = runtime.live_offset.clone();
+        source.live_lag = runtime.live_lag;
+        Some(source)
     }
 
     /// Update the status of an existing source ("OK", "PAUSED").
     pub fn update_source_status(&self, name: &str, status: &str) -> bool {
         let mut inner = self.inner.write().unwrap();
-        if let Some(s) = inner.sources.get_mut(name) {
-            s.status = status.to_string();
+        if inner.sources.contains_key(name) {
+            let runtime = inner
+                .source_runtime
+                .get_mut(name)
+                .expect("EDGE-SOURCE-RUNTIME: every catalog source has runtime state");
+            runtime.status = status.to_string();
             return true;
         }
         false
     }
 
+    /// Publish live connector progress without exposing source credentials.
+    pub fn update_source_runtime(&self, name: &str, offset: String, lag: u64) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let Some(runtime) = inner.source_runtime.get_mut(name) else {
+            return false;
+        };
+        runtime.live_offset = offset;
+        runtime.live_lag = lag;
+        true
+    }
+
     /// Remove a source entry (DROP SOURCE).
     pub fn remove_source(&self, name: &str) -> bool {
         let mut inner = self.inner.write().unwrap();
-        inner.sources.remove(name).is_some()
+        let removed = inner.sources.remove(name).is_some();
+        let runtime_removed = inner.source_runtime.remove(name).is_some();
+        assert_eq!(
+            removed, runtime_removed,
+            "EDGE-SOURCE-RUNTIME: catalog and runtime source removal must be atomic"
+        );
+        removed
     }
 
     /// List all registered sources.
     pub fn list_sources(&self) -> Vec<CatalogSourceEntry> {
         let inner = self.inner.read().unwrap();
-        let mut sources: Vec<CatalogSourceEntry> = inner.sources.values().cloned().collect();
+        let mut sources: Vec<CatalogSourceEntry> = inner
+            .sources
+            .values()
+            .map(|source| {
+                let mut source = source.clone();
+                let runtime = inner
+                    .source_runtime
+                    .get(&source.name)
+                    .expect("EDGE-SOURCE-RUNTIME: every catalog source has runtime state");
+                source.status = runtime.status.clone();
+                source.live_offset = runtime.live_offset.clone();
+                source.live_lag = runtime.live_lag;
+                source
+            })
+            .collect();
         sources.sort_by(|a, b| a.name.cmp(&b.name));
         sources
     }

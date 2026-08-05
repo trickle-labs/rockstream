@@ -309,6 +309,18 @@ pub const RS_4008: ErrorCode = ErrorCode::new(4008);
 pub const RS_4009: ErrorCode = ErrorCode::new(4009);
 /// Source already exists.
 pub const RS_4010: ErrorCode = ErrorCode::new(4010);
+/// PostgreSQL CDC replication cannot proceed without recovery.
+pub const RS_4011: ErrorCode = ErrorCode::new(4011);
+/// Webhook request authentication failed.
+pub const RS_4012: ErrorCode = ErrorCode::new(4012);
+/// Webhook source is paused.
+pub const RS_4013: ErrorCode = ErrorCode::new(4013);
+/// Webhook request exceeded the configured byte bound.
+pub const RS_4014: ErrorCode = ErrorCode::new(4014);
+/// Webhook epoch buffer is full.
+pub const RS_4015: ErrorCode = ErrorCode::new(4015);
+/// Webhook payload or watermark is invalid.
+pub const RS_4016: ErrorCode = ErrorCode::new(4016);
 
 /// Self-fencing configuration invalid: self_fence_after must satisfy
 /// dead_after < self_fence_after < 2 × shard_recovery_budget.

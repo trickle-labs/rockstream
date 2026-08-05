@@ -64,6 +64,10 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:5432")]
         listen: String,
 
+        /// Independent HTTP listener for `POST /webhook/<source>` ingestion.
+        #[arg(long)]
+        webhook_listen: Option<String>,
+
         /// v0.45.2 M7: comma-separated list of the *other* control nodes in
         /// this node's Raft group, `id@host:port,id@host:port`. Only
         /// meaningful for `--role=control`. When omitted, the control role
@@ -206,6 +210,7 @@ fn main() -> ExitCode {
             availability_zone,
             metrics_addr,
             listen,
+            webhook_listen,
             raft_peers,
             raft_node_id,
             raft_bind,
@@ -256,6 +261,7 @@ fn main() -> ExitCode {
             if let Some(value) = tls_ca_cert_path {
                 config.gateway.tls_ca_cert_path = Some(value);
             }
+            config.gateway.webhook_listen_addr = webhook_listen;
             let opts = StartOptions {
                 storage,
                 role,

@@ -393,17 +393,35 @@ pub async fn start_gateway_with_shard(
         }
     };
 
-    server
-        .with_query_time_shard_topology_provider(topology_provider)
-        .serve_background()
-        .await
-        .map_err(|e| {
+    let server = server.with_query_time_shard_topology_provider(topology_provider);
+    if let Some(webhook_listen) = &opts.config.gateway.webhook_listen_addr {
+        let webhook_addr = webhook_listen.parse().map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("invalid webhook listen address `{webhook_listen}`: {e}"),
+                "Pass a valid --webhook-listen address such as 127.0.0.1:8080.",
+            )
+        })?;
+        let (pgwire_addr, _, pgwire_handle, _) = server
+            .serve_background_with_webhook(webhook_addr)
+            .await
+            .map_err(|e| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed to bind gateway or webhook listener: {e}"),
+                    "Check that both --listen and --webhook-listen ports are available.",
+                )
+            })?;
+        Ok((pgwire_addr, pgwire_handle))
+    } else {
+        server.serve_background().await.map_err(|e| {
             CliError::new(
                 RS_0003,
                 format!("failed to bind gateway on {listen}: {e}"),
                 "Check that the port is not already in use.",
             )
         })
+    }
 }
 
 /// Run `rockstream start`.

@@ -146,6 +146,10 @@ pub struct StorageConfig {
 /// Distinct from any *internal* control<->worker/worker<->worker mTLS.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct GatewayConfig {
+    /// Optional independent listener for authenticated `POST /webhook/<source>`
+    /// ingestion.  It must not share the pgwire port.
+    #[serde(default)]
+    pub webhook_listen_addr: Option<String>,
     /// Path to the PEM-encoded server certificate (chain) presented during
     /// the TLS handshake. `None` (the default) means TLS is not configured
     /// and the gateway keeps its pre-v0.51.5 plaintext-refusal `SSLRequest`

@@ -14,6 +14,7 @@ pub mod kafka_sink;
 pub mod kafka_source;
 pub mod object_store_sink;
 pub mod partition_spec;
+pub mod postgres_cdc;
 pub mod s3_source;
 pub mod sink_connector;
 pub mod source_connector;
@@ -32,6 +33,11 @@ pub use iceberg_sink::IcebergSink;
 pub use kafka_sink::KafkaSink;
 pub use kafka_source::KafkaSource;
 pub use object_store_sink::{ObjectStoreSink, OBJECT_STORE_SINK_MAX_PENDING_EPOCHS};
+pub use postgres_cdc::{
+    CdcChange, CdcOperation, CdcWireFormat, PgLsn, PostgresCdcFailure, PostgresCdcSource,
+    PostgresCdcStatus, POSTGRES_CDC_MAX_IN_FLIGHT_BYTES, POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS,
+    POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS, POSTGRES_CDC_MAX_WAL_LAG_BYTES,
+};
 pub use s3_source::S3Source;
 pub use sink_connector::{
     assert_commit_pointer_atomic, assert_epoch_committed_only_after_cluster_checkpoint,
