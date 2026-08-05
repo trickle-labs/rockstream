@@ -5,6 +5,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Maximum bytes accepted from one webhook request before it is decoded.
@@ -30,8 +31,9 @@ impl WebhookFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookEpoch {
+    pub source_epoch: u64,
     pub delivery_id: String,
     pub digest: String,
     pub payload: Vec<u8>,
@@ -48,6 +50,8 @@ pub enum WebhookResult {
     PayloadTooLarge,
     Full,
     InvalidPayload,
+    DurabilityFailed,
+    InFlight,
 }
 
 impl WebhookResult {
@@ -60,6 +64,8 @@ impl WebhookResult {
             Self::PayloadTooLarge => 413,
             Self::Full => 429,
             Self::InvalidPayload => 400,
+            Self::DurabilityFailed => 500,
+            Self::InFlight => 409,
         }
     }
 
@@ -71,6 +77,8 @@ impl WebhookResult {
             Self::PayloadTooLarge => Some("RS-4014"),
             Self::Full => Some("RS-4015"),
             Self::InvalidPayload => Some("RS-4016"),
+            Self::DurabilityFailed => Some("RS-4017"),
+            Self::InFlight => Some("RS-4018"),
             Self::Accepted | Self::Duplicate => None,
         }
     }
@@ -87,6 +95,7 @@ pub struct HttpWebhookSource {
     committed: HashSet<String>,
     committed_order: VecDeque<String>,
     watermark: Option<u64>,
+    next_epoch: u64,
 }
 
 impl HttpWebhookSource {
@@ -101,6 +110,7 @@ impl HttpWebhookSource {
             committed: HashSet::new(),
             committed_order: VecDeque::new(),
             watermark: None,
+            next_epoch: 0,
         }
     }
 
@@ -148,14 +158,19 @@ impl HttpWebhookSource {
         }
         let digest = format!("{:x}", Sha256::digest(payload));
         let identity = delivery_id.unwrap_or(&digest).to_string();
-        if self.pending.contains(&identity) || self.committed.contains(&identity) {
+        if self.committed.contains(&identity) {
             return WebhookResult::Duplicate;
+        }
+        if self.pending.contains(&identity) {
+            return WebhookResult::InFlight;
         }
         if self.accepted.len() >= HTTP_WEBHOOK_LOCAL_BUFFER_MAX_EPOCHS {
             return WebhookResult::Full;
         }
         self.pending.insert(identity.clone());
+        self.next_epoch += 1;
         self.accepted.push_back(WebhookEpoch {
+            source_epoch: self.next_epoch,
             delivery_id: identity,
             digest,
             payload: payload.to_vec(),
@@ -167,7 +182,19 @@ impl HttpWebhookSource {
     /// Commit one accepted epoch.  The identity enters dedup only here, which
     /// makes a retry after a failed pre-commit attempt eligible for delivery.
     pub fn commit_next(&mut self) -> Option<WebhookEpoch> {
-        let epoch = self.accepted.pop_front()?;
+        let delivery_id = self.accepted.front()?.delivery_id.clone();
+        self.commit_pending(&delivery_id)
+    }
+
+    /// Mark one specifically persisted delivery committed. The identity is
+    /// selected rather than relying on queue position because storage commits
+    /// may complete in a different request scheduling order.
+    pub fn commit_pending(&mut self, delivery_id: &str) -> Option<WebhookEpoch> {
+        let index = self
+            .accepted
+            .iter()
+            .position(|epoch| epoch.delivery_id == delivery_id)?;
+        let epoch = self.accepted.remove(index)?;
         self.pending.remove(&epoch.delivery_id);
         self.committed.insert(epoch.delivery_id.clone());
         self.committed_order.push_back(epoch.delivery_id.clone());
@@ -177,6 +204,26 @@ impl HttpWebhookSource {
             }
         }
         Some(epoch)
+    }
+
+    /// Inspect the next accepted epoch without advancing the durable-delivery
+    /// identity. The caller writes this exact record in its M3 transaction
+    /// before calling [`Self::commit_next`].
+    pub fn next_pending(&self) -> Option<WebhookEpoch> {
+        self.accepted.front().cloned()
+    }
+
+    /// Abandon a failed pre-commit delivery so its retry can be accepted.
+    pub fn abort_pending(&mut self, delivery_id: &str) -> bool {
+        let Some(index) = self
+            .accepted
+            .iter()
+            .position(|epoch| epoch.delivery_id == delivery_id)
+        else {
+            return false;
+        };
+        let epoch = self.accepted.remove(index).expect("checked accepted index");
+        self.pending.remove(&epoch.delivery_id)
     }
 }
 

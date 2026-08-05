@@ -13,7 +13,7 @@ use arrow::record_batch::RecordBatch;
 use rockstream_types::arrow_batch::append_weight_column;
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
-use rockstream_types::timestamp::{Epoch, EventTimeWatermark};
+use rockstream_types::timestamp::Epoch;
 use serde::Deserialize;
 
 use crate::source_connector::{

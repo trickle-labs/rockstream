@@ -1670,7 +1670,7 @@ impl GatewayHandler {
         }
     }
 
-    fn accept_webhook(
+    async fn accept_webhook(
         &self,
         source_name: &str,
         token: &[u8],
@@ -1683,20 +1683,66 @@ impl GatewayHandler {
         if source_entry.source_type != "http_webhook" {
             return WebhookResult::NotFound;
         }
-        let Some(source) = self.webhook_sources.get(source_name) else {
+        let Some(source) = self
+            .webhook_sources
+            .get(source_name)
+            .map(|source| source.value().clone())
+        else {
             return WebhookResult::NotFound;
         };
-        let mut source = source.lock().expect("webhook source lock");
-        let result = source.accept(token, delivery_id, payload);
-        if result == WebhookResult::Accepted {
-            // The source epoch is committed before the success response.  The
-            // full M3 input binding consumes this committed epoch; retries see
-            // the durable source identity and cannot apply it twice.
-            let committed = source.commit_next().expect("accepted epoch is queued");
-            self.catalog.update_source_runtime(
+        let (result, pending) = {
+            let mut source = source.lock().expect("webhook source lock");
+            let result = source.accept(token, delivery_id, payload);
+            let pending = if result == WebhookResult::Accepted {
+                source.next_pending()
+            } else {
+                None
+            };
+            (result, pending)
+        };
+        if let Some(pending) = pending {
+            if let Some(shard_db) = &self.shard_db {
+                let key = format!(
+                    "source_input/{source_name}/epoch/{:020}",
+                    pending.source_epoch
+                );
+                let payload = match serde_json::to_vec(&pending) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        source
+                            .lock()
+                            .expect("webhook source lock")
+                            .abort_pending(&pending.delivery_id);
+                        return WebhookResult::DurabilityFailed;
+                    }
+                };
+                let mut batch = rockstream_storage::WriteBatch::new();
+                batch.put(key.as_bytes(), &payload);
+                if shard_db.write_batch(batch).await.is_err() || shard_db.flush().await.is_err() {
+                    source
+                        .lock()
+                        .expect("webhook source lock")
+                        .abort_pending(&pending.delivery_id);
+                    return WebhookResult::DurabilityFailed;
+                }
+            }
+
+            // The success response is emitted only after the M3 source-input
+            // transaction commits. A gateway without an attached ShardDb is
+            // the in-memory test/control-plane mode and retains its bounded
+            // local acknowledgement semantics.
+            let mut source = source.lock().expect("webhook source lock");
+            let committed = source
+                .commit_pending(&pending.delivery_id)
+                .expect("accepted epoch remains queued until durable commit");
+            self.catalog.update_source_runtime_detail(
                 source_name,
+                Some("gateway:webhook".to_string()),
+                Some(committed.source_epoch),
                 committed.digest,
                 source.buffered_epochs() as u64,
+                Some(source.buffered_epochs()),
+                None,
             );
         }
         result
@@ -8819,7 +8865,7 @@ impl GatewayServer {
 
     /// Test and embedding hook for routing one already-authenticated webhook
     /// request through the same source lifecycle as the TCP HTTP listener.
-    pub fn accept_webhook(
+    pub async fn accept_webhook(
         &self,
         source_name: &str,
         token: &[u8],
@@ -8828,6 +8874,7 @@ impl GatewayServer {
     ) -> WebhookResult {
         self.handler
             .accept_webhook(source_name, token, delivery_id, payload)
+            .await
     }
 
     /// Start listening.  Blocks until the future is dropped.
@@ -10220,6 +10267,7 @@ impl Debug for QueryTimeScatterPartition {
     }
 }
 
+#[allow(clippy::type_complexity)]
 struct QueryTimeScatterStreamState {
     schema: SchemaRef,
     relation: String,
@@ -10262,9 +10310,7 @@ impl PartitionStream for QueryTimeScatterPartition {
             state.current_bytes = 0;
             loop {
                 if state.receiver.is_none() {
-                    let Some(reader) = state.readers.get(state.next_reader).cloned() else {
-                        return None;
-                    };
+                    let reader = state.readers.get(state.next_reader).cloned()?;
                     state.next_reader += 1;
                     let (sender, receiver) =
                         tokio::sync::mpsc::channel(QUERY_TIME_SCATTER_MAX_CONCURRENT_SHARD_BATCHES);
@@ -11386,12 +11432,14 @@ async fn serve_webhook_connection(
             .read_exact(&mut request[body_start + already_read..])
             .await?;
     }
-    let result = handler.accept_webhook(
-        &source_name,
-        token.as_deref().unwrap_or_default(),
-        delivery_id.as_deref(),
-        &request[body_start..],
-    );
+    let result = handler
+        .accept_webhook(
+            &source_name,
+            token.as_deref().unwrap_or_default(),
+            delivery_id.as_deref(),
+            &request[body_start..],
+        )
+        .await;
     write_webhook_response(&mut socket, result).await
 }
 

@@ -244,6 +244,10 @@ struct CatalogSourceRuntimeEntry {
     status: String,
     live_offset: String,
     live_lag: u64,
+    owner: Option<String>,
+    committed_checkpoint: u64,
+    buffer_fill: usize,
+    blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -754,6 +758,10 @@ impl CatalogStubs {
                 status: entry.status.clone(),
                 live_offset: entry.live_offset.clone(),
                 live_lag: entry.live_lag,
+                owner: Some("gateway:pending".to_string()),
+                committed_checkpoint: 0,
+                buffer_fill: 0,
+                blocked_reason: None,
             },
         );
         inner.sources.insert(entry.name.clone(), entry);
@@ -780,6 +788,13 @@ impl CatalogStubs {
                 .get_mut(name)
                 .expect("EDGE-SOURCE-RUNTIME: every catalog source has runtime state");
             runtime.status = status.to_string();
+            if status == "PAUSED" {
+                runtime.owner = None;
+                runtime.blocked_reason = Some("paused by operator".to_string());
+            } else {
+                runtime.owner = Some("gateway:pending".to_string());
+                runtime.blocked_reason = None;
+            }
             return true;
         }
         false
@@ -787,12 +802,39 @@ impl CatalogStubs {
 
     /// Publish live connector progress without exposing source credentials.
     pub fn update_source_runtime(&self, name: &str, offset: String, lag: u64) -> bool {
+        self.update_source_runtime_detail(name, None, None, offset, lag, None, None)
+    }
+
+    /// Publish an exact live runtime projection. Checkpoint tokens and source
+    /// credentials are deliberately absent: they are durable/runtime secrets,
+    /// not operator-visible status values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_source_runtime_detail(
+        &self,
+        name: &str,
+        owner: Option<String>,
+        committed_checkpoint: Option<u64>,
+        offset: String,
+        lag: u64,
+        buffer_fill: Option<usize>,
+        blocked_reason: Option<String>,
+    ) -> bool {
         let mut inner = self.inner.write().unwrap();
         let Some(runtime) = inner.source_runtime.get_mut(name) else {
             return false;
         };
+        if let Some(owner) = owner {
+            runtime.owner = Some(owner);
+        }
+        if let Some(committed_checkpoint) = committed_checkpoint {
+            runtime.committed_checkpoint = committed_checkpoint;
+        }
         runtime.live_offset = offset;
         runtime.live_lag = lag;
+        if let Some(buffer_fill) = buffer_fill {
+            runtime.buffer_fill = buffer_fill;
+        }
+        runtime.blocked_reason = blocked_reason;
         true
     }
 
@@ -860,7 +902,16 @@ impl CatalogStubs {
                 None => true,
             })
             .map(|s| {
-                let opts_json = serde_json::to_string(&s.options).unwrap_or_default();
+                let opts_json =
+                    serde_json::to_string(&redacted_source_options(&s.options)).unwrap_or_default();
+                let runtime = self
+                    .inner
+                    .read()
+                    .unwrap()
+                    .source_runtime
+                    .get(&s.name)
+                    .cloned()
+                    .expect("EDGE-SOURCE-RUNTIME: every catalog source has runtime state");
                 vec![
                     Some(s.name),
                     Some(s.source_type),
@@ -868,6 +919,10 @@ impl CatalogStubs {
                     Some(s.status),
                     Some(s.live_offset),
                     Some(s.live_lag.to_string()),
+                    runtime.owner,
+                    Some(runtime.committed_checkpoint.to_string()),
+                    Some(runtime.buffer_fill.to_string()),
+                    runtime.blocked_reason,
                     Some(opts_json),
                 ]
             })
@@ -2438,8 +2493,32 @@ pub(crate) fn show_source_status_columns() -> Vec<String> {
         "status".to_string(),
         "live_offset".to_string(),
         "live_lag".to_string(),
+        "owner".to_string(),
+        "committed_checkpoint".to_string(),
+        "buffer_fill".to_string(),
+        "blocked_reason".to_string(),
         "options".to_string(),
     ]
+}
+
+fn redacted_source_options(options: &HashMap<String, String>) -> HashMap<String, String> {
+    options
+        .iter()
+        .map(|(key, value)| {
+            let key_lower = key.to_ascii_lowercase();
+            let redacted = ["credential", "secret", "password", "token"]
+                .iter()
+                .any(|needle| key_lower.contains(needle));
+            (
+                key.clone(),
+                if redacted {
+                    "<redacted>".to_string()
+                } else {
+                    value.clone()
+                },
+            )
+        })
+        .collect()
 }
 
 fn fmt_bool(value: bool) -> Option<String> {

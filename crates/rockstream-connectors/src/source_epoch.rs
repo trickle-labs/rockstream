@@ -14,7 +14,12 @@
 //! sequence (DESIGN.md §8.1.1).
 
 use std::collections::BTreeMap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
+use rockstream_storage::{keys::CatalogType, CatalogKeyEncoder, ShardDb, StorageError, WriteBatch};
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
 
@@ -42,7 +47,7 @@ impl OffsetToken {
 // ─── SourceEpochEntry ─────────────────────────────────────────────────────────
 
 /// One committed entry in the epoch map.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceEpochEntry {
     /// The monotone source epoch.
     pub source_epoch: Epoch,
@@ -69,7 +74,224 @@ pub struct SourceEpochRegistry {
     history: BTreeMap<Epoch, SourceEpochEntry>,
 }
 
-const MAX_HISTORY: usize = 128;
+/// The maximum number of durable prepared and committed checkpoint slots per source.
+///
+/// Slots are overwritten circularly, so recovery scans at most twice this many records.
+pub const SOURCE_CHECKPOINT_HISTORY_MAX_ENTRIES: usize = 128;
+
+/// Maximum bytes read by one source-runtime cleanup scan. Cleanup loops over
+/// these bounded pages and deletes only the named source's point keys.
+pub const SOURCE_CLEANUP_SCAN_PAGE_LIMIT: usize = 1024 * 1024;
+
+const MAX_HISTORY: usize = SOURCE_CHECKPOINT_HISTORY_MAX_ENTRIES;
+
+/// Durable state of a source checkpoint record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceCheckpointState {
+    Prepared,
+    Committed,
+}
+
+/// Versioned durable source checkpoint bound to the M3 input transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCheckpoint {
+    pub version: u16,
+    pub connector_id: ConnectorId,
+    pub source_epoch: Epoch,
+    pub token: OffsetToken,
+    pub state: SourceCheckpointState,
+    pub delivery_id: Option<String>,
+    pub payload_digest: Option<[u8; 32]>,
+}
+
+impl SourceCheckpoint {
+    pub fn prepared(connector_id: ConnectorId, source_epoch: Epoch, token: OffsetToken) -> Self {
+        Self {
+            version: 1,
+            connector_id,
+            source_epoch,
+            token,
+            state: SourceCheckpointState::Prepared,
+            delivery_id: None,
+            payload_digest: None,
+        }
+    }
+
+    pub fn committed(&self) -> Self {
+        let mut checkpoint = self.clone();
+        checkpoint.state = SourceCheckpointState::Committed;
+        checkpoint
+    }
+}
+
+/// Persists source checkpoints using bounded point-write slots. Recovery reads only
+/// committed records; prepared records can never advance an acknowledged source token.
+#[derive(Clone)]
+pub struct SourceCheckpointStore {
+    db: Arc<ShardDb>,
+    namespace_id: u128,
+    connector_id: ConnectorId,
+    cleanup_scan_pages: Arc<AtomicUsize>,
+}
+
+impl SourceCheckpointStore {
+    pub fn new(db: Arc<ShardDb>, namespace_id: u128, connector_id: ConnectorId) -> Self {
+        Self {
+            db,
+            namespace_id,
+            connector_id,
+            cleanup_scan_pages: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn prefix(&self, state: SourceCheckpointState) -> Vec<u8> {
+        let state: &[u8] = match state {
+            SourceCheckpointState::Prepared => b"source_checkpoint/prepared/",
+            SourceCheckpointState::Committed => b"source_checkpoint/committed/",
+        };
+        CatalogKeyEncoder::encode_with_suffix(
+            CatalogType::Connector,
+            self.namespace_id,
+            self.connector_id.0 as u128,
+            state,
+        )
+    }
+
+    fn key(&self, state: SourceCheckpointState, epoch: Epoch) -> Vec<u8> {
+        let mut key = self.prefix(state);
+        key.extend_from_slice(
+            &(epoch % SOURCE_CHECKPOINT_HISTORY_MAX_ENTRIES as u64).to_be_bytes(),
+        );
+        key
+    }
+
+    fn encode(checkpoint: &SourceCheckpoint) -> Result<Vec<u8>, StorageError> {
+        serde_json::to_vec(checkpoint).map_err(|error| StorageError::KeyEncoding(error.to_string()))
+    }
+
+    /// Persist a prepared record before the M3 input commit starts.
+    pub async fn prepare(&self, checkpoint: &SourceCheckpoint) -> Result<(), StorageError> {
+        if checkpoint.connector_id != self.connector_id
+            || checkpoint.state != SourceCheckpointState::Prepared
+        {
+            return Err(StorageError::KeyEncoding(
+                "RS-4010: source checkpoint prepare has wrong identity or state; next steps: rebuild the checkpoint from this source's current epoch".to_string(),
+            ));
+        }
+        let mut batch = WriteBatch::new();
+        batch.put(
+            &self.key(SourceCheckpointState::Prepared, checkpoint.source_epoch),
+            &Self::encode(checkpoint)?,
+        );
+        self.db.write_batch(batch).await?;
+        self.db.flush().await
+    }
+
+    /// Add the committed checkpoint to the caller's M3 input `WriteBatch`.
+    pub fn append_committed(
+        &self,
+        batch: &mut WriteBatch,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<SourceCheckpoint, StorageError> {
+        if checkpoint.connector_id != self.connector_id
+            || checkpoint.state != SourceCheckpointState::Prepared
+        {
+            return Err(StorageError::KeyEncoding(
+                "RS-4011: source checkpoint commit requires a prepared checkpoint for this source; next steps: prepare the source input before committing M3".to_string(),
+            ));
+        }
+        let committed = checkpoint.committed();
+        batch.put(
+            &self.key(SourceCheckpointState::Committed, committed.source_epoch),
+            &Self::encode(&committed)?,
+        );
+        batch.delete(&self.key(SourceCheckpointState::Prepared, committed.source_epoch));
+        Ok(committed)
+    }
+
+    /// Commit source input and its checkpoint atomically, then make the durable
+    /// commit visible to restart recovery.
+    pub async fn commit_m3(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.db.write_batch(batch).await?;
+        self.db.flush().await
+    }
+
+    /// Return exactly the highest valid committed checkpoint, ignoring prepared
+    /// records and stale circular-history slots.
+    pub async fn highest_committed(&self) -> Result<Option<SourceCheckpoint>, StorageError> {
+        let records = self
+            .db
+            .scan_prefix(&self.prefix(SourceCheckpointState::Committed))
+            .await?;
+        let mut highest = None;
+        for (_, value) in records {
+            let checkpoint: SourceCheckpoint = serde_json::from_slice(&value)
+                .map_err(|error| StorageError::KeyEncoding(error.to_string()))?;
+            if checkpoint.version != 1
+                || checkpoint.connector_id != self.connector_id
+                || checkpoint.state != SourceCheckpointState::Committed
+            {
+                continue;
+            }
+            if highest.as_ref().is_none_or(|current: &SourceCheckpoint| {
+                checkpoint.source_epoch > current.source_epoch
+            }) {
+                highest = Some(checkpoint);
+            }
+        }
+        Ok(highest)
+    }
+
+    /// Number of currently retained durable checkpoint records, for the
+    /// `source_checkpoint_history_entries` fill-level metric.
+    pub async fn history_entries(&self) -> Result<usize, StorageError> {
+        let prepared = self
+            .db
+            .scan_prefix(&self.prefix(SourceCheckpointState::Prepared))
+            .await?;
+        let committed = self
+            .db
+            .scan_prefix(&self.prefix(SourceCheckpointState::Committed))
+            .await?;
+        Ok(prepared.len() + committed.len())
+    }
+
+    /// Remove every retained checkpoint for this source through bounded prefix
+    /// scans and point deletes. SlateDB range deletion is intentionally never
+    /// used because it is not snapshot-safe for source recovery.
+    pub async fn cleanup(&self) -> Result<usize, StorageError> {
+        let mut removed = 0;
+        for state in [
+            SourceCheckpointState::Prepared,
+            SourceCheckpointState::Committed,
+        ] {
+            loop {
+                let (records, _) = self
+                    .db
+                    .scan_prefix_bounded(&self.prefix(state), SOURCE_CLEANUP_SCAN_PAGE_LIMIT)
+                    .await?;
+                if records.is_empty() {
+                    break;
+                }
+                let mut batch = WriteBatch::new();
+                for (key, _) in &records {
+                    batch.delete(key);
+                }
+                self.db.write_batch(batch).await?;
+                self.db.flush().await?;
+                removed += records.len();
+                self.cleanup_scan_pages.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Cumulative bounded cleanup pages, exposed as
+    /// `source_cleanup_scan_pages` for operator monitoring.
+    pub fn cleanup_scan_pages(&self) -> usize {
+        self.cleanup_scan_pages.load(Ordering::Relaxed)
+    }
+}
 
 impl SourceEpochRegistry {
     /// Create a new registry starting at epoch 0 (no committed epochs).

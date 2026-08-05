@@ -19,6 +19,7 @@ pub mod s3_source;
 pub mod sink_connector;
 pub mod source_connector;
 pub mod source_epoch;
+pub mod source_runtime;
 
 pub use catalog_registrar::{
     CatalogRegistrar, CatalogRegistrationError, DuckLakeCatalogRegistrar,
@@ -48,7 +49,14 @@ pub use source_connector::{
     validate_window_watermark, PollDeltaResult, SnapshotStream, SourceConnector, SourceError,
     SourcePollLifecycle, WatermarkCapability, WindowWatermarkPolicy,
 };
-pub use source_epoch::{OffsetToken, SourceEpochEntry, SourceEpochRegistry};
+pub use source_epoch::{
+    OffsetToken, SourceCheckpoint, SourceCheckpointState, SourceCheckpointStore, SourceEpochEntry,
+    SourceEpochRegistry, SOURCE_CHECKPOINT_HISTORY_MAX_ENTRIES,
+};
+pub use source_runtime::{
+    SourceOwnerLease, SourceRuntimeCoordinator, SourceRuntimeMetrics,
+    SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS,
+};
 
 #[cfg(test)]
 mod tests {

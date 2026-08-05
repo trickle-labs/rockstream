@@ -13,6 +13,7 @@ simulation = ["rockstream-sim/simulation"]
 
 [dependencies]
 rockstream-types = { path = "../rockstream-types" }
+rockstream-storage = { path = "../rockstream-storage" }
 rockstream-sim = { path = "../rockstream-sim" }
 arrow = { workspace = true }
 async-trait = { workspace = true }
@@ -35,7 +36,6 @@ csv = { workspace = true }
 [dev-dependencies]
 rockstream-ops = { path = "../rockstream-ops" }
 rockstream-plan = { path = "../rockstream-plan" }
-rockstream-storage = { path = "../rockstream-storage" }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 object_store = { workspace = true }

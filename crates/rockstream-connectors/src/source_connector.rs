@@ -243,7 +243,6 @@ impl<S: SourceConnector> SourcePollLifecycle<S> {
                 "source is paused after a failed poll; call resume before committing".to_string(),
             ));
         }
-        self.source.commit_offset(epoch, offset.clone())?;
         let entry = self
             .source_epochs
             .prepare_commit(BTreeMap::from([(0, offset.clone())]));
@@ -253,6 +252,8 @@ impl<S: SourceConnector> SourcePollLifecycle<S> {
         );
         self.source_epochs.commit_epoch(entry);
         self.committed_offset = offset;
+        self.source
+            .commit_offset(epoch, self.committed_offset.clone())?;
         Ok(())
     }
 

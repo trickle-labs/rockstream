@@ -5,8 +5,10 @@ use std::sync::Arc;
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs,
     view_reader::{ViewReadStrategy, ViewReader},
-    GatewayError, GatewayServer,
+    GatewayError, GatewayServer, WebhookEpoch,
 };
+use rockstream_storage::ShardDb;
+use sha2::{Digest, Sha256};
 use tokio_postgres::NoTls;
 
 struct NoopViewReader;
@@ -51,6 +53,42 @@ async fn client() -> (tokio_postgres::Client, std::net::SocketAddr) {
         let _ = connection.await;
     });
     (client, webhook_address)
+}
+
+async fn shard_backed_client() -> (tokio_postgres::Client, std::net::SocketAddr, Arc<ShardDb>) {
+    let shard_db = Arc::new(
+        ShardDb::builder(
+            "webhook-durable-ingress",
+            Arc::new(object_store::memory::InMemory::new()),
+        )
+        .build()
+        .await
+        .unwrap(),
+    );
+    let server = GatewayServer::with_shard_db(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(CatalogStubs::new()),
+        Arc::new(NoopViewReader),
+        shard_db.clone(),
+    );
+    let (webhook_address, _webhook_handle) = server
+        .serve_webhook_background("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let (address, _handle) = server.serve_background().await.unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=test dbname=test",
+            address.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    (client, webhook_address, shard_db)
 }
 
 #[tokio::test]
@@ -200,5 +238,131 @@ async fn http_webhook_reachability_negative_paths_and_lifecycle_are_exact() {
     assert_eq!(
         (dropped.status().as_u16(), dropped.text().await.unwrap()),
         (404, "RS-4009: webhook request rejected. Next steps: verify source, bearer token, payload, and source capacity\n".to_string())
+    );
+}
+
+#[tokio::test]
+async fn webhook_returns_202_only_after_durable_m3_commit() {
+    let (client, webhook_addr, shard_db) = shard_backed_client().await;
+    client
+        .execute(
+            "CREATE SOURCE inbound TYPE http_webhook (credential_ref='vault://webhook/inbound') FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap();
+    let payload = br#"{"id":1}"#;
+    let response = reqwest::Client::new()
+        .post(format!("http://{webhook_addr}/webhook/inbound"))
+        .header("Authorization", "Bearer vault://webhook/inbound")
+        .header("Idempotency-Key", "delivery-1")
+        .body(payload.as_slice())
+        .send()
+        .await
+        .unwrap();
+    let durable = shard_db
+        .scan_prefix(b"source_input/inbound/epoch/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, value)| (key.to_vec(), value.to_vec()))
+        .collect::<Vec<_>>();
+    let expected = WebhookEpoch {
+        source_epoch: 1,
+        delivery_id: "delivery-1".to_string(),
+        digest: format!("{:x}", Sha256::digest(payload)),
+        payload: payload.to_vec(),
+        watermark: None,
+    };
+
+    assert_eq!(
+        (
+            response.status().as_u16(),
+            response.text().await.unwrap(),
+            durable,
+        ),
+        (
+            202,
+            "accepted\n".to_string(),
+            vec![(
+                b"source_input/inbound/epoch/00000000000000000001".to_vec(),
+                serde_json::to_vec(&expected).unwrap(),
+            )],
+        )
+    );
+}
+
+#[tokio::test]
+async fn show_source_status_reports_exact_live_owner_checkpoint_lag_buffer_and_redacts_credentials()
+{
+    let (client, _) = client().await;
+    client
+        .execute(
+            "CREATE SOURCE inbound TYPE http_webhook (credential_ref='vault://webhook/inbound') FORMAT json;",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let rows = client
+        .query("SHOW SOURCE STATUS FOR inbound;", &[])
+        .await
+        .unwrap();
+    let exact = rows
+        .iter()
+        .map(|row| {
+            (0..11)
+                .map(|index| row.get::<_, Option<String>>(index))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exact,
+        vec![vec![
+            Some("inbound".to_string()),
+            Some("http_webhook".to_string()),
+            Some("json".to_string()),
+            Some("OK".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("gateway:pending".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string()),
+            None,
+            Some("{\"credential_ref\":\"<redacted>\"}".to_string()),
+        ]]
+    );
+
+    client
+        .execute("ALTER SOURCE inbound PAUSE;", &[])
+        .await
+        .unwrap();
+    let rows = client
+        .query("SHOW SOURCE STATUS FOR inbound;", &[])
+        .await
+        .unwrap();
+    let exact = rows
+        .iter()
+        .map(|row| {
+            (0..11)
+                .map(|index| row.get::<_, Option<String>>(index))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exact,
+        vec![vec![
+            Some("inbound".to_string()),
+            Some("http_webhook".to_string()),
+            Some("json".to_string()),
+            Some("PAUSED".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string()),
+            None,
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("paused by operator".to_string()),
+            Some("{\"credential_ref\":\"<redacted>\"}".to_string()),
+        ]]
     );
 }
