@@ -1,7 +1,6 @@
 //! Auth types and JWT verification for v0.26.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{
@@ -9,6 +8,7 @@ use base64::{
     Engine,
 };
 use hmac::{Hmac, Mac};
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 /// Max entries in the JWKS key cache (LRU eviction).
@@ -278,6 +278,8 @@ impl JwksCache {
 
 /// JWT verifier with JWKS key cache.
 pub struct JwtVerifier {
+    // Audit: cache operations are synchronous, never await, and tolerate retaining
+    // an inserted key if a holder panics before it returns.
     cache: Mutex<JwksCache>,
     default_key: Option<Vec<u8>>, // for HS256 tests
 }
@@ -304,12 +306,12 @@ impl JwtVerifier {
     }
 
     pub fn add_key(&self, kid: String, key_bytes: Vec<u8>) {
-        self.cache.lock().unwrap().insert(kid, key_bytes);
+        self.cache.lock().insert(kid, key_bytes);
     }
 
     /// Fill metric: jwks_cache_size.
     pub fn cache_size(&self) -> usize {
-        self.cache.lock().unwrap().len()
+        self.cache.lock().len()
     }
 
     /// Verify a JWT token (HS256 only). Returns JwtClaims on success.
@@ -345,7 +347,7 @@ impl JwtVerifier {
         // Key lookup
         let kid = header["kid"].as_str().map(String::from);
         let key = {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache.lock();
             kid.as_deref().and_then(|k| cache.get(k)).cloned()
         }
         .or_else(|| self.default_key.clone())
@@ -584,5 +586,30 @@ mod tests {
             verifier.add_key(format!("kid-{i}"), vec![0u8; 32]);
         }
         assert_eq!(verifier.cache_size(), MAX_JWKS_ENTRIES); // evicted oldest
+    }
+
+    #[test]
+    fn jwks_cache_remains_usable_after_holder_panics() {
+        let verifier = JwtVerifier::with_hs256_key(TEST_SECRET.to_vec());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cache = verifier.cache.lock();
+            cache.insert("abandoned".to_string(), b"abandoned-key".to_vec());
+            panic!("injected JWKS cache holder panic");
+        }));
+        assert!(panic.is_err());
+
+        verifier.add_key("peer".to_string(), b"peer-key".to_vec());
+        assert_eq!(verifier.cache_size(), 2);
+
+        let token = create_test_jwt(
+            "alice",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+            TEST_SECRET,
+        );
+        assert_eq!(verifier.verify(&token).unwrap().sub, "alice");
     }
 }

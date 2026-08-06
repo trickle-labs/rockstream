@@ -24,6 +24,7 @@ use datafusion::datasource::memory::MemTable;
 use datafusion::execution::context::SessionConfig;
 use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
 use datafusion::prelude::SessionContext;
+use parking_lot::Mutex;
 
 use rockstream_plan::PlanNode;
 use rockstream_types::explain::{ExplainLevel, OperatorStats, ShardInfo};
@@ -100,7 +101,9 @@ pub enum DdlStatement {
 /// and provides the methods below.
 pub struct SqlFrontend {
     ctx: SessionContext,
-    snapshot_tables: std::sync::Mutex<std::collections::HashSet<String>>,
+    // Audit: this set is updated synchronously before planning; retaining an
+    // inserted name after a holder panic is valid and no guard crosses an await.
+    snapshot_tables: Mutex<std::collections::HashSet<String>>,
 }
 
 pub fn register_session_sql_udf(ctx: &SessionContext) {
@@ -135,7 +138,7 @@ impl SqlFrontend {
         register_session_sql_udf(&ctx);
         Self {
             ctx,
-            snapshot_tables: std::sync::Mutex::new(std::collections::HashSet::new()),
+            snapshot_tables: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -153,10 +156,7 @@ impl SqlFrontend {
     /// Register an empty in-memory table as a snapshot source.
     pub fn register_snapshot_table(&self, name: &str, schema: SchemaRef) -> Result<(), SqlError> {
         self.register_table(name, schema)?;
-        self.snapshot_tables
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(name.to_string());
+        self.snapshot_tables.lock().insert(name.to_string());
         Ok(())
     }
 
@@ -169,11 +169,7 @@ impl SqlFrontend {
             message: e.to_string(),
         })?;
         let logical = df.into_optimized_plan()?;
-        let snapshot_sources = self
-            .snapshot_tables
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let snapshot_sources = self.snapshot_tables.lock().clone();
         lower_with_views(&logical, &Default::default(), &snapshot_sources)
     }
 
@@ -188,11 +184,7 @@ impl SqlFrontend {
             message: e.to_string(),
         })?;
         let logical = df.into_unoptimized_plan();
-        let snapshot_sources = self
-            .snapshot_tables
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let snapshot_sources = self.snapshot_tables.lock().clone();
         lower_with_views(&logical, &Default::default(), &snapshot_sources)
     }
 
@@ -208,11 +200,7 @@ impl SqlFrontend {
         let logical = df.into_optimized_plan()?;
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
-        let snapshot_sources = self
-            .snapshot_tables
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let snapshot_sources = self.snapshot_tables.lock().clone();
         lower_with_views(&logical, &registered_views, &snapshot_sources)
     }
 
@@ -228,11 +216,7 @@ impl SqlFrontend {
         let logical = df.into_unoptimized_plan();
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
-        let snapshot_sources = self
-            .snapshot_tables
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let snapshot_sources = self.snapshot_tables.lock().clone();
         lower_with_views(&logical, &registered_views, &snapshot_sources)
     }
 
@@ -260,11 +244,7 @@ impl SqlFrontend {
         let logical = df.into_optimized_plan()?;
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
-        let snapshot_sources = self
-            .snapshot_tables
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let snapshot_sources = self.snapshot_tables.lock().clone();
         let plan_node = lower_with_views(&logical, &registered_views, &snapshot_sources)?;
         catalog
             .register_view(name, query_sql, &plan_node, columns)
@@ -879,6 +859,42 @@ mod tests {
         assert_eq!(
             sql_plan, expected,
             "SQL-lowered plan should equal hand-coded plan.\nGot: {sql_plan:?}\nExpected: {expected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_table_planning_survives_registration_panic() {
+        let frontend = SqlFrontend::new();
+        frontend
+            .register_snapshot_table("snap", two_col_schema())
+            .unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut snapshots = frontend.snapshot_tables.lock();
+            snapshots.insert("abandoned".to_string());
+            panic!("injected snapshot registration panic");
+        }));
+        assert!(panic.is_err());
+
+        let expected = PlanNode::Project {
+            input: Box::new(PlanNode::Snapshot {
+                source_name: "snap".to_string(),
+                batch_size: 1000,
+            }),
+            columns: vec![Expr::Column(0)],
+        };
+        assert_eq!(
+            frontend
+                .sql_to_plan_node("SELECT a FROM snap")
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            frontend
+                .sql_to_unoptimized_plan_node("SELECT a FROM snap")
+                .await
+                .unwrap(),
+            expected
         );
     }
 

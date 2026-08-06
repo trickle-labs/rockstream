@@ -85,6 +85,13 @@ pub fn register_coord_faults(model: &mut FaultModel) {
                        must still be preferred and no frame may be stranded while domains refresh.",
         category: FaultCategory::Timing,
     });
+    model.register(FaultEntry {
+        id: "lock_poisoning.holder_panic",
+        description:
+            "A task panics while holding shared lock state; peer operations must continue \
+                       without PoisonError, lock acquisition stalls, or degraded service.",
+        category: FaultCategory::Logic,
+    });
 }
 
 /// Fault-model entries registered by `register_coord_faults`.
@@ -100,6 +107,7 @@ pub const COORD_FAULT_IDS: &[&str] = &[
     "exchange.az_metadata_missing",
     "exchange.shm_segment_unavailable",
     "exchange.domain_rebuild_during_drain",
+    "lock_poisoning.holder_panic",
 ];
 
 #[cfg(test)]

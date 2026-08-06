@@ -24,6 +24,7 @@ rockstream-storage.workspace = true
 rockstream-sql.workspace = true
 rand.workspace = true
 dashmap.workspace = true
+parking_lot.workspace = true
 lru.workspace = true
 sha2.workspace = true
 hmac.workspace = true
@@ -65,5 +66,4 @@ rcgen.workspace = true
 tokio-postgres-rustls.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 rockstream-connectors = { workspace = true }
-
 

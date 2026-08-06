@@ -28,6 +28,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::SinkExt;
 use futures::{stream, Sink, StreamExt};
+use parking_lot::Mutex;
 use pgwire::api::auth::{
     finish_authentication, save_startup_parameters_to_metadata, ServerParameterProvider,
     StartupHandler,
@@ -1669,7 +1670,9 @@ pub struct GatewayHandler {
     compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
     /// Runtime-only webhook credentials and bounded epoch buffers.  Entries
     /// are installed and removed with the catalog source lifecycle.
-    webhook_sources: Arc<DashMap<String, Arc<std::sync::Mutex<HttpWebhookSource>>>>,
+    // Audit: each guard protects a synchronous source-state transition that
+    // remains valid after a holder panic; guards are dropped before awaits.
+    webhook_sources: Arc<DashMap<String, Arc<Mutex<HttpWebhookSource>>>>,
 }
 
 impl GatewayHandler {
@@ -1710,7 +1713,7 @@ impl GatewayHandler {
             return WebhookResult::NotFound;
         };
         let (result, pending) = {
-            let mut source = source.lock().unwrap_or_else(|p| p.into_inner());
+            let mut source = source.lock();
             let result = source.accept(token, delivery_id, payload);
             let pending = if result == WebhookResult::Accepted {
                 source.next_pending()
@@ -1728,20 +1731,14 @@ impl GatewayHandler {
                 let payload = match serde_json::to_vec(&pending) {
                     Ok(payload) => payload,
                     Err(_) => {
-                        source
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .abort_pending(&pending.delivery_id);
+                        source.lock().abort_pending(&pending.delivery_id);
                         return WebhookResult::DurabilityFailed;
                     }
                 };
                 let mut batch = rockstream_storage::WriteBatch::new();
                 batch.put(key.as_bytes(), &payload);
                 if shard_db.write_batch(batch).await.is_err() || shard_db.flush().await.is_err() {
-                    source
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .abort_pending(&pending.delivery_id);
+                    source.lock().abort_pending(&pending.delivery_id);
                     return WebhookResult::DurabilityFailed;
                 }
             }
@@ -1750,7 +1747,7 @@ impl GatewayHandler {
             // transaction commits. A gateway without an attached ShardDb is
             // the in-memory test/control-plane mode and retains its bounded
             // local acknowledgement semantics.
-            let mut source = source.lock().unwrap_or_else(|p| p.into_inner());
+            let mut source = source.lock();
             let Some(committed) = source.commit_pending(&pending.delivery_id) else {
                 // Delivery ID was not found in the accepted queue — return
                 // DurabilityFailed rather than panicking. This can occur
@@ -5169,7 +5166,7 @@ impl GatewayHandler {
             };
             self.webhook_sources.insert(
                 parsed.name.clone(),
-                Arc::new(std::sync::Mutex::new(HttpWebhookSource::new(token, format))),
+                Arc::new(Mutex::new(HttpWebhookSource::new(token, format))),
             );
         }
 
@@ -5203,9 +5200,7 @@ impl GatewayHandler {
             AlterSourceAction::Pause => {
                 self.catalog.update_source_status(&parsed.name, "PAUSED");
                 if let Some(source) = self.webhook_sources.get(&parsed.name) {
-                    if let Ok(mut src) = source.lock() {
-                        src.set_paused(true);
-                    }
+                    source.lock().set_paused(true);
                 }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
@@ -5219,9 +5214,7 @@ impl GatewayHandler {
             AlterSourceAction::Resume => {
                 self.catalog.update_source_status(&parsed.name, "OK");
                 if let Some(source) = self.webhook_sources.get(&parsed.name) {
-                    if let Ok(mut src) = source.lock() {
-                        src.set_paused(false);
-                    }
+                    source.lock().set_paused(false);
                 }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
@@ -5250,10 +5243,7 @@ impl GatewayHandler {
                         "[RS-4016] ALTER SOURCE ADVANCE WATERMARK is supported only for http_webhook sources. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
                     ))]);
                 };
-                let res = match source.lock() {
-                    Ok(mut src) => src.advance_watermark(watermark),
-                    Err(_) => Err("[RS-4008] webhook source lock error"),
-                };
+                let res = source.lock().advance_watermark(watermark);
                 if let Err(message) = res {
                     return Ok(vec![create_source_error_response(message.to_string())]);
                 }
@@ -12617,6 +12607,57 @@ mod s4_tests {
         let catalog = Arc::new(CatalogStubs::new());
         let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
         Arc::new(GatewayHandler::new(catalog, reader))
+    }
+
+    #[tokio::test]
+    async fn webhook_panic_does_not_block_peer_delivery_or_source_lifecycle() {
+        let handler = make_handler();
+        handler
+            .handle_create_source(
+                "CREATE SOURCE orders TYPE http_webhook (credential_ref='secret') FORMAT json",
+            )
+            .unwrap();
+        let source = handler
+            .webhook_sources
+            .get("orders")
+            .expect("CREATE SOURCE installs the webhook state")
+            .value()
+            .clone();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut source = source.lock();
+            source.set_paused(false);
+            panic!("injected webhook registry holder panic");
+        }));
+        assert!(panic.is_err());
+
+        assert_eq!(
+            handler
+                .accept_webhook("orders", b"secret", Some("delivery-1"), br#"{}"#)
+                .await,
+            WebhookResult::Accepted
+        );
+        assert!(handler
+            .handle_alter_source("ALTER SOURCE orders PAUSE")
+            .is_ok());
+        assert_eq!(
+            handler
+                .accept_webhook("orders", b"secret", Some("delivery-2"), br#"{}"#)
+                .await,
+            WebhookResult::Paused
+        );
+        assert!(handler
+            .handle_alter_source("ALTER SOURCE orders RESUME")
+            .is_ok());
+        assert!(handler
+            .handle_alter_source("ALTER SOURCE orders ADVANCE WATERMARK 7")
+            .is_ok());
+        assert!(handler.handle_alter_source("DROP SOURCE orders").is_ok());
+        assert_eq!(
+            handler
+                .accept_webhook("orders", b"secret", Some("delivery-3"), br#"{}"#)
+                .await,
+            WebhookResult::NotFound
+        );
     }
 
     #[test]

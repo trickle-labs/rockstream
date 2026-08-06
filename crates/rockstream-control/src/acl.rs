@@ -5,9 +5,9 @@
 //! Cache: up to MAX_ACL_CACHE_ENTRIES with 60s TTL; fill metric: acl_cache_size.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use parking_lot::RwLock;
 use rockstream_types::acl::{AclEntry, Role};
 
 /// Max ACL cache entries (LRU; default 10,000).
@@ -105,6 +105,8 @@ impl AclStoreInner {
 
 /// Thread-safe ACL store.
 pub struct AclStore {
+    // Audit: each synchronous map update preserves a valid ACL/cache state if a
+    // holder panics; no guard crosses an await or external call.
     inner: RwLock<AclStoreInner>,
 }
 
@@ -117,12 +119,12 @@ impl AclStore {
 
     /// Fill metric: acl_cache_size gauge.
     pub fn cache_size(&self) -> usize {
-        self.inner.read().unwrap().cache.len()
+        self.inner.read().cache.len()
     }
 
     /// Grant an ACL entry. Point-write (not range-write).
     pub fn grant(&self, entry: AclEntry) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         let key = AclKey {
             principal: entry.principal.clone(),
             namespace: entry.namespace.clone(),
@@ -139,7 +141,7 @@ impl AclStore {
             namespace: namespace.to_string(),
             view_name: view_name.map(String::from),
         };
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         inner.entries.remove(&key);
         inner.cache.remove(&key);
     }
@@ -152,7 +154,7 @@ impl AclStore {
         namespace: &str,
         view_name: Option<&str>,
     ) -> Option<Role> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         if let Some(vn) = view_name {
             let vk = AclKey {
@@ -300,5 +302,42 @@ mod tests {
         assert!(store
             .check("system", "any-ns", Some("any-view"), Role::Admin)
             .is_ok());
+    }
+
+    #[test]
+    fn acl_store_peer_grant_revoke_and_check_survive_writer_panic() {
+        let store = AclStore::new();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut inner = store.inner.write();
+            inner.entries.insert(
+                AclKey {
+                    principal: "abandoned".to_string(),
+                    namespace: "public".to_string(),
+                    view_name: None,
+                },
+                AclEntry {
+                    principal: "abandoned".to_string(),
+                    namespace: "public".to_string(),
+                    view_name: None,
+                    role: Role::Viewer,
+                },
+            );
+            panic!("injected ACL writer panic");
+        }));
+        assert!(panic.is_err());
+
+        let peer = AclEntry {
+            principal: "peer".to_string(),
+            namespace: "public".to_string(),
+            view_name: None,
+            role: Role::Admin,
+        };
+        store.grant(peer);
+        assert!(store.check("peer", "public", None, Role::Admin).is_ok());
+        store.revoke("peer", "public", None);
+        assert!(matches!(
+            store.check("peer", "public", None, Role::Viewer),
+            Err(AclError::PermissionDenied { .. })
+        ));
     }
 }

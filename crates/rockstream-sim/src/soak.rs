@@ -285,6 +285,10 @@ pub fn build_initial_corpus() -> SeedCorpus {
         seed: 0xFFFF_FFFF_FFFF_FFFF,
         description: "Max seed: verifies deterministic behaviour at RNG maximum",
     });
+    corpus.add_regression_seed(RegressionSeed {
+        seed: 0x5101_9000_0000_0001,
+        description: "Lock poisoning: holder panic must not poison GLOBAL_DLQ for peer operations",
+    });
 
     corpus
 }
