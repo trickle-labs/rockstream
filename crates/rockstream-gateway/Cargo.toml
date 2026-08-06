@@ -64,3 +64,6 @@ async-trait.workspace = true
 rcgen.workspace = true
 tokio-postgres-rustls.workspace = true
 uuid = { workspace = true, features = ["v4"] }
+rockstream-connectors = { workspace = true }
+
+

@@ -1,7 +1,9 @@
-//! Bounded, authenticated HTTP-webhook source state.
+//! Bounded HTTP webhook source (`http_webhook`).
 //!
-//! The TCP listener lives in `server`; this module deliberately owns the
-//! source-side invariants so tests and the listener share one implementation.
+//! Accepts authenticated JSON or CSV payloads over POST requests, assigning
+//! sequential, monotonic source epochs before passing them to gateway ingestion.
+
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::{HashSet, VecDeque};
 
@@ -222,7 +224,9 @@ impl HttpWebhookSource {
         else {
             return false;
         };
-        let epoch = self.accepted.remove(index).expect("checked accepted index");
+        let Some(epoch) = self.accepted.remove(index) else {
+            return false;
+        };
         self.pending.remove(&epoch.delivery_id)
     }
 }
@@ -230,7 +234,13 @@ impl HttpWebhookSource {
 fn valid_payload(format: WebhookFormat, payload: &[u8]) -> bool {
     match format {
         WebhookFormat::Json => serde_json::from_slice::<serde_json::Value>(payload).is_ok(),
-        WebhookFormat::Csv => !payload.is_empty() && std::str::from_utf8(payload).is_ok(),
+        WebhookFormat::Csv => {
+            if payload.is_empty() || std::str::from_utf8(payload).is_err() {
+                return false;
+            }
+            let quote_count = payload.iter().filter(|&&b| b == b'"').count();
+            quote_count % 2 == 0
+        }
     }
 }
 
@@ -254,7 +264,12 @@ mod tests {
             source.accept(b"secret", Some("a"), br#"{"id":1}"#),
             WebhookResult::Accepted
         );
-        assert_eq!(source.commit_next().unwrap().payload, br#"{"id":1}"#);
+        let commit = source.commit_next();
+        assert!(commit.is_some());
+        assert_eq!(
+            commit.as_ref().map(|c| c.payload.as_slice()),
+            Some(br#"{"id":1}"#.as_slice())
+        );
         assert_eq!(
             source.accept(b"secret", Some("a"), br#"{"id":1}"#),
             WebhookResult::Duplicate

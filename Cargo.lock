@@ -184,6 +184,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+
+[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4688,6 +4694,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libfuzzer-sys"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
+dependencies = [
+ "arbitrary",
+ "cc",
+]
+
+[[package]]
 name = "liblzma"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6612,6 +6628,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rockstream-fuzz"
+version = "0.42.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "libfuzzer-sys",
+ "rockstream-connectors",
+ "rockstream-gateway",
+ "rockstream-sql",
+ "rockstream-types",
+ "tokio",
+]
+
+[[package]]
 name = "rockstream-gateway"
 version = "0.42.0"
 dependencies = [
@@ -6634,6 +6664,7 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "reqwest 0.12.28",
+ "rockstream-connectors",
  "rockstream-control",
  "rockstream-diff",
  "rockstream-ops",

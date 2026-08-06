@@ -14,6 +14,7 @@ members = [
     "crates/rockstream-sql",
     "crates/rockstream-storage",
     "crates/rockstream-types",
+    "fuzz",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ license = "Apache-2.0"
 repository = "https://github.com/trickle-labs/rockstream"
 
 [workspace.dependencies]
+libfuzzer-sys = "0.4"
 # Shared workspace dependencies
 arrow = "58"
 arrow-flight = "58"

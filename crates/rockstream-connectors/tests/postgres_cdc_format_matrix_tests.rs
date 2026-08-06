@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use rockstream_connectors::{
-    CdcChange, CdcWireFormat, PgLsn, PostgresCdcSource, SourceConnector,
-};
+use rockstream_connectors::{CdcChange, CdcWireFormat, PgLsn, PostgresCdcSource, SourceConnector};
 use rockstream_types::arrow_batch::split_weight_column;
 use rockstream_types::ids::ConnectorId;
 

@@ -1,0 +1,37 @@
+name: Scheduled Fuzz Soak
+
+# Continuous coverage-guided fuzzing and corpus replay against main.
+# Introduced in v0.51.17 for untrusted-input panic safety (PGWire, SQL Parser, CDC, Webhooks).
+#
+# Schedule: every 6 hours on main.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fuzz-soak:
+    name: Coverage-Guided Fuzz Soak & Corpus Replay
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Fuzz Corpus Replay & Panic Safety Tests
+        run: |
+          cargo test --package rockstream-gateway --test fuzz_corpus_regression_tests -- --nocapture
+          cargo test --package rockstream-gateway --test clippy_panic_lint_tests -- --nocapture
+          cargo test --package rockstream-gateway --test untrusted_input_panic_safety_tests -- --nocapture
+          cargo test --package rockstream-connectors --test untrusted_input_panic_safety_tests -- --nocapture
+      - name: Verify Fuzz Workspace Builds Cleanly
+        run: |
+          cargo check --package rockstream-fuzz

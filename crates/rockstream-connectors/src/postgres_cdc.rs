@@ -4,7 +4,10 @@
 //! decoded, credit-controlled handoff into the source epoch.  Consequently a
 //! zero-credit poll never consumes another replication message.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::VecDeque;
+
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -404,7 +407,9 @@ impl SourceConnector for PostgresCdcSource {
             if !changes.is_empty() && used_bytes.saturating_add(queued.bytes) > max_bytes {
                 break;
             }
-            let queued = self.queued.pop_front().expect("front checked");
+            let Some(queued) = self.queued.pop_front() else {
+                break;
+            };
             self.queued_bytes = self.queued_bytes.saturating_sub(queued.bytes);
             used_bytes += queued.bytes;
             if queued.change.lsn > after {
@@ -424,7 +429,17 @@ impl SourceConnector for PostgresCdcSource {
         {
             self.replication_read_paused = false;
         }
-        let last_lsn = changes.last().expect("not empty").lsn;
+        let last_lsn = match changes.last() {
+            Some(c) => c.lsn,
+            None => {
+                return Ok(PollDeltaResult {
+                    batches: Vec::new(),
+                    new_offset: after.to_offset_token(),
+                    watermark: None,
+                });
+            }
+        };
+
         let batch = Self::batch_for(&changes, self.schema.clone())?;
         Ok(PollDeltaResult {
             batches: vec![batch],
@@ -544,4 +559,36 @@ fn parse_values(value: &str) -> Result<Vec<i64>, SourceError> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use rockstream_types::ids::ConnectorId;
+
+    fn test_source(format: CdcWireFormat) -> PostgresCdcSource {
+        PostgresCdcSource::new(
+            ConnectorId(9999),
+            std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            format,
+        )
+    }
+
+    #[test]
+    fn cdc_pgoutput_truncated_tuple_returns_rs_error_no_panic() {
+        let mut cdc = test_source(CdcWireFormat::PgOutput);
+        let payload = b"B|0/16B3748|1001|I";
+        let res = cdc.decode_and_enqueue(payload);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn cdc_wal2json_malformed_json_returns_rs_error_no_panic() {
+        let mut cdc = test_source(CdcWireFormat::Wal2Json);
+        let payload = b"{\"change\": [invalid json";
+        let res = cdc.decode_and_enqueue(payload);
+        assert!(res.is_err());
+    }
 }

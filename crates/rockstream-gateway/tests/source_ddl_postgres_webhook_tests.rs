@@ -470,7 +470,10 @@ mod http_webhook_ingestion_tests {
             .unwrap();
         assert_eq!(bad.status().as_u16(), 400);
         let msg = bad.text().await.unwrap();
-        assert!(msg.contains("RS-4016") || msg.contains("RS-4008"), "msg: {msg}");
+        assert!(
+            msg.contains("RS-4016") || msg.contains("RS-4008"),
+            "msg: {msg}"
+        );
     }
 }
 
@@ -504,4 +507,3 @@ mod http_webhook_backpressure_tests {
         verify_webhook_returns_202_only_after_durable_m3_commit().await;
     }
 }
-

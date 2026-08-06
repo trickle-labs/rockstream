@@ -15,6 +15,8 @@
 //! unoptimized plan is used for lowering.  This gives deterministic plan
 //! structure that matches hand-coded `PlanNode` trees in tests.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
@@ -153,7 +155,7 @@ impl SqlFrontend {
         self.register_table(name, schema)?;
         self.snapshot_tables
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(name.to_string());
         Ok(())
     }
@@ -167,7 +169,11 @@ impl SqlFrontend {
             message: e.to_string(),
         })?;
         let logical = df.into_optimized_plan()?;
-        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        let snapshot_sources = self
+            .snapshot_tables
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         lower_with_views(&logical, &Default::default(), &snapshot_sources)
     }
 
@@ -182,7 +188,11 @@ impl SqlFrontend {
             message: e.to_string(),
         })?;
         let logical = df.into_unoptimized_plan();
-        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        let snapshot_sources = self
+            .snapshot_tables
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         lower_with_views(&logical, &Default::default(), &snapshot_sources)
     }
 
@@ -198,7 +208,11 @@ impl SqlFrontend {
         let logical = df.into_optimized_plan()?;
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
-        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        let snapshot_sources = self
+            .snapshot_tables
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         lower_with_views(&logical, &registered_views, &snapshot_sources)
     }
 
@@ -214,7 +228,11 @@ impl SqlFrontend {
         let logical = df.into_unoptimized_plan();
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
-        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        let snapshot_sources = self
+            .snapshot_tables
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         lower_with_views(&logical, &registered_views, &snapshot_sources)
     }
 
@@ -242,7 +260,11 @@ impl SqlFrontend {
         let logical = df.into_optimized_plan()?;
         let registered_views: std::collections::HashSet<String> =
             catalog.list_view_names().await?.into_iter().collect();
-        let snapshot_sources = self.snapshot_tables.lock().unwrap().clone();
+        let snapshot_sources = self
+            .snapshot_tables
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let plan_node = lower_with_views(&logical, &registered_views, &snapshot_sources)?;
         catalog
             .register_view(name, query_sql, &plan_node, columns)
@@ -793,7 +815,9 @@ impl SqlFrontend {
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
     use super::*;
     #[allow(unused_imports)]
     use crate::frontend::DdlStatement;

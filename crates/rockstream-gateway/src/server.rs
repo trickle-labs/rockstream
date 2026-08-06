@@ -4,7 +4,10 @@
 //! pgwire library. The same handler implements both simple and extended query
 //! protocols.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::{HashMap, HashSet};
+
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1093,9 +1096,22 @@ impl<'a> postgres_types::FromSql<'a> for PgInterval {
         if raw.len() != 16 {
             return Err("[RS-0001] invalid interval binary length; next_steps: send the 16-byte PostgreSQL INTERVAL binary representation".into());
         }
-        let microseconds = i64::from_be_bytes(raw[0..8].try_into().unwrap());
-        let days = i32::from_be_bytes(raw[8..12].try_into().unwrap());
-        let months = i32::from_be_bytes(raw[12..16].try_into().unwrap());
+        let microseconds = i64::from_be_bytes(
+            raw[0..8]
+                .try_into()
+                .map_err(|_| "[RS-0001] invalid interval slice")?,
+        );
+        let days = i32::from_be_bytes(
+            raw[8..12]
+                .try_into()
+                .map_err(|_| "[RS-0001] invalid interval slice")?,
+        );
+        let months = i32::from_be_bytes(
+            raw[12..16]
+                .try_into()
+                .map_err(|_| "[RS-0001] invalid interval slice")?,
+        );
+
         Ok(PgInterval {
             months,
             days,
@@ -1522,9 +1538,12 @@ impl QueryTimeShardTopologyProvider {
                 .await
                 .map_err(|_| GatewayError::QueryTimeScatterTopologyUnavailable)?
             {
-                Some(bytes) if bytes.len() == 8 => {
-                    u64::from_be_bytes(bytes[..8].try_into().expect("checked length"))
-                }
+                Some(bytes) if bytes.len() == 8 => u64::from_be_bytes(
+                    bytes[..8]
+                        .try_into()
+                        .map_err(|_| GatewayError::QueryTimeScatterTopologyUnavailable)?,
+                ),
+
                 Some(_) => return Err(GatewayError::QueryTimeScatterTopologyUnavailable),
                 None => 0,
             };
@@ -1691,7 +1710,7 @@ impl GatewayHandler {
             return WebhookResult::NotFound;
         };
         let (result, pending) = {
-            let mut source = source.lock().expect("webhook source lock");
+            let mut source = source.lock().unwrap_or_else(|p| p.into_inner());
             let result = source.accept(token, delivery_id, payload);
             let pending = if result == WebhookResult::Accepted {
                 source.next_pending()
@@ -1711,7 +1730,7 @@ impl GatewayHandler {
                     Err(_) => {
                         source
                             .lock()
-                            .expect("webhook source lock")
+                            .unwrap_or_else(|p| p.into_inner())
                             .abort_pending(&pending.delivery_id);
                         return WebhookResult::DurabilityFailed;
                     }
@@ -1721,7 +1740,7 @@ impl GatewayHandler {
                 if shard_db.write_batch(batch).await.is_err() || shard_db.flush().await.is_err() {
                     source
                         .lock()
-                        .expect("webhook source lock")
+                        .unwrap_or_else(|p| p.into_inner())
                         .abort_pending(&pending.delivery_id);
                     return WebhookResult::DurabilityFailed;
                 }
@@ -1731,10 +1750,13 @@ impl GatewayHandler {
             // transaction commits. A gateway without an attached ShardDb is
             // the in-memory test/control-plane mode and retains its bounded
             // local acknowledgement semantics.
-            let mut source = source.lock().expect("webhook source lock");
-            let committed = source
-                .commit_pending(&pending.delivery_id)
-                .expect("accepted epoch remains queued until durable commit");
+            let mut source = source.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(committed) = source.commit_pending(&pending.delivery_id) else {
+                // Delivery ID was not found in the accepted queue — return
+                // DurabilityFailed rather than panicking. This can occur
+                // if a concurrent abort already removed the entry (RS-4017).
+                return WebhookResult::DurabilityFailed;
+            };
             self.catalog.update_source_runtime_detail(
                 source_name,
                 Some("gateway:webhook".to_string()),
@@ -4962,13 +4984,30 @@ impl GatewayHandler {
         let ql = q.to_lowercase();
         let if_not_exists = ql.contains("if not exists");
 
-        // Parse: "CREATE TABLE [IF NOT EXISTS] <name> (col type, ...)"
         let after = if if_not_exists {
-            let pos = ql.find("if not exists").unwrap() + "if not exists".len();
-            q[pos..].trim()
+            let pos = match ql.find("if not exists") {
+                Some(p) => p + "if not exists".len(),
+                None => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "[RS-2000] malformed CREATE TABLE DDL".to_owned(),
+                    )))]);
+                }
+            };
+            q.get(pos..).unwrap_or("").trim()
         } else {
-            let pos = ql.find("create table").unwrap() + "create table".len();
-            q[pos..].trim()
+            let pos = match ql.find("create table") {
+                Some(p) => p + "create table".len(),
+                None => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "[RS-2000] malformed CREATE TABLE DDL".to_owned(),
+                    )))]);
+                }
+            };
+            q.get(pos..).unwrap_or("").trim()
         };
 
         // Extract table name (up to first whitespace or '(')
@@ -5118,12 +5157,16 @@ impl GatewayHandler {
             // A credential reference is catalog-safe metadata.  The listener
             // keeps its verifier only in runtime memory and never returns it
             // through SHOW SOURCE STATUS.
-            let format = WebhookFormat::parse(&parsed.format)
-                .expect("DDL validation permits only JSON or CSV webhook formats");
-            let token = parsed
-                .options
-                .get("credential_ref")
-                .expect("validated credential ref");
+            let Some(format) = WebhookFormat::parse(&parsed.format) else {
+                return Ok(vec![create_source_error_response(
+                    "[RS-4008] invalid webhook format".to_string(),
+                )]);
+            };
+            let Some(token) = parsed.options.get("credential_ref") else {
+                return Ok(vec![create_source_error_response(
+                    "[RS-4008] missing credential_ref".to_string(),
+                )]);
+            };
             self.webhook_sources.insert(
                 parsed.name.clone(),
                 Arc::new(std::sync::Mutex::new(HttpWebhookSource::new(token, format))),
@@ -5160,7 +5203,9 @@ impl GatewayHandler {
             AlterSourceAction::Pause => {
                 self.catalog.update_source_status(&parsed.name, "PAUSED");
                 if let Some(source) = self.webhook_sources.get(&parsed.name) {
-                    source.lock().expect("webhook source lock").set_paused(true);
+                    if let Ok(mut src) = source.lock() {
+                        src.set_paused(true);
+                    }
                 }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
@@ -5174,10 +5219,9 @@ impl GatewayHandler {
             AlterSourceAction::Resume => {
                 self.catalog.update_source_status(&parsed.name, "OK");
                 if let Some(source) = self.webhook_sources.get(&parsed.name) {
-                    source
-                        .lock()
-                        .expect("webhook source lock")
-                        .set_paused(false);
+                    if let Ok(mut src) = source.lock() {
+                        src.set_paused(false);
+                    }
                 }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
@@ -5206,13 +5250,14 @@ impl GatewayHandler {
                         "[RS-4016] ALTER SOURCE ADVANCE WATERMARK is supported only for http_webhook sources. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
                     ))]);
                 };
-                if let Err(message) = source
-                    .lock()
-                    .expect("webhook source lock")
-                    .advance_watermark(watermark)
-                {
+                let res = match source.lock() {
+                    Ok(mut src) => src.advance_watermark(watermark),
+                    Err(_) => Err("[RS-4008] webhook source lock error"),
+                };
+                if let Err(message) = res {
                     return Ok(vec![create_source_error_response(message.to_string())]);
                 }
+
                 self.catalog
                     .update_source_runtime(&parsed.name, watermark.to_string(), 0);
                 if let Some(log) = &self.audit_log {
@@ -6934,13 +6979,16 @@ impl GatewayHandler {
                     captured_row = Some(row);
                 }
                 None if returning_cols.is_some() => {
-                    return Ok(vec![self.build_returning_response(
-                        &table,
-                        &table_columns,
-                        returning_cols.as_ref().expect("checked Some above"),
-                        Vec::new(),
-                    )]);
+                    if let Some(ref rcols) = returning_cols {
+                        return Ok(vec![self.build_returning_response(
+                            &table,
+                            &table_columns,
+                            rcols,
+                            Vec::new(),
+                        )]);
+                    }
                 }
+
                 None => {}
             }
         }
@@ -7065,13 +7113,10 @@ impl GatewayHandler {
         // Resolve columns: use declared list, or infer from catalog.
         let columns = if !requested_cols.is_empty() {
             requested_cols
+        } else if let Some(ref cat_tbl) = catalog_table {
+            cat_tbl.columns.iter().map(|c| c.name.clone()).collect()
         } else {
-            catalog_table
-                .unwrap()
-                .columns
-                .iter()
-                .map(|c| c.name.clone())
-                .collect()
+            Vec::new()
         };
 
         let col_count = columns.len();
@@ -7808,7 +7853,8 @@ impl ExtendedQueryHandler for GatewayHandler {
                 .entry(conn_id.clone())
                 .or_insert_with(|| {
                     lru::LruCache::new(
-                        std::num::NonZeroUsize::new(MAX_PREPARED_STATEMENTS_PER_CONN).unwrap(),
+                        std::num::NonZeroUsize::new(MAX_PREPARED_STATEMENTS_PER_CONN)
+                            .unwrap_or(std::num::NonZeroUsize::MIN),
                     )
                 });
             let is_new = !conn_stmts.contains(&stmt_name);
@@ -7872,7 +7918,8 @@ impl ExtendedQueryHandler for GatewayHandler {
                     .entry(conn_id.clone())
                     .or_insert_with(|| {
                         lru::LruCache::new(
-                            std::num::NonZeroUsize::new(MAX_PORTALS_PER_CONN).unwrap(),
+                            std::num::NonZeroUsize::new(MAX_PORTALS_PER_CONN)
+                                .unwrap_or(std::num::NonZeroUsize::MIN),
                         )
                     });
             let is_new = !conn_portals.contains(&portal_name);
@@ -8309,12 +8356,7 @@ impl CopyHandler for GatewayHandler {
             let mut new_ops: Vec<DmlOp> = Vec::new();
             let mut col_mismatch: Option<(usize, usize)> = None;
 
-            loop {
-                let nl = state.partial_line.find('\n');
-                if nl.is_none() {
-                    break;
-                }
-                let nl_pos = nl.unwrap();
+            while let Some(nl_pos) = state.partial_line.find('\n') {
                 let raw_line = state.partial_line[..nl_pos].to_string();
                 state.partial_line.drain(..=nl_pos);
 
@@ -8614,9 +8656,9 @@ impl GatewayServer {
     /// Query-time execution keeps that topology intact rather than reverting to
     /// the local shard after authentication wrapping.
     pub fn with_query_time_shard_topology(mut self, topology: QueryTimeShardTopology) -> Self {
-        Arc::get_mut(&mut self.handler)
-            .expect("GatewayServer construction keeps the handler uniquely owned")
-            .query_time_shard_topology = Some(Arc::new(topology));
+        if let Some(h) = Arc::get_mut(&mut self.handler) {
+            h.query_time_shard_topology = Some(Arc::new(topology));
+        }
         self
     }
 
@@ -8626,9 +8668,9 @@ impl GatewayServer {
         mut self,
         provider: QueryTimeShardTopologyProvider,
     ) -> Self {
-        Arc::get_mut(&mut self.handler)
-            .expect("GatewayServer construction keeps the handler uniquely owned")
-            .query_time_shard_topology_provider = Some(Arc::new(provider));
+        if let Some(h) = Arc::get_mut(&mut self.handler) {
+            h.query_time_shard_topology_provider = Some(Arc::new(provider));
+        }
         self
     }
 
@@ -9044,6 +9086,14 @@ impl GatewayServer {
                 ),
             ));
         }
+    }
+
+    /// Process a TCP stream through pgwire.
+    pub async fn process_raw_socket(&self, socket: tokio::net::TcpStream) {
+        let factory = Arc::new(GatewayHandlerFactory {
+            handler: self.handler.clone(),
+        });
+        let _ = pgwire::tokio::process_socket(socket, self.tls_acceptor.clone(), factory).await;
     }
 
     /// Bind to `addr`, return the actual local address (useful for port 0 tests),
@@ -10328,15 +10378,16 @@ impl PartitionStream for QueryTimeScatterPartition {
                     });
                     state.receiver = Some(receiver);
                 }
-                let receiver = state.receiver.as_mut().expect("initialized above");
+                let Some(receiver) = state.receiver.as_mut() else {
+                    break;
+                };
                 if state.batch_permit.is_none() {
-                    state.batch_permit = Some(
-                        QUERY_TIME_SCATTER_BATCH_PERMITS
-                            .acquire()
-                            .await
-                            .expect("static semaphore is never closed"),
-                    );
+                    let Ok(permit) = QUERY_TIME_SCATTER_BATCH_PERMITS.acquire().await else {
+                        break;
+                    };
+                    state.batch_permit = Some(permit);
                 }
+
                 match receiver.recv().await {
                     Some(Ok(page)) => {
                         let rows = page.len();
@@ -10380,6 +10431,7 @@ impl PartitionStream for QueryTimeScatterPartition {
                     None => state.receiver = None,
                 }
             }
+            None
         });
         Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
     }
@@ -10659,7 +10711,7 @@ fn extract_where_range(q: &str) -> Option<(String, i64, i64)> {
                 if col.is_empty() {
                     return None;
                 }
-                return Some((col, op.chars().next().unwrap(), is_lower, val));
+                return Some((col, op.chars().next()?, is_lower, val));
             }
         }
         None
@@ -11528,7 +11580,12 @@ fn parse_alter_source_ddl(q: &str) -> Result<ParsedAlterSource, String> {
             action: AlterSourceAction::AdvanceWatermark(watermark),
         });
     }
-    let action_str = tokens.last().unwrap().to_lowercase();
+    let Some(last_tok) = tokens.last() else {
+        return Err(format!(
+            "[RS-4008] invalid ALTER SOURCE statement. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
+        ));
+    };
+    let action_str = last_tok.to_lowercase();
     let name = tokens[..tokens.len() - 1]
         .join(" ")
         .trim_matches('"')
@@ -11562,7 +11619,9 @@ fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {
                 current.push(ch);
                 if in_string {
                     if chars.peek() == Some(&'\'') {
-                        current.push(chars.next().unwrap());
+                        if let Some(next_quote) = chars.next() {
+                            current.push(next_quote);
+                        }
                     } else {
                         in_string = false;
                     }
@@ -11570,6 +11629,7 @@ fn split_top_level_comma_list(input: &str) -> Result<Vec<String>, String> {
                     in_string = true;
                 }
             }
+
             '[' if !in_string => {
                 bracket_depth += 1;
                 current.push(ch);
@@ -12325,7 +12385,8 @@ type ParsedUpdate = (
 fn parse_update(q: &str) -> Result<ParsedUpdate, String> {
     let ql = q.to_lowercase();
     let after = ql.strip_prefix("update ").ok_or("not UPDATE")?.trim_start();
-    let _orig_after = q[q.to_lowercase().find("update ").unwrap() + 7..].trim_start();
+    let update_pos = ql.find("update ").ok_or("not UPDATE")?;
+    let _orig_after = q.get(update_pos + 7..).unwrap_or("").trim_start();
 
     // Table name
     let name_end = after
@@ -12518,7 +12579,9 @@ fn parse_value_list(s: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod s4_tests {
+
     use super::*;
     use crate::auth::Principal;
     use crate::catalog_stubs::{CatalogColumn, CatalogStubs, CatalogView};
@@ -12884,7 +12947,9 @@ mod s4_tests {
 // ── v0.42.2: multi-row VALUES parsing ───────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod parse_insert_tests {
+
     use super::*;
 
     /// v0.42.2 green gate: a multi-row `VALUES (...), (...), (...)` list is
@@ -12995,7 +13060,9 @@ mod parse_insert_tests {
 // ── v0.48: RETURNING clause parsing for UPDATE/DELETE ───────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod parse_update_returning_tests {
+
     use super::*;
 
     /// v0.48 Slice A1 green gate: `UPDATE ... RETURNING *` parses, keeping
@@ -13043,7 +13110,9 @@ mod parse_update_returning_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod parse_delete_returning_tests {
+
     use super::*;
 
     /// v0.48 Slice A1 green gate: `DELETE ... RETURNING <col list>` parses.

@@ -1,0 +1,44 @@
+[package]
+name = "rockstream-fuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { workspace = true }
+rockstream-sql = { workspace = true }
+rockstream-gateway = { workspace = true }
+rockstream-connectors = { workspace = true }
+rockstream-types = { workspace = true }
+arrow = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+[[bin]]
+name = "fuzz_sql_parser"
+path = "fuzz_targets/fuzz_sql_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_pgwire_decoder"
+path = "fuzz_targets/fuzz_pgwire_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_postgres_cdc"
+path = "fuzz_targets/fuzz_postgres_cdc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_webhook_body"
+path = "fuzz_targets/fuzz_webhook_body.rs"
+test = false
+doc = false

@@ -314,5 +314,3 @@ fn seeded_slot_invalidation_recovery() {
 fn seeded_wal_lag_backpressure() {
     seeded_lifecycle_race_never_revives_dropped_or_paused_source();
 }
-
-
