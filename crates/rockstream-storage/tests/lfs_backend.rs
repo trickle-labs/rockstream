@@ -13,7 +13,7 @@
 //! No code path uses range deletion — validated by the `no_range_delete`
 //! test that scans-and-deletes explicitly instead of calling a missing API.
 
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 use bytes::Bytes;
 use object_store::local::LocalFileSystem;
@@ -49,6 +49,19 @@ async fn lfs_put_get_roundtrip() {
     db.put(b"lfs_key", b"lfs_value").await.unwrap();
     let v = db.get(b"lfs_key").await.unwrap();
     assert_eq!(v, Some(Bytes::from("lfs_value")));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn commit_epoch_boundary_is_rs2060_without_wrap() {
+    let dir = TempDir::new().unwrap();
+    let db = lfs_shard(&dir).await;
+
+    db.last_epoch().store(u64::MAX - 1, Ordering::SeqCst);
+    assert_eq!(db.try_next_epoch(), Some(u64::MAX));
+    assert_eq!(db.try_next_epoch(), None);
+    assert_eq!(db.last_epoch().load(Ordering::SeqCst), u64::MAX);
+
     db.close().await.unwrap();
 }
 

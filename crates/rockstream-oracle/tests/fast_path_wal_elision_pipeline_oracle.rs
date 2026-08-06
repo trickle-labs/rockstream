@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Float64Array, Int64Array};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use parking_lot::RwLock;
@@ -91,7 +91,8 @@ fn project_to_category_value(join_out: &ArrowZSet) -> ArrowZSet {
     ArrowZSet::from_ab_weighted(&rows)
 }
 
-/// Accumulate all rows of an aggregate-output ZSet (4 Int64 columns) into a
+/// Accumulate all rows of an aggregate-output ZSet (three Int64 columns and one
+/// Float64 column) into a
 /// net weight map keyed by the full row. Zero-net rows are dropped, so the
 /// resulting map is the materialized aggregate relation.
 fn accumulate_full_rows(zset: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
@@ -99,17 +100,22 @@ fn accumulate_full_rows(zset: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
         return;
     }
     let ncols = zset.data.num_columns();
-    let cols: Vec<&Int64Array> = (0..ncols)
+    let cols: Vec<Vec<i64>> = (0..ncols)
         .map(|c| {
-            zset.data
-                .column(c)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
+            let column = zset.data.column(c);
+            if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+                (0..zset.num_rows()).map(|i| values.value(i)).collect()
+            } else if let Some(values) = column.as_any().downcast_ref::<Float64Array>() {
+                (0..zset.num_rows())
+                    .map(|i| values.value(i).to_bits() as i64)
+                    .collect()
+            } else {
+                panic!("aggregate oracle received unsupported column type: {column:?}");
+            }
         })
         .collect();
     for i in 0..zset.num_rows() {
-        let key: Vec<i64> = cols.iter().map(|c| c.value(i)).collect();
+        let key: Vec<i64> = cols.iter().map(|c| c[i]).collect();
         let entry = acc.entry(key.clone()).or_insert(0);
         *entry += zset.weights[i];
         if *entry == 0 {

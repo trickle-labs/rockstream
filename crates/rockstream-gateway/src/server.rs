@@ -12583,6 +12583,7 @@ fn parse_value_list(s: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+// These legacy parser tests intentionally use unwrap/expect for concise fixture assertions.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod s4_tests {
 
@@ -12951,6 +12952,7 @@ mod s4_tests {
 // ── v0.42.2: multi-row VALUES parsing ───────────────────────────────────────
 
 #[cfg(test)]
+// These parser tests intentionally use unwrap/expect for concise fixture assertions.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod parse_insert_tests {
 
@@ -13064,6 +13066,7 @@ mod parse_insert_tests {
 // ── v0.48: RETURNING clause parsing for UPDATE/DELETE ───────────────────────
 
 #[cfg(test)]
+// These parser tests intentionally use unwrap/expect for concise fixture assertions.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod parse_update_returning_tests {
 
@@ -13114,6 +13117,7 @@ mod parse_update_returning_tests {
 }
 
 #[cfg(test)]
+// These parser tests intentionally use unwrap/expect for concise fixture assertions.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod parse_delete_returning_tests {
 

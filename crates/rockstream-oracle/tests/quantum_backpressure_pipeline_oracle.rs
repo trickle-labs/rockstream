@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Float64Array, Int64Array};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
@@ -93,17 +93,19 @@ fn accumulate_full_rows(zset: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
         return;
     }
     let ncols = zset.data.num_columns();
-    let cols: Vec<&Int64Array> = (0..ncols)
-        .map(|c| {
-            zset.data
-                .column(c)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-        })
-        .collect();
     for i in 0..zset.num_rows() {
-        let key: Vec<i64> = cols.iter().map(|c| c.value(i)).collect();
+        let key: Vec<i64> = (0..ncols)
+            .map(|c| {
+                let column = zset.data.column(c);
+                if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+                    values.value(i)
+                } else if let Some(values) = column.as_any().downcast_ref::<Float64Array>() {
+                    values.value(i).to_bits() as i64
+                } else {
+                    panic!("aggregate oracle received unsupported output type")
+                }
+            })
+            .collect();
         let entry = acc.entry(key.clone()).or_insert(0);
         *entry += zset.weights[i];
         if *entry == 0 {

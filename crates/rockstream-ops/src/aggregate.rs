@@ -383,7 +383,6 @@ impl Operator for AggregateOp {
         }
 
         drop(state);
-
         debug!(
             op_id = self.op_id.0,
             input_rows = n,

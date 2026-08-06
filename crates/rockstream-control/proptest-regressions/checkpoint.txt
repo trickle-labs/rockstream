@@ -4,5 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 71b2c0ea3719c49a8d88cb27dabe44b76082c6c7cd816a40417e279e7f539192 # shrinks to epochs = [[(4, 11, -1)], [(4, 11, 1)]]
-cc 79017cf3ad397e1e8ba293fdffd003fe01021494c318eaa652071bf213edd37c # shrinks to epochs = [[(1501, 1, 1)], [(0, 1, 1)]]
+cc 41938eb6176adae29f526f3808fff15dd97696f67d8e85923a861a5376d78290 # shrinks to delta = 0, shard_count = 1

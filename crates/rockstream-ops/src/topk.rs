@@ -55,8 +55,8 @@ struct BufferEntry {
 struct PartitionState {
     /// Buffer: row_id → BufferEntry (all entries, up to K + epsilon).
     buffer: HashMap<u128, BufferEntry>,
-    /// Currently emitted top-K: row_id → row_vals.
-    emitted: HashMap<u128, Vec<i64>>,
+    /// Currently emitted top-K: row_id → (row_vals, emitted multiplicity).
+    emitted: HashMap<u128, (Vec<i64>, i64)>,
 }
 
 impl PartitionState {
@@ -203,34 +203,24 @@ impl TopKOp {
             };
 
             // Compute new top-K: sort positive-weight buffer entries by
-            // rank_value descending, then by full row bytes ascending (stable tiebreaker).
-            let mut sorted: Vec<(i64, u128, Vec<i64>)> = part
-                .buffer
-                .iter()
-                .filter(|(_, e)| e.net_weight > 0)
-                .map(|(&rid, e)| (e.rank_value, rid, e.row_vals.clone()))
-                .collect();
-            sorted.sort_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2)))
-            });
-            let new_topk: HashMap<u128, Vec<i64>> = sorted
-                .iter()
-                .take(self.k)
-                .map(|(_, rid, vals)| (*rid, vals.clone()))
-                .collect();
+            // rank_value descending, then by full row bytes ascending (stable
+            // tiebreaker). Consume each entry's full positive multiplicity so
+            // duplicate input rows occupy duplicate Top-K positions.
+            let new_topk = select_topk(part, self.k);
 
             // Retract rows no longer in top-K.
-            for (rid, old_vals) in &part.emitted {
-                if !new_topk.contains_key(rid) {
-                    output_rows.push((old_vals.clone(), -1));
+            for (rid, (old_vals, old_count)) in &part.emitted {
+                let new_count = new_topk.get(rid).map_or(0, |(_, count)| *count);
+                if *old_count > new_count {
+                    output_rows.push((old_vals.clone(), new_count - *old_count));
                 }
             }
 
             // Insert newly-in-top-K rows.
-            for (rid, new_vals) in &new_topk {
-                if !part.emitted.contains_key(rid) {
-                    output_rows.push((new_vals.clone(), 1));
+            for (rid, (new_vals, new_count)) in &new_topk {
+                let old_count = part.emitted.get(rid).map_or(0, |(_, count)| *count);
+                if *new_count > old_count {
+                    output_rows.push((new_vals.clone(), *new_count - old_count));
                 }
             }
 
@@ -280,6 +270,38 @@ fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i
                 .unwrap_or(0)
         })
         .collect()
+}
+
+fn select_topk(part: &PartitionState, k: usize) -> HashMap<u128, (Vec<i64>, i64)> {
+    let mut sorted: Vec<(i64, u128, Vec<i64>, i64)> = part
+        .buffer
+        .iter()
+        .filter(|(_, entry)| entry.net_weight > 0)
+        .map(|(&row_id, entry)| {
+            (
+                entry.rank_value,
+                row_id,
+                entry.row_vals.clone(),
+                entry.net_weight,
+            )
+        })
+        .collect();
+    sorted.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2)))
+    });
+
+    let mut remaining = k.min(i64::MAX as usize) as i64;
+    let mut selected = HashMap::new();
+    for (_, row_id, row_vals, net_weight) in sorted {
+        if remaining == 0 {
+            break;
+        }
+        let emitted_count = net_weight.min(remaining);
+        selected.insert(row_id, (row_vals, emitted_count));
+        remaining -= emitted_count;
+    }
+    selected
 }
 
 fn row_id_hash(vals: &[i64]) -> u128 {
@@ -443,23 +465,9 @@ pub async fn load_topk_state(
         }
     }
 
-    // Reconstruct emitted top-K for each partition using the same sort as process_epoch.
+    // Reconstruct emitted top-K for each partition using the same selection as process_epoch.
     for part in st.partitions.values_mut() {
-        let mut sorted: Vec<(i64, u128, Vec<i64>)> = part
-            .buffer
-            .iter()
-            .filter(|(_, e)| e.net_weight > 0)
-            .map(|(&rid, e)| (e.rank_value, rid, e.row_vals.clone()))
-            .collect();
-        sorted.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2)))
-        });
-        part.emitted = sorted
-            .iter()
-            .take(k)
-            .map(|(_, rid, vals)| (*rid, vals.clone()))
-            .collect();
+        part.emitted = select_topk(part, k);
     }
 
     let total = st.total_entries();
@@ -627,5 +635,23 @@ mod tests {
             vec![7],
             "expected insertion of v=7: {insertions:?}"
         );
+    }
+
+    #[test]
+    fn topk_duplicate_rows_consume_duplicate_positions() {
+        let op = TopKOp::new(schema_kv(), 2, 0, vec![]);
+
+        let out = op
+            .process_epoch(
+                make_input(&[(10, 1, 1), (10, 1, 1), (9, 2, 1), (8, 3, 1)]),
+                1,
+            )
+            .unwrap();
+        let mut net = HashMap::new();
+        accumulate_vals(&mut net, &out);
+
+        assert_eq!(net.get(&10), Some(&2));
+        assert_eq!(net.get(&9), None);
+        assert_eq!(net.get(&8), None);
     }
 }

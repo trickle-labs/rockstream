@@ -7,5 +7,6 @@
   "exchange_serialize_zset/serialize": 11190.472045844346,
   "exchange_transport_claims/direct_lz4_codec_v1": 17769.593267247223,
   "exchange_transport_claims/direct_raw_baseline": 23639.729365821266,
-  "exchange_transport_claims/durable_zstd_codec_v1": 22872.234896441525
+  "exchange_transport_claims/durable_zstd_codec_v1": 22872.234896441525,
+  "ingest_checked_quota/acquire_release_1k": 80.259
 }

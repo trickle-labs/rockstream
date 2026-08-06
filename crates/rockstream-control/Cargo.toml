@@ -33,6 +33,7 @@ zstd = { workspace = true }
 rockstream-sim = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 testcontainers = { workspace = true }

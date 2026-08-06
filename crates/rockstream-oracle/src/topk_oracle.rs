@@ -108,7 +108,9 @@ mod proptest_oracle {
             if w <= 0 {
                 continue;
             }
-            by_pk.entry(pk).or_default().push((v, id));
+            for _ in 0..w {
+                by_pk.entry(pk).or_default().push((v, id));
+            }
         }
 
         let mut result: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
@@ -119,7 +121,7 @@ mod proptest_oracle {
                     .then_with(|| encode_row_key(a.0, a.1, pk).cmp(&encode_row_key(b.0, b.1, pk)))
             });
             for (v, id) in rows.into_iter().take(k) {
-                result.insert((pk, v, id), 1);
+                *result.entry((pk, v, id)).or_insert(0) += 1;
             }
         }
         result

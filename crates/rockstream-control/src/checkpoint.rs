@@ -225,6 +225,10 @@ impl CheckpointCoordinator {
 
         let shards = guard.shards.clone();
         let n = shards.len();
+        let checkpoint_id = guard.next_checkpoint_id;
+        let next_checkpoint_id = checkpoint_id
+            .checked_next()
+            .ok_or(CoordinatorError::CheckpointIdOverflow)?;
 
         // Acquire one credit per shard.
         let mut acquired = 0usize;
@@ -239,10 +243,7 @@ impl CheckpointCoordinator {
             acquired += 1;
         }
 
-        let checkpoint_id = guard.next_checkpoint_id;
-        guard.next_checkpoint_id = checkpoint_id
-            .checked_next()
-            .ok_or(CoordinatorError::CheckpointIdOverflow)?;
+        guard.next_checkpoint_id = next_checkpoint_id;
 
         let barrier = CheckpointBarrier::new(checkpoint_id);
 
@@ -389,6 +390,7 @@ impl CheckpointCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use rockstream_types::ids::ShardId;
 
     fn make_coordinator(shards: &[u64]) -> CheckpointCoordinator {
@@ -418,6 +420,37 @@ mod tests {
             coordinator.begin_checkpoint(noop_inject).unwrap_err().to_string(),
             "RS-3604: checkpoint id exhausted; next_steps: create a new cluster identity before retrying"
         );
+        assert_eq!(coordinator.credits_used(), 0);
+        assert_eq!(
+            coordinator.inner.lock().next_checkpoint_id,
+            CheckpointId(u64::MAX)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn checkpoint_boundary_proptest(
+            delta in 0u8..=1,
+            shard_count in 1usize..=3,
+        ) {
+            let coordinator = make_coordinator(&(0..shard_count as u64).collect::<Vec<_>>());
+            let initial_id = CheckpointId(u64::MAX - u64::from(delta));
+            coordinator.inner.lock().next_checkpoint_id = initial_id;
+
+            match coordinator.begin_checkpoint(noop_inject) {
+                Ok(checkpoint_id) => {
+                    prop_assert_eq!(delta, 1);
+                    prop_assert_eq!(checkpoint_id, initial_id);
+                    prop_assert_eq!(coordinator.credits_used(), shard_count);
+                }
+                Err(error) => {
+                    prop_assert_eq!(delta, 0);
+                    prop_assert_eq!(error.to_string(), "RS-3604: checkpoint id exhausted; next_steps: create a new cluster identity before retrying");
+                    prop_assert_eq!(coordinator.credits_used(), 0);
+                    prop_assert_eq!(coordinator.inner.lock().next_checkpoint_id, initial_id);
+                }
+            }
+        }
     }
 
     #[test]

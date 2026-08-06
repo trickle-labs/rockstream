@@ -34,6 +34,7 @@ csv = { workspace = true }
 
 
 [dev-dependencies]
+proptest = { workspace = true }
 rockstream-ops = { path = "../rockstream-ops" }
 rockstream-plan = { path = "../rockstream-plan" }
 tokio = { workspace = true }

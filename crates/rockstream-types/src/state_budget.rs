@@ -509,7 +509,10 @@ impl DistributedQuotaLedger {
             if memory_limit > 0 {
                 loop {
                     let current = entry.current_memory_bytes.load(Ordering::Relaxed);
-                    let proposed = current.saturating_add(requested_bytes);
+                    let Some(proposed) = current.checked_add(requested_bytes) else {
+                        self.total_rejections.fetch_add(1, Ordering::Relaxed);
+                        return Err(quota_overflow_error("memory", current, requested_bytes));
+                    };
                     if proposed > memory_limit {
                         self.total_rejections.fetch_add(1, Ordering::Relaxed);
                         return Err(StateBudgetError {
@@ -558,7 +561,28 @@ impl DistributedQuotaLedger {
             if max_p > 0 {
                 loop {
                     let current_p = entry.current_parallelism.load(Ordering::Relaxed);
-                    let proposed_p = current_p.saturating_add(parallelism as u64);
+                    let Some(proposed_p) = current_p.checked_add(parallelism as u64) else {
+                        entry
+                            .current_memory_bytes
+                            .fetch_sub(requested_bytes, Ordering::Relaxed);
+                        self.total_rejections.fetch_add(1, Ordering::Relaxed);
+                        return Err(quota_overflow_error(
+                            "parallelism",
+                            current_p,
+                            parallelism as u64,
+                        ));
+                    };
+                    if proposed_p > u64::from(u32::MAX) {
+                        entry
+                            .current_memory_bytes
+                            .fetch_sub(requested_bytes, Ordering::Relaxed);
+                        self.total_rejections.fetch_add(1, Ordering::Relaxed);
+                        return Err(quota_overflow_error(
+                            "parallelism",
+                            current_p,
+                            parallelism as u64,
+                        ));
+                    }
                     if proposed_p > max_p {
                         entry
                             .current_memory_bytes
@@ -711,6 +735,7 @@ impl Drop for QuotaGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn acquire_within_budget_succeeds() {
@@ -889,5 +914,54 @@ mod tests {
             entry.current_memory_bytes.load(Ordering::Relaxed),
             u64::MAX - 1
         );
+    }
+
+    proptest! {
+        #[test]
+        fn quota_boundary_proptest(
+            byte_delta in 0u8..=1,
+            parallelism_delta in 0u8..=1,
+        ) {
+            let ledger = Arc::new(DistributedQuotaLedger::new());
+            let workload_id = WorkloadId(304);
+            ledger.register_workload(workload_id, u64::MAX, u32::MAX).unwrap();
+            let entry = ledger.get_entry(workload_id).unwrap();
+
+            let bytes = u64::MAX - u64::from(byte_delta);
+            entry.current_memory_bytes.store(bytes, Ordering::Relaxed);
+            match ledger.try_acquire_batch(workload_id, 1, 0) {
+                Ok(mut guard) => {
+                    prop_assert_eq!(byte_delta, 1);
+                    prop_assert_eq!(entry.current_memory_bytes.load(Ordering::Relaxed), u64::MAX);
+                    guard.release();
+                }
+                Err(error) => {
+                    prop_assert_eq!(byte_delta, 0);
+                    prop_assert_eq!(error.to_string(), format!(
+                        "RS-5004: quota counter overflow for 'quota-overflow-memory': current={bytes}, requested=1; next_steps: release quota or create a new workload before retrying"
+                    ));
+                }
+            }
+            prop_assert_eq!(entry.current_memory_bytes.load(Ordering::Relaxed), bytes);
+
+            entry.current_memory_bytes.store(0, Ordering::Relaxed);
+            let parallelism = u64::from(u32::MAX) - u64::from(parallelism_delta);
+            entry.current_parallelism.store(parallelism, Ordering::Relaxed);
+            match ledger.try_acquire_batch(workload_id, 0, 1) {
+                Ok(mut guard) => {
+                    prop_assert_eq!(parallelism_delta, 1);
+                    prop_assert_eq!(entry.current_parallelism.load(Ordering::Relaxed), u64::from(u32::MAX));
+                    guard.release();
+                }
+                Err(error) => {
+                    prop_assert_eq!(parallelism_delta, 0);
+                    prop_assert_eq!(error.to_string(), format!(
+                        "RS-5004: quota counter overflow for 'quota-overflow-parallelism': current={parallelism}, requested=1; next_steps: release quota or create a new workload before retrying"
+                    ));
+                }
+            }
+            prop_assert_eq!(entry.current_parallelism.load(Ordering::Relaxed), parallelism);
+            prop_assert_eq!(entry.current_memory_bytes.load(Ordering::Relaxed), 0);
+        }
     }
 }

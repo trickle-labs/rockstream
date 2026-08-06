@@ -329,16 +329,29 @@ impl GroupKeyPacker {
         let mut reverse = self.reverse.lock().unwrap();
         let mut max_id: i64 = -1;
         for (key, value) in entries {
-            if key.len() <= prefix.len() || value.len() < 8 || (key.len() - prefix.len()) != n * 8 {
+            let encoded_len = key.len().saturating_sub(prefix.len());
+            if key.len() <= prefix.len() || value.len() < 8 || encoded_len != n * 9 {
                 continue;
             }
             let encoded_key = key[prefix.len()..].to_vec();
             let surrogate = i64::from_be_bytes(value[0..8].try_into().unwrap_or([0; 8]));
-            let key_vals: Vec<i64> = (0..n)
-                .map(|i| {
-                    i64::from_be_bytes(encoded_key[i * 8..(i + 1) * 8].try_into().unwrap_or([0; 8]))
-                })
-                .collect();
+            let mut key_vals = Vec::with_capacity(n);
+            let mut valid = true;
+            for i in 0..n {
+                let start = i * 9;
+                if encoded_key[start] != 1 {
+                    valid = false;
+                    break;
+                }
+                key_vals.push(i64::from_be_bytes(
+                    encoded_key[start + 1..start + 9]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                ));
+            }
+            if !valid {
+                continue;
+            }
             forward.insert(encoded_key, surrogate);
             reverse.insert(surrogate, key_vals);
             max_id = max_id.max(surrogate);
@@ -1240,6 +1253,52 @@ mod tests {
 
         let (_dir, db) = make_db().await;
         pipeline.persist(&db).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_key_packer_restores_type_tagged_int64_keys() {
+        let (_dir, db) = make_db().await;
+        let op_id = OperatorId(42);
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("k0", DataType::Int64, false),
+            Field::new("k1", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1000, 2000])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 1])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let original = GroupKeyPacker::new(2);
+        original.pack(ArrowZSet::new(batch, vec![1, 1])).unwrap();
+        original.persist(&db, op_id).await.unwrap();
+
+        let restored = GroupKeyPacker::new(2);
+        restored.restore_in_place(&db, op_id).await.unwrap();
+        let reordered = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![9, 1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![9000, 1000])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 1])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let packed = restored
+            .pack(ArrowZSet::new(reordered, vec![1, 1]))
+            .unwrap();
+        let keys = packed
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(keys.values().as_ref(), &[2, 0]);
     }
 
     /// Regression test for a v0.51.4 fix: `TumbleWindowOp` used to drop

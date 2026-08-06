@@ -46,7 +46,7 @@ mod proptest_oracle {
 
     #[cfg(test)]
     mod hop_window_oracle {
-        use std::collections::{BTreeMap, HashMap};
+        use std::collections::{BTreeMap, HashSet};
         use std::sync::Arc;
 
         use arrow::array::{ArrayRef, Int64Array};
@@ -294,9 +294,11 @@ mod proptest_oracle {
         }
 
         fn accumulate_input(
-            state: &mut BTreeMap<(i64, i64), i64>,
+            state: &mut BTreeMap<(i64, i64, i64), i64>,
             batch: &ArrowZSet,
             watermark_ms: &mut i64,
+            window_size_ms: i64,
+            slide_ms: i64,
         ) {
             if batch.is_empty() {
                 return;
@@ -313,16 +315,25 @@ mod proptest_oracle {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
+            let epoch_start_watermark = *watermark_ms;
+            let mut reopened_this_epoch = HashSet::new();
             for i in 0..batch.num_rows() {
-                if t.value(i) < *watermark_ms {
-                    continue;
-                }
                 *watermark_ms = (*watermark_ms).max(t.value(i));
-                let key = (t.value(i), v.value(i));
-                let entry = state.entry(key).or_insert(0);
-                *entry += batch.weights[i];
-                if *entry == 0 {
-                    state.remove(&key);
+                for window_id in hop_window_ids(t.value(i), window_size_ms, slide_ms) {
+                    let window_closed = epoch_start_watermark > window_id + window_size_ms
+                        && !reopened_this_epoch.contains(&window_id);
+                    if window_closed && batch.weights[i] > 0 {
+                        continue;
+                    }
+                    if window_closed && batch.weights[i] <= 0 {
+                        reopened_this_epoch.insert(window_id);
+                    }
+                    let key = (window_id, t.value(i), v.value(i));
+                    let entry = state.entry(key).or_insert(0);
+                    *entry += batch.weights[i];
+                    if *entry == 0 {
+                        state.remove(&key);
+                    }
                 }
             }
         }
@@ -367,21 +378,12 @@ mod proptest_oracle {
                 .collect()
         }
 
-        fn batch_hop(
-            acc: &BTreeMap<(i64, i64), i64>,
-            window_size_ms: i64,
-            slide_ms: i64,
-        ) -> Vec<(i64, i64, i64)> {
-            let mut out: HashMap<(i64, i64, i64), i64> = HashMap::new();
-            for (&(t, v), &w) in acc {
-                if w <= 0 {
-                    continue;
-                }
-                for window_id in hop_window_ids(t, window_size_ms, slide_ms) {
-                    out.insert((window_id, t, v), 1);
-                }
-            }
-            let mut rows = out.keys().copied().collect::<Vec<_>>();
+        fn batch_hop(acc: &BTreeMap<(i64, i64, i64), i64>) -> Vec<(i64, i64, i64)> {
+            let mut rows = acc
+                .iter()
+                .filter(|(_, &w)| w > 0)
+                .map(|(&row, _)| row)
+                .collect::<Vec<_>>();
             rows.sort();
             rows
         }
@@ -409,19 +411,40 @@ mod proptest_oracle {
 
                 for (epoch_idx, epoch_rows) in epochs.iter().enumerate() {
                     let batch = make_batch(epoch_rows);
-                    accumulate_input(&mut input_state, &batch, &mut watermark_ms);
+                    accumulate_input(
+                        &mut input_state,
+                        &batch,
+                        &mut watermark_ms,
+                        window_size_ms,
+                        slide_ms,
+                    );
                     let out = op
                         .process_epoch(batch, epoch_idx as u64 + 1)
                         .map_err(|e| TestCaseError::fail(format!("process_epoch failed: {e}")))?;
                     accumulate_output(&mut output_state, &out);
                     prop_assert_eq!(
                         live_output(&output_state),
-                        batch_hop(&input_state, window_size_ms, slide_ms),
+                        batch_hop(&input_state),
                         "hop incremental output diverged at epoch {}",
                         epoch_idx + 1
                     );
                 }
             }
+        }
+
+        #[test]
+        fn oracle_hop_window_regression_out_of_order_rows_within_epoch() {
+            let batch = make_batch(&[(605, 1, 1), (0, 1, 1)]);
+            let op = HopWindowOp::new(schema_tv(), 0, 1000, 500, LateDataPolicy::Drop);
+            let mut input_state = BTreeMap::new();
+            let mut output_state = BTreeMap::new();
+            let mut watermark_ms = i64::MIN;
+
+            accumulate_input(&mut input_state, &batch, &mut watermark_ms, 1000, 500);
+            let out = op.process_epoch(batch, 1).unwrap();
+            accumulate_output(&mut output_state, &out);
+
+            assert_eq!(live_output(&output_state), batch_hop(&input_state));
         }
     }
 

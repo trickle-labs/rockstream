@@ -231,6 +231,16 @@ impl From<GatewayError> for pgwire::error::PgWireError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn commit_epoch_exhausted_error_is_rs2060() {
+        let error = GatewayError::CommitEpochExhausted;
+        assert_eq!(
+            error.to_string(),
+            "[RS-2060] write.epoch_exhausted: commit epoch reached u64::MAX. next_steps: create a new shard before retrying."
+        );
+        assert_eq!(sqlstate_for(&error), "54000");
+    }
+
     /// S1 green gate: each new variant's Display contains the expected RS code.
     #[test]
     fn copy_error_codes_display() {

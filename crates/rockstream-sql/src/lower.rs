@@ -655,7 +655,23 @@ pub fn lower_expr(expr: &DfExpr, schema: &DFSchema) -> Result<Expr, SqlError> {
         // Strip aliases (projection output aliases don't affect the expression).
         DfExpr::Alias(alias) => lower_expr(&alias.expr, schema),
 
-        // Strip casts that don't change the logical value (e.g. Int32→Int64).
+        // Preserve an explicit BIGINT cast. The incremental aggregate path
+        // represents AVG as Float64, so stripping `CAST(AVG(...) AS BIGINT)`
+        // would expose a different type than the SQL batch result. Other
+        // casts retain the historical pass-through lowering because their
+        // existing operator paths already expose the expected wire value.
+        DfExpr::Cast(cast) if matches!(&cast.data_type, arrow::datatypes::DataType::Int64) => {
+            Ok(Expr::ScalarUdf {
+                name: "cast_int64".to_string(),
+                args: vec![lower_expr(&cast.expr, schema)?],
+            })
+        }
+        DfExpr::TryCast(cast) if matches!(&cast.data_type, arrow::datatypes::DataType::Int64) => {
+            Ok(Expr::ScalarUdf {
+                name: "cast_int64".to_string(),
+                args: vec![lower_expr(&cast.expr, schema)?],
+            })
+        }
         DfExpr::Cast(cast) => lower_expr(&cast.expr, schema),
         DfExpr::TryCast(cast) => lower_expr(&cast.expr, schema),
 
@@ -2260,6 +2276,25 @@ mod tests {
             has_distinct(&plan),
             "expected Distinct node in plan: {plan:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn cast_avg_to_bigint_is_preserved_in_plan() {
+        let f = make_frontend_with_t();
+        let plan = f
+            .sql_to_plan_node("SELECT id, CAST(AVG(val) AS BIGINT) FROM t GROUP BY id")
+            .await
+            .expect("CAST(AVG(...) AS BIGINT) should lower");
+
+        let PlanNode::Project { columns, .. } = plan else {
+            panic!("expected aggregate projection, got {plan:?}");
+        };
+        assert_eq!(columns.len(), 2);
+        assert!(matches!(
+            &columns[1],
+            Expr::ScalarUdf { name, args }
+                if name == "cast_int64" && args.len() == 1
+        ));
     }
 
     /// `SELECT id FROM a UNION ALL SELECT id FROM b` must lower to a plan

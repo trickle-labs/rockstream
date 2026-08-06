@@ -385,7 +385,7 @@ impl SourceEpochRegistry {
         partition_offsets: BTreeMap<u64, OffsetToken>,
     ) -> Result<SourceEpochEntry, SourceEpochError> {
         Ok(SourceEpochEntry {
-            source_epoch: self.current_epoch.checked_add(1).ok_or_else(|| {
+            source_epoch: self.current_epoch.checked_add(1).ok_or({
                 SourceEpochError::Exhausted {
                     connector_id: self.connector_id,
                 }
@@ -399,16 +399,16 @@ impl SourceEpochRegistry {
     /// `entry` must be the value returned by a previous [`prepare_commit`] call
     /// for this epoch.
     ///
-    /// # Panics
-    ///
-    /// Panics if `entry.source_epoch != current_epoch + 1` (non-monotone advance).
+    /// Returns [`SourceEpochError::NonMonotone`] when `entry.source_epoch` is
+    /// not the next epoch, and [`SourceEpochError::Exhausted`] at the numeric
+    /// boundary.
     pub fn commit_epoch(&mut self, entry: SourceEpochEntry) -> Result<(), SourceEpochError> {
-        let expected =
-            self.current_epoch
-                .checked_add(1)
-                .ok_or_else(|| SourceEpochError::Exhausted {
-                    connector_id: self.connector_id,
-                })?;
+        let expected = self
+            .current_epoch
+            .checked_add(1)
+            .ok_or(SourceEpochError::Exhausted {
+                connector_id: self.connector_id,
+            })?;
         if entry.source_epoch != expected {
             return Err(SourceEpochError::NonMonotone {
                 connector_id: self.connector_id,
@@ -442,6 +442,7 @@ impl SourceEpochRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn offsets(map: &[(&str, &str)]) -> BTreeMap<u64, OffsetToken> {
         map.iter()
@@ -544,5 +545,41 @@ mod tests {
             reg.prepare_commit(BTreeMap::new()).unwrap_err().to_string(),
             "RS-4018: source epoch exhausted for connector connector-8; next_steps: create a new connector before retrying"
         );
+    }
+
+    proptest! {
+        #[test]
+        fn source_epoch_boundary_proptest(
+            epoch_delta in 0u8..=1,
+            partition_delta in 0u8..=1,
+            offset_delta in 0u8..=1,
+        ) {
+            let partition = u64::MAX - u64::from(partition_delta);
+            let offset = u64::MAX - u64::from(offset_delta);
+            let mut partition_offsets = BTreeMap::new();
+            partition_offsets.insert(partition, OffsetToken::new(offset.to_be_bytes().to_vec()));
+            let mut registry = SourceEpochRegistry::restore(
+                ConnectorId(8),
+                u64::MAX - u64::from(epoch_delta),
+                partition_offsets.clone(),
+            );
+
+            match registry.prepare_commit(partition_offsets.clone()) {
+                Ok(entry) => {
+                    prop_assert_eq!(epoch_delta, 1);
+                    prop_assert_eq!(entry.source_epoch, u64::MAX);
+                    prop_assert_eq!(&entry.partition_offsets, &partition_offsets);
+                    registry.commit_epoch(entry).unwrap();
+                    prop_assert_eq!(registry.current_epoch(), u64::MAX);
+                    prop_assert_eq!(registry.recovery_offsets(), Some(&partition_offsets));
+                }
+                Err(error) => {
+                    prop_assert_eq!(epoch_delta, 0);
+                    prop_assert_eq!(error.to_string(), "RS-4018: source epoch exhausted for connector connector-8; next_steps: create a new connector before retrying");
+                    prop_assert_eq!(registry.current_epoch(), u64::MAX);
+                    prop_assert_eq!(registry.recovery_offsets(), Some(&partition_offsets));
+                }
+            }
+        }
     }
 }

@@ -6,13 +6,11 @@
 //! - `BinaryOp { Gt | Lt | Ge | Le | Eq | Ne | Add | Sub | Mul | Div | And | Or, … }`
 //!
 //! v0.51.4 (Slice 7) adds `Expr::Case` (searched `CASE WHEN ... THEN ...
-//! ELSE ... END`) and three specific `Expr::ScalarUdf` names used by Nexmark
-//! q14/q21/q22: `regexp_replace`, `split_part`, `length` (and the plain
-//! `replace` function q14's `length(extra) - length(replace(extra, 'a',
-//! ''))` lowers to). These can produce `Utf8` output, so they are evaluated
-//! through `eval_to_array` (the array-preserving entry point); `length` is
-//! additionally wired into `eval_i64` since it is used inside integer
-//! arithmetic (`length(x) - length(y)`).
+//! ELSE ... END`) and specific `Expr::ScalarUdf` names used by Nexmark:
+//! `regexp_replace`, `split_part`, `length`, `replace`, and `cast_int64`.
+//! These can produce non-Int64 output, so they are evaluated through
+//! `eval_to_array` (the array-preserving entry point); `length` is additionally
+//! wired into `eval_i64` since it is used inside integer arithmetic.
 //!
 //! Returns either a per-row `Vec<i64>` (arithmetic result) or a `Vec<bool>`
 //! (comparison / boolean result). Boolean context is used by `FilterOp`;
@@ -368,14 +366,17 @@ fn resolve_operand_pair_type(
     }
 }
 
-/// Evaluate the three Nexmark scalar UDFs (`regexp_replace`, `split_part`,
-/// `length`; plus the plain `replace` used by q14's
-/// `length(extra) - length(replace(extra, 'a', ''))`).
+/// Evaluate the supported scalar UDFs, including `cast_int64` for preserving
+/// SQL `CAST(... AS BIGINT)` semantics over Float64 aggregate results.
 ///
 /// Any other UDF name keeps returning `OpError::unimplemented` — no
 /// speculative general UDF framework, per ground rules.
 fn eval_scalar_udf(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, OpError> {
     match name {
+        "cast_int64" => {
+            let arr = eval_to_array(arg(args, 0)?, batch)?;
+            arrow::compute::cast(&arr, &DataType::Int64).map_err(OpError::arrow)
+        }
         "length" => {
             let arr = eval_to_array(arg(args, 0)?, batch)?;
             let s = downcast_utf8(&arr)?;
@@ -593,5 +594,29 @@ mod tests {
         let b = batch_ab(&[(1, 2)]);
         let r = eval_i64(&Expr::Literal(vec![1, 2, 3]), &b);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn cast_int64_truncates_float64_values() {
+        use arrow::array::{Float64Array, Int64Array};
+        use arrow::datatypes::{Field, Schema};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "avg",
+                DataType::Float64,
+                false,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![2887.3913, -4.75]))],
+        )
+        .unwrap();
+        let expr = Expr::ScalarUdf {
+            name: "cast_int64".to_string(),
+            args: vec![Expr::Column(0)],
+        };
+
+        let result = eval_to_array(&expr, &batch).unwrap();
+        let result = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(result.values(), &[2887, -4]);
     }
 }
