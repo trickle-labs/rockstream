@@ -25,7 +25,9 @@ use rockstream_runtime::exchange::service::ShuffleServer;
 use rockstream_storage::shard_db::ShardDb;
 use rockstream_types::config::{AutotunerConfig, ExchangeConfig, WorkerConfig};
 use rockstream_types::exchange::ShuffleCompression;
+use rockstream_types::ids::WorkloadId;
 use rockstream_types::ids::{ExchangeId, WorkerId};
+use rockstream_types::state_budget::DistributedQuotaLedger;
 use rockstream_types::topology::{
     CapacityHeadroom, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLifecycleState,
     WorkerLocation,
@@ -346,6 +348,23 @@ fn bench_complex_dag_hot_path(c: &mut Criterion) {
     group.finish();
 }
 
+/// Measures the checked atomic admission path added for v0.51.18. The ledger
+/// has no configured cap here, exercising the hot unlimited-quota branch.
+fn bench_checked_ingest_quota(c: &mut Criterion) {
+    let ledger = Arc::new(DistributedQuotaLedger::new());
+    let workload_id = WorkloadId(51_018);
+    ledger.register_workload(workload_id, 0, 0).unwrap();
+    let mut group = c.benchmark_group("ingest_checked_quota");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("acquire_release_1k", |b| {
+        b.iter(|| {
+            let guard = ledger.try_acquire_batch(workload_id, 1_024, 1).unwrap();
+            criterion::black_box(guard);
+        });
+    });
+    group.finish();
+}
+
 fn default_criterion_dir() -> PathBuf {
     rockstream_ops::bench_regression::default_criterion_dir(env!("CARGO_MANIFEST_DIR"))
 }
@@ -358,6 +377,7 @@ fn main() {
     bench_transport_codec_claims(&mut criterion);
     bench_direct_lz4_epoch_cpu_budget(&mut criterion);
     bench_complex_dag_hot_path(&mut criterion);
+    bench_checked_ingest_quota(&mut criterion);
     criterion.final_summary();
 
     let summary = rockstream_ops::bench_regression::collect_criterion_summary(
@@ -369,6 +389,7 @@ fn main() {
             "exchange_transport_claims",
             "exchange_bench_direct_lz4_epoch_cpu_budget",
             "exchange_complex_dag_hot_path",
+            "ingest_checked_quota",
         ],
     );
     println!(

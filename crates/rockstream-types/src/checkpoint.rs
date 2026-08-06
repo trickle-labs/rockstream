@@ -41,9 +41,10 @@ impl CheckpointId {
     /// The sentinel value representing "no checkpoint yet committed".
     pub const NONE: Self = Self(0);
 
-    /// Returns the next checkpoint id in the sequence.
-    pub fn next(self) -> Self {
-        Self(self.0 + 1)
+    /// Returns the next checkpoint id in the sequence, or `None` at its
+    /// representable boundary. Callers must reject rather than wrap.
+    pub fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
     }
 
     /// Returns `true` if this is the sentinel "none" value.
@@ -282,8 +283,9 @@ mod tests {
     #[test]
     fn checkpoint_id_next_is_monotone() {
         let c = CheckpointId(5);
-        assert_eq!(c.next(), CheckpointId(6));
-        assert!(c.next() > c);
+        assert_eq!(c.checked_next(), Some(CheckpointId(6)));
+        assert!(c.checked_next().is_some_and(|next| next > c));
+        assert_eq!(CheckpointId(u64::MAX).checked_next(), None);
     }
 
     #[test]

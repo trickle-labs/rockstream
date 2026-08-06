@@ -17,6 +17,9 @@ members = [
     "fuzz",
 ]
 
+[profile.release]
+overflow-checks = true
+
 [workspace.package]
 version = "0.42.0"
 edition = "2021"

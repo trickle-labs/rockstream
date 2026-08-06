@@ -180,6 +180,23 @@ impl ShardDb {
         &self.last_epoch
     }
 
+    /// Allocate the next direct-write epoch without allowing atomic wraparound.
+    pub fn try_next_epoch(&self) -> Option<u64> {
+        let mut current = self.last_epoch.load(Ordering::SeqCst);
+        loop {
+            let next = current.checked_add(1)?;
+            match self.last_epoch.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(next),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     /// Create a builder for opening a shard database.
     pub fn builder(path: impl Into<String>, object_store: Arc<dyn ObjectStore>) -> ShardDbBuilder {
         ShardDbBuilder::new(path, object_store)

@@ -5,6 +5,8 @@ use thiserror::Error;
 /// Errors produced by the gateway.
 #[derive(Debug, Error)]
 pub enum GatewayError {
+    #[error("[RS-2060] write.epoch_exhausted: commit epoch reached u64::MAX. next_steps: create a new shard before retrying.")]
+    CommitEpochExhausted,
     #[error("[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED or REPEATABLE READ")]
     SerializableNotSupported,
 
@@ -172,6 +174,7 @@ impl From<pgwire::error::PgWireError> for GatewayError {
 /// Return the 5-char Postgres SQLSTATE code for a `GatewayError`.
 pub fn sqlstate_for(e: &GatewayError) -> &'static str {
     match e {
+        GatewayError::CommitEpochExhausted => "54000",
         GatewayError::SerializableNotSupported => "25001",
         GatewayError::RepeatableReadNotSupported => "25001",
         GatewayError::PreparedStatementsLimitExceeded { .. } => "53200",

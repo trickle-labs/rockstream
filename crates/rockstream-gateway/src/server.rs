@@ -5841,7 +5841,9 @@ impl GatewayHandler {
         drop(entry); // release DashMap entry guard before await
 
         // Allocate next epoch
-        let epoch = shard_db.last_epoch().fetch_add(1, Ordering::SeqCst) + 1;
+        let epoch = shard_db.try_next_epoch().ok_or_else(|| {
+            PgWireError::ApiError(Box::new(crate::error::GatewayError::CommitEpochExhausted))
+        })?;
 
         // Build WriteBatch from DmlOps — only Put and Delete, no range-delete.
         let mut batch = rockstream_storage::WriteBatch::new();
@@ -7165,7 +7167,9 @@ impl GatewayHandler {
             return Ok(rows.len()); // no storage — pretend success
         };
 
-        let epoch = shard_db.last_epoch().fetch_add(1, Ordering::SeqCst) + 1;
+        let epoch = shard_db.try_next_epoch().ok_or_else(|| {
+            PgWireError::ApiError(Box::new(crate::error::GatewayError::CommitEpochExhausted))
+        })?;
         let mut batch = rockstream_storage::WriteBatch::new();
         for op in rows {
             if let DmlOp::Insert {

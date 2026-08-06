@@ -55,6 +55,30 @@ pub struct SourceEpochEntry {
     pub partition_offsets: BTreeMap<u64, OffsetToken>,
 }
 
+/// Source-epoch advancement rejected before numeric wraparound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceEpochError {
+    Exhausted {
+        connector_id: ConnectorId,
+    },
+    NonMonotone {
+        connector_id: ConnectorId,
+        expected: Epoch,
+        got: Epoch,
+    },
+}
+
+impl std::fmt::Display for SourceEpochError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exhausted { connector_id } => write!(f, "RS-4018: source epoch exhausted for connector {connector_id}; next_steps: create a new connector before retrying"),
+            Self::NonMonotone { connector_id, expected, got } => write!(f, "RS-4006: source_epoch must advance monotonically: connector={connector_id}, expected={expected}, got={got}"),
+        }
+    }
+}
+
+impl std::error::Error for SourceEpochError {}
+
 // ─── SourceEpochRegistry ──────────────────────────────────────────────────────
 
 /// Maintains the per-connector strictly-increasing `source_epoch` and its
@@ -359,11 +383,15 @@ impl SourceEpochRegistry {
     pub fn prepare_commit(
         &self,
         partition_offsets: BTreeMap<u64, OffsetToken>,
-    ) -> SourceEpochEntry {
-        SourceEpochEntry {
-            source_epoch: self.current_epoch + 1,
+    ) -> Result<SourceEpochEntry, SourceEpochError> {
+        Ok(SourceEpochEntry {
+            source_epoch: self.current_epoch.checked_add(1).ok_or_else(|| {
+                SourceEpochError::Exhausted {
+                    connector_id: self.connector_id,
+                }
+            })?,
             partition_offsets,
-        }
+        })
     }
 
     /// Advance to the next epoch after the `WriteBatch` has been durably flushed.
@@ -374,14 +402,20 @@ impl SourceEpochRegistry {
     /// # Panics
     ///
     /// Panics if `entry.source_epoch != current_epoch + 1` (non-monotone advance).
-    pub fn commit_epoch(&mut self, entry: SourceEpochEntry) {
-        let expected = self.current_epoch + 1;
-        assert_eq!(
-            entry.source_epoch, expected,
-            "RS-4006: source_epoch must advance monotonically: \
-             connector={}, expected={expected}, got={}",
-            self.connector_id, entry.source_epoch
-        );
+    pub fn commit_epoch(&mut self, entry: SourceEpochEntry) -> Result<(), SourceEpochError> {
+        let expected =
+            self.current_epoch
+                .checked_add(1)
+                .ok_or_else(|| SourceEpochError::Exhausted {
+                    connector_id: self.connector_id,
+                })?;
+        if entry.source_epoch != expected {
+            return Err(SourceEpochError::NonMonotone {
+                connector_id: self.connector_id,
+                expected,
+                got: entry.source_epoch,
+            });
+        }
         self.current_epoch = entry.source_epoch;
         self.last_committed = Some(entry.clone());
 
@@ -392,6 +426,7 @@ impl SourceEpochRegistry {
                 self.history.remove(&oldest_key);
             }
         }
+        Ok(())
     }
 
     /// Look up the partition→offset map for a specific past epoch.
@@ -426,8 +461,8 @@ mod tests {
     #[test]
     fn commit_epoch_advances_monotonically() {
         let mut reg = SourceEpochRegistry::new(ConnectorId(1));
-        let entry = reg.prepare_commit(offsets(&[("p0", "offset-10")]));
-        reg.commit_epoch(entry);
+        let entry = reg.prepare_commit(offsets(&[("p0", "offset-10")])).unwrap();
+        reg.commit_epoch(entry).unwrap();
         assert_eq!(reg.current_epoch(), 1);
         assert_eq!(reg.last_committed().unwrap().source_epoch, 1);
     }
@@ -437,8 +472,8 @@ mod tests {
         let mut reg = SourceEpochRegistry::new(ConnectorId(2));
         for i in 0..10 {
             let offs = offsets(&[("p0", &format!("offset-{i}"))]);
-            let entry = reg.prepare_commit(offs);
-            reg.commit_epoch(entry);
+            let entry = reg.prepare_commit(offs).unwrap();
+            reg.commit_epoch(entry).unwrap();
         }
         assert_eq!(reg.current_epoch(), 10);
     }
@@ -447,8 +482,8 @@ mod tests {
     fn recovery_offsets_returns_last_committed() {
         let mut reg = SourceEpochRegistry::new(ConnectorId(3));
         let offs = offsets(&[("p0", "offset-100"), ("p1", "offset-200")]);
-        let entry = reg.prepare_commit(offs.clone());
-        reg.commit_epoch(entry);
+        let entry = reg.prepare_commit(offs.clone()).unwrap();
+        reg.commit_epoch(entry).unwrap();
         let recovered = reg.recovery_offsets().unwrap();
         assert_eq!(recovered.get(&0).unwrap().as_bytes(), b"offset-100");
         assert_eq!(recovered.get(&1).unwrap().as_bytes(), b"offset-200");
@@ -468,8 +503,10 @@ mod tests {
     fn offsets_for_epoch_returns_correct_entry() {
         let mut reg = SourceEpochRegistry::new(ConnectorId(5));
         for i in 0..3 {
-            let entry = reg.prepare_commit(offsets(&[("p0", &format!("offset-{i}"))]));
-            reg.commit_epoch(entry);
+            let entry = reg
+                .prepare_commit(offsets(&[("p0", &format!("offset-{i}"))]))
+                .unwrap();
+            reg.commit_epoch(entry).unwrap();
         }
         // epoch 2 should have "offset-1"
         let e2 = reg.offsets_for_epoch(2).unwrap();
@@ -477,26 +514,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "RS-4006")]
-    fn commit_epoch_panics_on_non_monotone_advance() {
+    fn commit_epoch_rejects_non_monotone_advance() {
         let mut reg = SourceEpochRegistry::new(ConnectorId(6));
-        let entry = reg.prepare_commit(BTreeMap::new());
         // Manually corrupt the epoch to skip ahead.
         let bad_entry = SourceEpochEntry {
             source_epoch: 5,
             partition_offsets: BTreeMap::new(),
         };
-        reg.commit_epoch(bad_entry);
-        let _ = entry; // suppress unused warning
+        assert_eq!(
+            reg.commit_epoch(bad_entry).unwrap_err().to_string(),
+            "RS-4006: source_epoch must advance monotonically: connector=connector-6, expected=1, got=5"
+        );
     }
 
     #[test]
     fn history_is_bounded_to_max_history() {
         let mut reg = SourceEpochRegistry::new(ConnectorId(7));
         for _ in 0..(MAX_HISTORY + 10) {
-            let entry = reg.prepare_commit(BTreeMap::new());
-            reg.commit_epoch(entry);
+            let entry = reg.prepare_commit(BTreeMap::new()).unwrap();
+            reg.commit_epoch(entry).unwrap();
         }
         assert!(reg.history.len() <= MAX_HISTORY);
+    }
+
+    #[test]
+    fn epoch_exhaustion_returns_rs4018_without_wrapping() {
+        let reg = SourceEpochRegistry::restore(ConnectorId(8), u64::MAX, BTreeMap::new());
+        assert_eq!(
+            reg.prepare_commit(BTreeMap::new()).unwrap_err().to_string(),
+            "RS-4018: source epoch exhausted for connector connector-8; next_steps: create a new connector before retrying"
+        );
     }
 }

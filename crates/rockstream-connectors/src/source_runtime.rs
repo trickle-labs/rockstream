@@ -165,10 +165,13 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
                 "RS-4014: source_runtime_in_flight_epochs reached SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS; next steps: wait for upstream acknowledgements before polling more input",
             );
         }
-        if epoch != self.source_epochs.current_epoch() + 1 {
+        let Some(next_epoch) = self.source_epochs.current_epoch().checked_add(1) else {
+            return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying");
+        };
+        if epoch != next_epoch {
             return self.block(&format!(
                 "RS-4015: source epoch {epoch} is not the next fenced epoch {}; next steps: recover the committed checkpoint and retry",
-                self.source_epochs.current_epoch() + 1
+                next_epoch
             ));
         }
 
@@ -194,10 +197,13 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             return self.block(&storage_error(error).to_string());
         }
 
-        self.source_epochs.commit_epoch(
-            self.source_epochs
-                .prepare_commit(BTreeMap::from([(0, committed.token.clone())])),
-        );
+        self.source_epochs
+            .commit_epoch(
+                self.source_epochs
+                    .prepare_commit(BTreeMap::from([(0, committed.token.clone())]))
+                    .map_err(|error| SourceError::Io(error.to_string()))?,
+            )
+            .map_err(|error| SourceError::Io(error.to_string()))?;
         self.committed_offset = committed.token.clone();
 
         if let Err(error) = self.source.commit_offset(epoch, committed.token) {

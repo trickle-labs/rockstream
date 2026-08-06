@@ -245,12 +245,15 @@ impl<S: SourceConnector> SourcePollLifecycle<S> {
         }
         let entry = self
             .source_epochs
-            .prepare_commit(BTreeMap::from([(0, offset.clone())]));
+            .prepare_commit(BTreeMap::from([(0, offset.clone())]))
+            .map_err(|error| SourceError::Io(error.to_string()))?;
         assert_eq!(
             entry.source_epoch, epoch,
             "EDGE-SOURCEFAIL: a recovered offset must be committed at its prepared source epoch"
         );
-        self.source_epochs.commit_epoch(entry);
+        self.source_epochs
+            .commit_epoch(entry)
+            .map_err(|error| SourceError::Io(error.to_string()))?;
         self.committed_offset = offset;
         self.source
             .commit_offset(epoch, self.committed_offset.clone())?;

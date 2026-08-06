@@ -693,15 +693,33 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
 
         if opts.role == "worker" || opts.role == "all" {
             let url = control_url.as_deref().unwrap_or("127.0.0.1:8000");
-            let (client, handle) = rockstream_runtime::start_worker_client_with_metadata(
-                1,
-                url,
-                &opts.storage,
-                opts.worker_location.clone(),
-                opts.worker_capabilities,
-            )
-            .await
-            .unwrap();
+            let mut worker = None;
+            let mut last_error = None;
+            for _ in 0..20 {
+                match rockstream_runtime::start_worker_client_with_metadata(
+                    1,
+                    url,
+                    &opts.storage,
+                    opts.worker_location.clone(),
+                    opts.worker_capabilities,
+                )
+                .await
+                {
+                    Ok(connected) => {
+                        worker = Some(connected);
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            let (client, handle) = worker.ok_or_else(|| CliError::new(
+                RS_0003,
+                format!("worker failed to connect to control at {url}: {}", last_error.expect("connection attempts ran")),
+                "Verify the control address and that the control service is healthy before retrying.",
+            ))?;
 
             if opts.role == "all" {
                 // Wait for worker registration handshake

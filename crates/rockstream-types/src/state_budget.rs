@@ -43,12 +43,28 @@ pub struct StateBudgetError {
 
 impl fmt::Display for StateBudgetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.operator_name.starts_with("quota-overflow-") {
+            return write!(
+                f,
+                "RS-5004: quota counter overflow for '{}': current={}, requested={}; next_steps: release quota or create a new workload before retrying",
+                self.operator_name, self.current_bytes, self.requested_bytes
+            );
+        }
         write!(
             f,
             "RS-5003: state budget exceeded for '{}': current={} bytes, \
              requested={} bytes, limit={} bytes",
             self.operator_name, self.current_bytes, self.requested_bytes, self.max_bytes
         )
+    }
+}
+
+fn quota_overflow_error(name: &str, current: u64, requested: u64) -> StateBudgetError {
+    StateBudgetError {
+        operator_name: format!("quota-overflow-{name}"),
+        max_bytes: u64::MAX,
+        current_bytes: current,
+        requested_bytes: requested,
     }
 }
 
@@ -517,9 +533,25 @@ impl DistributedQuotaLedger {
                     }
                 }
             } else {
-                entry
-                    .current_memory_bytes
-                    .fetch_add(requested_bytes, Ordering::Relaxed);
+                loop {
+                    let current = entry.current_memory_bytes.load(Ordering::Relaxed);
+                    let Some(proposed) = current.checked_add(requested_bytes) else {
+                        self.total_rejections.fetch_add(1, Ordering::Relaxed);
+                        return Err(quota_overflow_error("memory", current, requested_bytes));
+                    };
+                    if entry
+                        .current_memory_bytes
+                        .compare_exchange_weak(
+                            current,
+                            proposed,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
             }
 
             let max_p = entry.max_parallelism.load(Ordering::Relaxed);
@@ -528,11 +560,9 @@ impl DistributedQuotaLedger {
                     let current_p = entry.current_parallelism.load(Ordering::Relaxed);
                     let proposed_p = current_p.saturating_add(parallelism as u64);
                     if proposed_p > max_p {
-                        if memory_limit > 0 {
-                            entry
-                                .current_memory_bytes
-                                .fetch_sub(requested_bytes, Ordering::Relaxed);
-                        }
+                        entry
+                            .current_memory_bytes
+                            .fetch_sub(requested_bytes, Ordering::Relaxed);
                         self.total_rejections.fetch_add(1, Ordering::Relaxed);
                         return Err(StateBudgetError {
                             operator_name: format!("workload-parallelism-{}", workload_id.0),
@@ -555,9 +585,32 @@ impl DistributedQuotaLedger {
                     }
                 }
             } else {
-                entry
-                    .current_parallelism
-                    .fetch_add(parallelism as u64, Ordering::Relaxed);
+                loop {
+                    let current = entry.current_parallelism.load(Ordering::Relaxed);
+                    let Some(proposed) = current.checked_add(parallelism as u64) else {
+                        entry
+                            .current_memory_bytes
+                            .fetch_sub(requested_bytes, Ordering::Relaxed);
+                        self.total_rejections.fetch_add(1, Ordering::Relaxed);
+                        return Err(quota_overflow_error(
+                            "parallelism",
+                            current,
+                            parallelism as u64,
+                        ));
+                    };
+                    if entry
+                        .current_parallelism
+                        .compare_exchange_weak(
+                            current,
+                            proposed,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
             }
         }
         self.total_reservations.fetch_add(1, Ordering::Relaxed);
@@ -815,5 +868,26 @@ mod tests {
         assert!(ledger.register_workload(WorkloadId(1), 100, 1).is_ok());
         assert!(ledger.register_workload(WorkloadId(2), 100, 1).is_ok());
         assert!(ledger.register_workload(WorkloadId(3), 100, 1).is_err());
+    }
+
+    #[test]
+    fn unlimited_quota_counter_overflow_is_rs5004_and_does_not_wrap() {
+        let ledger = Arc::new(DistributedQuotaLedger::new());
+        let workload_id = WorkloadId(303);
+        ledger.register_workload(workload_id, 0, 0).unwrap();
+        let entry = ledger.get_entry(workload_id).unwrap();
+        entry
+            .current_memory_bytes
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        let err = ledger.try_acquire_batch(workload_id, 2, 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RS-5004: quota counter overflow for 'quota-overflow-memory': current=18446744073709551614, requested=2; next_steps: release quota or create a new workload before retrying"
+        );
+        assert_eq!(
+            entry.current_memory_bytes.load(Ordering::Relaxed),
+            u64::MAX - 1
+        );
     }
 }

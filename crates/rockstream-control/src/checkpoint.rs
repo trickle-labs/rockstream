@@ -60,6 +60,8 @@ pub enum CoordinatorError {
     AlignmentBufferFull { used: usize, max: usize },
     /// The checkpoint alignment window timed out (RS-3602).
     AlignmentTimeout,
+    /// The monotone checkpoint id reached `u64::MAX` (RS-3604).
+    CheckpointIdOverflow,
     /// The shard is not registered with the coordinator.
     UnknownShard(ShardId),
     /// A shard reported a confirmation for the wrong checkpoint id.
@@ -82,6 +84,10 @@ impl std::fmt::Display for CoordinatorError {
                 f,
                 "RS-3602: checkpoint alignment timeout; pipeline in RECOVERING state; \
                  next_steps: monitor shard reassignment and frontier progress"
+            ),
+            Self::CheckpointIdOverflow => write!(
+                f,
+                "RS-3604: checkpoint id exhausted; next_steps: create a new cluster identity before retrying"
             ),
             Self::UnknownShard(s) => write!(f, "unknown shard {s}"),
             Self::StaleConfirmation {
@@ -234,7 +240,9 @@ impl CheckpointCoordinator {
         }
 
         let checkpoint_id = guard.next_checkpoint_id;
-        guard.next_checkpoint_id = guard.next_checkpoint_id.next();
+        guard.next_checkpoint_id = checkpoint_id
+            .checked_next()
+            .ok_or(CoordinatorError::CheckpointIdOverflow)?;
 
         let barrier = CheckpointBarrier::new(checkpoint_id);
 
@@ -400,6 +408,16 @@ mod tests {
         let coord = make_coordinator(&[0, 1]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
         assert_eq!(id, CheckpointId(1));
+    }
+
+    #[test]
+    fn checkpoint_id_exhaustion_returns_rs3604_without_wrapping() {
+        let coordinator = make_coordinator(&[1]);
+        coordinator.inner.lock().next_checkpoint_id = CheckpointId(u64::MAX);
+        assert_eq!(
+            coordinator.begin_checkpoint(noop_inject).unwrap_err().to_string(),
+            "RS-3604: checkpoint id exhausted; next_steps: create a new cluster identity before retrying"
+        );
     }
 
     #[test]

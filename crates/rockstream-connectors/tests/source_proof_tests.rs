@@ -207,7 +207,7 @@ async fn test_source_offset_replay_lfs() {
         part_offsets.insert(pid, OffsetToken::new(serde_json::to_vec(&off).unwrap()));
     }
 
-    let entry = registry.prepare_commit(part_offsets);
+    let entry = registry.prepare_commit(part_offsets).unwrap();
 
     // Save entry to ShardDb
     let mut suffix = b"epoch_map/".to_vec();
@@ -226,7 +226,7 @@ async fn test_source_offset_replay_lfs() {
     db.flush().await.unwrap();
 
     // Commit epoch in registry
-    registry.commit_epoch(entry);
+    registry.commit_epoch(entry).unwrap();
 
     // Simulate crash by closing the DB and recreating everything
     Arc::try_unwrap(db)
