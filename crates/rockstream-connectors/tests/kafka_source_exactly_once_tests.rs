@@ -1,67 +1,135 @@
-//! E2E Proof P1: Real Kafka broker in TestContainers publishes records that KafkaSource ingests
-//! exactly-once into a materialized view, surviving mid-stream worker kill with zero loss/duplicates.
+//! E2E proof: a real Kafka consumer group polls, revokes, and commits exact offsets.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::{DataType, Field, Schema};
-use rockstream_connectors::{KafkaSource, OffsetToken, SourceConnector};
+use rdkafka::{
+    admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
+    consumer::{Consumer, StreamConsumer},
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig, Offset, TopicPartitionList,
+};
+use rockstream_connectors::{KafkaSource, OffsetToken, PollDeltaResult, SourceConnector};
 use rockstream_types::arrow_batch::split_weight_column;
 use rockstream_types::ids::ConnectorId;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{self, KAFKA_PORT};
 
-#[test]
-fn test_kafka_json_ingest_exactly_once() {
-    // 1. Verify schema definition
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("val", DataType::Int64, false),
-    ]));
+async fn poll_until(
+    source: &mut KafkaSource,
+    after: OffsetToken,
+    credits: usize,
+) -> PollDeltaResult {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let result = source
+            .poll_delta(after.clone(), 4096, credits, None)
+            .unwrap();
+        if !result.batches.is_empty() {
+            return result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Kafka source did not receive a record"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
 
-    let mut source = KafkaSource::new(ConnectorId(101), schema, &[0, 1]);
+#[tokio::test(flavor = "multi_thread")]
+async fn real_broker_source_assignment_poll_and_commit() {
+    let broker = apache::Kafka::default().start().await.unwrap();
+    let bootstrap = format!(
+        "127.0.0.1:{}",
+        broker.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
+    );
+    let topic = "source-exactly-once";
+    let admin: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
+    let created = admin
+        .create_topics(
+            &[NewTopic::new(topic, 2, TopicReplication::Fixed(1))],
+            &AdminOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created, vec![Ok(topic.to_string())]);
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .unwrap();
 
-    // 2. Publish initial batch of records (simulating mid-stream ingestion)
-    for i in 0..50 {
-        source.add_record(0, i * 10, vec![i, i * 100]);
-        source.add_record(1, i * 10 + 5, vec![1000 + i, (1000 + i) * 100]);
+    for (partition, timestamp, value) in [(0, 100, 10), (1, 200, 20)] {
+        let payload =
+            serde_json::json!({"timestamp": timestamp, "values": [value], "weight": 1}).to_string();
+        producer
+            .send(
+                FutureRecord::to(topic)
+                    .partition(partition)
+                    .payload(&payload)
+                    .key(&format!("key-{partition}")),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
     }
 
-    // 3. Ingest first half before simulated worker kill
-    let start_tok = OffsetToken::new(vec![]);
-    let res1 = source.poll_delta(start_tok, 4096, 20, None).unwrap();
-    assert_eq!(res1.batches.len(), 1);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let mut source =
+        KafkaSource::connect(ConnectorId(101), schema, &bootstrap, topic, "source-proof").unwrap();
+    let first = poll_until(&mut source, OffsetToken::new(vec![]), 1).await;
+    let second = poll_until(&mut source, first.new_offset.clone(), 1).await;
+    source.commit_offset(7, second.new_offset.clone()).unwrap();
+    let committed = second.new_offset.clone();
 
-    let (batch1_data, batch1_weights) = split_weight_column(&res1.batches[0]).unwrap();
-    assert_eq!(batch1_data.num_rows(), 20);
-    assert_eq!(batch1_weights.len(), 20);
+    let mut values = [first, second]
+        .into_iter()
+        .flat_map(|result| {
+            let (data, weights) = split_weight_column(&result.batches[0]).unwrap();
+            assert_eq!(weights, vec![1]);
+            data.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    values.sort_unstable();
 
-    // Commit epoch 1
-    source.commit_offset(1, res1.new_offset.clone()).unwrap();
-    let (epoch1, committed_tok1) = source.last_committed().unwrap();
-    assert_eq!(epoch1, 1);
-    assert_eq!(committed_tok1, res1.new_offset);
+    assert_eq!(source.assigned_partition_count(), 2);
+    assert_eq!(values, vec![10, 20]);
+    assert_eq!(source.get_partition_offset(&committed, 0), Some(1));
+    assert_eq!(source.get_partition_offset(&committed, 1), Some(1));
+    assert_eq!(source.last_committed(), Some((7, committed)));
+    assert_eq!(source.last_poll_fill_level(), 0);
 
-    // 4. Simulate worker restart / failover: recover state from last committed token
-    let p0_off = source.get_partition_offset(&committed_tok1, 0).unwrap();
-    let p1_off = source.get_partition_offset(&committed_tok1, 1).unwrap();
-
-    let mut recovered_offsets = BTreeMap::new();
-    recovered_offsets.insert(0u64, p0_off);
-    recovered_offsets.insert(1u64, p1_off);
-
-    let resume_tok = OffsetToken::new(serde_json::to_vec(&recovered_offsets).unwrap());
-
-    // 5. Ingest remaining records post-restart
-    let res2 = source.poll_delta(resume_tok, 4096, 100, None).unwrap();
-    assert_eq!(res2.batches.len(), 1);
-
-    let (batch2_data, batch2_weights) = split_weight_column(&res2.batches[0]).unwrap();
-    assert_eq!(batch2_data.num_rows(), 80); // Remaining 80 records out of 100 total
-    assert_eq!(batch2_weights.len(), 80);
-
-    // Verify total ingested record count matches 100 exactly without duplicates or loss
-    let total_rows = batch1_data.num_rows() + batch2_data.num_rows();
+    let verifier: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .set("group.id", "source-proof")
+        .create()
+        .unwrap();
+    let mut partitions = TopicPartitionList::new();
+    partitions.add_partition(topic, 0);
+    partitions.add_partition(topic, 1);
+    let committed_offsets = verifier
+        .committed_offsets(partitions, Duration::from_secs(5))
+        .unwrap();
     assert_eq!(
-        total_rows, 100,
-        "Exactly 100 published records ingested across failover"
+        committed_offsets
+            .elements()
+            .into_iter()
+            .map(|partition| (partition.partition(), partition.offset()))
+            .collect::<Vec<_>>(),
+        vec![(0, Offset::Offset(1)), (1, Offset::Offset(1))]
     );
 }

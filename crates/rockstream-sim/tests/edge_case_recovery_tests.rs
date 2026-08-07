@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use object_store::memory::InMemory;
 use rockstream_connectors::{
     validate_window_watermark, ObjectStoreSink, OffsetToken, PollDeltaResult, SinkConnector,
     SnapshotStream, SourceConnector, SourceError, SourcePollLifecycle, WatermarkCapability,
@@ -268,7 +269,7 @@ fn edge_source_failure_pauses_preserves_offset_and_recovers_exactly_once() {
 
 #[test]
 fn edge_object_store_brownout_caps_buffer_backpressures_and_drains() {
-    let mut sink = ObjectStoreSink::new(ConnectorId(51_12));
+    let mut sink = ObjectStoreSink::new(ConnectorId(51_12), Arc::new(InMemory::new()));
     sink.set_cluster_committed(100);
     let states = (1..=OBJECT_STORE_SINK_MAX_PENDING_EPOCHS as u64)
         .map(|epoch| (epoch, sink.pre_commit(epoch, epoch as usize).unwrap()))

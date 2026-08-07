@@ -18,6 +18,13 @@
 //! | During commit | CheckBeforeCommit: query topic; already present → Committed. |
 
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
+
+use rdkafka::{
+    consumer::{BaseConsumer, Consumer},
+    producer::{BaseProducer, BaseRecord, Producer},
+    ClientConfig, Message, TopicPartitionList,
+};
 
 use rockstream_sim::buggify;
 use rockstream_types::ids::ConnectorId;
@@ -33,10 +40,13 @@ use crate::sink_connector::{
 /// simultaneously. Exceeding this triggers backpressure.
 pub const KAFKA_SINK_MAX_STAGED_EPOCHS: usize = 5;
 
-/// In-memory Kafka sink implementing `CheckBeforeCommit` idempotency.
-///
-/// In production this would wrap a real Kafka producer (e.g. `rdkafka`).
-/// Here it is a self-contained state machine that can be driven by tests.
+struct KafkaBroker {
+    producer: BaseProducer,
+    bootstrap: String,
+    topic: String,
+}
+
+/// Kafka sink implementing `CheckBeforeCommit` idempotency.
 pub struct KafkaSink {
     connector_id: ConnectorId,
     /// Epochs that have been delivered to the "external Kafka".
@@ -47,16 +57,57 @@ pub struct KafkaSink {
     max_staged_epochs: usize,
     /// Fill-level metric: current count of staged epochs.
     staged_epochs_count: usize,
-    /// Simulated Kafka cluster_committed horizon (for checkpoint-coupling assertion).
+    /// Cluster checkpoint horizon used by the checkpoint-coupling assertion.
     cluster_committed: Epoch,
     /// Probability that the broker force-aborts the open producer
     /// transaction before commit, mirroring a real `transaction.timeout.ms`
     /// expiry (`kafka.tx_timeout` fault, v0.43, DESIGN.md §17.8 gap 2). Zero
     /// by default (production/no simulation).
     kafka_tx_timeout_probability: f64,
+    broker: Option<KafkaBroker>,
 }
 
 impl KafkaSink {
+    /// Connect a transactional producer to the epoch-marker topic.
+    pub fn connect(
+        connector_id: ConnectorId,
+        bootstrap: &str,
+        topic: &str,
+    ) -> Result<Self, SinkError> {
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap)
+            .set(
+                "transactional.id",
+                format!("rockstream-{}-{topic}", connector_id.0),
+            )
+            .set("enable.idempotence", "true")
+            .set("acks", "all")
+            .create()
+            .map_err(|error| {
+                SinkError::Io(format!("Kafka producer configuration failed: {error}"))
+            })?;
+        producer
+            .init_transactions(Duration::from_secs(15))
+            .map_err(|error| {
+                SinkError::Io(format!("Kafka transaction initialization failed: {error}"))
+            })?;
+        Ok(Self {
+            connector_id,
+            delivered_epochs: BTreeSet::new(),
+            staged_epochs: BTreeSet::new(),
+            max_staged_epochs: KAFKA_SINK_MAX_STAGED_EPOCHS,
+            staged_epochs_count: 0,
+            cluster_committed: 0,
+            kafka_tx_timeout_probability: 0.0,
+            broker: Some(KafkaBroker {
+                producer,
+                bootstrap: bootstrap.to_owned(),
+                topic: topic.to_owned(),
+            }),
+        })
+    }
+
+    #[cfg(any(test, feature = "simulation"))]
     pub fn new(connector_id: ConnectorId) -> Self {
         Self {
             connector_id,
@@ -66,6 +117,7 @@ impl KafkaSink {
             staged_epochs_count: 0,
             cluster_committed: 0,
             kafka_tx_timeout_probability: 0.0,
+            broker: None,
         }
     }
 
@@ -96,12 +148,65 @@ impl KafkaSink {
         self.staged_epochs_count >= self.max_staged_epochs
     }
 
-    /// Simulate a "check" query to the Kafka topic for a given epoch.
-    ///
-    /// Returns `true` if the epoch has already been delivered (for
-    /// `CheckBeforeCommit` recovery path).
+    /// Returns whether the durable epoch marker is present in Kafka.
     pub fn check_epoch_delivered(&self, epoch: Epoch) -> bool {
-        self.delivered_epochs.contains(&epoch)
+        let Some(broker) = &self.broker else {
+            return self.delivered_epochs.contains(&epoch);
+        };
+        let consumer: BaseConsumer = match ClientConfig::new()
+            .set("bootstrap.servers", &broker.bootstrap)
+            .set(
+                "group.id",
+                format!("rockstream-epoch-check-{}-{epoch}", self.connector_id.0),
+            )
+            .set("auto.offset.reset", "earliest")
+            .set("enable.auto.commit", "false")
+            .set("isolation.level", "read_committed")
+            .create()
+        {
+            Ok(consumer) => consumer,
+            Err(_) => return false,
+        };
+        if consumer.subscribe(&[&broker.topic]).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(Ok(message)) = consumer.poll(Duration::from_millis(100)) {
+                if message
+                    .payload_view::<str>()
+                    .and_then(Result::ok)
+                    .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+                    .and_then(|payload| payload.get("epoch").and_then(serde_json::Value::as_u64))
+                    == Some(epoch)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Atomically attach consumed source offsets to the open transaction.
+    pub fn send_offsets_to_transaction<C: Consumer>(
+        &self,
+        offsets: &TopicPartitionList,
+        consumer: &C,
+    ) -> Result<(), SinkError> {
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            SinkError::Io("Kafka transaction offsets require KafkaSink::connect".to_string())
+        })?;
+        let metadata = consumer.group_metadata().ok_or_else(|| {
+            SinkError::Io(
+                "Kafka consumer group is not ready for transactional offset commit".to_string(),
+            )
+        })?;
+        broker
+            .producer
+            .send_offsets_to_transaction(offsets, &metadata, Duration::from_secs(10))
+            .map_err(|error| {
+                SinkError::Io(format!("Kafka transactional offset commit failed: {error}"))
+            })
     }
 }
 
@@ -120,13 +225,33 @@ impl SinkConnector for KafkaSink {
                 ),
             });
         }
-        // Begin a Kafka producer transaction (simulated: record in staged set).
+        if let Some(broker) = &self.broker {
+            broker
+                .producer
+                .begin_transaction()
+                .map_err(|error| SinkError::PreCommitFailed {
+                    epoch,
+                    reason: format!("Kafka transaction begin failed: {error}"),
+                })?;
+            let payload = format!("{{\"epoch\":{epoch},\"rows\":{row_count}}}");
+            broker
+                .producer
+                .send(
+                    BaseRecord::to(&broker.topic)
+                        .payload(&payload)
+                        .key(&epoch.to_string()),
+                )
+                .map_err(|(error, _)| SinkError::PreCommitFailed {
+                    epoch,
+                    reason: format!("Kafka transaction produce failed: {error}"),
+                })?;
+        }
         let txn_id = format!("kafka-txn-{}-epoch-{}", self.connector_id.0, epoch);
         self.staged_epochs.insert(epoch);
         self.staged_epochs_count += 1;
         Ok(SinkState::PreCommitted {
             staged_rows: row_count,
-            pending_handle: txn_id.into_bytes(),
+            pending_handle: format!("{txn_id}:{row_count}").into_bytes(),
         })
     }
 
@@ -151,6 +276,9 @@ impl SinkConnector for KafkaSink {
                     // retry via `recover()`'s `CheckBeforeCommit` path, which
                     // will find the topic absent and re-commit in a fresh
                     // transaction, delivering exactly once.
+                    if let Some(broker) = &self.broker {
+                        let _ = broker.producer.abort_transaction(Duration::from_secs(10));
+                    }
                     return Err(SinkError::CommitFailed {
                         epoch,
                         reason: "kafka transactional broker timeout — open transaction \
@@ -159,7 +287,15 @@ impl SinkConnector for KafkaSink {
                             .to_string(),
                     });
                 }
-                // Finalize: mark as delivered in Kafka.
+                if let Some(broker) = &self.broker {
+                    broker
+                        .producer
+                        .commit_transaction(Duration::from_secs(15))
+                        .map_err(|error| SinkError::CommitFailed {
+                            epoch,
+                            reason: format!("Kafka transaction commit failed: {error}"),
+                        })?;
+                }
                 self.delivered_epochs.insert(epoch);
                 self.staged_epochs.remove(&epoch);
                 if self.staged_epochs_count > 0 {
@@ -175,6 +311,14 @@ impl SinkConnector for KafkaSink {
     }
 
     fn abort(&mut self, epoch: Epoch) -> Result<(), SinkError> {
+        if let Some(broker) = &self.broker {
+            broker
+                .producer
+                .abort_transaction(Duration::from_secs(10))
+                .map_err(|error| {
+                    SinkError::Io(format!("Kafka transaction abort failed: {error}"))
+                })?;
+        }
         self.staged_epochs.remove(&epoch);
         if self.staged_epochs_count > 0 {
             self.staged_epochs_count -= 1;
@@ -191,7 +335,7 @@ impl SinkConnector for KafkaSink {
                 pending_handle,
             } => {
                 let epoch = *epoch;
-                // CheckBeforeCommit: check the Kafka topic first.
+                // CheckBeforeCommit: query the durable epoch topic first.
                 if self.check_epoch_delivered(epoch) {
                     // Already delivered; mark as committed (idempotent no-op).
                     // The epoch is resolved: clear any stale staged-epoch
@@ -203,11 +347,38 @@ impl SinkConnector for KafkaSink {
                     assert_recovery_dispatch_idempotent(self.connector_id, &action, &final_state);
                     return Ok(());
                 }
-                // Not yet delivered: begin a new transaction and commit.
-                let _state = SinkState::PreCommitted {
-                    staged_rows: 0,
-                    pending_handle: pending_handle.clone(),
-                };
+                if let Some(broker) = &self.broker {
+                    let rows = std::str::from_utf8(pending_handle)
+                        .ok()
+                        .and_then(|handle| handle.rsplit(':').next())
+                        .and_then(|rows| rows.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    broker.producer.begin_transaction().map_err(|error| {
+                        SinkError::CommitFailed {
+                            epoch,
+                            reason: format!("Kafka recovery transaction begin failed: {error}"),
+                        }
+                    })?;
+                    let payload = format!("{{\"epoch\":{epoch},\"rows\":{rows}}}");
+                    broker
+                        .producer
+                        .send(
+                            BaseRecord::to(&broker.topic)
+                                .payload(&payload)
+                                .key(&epoch.to_string()),
+                        )
+                        .map_err(|(error, _)| SinkError::CommitFailed {
+                            epoch,
+                            reason: format!("Kafka recovery produce failed: {error}"),
+                        })?;
+                    broker
+                        .producer
+                        .commit_transaction(Duration::from_secs(15))
+                        .map_err(|error| SinkError::CommitFailed {
+                            epoch,
+                            reason: format!("Kafka recovery transaction commit failed: {error}"),
+                        })?;
+                }
                 // Recovery commit does not check cluster_committed (the
                 // checkpoint already succeeded before recovery).
                 self.delivered_epochs.insert(epoch);
@@ -390,6 +561,7 @@ mod tests {
             staged_epochs_count: 0,
             cluster_committed: 100,
             kafka_tx_timeout_probability: 0.0,
+            broker: None,
         };
         sink.pre_commit(1, 10).unwrap();
         sink.pre_commit(2, 10).unwrap();

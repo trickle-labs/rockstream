@@ -365,6 +365,7 @@ mod sim_coordination {
     use rockstream_types::ids::ConnectorId;
     use rockstream_types::sink::RecoveryAction;
     use rockstream_types::sink::SinkIdempotencyProfile;
+    use std::sync::Arc;
 
     const NUM_EPOCHS: u64 = 20;
     const PARTIAL_WRITE_PROBABILITY: f64 = 0.5;
@@ -375,7 +376,10 @@ mod sim_coordination {
         for &seed in &SEEDS {
             buggify_init(seed);
 
-            let mut sink = ObjectStoreSink::new(ConnectorId(43));
+            let mut sink = ObjectStoreSink::new(
+                ConnectorId(43),
+                Arc::new(object_store::memory::InMemory::new()),
+            );
             sink.set_cluster_committed(1_000);
             sink.set_partial_write_probability(PARTIAL_WRITE_PROBABILITY);
 

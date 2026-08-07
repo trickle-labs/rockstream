@@ -1,105 +1,145 @@
-//! Kafka source connector supporting multi-partition consumer groups (§13.3).
+//! Kafka source connector backed by a real consumer group (§13.3).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::{Epoch, EventTimeWatermark};
+use serde::Deserialize;
 
 use crate::source_connector::{PollDeltaResult, SnapshotStream, SourceConnector, SourceError};
 use crate::source_epoch::OffsetToken;
 
-/// Buffer bound declaration: Kafka source buffer limit.
+/// Native Kafka queue bound in KiB; one overflow record is retained locally.
 pub const KAFKA_SOURCE_BUFFER_LIMIT: usize = 50_000;
 
 #[derive(Debug, Clone)]
-pub struct KafkaRecord {
-    pub offset: u64,
-    pub timestamp: i64,
-    pub values: Vec<i64>,
-    pub weight: i64,
+struct KafkaRecord {
+    offset: u64,
+    partition: i32,
+    timestamp: i64,
+    values: Vec<i64>,
+    weight: i64,
+    bytes: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct KafkaPartition {
-    pub partition_id: u64,
-    pub records: Vec<KafkaRecord>,
-    pub watermark: i64,
+#[derive(Deserialize)]
+struct KafkaPayload {
+    timestamp: i64,
+    values: Vec<i64>,
+    #[serde(default = "default_weight")]
+    weight: i64,
 }
 
-impl KafkaPartition {
-    pub fn new(partition_id: u64) -> Self {
-        Self {
-            partition_id,
-            records: Vec::new(),
-            watermark: i64::MIN,
-        }
-    }
-
-    pub fn poll_from(&self, start_offset: u64, limit: usize) -> Vec<KafkaRecord> {
-        let mut results = Vec::new();
-        for rec in &self.records {
-            if rec.offset >= start_offset {
-                results.push(rec.clone());
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-        results
-    }
+const fn default_weight() -> i64 {
+    1
 }
 
-/// A mock `KafkaSource` implementing `SourceConnector`.
+/// Kafka source using a real `rdkafka::consumer::StreamConsumer`.
 pub struct KafkaSource {
     _connector_id: ConnectorId,
     schema: SchemaRef,
-    partitions: BTreeMap<u64, KafkaPartition>,
+    consumer: StreamConsumer,
+    runtime: Option<tokio::runtime::Runtime>,
+    topic: String,
     paused: bool,
+    watermarks: BTreeMap<i32, i64>,
+    pending_record: Option<KafkaRecord>,
+    last_poll_fill_level: usize,
+    last_polled: Option<OffsetToken>,
     last_committed: Option<(Epoch, OffsetToken)>,
 }
 
 impl KafkaSource {
-    pub fn new(connector_id: ConnectorId, schema: SchemaRef, partition_ids: &[u64]) -> Self {
-        let mut partitions = BTreeMap::new();
-        for &pid in partition_ids {
-            partitions.insert(pid, KafkaPartition::new(pid));
+    /// Connect and subscribe this source to a Kafka consumer group.
+    pub fn connect(
+        connector_id: ConnectorId,
+        schema: SchemaRef,
+        bootstrap_servers: &str,
+        topic: &str,
+        group_id: &str,
+    ) -> Result<Self, SourceError> {
+        if bootstrap_servers.is_empty() || topic.is_empty() || group_id.is_empty() {
+            return Err(SourceError::Io(
+                "Kafka configuration is incomplete. Next steps: provide bootstrap servers, topic, and group id"
+                    .to_string(),
+            ));
         }
-        Self {
+
+        let runtime = if tokio::runtime::Handle::try_current().is_err() {
+            Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .map_err(|error| {
+                        SourceError::Io(format!(
+                        "Kafka runtime creation failed: {error}. Next steps: retry source startup"
+                    ))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let config = || {
+            ClientConfig::new()
+                .set("bootstrap.servers", bootstrap_servers)
+                .set("group.id", group_id)
+                .set("enable.auto.commit", "false")
+                .set("enable.auto.offset.store", "false")
+                .set("auto.offset.reset", "earliest")
+                .set(
+                    "queued.max.messages.kbytes",
+                    KAFKA_SOURCE_BUFFER_LIMIT.to_string(),
+                )
+                .create::<StreamConsumer>()
+        };
+        let consumer = if let Some(runtime) = &runtime {
+            let _guard = runtime.enter();
+            config()
+        } else {
+            config()
+        }
+        .map_err(|error| SourceError::Io(format!(
+            "Kafka consumer creation failed: {error}. Next steps: verify broker connectivity and consumer configuration"
+        )))?;
+        consumer.subscribe(&[topic]).map_err(|error| {
+            SourceError::Io(format!(
+                "Kafka subscription failed: {error}. Next steps: verify that topic {topic:?} exists and is authorized"
+            ))
+        })?;
+
+        Ok(Self {
             _connector_id: connector_id,
             schema,
-            partitions,
+            consumer,
+            runtime,
+            topic: topic.to_owned(),
             paused: false,
+            watermarks: BTreeMap::new(),
+            pending_record: None,
+            last_poll_fill_level: 0,
+            last_polled: None,
             last_committed: None,
-        }
+        })
     }
 
-    /// Add a record to the given partition.
-    pub fn add_record(&mut self, partition_id: u64, timestamp: i64, values: Vec<i64>) {
-        let partition = self
-            .partitions
-            .entry(partition_id)
-            .or_insert_with(|| KafkaPartition::new(partition_id));
-        let next_offset = partition.records.len() as u64;
-        partition.records.push(KafkaRecord {
-            offset: next_offset,
-            timestamp,
-            values,
-            weight: 1,
-        });
+    /// The number of partitions currently assigned by the Kafka group.
+    pub fn assigned_partition_count(&self) -> usize {
+        self.watermarks.len()
     }
 
-    /// Direct skew injection helper to explicitly set partition watermarks.
-    pub fn set_partition_watermark(&mut self, partition_id: u64, watermark: i64) {
-        if let Some(partition) = self.partitions.get_mut(&partition_id) {
-            partition.watermark = watermark;
-        }
+    /// Bounded local-buffer fill level (zero or one overflow record).
+    pub fn last_poll_fill_level(&self) -> usize {
+        self.last_poll_fill_level
     }
 
-    /// Retrieve the partition's current offset from serialized OffsetToken.
+    /// Retrieve a partition's next offset from a serialized `OffsetToken`.
     pub fn get_partition_offset(&self, token: &OffsetToken, partition_id: u64) -> Option<u64> {
         if token.as_bytes().is_empty() {
             return Some(0);
@@ -108,62 +148,163 @@ impl KafkaSource {
         Some(map.get(&partition_id).copied().unwrap_or(0))
     }
 
-    /// Current global watermark is the minimum watermark across all partitions.
     fn current_global_watermark(&self) -> Option<EventTimeWatermark> {
-        if self.partitions.is_empty() {
-            return None;
-        }
-        let min_wm = self
-            .partitions
+        self.watermarks
             .values()
-            .map(|p| p.watermark)
+            .copied()
             .min()
-            .unwrap_or(i64::MIN);
-        if min_wm == i64::MIN {
-            None
-        } else {
-            Some(min_wm as u64)
-        }
+            .filter(|watermark| *watermark != i64::MIN)
+            .map(|watermark| watermark as u64)
     }
 
-    /// Build a single `RecordBatch` from polled records.
+    fn refresh_assignment(&mut self) -> Result<BTreeSet<i32>, SourceError> {
+        let assigned = self
+            .consumer
+            .assignment()
+            .map_err(|error| SourceError::PollDeltaFailed {
+                reason: format!(
+                    "Kafka assignment lookup failed: {error}. Next steps: retry after consumer-group rebalance"
+                ),
+            })?
+            .elements_for_topic(&self.topic)
+            .into_iter()
+            .map(|partition| partition.partition())
+            .collect::<BTreeSet<_>>();
+        self.watermarks
+            .retain(|partition, _| assigned.contains(partition));
+        for partition in &assigned {
+            self.watermarks.entry(*partition).or_insert(i64::MIN);
+        }
+        Ok(assigned)
+    }
+
+    fn seek_recovery_offset(
+        &mut self,
+        after: &OffsetToken,
+        assigned: &BTreeSet<i32>,
+    ) -> Result<(), SourceError> {
+        if after.as_bytes().is_empty() || self.last_polled.as_ref() == Some(after) {
+            return Ok(());
+        }
+        let offsets: BTreeMap<u64, u64> = serde_json::from_slice(after.as_bytes()).map_err(|e| {
+            SourceError::PollDeltaFailed {
+                reason: format!(
+                    "invalid Kafka offset token: {e}. Next steps: recover the token from the committed source epoch"
+                ),
+            }
+        })?;
+        if assigned.is_empty() {
+            return Ok(());
+        }
+        let mut positions = TopicPartitionList::new();
+        for partition in assigned {
+            let offset = offsets.get(&(*partition as u64)).copied().unwrap_or(0);
+            let offset = i64::try_from(offset).map_err(|_| SourceError::PollDeltaFailed {
+                reason:
+                    "Kafka offset exceeds i64. Next steps: restore a valid committed offset token"
+                        .to_string(),
+            })?;
+            positions
+                .add_partition_offset(&self.topic, *partition, Offset::Offset(offset))
+                .map_err(|error| SourceError::PollDeltaFailed {
+                    reason: format!(
+                        "Kafka recovery seek setup failed: {error}. Next steps: retry after assignment stabilizes"
+                    ),
+                })?;
+        }
+        self.consumer
+            .seek_partitions(positions, Duration::from_secs(1))
+            .map_err(|error| SourceError::PollDeltaFailed {
+                reason: format!(
+                    "Kafka recovery seek failed: {error}. Next steps: retry after consumer-group rebalance"
+                ),
+            })?;
+        Ok(())
+    }
+
+    fn next_record(&mut self) -> Result<Option<KafkaRecord>, SourceError> {
+        if let Some(record) = self.pending_record.take() {
+            return Ok(Some(record));
+        }
+        let receive =
+            async { tokio::time::timeout(Duration::from_millis(25), self.consumer.recv()).await };
+        let message = match if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(receive))
+        } else {
+            self.runtime
+                .as_ref()
+                .expect("runtime exists outside Tokio")
+                .block_on(receive)
+        } {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => {
+                return Err(SourceError::PollDeltaFailed {
+                    reason: format!(
+                        "Kafka poll failed: {error}. Next steps: retry after verifying broker connectivity"
+                    ),
+                });
+            }
+            Err(_) => return Ok(None),
+        };
+        let payload = message
+            .payload()
+            .ok_or_else(|| SourceError::PollDeltaFailed {
+                reason: "Kafka record has no payload. Next steps: publish JSON source records"
+                    .to_string(),
+            })?;
+        let body: KafkaPayload = serde_json::from_slice(payload).map_err(|error| {
+            SourceError::PollDeltaFailed {
+                reason: format!(
+                    "Kafka record payload is not the required JSON shape: {error}. Next steps: publish timestamp, values, and optional weight"
+                ),
+            }
+        })?;
+        let offset = u64::try_from(message.offset()).map_err(|_| SourceError::PollDeltaFailed {
+            reason: "Kafka record has a negative offset. Next steps: retry from the committed source epoch"
+                .to_string(),
+        })?;
+        Ok(Some(KafkaRecord {
+            offset,
+            partition: message.partition(),
+            timestamp: body.timestamp,
+            values: body.values,
+            weight: body.weight,
+            bytes: payload.len(),
+        }))
+    }
+
     fn build_batch(&self, records: &[KafkaRecord]) -> Result<Vec<RecordBatch>, SourceError> {
         use arrow::array::Int64Array;
         use rockstream_types::arrow_batch::append_weight_column;
 
         let num_rows = records.len();
         let num_cols = self.schema.fields().len();
-
         let mut columns: Vec<Vec<i64>> = vec![vec![0; num_rows]; num_cols];
         let mut weights = vec![0; num_rows];
-
-        for (r_idx, rec) in records.iter().enumerate() {
-            weights[r_idx] = rec.weight;
-            for (c_idx, col) in columns.iter_mut().enumerate().take(num_cols) {
-                col[r_idx] = rec.values.get(c_idx).copied().unwrap_or(0);
+        for (row, record) in records.iter().enumerate() {
+            weights[row] = record.weight;
+            for (column, values) in columns.iter_mut().enumerate() {
+                values[row] = record.values.get(column).copied().unwrap_or(0);
             }
         }
-
-        let mut arrow_columns: Vec<arrow::array::ArrayRef> = vec![];
-        for col_data in columns {
-            arrow_columns.push(Arc::new(Int64Array::from(col_data)));
-        }
-
-        let data_batch = RecordBatch::try_new(self.schema.clone(), arrow_columns).map_err(|e| {
-            SourceError::PollDeltaFailed {
-                reason: format!("failed to build RecordBatch: {e}"),
-            }
+        let data = RecordBatch::try_new(
+            self.schema.clone(),
+            columns
+                .into_iter()
+                .map(|values| Arc::new(Int64Array::from(values)) as arrow::array::ArrayRef)
+                .collect(),
+        )
+        .map_err(|error| SourceError::PollDeltaFailed {
+            reason: format!("failed to build Kafka RecordBatch: {error}"),
         })?;
-
-        let weighted_batch = append_weight_column(data_batch, &weights).map_err(|e| {
-            SourceError::PollDeltaFailed {
-                reason: format!("failed to append weight column: {e}"),
-            }
-        })?;
-
-        Ok(vec![weighted_batch])
+        append_weight_column(data, &weights)
+            .map(|batch| vec![batch])
+            .map_err(|error| SourceError::PollDeltaFailed {
+                reason: format!("failed to append Kafka weight column: {error}"),
+            })
     }
 
+    /// Last successfully committed epoch/token pair.
     pub fn last_committed(&self) -> Option<(Epoch, OffsetToken)> {
         self.last_committed.clone()
     }
@@ -179,158 +320,151 @@ impl SourceConnector for KafkaSource {
         _frontier: Epoch,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
-        // Mock Kafka source starts with an empty snapshot stream by default
         Ok(SnapshotStream::new(vec![]))
     }
 
     fn poll_delta(
         &mut self,
         after: OffsetToken,
-        _max_bytes: usize,
+        max_bytes: usize,
         credits_available: usize,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
-        if self.paused || credits_available == 0 {
+        self.last_poll_fill_level = usize::from(self.pending_record.is_some());
+        if self.paused || credits_available == 0 || max_bytes == 0 {
             return Ok(PollDeltaResult {
                 batches: vec![],
                 new_offset: after,
                 watermark: self.current_global_watermark(),
             });
         }
+        let assigned = self.refresh_assignment()?;
+        self.seek_recovery_offset(&after, &assigned)?;
 
-        let mut current_offsets: BTreeMap<u64, u64> = if after.as_bytes().is_empty() {
+        let mut offsets: BTreeMap<u64, u64> = if after.as_bytes().is_empty() {
             BTreeMap::new()
         } else {
-            serde_json::from_slice(after.as_bytes()).map_err(|e| SourceError::PollDeltaFailed {
-                reason: format!("failed to deserialize offset token: {e}"),
+            serde_json::from_slice(after.as_bytes()).map_err(|error| SourceError::PollDeltaFailed {
+                reason: format!(
+                    "invalid Kafka offset token: {error}. Next steps: recover the token from the committed source epoch"
+                ),
             })?
         };
-
-        let mut polled_records = Vec::new();
-        let mut credits_left = credits_available;
-
-        for (&part_id, partition) in &mut self.partitions {
-            if credits_left == 0 {
+        let record_limit = credits_available.min(KAFKA_SOURCE_BUFFER_LIMIT);
+        let mut records = Vec::with_capacity(record_limit);
+        let mut bytes = 0;
+        while records.len() < record_limit {
+            let Some(record) = self.next_record()? else {
+                break;
+            };
+            if record.bytes > max_bytes && records.is_empty() {
+                self.pending_record = Some(record);
+                return Err(SourceError::PollDeltaFailed {
+                    reason: format!(
+                        "Kafka record exceeds max_bytes={max_bytes}. Next steps: increase the bounded poll size"
+                    ),
+                });
+            }
+            if bytes + record.bytes > max_bytes {
+                self.pending_record = Some(record);
                 break;
             }
-            let start_offset = current_offsets.get(&part_id).copied().unwrap_or(0);
-            let part_records = partition.poll_from(start_offset, credits_left);
-            if !part_records.is_empty() {
-                let next_offset = start_offset + part_records.len() as u64;
-                current_offsets.insert(part_id, next_offset);
-                credits_left -= part_records.len();
-
-                // Watermark advances to the maximum of polled timestamps
-                let max_ts = part_records.iter().map(|r| r.timestamp).max().unwrap();
-                partition.watermark = partition.watermark.max(max_ts);
-
-                polled_records.extend(part_records);
-            }
+            bytes += record.bytes;
+            offsets.insert(record.partition as u64, record.offset + 1);
+            self.watermarks
+                .entry(record.partition)
+                .and_modify(|watermark| *watermark = (*watermark).max(record.timestamp));
+            records.push(record);
         }
-
-        let batches = if polled_records.is_empty() {
-            Vec::new()
-        } else {
-            self.build_batch(&polled_records)?
-        };
-
-        let new_offset_bytes =
-            serde_json::to_vec(&current_offsets).map_err(|e| SourceError::PollDeltaFailed {
-                reason: format!("failed to serialize offset token: {e}"),
-            })?;
-
+        self.last_poll_fill_level = usize::from(self.pending_record.is_some());
+        self.refresh_assignment()?;
+        let new_offset = OffsetToken::new(serde_json::to_vec(&offsets).map_err(|error| {
+            SourceError::PollDeltaFailed {
+                reason: format!("failed to serialize Kafka offset token: {error}"),
+            }
+        })?);
+        self.last_polled = Some(new_offset.clone());
         Ok(PollDeltaResult {
-            batches,
-            new_offset: OffsetToken::new(new_offset_bytes),
+            batches: if records.is_empty() {
+                vec![]
+            } else {
+                self.build_batch(&records)?
+            },
+            new_offset,
             watermark: self.current_global_watermark(),
         })
     }
 
     fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+        let offsets: BTreeMap<u64, u64> =
+            serde_json::from_slice(offset.as_bytes()).map_err(|e| {
+                SourceError::CommitOffsetFailed {
+                    epoch,
+                    reason: format!(
+                    "invalid Kafka offset token: {e}. Next steps: commit the emitted source token"
+                ),
+                }
+            })?;
+        let mut commit = TopicPartitionList::new();
+        for (partition, next_offset) in offsets {
+            let partition =
+                i32::try_from(partition).map_err(|_| SourceError::CommitOffsetFailed {
+                    epoch,
+                    reason: "Kafka partition exceeds i32. Next steps: commit a valid source token"
+                        .to_string(),
+                })?;
+            let next_offset =
+                i64::try_from(next_offset).map_err(|_| SourceError::CommitOffsetFailed {
+                    epoch,
+                    reason: "Kafka offset exceeds i64. Next steps: commit a valid source token"
+                        .to_string(),
+                })?;
+            commit
+                .add_partition_offset(&self.topic, partition, Offset::Offset(next_offset))
+                .map_err(|error| SourceError::CommitOffsetFailed {
+                    epoch,
+                    reason: format!(
+                        "Kafka commit setup failed: {error}. Next steps: retry after rebalance"
+                    ),
+                })?;
+        }
+        self.consumer
+            .commit(&commit, CommitMode::Sync)
+            .map_err(|error| SourceError::CommitOffsetFailed {
+                epoch,
+                reason: format!("Kafka commit failed: {error}. Next steps: retry the source epoch"),
+            })?;
         self.last_committed = Some((epoch, offset));
         Ok(())
     }
 
     fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+        let assigned = self.consumer.assignment().map_err(|error| {
+            SourceError::Io(format!(
+                "Kafka assignment lookup failed: {error}. Next steps: retry pause after rebalance"
+            ))
+        })?;
+        self.consumer.pause(&assigned).map_err(|error| {
+            SourceError::Io(format!(
+                "Kafka pause failed: {error}. Next steps: retry pause after rebalance"
+            ))
+        })?;
         self.paused = true;
         Ok(())
     }
 
     fn resume(&mut self) -> Result<(), SourceError> {
+        let assigned = self.consumer.assignment().map_err(|error| {
+            SourceError::Io(format!(
+                "Kafka assignment lookup failed: {error}. Next steps: retry resume after rebalance"
+            ))
+        })?;
+        self.consumer.resume(&assigned).map_err(|error| {
+            SourceError::Io(format!(
+                "Kafka resume failed: {error}. Next steps: retry resume after rebalance"
+            ))
+        })?;
         self.paused = false;
         Ok(())
-    }
-}
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use rockstream_types::arrow_batch::split_weight_column;
-
-    fn test_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("t", DataType::Int64, false),
-            Field::new("v", DataType::Int64, false),
-        ]))
-    }
-
-    #[test]
-    fn test_kafka_source_basic() {
-        let schema = test_schema();
-        let mut source = KafkaSource::new(ConnectorId(101), schema, &[0, 1]);
-
-        // Add records to partitions
-        source.add_record(0, 100, vec![100, 10]);
-        source.add_record(0, 200, vec![200, 20]);
-        source.add_record(1, 150, vec![150, 15]);
-
-        // Poll with 1 credit limit (respecting backpressure / credit limit)
-        let token_start = OffsetToken::new(vec![]);
-        let res1 = source
-            .poll_delta(token_start.clone(), 1024, 1, None)
-            .unwrap();
-        assert_eq!(res1.batches.len(), 1);
-        let (data1, weights1) = split_weight_column(&res1.batches[0]).unwrap();
-        assert_eq!(data1.num_rows(), 1);
-        assert_eq!(weights1, vec![1]);
-
-        // Verify partition 0 offset advanced, partition 1 is 0
-        let p0_off = source.get_partition_offset(&res1.new_offset, 0).unwrap();
-        let p1_off = source.get_partition_offset(&res1.new_offset, 1).unwrap();
-        assert_eq!(p0_off, 1);
-        assert_eq!(p1_off, 0);
-
-        // Watermark should be None because partition 1 hasn't polled anything (watermark is i64::MIN)
-        assert!(res1.watermark.is_none());
-
-        // Poll remaining records
-        let res2 = source
-            .poll_delta(res1.new_offset.clone(), 1024, 10, None)
-            .unwrap();
-        assert_eq!(res2.batches.len(), 1);
-        let (data2, weights2) = split_weight_column(&res2.batches[0]).unwrap();
-        assert_eq!(data2.num_rows(), 2); // 1 from p0, 1 from p1
-        assert_eq!(weights2, vec![1, 1]);
-
-        // Verify both partitions advanced
-        let p0_off2 = source.get_partition_offset(&res2.new_offset, 0).unwrap();
-        let p1_off2 = source.get_partition_offset(&res2.new_offset, 1).unwrap();
-        assert_eq!(p0_off2, 2);
-        assert_eq!(p1_off2, 1);
-
-        // Watermark should now be the minimum of watermarks of partitions:
-        // p0 watermark is 200 (max of 100, 200)
-        // p1 watermark is 150 (max of 150)
-        // min(200, 150) = 150
-        assert_eq!(res2.watermark, Some(150));
-
-        // Test offset commit
-        source.commit_offset(5, res2.new_offset.clone()).unwrap();
-        let (epoch, commit_tok) = source.last_committed().unwrap();
-        assert_eq!(epoch, 5);
-        assert_eq!(commit_tok, res2.new_offset);
     }
 }

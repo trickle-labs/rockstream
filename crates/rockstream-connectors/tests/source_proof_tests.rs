@@ -6,8 +6,8 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use rockstream_connectors::{
-    KafkaSource, OffsetToken, PollDeltaResult, S3Source, SnapshotStream, SourceConnector,
-    SourceEpochRegistry, SourceError,
+    OffsetToken, PollDeltaResult, S3Source, SnapshotStream, SourceConnector, SourceEpochRegistry,
+    SourceError,
 };
 use rockstream_ops::time_window::TumbleWindowOp;
 use rockstream_plan::LateDataPolicy;
@@ -30,6 +30,152 @@ use std::collections::HashMap;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{core::WaitFor, Image};
 
+struct RecordedSource {
+    schema: SchemaRef,
+    partitions: BTreeMap<u64, Vec<(i64, Vec<i64>)>>,
+    watermarks: BTreeMap<u64, i64>,
+    paused: bool,
+    last_committed: Option<(Epoch, OffsetToken)>,
+}
+
+impl RecordedSource {
+    fn new(schema: SchemaRef, partitions: &[u64]) -> Self {
+        Self {
+            schema,
+            partitions: partitions
+                .iter()
+                .map(|partition| (*partition, vec![]))
+                .collect(),
+            watermarks: partitions
+                .iter()
+                .map(|partition| (*partition, i64::MIN))
+                .collect(),
+            paused: false,
+            last_committed: None,
+        }
+    }
+
+    fn add_record(&mut self, partition: u64, timestamp: i64, values: Vec<i64>) {
+        self.partitions
+            .entry(partition)
+            .or_default()
+            .push((timestamp, values));
+        self.watermarks.entry(partition).or_insert(i64::MIN);
+    }
+
+    fn get_partition_offset(&self, token: &OffsetToken, partition: u64) -> Option<u64> {
+        if token.as_bytes().is_empty() {
+            return Some(0);
+        }
+        serde_json::from_slice::<BTreeMap<u64, u64>>(token.as_bytes())
+            .ok()
+            .map(|offsets| offsets.get(&partition).copied().unwrap_or(0))
+    }
+
+    fn last_committed(&self) -> Option<(Epoch, OffsetToken)> {
+        self.last_committed.clone()
+    }
+}
+
+impl SourceConnector for RecordedSource {
+    fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
+        Ok(self.schema.clone())
+    }
+
+    fn start_snapshot(
+        &mut self,
+        _frontier: Epoch,
+        _partition_filter: Option<PartitionFilter>,
+    ) -> Result<SnapshotStream, SourceError> {
+        Ok(SnapshotStream::new(vec![]))
+    }
+
+    fn poll_delta(
+        &mut self,
+        after: OffsetToken,
+        _max_bytes: usize,
+        credits: usize,
+        _partition_filter: Option<PartitionFilter>,
+    ) -> Result<PollDeltaResult, SourceError> {
+        if self.paused || credits == 0 {
+            return Ok(PollDeltaResult {
+                batches: vec![],
+                new_offset: after,
+                watermark: None,
+            });
+        }
+        let mut offsets = if after.as_bytes().is_empty() {
+            BTreeMap::new()
+        } else {
+            serde_json::from_slice(after.as_bytes()).unwrap()
+        };
+        let mut rows = vec![];
+        for (partition, records) in &self.partitions {
+            for (index, (timestamp, values)) in records
+                .iter()
+                .enumerate()
+                .skip(offsets.get(partition).copied().unwrap_or(0) as usize)
+            {
+                if rows.len() == credits {
+                    break;
+                }
+                rows.push((*timestamp, values.clone()));
+                offsets.insert(*partition, (index + 1) as u64);
+                self.watermarks
+                    .entry(*partition)
+                    .and_modify(|watermark| *watermark = (*watermark).max(*timestamp));
+            }
+            if rows.len() == credits {
+                break;
+            }
+        }
+        let batches = if rows.is_empty() {
+            vec![]
+        } else {
+            use arrow::array::Int64Array;
+            use rockstream_types::arrow_batch::append_weight_column;
+            let columns = (0..self.schema.fields().len())
+                .map(|column| {
+                    Arc::new(Int64Array::from(
+                        rows.iter()
+                            .map(|(_, values)| values[column])
+                            .collect::<Vec<_>>(),
+                    )) as arrow::array::ArrayRef
+                })
+                .collect();
+            let batch =
+                arrow::record_batch::RecordBatch::try_new(self.schema.clone(), columns).unwrap();
+            vec![append_weight_column(batch, &vec![1; rows.len()]).unwrap()]
+        };
+        Ok(PollDeltaResult {
+            batches,
+            new_offset: OffsetToken::new(serde_json::to_vec(&offsets).unwrap()),
+            watermark: self
+                .watermarks
+                .values()
+                .copied()
+                .min()
+                .filter(|watermark| *watermark != i64::MIN)
+                .map(|watermark| watermark as u64),
+        })
+    }
+
+    fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+        self.last_committed = Some((epoch, offset));
+        Ok(())
+    }
+
+    fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+        self.paused = true;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), SourceError> {
+        self.paused = false;
+        Ok(())
+    }
+}
+
 #[test]
 fn test_kafka_clock_skew_window_closure() {
     // Schema: [t: Int64, v: Int64]
@@ -38,7 +184,7 @@ fn test_kafka_clock_skew_window_closure() {
         Field::new("v", DataType::Int64, false),
     ]));
 
-    let mut source = KafkaSource::new(ConnectorId(1), schema.clone(), &[0, 1]);
+    let mut source = RecordedSource::new(schema.clone(), &[0, 1]);
 
     // Partition 0 is skewed (slower), starting with a record at t=500
     source.add_record(0, 500, vec![500, 10]);
@@ -128,7 +274,7 @@ fn test_kafka_clock_skew_window_closure() {
 fn test_kafka_offset_tracking_causal_frontier() {
     let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
 
-    let mut source = KafkaSource::new(ConnectorId(2), schema, &[0, 1]);
+    let mut source = RecordedSource::new(schema, &[0, 1]);
     source.add_record(0, 100, vec![10]);
     source.add_record(1, 200, vec![20]);
 
@@ -186,7 +332,7 @@ async fn test_source_offset_replay_lfs() {
 
     // Schema: [v: Int64]
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-    let mut source = KafkaSource::new(connector_id, schema, &[0, 1]);
+    let mut source = RecordedSource::new(schema, &[0, 1]);
 
     // Add records to partitions
     source.add_record(0, 100, vec![10]);
@@ -616,7 +762,7 @@ fn test_source_coordination_sim() {
             let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
 
             // Set up a KafkaSource and populate it with deterministic data based on seed
-            let mut base_source = KafkaSource::new(ConnectorId(seed), schema.clone(), &[0, 1]);
+            let mut base_source = RecordedSource::new(schema.clone(), &[0, 1]);
             for i in 0..10 {
                 base_source.add_record(0, i * 100, vec![i]);
                 base_source.add_record(1, i * 100 + 50, vec![100 + i]);
