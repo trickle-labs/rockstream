@@ -271,10 +271,21 @@ pub async fn start_worker_client_with_metadata(
                     let shard_path = storage_dir
                         .join("shards")
                         .join(lease.shard_id.0.to_string());
-                    std::fs::create_dir_all(&shard_path).unwrap();
-                    let store = Arc::new(
-                        object_store::local::LocalFileSystem::new_with_prefix(&shard_path).unwrap(),
-                    );
+                    let remote_prefix = format!("shards/{}", lease.shard_id.0);
+                    let store = match rockstream_storage::build_runtime_object_store(
+                        &shard_path,
+                        &remote_prefix,
+                    ) {
+                        Ok(store) => store,
+                        Err(error) => {
+                            tracing::error!(
+                                code = %rockstream_types::error_code::RS_0003,
+                                shard = ?lease.shard_id,
+                                "Failed to configure shard object store: {error}"
+                            );
+                            continue;
+                        }
+                    };
 
                     // Attempt to open the ShardDb
                     let mut builder = ShardDb::builder("db", store);

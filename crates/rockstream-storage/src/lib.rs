@@ -33,8 +33,8 @@ pub use shard_db::{
     PartialAggSpec, ShardDb, WriteBatch,
 };
 pub use tiered_store::{
-    build_s3_backend_from_config, s3_express_build_config, tier_aged_ssts, TieredObjectStore,
-    MAX_TIERING_SCAN_OBJECTS,
+    build_runtime_object_store, build_s3_backend_from_config, s3_express_build_config,
+    tier_aged_ssts, TieredObjectStore, MAX_TIERING_SCAN_OBJECTS,
 };
 pub use wal_cache::WalListingCache;
 

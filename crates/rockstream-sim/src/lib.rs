@@ -28,6 +28,7 @@ pub mod nexmark;
 pub mod object_store;
 pub mod paired_assert;
 pub mod recovery_soak;
+pub mod resource_leak_soak;
 pub mod runtime;
 pub mod shard_map;
 pub mod sim;
@@ -63,6 +64,10 @@ pub use paired_assert::paired_assert;
 pub use recovery_soak::{
     run_brownout_recovery_scenario, run_partition_recovery_scenario, KafkaLagTimings,
     KafkaRecoverySoakResult, RecoverySoakConfig,
+};
+pub use resource_leak_soak::{
+    ProcessResourceSampler, ResourceGateConfig, ResourceGateError, ResourceKind,
+    ResourceLeakSoakSummary, ResourceSample, ResourceSeriesGate,
 };
 pub use runtime::{Runtime, Spawner};
 pub use shard_map::{ShardOwnership, ShardRange, SimShardMap};

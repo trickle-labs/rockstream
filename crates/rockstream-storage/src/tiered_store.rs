@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
+use std::path::Path as LocalPath;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -367,6 +368,54 @@ pub fn build_s3_backend_from_config(
             .with_bucket_name(bucket_name)
             .with_region(region)
     }
+}
+
+/// Build the store used by a real node's shard database.
+///
+/// Local filesystem storage remains the default.  Setting the complete
+/// `ROCKSTREAM_OBJECT_STORE_*` endpoint contract switches the same node path
+/// to an S3-compatible store (including MinIO) while keeping each shard in a
+/// bounded object-key prefix.
+pub fn build_runtime_object_store(
+    local_path: &LocalPath,
+    remote_prefix: &str,
+) -> Result<Arc<dyn ObjectStore>, String> {
+    let Some(endpoint) = std::env::var_os("ROCKSTREAM_OBJECT_STORE_ENDPOINT") else {
+        std::fs::create_dir_all(local_path)
+            .map_err(|error| format!("failed to create {}: {error}", local_path.display()))?;
+        let store = object_store::local::LocalFileSystem::new_with_prefix(local_path)
+            .map_err(|error| format!("failed to open {}: {error}", local_path.display()))?;
+        return Ok(Arc::new(store));
+    };
+
+    let bucket = std::env::var("ROCKSTREAM_OBJECT_STORE_BUCKET").map_err(|_| {
+        "ROCKSTREAM_OBJECT_STORE_BUCKET is required with an object-store endpoint".to_owned()
+    })?;
+    let region =
+        std::env::var("ROCKSTREAM_OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
+    let access_key = std::env::var("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY").map_err(|_| {
+        "ROCKSTREAM_OBJECT_STORE_ACCESS_KEY is required with an object-store endpoint".to_owned()
+    })?;
+    let secret_key = std::env::var("ROCKSTREAM_OBJECT_STORE_SECRET_KEY").map_err(|_| {
+        "ROCKSTREAM_OBJECT_STORE_SECRET_KEY is required with an object-store endpoint".to_owned()
+    })?;
+    let endpoint = endpoint
+        .into_string()
+        .map_err(|_| "ROCKSTREAM_OBJECT_STORE_ENDPOINT must be valid UTF-8".to_owned())?;
+    let store = AmazonS3Builder::new()
+        .with_endpoint(endpoint.clone())
+        .with_bucket_name(bucket)
+        .with_region(region)
+        .with_access_key_id(access_key)
+        .with_secret_access_key(secret_key)
+        .with_allow_http(endpoint.starts_with("http://"))
+        .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+        .build()
+        .map_err(|error| format!("failed to build object-store backend: {error}"))?;
+    Ok(Arc::new(object_store::prefix::PrefixStore::new(
+        store,
+        remote_prefix.trim_matches('/'),
+    )))
 }
 
 #[cfg(test)]

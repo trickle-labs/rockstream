@@ -239,15 +239,14 @@ pub async fn start_gateway(
         )
     })?;
 
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(
-        object_store::local::LocalFileSystem::new_with_prefix(&gateway_shard_dir).map_err(|e| {
+    let store = rockstream_storage::build_runtime_object_store(&gateway_shard_dir, "gateway-shard")
+        .map_err(|error| {
             CliError::new(
                 RS_0003,
-                format!("gateway storage init failed: {e}"),
-                "Check that the storage path exists and is writable.",
+                format!("gateway storage init failed: {error}"),
+                "Check that the storage path or object-store credentials are valid.",
             )
-        })?,
-    );
+        })?;
 
     let shard_db = rockstream_storage::ShardDb::builder("gateway", store.clone())
         .build()
@@ -744,16 +743,17 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 }
                 if let Some(db) = shard_db {
                     let shard_path = opts.storage.join("shards").join("0");
-                    let store: Arc<dyn object_store::ObjectStore> = Arc::new(
-                        object_store::local::LocalFileSystem::new_with_prefix(&shard_path)
-                            .map_err(|e| {
-                                CliError::new(
-                                    RS_0003,
-                                    format!("failed to open shared shard-0 store: {e}"),
-                                    "Check storage directory permissions.",
-                                )
-                            })?,
-                    );
+                    let store = rockstream_storage::build_runtime_object_store(
+                        &shard_path,
+                        "shards/0",
+                    )
+                    .map_err(|error| {
+                        CliError::new(
+                            RS_0003,
+                            format!("failed to open shared shard-0 store: {error}"),
+                            "Check storage directory or object-store credentials.",
+                        )
+                    })?;
                     shared_gateway_shard = Some((Arc::new(db), store));
                 }
             }

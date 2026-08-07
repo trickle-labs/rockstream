@@ -1,0 +1,55 @@
+name: Long-Duration Resource Soak
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 1 * * *"
+
+jobs:
+  resource-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - name: Require Docker
+        run: docker info
+      - name: Build unified-binary test image
+        run: docker build -t rockstream-tc-test:latest .
+      - name: Prove seeded source pause/resume lifecycle
+        run: cargo test -p rockstream-connectors --features simulation --test source_coordination_sim_tests seeded_lifecycle_race_never_revives_dropped_or_paused_source -- --exact
+      - name: Prove real Kafka and MinIO source baseline
+        run: cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle -- --exact
+      - name: Prove real-process LFS churn contract
+        env:
+          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "180"
+          ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS: "60"
+        run: cargo test -p rockstream-sim --features docker_tests --test resource_leak_soak_real_binary_tests resource_leak_soak_real_binary_lfs_churn_is_flat -- --exact
+      - name: Run four-hour real-process MinIO churn
+        env:
+          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "14400"
+          ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS: "60"
+          ROCKSTREAM_RESOURCE_SOAK_ARTIFACT_DIR: target/resource-leak-soak
+        run: cargo test -p rockstream-sim --features docker_tests --test resource_leak_soak_real_binary_tests resource_leak_soak_real_binary_minio_churn_is_flat -- --exact
+      - name: Assert and render resource SLO artifact
+        env:
+          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "14400"
+          ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS: "60"
+        run: bash scripts/sample-resource-leak-soak.sh --samples-file target/resource-leak-soak/resource-leak-soak-samples.tsv --artifact-dir target/resource-leak-soak
+      - name: Prove a skipped teardown deregistration fails the same gate
+        env:
+          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "180"
+          ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS: "60"
+        run: cargo test -p rockstream-sim --features docker_tests --test resource_leak_soak_real_binary_tests resource_leak_soak_real_binary_injected_teardown_deregistration_leak_fails_gate -- --exact
+      - name: Upload resource-soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-duration-resource-soak-summary
+          path: target/resource-leak-soak/
+          if-no-files-found: error
+      - name: Append resource summary to job summary
+        if: always()
+        run: cat target/resource-leak-soak/resource-leak-soak-summary.md >> "$GITHUB_STEP_SUMMARY"

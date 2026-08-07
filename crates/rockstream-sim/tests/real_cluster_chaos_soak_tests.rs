@@ -18,7 +18,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const IMAGE_NAME: &str = "rockstream-tc-test";
 const IMAGE_TAG: &str = "latest";
-const SEED: u64 = 0x51_12_C0A5;
+const SEED: u64 = 0x5112_C0A5;
 const RECORD_COUNT: u64 = 128;
 const WORKER_COUNT: usize = 2;
 const MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC: u64 = 1;
@@ -114,15 +114,19 @@ fn p99(samples: &[u64]) -> u64 {
     sorted[((sorted.len() - 1) * 99) / 100]
 }
 
+struct ChaosMetrics {
+    failure_detection_ms: u64,
+    shard_reassignment_ms: u64,
+    freshness_recovery_ms: u64,
+    throughput_rows_per_sec: u64,
+}
+
 fn write_artifacts(
     seed: u64,
     rows_submitted: u64,
     rows_committed: u64,
     output_digest: &str,
-    failure_detection_ms: u64,
-    shard_reassignment_ms: u64,
-    freshness_recovery_ms: u64,
-    throughput_rows_per_sec: u64,
+    metrics: ChaosMetrics,
 ) {
     let directory = std::env::var("ROCKSTREAM_CHAOS_ARTIFACT_DIR")
         .unwrap_or_else(|_| "target/real-cluster-chaos".to_string());
@@ -133,10 +137,10 @@ fn write_artifacts(
         "rows_submitted": rows_submitted,
         "rows_committed": rows_committed,
         "complete_output_digest": output_digest,
-        "failure_detection_p99_ms": failure_detection_ms,
-        "shard_reassignment_p99_ms": shard_reassignment_ms,
-        "freshness_recovery_p99_ms": freshness_recovery_ms,
-        "steady_state_throughput_rows_per_sec": throughput_rows_per_sec,
+        "failure_detection_p99_ms": metrics.failure_detection_ms,
+        "shard_reassignment_p99_ms": metrics.shard_reassignment_ms,
+        "freshness_recovery_p99_ms": metrics.freshness_recovery_ms,
+        "steady_state_throughput_rows_per_sec": metrics.throughput_rows_per_sec,
         "targets": {
             "failure_detection_ms": FAILURE_DETECTION_LIMIT.as_millis(),
             "shard_reassignment_ms": SHARD_REASSIGNMENT_LIMIT.as_millis(),
@@ -155,7 +159,11 @@ fn write_artifacts(
     fs::write(
         format!("{directory}/real-cluster-chaos-summary.md"),
         format!(
-            "# Real-cluster chaos SLO summary\n\nseed: `{seed}`\n\n| metric | measured | target |\n| --- | ---: | ---: |\n| rows submitted / committed | {rows_submitted} / {rows_committed} | exact / exact |\n| output digest | `{output_digest}` | batch oracle match |\n| failure detection p99 | {failure_detection_ms} ms | ≤ 5000 ms |\n| shard reassignment p99 | {shard_reassignment_ms} ms | ≤ 30000 ms |\n| freshness recovery p99 | {freshness_recovery_ms} ms | ≤ 60000 ms |\n| sustained throughput | {throughput_rows_per_sec} rows/s | ≥ {MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC} rows/s |\n"
+            "# Real-cluster chaos SLO summary\n\nseed: `{seed}`\n\n| metric | measured | target |\n| --- | ---: | ---: |\n| rows submitted / committed | {rows_submitted} / {rows_committed} | exact / exact |\n| output digest | `{output_digest}` | batch oracle match |\n| failure detection p99 | {} ms | ≤ 5000 ms |\n| shard reassignment p99 | {} ms | ≤ 30000 ms |\n| freshness recovery p99 | {} ms | ≤ 60000 ms |\n| sustained throughput | {} rows/s | ≥ {MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC} rows/s |\n",
+            metrics.failure_detection_ms,
+            metrics.shard_reassignment_ms,
+            metrics.freshness_recovery_ms,
+            metrics.throughput_rows_per_sec,
         ),
     )
     .unwrap();
@@ -332,10 +340,12 @@ async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
         RECORD_COUNT,
         committed.len() as u64,
         &output_digest,
-        failure_detection_ms,
-        shard_reassignment_ms,
-        freshness_recovery_ms,
-        throughput_rows_per_sec,
+        ChaosMetrics {
+            failure_detection_ms,
+            shard_reassignment_ms,
+            freshness_recovery_ms,
+            throughput_rows_per_sec,
+        },
     );
 
     let _ = kafka.rm().await;
