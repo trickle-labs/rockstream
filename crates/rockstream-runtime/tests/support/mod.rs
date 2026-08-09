@@ -6,13 +6,7 @@ pub const MINIO_USER: &str = "minioadmin";
 pub const MINIO_PASS: &str = "minioadmin";
 
 pub fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    rockstream_test_support::docker_available()
 }
 
 fn sha256_hex(data: &[u8]) -> String {

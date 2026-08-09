@@ -21,13 +21,7 @@ const MINIO_PASS: &str = "minioadmin";
 const MINIO_BUCKET: &str = "rockstream-test-recursion";
 
 fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    rockstream_test_support::docker_available()
 }
 
 fn schema_edges() -> SchemaRef {

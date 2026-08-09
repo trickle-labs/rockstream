@@ -65,13 +65,7 @@ async fn open_shard_db(path: &str, store: Arc<dyn ObjectStore>) -> ShardDb {
 }
 
 fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    rockstream_test_support::docker_available()
 }
 
 // ─── Slice 4 / slice 7: LFS test 1 ───────────────────────────────────────────

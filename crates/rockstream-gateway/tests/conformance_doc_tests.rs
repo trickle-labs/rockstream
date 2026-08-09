@@ -1,220 +1,260 @@
 //! v0.42 Slice 1 + Slice 3 — conformance doc link-checker and CI coverage gate tests.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-/// Reads `docs/pgwire-conformance.md`, extracts every `file::function` link,
-/// and asserts the named function exists in the gateway test corpus.
-///
-/// Link format: `some_file.rs::some_function_name`
-/// The check greps for `fn some_function_name` in the tests/ directory.
-#[test]
-fn test_conformance_doc_has_linked_tests() {
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // doc is two levels above the crate: crates/rockstream-gateway/../../docs/
-    let doc_path = manifest_dir
+fn repo_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .parent()
         .unwrap()
-        .join("docs/pgwire-conformance.md");
+        .to_path_buf()
+}
 
-    assert!(
-        doc_path.exists(),
-        "docs/pgwire-conformance.md not found at {:?}",
-        doc_path
-    );
+fn conformance_links() -> Vec<(String, String)> {
+    let content = std::fs::read_to_string(repo_root().join("docs/pgwire-conformance.md"))
+        .expect("failed to read docs/pgwire-conformance.md");
+    content
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches('`').trim_matches('|').trim_matches('`');
+            let (file, function) = token.split_once("::")?;
+            (file.ends_with(".rs")
+                && !function.is_empty()
+                && function.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            .then(|| (file.to_string(), function.to_string()))
+        })
+        .collect()
+}
 
-    let content =
-        std::fs::read_to_string(&doc_path).expect("failed to read docs/pgwire-conformance.md");
-
-    // Extract all `filename.rs::function_name` references from the doc.
-    let mut links: Vec<(String, String)> = Vec::new();
-    for token in content.split_whitespace() {
-        // Strip Markdown table separators and backticks
-        let token = token.trim_matches('`').trim_matches('|').trim_matches('`');
-        if let Some(sep) = token.find("::") {
-            let file = &token[..sep];
-            let func = &token[sep + 2..];
-            if file.ends_with(".rs")
-                && !func.is_empty()
-                && func.chars().all(|c| c.is_alphanumeric() || c == '_')
-            {
-                links.push((file.to_string(), func.to_string()));
-            }
-        }
-    }
-
-    assert!(
-        !links.is_empty(),
-        "no file::function links found in docs/pgwire-conformance.md"
-    );
-
-    let tests_dir = manifest_dir.join("tests");
-    assert!(
-        tests_dir.exists(),
-        "tests/ directory not found at {:?}",
-        tests_dir
-    );
-
-    // Collect all test function names from the test corpus.
-    let mut known_functions: HashSet<String> = HashSet::new();
-    for entry in std::fs::read_dir(&tests_dir).expect("read tests/") {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().map(|e| e == "rs").unwrap_or(false) {
-            let src = std::fs::read_to_string(&path).unwrap_or_default();
-            for line in src.lines() {
-                let trimmed = line.trim();
-                // Match `async fn name` or `fn name`
-                for prefix in &["async fn ", "fn "] {
-                    if let Some(rest) = trimmed.strip_prefix(prefix) {
-                        let name: String = rest
-                            .chars()
-                            .take_while(|c| c.is_alphanumeric() || *c == '_')
-                            .collect();
-                        if !name.is_empty() {
-                            known_functions.insert(name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut missing: Vec<String> = Vec::new();
-    for (file, func) in &links {
-        if !known_functions.contains(func.as_str()) {
-            missing.push(format!("{}::{}", file, func));
-        }
-    }
-
+fn assert_links_are_passing(links: &[(String, String)], passed: &HashSet<String>) {
+    let missing = links
+        .iter()
+        .filter(|(_, function)| !passed.contains(function))
+        .map(|(file, function)| format!("{file}::{function}"))
+        .collect::<Vec<_>>();
     assert!(
         missing.is_empty(),
-        "docs/pgwire-conformance.md references test functions that do not exist:\n{}",
+        "docs/pgwire-conformance.md links must name executed passing tests:\n{}",
         missing.join("\n")
     );
 }
 
-/// Parses `.github/workflows/ci.yml` and asserts that both coverage gate flags
-/// are present: `--fail-under-lines 70` and `--fail-under-regions 70`.
-///
-/// Slice 3 green gate: CI must enforce these thresholds.
+fn passing_conformance_tests() -> HashSet<String> {
+    let path = repo_root().join("target/pgwire-test-results.json");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("missing conformance test-result report {path:?}: {error}"));
+    content
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|error| panic!("malformed conformance test-result report: {error}"))
+        })
+        .filter(|event| event["type"] == "test" && event["event"] == "ok")
+        .filter_map(|event| event["name"].as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+/// Reads `docs/pgwire-conformance.md` and requires every link to appear in
+/// the current CI JSON test-result report as a passing test.
 #[test]
-fn test_coverage_gate_config_is_present() {
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ci_path = manifest_dir
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(".github/workflows/ci.yml");
+fn test_conformance_doc_has_linked_tests() {
+    if std::env::var_os("ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER").is_none()
+        && (std::env::var_os("CI").is_some()
+            || repo_root().join("target/pgwire-test-results.json").exists())
+    {
+        let links = conformance_links();
+        assert!(
+            !links.is_empty(),
+            "no file::function links found in docs/pgwire-conformance.md"
+        );
+        assert_links_are_passing(&links, &passing_conformance_tests());
+    }
+}
 
+#[test]
+fn documented_stub_is_rejected_without_a_passing_result() {
+    let result = std::panic::catch_unwind(|| {
+        assert_links_are_passing(
+            &[("fixture.rs".to_string(), "documented_stub".to_string())],
+            &HashSet::new(),
+        );
+    });
     assert!(
-        ci_path.exists(),
-        ".github/workflows/ci.yml not found at {:?}",
-        ci_path
-    );
-
-    let content =
-        std::fs::read_to_string(&ci_path).expect("failed to read .github/workflows/ci.yml");
-
-    // v0.45.3: the gateway's floor ratchets up from 70 to its actual
-    // measured baseline (77) as part of expanding the coverage gate to all
-    // 13 workspace crates (see `test_all_gated_crates_present_in_ci_coverage_job`
-    // and `.claude/v0.45.3-plan.md` S1/S4). The floor only ever goes up.
-    assert!(
-        content.contains("--package rockstream-gateway --fail-under-lines 77"),
-        "ci.yml must contain a `--fail-under-lines 77` step for rockstream-gateway in the coverage job"
-    );
-
-    assert!(
-        content.contains("--package rockstream-gateway --fail-under-regions 77"),
-        "ci.yml must contain a `--fail-under-regions 77` step for rockstream-gateway in the coverage job"
+        result.is_err(),
+        "a documented stub must not satisfy conformance"
     );
 }
 
-/// The 13 workspace crate names that must each have a coverage-gate floor
+fn coverage_floors() -> HashMap<String, (u32, u32)> {
+    let workflow: serde_yaml::Value = serde_yaml::from_str(
+        &std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
+            .expect("failed to read ci.yml"),
+    )
+    .expect("ci.yml must be valid YAML");
+    let steps = workflow["jobs"]["coverage"]["steps"]
+        .as_sequence()
+        .expect("ci.yml coverage job must have steps");
+    let mut floors = HashMap::new();
+    for run in steps.iter().filter_map(|step| step["run"].as_str()) {
+        let fields = run.split_whitespace().collect::<Vec<_>>();
+        let package = fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--package").then_some(pair[1]));
+        let lines = fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--fail-under-lines").then_some(pair[1]));
+        let regions = fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--fail-under-regions").then_some(pair[1]));
+        if let (Some(package), Some(lines)) = (package, lines) {
+            floors.entry(package.to_string()).or_insert((0, 0)).0 = lines.parse().unwrap();
+        }
+        if let (Some(package), Some(regions)) = (package, regions) {
+            floors.entry(package.to_string()).or_insert((0, 0)).1 = regions.parse().unwrap();
+        }
+    }
+    floors
+}
+
+fn extract_coverage_floors(commands: &str) -> HashMap<String, (u32, u32)> {
+    let mut floors = HashMap::new();
+    for command in commands.lines() {
+        let fields = command.split_whitespace().collect::<Vec<_>>();
+        let package = fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--package").then_some(pair[1]));
+        let lines = fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--fail-under-lines").then_some(pair[1]));
+        let regions = fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--fail-under-regions").then_some(pair[1]));
+        if let (Some(package), Some(lines)) = (package, lines) {
+            floors.entry(package.to_string()).or_insert((0, 0)).0 = lines.parse().unwrap();
+        }
+        if let (Some(package), Some(regions)) = (package, regions) {
+            floors.entry(package.to_string()).or_insert((0, 0)).1 = regions.parse().unwrap();
+        }
+    }
+    floors
+}
+
+/// The workspace crate names that must each have a coverage-gate floor
 /// (added incrementally in v0.45.3: `rockstream-diff`, `-ops`, `-storage`,
 /// `-runtime`, `-sql`, `-control`, `-connectors`, `-types`, `-plan`, `-sim`,
 /// `-cli`, `-oracle`, and `-gateway`, gated since v0.42).
-const GATED_CRATE_NAMES: &[&str] = &[
-    "rockstream-gateway",
-    "rockstream-diff",
-    "rockstream-ops",
-    "rockstream-storage",
-    "rockstream-runtime",
-    "rockstream-sql",
-    "rockstream-control",
-    "rockstream-connectors",
-    "rockstream-types",
-    "rockstream-plan",
-    "rockstream-sim",
-    "rockstream-cli",
-    "rockstream-oracle",
-];
-
-/// Extracts `(crate_name, fail_under_lines, fail_under_regions)` triples
-/// from a `cargo llvm-cov --package <crate> --fail-under-lines <N>` /
-/// `--fail-under-regions <N>` pair of lines anywhere in `content`.
-fn extract_coverage_floors(content: &str) -> std::collections::HashMap<String, (u32, u32)> {
-    let mut lines: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut regions: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-
-    for cap_line in content.lines() {
-        let Some(pkg_idx) = cap_line.find("--package ") else {
-            continue;
-        };
-        let rest = &cap_line[pkg_idx + "--package ".len()..];
-        let crate_name = rest.split_whitespace().next().unwrap_or("").to_string();
-        if crate_name.is_empty() {
-            continue;
-        }
-        if let Some(idx) = cap_line.find("--fail-under-lines ") {
-            let rest = &cap_line[idx + "--fail-under-lines ".len()..];
-            if let Some(num) = rest.split_whitespace().next() {
-                if let Ok(n) = num.parse::<u32>() {
-                    lines.insert(crate_name.clone(), n);
-                }
-            }
-        }
-        if let Some(idx) = cap_line.find("--fail-under-regions ") {
-            let rest = &cap_line[idx + "--fail-under-regions ".len()..];
-            if let Some(num) = rest.split_whitespace().next() {
-                if let Ok(n) = num.parse::<u32>() {
-                    regions.insert(crate_name.clone(), n);
-                }
-            }
-        }
-    }
-
-    let mut merged = std::collections::HashMap::new();
-    for name in lines.keys().chain(regions.keys()) {
-        let l = *lines.get(name).unwrap_or(&0);
-        let r = *regions.get(name).unwrap_or(&0);
-        merged.insert(name.clone(), (l, r));
-    }
-    merged
+fn workspace_crates() -> BTreeSet<String> {
+    let metadata = std::process::Command::new(env!("CARGO"))
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(repo_root())
+        .output()
+        .expect("cargo metadata must run");
+    assert!(metadata.status.success(), "cargo metadata failed");
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    let members = metadata["workspace_members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|member| member.as_str())
+        .collect::<HashSet<_>>();
+    metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| {
+            package["id"]
+                .as_str()
+                .is_some_and(|id| members.contains(id))
+        })
+        .filter(|package| package["metadata"].get("cargo-fuzz").is_none())
+        .filter_map(|package| package["name"].as_str())
+        .filter(|name| name.starts_with("rockstream-"))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
-/// P1: `cargo llvm-cov` must be configured in CI to fail if any of the 13
+#[test]
+fn test_coverage_gate_config_is_present() {
+    assert_eq!(
+        coverage_floors().get("rockstream-gateway"),
+        Some(&(77, 77)),
+        "the gateway coverage floor must retain its measured baseline"
+    );
+}
+
+#[test]
+fn test_coverage_gates_reuse_complete_workspace_report() {
+    let root = repo_root();
+    let workflow: serde_yaml::Value = serde_yaml::from_str(
+        &std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+            .expect("failed to read ci.yml"),
+    )
+    .expect("ci.yml must be valid YAML");
+    let steps = workflow["jobs"]["coverage"]["steps"]
+        .as_sequence()
+        .expect("ci.yml coverage job must have steps");
+    let runs = steps
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .collect::<Vec<_>>();
+    for command in [
+        "cargo llvm-cov --workspace --lib --tests --no-report",
+        "cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers",
+        "cargo llvm-cov --no-clean -p rockstream-sim --features simulation",
+        "cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests",
+        "cargo llvm-cov report --no-clean --lcov --output-path lcov.info",
+    ] {
+        assert!(
+            runs.iter().any(|run| run.contains(command)),
+            "coverage job must collect the explicit feature matrix command `{command}`"
+        );
+    }
+    assert!(
+        runs.iter()
+            .filter(|run| run.contains("--fail-under-"))
+            .all(|run| { run.starts_with("cargo llvm-cov report --package ") }),
+        "coverage floors must be enforced from the collected workspace report"
+    );
+
+    let makefile = std::fs::read_to_string(root.join("Makefile")).expect("failed to read Makefile");
+    for command in [
+        "cargo llvm-cov --workspace --lib --tests --no-report",
+        "cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers",
+        "cargo llvm-cov --no-clean -p rockstream-sim --features simulation",
+        "cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests",
+        "cargo llvm-cov report --no-clean --lcov --output-path lcov.info",
+    ] {
+        assert!(
+            makefile.contains(command),
+            "Makefile coverage target must collect the explicit feature matrix command `{command}`"
+        );
+    }
+    let gate = makefile
+        .split_once("coverage-gate:")
+        .map(|(_, body)| body)
+        .and_then(|body| body.split_once("\n\n").map(|(gate, _)| gate))
+        .expect("Makefile must have a coverage-gate target");
+    assert!(
+        gate.contains("$(MAKE) coverage"),
+        "Makefile coverage-gate must reuse the explicit feature-matrix collector"
+    );
+    assert!(
+        gate.contains("cargo llvm-cov report --package"),
+        "Makefile coverage-gate must enforce floors from the workspace report"
+    );
+}
+
+/// P1: `cargo llvm-cov` must be configured in CI to fail if any of the
 /// workspace crates' coverage drops below its floor — not just the
 /// hot-path crates or the historically-gated gateway.
 #[test]
 fn test_all_gated_crates_present_in_ci_coverage_job() {
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ci_path = manifest_dir
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(".github/workflows/ci.yml");
-    let content = std::fs::read_to_string(&ci_path).expect("failed to read ci.yml");
-
-    let floors = extract_coverage_floors(&content);
-
-    for crate_name in GATED_CRATE_NAMES {
+    let floors = coverage_floors();
+    let crates = workspace_crates();
+    for crate_name in &crates {
         let (lines, regions) = floors
-            .get(*crate_name)
+            .get(crate_name)
             .unwrap_or_else(|| panic!("ci.yml coverage job is missing a gate for `{crate_name}`"));
         assert!(
             *lines >= 70,
@@ -227,8 +267,8 @@ fn test_all_gated_crates_present_in_ci_coverage_job() {
     }
     assert_eq!(
         floors.len(),
-        GATED_CRATE_NAMES.len(),
-        "ci.yml coverage job must gate exactly the 13 workspace crates, found: {:?}",
+        crates.len(),
+        "ci.yml coverage job must gate every workspace crate, found: {:?}",
         floors.keys().collect::<Vec<_>>()
     );
 }
@@ -308,14 +348,12 @@ fn walk_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn test_makefile_coverage_gate_matches_ci_yml() {
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
-    let ci_path = repo_root.join(".github/workflows/ci.yml");
     let makefile_path = repo_root.join("Makefile");
 
-    let ci_content = std::fs::read_to_string(&ci_path).expect("failed to read ci.yml");
     let makefile_content =
         std::fs::read_to_string(&makefile_path).expect("failed to read Makefile");
 
-    let ci_floors = extract_coverage_floors(&ci_content);
+    let ci_floors = coverage_floors();
     let make_floors = extract_coverage_floors(&makefile_content);
 
     let ci_names: HashSet<&String> = ci_floors.keys().collect();
@@ -623,6 +661,11 @@ fn formal_verify_runs_for_path(path: &str) -> bool {
             "gateway",
             "sql",
             "types",
+            "plan",
+            "oracle",
+            "cli",
+            "diff",
+            "test-support",
         ]
         .iter()
         .any(|crate_name| path.starts_with(&format!("crates/rockstream-{crate_name}/")))
@@ -639,7 +682,7 @@ fn formal_verify_path_filter_runs_for_each_edge_covered_crate() {
     let ci = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yml")).unwrap();
     assert!(
         ci.contains(
-            "crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types)/"
+            "crates/rockstream-(runtime|control|connectors|storage|sim|ops|gateway|sql|types|plan|oracle|cli|diff|test-support)/"
         ),
         "formal-verify must use the EDGE-covered crate path filter"
     );
@@ -650,10 +693,15 @@ fn formal_verify_path_filter_runs_for_each_edge_covered_crate() {
         "crates/rockstream-gateway/src/lib.rs",
         "crates/rockstream-sql/src/lib.rs",
         "crates/rockstream-types/src/state_budget.rs",
+        "crates/rockstream-plan/src/lib.rs",
+        "crates/rockstream-oracle/src/lib.rs",
+        "crates/rockstream-cli/src/main.rs",
+        "crates/rockstream-diff/src/lib.rs",
+        "crates/rockstream-test-support/src/lib.rs",
     ];
     assert_eq!(
         paths.map(formal_verify_runs_for_path),
-        [true, true, true, true, true, true],
+        [true, true, true, true, true, true, true, true, true, true, true],
         "every EDGE-covered path must trigger formal-verify"
     );
 }
@@ -664,4 +712,17 @@ fn formal_verify_path_filter_ignores_uncovered_path() {
         !formal_verify_runs_for_path("docs/architecture-notes.md"),
         "an unrelated documentation path must not trigger formal-verify"
     );
+}
+
+#[test]
+fn real_cluster_chaos_path_filter_covers_every_workspace_crate() {
+    let workflow =
+        std::fs::read_to_string(repo_root().join(".github/workflows/real-cluster-chaos.yml"))
+            .expect("failed to read real-cluster-chaos.yml");
+    for crate_name in workspace_crates() {
+        assert!(
+            workflow.contains(&format!("\"crates/{crate_name}/**\"")),
+            "real-cluster chaos must run for a `{crate_name}`-only change"
+        );
+    }
 }

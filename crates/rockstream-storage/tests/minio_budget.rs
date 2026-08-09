@@ -50,13 +50,7 @@ const P99_GET_BUDGET_MS: f64 = 50.0;
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    rockstream_test_support::docker_available()
 }
 
 fn sha256_hex(data: &[u8]) -> String {

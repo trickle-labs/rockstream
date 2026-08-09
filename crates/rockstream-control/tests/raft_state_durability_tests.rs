@@ -23,13 +23,7 @@ use object_store::ObjectStore;
 use rockstream_control::raft::{RaftPersistentState, RaftPersistentStore};
 
 fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    rockstream_test_support::docker_available()
 }
 
 /// **S5 durability slice** — LocalFileSystem (embedded) backend: a control

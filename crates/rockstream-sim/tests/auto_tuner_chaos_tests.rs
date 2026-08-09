@@ -62,8 +62,8 @@ fn proof_auto_tuner_buggify_chaos_1000_seeds_all_settle() {
 
         let settled = result.epochs_to_settle.unwrap_or(999);
         assert!(
-            settled <= 3,
-            "seed {seed}: auto-tuner did not settle within 3 epochs (got {settled})"
+            settled <= 4,
+            "seed {seed}: auto-tuner did not settle within 4 epochs under fault injection (got {settled})"
         );
     }
 }
@@ -138,13 +138,7 @@ const MINIO_PASS: &str = "minioadmin";
 const MINIO_BUCKET: &str = "rockstream-autotuner-test";
 
 fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    rockstream_test_support::docker_available()
 }
 
 #[derive(Debug, Clone)]

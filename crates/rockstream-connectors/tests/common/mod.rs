@@ -18,13 +18,7 @@ pub const MINIO_PASS: &str = "minioadmin";
 pub const RNG_SEED: u64 = 0x4400_0044;
 
 pub fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    rockstream_test_support::docker_available()
 }
 
 pub fn make_cumulative_batch(last_id: i64) -> RecordBatch {

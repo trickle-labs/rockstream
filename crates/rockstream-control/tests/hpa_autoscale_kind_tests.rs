@@ -13,7 +13,7 @@ fn command_available(program: &str, args: &[&str]) -> bool {
 }
 
 fn docker_available() -> bool {
-    command_available("docker", &["info"])
+    rockstream_test_support::docker_available()
 }
 
 fn kind_available() -> bool {

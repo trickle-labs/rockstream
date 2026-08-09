@@ -57,42 +57,49 @@ exit-criteria:
 
 # Generate an lcov coverage report for the workspace (requires cargo-llvm-cov).
 coverage:
-	cargo llvm-cov --workspace --lcov --output-path lcov.info
+	cargo llvm-cov --workspace --lib --tests --no-report
+	cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests --no-report
+	cargo llvm-cov --no-clean -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_plane_ha_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests --no-report
+	cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests --no-report
+	cargo llvm-cov report --no-clean --lcov --output-path lcov.info
 	@echo "Coverage written to lcov.info"
 
-# Enforce coverage thresholds for every one of the 13 workspace crates
-# (requires cargo-llvm-cov). Mirrors the `coverage` job in
-# .github/workflows/ci.yml exactly — each crate's floor is
+# Enforce coverage thresholds for every workspace crate from one complete
+# feature-matrix report (requires cargo-llvm-cov). Mirrors the `coverage` job
+# in .github/workflows/ci.yml exactly — each crate's floor is
 # `max(70, floor(measured baseline %))`, never below 70, never loosened
 # below what the crate already achieves. See `.claude/v0.45.3-plan.md` S1
 # for the baseline table these numbers come from.
 coverage-gate:
-	cargo llvm-cov --package rockstream-gateway --fail-under-lines 77
-	cargo llvm-cov --package rockstream-gateway --fail-under-regions 77
-	cargo llvm-cov --package rockstream-diff --fail-under-lines 76
-	cargo llvm-cov --package rockstream-diff --fail-under-regions 71
-	cargo llvm-cov --package rockstream-ops --fail-under-lines 88
-	cargo llvm-cov --package rockstream-ops --fail-under-regions 87
-	cargo llvm-cov --package rockstream-storage --fail-under-lines 75
-	cargo llvm-cov --package rockstream-storage --fail-under-regions 75
-	cargo llvm-cov --package rockstream-runtime --fail-under-lines 76
-	cargo llvm-cov --package rockstream-runtime --fail-under-regions 79
-	cargo llvm-cov --package rockstream-sql --fail-under-lines 73
-	cargo llvm-cov --package rockstream-sql --fail-under-regions 74
-	cargo llvm-cov --package rockstream-control --fail-under-lines 89
-	cargo llvm-cov --package rockstream-control --fail-under-regions 90
-	cargo llvm-cov --package rockstream-connectors --fail-under-lines 84
-	cargo llvm-cov --package rockstream-connectors --fail-under-regions 86
-	cargo llvm-cov --package rockstream-types --fail-under-lines 84
-	cargo llvm-cov --package rockstream-types --fail-under-regions 87
-	cargo llvm-cov --package rockstream-plan --fail-under-lines 84
-	cargo llvm-cov --package rockstream-plan --fail-under-regions 82
-	cargo llvm-cov --package rockstream-sim --fail-under-lines 92
-	cargo llvm-cov --package rockstream-sim --fail-under-regions 93
-	cargo llvm-cov --package rockstream-cli --fail-under-lines 73
-	cargo llvm-cov --package rockstream-cli --fail-under-regions 77
-	cargo llvm-cov --package rockstream-oracle --fail-under-lines 83
-	cargo llvm-cov --package rockstream-oracle --fail-under-regions 81
+	$(MAKE) coverage
+	cargo llvm-cov report --package rockstream-gateway --fail-under-lines 77
+	cargo llvm-cov report --package rockstream-gateway --fail-under-regions 77
+	cargo llvm-cov report --package rockstream-diff --fail-under-lines 76
+	cargo llvm-cov report --package rockstream-diff --fail-under-regions 71
+	cargo llvm-cov report --package rockstream-ops --fail-under-lines 88
+	cargo llvm-cov report --package rockstream-ops --fail-under-regions 87
+	cargo llvm-cov report --package rockstream-storage --fail-under-lines 75
+	cargo llvm-cov report --package rockstream-storage --fail-under-regions 75
+	cargo llvm-cov report --package rockstream-runtime --fail-under-lines 76
+	cargo llvm-cov report --package rockstream-runtime --fail-under-regions 79
+	cargo llvm-cov report --package rockstream-sql --fail-under-lines 73
+	cargo llvm-cov report --package rockstream-sql --fail-under-regions 74
+	cargo llvm-cov report --package rockstream-control --fail-under-lines 89
+	cargo llvm-cov report --package rockstream-control --fail-under-regions 90
+	cargo llvm-cov report --package rockstream-connectors --fail-under-lines 84
+	cargo llvm-cov report --package rockstream-connectors --fail-under-regions 86
+	cargo llvm-cov report --package rockstream-types --fail-under-lines 84
+	cargo llvm-cov report --package rockstream-types --fail-under-regions 87
+	cargo llvm-cov report --package rockstream-plan --fail-under-lines 84
+	cargo llvm-cov report --package rockstream-plan --fail-under-regions 82
+	cargo llvm-cov report --package rockstream-sim --fail-under-lines 92
+	cargo llvm-cov report --package rockstream-sim --fail-under-regions 93
+	cargo llvm-cov report --package rockstream-cli --fail-under-lines 73 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
+	cargo llvm-cov report --package rockstream-cli --fail-under-regions 77 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
+	cargo llvm-cov report --package rockstream-oracle --fail-under-lines 83
+	cargo llvm-cov report --package rockstream-oracle --fail-under-regions 81
+	cargo llvm-cov report --package rockstream-test-support --fail-under-lines 70
+	cargo llvm-cov report --package rockstream-test-support --fail-under-regions 70
 	@echo "Coverage gate passed."
 
 # Re-measure all four v0.45.4 performance-regression benchmark suites and

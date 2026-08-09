@@ -773,13 +773,7 @@ async fn tpch_q11_lfs_join_aggregate() {
 // ─── Test 3: TPC-H Q1 on MinIO ──────────────────────────────────────────────
 
 fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    rockstream_test_support::docker_available()
 }
 
 /// TPC-H Q1 via wire protocol on MinIO backend.

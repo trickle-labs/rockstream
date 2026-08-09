@@ -20,6 +20,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 parking_lot = "0.12"
 
 [dev-dependencies]
+rockstream-test-support.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 rockstream-oracle = { path = "../rockstream-oracle" }
 rockstream-control = { workspace = true }
@@ -37,7 +38,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 rockstream-ops = { workspace = true }
-rockstream-connectors = { workspace = true }
+rockstream-connectors = { workspace = true, features = ["simulation"] }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tonic = { workspace = true }

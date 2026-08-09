@@ -196,6 +196,11 @@ async fn proof_end_to_end_postgres_pillar_tc() {
     });
 
     client
+        .simple_query("CREATE TABLE base_table (id INT, region TEXT, val INT)")
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    client
         .simple_query(
             "CREATE MATERIALIZED VIEW orders_mv AS SELECT id, region, val FROM base_table",
         )

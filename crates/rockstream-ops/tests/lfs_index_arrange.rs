@@ -155,6 +155,27 @@ async fn point_delete_removes_entry_not_range() {
     assert_eq!(op.row_count(), 0);
 }
 
+#[tokio::test]
+async fn zero_weight_delta_leaves_arrangement_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard_db(&dir).await;
+    let op = IndexArrangeOp::new(
+        Arc::clone(&db),
+        OperatorId(47),
+        vec![0],
+        vec![1],
+        MAX_INDEX_ARRANGE_ROWS,
+    );
+
+    op.apply_delta(&make_zset(&[(7, 99, 0)])).await.unwrap();
+
+    assert_eq!(op.row_count(), 0);
+    assert_eq!(
+        op.point_lookup(&7i64.to_be_bytes()).await.unwrap(),
+        Vec::<Vec<u8>>::new()
+    );
+}
+
 // ─── Test 3: is_over_limit enforces max_rows ─────────────────────────────────
 
 /// Verify that is_over_limit() returns true when row_count >= max_rows.
@@ -268,6 +289,19 @@ async fn index_backfill_lfs_crash_restart() {
     assert_eq!(
         total_found, 10,
         "final row count should be exactly 10 (no duplicates); found {total_found}"
+    );
+}
+
+#[tokio::test]
+async fn unread_backfill_frontier_is_zero() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard_db(&dir).await;
+
+    assert_eq!(
+        IndexArrangeOp::read_backfill_frontier(db, "missing_index")
+            .await
+            .unwrap(),
+        0
     );
 }
 

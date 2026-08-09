@@ -314,3 +314,113 @@ fn seeded_slot_invalidation_recovery() {
 fn seeded_wal_lag_backpressure() {
     seeded_lifecycle_race_never_revives_dropped_or_paused_source();
 }
+
+#[tokio::test]
+async fn recovery_uses_only_committed_checkpoint_and_fences_replaced_owner() {
+    let connector_id = ConnectorId(5125);
+    let db = Arc::new(
+        ShardDb::builder(
+            "source-coordination-recovery-owner",
+            Arc::new(InMemory::new()),
+        )
+        .build()
+        .await
+        .unwrap(),
+    );
+    let store = SourceCheckpointStore::new(db, 0, connector_id);
+    store
+        .prepare(&SourceCheckpoint::prepared(
+            connector_id,
+            9,
+            OffsetToken::new(b"prepared-only".to_vec()),
+        ))
+        .await
+        .unwrap();
+    let committed =
+        SourceCheckpoint::prepared(connector_id, 2, OffsetToken::new(b"committed-02".to_vec()));
+    store.prepare(&committed).await.unwrap();
+    let mut batch = WriteBatch::new();
+    store.append_committed(&mut batch, &committed).unwrap();
+    store.commit_m3(batch).await.unwrap();
+
+    let mut coordinator = SourceRuntimeCoordinator::new(
+        RecordingSource {
+            acknowledgements: vec![],
+        },
+        connector_id,
+        OffsetToken::new(vec![]),
+        store,
+    );
+    let before_recovery = coordinator.acquire_owner("owner-a").unwrap_err();
+    let recovered = coordinator.recover().await.unwrap();
+    let replaced_owner = coordinator.acquire_owner("owner-a").unwrap();
+    let owner = coordinator.acquire_owner("owner-b").unwrap();
+    let stale = coordinator
+        .acknowledge_recovered(&replaced_owner)
+        .unwrap_err();
+    coordinator.acknowledge_recovered(&owner).unwrap();
+
+    assert_eq!(
+        (
+            before_recovery.to_string(),
+            recovered,
+            replaced_owner,
+            owner,
+            stale.to_string(),
+            coordinator.committed_offset().clone(),
+            coordinator.into_inner().acknowledgements,
+        ),
+        (
+            "RS-4001: source I/O error: RS-4012: source owner cannot become active before checkpoint recovery; next steps: run recovery and retry owner registration".to_string(),
+            Some(committed.committed()),
+            rockstream_connectors::SourceOwnerLease {
+                owner_id: "owner-a".to_string(),
+                fence_token: 1,
+            },
+            rockstream_connectors::SourceOwnerLease {
+                owner_id: "owner-b".to_string(),
+                fence_token: 2,
+            },
+            "RS-4001: source I/O error: RS-4013: source owner lease is fenced or inactive; next steps: recover the checkpoint and acquire a new owner lease".to_string(),
+            OffsetToken::new(b"committed-02".to_vec()),
+            vec![(2, OffsetToken::new(b"committed-02".to_vec()))],
+        )
+    );
+}
+
+#[tokio::test]
+async fn invalid_epoch_blocks_without_advancing_runtime_state() {
+    let mut coordinator = runtime(ConnectorId(5126)).await;
+    coordinator.recover().await.unwrap();
+    let owner = coordinator.acquire_owner("owner-a").unwrap();
+    let error = coordinator
+        .commit_epoch(
+            &owner,
+            2,
+            OffsetToken::new(b"offset-02".to_vec()),
+            WriteBatch::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        (
+            error.to_string(),
+            coordinator.committed_offset().clone(),
+            coordinator.blocked_reason().map(str::to_string),
+            coordinator.metrics().await.unwrap(),
+            coordinator.into_inner().acknowledgements,
+        ),
+        (
+            "RS-4001: source I/O error: RS-4015: source epoch 2 is not the next fenced epoch 1; next steps: recover the committed checkpoint and retry".to_string(),
+            OffsetToken::new(vec![]),
+            Some("RS-4015: source epoch 2 is not the next fenced epoch 1; next steps: recover the committed checkpoint and retry".to_string()),
+            rockstream_connectors::SourceRuntimeMetrics {
+                source_runtime_in_flight_epochs: 0,
+                source_checkpoint_history_entries: 0,
+                source_cleanup_scan_pages: 0,
+            },
+            vec![],
+        )
+    );
+}

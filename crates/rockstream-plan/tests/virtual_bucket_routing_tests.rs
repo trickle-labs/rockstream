@@ -36,6 +36,18 @@ fn virtual_bucket_routing_is_deterministic_for_same_key_and_bucket_count() {
 }
 
 #[test]
+fn virtual_bucket_routing_handles_zero_buckets_and_prefix_bounds() {
+    let key = b"customer-42";
+
+    assert_eq!(route_virtual_bucket(key, 0, key.len()), None);
+    assert_eq!(route_virtual_bucket(key, 1, 0), Some(0));
+    assert_eq!(
+        route_virtual_bucket(key, 16, key.len() + 1),
+        route_virtual_bucket(key, 16, key.len())
+    );
+}
+
+#[test]
 fn virtual_bucket_routing_spreads_synthetic_keys_across_all_buckets_with_bounded_skew() {
     let bucket_count = 16u16;
     let mut counts: HashMap<u16, usize> = HashMap::new();

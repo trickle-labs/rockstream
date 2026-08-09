@@ -1,4 +1,7 @@
-use rockstream_sim::{ResourceGateConfig, ResourceSample, ResourceSeriesGate};
+use rockstream_sim::{
+    ProcessResourceSampler, ResourceGateConfig, ResourceGateError, ResourceSample,
+    ResourceSeriesGate,
+};
 
 const CONFIG: ResourceGateConfig = ResourceGateConfig {
     capacity: 4,
@@ -82,6 +85,17 @@ fn assert_rejected_series(
     );
 }
 
+fn assert_error_contract(error: ResourceGateError, diagnostic: &str) {
+    assert_eq!(
+        error.render_markdown(),
+        format!("# Rockstream resource-leak soak\n\nstatus: FAIL\n\ndiagnostic: {diagnostic}\n")
+    );
+    assert_eq!(
+        error.render_json(),
+        format!("{{\"status\":\"FAIL\",\"diagnostic\":\"{diagnostic}\"}}\n")
+    );
+}
+
 #[test]
 fn resource_series_accepts_flat_rss_within_band() {
     assert_passing_summary(
@@ -151,6 +165,44 @@ fn resource_series_refuses_samples_beyond_its_named_capacity() {
     assert_eq!(
         error.to_string(),
         "resource soak sample capacity 4 is full; refusing unbounded accumulation"
+    );
+}
+
+#[test]
+fn resource_series_reports_configuration_and_sample_errors_exactly() {
+    assert_error_contract(
+        ResourceSeriesGate::new(ResourceGateConfig { capacity: 0, ..CONFIG })
+            .evaluate(&[])
+            .unwrap_err(),
+        "invalid resource soak configuration: capacity, warmup_samples, and rolling_window must all be nonzero",
+    );
+    assert_error_contract(
+        ResourceSeriesGate::new(ResourceGateConfig {
+            warmup_samples: 3,
+            rolling_window: 2,
+            ..CONFIG
+        })
+        .evaluate(&[])
+        .unwrap_err(),
+        "invalid resource soak configuration: warmup_samples 3 + rolling_window 2 exceeds capacity 4",
+    );
+    assert_error_contract(
+        ResourceSeriesGate::new(CONFIG)
+            .evaluate(&samples(&[(100, 10, 3)]))
+            .unwrap_err(),
+        "resource soak requires 4 samples but collected 1",
+    );
+}
+
+#[test]
+fn resource_sampler_rejects_zero_sample_interval_exactly() {
+    let error = match ProcessResourceSampler::new(1, 1, 0) {
+        Ok(_) => panic!("zero sample interval must be rejected"),
+        Err(error) => error,
+    };
+    assert_error_contract(
+        error,
+        "invalid resource soak configuration: sample_interval_secs must be nonzero",
     );
 }
 

@@ -12,13 +12,22 @@ on:
       - "crates/rockstream-ops/**"
       - "crates/rockstream-runtime/**"
       - "crates/rockstream-sim/**"
+      - "crates/rockstream-sql/**"
       - "crates/rockstream-storage/**"
+      - "crates/rockstream-plan/**"
+      - "crates/rockstream-types/**"
+      - "crates/rockstream-oracle/**"
+      - "crates/rockstream-cli/**"
+      - "crates/rockstream-diff/**"
+      - "crates/rockstream-test-support/**"
       - "formal/edge_*.fizz"
       - "Dockerfile"
 
 jobs:
   chaos:
     runs-on: ubuntu-latest
+    env:
+      ROCKSTREAM_REQUIRE_DOCKER: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

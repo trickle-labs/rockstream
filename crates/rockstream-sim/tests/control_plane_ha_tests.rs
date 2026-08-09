@@ -390,13 +390,7 @@ mod tc {
     pub const IMAGE_TAG: &str = "latest";
 
     pub fn docker_available() -> bool {
-        std::process::Command::new("docker")
-            .args(["info"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        rockstream_test_support::docker_available()
     }
 
     /// One real control-node container.
@@ -832,6 +826,7 @@ async fn leader_kill_recovers_within_budget_tc() {
          worker 10's pre-kill lease (persisted to the shared control-plane \
          store) is still live: {conflicting:?}"
     );
+    tc::register_worker(new_leader_addr, 20).await;
     let fresh_lease = tc::request_shard(new_leader_addr, 20, 8)
         .await
         .expect("shard leasing must resume against the new leader for an unleased shard");

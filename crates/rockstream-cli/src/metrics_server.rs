@@ -93,8 +93,14 @@ mod tests {
     async fn metrics_endpoint_returns_200_with_prometheus_body() {
         let handle = start_metrics_server("127.0.0.1:0").await.unwrap();
         let resp = request(handle.local_addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
-        assert!(resp.starts_with("HTTP/1.1 200 OK"));
-        assert!(resp.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8"));
+        let body = rockstream_types::metrics::generate_prometheus_metrics();
+        assert_eq!(
+            resp,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        );
         handle.shutdown();
     }
 
@@ -102,7 +108,10 @@ mod tests {
     async fn unknown_path_returns_404() {
         let handle = start_metrics_server("127.0.0.1:0").await.unwrap();
         let resp = request(handle.local_addr, "GET /other HTTP/1.1\r\n\r\n").await;
-        assert!(resp.starts_with("HTTP/1.1 404 Not Found"));
+        assert_eq!(
+            resp,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
         handle.shutdown();
     }
 

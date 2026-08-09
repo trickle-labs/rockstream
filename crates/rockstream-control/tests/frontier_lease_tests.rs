@@ -24,13 +24,7 @@ use rockstream_control::frontier::{FrontierLeaseError, FrontierLeaseStore};
 use rockstream_types::ids::AggregatorId;
 
 fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    rockstream_test_support::docker_available()
 }
 
 /// **S7 durability slice** — LocalFileSystem (embedded) backend: a

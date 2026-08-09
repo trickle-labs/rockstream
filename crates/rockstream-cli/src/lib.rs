@@ -1060,8 +1060,10 @@ mod tests {
     #[test]
     fn unknown_role_is_rejected_with_rs_0002() {
         let err = validate_role("bogus").unwrap_err();
-        assert_eq!(err.code.to_string(), "RS-0002");
-        assert!(err.next_steps.contains("all"));
+        assert_eq!(
+            err.to_string(),
+            "RS-0002 unknown node role `bogus`\n  next steps: Pass --role with one of: all, control, worker, gateway, frontier."
+        );
     }
 
     #[test]
@@ -1069,6 +1071,113 @@ mod tests {
         for role in KNOWN_ROLES {
             assert!(validate_role(role).is_ok());
         }
+    }
+
+    #[test]
+    fn invalid_auth_mode_is_rejected_with_rs_0002() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StartOptions {
+            storage: dir.path().to_path_buf(),
+            role: "all".to_string(),
+            control: None,
+            auth_mode: "invalid".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
+            metrics_addr: None,
+            listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
+        };
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RS-0002 unknown auth mode `invalid`\n  next steps: Pass --auth with one of: off, scram, md5, oidc, mtls."
+        );
+    }
+
+    #[test]
+    fn invalid_listen_address_is_rejected_with_rs_0002() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StartOptions {
+            storage: dir.path().to_path_buf(),
+            role: "gateway".to_string(),
+            control: None,
+            auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
+            metrics_addr: None,
+            listen_addr: Some("not-an-address".to_string()),
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            control_bind: None,
+            control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
+        };
+        let err = run_start(&opts).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RS-0002 invalid --listen address `not-an-address`: invalid socket address syntax\n  next steps: Pass a valid socket address such as 127.0.0.1:5432."
+        );
+    }
+
+    #[test]
+    fn worker_drain_closed_connection_returns_exact_rs_0003() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream).read_line(&mut request).unwrap();
+            assert_eq!(request, "{\"type\":\"request_drain\",\"worker_id\":7}\n");
+        });
+
+        let err = request_worker_drain(&address, 7).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "RS-0003 control service closed the drain request without a reply\n  next steps: Retry against the current control leader and inspect the control-plane audit log."
+        );
+    }
+
+    #[test]
+    fn worker_drain_operation_failure_preserves_exact_error() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(request, "{\"type\":\"request_drain\",\"worker_id\":7}\n");
+            stream
+                .write_all(b"{\"type\":\"operation_failed\",\"code\":\"RS-3604\",\"message\":\"worker is draining\",\"next_steps\":\"Wait for completion.\"}\n")
+                .unwrap();
+        });
+
+        let err = request_worker_drain(&address, 7).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "RS-3604 worker is draining\n  next steps: Wait for completion."
+        );
     }
 
     #[test]

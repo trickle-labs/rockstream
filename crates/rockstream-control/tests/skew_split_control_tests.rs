@@ -182,3 +182,27 @@ fn routing_decision_tracks_composable_flag_end_to_end() {
         HotKeyMitigationPlan::Spill { code, .. } if code == rockstream_types::error_code::RS_5036
     ));
 }
+
+#[test]
+fn disabled_skew_controller_ignores_an_overloaded_cluster() {
+    let mut controller = AdaptiveSkewSplitter::new(SkewSplitConfig {
+        enabled: false,
+        hot_key_factor: 1.0,
+        max_skew_buckets: 16,
+    });
+
+    assert_eq!(
+        controller
+            .observe(
+                OperatorId(17),
+                &LawDescriptor::from_bundle(&SumCountV1),
+                &make_cluster_samples(),
+                None,
+                ShardId(99),
+                SKEW_SPLIT_TRIGGER_WINDOW.as_millis() as u64 + 1,
+                None,
+            )
+            .unwrap(),
+        None
+    );
+}

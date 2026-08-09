@@ -6,7 +6,7 @@ use rockstream_control::{
     BucketMapVersionTracker, CheckpointCoordinator, MigrationConsumerFrontierTracker,
     MigrationCoordinator, MigrationPersistentStore, MigrationShard, PhaseClocks,
 };
-use rockstream_storage::ShardDb;
+use rockstream_storage::{ShardDb, WriteBatch};
 use rockstream_types::ids::ShardId;
 use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
 
@@ -275,11 +275,17 @@ async fn verify_scan_window_is_bounded_with_fill_level_metric() {
     let store = Arc::new(InMemory::new());
     let donor = make_shard(1, "migration/donor-window", store.clone(), 42).await;
     let recipient = make_shard(2, "migration/recipient-window", store.clone(), 42).await;
+    let mut donor_batch = WriteBatch::new();
+    let mut recipient_batch = WriteBatch::new();
     for i in 0..1025usize {
         let key = make_key(7, &format!("k{i:04}"));
-        donor.db.put(&key, b"v").await.unwrap();
-        recipient.db.put(&key, b"v").await.unwrap();
+        donor_batch.put(&key, b"v");
+        recipient_batch.put(&key, b"v");
     }
+    donor.db.write_batch(donor_batch).await.unwrap();
+    recipient.db.write_batch(recipient_batch).await.unwrap();
+    donor.db.flush().await.unwrap();
+    recipient.db.flush().await.unwrap();
 
     let mut record = make_record();
     step_to_cutover(&mut record);

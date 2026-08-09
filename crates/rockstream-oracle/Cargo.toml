@@ -16,6 +16,7 @@ rockstream-sql = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+rockstream-test-support.workspace = true
 rockstream-runtime = { workspace = true }
 parking_lot = { workspace = true }
 proptest = { workspace = true }

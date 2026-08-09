@@ -33,8 +33,8 @@ jobs:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
       - name: Run simulation soak tests
-        run: cargo test -p rockstream-sim --test chaos_tests -- --nocapture
+        run: cargo test -p rockstream-sim --features simulation --test chaos_tests -- --nocapture
       - name: Verify seed corpus covers all registered laws
         run: |
-          cargo test -p rockstream-sim --test chaos_tests \
+          cargo test -p rockstream-sim --features simulation --test chaos_tests \
             proof_seed_corpus_covers_all_registered_laws -- --nocapture

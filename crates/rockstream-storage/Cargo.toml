@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+rockstream-test-support.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 serial_test = "3"
 tempfile = { workspace = true }

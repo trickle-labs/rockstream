@@ -6576,6 +6576,7 @@ dependencies = [
  "rockstream-plan",
  "rockstream-sim",
  "rockstream-storage",
+ "rockstream-test-support",
  "rockstream-types",
  "serde",
  "serde_json",
@@ -6604,6 +6605,7 @@ dependencies = [
  "rockstream-plan",
  "rockstream-sim",
  "rockstream-storage",
+ "rockstream-test-support",
  "rockstream-types",
  "serde",
  "serde_json",
@@ -6676,12 +6678,14 @@ dependencies = [
  "rockstream-runtime",
  "rockstream-sql",
  "rockstream-storage",
+ "rockstream-test-support",
  "rockstream-types",
  "rust_decimal",
  "rustls 0.23.40",
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "sqlparser",
  "tempfile",
@@ -6717,6 +6721,7 @@ dependencies = [
  "rockstream-plan",
  "rockstream-sim",
  "rockstream-storage",
+ "rockstream-test-support",
  "rockstream-types",
  "serde",
  "serde_json",
@@ -6752,6 +6757,7 @@ dependencies = [
  "rockstream-sim",
  "rockstream-sql",
  "rockstream-storage",
+ "rockstream-test-support",
  "rockstream-types",
  "sha2 0.10.9",
  "tempfile",
@@ -6796,6 +6802,7 @@ dependencies = [
  "rockstream-ops",
  "rockstream-sim",
  "rockstream-storage",
+ "rockstream-test-support",
  "rockstream-types",
  "serde",
  "serde_json",
@@ -6834,6 +6841,7 @@ dependencies = [
  "rockstream-runtime",
  "rockstream-sql",
  "rockstream-storage",
+ "rockstream-test-support",
  "rockstream-types",
  "serde_json",
  "sha2 0.10.9",
@@ -6891,6 +6899,7 @@ dependencies = [
  "moka",
  "object_store 0.12.5",
  "reqwest 0.12.28",
+ "rockstream-test-support",
  "rockstream-types",
  "serde",
  "serde_json",
@@ -6905,6 +6914,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "rockstream-test-support"
+version = "0.42.0"
 
 [[package]]
 name = "rockstream-types"
