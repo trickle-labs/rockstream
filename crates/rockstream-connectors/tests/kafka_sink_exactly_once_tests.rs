@@ -67,10 +67,10 @@ async fn transactional_commit_and_recovery_have_one_payload_per_epoch() {
 
     let mut sink = KafkaSink::connect(ConnectorId(102), &bootstrap, topic).unwrap();
     sink.set_cluster_committed(2);
-    let first = sink.pre_commit(1, 3).unwrap();
-    sink.commit(1, &first).unwrap();
-    let second = sink.pre_commit(2, 5).unwrap();
-    sink.commit(2, &second).unwrap();
+    let first = sink.pre_commit(1, 3).await.unwrap();
+    sink.commit(1, &first).await.unwrap();
+    let second = sink.pre_commit(2, 5).await.unwrap();
+    sink.commit(2, &second).await.unwrap();
 
     let mut recovered = KafkaSink::connect(ConnectorId(102), &bootstrap, topic).unwrap();
     recovered.set_cluster_committed(2);
@@ -80,6 +80,7 @@ async fn transactional_commit_and_recovery_have_one_payload_per_epoch() {
             profile: recovered.idempotency_profile(),
             pending_handle: second.pending_handle().to_vec(),
         })
+        .await
         .unwrap();
 
     assert_eq!(

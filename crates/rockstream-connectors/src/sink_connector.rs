@@ -22,6 +22,7 @@
 //! |---|---|
 //! | M5-S1 / M5-S3 | [`assert_commit_pointer_atomic`] |
 
+use async_trait::async_trait;
 use std::collections::BTreeSet;
 
 use rockstream_types::ids::ConnectorId;
@@ -34,6 +35,7 @@ use rockstream_types::timestamp::Epoch;
 ///
 /// The concrete implementations (Kafka, object-store) live in the sub-modules
 /// [`kafka_sink`] and [`object_store_sink`].
+#[async_trait]
 pub trait SinkConnector: Send + Sync {
     /// Returns the idempotency profile for this connector.
     fn idempotency_profile(&self) -> SinkIdempotencyProfile;
@@ -55,23 +57,23 @@ pub trait SinkConnector: Send + Sync {
     ///
     /// The returned `SinkState` must be committed atomically with the shard's
     /// `WriteBatch` by the epoch-commit loop.
-    fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError>;
+    async fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError>;
 
     /// Finalize the commit after the cluster checkpoint succeeds.
     ///
     /// Implementations must be idempotent: calling `commit` twice for the
     /// same epoch (after a crash) must produce the same result.
-    fn commit(&mut self, epoch: Epoch, state: &SinkState) -> Result<(), SinkError>;
+    async fn commit(&mut self, epoch: Epoch, state: &SinkState) -> Result<(), SinkError>;
 
     /// Abort the staged transaction (checkpoint aborted or source reset).
-    fn abort(&mut self, epoch: Epoch) -> Result<(), SinkError>;
+    async fn abort(&mut self, epoch: Epoch) -> Result<(), SinkError>;
 
     /// Recover from a crash.
     ///
     /// The caller reads the durable `SinkState` and passes the appropriate
     /// `RecoveryAction`. The connector re-runs commit if needed, following
     /// its `SinkIdempotencyProfile`.
-    fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError>;
+    async fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError>;
 }
 
 // ─── SinkError ────────────────────────────────────────────────────────────────

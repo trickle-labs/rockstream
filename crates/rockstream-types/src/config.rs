@@ -83,6 +83,7 @@ fn default_max_lag_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ClusterConfig {
     pub min_epoch_ms: u64,
     pub checkpoint_retention_count: u32,
@@ -99,19 +100,75 @@ pub struct ClusterConfig {
     pub index_max_lag_ms: u64,
 }
 
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            min_epoch_ms: 10,
+            checkpoint_retention_count: 5,
+            state_budget_gb: 16,
+            autotuner: AutotunerConfig::default(),
+            skew_split: SkewSplitConfig::default(),
+            scatter_pruning: ScatterPruningConfig::default(),
+            index_prefer_selectivity_threshold: 0.01,
+            index_max_lag_ms: 1000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct WorkerConfig {
     pub segment_cache_bytes: usize,
     pub max_rows_per_quantum: usize,
 }
 
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            segment_cache_bytes: 64 * 1024 * 1024,
+            max_rows_per_quantum: 8192,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ConnectorConfig {
     pub dlq_warn_threshold: u32,
     pub dlq_retention_days: u32,
 }
 
+impl Default for ConnectorConfig {
+    fn default() -> Self {
+        Self {
+            dlq_warn_threshold: 100,
+            dlq_retention_days: 7,
+        }
+    }
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    250
+}
+
+fn default_rpc_timeout_ms() -> u64 {
+    10000
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+
+fn default_backoff_jitter_ms() -> u64 {
+    100
+}
+
+fn default_frame_channel_capacity() -> usize {
+    64
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ExchangeConfig {
     pub exchange_direct_threshold_bytes: usize,
     pub exchange_spill_threshold_mb: u64,
@@ -120,6 +177,16 @@ pub struct ExchangeConfig {
     pub same_host_shm_segment_bytes: usize,
     pub same_host_shm_segments_per_peer: usize,
     pub max_exchange_compression_states: usize,
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    #[serde(default = "default_rpc_timeout_ms")]
+    pub rpc_timeout_ms: u64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_backoff_jitter_ms")]
+    pub backoff_jitter_ms: u64,
+    #[serde(default = "default_frame_channel_capacity")]
+    pub frame_channel_capacity: usize,
 }
 
 impl Default for ExchangeConfig {
@@ -132,6 +199,11 @@ impl Default for ExchangeConfig {
             same_host_shm_segment_bytes: 8 * 1024 * 1024,
             same_host_shm_segments_per_peer: 8,
             max_exchange_compression_states: 1024,
+            connect_timeout_ms: 250,
+            rpc_timeout_ms: 10000,
+            max_retries: 3,
+            backoff_jitter_ms: 100,
+            frame_channel_capacity: 64,
         }
     }
 }
@@ -170,8 +242,11 @@ pub struct GatewayConfig {
 pub struct RockstreamConfig {
     #[serde(default = "default_recursion_max_iterations")]
     pub recursion_max_iterations: usize,
+    #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default)]
     pub worker: WorkerConfig,
+    #[serde(default)]
     pub connector: ConnectorConfig,
     #[serde(default)]
     pub exchange: ExchangeConfig,

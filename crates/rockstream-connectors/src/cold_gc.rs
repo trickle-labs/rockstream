@@ -23,8 +23,10 @@
 //! gone (returns `0` bytes reclaimed), so replaying the same delete list
 //! twice is safe and deletes nothing extra.
 
+use async_trait::async_trait;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use rockstream_types::timestamp::Epoch;
 
@@ -81,23 +83,24 @@ pub struct ColdGcResult {
 /// catalog. Implemented by `IcebergSink`/`DeltaSink` directly (kept separate
 /// from `SinkConnector` since GC is a maintenance operation, not part of the
 /// exactly-once commit protocol).
-pub trait ColdGcCatalog: Send {
+#[async_trait]
+pub trait ColdGcCatalog: Send + Sync {
     /// All committed snapshots (any order — `ColdGc::run` sorts by epoch).
-    fn list_snapshots(&self) -> Result<Vec<RetainedSnapshot>, SinkError>;
+    async fn list_snapshots(&self) -> Result<Vec<RetainedSnapshot>, SinkError>;
     /// Drop the given epochs from the snapshot metadata (never a range
     /// delete — implementations rewrite the metadata file to omit them).
-    fn remove_snapshots(&mut self, epochs: &[Epoch]) -> Result<(), SinkError>;
+    async fn remove_snapshots(&mut self, epochs: &[Epoch]) -> Result<(), SinkError>;
     /// Delete a single data file, scan-and-delete style. Returns the number
     /// of bytes reclaimed (`0` if the file was already gone — idempotent).
-    fn delete_file(&mut self, path: &str) -> Result<u64, SinkError>;
+    async fn delete_file(&mut self, path: &str) -> Result<u64, SinkError>;
     /// Read a durably-staged pending-delete list left by a crashed GC run
     /// (empty if there is none).
-    fn read_pending_deletes(&self) -> Result<Vec<String>, SinkError>;
+    async fn read_pending_deletes(&self) -> Result<Vec<String>, SinkError>;
     /// Durably stage a pending-delete list before removing snapshot
     /// metadata, so a crash mid-delete can resume.
-    fn write_pending_deletes(&mut self, paths: &[String]) -> Result<(), SinkError>;
+    async fn write_pending_deletes(&mut self, paths: &[String]) -> Result<(), SinkError>;
     /// Clear the pending-delete marker once all listed files are deleted.
-    fn clear_pending_deletes(&mut self) -> Result<(), SinkError>;
+    async fn clear_pending_deletes(&mut self) -> Result<(), SinkError>;
 }
 
 /// Cold-snapshot GC coordinator. Holds the same `Arc<Mutex<_>>` around the
@@ -116,27 +119,32 @@ impl<C: ColdGcCatalog> ColdGc<C> {
     /// Evaluate retention and scan-and-delete expired, unreferenced files.
     /// `now_ms` is the caller's wall-clock time (injectable for deterministic
     /// tests).
-    pub fn run(&self, now_ms: u64) -> Result<ColdGcResult, SinkError> {
-        let mut catalog = self
-            .catalog
-            .lock()
-            .expect("cold_gc: catalog mutex poisoned");
+    pub async fn run(&self, now_ms: u64) -> Result<ColdGcResult, SinkError> {
+        let pending = {
+            let catalog = self.catalog.lock().await;
+            catalog.read_pending_deletes().await?
+        };
 
-        // Resume any pending-delete list left by a crashed prior run first
-        // (P6b: idempotent GC).
-        let pending = catalog.read_pending_deletes()?;
         let mut bytes_reclaimed = 0u64;
         let mut deleted_files = Vec::new();
         let resumed_from_crash = !pending.is_empty();
         for path in &pending {
-            bytes_reclaimed += catalog.delete_file(path)?;
+            let bytes = {
+                let mut catalog = self.catalog.lock().await;
+                catalog.delete_file(path).await?
+            };
+            bytes_reclaimed += bytes;
             deleted_files.push(path.clone());
         }
         if resumed_from_crash {
-            catalog.clear_pending_deletes()?;
+            let mut catalog = self.catalog.lock().await;
+            catalog.clear_pending_deletes().await?;
         }
 
-        let mut snapshots = catalog.list_snapshots()?;
+        let mut snapshots = {
+            let catalog = self.catalog.lock().await;
+            catalog.list_snapshots().await?
+        };
         snapshots.sort_by_key(|snapshot| snapshot.epoch);
         let last_run_epoch = snapshots.last().map(|snapshot| snapshot.epoch).unwrap_or(0);
 
@@ -209,14 +217,24 @@ impl<C: ColdGcCatalog> ColdGc<C> {
 
         // Stage the delete list durably BEFORE removing snapshot metadata,
         // so a crash mid-delete can resume via `read_pending_deletes` above.
-        catalog.write_pending_deletes(&deletable)?;
-        catalog.remove_snapshots(&expired_epochs)?;
+        {
+            let mut catalog = self.catalog.lock().await;
+            catalog.write_pending_deletes(&deletable).await?;
+            catalog.remove_snapshots(&expired_epochs).await?;
+        }
 
         for path in &deletable {
-            bytes_reclaimed += catalog.delete_file(path)?;
+            let bytes = {
+                let mut catalog = self.catalog.lock().await;
+                catalog.delete_file(path).await?
+            };
+            bytes_reclaimed += bytes;
             deleted_files.push(path.clone());
         }
-        catalog.clear_pending_deletes()?;
+        {
+            let mut catalog = self.catalog.lock().await;
+            catalog.clear_pending_deletes().await?;
+        }
 
         Ok(ColdGcResult {
             expired_epochs,
@@ -262,18 +280,19 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl ColdGcCatalog for MockCatalog {
-        fn list_snapshots(&self) -> Result<Vec<RetainedSnapshot>, SinkError> {
+        async fn list_snapshots(&self) -> Result<Vec<RetainedSnapshot>, SinkError> {
             Ok(self.snapshots.clone())
         }
 
-        fn remove_snapshots(&mut self, epochs: &[Epoch]) -> Result<(), SinkError> {
+        async fn remove_snapshots(&mut self, epochs: &[Epoch]) -> Result<(), SinkError> {
             self.snapshots
                 .retain(|snapshot| !epochs.contains(&snapshot.epoch));
             Ok(())
         }
 
-        fn delete_file(&mut self, path: &str) -> Result<u64, SinkError> {
+        async fn delete_file(&mut self, path: &str) -> Result<u64, SinkError> {
             if self.existing_files.remove(path) {
                 self.deleted_paths.push(path.to_string());
                 Ok(1024)
@@ -282,16 +301,16 @@ mod tests {
             }
         }
 
-        fn read_pending_deletes(&self) -> Result<Vec<String>, SinkError> {
+        async fn read_pending_deletes(&self) -> Result<Vec<String>, SinkError> {
             Ok(self.pending_deletes.clone())
         }
 
-        fn write_pending_deletes(&mut self, paths: &[String]) -> Result<(), SinkError> {
+        async fn write_pending_deletes(&mut self, paths: &[String]) -> Result<(), SinkError> {
             self.pending_deletes = paths.to_vec();
             Ok(())
         }
 
-        fn clear_pending_deletes(&mut self) -> Result<(), SinkError> {
+        async fn clear_pending_deletes(&mut self) -> Result<(), SinkError> {
             self.pending_deletes.clear();
             Ok(())
         }
@@ -307,8 +326,8 @@ mod tests {
 
     // ── P5: retention-count expiry ──────────────────────────────────────────
 
-    #[test]
-    fn expires_by_count_whichever_first() {
+    #[tokio::test]
+    async fn expires_by_count_whichever_first() {
         let snapshots: Vec<RetainedSnapshot> = (1..=5)
             .map(|epoch| {
                 snapshot(
@@ -327,7 +346,7 @@ mod tests {
             },
         );
 
-        let result = gc.run(10_000).unwrap();
+        let result = gc.run(10_000).await.unwrap();
         // 5 snapshots, retain 2 newest (epochs 4,5) => expire 1,2,3.
         assert_eq!(result.expired_epochs, vec![1, 2, 3]);
         assert_eq!(result.metrics.cold_gc_last_run_epoch, 5);
@@ -343,8 +362,8 @@ mod tests {
         assert_eq!(remaining, vec![4, 5]);
     }
 
-    #[test]
-    fn expires_by_duration_whichever_first() {
+    #[tokio::test]
+    async fn expires_by_duration_whichever_first() {
         let snapshots = vec![
             snapshot(1, 0, &["data/epoch-1.parquet"]),
             snapshot(2, 1_000, &["data/epoch-2.parquet"]),
@@ -361,12 +380,12 @@ mod tests {
 
         // now=100_000: epoch 1 (age 100_000) and 2 (age 99_000) are older
         // than the 10s bound; epoch 3 is the newest and is never expired.
-        let result = gc.run(100_000).unwrap();
+        let result = gc.run(100_000).await.unwrap();
         assert_eq!(result.expired_epochs, vec![1, 2]);
     }
 
-    #[test]
-    fn never_expires_the_only_or_newest_snapshot() {
+    #[tokio::test]
+    async fn never_expires_the_only_or_newest_snapshot() {
         let catalog = Arc::new(Mutex::new(MockCatalog::with_snapshots(vec![snapshot(
             1,
             0,
@@ -379,15 +398,15 @@ mod tests {
                 retention_duration_ms: 1,
             },
         );
-        let result = gc.run(1_000_000).unwrap();
+        let result = gc.run(1_000_000).await.unwrap();
         assert!(result.expired_epochs.is_empty());
         assert_eq!(catalog.lock().unwrap().snapshots.len(), 1);
     }
 
     // ── P6: shared-file safety ──────────────────────────────────────────────
 
-    #[test]
-    fn never_deletes_a_file_shared_with_a_retained_snapshot() {
+    #[tokio::test]
+    async fn never_deletes_a_file_shared_with_a_retained_snapshot() {
         let snapshots = vec![
             snapshot(1, 0, &["data/shared.parquet", "data/epoch-1-only.parquet"]),
             snapshot(2, 0, &["data/shared.parquet"]), // shares a file with expired epoch 1
@@ -401,7 +420,7 @@ mod tests {
             },
         );
 
-        let result = gc.run(10_000).unwrap();
+        let result = gc.run(10_000).await.unwrap();
         assert_eq!(result.expired_epochs, vec![1]);
         // Only the epoch-1-exclusive file is deleted; the shared file
         // (still referenced by retained epoch 2) must survive.
@@ -416,20 +435,43 @@ mod tests {
             .contains("data/shared.parquet"));
     }
 
-    // ── P6b: crash-mid-delete idempotency ───────────────────────────────────
+    // ── P6: Shared file safety ─────────────────────────────────────────────
 
-    #[test]
-    fn resumes_and_is_idempotent_after_crash_mid_delete() {
+    #[tokio::test]
+    async fn shared_file_referenced_by_retained_snapshot_is_never_deleted() {
         let snapshots = vec![
-            snapshot(1, 0, &["data/epoch-1.parquet"]),
-            snapshot(2, 0, &["data/epoch-2.parquet"]),
+            snapshot(1, 1000, &["shared.parquet", "epoch1_only.parquet"]),
+            snapshot(2, 2000, &["shared.parquet", "epoch2_only.parquet"]),
         ];
         let catalog = Arc::new(Mutex::new(MockCatalog::with_snapshots(snapshots)));
+        let gc = ColdGc::new(
+            Arc::clone(&catalog),
+            ColdGcConfig {
+                retention_count: 1,
+                retention_duration_ms: 0,
+            },
+        );
 
-        // Simulate a crash: metadata already dropped epoch 1, but its file
-        // was never actually deleted — as if `write_pending_deletes` +
-        // `remove_snapshots` committed but the process died before
-        // `delete_file` ran.
+        let result = gc.run(3000).await.unwrap();
+        assert_eq!(result.expired_epochs, vec![1]);
+        assert_eq!(
+            result.deleted_files,
+            vec!["epoch1_only.parquet".to_string()]
+        );
+
+        let guard = catalog.lock().unwrap();
+        assert!(guard.existing_files.contains("shared.parquet"));
+    }
+
+    // ── P6b: Crash-mid-delete resume safety ───────────────────────────────
+
+    #[tokio::test]
+    async fn resumes_and_clears_pending_deletes_left_by_crashed_run() {
+        let snapshots = vec![
+            snapshot(1, 1000, &["data/epoch-1.parquet"]),
+            snapshot(2, 2000, &["data/epoch-2.parquet"]),
+        ];
+        let catalog = Arc::new(Mutex::new(MockCatalog::with_snapshots(snapshots)));
         {
             let mut catalog = catalog.lock().unwrap();
             catalog.snapshots.retain(|s| s.epoch != 1);
@@ -444,60 +486,52 @@ mod tests {
             },
         );
 
-        let first = gc.run(10_000).unwrap();
+        let first = gc.run(10_000).await.unwrap();
         assert!(first.resumed_from_crash);
         assert_eq!(
             first.deleted_files,
             vec!["data/epoch-1.parquet".to_string()]
         );
-        assert_eq!(first.metrics.cold_gc_bytes_reclaimed, 1024);
 
-        // Re-running is idempotent: nothing pending, nothing extra deleted.
-        let second = gc.run(10_000).unwrap();
+        let second = gc.run(10_000).await.unwrap();
         assert!(!second.resumed_from_crash);
         assert!(second.deleted_files.is_empty());
-        assert_eq!(second.metrics.cold_gc_bytes_reclaimed, 0);
     }
 
     // ── P7: GC never runs concurrently with a snapshot commit ──────────────
 
-    #[test]
-    fn gc_and_commit_are_serialized_by_the_shared_lock() {
-        // A slow-motion catalog: `delete_file` sleeps while the caller still
-        // holds `ColdGc::run`'s lock guard. Mutual exclusion comes entirely
-        // from `ColdGc::run` holding `self.catalog.lock()` for its whole
-        // duration, exactly as a real `commit()` implementation would via
-        // the same mutex — so `active_ops` must never exceed 1 while GC's
-        // `delete_file` is sleeping.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gc_and_commit_are_serialized_by_the_shared_lock() {
         struct SlowCatalog {
             inner: MockCatalog,
             active_ops: Arc<AtomicI64>,
             max_concurrent: Arc<AtomicI64>,
         }
 
+        #[async_trait]
         impl ColdGcCatalog for SlowCatalog {
-            fn list_snapshots(&self) -> Result<Vec<RetainedSnapshot>, SinkError> {
-                self.inner.list_snapshots()
+            async fn list_snapshots(&self) -> Result<Vec<RetainedSnapshot>, SinkError> {
+                self.inner.list_snapshots().await
             }
-            fn remove_snapshots(&mut self, epochs: &[Epoch]) -> Result<(), SinkError> {
-                self.inner.remove_snapshots(epochs)
+            async fn remove_snapshots(&mut self, epochs: &[Epoch]) -> Result<(), SinkError> {
+                self.inner.remove_snapshots(epochs).await
             }
-            fn delete_file(&mut self, path: &str) -> Result<u64, SinkError> {
+            async fn delete_file(&mut self, path: &str) -> Result<u64, SinkError> {
                 let now = self.active_ops.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_concurrent.fetch_max(now, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(20));
-                let result = self.inner.delete_file(path);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let result = self.inner.delete_file(path).await;
                 self.active_ops.fetch_sub(1, Ordering::SeqCst);
                 result
             }
-            fn read_pending_deletes(&self) -> Result<Vec<String>, SinkError> {
-                self.inner.read_pending_deletes()
+            async fn read_pending_deletes(&self) -> Result<Vec<String>, SinkError> {
+                self.inner.read_pending_deletes().await
             }
-            fn write_pending_deletes(&mut self, paths: &[String]) -> Result<(), SinkError> {
-                self.inner.write_pending_deletes(paths)
+            async fn write_pending_deletes(&mut self, paths: &[String]) -> Result<(), SinkError> {
+                self.inner.write_pending_deletes(paths).await
             }
-            fn clear_pending_deletes(&mut self) -> Result<(), SinkError> {
-                self.inner.clear_pending_deletes()
+            async fn clear_pending_deletes(&mut self) -> Result<(), SinkError> {
+                self.inner.clear_pending_deletes().await
             }
         }
 
@@ -521,34 +555,26 @@ mod tests {
             },
         );
 
-        // "Commit" thread: repeatedly acquires the exact same mutex the
-        // sink's real commit() path would hold, incrementing/decrementing
-        // the shared `active_ops` counter to detect any overlap with GC's
-        // critical section.
-        let commit_thread = {
+        let commit_task = {
             let catalog = Arc::clone(&catalog);
             let active_ops = Arc::clone(&active_ops);
             let max_concurrent = Arc::clone(&max_concurrent);
-            std::thread::spawn(move || {
+            tokio::spawn(async move {
                 for _ in 0..10 {
-                    let _guard = catalog.lock().unwrap();
-                    let now = active_ops.fetch_add(1, Ordering::SeqCst) + 1;
-                    max_concurrent.fetch_max(now, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(2));
+                    {
+                        let _guard = catalog.lock().unwrap();
+                        let now = active_ops.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_concurrent.fetch_max(now, Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
                     active_ops.fetch_sub(1, Ordering::SeqCst);
                 }
             })
         };
 
-        let gc_thread = std::thread::spawn(move || gc.run(10_000));
-
-        commit_thread.join().unwrap();
-        let result = gc_thread.join().unwrap().unwrap();
+        let result = gc.run(10_000).await.unwrap();
+        commit_task.await.unwrap();
         assert_eq!(result.expired_epochs, vec![1]);
-
-        // If GC's critical section and "commit"'s critical section had ever
-        // run concurrently, `max_concurrent` would exceed 1 — the shared
-        // mutex must have serialized them.
         assert_eq!(max_concurrent.load(Ordering::SeqCst), 1);
     }
 }

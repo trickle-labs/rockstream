@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -16,6 +17,7 @@ struct PausableSource {
     resumes: usize,
 }
 
+#[async_trait]
 impl SourceConnector for PausableSource {
     fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
         Ok(Arc::new(Schema::new(vec![Field::new(
@@ -25,7 +27,7 @@ impl SourceConnector for PausableSource {
         )])))
     }
 
-    fn start_snapshot(
+    async fn start_snapshot(
         &mut self,
         _frontier: Epoch,
         _partition_filter: Option<PartitionFilter>,
@@ -33,7 +35,7 @@ impl SourceConnector for PausableSource {
         Ok(SnapshotStream::new(vec![]))
     }
 
-    fn poll_delta(
+    async fn poll_delta(
         &mut self,
         _after: OffsetToken,
         _max_bytes: usize,
@@ -43,16 +45,20 @@ impl SourceConnector for PausableSource {
         unreachable!("lifecycle tests use explicit checkpoint commits")
     }
 
-    fn commit_offset(&mut self, _epoch: Epoch, _offset: OffsetToken) -> Result<(), SourceError> {
+    async fn commit_offset(
+        &mut self,
+        _epoch: Epoch,
+        _offset: OffsetToken,
+    ) -> Result<(), SourceError> {
         Ok(())
     }
 
-    fn pause(&mut self, reason: String) -> Result<(), SourceError> {
+    async fn pause(&mut self, reason: String) -> Result<(), SourceError> {
         self.pauses.push(reason);
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<(), SourceError> {
+    async fn resume(&mut self) -> Result<(), SourceError> {
         self.resumes += 1;
         Ok(())
     }
@@ -89,7 +95,7 @@ async fn pause_fences_owner_and_preserves_recoverable_checkpoint() {
     );
     runtime.recover().await.unwrap();
     let owner = runtime.acquire_owner("owner-a").unwrap();
-    runtime.pause("paused by operator").unwrap();
+    runtime.pause("paused by operator").await.unwrap();
 
     assert_eq!(
         (
@@ -127,7 +133,7 @@ async fn resume_recovers_from_exact_committed_checkpoint() {
         OffsetToken::new(vec![]),
         store,
     );
-    runtime.pause("paused by operator").unwrap();
+    runtime.pause("paused by operator").await.unwrap();
 
     assert_eq!(
         runtime.resume().await.unwrap(),

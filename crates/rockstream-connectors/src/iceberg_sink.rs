@@ -12,6 +12,7 @@
 //! exact row read-back in tests, but it does **not** fully prove P1 ("external
 //! engines can query with zero data corruption").
 
+use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -377,12 +378,13 @@ impl IcebergSink {
     }
 }
 
+#[async_trait]
 impl SinkConnector for IcebergSink {
     fn idempotency_profile(&self) -> SinkIdempotencyProfile {
         SinkIdempotencyProfile::NativeIdempotent
     }
 
-    fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError> {
+    async fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError> {
         if self.backpressure_active() {
             return Err(SinkError::PreCommitFailed {
                 epoch,
@@ -412,18 +414,12 @@ impl SinkConnector for IcebergSink {
         for (partition, sub_batch) in &groups {
             let pending_path = self.pending_data_path(epoch, partition);
             let final_path = self.final_data_path(epoch, partition);
-            let store = Arc::clone(&store);
-            let sub_batch_owned = sub_batch.clone();
-            let pending_path_for_task = pending_path.clone();
-            run_async(async move {
-                let bytes =
-                    encode_record_batch_as_parquet(&sub_batch_owned, parquet_row_group_bytes)?;
-                store
-                    .inner()
-                    .put(&pending_path_for_task, bytes.into())
-                    .await
-                    .map_err(|error| SinkError::Io(error.to_string()))
-            })?;
+            let bytes = encode_record_batch_as_parquet(sub_batch, parquet_row_group_bytes)?;
+            store
+                .inner()
+                .put(&pending_path, bytes.into())
+                .await
+                .map_err(|error| SinkError::Io(error.to_string()))?;
             files.push(PendingFile {
                 pending_path: pending_path.to_string(),
                 final_path: final_path.to_string(),
@@ -445,7 +441,7 @@ impl SinkConnector for IcebergSink {
         })
     }
 
-    fn commit(&mut self, epoch: Epoch, state: &SinkState) -> Result<(), SinkError> {
+    async fn commit(&mut self, epoch: Epoch, state: &SinkState) -> Result<(), SinkError> {
         assert_epoch_committed_only_after_cluster_checkpoint(
             self.connector_id,
             epoch,
@@ -469,17 +465,17 @@ impl SinkConnector for IcebergSink {
             }
         };
 
-        run_async(self.finalize_commit(epoch, files))
+        self.finalize_commit(epoch, files).await
     }
 
-    fn abort(&mut self, epoch: Epoch) -> Result<(), SinkError> {
+    async fn abort(&mut self, epoch: Epoch) -> Result<(), SinkError> {
         if let Some(pending) = self.pending.get(&epoch).cloned() {
-            run_async(self.cleanup_pending(epoch, &pending.files))?;
+            self.cleanup_pending(epoch, &pending.files).await?;
         }
         Ok(())
     }
 
-    fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError> {
+    async fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError> {
         match action {
             RecoveryAction::Noop => Ok(()),
             RecoveryAction::RerunCommit {
@@ -490,33 +486,31 @@ impl SinkConnector for IcebergSink {
                 let files: Vec<PendingFile> = serde_json::from_slice(pending_handle)
                     .map_err(|error| SinkError::Io(error.to_string()))?;
 
-                run_async(async {
-                    for file in &files {
-                        let pending_path = Path::from(file.pending_path.clone());
-                        let final_path = Path::from(file.final_path.clone());
-                        let expected_size_bytes = self
-                            .store
-                            .inner()
-                            .head(&pending_path)
-                            .await
-                            .map_err(|error| SinkError::CommitFailed {
-                                epoch,
-                                reason: error.to_string(),
-                            })?
-                            .size;
+                for file in &files {
+                    let pending_path = Path::from(file.pending_path.clone());
+                    let final_path = Path::from(file.final_path.clone());
+                    let expected_size_bytes = self
+                        .store
+                        .inner()
+                        .head(&pending_path)
+                        .await
+                        .map_err(|error| SinkError::CommitFailed {
+                            epoch,
+                            reason: error.to_string(),
+                        })?
+                        .size;
 
-                        if let Ok(meta) = self.store.inner().head(&final_path).await {
-                            if meta.size != expected_size_bytes {
-                                let _ = self.store.inner().delete(&final_path).await;
-                            }
+                    if let Ok(meta) = self.store.inner().head(&final_path).await {
+                        if meta.size != expected_size_bytes {
+                            let _ = self.store.inner().delete(&final_path).await;
                         }
                     }
+                }
 
-                    self.finalize_commit(epoch, files).await?;
-                    let final_state = SinkState::Committed;
-                    assert_recovery_dispatch_idempotent(self.connector_id, &action, &final_state);
-                    Ok(())
-                })
+                self.finalize_commit(epoch, files).await?;
+                let final_state = SinkState::Committed;
+                assert_recovery_dispatch_idempotent(self.connector_id, &action, &final_state);
+                Ok(())
             }
         }
     }
@@ -530,9 +524,10 @@ impl SinkConnector for IcebergSink {
 /// `delete_file` tolerates `NotFound`).
 const GC_PENDING_DELETES_FILE: &str = "_gc_pending_deletes.json";
 
+#[async_trait]
 impl crate::cold_gc::ColdGcCatalog for IcebergSink {
-    fn list_snapshots(&self) -> Result<Vec<crate::cold_gc::RetainedSnapshot>, SinkError> {
-        let metadata = run_async(self.read_metadata())?;
+    async fn list_snapshots(&self) -> Result<Vec<crate::cold_gc::RetainedSnapshot>, SinkError> {
+        let metadata = self.read_metadata().await?;
         Ok(metadata
             .snapshots
             .into_iter()
@@ -548,70 +543,60 @@ impl crate::cold_gc::ColdGcCatalog for IcebergSink {
             .collect())
     }
 
-    fn remove_snapshots(&mut self, epochs: &[Epoch]) -> Result<(), SinkError> {
-        run_async(async {
-            let mut metadata = self.read_metadata().await?;
-            metadata
-                .snapshots
-                .retain(|snapshot| !epochs.contains(&snapshot.epoch));
-            self.write_metadata(&metadata).await
-        })
+    async fn remove_snapshots(&mut self, epochs: &[Epoch]) -> Result<(), SinkError> {
+        let mut metadata = self.read_metadata().await?;
+        metadata
+            .snapshots
+            .retain(|snapshot| !epochs.contains(&snapshot.epoch));
+        self.write_metadata(&metadata).await
     }
 
-    fn delete_file(&mut self, path: &str) -> Result<u64, SinkError> {
-        run_async(async {
-            let object_path = Path::from(path);
-            let size_before = match self.store.inner().head(&object_path).await {
-                Ok(meta) => meta.size,
-                Err(object_store::Error::NotFound { .. }) => return Ok(0),
-                Err(error) => return Err(SinkError::Io(error.to_string())),
-            };
-            match self.store.inner().delete(&object_path).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(size_before),
-                Err(error) => Err(SinkError::Io(error.to_string())),
-            }
-        })
+    async fn delete_file(&mut self, path: &str) -> Result<u64, SinkError> {
+        let object_path = Path::from(path);
+        let size_before = match self.store.inner().head(&object_path).await {
+            Ok(meta) => meta.size,
+            Err(object_store::Error::NotFound { .. }) => return Ok(0),
+            Err(error) => return Err(SinkError::Io(error.to_string())),
+        };
+        match self.store.inner().delete(&object_path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(size_before),
+            Err(error) => Err(SinkError::Io(error.to_string())),
+        }
     }
 
-    fn read_pending_deletes(&self) -> Result<Vec<String>, SinkError> {
+    async fn read_pending_deletes(&self) -> Result<Vec<String>, SinkError> {
         let path = Path::from(format!("{}/{}", self.base_path, GC_PENDING_DELETES_FILE));
-        run_async(async {
-            match self.store.inner().get(&path).await {
-                Ok(result) => {
-                    let bytes = result
-                        .bytes()
-                        .await
-                        .map_err(|error| SinkError::Io(error.to_string()))?;
-                    serde_json::from_slice(&bytes).map_err(|error| SinkError::Io(error.to_string()))
-                }
-                Err(object_store::Error::NotFound { .. }) => Ok(Vec::new()),
-                Err(error) => Err(SinkError::Io(error.to_string())),
+        match self.store.inner().get(&path).await {
+            Ok(result) => {
+                let bytes = result
+                    .bytes()
+                    .await
+                    .map_err(|error| SinkError::Io(error.to_string()))?;
+                serde_json::from_slice(&bytes).map_err(|error| SinkError::Io(error.to_string()))
             }
-        })
+            Err(object_store::Error::NotFound { .. }) => Ok(Vec::new()),
+            Err(error) => Err(SinkError::Io(error.to_string())),
+        }
     }
 
-    fn write_pending_deletes(&mut self, paths: &[String]) -> Result<(), SinkError> {
+    async fn write_pending_deletes(&mut self, paths: &[String]) -> Result<(), SinkError> {
         let path = Path::from(format!("{}/{}", self.base_path, GC_PENDING_DELETES_FILE));
         let payload =
             serde_json::to_vec(paths).map_err(|error| SinkError::Io(error.to_string()))?;
-        run_async(async {
-            self.store
-                .inner()
-                .put(&path, payload.into())
-                .await
-                .map_err(|error| SinkError::Io(error.to_string()))?;
-            Ok(())
-        })
+        self.store
+            .inner()
+            .put(&path, payload.into())
+            .await
+            .map_err(|error| SinkError::Io(error.to_string()))?;
+        Ok(())
     }
 
-    fn clear_pending_deletes(&mut self) -> Result<(), SinkError> {
+    async fn clear_pending_deletes(&mut self) -> Result<(), SinkError> {
         let path = Path::from(format!("{}/{}", self.base_path, GC_PENDING_DELETES_FILE));
-        run_async(async {
-            match self.store.inner().delete(&path).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-                Err(error) => Err(SinkError::Io(error.to_string())),
-            }
-        })
+        match self.store.inner().delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(SinkError::Io(error.to_string())),
+        }
     }
 }
 
@@ -642,21 +627,6 @@ fn decode_record_batches_from_parquet(bytes: Bytes) -> Result<Vec<RecordBatch>, 
     reader
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| SinkError::Io(error.to_string()))
-}
-
-fn run_async<F, T>(future: F) -> Result<T, SinkError>
-where
-    F: std::future::Future<Output = Result<T, SinkError>>,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(future))
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| SinkError::Io(error.to_string()))?
-            .block_on(future)
-    }
 }
 
 #[cfg(test)]
@@ -720,9 +690,9 @@ mod tests {
             let batch = make_batch(epoch as i64);
             expected_batches.push(batch.clone());
             sink.set_staged_batch(batch.clone());
-            let state = sink.pre_commit(epoch, batch.num_rows()).unwrap();
+            let state = sink.pre_commit(epoch, batch.num_rows()).await.unwrap();
             sink.set_cluster_committed(epoch);
-            sink.commit(epoch, &state).unwrap();
+            sink.commit(epoch, &state).await.unwrap();
         }
 
         for (index, expected) in expected_batches.iter().enumerate() {
@@ -756,9 +726,9 @@ mod tests {
 
         let batch = make_partitioned_batch();
         sink.set_staged_batch(batch.clone());
-        let state = sink.pre_commit(1, batch.num_rows()).unwrap();
+        let state = sink.pre_commit(1, batch.num_rows()).await.unwrap();
         sink.set_cluster_committed(1);
-        sink.commit(1, &state).unwrap();
+        sink.commit(1, &state).await.unwrap();
 
         let partition_files = sink.snapshot_partition_files(1).await.unwrap();
         let mut suffixes: Vec<&str> = partition_files
@@ -801,12 +771,12 @@ mod tests {
         for epoch in 1..=4u64 {
             let batch = make_batch(epoch as i64);
             sink.set_staged_batch(batch.clone());
-            let state = sink.pre_commit(epoch, batch.num_rows()).unwrap();
+            let state = sink.pre_commit(epoch, batch.num_rows()).await.unwrap();
             sink.set_cluster_committed(epoch);
-            sink.commit(epoch, &state).unwrap();
+            sink.commit(epoch, &state).await.unwrap();
         }
 
-        let snapshots_before = ColdGcCatalog::list_snapshots(&sink).unwrap();
+        let snapshots_before = ColdGcCatalog::list_snapshots(&sink).await.unwrap();
         assert_eq!(snapshots_before.len(), 4);
 
         let catalog = Arc::new(Mutex::new(sink));
@@ -817,14 +787,14 @@ mod tests {
                 retention_duration_ms: u64::MAX,
             },
         );
-        let result = gc.run(0).unwrap();
+        let result = gc.run(0).await.unwrap();
         assert_eq!(result.expired_epochs, vec![1, 2]);
         assert_eq!(result.deleted_files.len(), 2);
         drop(gc);
 
         let remaining_epochs = {
             let sink = catalog.lock().unwrap();
-            let snapshots_after = ColdGcCatalog::list_snapshots(&*sink).unwrap();
+            let snapshots_after = ColdGcCatalog::list_snapshots(&*sink).await.unwrap();
             let mut remaining_epochs: Vec<Epoch> =
                 snapshots_after.iter().map(|s| s.epoch).collect();
             remaining_epochs.sort();

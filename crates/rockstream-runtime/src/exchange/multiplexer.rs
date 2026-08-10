@@ -1,3 +1,6 @@
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -41,6 +44,8 @@ pub struct WorkerStreamMultiplexer {
     src_worker: Option<WorkerId>,
     exchange_config: ExchangeConfig,
     shared_memory: SharedMemorySegmentPool,
+    task_tracker: TaskTracker,
+    cancel_token: CancellationToken,
 }
 
 impl WorkerStreamMultiplexer {
@@ -58,6 +63,8 @@ impl WorkerStreamMultiplexer {
             src_worker: None,
             exchange_config: ExchangeConfig::default(),
             shared_memory: SharedMemorySegmentPool::new(ExchangeConfig::default()),
+            task_tracker: TaskTracker::new(),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -78,7 +85,24 @@ impl WorkerStreamMultiplexer {
             src_worker: None,
             exchange_config: ExchangeConfig::default(),
             shared_memory: SharedMemorySegmentPool::new(ExchangeConfig::default()),
+            task_tracker: TaskTracker::new(),
+            cancel_token: CancellationToken::new(),
         }
+    }
+
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel_token
+    }
+
+    pub fn task_tracker(&self) -> &TaskTracker {
+        &self.task_tracker
+    }
+
+    pub async fn shutdown(&self) {
+        self.cancel_token.cancel();
+        self.task_tracker.close();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.task_tracker.wait()).await;
     }
 
     /// Add an object store for durable fallback.
@@ -317,20 +341,27 @@ impl WorkerStreamMultiplexer {
                             // fast-path WAL elision (v0.51) there is no local
                             // outbox entry to delete on ACK; the ACK only drives
                             // flow-control credit release.
-                            tokio::spawn(async move {
-                                while let Some(res) = response_stream.next().await {
-                                    match res {
-                                        Ok(ack) => {
-                                            flow_controller.handle_ack(&ack);
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                code = %rockstream_types::error_code::RS_0001,
-                                                worker_id = ?target_worker,
-                                                "Shuffle stream ACK error: {:?}",
-                                                e
-                                            );
-                                            break;
+                            let cancel_token = self.cancel_token.clone();
+                            self.task_tracker.spawn(async move {
+                                loop {
+                                    tokio::select! {
+                                        _ = cancel_token.cancelled() => break,
+                                        res = response_stream.next() => {
+                                            match res {
+                                                Some(Ok(ack)) => {
+                                                    flow_controller.handle_ack(&ack);
+                                                }
+                                                Some(Err(e)) => {
+                                                    tracing::error!(
+                                                        code = %rockstream_types::error_code::RS_0001,
+                                                        worker_id = ?target_worker,
+                                                        "Shuffle stream ACK error: {:?}",
+                                                        e
+                                                    );
+                                                    break;
+                                                }
+                                                None => break,
+                                            }
                                         }
                                     }
                                 }

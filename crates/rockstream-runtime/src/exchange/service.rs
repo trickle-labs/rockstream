@@ -1,3 +1,6 @@
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,6 +14,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::exchange::proto::{shuffle_service_server::ShuffleService, ShuffleAck, ShuffleFrame};
 use crate::exchange::serialization::deserialize_zset;
 use rockstream_ops::zset::ArrowZSet;
+use rockstream_types::config::ExchangeConfig;
 
 /// Holds the input channel and Schema metadata for a local exchange target.
 #[derive(Clone)]
@@ -55,6 +59,12 @@ impl ExchangeRegistry {
             cluster_frontier: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_frames_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Get total count of gRPC frames received.
+    pub fn grpc_frames_received(&self) -> u64 {
+        self.grpc_frames_received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the current cluster frontier.
@@ -102,12 +112,6 @@ impl ExchangeRegistry {
             .and_then(|state| state.db.clone())
     }
 
-    pub fn grpc_frames_received(&self) -> u64 {
-        self.grpc_frames_received
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Register a local inlet for the given exchange and target shard.
     pub fn register(
         &self,
         exchange_id: u64,
@@ -121,12 +125,10 @@ impl ExchangeRegistry {
         );
     }
 
-    /// Unregister a local inlet.
     pub fn unregister(&self, exchange_id: u64, target_shard: u32) {
         self.inlets.write().remove(&(exchange_id, target_shard));
     }
 
-    /// Get a registered local inlet.
     pub fn get(&self, exchange_id: u64, target_shard: u32) -> Option<ExchangeInlet> {
         self.inlets
             .read()
@@ -135,14 +137,118 @@ impl ExchangeRegistry {
     }
 }
 
+/// Service wrapper managing exchange gRPC server lifecycle with TaskTracker & CancellationToken.
+#[derive(Clone)]
+pub struct ExchangeService {
+    registry: ExchangeRegistry,
+    task_tracker: TaskTracker,
+    cancel_token: CancellationToken,
+    exchange_config: ExchangeConfig,
+}
+
+impl ExchangeService {
+    pub fn new(registry: ExchangeRegistry) -> Self {
+        Self {
+            registry,
+            task_tracker: TaskTracker::new(),
+            cancel_token: CancellationToken::new(),
+            exchange_config: ExchangeConfig::default(),
+        }
+    }
+
+    pub fn with_exchange_config(mut self, exchange_config: ExchangeConfig) -> Self {
+        self.exchange_config = exchange_config;
+        self
+    }
+
+    pub fn exchange_config(&self) -> &ExchangeConfig {
+        &self.exchange_config
+    }
+
+    pub fn registry(&self) -> &ExchangeRegistry {
+        &self.registry
+    }
+
+    pub fn task_tracker(&self) -> &TaskTracker {
+        &self.task_tracker
+    }
+
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel_token
+    }
+
+    pub async fn start(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let server = ShuffleServer::new_with_tracker(
+            self.registry.clone(),
+            Some(self.task_tracker.clone()),
+            Some(self.cancel_token.clone()),
+        )
+        .with_exchange_config(self.exchange_config.clone());
+        let cancel_token = self.cancel_token.clone();
+        let handle = self.task_tracker.spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(
+                    crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
+                        server,
+                    ),
+                )
+                .serve_with_shutdown(addr, async move {
+                    cancel_token.cancelled().await;
+                })
+                .await;
+        });
+        Ok(handle)
+    }
+
+    pub async fn shutdown(&self) {
+        self.cancel_token.cancel();
+        self.task_tracker.close();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.task_tracker.wait()).await;
+    }
+}
+
 /// gRPC implementation of the ShuffleService.
 pub struct ShuffleServer {
     registry: ExchangeRegistry,
+    task_tracker: Option<TaskTracker>,
+    cancel_token: Option<CancellationToken>,
+    exchange_config: ExchangeConfig,
 }
 
 impl ShuffleServer {
     pub fn new(registry: ExchangeRegistry) -> Self {
-        ShuffleServer { registry }
+        ShuffleServer {
+            registry,
+            task_tracker: None,
+            cancel_token: None,
+            exchange_config: ExchangeConfig::default(),
+        }
+    }
+
+    pub fn new_with_tracker(
+        registry: ExchangeRegistry,
+        task_tracker: Option<TaskTracker>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Self {
+        ShuffleServer {
+            registry,
+            task_tracker,
+            cancel_token,
+            exchange_config: ExchangeConfig::default(),
+        }
+    }
+
+    pub fn with_exchange_config(mut self, exchange_config: ExchangeConfig) -> Self {
+        self.exchange_config = exchange_config;
+        self
+    }
+
+    pub fn exchange_config(&self) -> &ExchangeConfig {
+        &self.exchange_config
     }
 }
 
@@ -157,9 +263,11 @@ impl ShuffleService for ShuffleServer {
         let mut stream = request.into_inner();
         let registry = self.registry.clone();
 
-        let (tx, rx) = mpsc::channel(64);
+        let cap = self.exchange_config.frame_channel_capacity.max(1);
+        let (tx, rx) = mpsc::channel(cap);
+        let cancel_token = self.cancel_token.clone();
 
-        tokio::spawn(async move {
+        let worker_task = async move {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(frame) => {
@@ -168,12 +276,6 @@ impl ShuffleService for ShuffleServer {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let inlet_opt = registry.get(frame.exchange_id, frame.target_shard);
                         if let Some(inlet) = inlet_opt {
-                            // Fast-path shuffle WAL elision (v0.51, Slice 1): the
-                            // receiver no longer persists a `shuffle_inbox/` key
-                            // for a directly delivered gRPC frame. Replay-dedup
-                            // relies on the target shard's committed frontier: a
-                            // frame whose epoch is already reflected in the
-                            // checkpointed operator state is skipped on replay.
                             let mut already_reflected = false;
                             if let Some(db) = registry.get_shard_db(frame.target_shard) {
                                 match crate::exchange::persistence::committed_frontier(&db).await {
@@ -192,20 +294,16 @@ impl ShuffleService for ShuffleServer {
                                     }
                                 }
                             }
+
                             if !already_reflected {
-                                match deserialize_zset(&frame.payload, inlet.schema.clone()) {
-                                    Ok(zset) => {
-                                        if inlet.sender.send(zset).await.is_err() {
-                                            tracing::warn!(
-                                                "Failed to forward shuffle batch to local inlet"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            code = %rockstream_types::error_code::RS_3009,
-                                            "Failed to deserialize shuffle payload: {:?}",
-                                            e
+                                if let Ok(zset) =
+                                    deserialize_zset(&frame.payload, inlet.schema.clone())
+                                {
+                                    if inlet.sender.send(zset).await.is_err() {
+                                        tracing::warn!(
+                                            exchange_id = frame.exchange_id,
+                                            target_shard = frame.target_shard,
+                                            "Target inlet receiver dropped"
                                         );
                                     }
                                 }
@@ -218,7 +316,6 @@ impl ShuffleService for ShuffleServer {
                             );
                         }
 
-                        // Send acknowledgement back to the sender
                         let ack = ShuffleAck {
                             exchange_id: frame.exchange_id,
                             src_shard: frame.src_shard,
@@ -242,7 +339,22 @@ impl ShuffleService for ShuffleServer {
                     }
                 }
             }
-        });
+        };
+
+        if let Some(tracker) = &self.task_tracker {
+            tracker.spawn(async move {
+                if let Some(token) = cancel_token {
+                    tokio::select! {
+                        _ = token.cancelled() => {}
+                        _ = worker_task => {}
+                    }
+                } else {
+                    worker_task.await;
+                }
+            });
+        } else {
+            tokio::spawn(worker_task);
+        }
 
         Ok(Response::new(Box::pin(RxStream { rx })))
     }
@@ -2258,5 +2370,19 @@ mod tests {
         assert_eq!(serialize_zset(&received).unwrap(), expected);
         assert_eq!(registry.grpc_frames_received(), 0);
         unregister_shared_memory_endpoint(WorkerId(922));
+    }
+
+    #[test]
+    fn test_frame_channel_row_budget_sizing() {
+        let registry = ExchangeRegistry::new();
+        let config = ExchangeConfig {
+            frame_channel_capacity: 512,
+            ..ExchangeConfig::default()
+        };
+        let service = ExchangeService::new(registry.clone()).with_exchange_config(config.clone());
+        assert_eq!(service.exchange_config().frame_channel_capacity, 512);
+
+        let server = ShuffleServer::new(registry).with_exchange_config(config);
+        assert_eq!(server.exchange_config().frame_channel_capacity, 512);
     }
 }

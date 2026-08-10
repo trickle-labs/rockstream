@@ -118,10 +118,10 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
 
     /// Fence the owner and stop upstream work while retaining the exact
     /// committed checkpoint for a later resume.
-    pub fn pause(&mut self, reason: impl Into<String>) -> Result<(), SourceError> {
+    pub async fn pause(&mut self, reason: impl Into<String>) -> Result<(), SourceError> {
         self.active_lease = None;
         let reason = reason.into();
-        self.source.pause(reason.clone())?;
+        self.source.pause(reason.clone()).await?;
         self.blocked_reason = Some(reason);
         Ok(())
     }
@@ -129,7 +129,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
     /// Rebuild the committed checkpoint before allowing a new owner lease.
     pub async fn resume(&mut self) -> Result<Option<SourceCheckpoint>, SourceError> {
         let checkpoint = self.recover().await?;
-        self.source.resume()?;
+        self.source.resume().await?;
         self.blocked_reason = None;
         Ok(checkpoint)
     }
@@ -139,7 +139,8 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
     pub async fn drop_source(&mut self) -> Result<usize, SourceError> {
         self.active_lease = None;
         self.source
-            .pause("source dropped; owner fenced before cleanup".to_string())?;
+            .pause("source dropped; owner fenced before cleanup".to_string())
+            .await?;
         let removed = self
             .checkpoint_store
             .cleanup()
@@ -206,7 +207,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
             .map_err(|error| SourceError::Io(error.to_string()))?;
         self.committed_offset = committed.token.clone();
 
-        if let Err(error) = self.source.commit_offset(epoch, committed.token) {
+        if let Err(error) = self.source.commit_offset(epoch, committed.token).await {
             return self.block(&format!(
                 "RS-4016: M3 source input committed but upstream acknowledgement failed: {error}; next steps: recover the checkpoint and retry acknowledgement"
             ));
@@ -217,7 +218,10 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
 
     /// Retry the upstream acknowledgement for the checkpoint recovered after a
     /// crash between M3 commit and acknowledgement. This never writes input.
-    pub fn acknowledge_recovered(&mut self, lease: &SourceOwnerLease) -> Result<(), SourceError> {
+    pub async fn acknowledge_recovered(
+        &mut self,
+        lease: &SourceOwnerLease,
+    ) -> Result<(), SourceError> {
         self.require_active_lease(lease)?;
         let epoch = self.source_epochs.current_epoch();
         if epoch == 0 {
@@ -226,6 +230,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         if let Err(error) = self
             .source
             .commit_offset(epoch, self.committed_offset.clone())
+            .await
         {
             return self.block(&format!(
                 "RS-4016: recovered source checkpoint acknowledgement failed: {error}; next steps: retain ownership and retry acknowledgement"
@@ -270,7 +275,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
 
     fn block<T>(&mut self, reason: &str) -> Result<T, SourceError> {
         self.blocked_reason = Some(reason.to_string());
-        let _ = self.source.pause(reason.to_string());
+        drop(self.source.pause(reason.to_string()));
         Err(SourceError::Io(reason.to_string()))
     }
 }

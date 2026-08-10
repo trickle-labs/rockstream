@@ -12,9 +12,9 @@ use rockstream_types::metrics::{inc_spill_faults_total, inc_spilled_bytes};
 
 use crate::error::OpError;
 
-pub(crate) fn block_on_future<F: std::future::Future>(fut: F) -> F::Output
+pub(crate) fn block_on_future<F>(fut: F) -> F::Output
 where
-    F: Send,
+    F: std::future::Future + Send,
     F::Output: Send,
 {
     match tokio::runtime::Handle::try_current() {

@@ -26,21 +26,25 @@ fn incomplete_kafka_configuration_is_rejected_before_client_creation() {
     );
 }
 
-#[test]
-fn broker_free_fast_paths_preserve_offsets_and_reject_invalid_commits() {
+#[tokio::test]
+async fn broker_free_fast_paths_preserve_offsets_and_reject_invalid_commits() {
     let mut source =
         KafkaSource::connect(ConnectorId(5128), schema(), "127.0.0.1:1", "topic", "group").unwrap();
     let token = OffsetToken::new(serde_json::to_vec(&BTreeMap::from([(3, 7)])).unwrap());
-    let zero_bytes = source.poll_delta(token.clone(), 0, 1, None).unwrap();
-    let zero_credits = source.poll_delta(token.clone(), 1024, 0, None).unwrap();
+    let zero_bytes = source.poll_delta(token.clone(), 0, 1, None).await.unwrap();
+    let zero_credits = source
+        .poll_delta(token.clone(), 1024, 0, None)
+        .await
+        .unwrap();
     let invalid_commit = source
         .commit_offset(4, OffsetToken::new(br#"{"2147483648":0}"#.to_vec()))
+        .await
         .unwrap_err();
 
     assert_eq!(
         (
             source.discover_schema().unwrap().fields().len(),
-            source.start_snapshot(0, None).unwrap().count(),
+            source.start_snapshot(0, None).await.unwrap().count(),
             source.get_partition_offset(&OffsetToken::new(vec![]), 3),
             source.get_partition_offset(&token, 3),
             source.get_partition_offset(&token, 4),

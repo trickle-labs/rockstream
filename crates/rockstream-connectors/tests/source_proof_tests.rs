@@ -77,12 +77,13 @@ impl RecordedSource {
     }
 }
 
+#[async_trait::async_trait]
 impl SourceConnector for RecordedSource {
     fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
         Ok(self.schema.clone())
     }
 
-    fn start_snapshot(
+    async fn start_snapshot(
         &mut self,
         _frontier: Epoch,
         _partition_filter: Option<PartitionFilter>,
@@ -90,7 +91,7 @@ impl SourceConnector for RecordedSource {
         Ok(SnapshotStream::new(vec![]))
     }
 
-    fn poll_delta(
+    async fn poll_delta(
         &mut self,
         after: OffsetToken,
         _max_bytes: usize,
@@ -160,24 +161,28 @@ impl SourceConnector for RecordedSource {
         })
     }
 
-    fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+    async fn commit_offset(
+        &mut self,
+        epoch: Epoch,
+        offset: OffsetToken,
+    ) -> Result<(), SourceError> {
         self.last_committed = Some((epoch, offset));
         Ok(())
     }
 
-    fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+    async fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
         self.paused = true;
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<(), SourceError> {
+    async fn resume(&mut self) -> Result<(), SourceError> {
         self.paused = false;
         Ok(())
     }
 }
 
-#[test]
-fn test_kafka_clock_skew_window_closure() {
+#[tokio::test]
+async fn test_kafka_clock_skew_window_closure() {
     // Schema: [t: Int64, v: Int64]
     let schema = Arc::new(Schema::new(vec![
         Field::new("t", DataType::Int64, false),
@@ -198,6 +203,7 @@ fn test_kafka_clock_skew_window_closure() {
     // ─── Poll and Process first batch (respecting credit limit of 2) ───
     let res1 = source
         .poll_delta(OffsetToken::new(vec![]), 1024, 2, None)
+        .await
         .unwrap();
     assert_eq!(res1.batches.len(), 1);
 
@@ -245,6 +251,7 @@ fn test_kafka_clock_skew_window_closure() {
 
     let res2 = source
         .poll_delta(res1.new_offset.clone(), 1024, 1, None)
+        .await
         .unwrap();
     assert_eq!(res2.batches.len(), 1);
 
@@ -270,8 +277,8 @@ fn test_kafka_clock_skew_window_closure() {
     assert_eq!(op.watermark_ms(), 1100);
 }
 
-#[test]
-fn test_kafka_offset_tracking_causal_frontier() {
+#[tokio::test]
+async fn test_kafka_offset_tracking_causal_frontier() {
     let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
 
     let mut source = RecordedSource::new(schema, &[0, 1]);
@@ -280,7 +287,7 @@ fn test_kafka_offset_tracking_causal_frontier() {
 
     // Poll first epoch: 1 record from partition 0
     let start_token = OffsetToken::new(vec![]);
-    let res1 = source.poll_delta(start_token, 1024, 1, None).unwrap();
+    let res1 = source.poll_delta(start_token, 1024, 1, None).await.unwrap();
     assert_eq!(res1.batches.len(), 1);
 
     // Check offsets in token
@@ -290,11 +297,15 @@ fn test_kafka_offset_tracking_causal_frontier() {
     assert_eq!(p1_off, 0);
 
     // Commit offset for epoch 1
-    source.commit_offset(1, res1.new_offset.clone()).unwrap();
+    source
+        .commit_offset(1, res1.new_offset.clone())
+        .await
+        .unwrap();
 
     // Poll second epoch: 1 record from partition 1
     let res2 = source
         .poll_delta(res1.new_offset.clone(), 1024, 1, None)
+        .await
         .unwrap();
     assert_eq!(res2.batches.len(), 1);
 
@@ -304,7 +315,10 @@ fn test_kafka_offset_tracking_causal_frontier() {
     assert_eq!(p1_off2, 1);
 
     // Commit offset for epoch 2
-    source.commit_offset(2, res2.new_offset.clone()).unwrap();
+    source
+        .commit_offset(2, res2.new_offset.clone())
+        .await
+        .unwrap();
 
     // Verify last committed matches
     let (epoch, commit_token) = source.last_committed().unwrap();
@@ -341,6 +355,7 @@ async fn test_source_offset_replay_lfs() {
     // Poll first epoch: 1 record from partition 0
     let res1 = source
         .poll_delta(OffsetToken::new(vec![]), 1024, 1, None)
+        .await
         .unwrap();
     assert_eq!(res1.batches.len(), 1);
 
@@ -424,7 +439,10 @@ async fn test_source_offset_replay_lfs() {
     let resume_token = OffsetToken::new(serde_json::to_vec(&resume_map).unwrap());
 
     // Verify it resumes from correct position (polled from partition 1 next)
-    let res2 = source.poll_delta(resume_token, 1024, 1, None).unwrap();
+    let res2 = source
+        .poll_delta(resume_token, 1024, 1, None)
+        .await
+        .unwrap();
     assert_eq!(res2.batches.len(), 1);
     let (data2, _) = split_weight_column(&res2.batches[0]).unwrap();
     let val_col = data2
@@ -644,6 +662,7 @@ async fn test_s3_source_minio_tc() {
     // Poll first batch (1 record limit)
     let res1 = source
         .poll_delta(OffsetToken::new(vec![]), 1024, 1, None)
+        .await
         .unwrap();
     assert_eq!(res1.batches.len(), 1);
     let (data1, _) = split_weight_column(&res1.batches[0]).unwrap();
@@ -661,6 +680,7 @@ async fn test_s3_source_minio_tc() {
     // Poll next batch (10 records limit)
     let res2 = source
         .poll_delta(res1.new_offset.clone(), 1024, 10, None)
+        .await
         .unwrap();
     assert_eq!(res2.batches.len(), 1);
     let (data2, _) = split_weight_column(&res2.batches[0]).unwrap();
@@ -677,7 +697,10 @@ async fn test_s3_source_minio_tc() {
     assert_eq!(pos2, (2, 0)); // both files completed
 
     // Commit offsets
-    source.commit_offset(10, res2.new_offset.clone()).unwrap();
+    source
+        .commit_offset(10, res2.new_offset.clone())
+        .await
+        .unwrap();
     let (epoch, commit_tok) = source.last_committed().unwrap();
     assert_eq!(epoch, 10);
     assert_eq!(commit_tok, res2.new_offset);
@@ -690,20 +713,21 @@ struct ChaosSource<'a, S: SourceConnector> {
     sim_rt: &'a rockstream_sim::SimRuntime,
 }
 
+#[async_trait::async_trait]
 impl<'a, S: SourceConnector> SourceConnector for ChaosSource<'a, S> {
     fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
         self.inner.discover_schema()
     }
 
-    fn start_snapshot(
+    async fn start_snapshot(
         &mut self,
         frontier: Epoch,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
-        self.inner.start_snapshot(frontier, partition_filter)
+        self.inner.start_snapshot(frontier, partition_filter).await
     }
 
-    fn poll_delta(
+    async fn poll_delta(
         &mut self,
         after: OffsetToken,
         max_bytes: usize,
@@ -712,7 +736,7 @@ impl<'a, S: SourceConnector> SourceConnector for ChaosSource<'a, S> {
     ) -> Result<PollDeltaResult, SourceError> {
         // Inject pause fault with 10% probability
         if self.sim_rt.random_bool(0.1) {
-            self.inner.pause("chaos pause".to_string())?;
+            self.inner.pause("chaos pause".to_string()).await?;
         }
 
         // Inject connection drop / error with 10% probability
@@ -724,23 +748,28 @@ impl<'a, S: SourceConnector> SourceConnector for ChaosSource<'a, S> {
 
         // Resume with 20% probability
         if self.sim_rt.random_bool(0.2) {
-            let _ = self.inner.resume();
+            let _ = self.inner.resume().await;
         }
 
         self.inner
             .poll_delta(after, max_bytes, credits_available, partition_filter)
+            .await
     }
 
-    fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
-        self.inner.commit_offset(epoch, offset)
+    async fn commit_offset(
+        &mut self,
+        epoch: Epoch,
+        offset: OffsetToken,
+    ) -> Result<(), SourceError> {
+        self.inner.commit_offset(epoch, offset).await
     }
 
-    fn pause(&mut self, reason: String) -> Result<(), SourceError> {
-        self.inner.pause(reason)
+    async fn pause(&mut self, reason: String) -> Result<(), SourceError> {
+        self.inner.pause(reason).await
     }
 
-    fn resume(&mut self) -> Result<(), SourceError> {
-        self.inner.resume()
+    async fn resume(&mut self) -> Result<(), SourceError> {
+        self.inner.resume().await
     }
 }
 
@@ -753,6 +782,9 @@ fn test_source_coordination_sim() {
 
     for seed in 0..SEEDS {
         runner.run_seed(seed, |sim_rt| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
             let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
 
             // Set up a KafkaSource and populate it with deterministic data based on seed
@@ -774,7 +806,7 @@ fn test_source_coordination_sim() {
 
             while retries < 500 && processed_values.len() < 20 {
                 // Poll delta (respecting credits_available = 5)
-                match source.poll_delta(current_offset.clone(), 1024, 5, None) {
+                match rt.block_on(source.poll_delta(current_offset.clone(), 1024, 5, None)) {
                     Ok(res) => {
                         current_offset = res.new_offset;
                         for batch in res.batches {
@@ -824,8 +856,8 @@ fn test_source_coordination_sim() {
     );
 }
 
-#[test]
-fn test_s3_file_pointer_tracking() {
+#[tokio::test]
+async fn test_s3_file_pointer_tracking() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int64, false),
         Field::new("b", DataType::Int64, false),
@@ -840,6 +872,7 @@ fn test_s3_file_pointer_tracking() {
     let token_start = OffsetToken::new(vec![]);
     let res1 = source
         .poll_delta(token_start.clone(), 1024, 1, None)
+        .await
         .unwrap();
     assert_eq!(res1.batches.len(), 1);
     let (data1, _) = split_weight_column(&res1.batches[0]).unwrap();
@@ -849,7 +882,10 @@ fn test_s3_file_pointer_tracking() {
     assert_eq!(pos1, (0, 1)); // file 0, line 1
 
     // Commit offset
-    source.commit_offset(1, res1.new_offset.clone()).unwrap();
+    source
+        .commit_offset(1, res1.new_offset.clone())
+        .await
+        .unwrap();
 
     // Recreate source to test resuming from last committed offset token
     let mut source2 = S3Source::new(ConnectorId(202), schema);
@@ -859,6 +895,7 @@ fn test_s3_file_pointer_tracking() {
     // Resume from the committed token
     let res2 = source2
         .poll_delta(res1.new_offset.clone(), 1024, 10, None)
+        .await
         .unwrap();
     assert_eq!(res2.batches.len(), 1);
     let (data2, _) = split_weight_column(&res2.batches[0]).unwrap();

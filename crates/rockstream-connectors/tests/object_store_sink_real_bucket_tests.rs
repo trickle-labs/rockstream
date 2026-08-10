@@ -20,24 +20,18 @@ async fn conditional_idempotent_finalization_uses_real_minio() {
     let store = build_minio_store(port, "object-store-sink-real");
     let expected = vec![0xAB; 3];
 
-    let (state, keys) = tokio::task::spawn_blocking({
-        let store = Arc::clone(&store);
-        move || {
-            let mut sink = ObjectStoreSink::new(ConnectorId(51_21), store);
-            sink.set_cluster_committed(7);
-            let state = sink.pre_commit(7, 3).unwrap();
-            sink.commit(7, &state).unwrap();
-            sink.recover(RecoveryAction::RerunCommit {
-                epoch: 7,
-                profile: SinkIdempotencyProfile::NativeIdempotent,
-                pending_handle: vec![],
-            })
-            .unwrap();
-            (state, ["_pending/7/part-0", "final/7/part-0"])
-        }
+    let mut sink = ObjectStoreSink::new(ConnectorId(51_21), Arc::clone(&store));
+    sink.set_cluster_committed(7);
+    let state = sink.pre_commit(7, 3).await.unwrap();
+    sink.commit(7, &state).await.unwrap();
+    sink.recover(RecoveryAction::RerunCommit {
+        epoch: 7,
+        profile: SinkIdempotencyProfile::NativeIdempotent,
+        pending_handle: vec![],
     })
     .await
     .unwrap();
+    let keys = ["_pending/7/part-0", "final/7/part-0"];
 
     assert_eq!(
         state,
@@ -71,17 +65,10 @@ async fn conflicting_existing_final_is_rejected() {
         .await
         .unwrap();
 
-    let error = tokio::task::spawn_blocking({
-        let store = Arc::clone(&store);
-        move || {
-            let mut sink = ObjectStoreSink::new(ConnectorId(51_22), store);
-            sink.set_cluster_committed(8);
-            let state = sink.pre_commit(8, 3).unwrap();
-            sink.commit(8, &state).unwrap_err().to_string()
-        }
-    })
-    .await
-    .unwrap();
+    let mut sink = ObjectStoreSink::new(ConnectorId(51_22), Arc::clone(&store));
+    sink.set_cluster_committed(8);
+    let state = sink.pre_commit(8, 3).await.unwrap();
+    let error = sink.commit(8, &state).await.unwrap_err().to_string();
 
     assert_eq!(
         error,

@@ -214,11 +214,19 @@ impl TopKOp {
                                 return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
                             }
                             if let Some(db) = self.db.lock().unwrap().as_ref() {
-                                let db_key = [b"topk_spill:".as_slice(), &part_key[..], &row_id.to_be_bytes()[..]].concat();
+                                let db_key = [
+                                    b"topk_spill:".as_slice(),
+                                    &part_key[..],
+                                    &row_id.to_be_bytes()[..],
+                                ]
+                                .concat();
                                 let v_bytes = encode_topk_value(rank_value, w, &row_vals);
-                                crate::spill::block_on_future(db.put(&db_key, &v_bytes))
-                                    .map_err(|e| OpError::storage_error(format!("topk spill put err: {e}")))?;
-                                rockstream_types::metrics::inc_spilled_bytes((db_key.len() + v_bytes.len()) as u64);
+                                crate::spill::block_on_future(db.put(&db_key, &v_bytes)).map_err(
+                                    |e| OpError::storage_error(format!("topk spill put err: {e}")),
+                                )?;
+                                rockstream_types::metrics::inc_spilled_bytes(
+                                    (db_key.len() + v_bytes.len()) as u64,
+                                );
                             }
                         } else {
                             entry_vac.insert(BufferEntry {
@@ -248,7 +256,8 @@ impl TopKOp {
             // tiebreaker). Consume each entry's full positive multiplicity so
             // duplicate input rows occupy duplicate Top-K positions.
             let db_guard = self.db.lock().unwrap();
-            let new_topk = select_topk(part, self.k, db_guard.as_ref(), part_key, self.n_input_cols);
+            let new_topk =
+                select_topk(part, self.k, db_guard.as_ref(), part_key, self.n_input_cols);
 
             // Retract rows no longer in top-K.
             for (rid, (old_vals, old_count)) in &part.emitted {
@@ -355,7 +364,9 @@ fn select_topk(
         let prefix_len = prefix.len();
         for (k_buf, v_buf) in raw_pairs {
             if k_buf.len() >= prefix_len + 16 {
-                let row_id_bytes: [u8; 16] = k_buf[prefix_len..prefix_len + 16].try_into().unwrap_or([0; 16]);
+                let row_id_bytes: [u8; 16] = k_buf[prefix_len..prefix_len + 16]
+                    .try_into()
+                    .unwrap_or([0; 16]);
                 let row_id = u128::from_be_bytes(row_id_bytes);
                 if !part.buffer.contains_key(&row_id) {
                     if let Some((rank_val, w, row_vals)) = decode_topk_value(&v_buf, n_input_cols) {

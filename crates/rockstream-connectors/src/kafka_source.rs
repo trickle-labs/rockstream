@@ -1,5 +1,6 @@
 //! Kafka source connector backed by a real consumer group (§13.3).
 
+use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -310,12 +311,13 @@ impl KafkaSource {
     }
 }
 
+#[async_trait]
 impl SourceConnector for KafkaSource {
     fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
         Ok(self.schema.clone())
     }
 
-    fn start_snapshot(
+    async fn start_snapshot(
         &mut self,
         _frontier: Epoch,
         _partition_filter: Option<PartitionFilter>,
@@ -323,7 +325,7 @@ impl SourceConnector for KafkaSource {
         Ok(SnapshotStream::new(vec![]))
     }
 
-    fn poll_delta(
+    async fn poll_delta(
         &mut self,
         after: OffsetToken,
         max_bytes: usize,
@@ -395,7 +397,11 @@ impl SourceConnector for KafkaSource {
         })
     }
 
-    fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+    async fn commit_offset(
+        &mut self,
+        epoch: Epoch,
+        offset: OffsetToken,
+    ) -> Result<(), SourceError> {
         let offsets: BTreeMap<u64, u64> =
             serde_json::from_slice(offset.as_bytes()).map_err(|e| {
                 SourceError::CommitOffsetFailed {
@@ -438,7 +444,7 @@ impl SourceConnector for KafkaSource {
         Ok(())
     }
 
-    fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+    async fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
         let assigned = self.consumer.assignment().map_err(|error| {
             SourceError::Io(format!(
                 "Kafka assignment lookup failed: {error}. Next steps: retry pause after rebalance"
@@ -453,7 +459,7 @@ impl SourceConnector for KafkaSource {
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<(), SourceError> {
+    async fn resume(&mut self) -> Result<(), SourceError> {
         let assigned = self.consumer.assignment().map_err(|error| {
             SourceError::Io(format!(
                 "Kafka assignment lookup failed: {error}. Next steps: retry resume after rebalance"

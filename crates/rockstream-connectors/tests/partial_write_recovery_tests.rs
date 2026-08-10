@@ -365,8 +365,9 @@ mod sim_coordination {
     const PARTIAL_WRITE_PROBABILITY: f64 = 0.5;
     const SEEDS: [u64; 5] = [1, 2, 3, 4, 5];
 
-    #[test]
-    fn seeded_partial_write_fault_injection_across_seeds() {
+    #[tokio::test]
+    async fn seeded_partial_write_fault_injection_across_seeds() {
+        use futures::FutureExt;
         for &seed in &SEEDS {
             buggify_init(seed);
 
@@ -380,20 +381,14 @@ mod sim_coordination {
             for epoch in 0..NUM_EPOCHS {
                 let state = sink
                     .pre_commit(epoch, (epoch as usize) + 1)
+                    .await
                     .expect("pre_commit must not fail within backpressure bound");
 
-                let commit_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    sink.commit(epoch, &state)
-                }));
+                let commit_result = std::panic::AssertUnwindSafe(sink.commit(epoch, &state))
+                    .catch_unwind()
+                    .await;
 
                 if commit_result.is_err() {
-                    // `assert_commit_pointer_atomic` panicked: the fault
-                    // truncated this epoch's final write, modeling a crash
-                    // mid-rename. Recovery must clean up and retry — and the
-                    // retried rename may itself be truncated again (the fault
-                    // is still armed), so recovery is retried in a bounded
-                    // loop until it succeeds, mirroring a real operator
-                    // retrying a crashed rename until it lands.
                     const MAX_RECOVERY_ATTEMPTS: u32 = 200;
                     let mut recovered = false;
                     for _ in 0..MAX_RECOVERY_ATTEMPTS {
@@ -402,10 +397,9 @@ mod sim_coordination {
                             profile: SinkIdempotencyProfile::NativeIdempotent,
                             pending_handle: vec![],
                         };
-                        let recover_result =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                sink.recover(action)
-                            }));
+                        let recover_result = std::panic::AssertUnwindSafe(sink.recover(action))
+                            .catch_unwind()
+                            .await;
                         if recover_result.is_ok() {
                             recovered = true;
                             break;
@@ -418,7 +412,7 @@ mod sim_coordination {
                 }
 
                 assert!(
-                    sink.final_exists(epoch),
+                    sink.final_exists(epoch).await,
                     "seed {seed} epoch {epoch}: final object must exist after commit/recovery"
                 );
             }

@@ -25,6 +25,7 @@ async fn poll_until(
     loop {
         let result = source
             .poll_delta(after.clone(), 4096, credits, None)
+            .await
             .unwrap();
         if !result.batches.is_empty() {
             return result;
@@ -86,7 +87,10 @@ async fn real_broker_source_assignment_poll_and_commit() {
         KafkaSource::connect(ConnectorId(101), schema, &bootstrap, topic, "source-proof").unwrap();
     let first = poll_until(&mut source, OffsetToken::new(vec![]), 1).await;
     let second = poll_until(&mut source, first.new_offset.clone(), 1).await;
-    source.commit_offset(7, second.new_offset.clone()).unwrap();
+    source
+        .commit_offset(7, second.new_offset.clone())
+        .await
+        .unwrap();
     let committed = second.new_offset.clone();
 
     let mut values = [first, second]

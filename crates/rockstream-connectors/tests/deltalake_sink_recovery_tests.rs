@@ -32,14 +32,14 @@ async fn run_delta_recovery_scenario(store: Arc<dyn ObjectStore>, base_path: &st
         let batch = make_cumulative_batch(epoch as i64);
         expected_final = Some(batch.clone());
         sink.set_staged_batch(batch.clone());
-        let state = sink.pre_commit(epoch, batch.num_rows()).unwrap();
+        let state = sink.pre_commit(epoch, batch.num_rows()).await.unwrap();
         sink.set_cluster_committed(epoch);
 
-        if let Err(SinkError::CommitFailed { .. }) = sink.commit(epoch, &state) {
+        if let Err(SinkError::CommitFailed { .. }) = sink.commit(epoch, &state).await {
             let action = RecoveryAction::from_sink_state(&state, epoch, sink.idempotency_profile());
             let mut recovered = false;
             for _attempt in 0..12 {
-                if sink.recover(action.clone()).is_ok() {
+                if sink.recover(action.clone()).await.is_ok() {
                     recovered = true;
                     break;
                 }

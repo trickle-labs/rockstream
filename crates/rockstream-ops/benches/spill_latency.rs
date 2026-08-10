@@ -12,7 +12,12 @@ fn bench_spill_latency(c: &mut Criterion) {
 
     let db = rt.block_on(async {
         let store = Arc::new(InMemory::new());
-        Arc::new(ShardDb::builder("bench-spill", store).build().await.unwrap())
+        Arc::new(
+            ShardDb::builder("bench-spill", store)
+                .build()
+                .await
+                .unwrap(),
+        )
     });
 
     c.bench_function("spillable_arrangement_insert_spill", |b| {

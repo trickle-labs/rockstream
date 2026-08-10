@@ -16,8 +16,8 @@ fn source() -> PostgresCdcSource {
     )
 }
 
-#[test]
-fn worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
+#[tokio::test]
+async fn worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
     let mut first_worker = source();
     first_worker
         .decode_and_enqueue(b"B|0/10|9|I|one|1")
@@ -27,9 +27,11 @@ fn worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
         .unwrap();
     let first = first_worker
         .poll_delta(PgLsn::ZERO.to_offset_token(), 1024, 1, None)
+        .await
         .unwrap();
     first_worker
         .commit_offset(1, first.new_offset.clone())
+        .await
         .unwrap();
     assert_eq!(
         first_worker.last_committed_lsn(),
@@ -45,6 +47,7 @@ fn worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
         .unwrap();
     let resumed = recovered_worker
         .poll_delta(first.new_offset, 1024, 2, None)
+        .await
         .unwrap();
     let (batch, weights) = split_weight_column(&resumed.batches[0]).unwrap();
     let ids = batch
@@ -68,8 +71,8 @@ fn worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
     );
 }
 
-#[test]
-fn pgoutput_snapshot_matches_initial_table_state() {
+#[tokio::test]
+async fn pgoutput_snapshot_matches_initial_table_state() {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut source =
         PostgresCdcSource::new(ConnectorId(515), schema.clone(), CdcWireFormat::PgOutput);
@@ -82,14 +85,14 @@ fn pgoutput_snapshot_matches_initial_table_state() {
         rockstream_types::arrow_batch::append_weight_column(batch, &[1, 1]).unwrap();
     source.set_snapshot_batches(vec![batch_with_weights.clone()]);
 
-    let stream = source.start_snapshot(1, None).unwrap();
+    let stream = source.start_snapshot(1, None).await.unwrap();
     let snapshot_records: Vec<_> = stream.collect();
     assert_eq!(snapshot_records.len(), 1);
     assert_eq!(snapshot_records[0].num_rows(), 2);
 }
 
-#[test]
-fn wal2json_snapshot_matches_initial_table_state() {
+#[tokio::test]
+async fn wal2json_snapshot_matches_initial_table_state() {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut source =
         PostgresCdcSource::new(ConnectorId(516), schema.clone(), CdcWireFormat::Wal2Json);
@@ -102,14 +105,14 @@ fn wal2json_snapshot_matches_initial_table_state() {
         rockstream_types::arrow_batch::append_weight_column(batch, &[1, 1]).unwrap();
     source.set_snapshot_batches(vec![batch_with_weights.clone()]);
 
-    let stream = source.start_snapshot(1, None).unwrap();
+    let stream = source.start_snapshot(1, None).await.unwrap();
     let snapshot_records: Vec<_> = stream.collect();
     assert_eq!(snapshot_records.len(), 1);
     assert_eq!(snapshot_records[0].num_rows(), 2);
 }
 
-#[test]
-fn real_pg18_lsn_restart_zero_duplicates() {
+#[tokio::test]
+async fn real_pg18_lsn_restart_zero_duplicates() {
     worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output();
 }
 

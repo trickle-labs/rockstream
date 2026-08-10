@@ -6,6 +6,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+use async_trait::async_trait;
 use std::collections::VecDeque;
 
 use std::sync::Arc;
@@ -363,12 +364,13 @@ impl PostgresCdcSource {
     }
 }
 
+#[async_trait]
 impl SourceConnector for PostgresCdcSource {
     fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
         Ok(self.schema.clone())
     }
 
-    fn start_snapshot(
+    async fn start_snapshot(
         &mut self,
         _frontier: Epoch,
         _partition_filter: Option<PartitionFilter>,
@@ -377,7 +379,7 @@ impl SourceConnector for PostgresCdcSource {
         Ok(SnapshotStream::new(batches))
     }
 
-    fn poll_delta(
+    async fn poll_delta(
         &mut self,
         after: OffsetToken,
         max_bytes: usize,
@@ -448,17 +450,21 @@ impl SourceConnector for PostgresCdcSource {
         })
     }
 
-    fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+    async fn commit_offset(
+        &mut self,
+        epoch: Epoch,
+        offset: OffsetToken,
+    ) -> Result<(), SourceError> {
         self.committed = Some((epoch, PgLsn::from_offset_token(&offset)?));
         Ok(())
     }
 
-    fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+    async fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
         self.manually_paused = true;
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<(), SourceError> {
+    async fn resume(&mut self) -> Result<(), SourceError> {
         self.manually_paused = false;
         Ok(())
     }

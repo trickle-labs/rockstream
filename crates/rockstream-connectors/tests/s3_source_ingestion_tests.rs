@@ -7,8 +7,8 @@ use rockstream_connectors::{OffsetToken, S3Source, SourceConnector};
 use rockstream_types::arrow_batch::split_weight_column;
 use rockstream_types::ids::ConnectorId;
 
-#[test]
-fn test_s3_json_ingest() {
+#[tokio::test]
+async fn test_s3_json_ingest() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Int64, false),
         Field::new("amount", DataType::Int64, false),
@@ -27,6 +27,7 @@ fn test_s3_json_ingest() {
     // Poll first batch
     let res1 = source
         .poll_delta(OffsetToken::new(vec![]), 1024, 10, None)
+        .await
         .unwrap();
     assert_eq!(res1.batches.len(), 1);
 
@@ -54,8 +55,8 @@ fn test_s3_json_ingest() {
     assert_eq!(pos, (2, 0)); // 2 files ingested completely
 }
 
-#[test]
-fn test_s3_csv_ingest() {
+#[tokio::test]
+async fn test_s3_csv_ingest() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("val", DataType::Int64, false),
@@ -66,6 +67,7 @@ fn test_s3_csv_ingest() {
 
     let res = source
         .poll_delta(OffsetToken::new(vec![]), 1024, 10, None)
+        .await
         .unwrap();
     assert_eq!(res.batches.len(), 1);
 
@@ -73,8 +75,8 @@ fn test_s3_csv_ingest() {
     assert_eq!(data.num_rows(), 2);
 }
 
-#[test]
-fn test_s3_avro_ingest() {
+#[tokio::test]
+async fn test_s3_avro_ingest() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("val", DataType::Int64, false),
@@ -85,9 +87,40 @@ fn test_s3_avro_ingest() {
 
     let res = source
         .poll_delta(OffsetToken::new(vec![]), 1024, 10, None)
+        .await
         .unwrap();
     assert_eq!(res.batches.len(), 1);
 
     let (data, _) = split_weight_column(&res.batches[0]).unwrap();
     assert_eq!(data.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn test_multi_source_s3_polling_thread_constancy() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Int64, false),
+        Field::new("amount", DataType::Int64, false),
+    ]));
+
+    let store = Arc::new(object_store::memory::InMemory::new());
+
+    let mut sources: Vec<S3Source> = (0..4)
+        .map(|i| {
+            S3Source::new(ConnectorId(310 + i), schema.clone())
+                .with_object_store(store.clone(), Some(format!("prefix_{i}")))
+        })
+        .collect();
+
+    let initial_thread_id = std::thread::current().id();
+
+    for i in 0..10_000 {
+        let src_idx = i % 4;
+        let _ = sources[src_idx]
+            .poll_delta(OffsetToken::new(vec![]), 1024, 10, None)
+            .await
+            .unwrap();
+    }
+
+    let final_thread_id = std::thread::current().id();
+    assert_eq!(initial_thread_id, final_thread_id);
 }

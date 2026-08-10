@@ -17,6 +17,7 @@
 //! | Between pre-commit and commit | CheckBeforeCommit: query topic; if absent, new transaction. |
 //! | During commit | CheckBeforeCommit: query topic; already present → Committed. |
 
+use async_trait::async_trait;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
@@ -210,12 +211,13 @@ impl KafkaSink {
     }
 }
 
+#[async_trait]
 impl SinkConnector for KafkaSink {
     fn idempotency_profile(&self) -> SinkIdempotencyProfile {
         SinkIdempotencyProfile::CheckBeforeCommit
     }
 
-    fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError> {
+    async fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError> {
         if self.backpressure_active() {
             return Err(SinkError::PreCommitFailed {
                 epoch,
@@ -255,7 +257,7 @@ impl SinkConnector for KafkaSink {
         })
     }
 
-    fn commit(&mut self, epoch: Epoch, state: &SinkState) -> Result<(), SinkError> {
+    async fn commit(&mut self, epoch: Epoch, state: &SinkState) -> Result<(), SinkError> {
         // M3-S3: must not commit before cluster checkpoint.
         assert_epoch_committed_only_after_cluster_checkpoint(
             self.connector_id,
@@ -310,7 +312,7 @@ impl SinkConnector for KafkaSink {
         }
     }
 
-    fn abort(&mut self, epoch: Epoch) -> Result<(), SinkError> {
+    async fn abort(&mut self, epoch: Epoch) -> Result<(), SinkError> {
         if let Some(broker) = &self.broker {
             broker
                 .producer
@@ -326,7 +328,7 @@ impl SinkConnector for KafkaSink {
         Ok(())
     }
 
-    fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError> {
+    async fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError> {
         match &action {
             RecoveryAction::Noop => Ok(()),
             RecoveryAction::RerunCommit {
@@ -426,35 +428,35 @@ mod tests {
 
     // ── Happy path ────────────────────────────────────────────────────────────
 
-    #[test]
-    fn happy_path_pre_commit_then_commit() {
+    #[tokio::test]
+    async fn happy_path_pre_commit_then_commit() {
         let mut sink = make_sink();
-        let state = sink.pre_commit(1, 50).unwrap();
+        let state = sink.pre_commit(1, 50).await.unwrap();
         assert!(state.needs_recovery_commit());
         assert_eq!(sink.kafka_sink_staged_epochs_count(), 1);
-        sink.commit(1, &state).unwrap();
+        sink.commit(1, &state).await.unwrap();
         assert_eq!(sink.kafka_sink_staged_epochs_count(), 0);
         assert!(sink.check_epoch_delivered(1));
     }
 
     // ── Crash before pre-commit ───────────────────────────────────────────────
 
-    #[test]
-    fn crash_before_precommit_noop_recovery() {
+    #[tokio::test]
+    async fn crash_before_precommit_noop_recovery() {
         let mut sink = make_sink();
         // No pre-commit staged; Idle state.
         let action = RecoveryAction::Noop;
-        sink.recover(action).unwrap();
+        sink.recover(action).await.unwrap();
         // Nothing delivered.
         assert!(!sink.check_epoch_delivered(1));
     }
 
     // ── Crash between pre-commit and commit ───────────────────────────────────
 
-    #[test]
-    fn crash_between_precommit_and_commit_recovery() {
+    #[tokio::test]
+    async fn crash_between_precommit_and_commit_recovery() {
         let mut sink = make_sink();
-        let state = sink.pre_commit(2, 10).unwrap();
+        let state = sink.pre_commit(2, 10).await.unwrap();
         // Simulate crash: ephemeral staged state lost (abort the in-memory set).
         sink.staged_epochs.clear();
         sink.staged_epochs_count = 0;
@@ -464,16 +466,16 @@ mod tests {
             profile: SinkIdempotencyProfile::CheckBeforeCommit,
             pending_handle: state.pending_handle().to_vec(),
         };
-        sink.recover(action).unwrap();
+        sink.recover(action).await.unwrap();
         assert!(sink.check_epoch_delivered(2));
     }
 
     // ── Crash during commit ───────────────────────────────────────────────────
 
-    #[test]
-    fn crash_during_commit_already_delivered_recovery() {
+    #[tokio::test]
+    async fn crash_during_commit_already_delivered_recovery() {
         let mut sink = make_sink();
-        let _state = sink.pre_commit(3, 5).unwrap();
+        let _state = sink.pre_commit(3, 5).await.unwrap();
         // Simulate: commit partially succeeded (delivered but not finalized).
         sink.delivered_epochs.insert(3);
         // Recovery: CheckBeforeCommit — already delivered → no-op.
@@ -482,7 +484,7 @@ mod tests {
             profile: SinkIdempotencyProfile::CheckBeforeCommit,
             pending_handle: vec![],
         };
-        sink.recover(action).unwrap();
+        sink.recover(action).await.unwrap();
         // Still exactly one delivery.
         assert_eq!(sink.delivered_epochs.len(), 1);
         assert!(sink.check_epoch_delivered(3));
@@ -506,10 +508,10 @@ mod tests {
         assert_eq!(sink.kafka_tx_timeout_probability, 0.5);
     }
 
-    #[test]
-    fn tx_timeout_then_recovery_delivers_exactly_once() {
+    #[tokio::test]
+    async fn tx_timeout_then_recovery_delivers_exactly_once() {
         let mut sink = make_sink();
-        let state = sink.pre_commit(6, 7).unwrap();
+        let state = sink.pre_commit(6, 7).await.unwrap();
         // Simulate the broker force-aborting the open transaction: the
         // commit call never marks the epoch delivered (as `commit()` does
         // when `kafka.tx_timeout` fires — see `commit_fails_when_forced_via_direct_buggify_check`
@@ -529,21 +531,21 @@ mod tests {
             profile: SinkIdempotencyProfile::CheckBeforeCommit,
             pending_handle: handle,
         };
-        sink.recover(action).unwrap();
+        sink.recover(action).await.unwrap();
         assert!(sink.check_epoch_delivered(6));
         assert_eq!(sink.delivered_count_for_test(), 1);
     }
 
     #[cfg(feature = "simulation")]
-    #[test]
-    fn commit_fails_when_forced_via_direct_buggify_check() {
+    #[tokio::test]
+    async fn commit_fails_when_forced_via_direct_buggify_check() {
         use rockstream_sim::buggify::{buggify_disable, buggify_init};
         buggify_init(999);
         let mut sink = make_sink();
         sink.set_kafka_tx_timeout_probability(1.0);
-        let state = sink.pre_commit(8, 3).unwrap();
+        let state = sink.pre_commit(8, 3).await.unwrap();
         // probability=1.0 with simulation enabled: the fault always fires.
-        let err = sink.commit(8, &state);
+        let err = sink.commit(8, &state).await;
         assert!(err.is_err(), "expected forced tx-timeout abort");
         assert!(!sink.check_epoch_delivered(8));
         buggify_disable();
@@ -551,8 +553,8 @@ mod tests {
 
     // ── Backpressure ──────────────────────────────────────────────────────────
 
-    #[test]
-    fn backpressure_when_staged_epochs_full() {
+    #[tokio::test]
+    async fn backpressure_when_staged_epochs_full() {
         let mut sink = KafkaSink {
             connector_id: ConnectorId(1),
             delivered_epochs: BTreeSet::new(),
@@ -563,22 +565,22 @@ mod tests {
             kafka_tx_timeout_probability: 0.0,
             broker: None,
         };
-        sink.pre_commit(1, 10).unwrap();
-        sink.pre_commit(2, 10).unwrap();
+        sink.pre_commit(1, 10).await.unwrap();
+        sink.pre_commit(2, 10).await.unwrap();
         // Now at capacity.
         assert!(sink.backpressure_active());
-        let err = sink.pre_commit(3, 10);
+        let err = sink.pre_commit(3, 10).await;
         assert!(err.is_err());
     }
 
     // ── Abort ─────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn abort_clears_staged_epoch() {
+    #[tokio::test]
+    async fn abort_clears_staged_epoch() {
         let mut sink = make_sink();
-        sink.pre_commit(10, 1).unwrap();
+        sink.pre_commit(10, 1).await.unwrap();
         assert_eq!(sink.kafka_sink_staged_epochs_count(), 1);
-        sink.abort(10).unwrap();
+        sink.abort(10).await.unwrap();
         assert_eq!(sink.kafka_sink_staged_epochs_count(), 0);
         assert!(!sink.check_epoch_delivered(10));
     }

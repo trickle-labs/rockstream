@@ -11,6 +11,7 @@
 use crate::source_epoch::{OffsetToken, SourceEpochRegistry};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::{Epoch, EventTimeWatermark};
@@ -143,19 +144,20 @@ pub struct PollDeltaResult {
 }
 
 /// Trait implemented by every source connector (§13.3).
+#[async_trait]
 pub trait SourceConnector: Send + Sync {
     /// Returns the Arrow schema of the source data.
     fn discover_schema(&self) -> Result<SchemaRef, SourceError>;
 
     /// Start the initial snapshot stream from a given checkpoint frontier.
-    fn start_snapshot(
+    async fn start_snapshot(
         &mut self,
         frontier: Epoch,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError>;
 
     /// Poll new delta records starting after the given offset.
-    fn poll_delta(
+    async fn poll_delta(
         &mut self,
         after: OffsetToken,
         max_bytes: usize,
@@ -164,13 +166,14 @@ pub trait SourceConnector: Send + Sync {
     ) -> Result<PollDeltaResult, SourceError>;
 
     /// Commit the progress offset for a given epoch.
-    fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError>;
+    async fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken)
+        -> Result<(), SourceError>;
 
     /// Pause the source connector polling.
-    fn pause(&mut self, reason: String) -> Result<(), SourceError>;
+    async fn pause(&mut self, reason: String) -> Result<(), SourceError>;
 
     /// Resume the source connector polling.
-    fn resume(&mut self) -> Result<(), SourceError>;
+    async fn resume(&mut self) -> Result<(), SourceError>;
 
     /// Returns whether this source connector supports partition filter pushdown.
     fn partition_filter_support(&self) -> bool {
@@ -205,7 +208,7 @@ impl<S: SourceConnector> SourcePollLifecycle<S> {
 
     /// Poll without committing the returned offset. On failure the source is
     /// paused before the error is returned, preserving the recovery token.
-    pub fn poll(
+    pub async fn poll(
         &mut self,
         max_bytes: usize,
         credits_available: usize,
@@ -217,15 +220,19 @@ impl<S: SourceConnector> SourcePollLifecycle<S> {
                     .to_string(),
             ));
         }
-        match self.source.poll_delta(
-            self.committed_offset.clone(),
-            max_bytes,
-            credits_available,
-            partition_filter,
-        ) {
+        match self
+            .source
+            .poll_delta(
+                self.committed_offset.clone(),
+                max_bytes,
+                credits_available,
+                partition_filter,
+            )
+            .await
+        {
             Ok(result) => Ok(result),
             Err(error) => {
-                self.source.pause(error.to_string())?;
+                self.source.pause(error.to_string()).await?;
                 self.paused = true;
                 assert!(
                     self.paused,
@@ -237,7 +244,7 @@ impl<S: SourceConnector> SourcePollLifecycle<S> {
     }
 
     /// Durably commit a successful poll's token and source epoch together.
-    pub fn commit(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+    pub async fn commit(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
         if self.paused {
             return Err(SourceError::Io(
                 "source is paused after a failed poll; call resume before committing".to_string(),
@@ -256,13 +263,14 @@ impl<S: SourceConnector> SourcePollLifecycle<S> {
             .map_err(|error| SourceError::Io(error.to_string()))?;
         self.committed_offset = offset;
         self.source
-            .commit_offset(epoch, self.committed_offset.clone())?;
+            .commit_offset(epoch, self.committed_offset.clone())
+            .await?;
         Ok(())
     }
 
     /// Resume a source only after its failure has been handled.
-    pub fn resume(&mut self) -> Result<(), SourceError> {
-        self.source.resume()?;
+    pub async fn resume(&mut self) -> Result<(), SourceError> {
+        self.source.resume().await?;
         self.paused = false;
         Ok(())
     }
@@ -301,12 +309,13 @@ mod tests {
         paused: bool,
     }
 
+    #[async_trait]
     impl SourceConnector for DummySource {
         fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
             Ok(self.schema.clone())
         }
 
-        fn start_snapshot(
+        async fn start_snapshot(
             &mut self,
             _frontier: Epoch,
             _partition_filter: Option<PartitionFilter>,
@@ -314,7 +323,7 @@ mod tests {
             Ok(SnapshotStream::new(vec![]))
         }
 
-        fn poll_delta(
+        async fn poll_delta(
             &mut self,
             after: OffsetToken,
             _max_bytes: usize,
@@ -328,7 +337,7 @@ mod tests {
             })
         }
 
-        fn commit_offset(
+        async fn commit_offset(
             &mut self,
             _epoch: Epoch,
             _offset: OffsetToken,
@@ -336,12 +345,12 @@ mod tests {
             Ok(())
         }
 
-        fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+        async fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
             self.paused = true;
             Ok(())
         }
 
-        fn resume(&mut self) -> Result<(), SourceError> {
+        async fn resume(&mut self) -> Result<(), SourceError> {
             self.paused = false;
             Ok(())
         }
@@ -351,8 +360,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_source_trait_compiles() {
+    #[tokio::test]
+    async fn test_source_trait_compiles() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let mut source = DummySource {
             schema,
@@ -360,9 +369,9 @@ mod tests {
         };
         assert_eq!(source.discover_schema().unwrap().fields().len(), 1);
         assert!(!source.partition_filter_support());
-        source.pause("test".to_string()).unwrap();
+        source.pause("test".to_string()).await.unwrap();
         assert!(source.paused);
-        source.resume().unwrap();
+        source.resume().await.unwrap();
         assert!(!source.paused);
     }
 }

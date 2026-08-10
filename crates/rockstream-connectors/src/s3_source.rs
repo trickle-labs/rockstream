@@ -1,5 +1,6 @@
 //! S3 source connector tracking file indices and line offsets (§13.3).
 
+use async_trait::async_trait;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -48,51 +49,39 @@ impl S3Source {
         self
     }
 
-    fn sync_files_from_store(&mut self) -> Result<(), SourceError> {
+    pub async fn sync_files_from_store(&mut self) -> Result<(), SourceError> {
         let store = match &self.store {
             Some(s) => s.clone(),
             None => return Ok(()),
         };
         let prefix = self.bucket_prefix.clone();
 
-        // Run asynchronously by spawning a dedicated thread to drive the runtime
-        let downloaded = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                use futures::StreamExt;
-                let path_prefix = prefix
-                    .as_ref()
-                    .map(|p| object_store::path::Path::from(p.as_str()));
-                let mut list_stream = store.list(path_prefix.as_ref());
-                let mut objs = Vec::new();
-                while let Some(meta) = list_stream.next().await {
-                    if let Ok(meta) = meta {
-                        objs.push(meta.location);
-                    }
-                }
+        use futures::StreamExt;
+        let path_prefix = prefix
+            .as_ref()
+            .map(|p| object_store::path::Path::from(p.as_str()));
+        let mut list_stream = store.list(path_prefix.as_ref());
+        let mut objs = Vec::new();
+        while let Some(meta) = list_stream.next().await {
+            if let Ok(meta) = meta {
+                objs.push(meta.location);
+            }
+        }
 
-                // Sort locations
-                let mut locations_sorted = objs;
-                locations_sorted.sort();
+        // Sort locations
+        let mut locations_sorted = objs;
+        locations_sorted.sort();
 
-                // Get data for each location
-                let mut results = Vec::new();
-                for location in locations_sorted {
-                    let get_res = store.get(&location).await;
-                    if let Ok(res) = get_res {
-                        if let Ok(bytes) = res.bytes().await {
-                            results.push((location.to_string(), bytes.to_vec()));
-                        }
-                    }
+        // Get data for each location directly without spawning OS threads or runtimes
+        let mut downloaded = Vec::new();
+        for location in locations_sorted {
+            let get_res = store.get(&location).await;
+            if let Ok(res) = get_res {
+                if let Ok(bytes) = res.bytes().await {
+                    downloaded.push((location.to_string(), bytes.to_vec()));
                 }
-                results
-            })
-        })
-        .join()
-        .map_err(|e| SourceError::Io(format!("helper thread panicked: {e:?}")))?;
+            }
+        }
 
         for (filename, data) in downloaded {
             // Check if we already have this file in self.files
@@ -100,8 +89,7 @@ impl S3Source {
                 continue;
             }
 
-            // Parse data. Let's assume each line is a JSON-serialized Vec<i64> (JSON array)
-            // or let's parse it as a JSON array of arrays: e.g. [[1, 10], [2, 20]] or newline-delimited JSON.
+            // Parse data. Assume each line is a JSON-serialized Vec<i64> or JSON array of arrays
             let mut records = Vec::new();
             let text = String::from_utf8_lossy(&data);
             let trimmed = text.trim();
@@ -188,17 +176,18 @@ impl S3Source {
     }
 }
 
+#[async_trait]
 impl SourceConnector for S3Source {
     fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
         Ok(self.schema.clone())
     }
 
-    fn start_snapshot(
+    async fn start_snapshot(
         &mut self,
         _frontier: Epoch,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
-        self.sync_files_from_store()?;
+        self.sync_files_from_store().await?;
         let mut all_records = Vec::new();
         for (_, rows) in &self.files {
             all_records.extend(rows.iter().cloned());
@@ -213,14 +202,14 @@ impl SourceConnector for S3Source {
         Ok(SnapshotStream::new(batches))
     }
 
-    fn poll_delta(
+    async fn poll_delta(
         &mut self,
         after: OffsetToken,
         _max_bytes: usize,
         credits_available: usize,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
-        self.sync_files_from_store()?;
+        self.sync_files_from_store().await?;
         if self.paused || credits_available == 0 {
             return Ok(PollDeltaResult {
                 batches: vec![],
@@ -274,17 +263,21 @@ impl SourceConnector for S3Source {
         })
     }
 
-    fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+    async fn commit_offset(
+        &mut self,
+        epoch: Epoch,
+        offset: OffsetToken,
+    ) -> Result<(), SourceError> {
         self.last_committed = Some((epoch, offset));
         Ok(())
     }
 
-    fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+    async fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
         self.paused = true;
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<(), SourceError> {
+    async fn resume(&mut self) -> Result<(), SourceError> {
         self.paused = false;
         Ok(())
     }
@@ -305,8 +298,8 @@ mod tests {
         ]))
     }
 
-    #[test]
-    fn test_s3_source_basic() {
+    #[tokio::test]
+    async fn test_s3_source_basic() {
         let schema = test_schema();
         let mut source = S3Source::new(ConnectorId(202), schema);
 
@@ -318,6 +311,7 @@ mod tests {
         let token_start = OffsetToken::new(vec![]);
         let res1 = source
             .poll_delta(token_start.clone(), 1024, 1, None)
+            .await
             .unwrap();
         assert_eq!(res1.batches.len(), 1);
         let (data1, weights1) = split_weight_column(&res1.batches[0]).unwrap();
@@ -330,6 +324,7 @@ mod tests {
         // Poll with remaining rows
         let res2 = source
             .poll_delta(res1.new_offset.clone(), 1024, 10, None)
+            .await
             .unwrap();
         assert_eq!(res2.batches.len(), 1);
         let (data2, weights2) = split_weight_column(&res2.batches[0]).unwrap();
@@ -340,13 +335,16 @@ mod tests {
         assert_eq!(pos2, (2, 0)); // finished file1 (0) and file2 (1), points to next (2, 0)
 
         // Verify snapshot contains everything
-        let mut snapshot_stream = source.start_snapshot(0, None).unwrap();
+        let mut snapshot_stream = source.start_snapshot(0, None).await.unwrap();
         let snap_batch = snapshot_stream.next().unwrap();
         let (snap_data, _) = split_weight_column(&snap_batch).unwrap();
         assert_eq!(snap_data.num_rows(), 3); // all 3 rows
 
         // Commit offsets
-        source.commit_offset(10, res2.new_offset.clone()).unwrap();
+        source
+            .commit_offset(10, res2.new_offset.clone())
+            .await
+            .unwrap();
         let (epoch, commit_tok) = source.last_committed().unwrap();
         assert_eq!(epoch, 10);
         assert_eq!(commit_tok, res2.new_offset);

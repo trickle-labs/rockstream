@@ -37,11 +37,16 @@ async fn test_topk_spill_buffer_overflow_resolved() {
 
     let k_arr = Arc::new(Int64Array::from(keys));
     let v_arr = Arc::new(Int64Array::from(vals));
-    let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![k_arr, v_arr]).unwrap();
+    let batch =
+        arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![k_arr, v_arr]).unwrap();
     let zset = ArrowZSet::new(batch, vec![1; n_rows as usize]);
 
     let res = topk.process_epoch(zset, 1);
-    assert!(res.is_ok(), "TopKOp with ShardDb attached must not fail on overflow: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "TopKOp with ShardDb attached must not fail on overflow: {:?}",
+        res.err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -79,7 +84,11 @@ async fn test_join_spill_10x_budget_bit_identical() {
     let right_zset = ArrowZSet::new(right_batch, vec![1; 5]);
 
     let res = join_op.process_epoch(left_zset, right_zset);
-    assert!(res.is_ok(), "JoinOp execution must succeed: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "JoinOp execution must succeed: {:?}",
+        res.err()
+    );
     let out = res.unwrap();
     assert!(!out.is_empty(), "Join output must not be empty");
 }
@@ -102,7 +111,11 @@ async fn test_aggregate_spill_10x_budget_bit_identical() {
     let zset = ArrowZSet::new(batch, vec![1; 5]);
 
     let res = agg_op.process_delta(zset);
-    assert!(res.is_ok(), "AggregateOp execution must succeed: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "AggregateOp execution must succeed: {:?}",
+        res.err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -123,7 +136,11 @@ async fn test_distinct_spill_10x_budget_bit_identical() {
     let zset = ArrowZSet::new(batch, vec![1; 4]);
 
     let res = distinct_op.process_delta(zset);
-    assert!(res.is_ok(), "DistinctOp execution must succeed: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "DistinctOp execution must succeed: {:?}",
+        res.err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -144,7 +161,11 @@ async fn test_minmax_spill_correctness() {
     let zset = ArrowZSet::new(batch, vec![1; 3]);
 
     let res = minmax_op.process_delta(zset);
-    assert!(res.is_ok(), "MinMaxOp execution must succeed: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "MinMaxOp execution must succeed: {:?}",
+        res.err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -177,5 +198,9 @@ async fn test_window_spill_correctness() {
     let zset = ArrowZSet::new(batch, vec![1; 3]);
 
     let res = window_op.process_delta(zset);
-    assert!(res.is_ok(), "WindowOp execution must succeed: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "WindowOp execution must succeed: {:?}",
+        res.err()
+    );
 }

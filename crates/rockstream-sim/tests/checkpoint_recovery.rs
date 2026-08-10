@@ -742,8 +742,8 @@ fn test_checkpoint_under_slow_input() {
 /// 5. Assert: sink epoch committed only after cluster checkpoint (M3-S3) AND
 ///    only after w1 self-fenced (M4-S2 × M3-S3 composition).
 #[cfg(feature = "simulation")]
-#[test]
-fn test_partitioned_worker_self_fences_before_sink_commit() {
+#[tokio::test]
+async fn test_partitioned_worker_self_fences_before_sink_commit() {
     use rockstream_connectors::{
         assert_epoch_committed_only_after_cluster_checkpoint, KafkaSink, SinkConnector,
     };
@@ -781,7 +781,10 @@ fn test_partitioned_worker_self_fences_before_sink_commit() {
     w2_sink.set_cluster_committed(cluster_committed_epoch);
 
     // w2 pre-commits epoch 1.
-    let state = w2_sink.pre_commit(cluster_committed_epoch, 10).unwrap();
+    let state = w2_sink
+        .pre_commit(cluster_committed_epoch, 10)
+        .await
+        .unwrap();
 
     // M3-S3 paired assertion: epoch committed only after cluster checkpoint.
     // This must not panic because cluster_committed >= epoch.
@@ -794,7 +797,10 @@ fn test_partitioned_worker_self_fences_before_sink_commit() {
     // w2 commits — succeeds because:
     //   1. w1 self-fenced before this point (M4-S2 satisfied),
     //   2. cluster checkpoint happened (M3-S3 satisfied).
-    w2_sink.commit(cluster_committed_epoch, &state).unwrap();
+    w2_sink
+        .commit(cluster_committed_epoch, &state)
+        .await
+        .unwrap();
     assert!(w2_sink.check_epoch_delivered(cluster_committed_epoch));
 
     buggify_disable();
@@ -805,8 +811,8 @@ fn test_partitioned_worker_self_fences_before_sink_commit() {
 /// Verifies that a crash before pre-commit leaves the sink in Idle state and
 /// that recovery dispatches Noop (the epoch's data will be re-produced from source).
 #[cfg(feature = "simulation")]
-#[test]
-fn test_2pc_crash_before_precommit() {
+#[tokio::test]
+async fn test_2pc_crash_before_precommit() {
     use rockstream_connectors::{assert_recovery_dispatch_idempotent, KafkaSink, SinkConnector};
     use rockstream_sim::buggify;
     use rockstream_sim::buggify::{buggify_disable, buggify_init};
@@ -833,7 +839,7 @@ fn test_2pc_crash_before_precommit() {
     );
 
     // Perform recovery; must not change delivered set.
-    sink.recover(recovery_action.clone()).unwrap();
+    sink.recover(recovery_action.clone()).await.unwrap();
     assert!(
         !sink.check_epoch_delivered(1),
         "epoch must not be delivered after Noop"
@@ -850,8 +856,8 @@ fn test_2pc_crash_before_precommit() {
 /// Verifies that a crash between pre_commit and commit leads to idempotent
 /// re-delivery via the CheckBeforeCommit recovery path.
 #[cfg(feature = "simulation")]
-#[test]
-fn test_2pc_crash_between_precommit_commit() {
+#[tokio::test]
+async fn test_2pc_crash_between_precommit_commit() {
     use rockstream_connectors::{assert_recovery_dispatch_idempotent, KafkaSink, SinkConnector};
     use rockstream_sim::buggify;
     use rockstream_sim::buggify::{buggify_disable, buggify_init};
@@ -868,7 +874,7 @@ fn test_2pc_crash_between_precommit_commit() {
     sink.set_cluster_committed(100);
 
     // Pre-commit epoch 3.
-    let state = sink.pre_commit(3, 20).unwrap();
+    let state = sink.pre_commit(3, 20).await.unwrap();
     let pending_handle = match &state {
         SinkState::PreCommitted { pending_handle, .. } => pending_handle.clone(),
         _ => panic!("expected PreCommitted"),
@@ -886,7 +892,7 @@ fn test_2pc_crash_between_precommit_commit() {
     // (In production: the new worker reads sink_state/ from SlateDB.)
     sink.staged_epochs_clear_for_test();
 
-    sink.recover(recovery_action.clone()).unwrap();
+    sink.recover(recovery_action.clone()).await.unwrap();
     assert!(
         sink.check_epoch_delivered(3),
         "epoch must be delivered after recovery"
@@ -903,8 +909,8 @@ fn test_2pc_crash_between_precommit_commit() {
 /// Verifies that a crash during commit (after partial delivery) recovers
 /// idempotently: CheckBeforeCommit detects the epoch was already delivered.
 #[cfg(feature = "simulation")]
-#[test]
-fn test_2pc_crash_during_commit() {
+#[tokio::test]
+async fn test_2pc_crash_during_commit() {
     use rockstream_connectors::{assert_recovery_dispatch_idempotent, KafkaSink, SinkConnector};
     use rockstream_sim::buggify;
     use rockstream_sim::buggify::{buggify_disable, buggify_init};
@@ -920,7 +926,7 @@ fn test_2pc_crash_during_commit() {
     let mut sink = KafkaSink::new(connector_id);
     sink.set_cluster_committed(100);
 
-    let _state = sink.pre_commit(5, 7).unwrap();
+    let _state = sink.pre_commit(5, 7).await.unwrap();
 
     // Simulate partial commit: epoch was delivered to Kafka but crash
     // prevented sink_state/ from being updated to Committed.
@@ -934,7 +940,7 @@ fn test_2pc_crash_during_commit() {
     };
 
     // CheckBeforeCommit: query Kafka → epoch already delivered → no duplicate.
-    sink.recover(recovery_action.clone()).unwrap();
+    sink.recover(recovery_action.clone()).await.unwrap();
     // Exactly one delivery.
     assert!(sink.check_epoch_delivered(5));
     assert_eq!(sink.delivered_count_for_test(), 1, "must not duplicate");

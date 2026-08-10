@@ -5,7 +5,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use object_store::local::LocalFileSystem;
 use rockstream_ops::spill::SpillableArrangement;
 use rockstream_ops::zset::ArrowZSet;
-use rockstream_ops::{int64_schema, AggregateOp, DistinctOp, JoinOp, MinMaxKind, MinMaxOp, Operator, TopKOp, WindowOp};
+use rockstream_ops::{
+    int64_schema, AggregateOp, DistinctOp, JoinOp, MinMaxKind, MinMaxOp, Operator, TopKOp, WindowOp,
+};
 use rockstream_plan::{WindowExpr, WindowFunc};
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::OperatorId;

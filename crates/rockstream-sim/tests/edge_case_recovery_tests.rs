@@ -125,6 +125,7 @@ struct ScriptedSource {
     paused: bool,
 }
 
+#[async_trait::async_trait]
 impl SourceConnector for ScriptedSource {
     fn discover_schema(&self) -> Result<Arc<Schema>, SourceError> {
         Ok(Arc::new(Schema::new(vec![Field::new(
@@ -134,7 +135,7 @@ impl SourceConnector for ScriptedSource {
         )])))
     }
 
-    fn start_snapshot(
+    async fn start_snapshot(
         &mut self,
         _frontier: Epoch,
         _partition_filter: Option<PartitionFilter>,
@@ -142,7 +143,7 @@ impl SourceConnector for ScriptedSource {
         Ok(SnapshotStream::new(vec![]))
     }
 
-    fn poll_delta(
+    async fn poll_delta(
         &mut self,
         _after: OffsetToken,
         _max_bytes: usize,
@@ -152,17 +153,21 @@ impl SourceConnector for ScriptedSource {
         self.polls.pop_front().expect("script has a poll response")
     }
 
-    fn commit_offset(&mut self, _epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+    async fn commit_offset(
+        &mut self,
+        _epoch: Epoch,
+        offset: OffsetToken,
+    ) -> Result<(), SourceError> {
         self.committed.push(offset);
         Ok(())
     }
 
-    fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+    async fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
         self.paused = true;
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<(), SourceError> {
+    async fn resume(&mut self) -> Result<(), SourceError> {
         self.paused = false;
         Ok(())
     }
@@ -210,8 +215,8 @@ fn edge_quota_exhaustion_is_prospective_and_recovers() {
     buggify_disable();
 }
 
-#[test]
-fn edge_source_failure_pauses_preserves_offset_and_recovers_exactly_once() {
+#[tokio::test]
+async fn edge_source_failure_pauses_preserves_offset_and_recovers_exactly_once() {
     let before = OffsetToken::new(b"offset-0".to_vec());
     let after = OffsetToken::new(b"offset-1".to_vec());
     let scripted = ScriptedSource {
@@ -230,7 +235,7 @@ fn edge_source_failure_pauses_preserves_offset_and_recovers_exactly_once() {
     };
     let mut lifecycle = SourcePollLifecycle::new(scripted, ConnectorId(51_12), before.clone());
 
-    let error = lifecycle.poll(1024, 1, None).unwrap_err();
+    let error = lifecycle.poll(1024, 1, None).await.unwrap_err();
     assert_eq!(
         (
             error.to_string(),
@@ -245,13 +250,16 @@ fn edge_source_failure_pauses_preserves_offset_and_recovers_exactly_once() {
         "EDGE-SOURCEFAIL: failure must pause without committing its offset"
     );
     assert_eq!(
-        lifecycle.poll(1024, 1, None).unwrap_err().to_string(),
+        lifecycle.poll(1024, 1, None).await.unwrap_err().to_string(),
         "RS-4001: source I/O error: source is paused after a failed poll; call resume before polling again",
         "a paused source must reject polling until its one recovery resume"
     );
-    lifecycle.resume().unwrap();
-    let result = lifecycle.poll(1024, 1, None).unwrap();
-    lifecycle.commit(1, result.new_offset.clone()).unwrap();
+    lifecycle.resume().await.unwrap();
+    let result = lifecycle.poll(1024, 1, None).await.unwrap();
+    lifecycle
+        .commit(1, result.new_offset.clone())
+        .await
+        .unwrap();
     let values = result.batches[0]
         .column(0)
         .as_any()
@@ -267,25 +275,29 @@ fn edge_source_failure_pauses_preserves_offset_and_recovers_exactly_once() {
     );
 }
 
-#[test]
-fn edge_object_store_brownout_caps_buffer_backpressures_and_drains() {
+#[tokio::test]
+async fn edge_object_store_brownout_caps_buffer_backpressures_and_drains() {
     let mut sink = ObjectStoreSink::new(ConnectorId(51_12), Arc::new(InMemory::new()));
     sink.set_cluster_committed(100);
-    let states = (1..=OBJECT_STORE_SINK_MAX_PENDING_EPOCHS as u64)
-        .map(|epoch| (epoch, sink.pre_commit(epoch, epoch as usize).unwrap()))
-        .collect::<Vec<_>>();
-    let rejected = sink.pre_commit(6, 6).unwrap_err().to_string();
+    let mut states = Vec::new();
+    for epoch in 1..=OBJECT_STORE_SINK_MAX_PENDING_EPOCHS as u64 {
+        let state = sink.pre_commit(epoch, epoch as usize).await.unwrap();
+        states.push((epoch, state));
+    }
+    let rejected = sink.pre_commit(6, 6).await.unwrap_err().to_string();
     for (epoch, state) in &states {
-        sink.commit(*epoch, state).unwrap();
+        sink.commit(*epoch, state).await.unwrap();
+    }
+    let mut finals = Vec::new();
+    for epoch in 1..=OBJECT_STORE_SINK_MAX_PENDING_EPOCHS as u64 {
+        finals.push(sink.final_exists(epoch).await);
     }
     assert_eq!(
         (
             rejected,
             sink.object_store_sink_pending_epochs_count(),
             sink.backpressure_active(),
-            (1..=OBJECT_STORE_SINK_MAX_PENDING_EPOCHS as u64)
-                .map(|epoch| sink.final_exists(epoch))
-                .collect::<Vec<_>>(),
+            finals,
         ),
         (
             "RS-4003: sink pre-commit failed for epoch 6: backpressure: pending_epochs=5 >= max=5"

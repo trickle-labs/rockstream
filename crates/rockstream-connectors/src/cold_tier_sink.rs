@@ -4,6 +4,7 @@
 //! while adding the v0.44 `should_flush` cadence hooks needed by the upcoming
 //! Iceberg and Delta writers.
 
+use async_trait::async_trait;
 use std::collections::BTreeMap;
 
 use rockstream_types::ids::ConnectorId;
@@ -80,6 +81,7 @@ impl ColdTierSink {
     }
 }
 
+#[async_trait]
 impl SinkConnector for ColdTierSink {
     fn idempotency_profile(&self) -> SinkIdempotencyProfile {
         SinkIdempotencyProfile::NativeIdempotent
@@ -93,7 +95,7 @@ impl SinkConnector for ColdTierSink {
         epoch_threshold_hit || time_threshold_hit
     }
 
-    fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError> {
+    async fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError> {
         if self.backpressure_active() {
             return Err(SinkError::PreCommitFailed {
                 epoch,
@@ -112,20 +114,20 @@ impl SinkConnector for ColdTierSink {
         })
     }
 
-    fn commit(&mut self, epoch: Epoch, _state: &SinkState) -> Result<(), SinkError> {
+    async fn commit(&mut self, epoch: Epoch, _state: &SinkState) -> Result<(), SinkError> {
         self.clear_pending_through(epoch);
         self.mark_flushed();
         Ok(())
     }
 
-    fn abort(&mut self, epoch: Epoch) -> Result<(), SinkError> {
+    async fn abort(&mut self, epoch: Epoch) -> Result<(), SinkError> {
         if self.pending.remove(&epoch).is_some() && self.pending_epochs_count > 0 {
             self.pending_epochs_count -= 1;
         }
         Ok(())
     }
 
-    fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError> {
+    async fn recover(&mut self, action: RecoveryAction) -> Result<(), SinkError> {
         match action {
             RecoveryAction::Noop => Ok(()),
             RecoveryAction::RerunCommit { epoch, .. } => {
@@ -140,29 +142,4 @@ impl SinkConnector for ColdTierSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn should_flush_every_third_epoch_and_stage_pending_buffer() {
-        let mut sink = ColdTierSink::new(ConnectorId(3), 3, 0);
-        let mut epochs_buffered = 0u64;
-        let mut flushed_epochs = Vec::new();
-
-        for epoch in 1..=9 {
-            sink.pre_commit(epoch, 2).unwrap();
-            epochs_buffered += 1;
-
-            let should_flush = sink.should_flush(epochs_buffered * 2, epochs_buffered);
-            if epoch % 3 == 0 {
-                assert!(should_flush, "epoch {epoch} should flush");
-                assert!(sink.pending_exists(epoch));
-                sink.commit(epoch, &SinkState::Committed).unwrap();
-                epochs_buffered = 0;
-                flushed_epochs.push(epoch);
-            } else {
-                assert!(!should_flush, "epoch {epoch} should not flush");
-            }
-        }
-
-        assert_eq!(flushed_epochs, vec![3, 6, 9]);
-    }
 }

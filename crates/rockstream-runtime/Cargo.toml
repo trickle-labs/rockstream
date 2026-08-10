@@ -18,6 +18,7 @@ rockstream-ops = { workspace = true }
 rockstream-types = { workspace = true }
 rockstream-storage = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -32,6 +33,7 @@ futures = { workspace = true }
 thiserror = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
+rand = { workspace = true }
 rockstream-sim = { workspace = true }
 
 [build-dependencies]

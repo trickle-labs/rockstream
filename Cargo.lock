@@ -6547,6 +6547,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -6812,6 +6813,7 @@ dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tonic 0.12.3",
  "tonic-build",
  "tracing",

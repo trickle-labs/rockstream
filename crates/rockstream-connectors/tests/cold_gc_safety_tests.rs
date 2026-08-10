@@ -33,9 +33,9 @@ async fn commit_n_epochs_iceberg(sink: &mut IcebergSink, n: u64) {
     for epoch in 1..=n {
         let batch = make_cumulative_batch(epoch as i64);
         sink.set_staged_batch(batch.clone());
-        let state = sink.pre_commit(epoch, batch.num_rows()).unwrap();
+        let state = sink.pre_commit(epoch, batch.num_rows()).await.unwrap();
         sink.set_cluster_committed(epoch);
-        sink.commit(epoch, &state).unwrap();
+        sink.commit(epoch, &state).await.unwrap();
     }
 }
 
@@ -44,9 +44,9 @@ async fn commit_n_epochs_delta(sink: &mut DeltaSink, n: u64) {
     for epoch in 1..=n {
         let batch = make_cumulative_batch(epoch as i64);
         sink.set_staged_batch(batch.clone());
-        let state = sink.pre_commit(epoch, batch.num_rows()).unwrap();
+        let state = sink.pre_commit(epoch, batch.num_rows()).await.unwrap();
         sink.set_cluster_committed(epoch);
-        sink.commit(epoch, &state).unwrap();
+        sink.commit(epoch, &state).await.unwrap();
     }
 }
 
@@ -61,7 +61,7 @@ async fn test_cold_gc_count_retention_reclaims_real_files_lfs_iceberg() {
     let mut sink = IcebergSink::new(ConnectorId(200), fault_store, "iceberg-gc-lfs");
     commit_n_epochs_iceberg(&mut sink, NUM_EPOCHS).await;
 
-    let files_before = sink.list_snapshots().unwrap();
+    let files_before = sink.list_snapshots().await.unwrap();
     assert_eq!(files_before.len(), NUM_EPOCHS as usize);
     for snapshot in &files_before {
         for path in &snapshot.files {
@@ -80,7 +80,7 @@ async fn test_cold_gc_count_retention_reclaims_real_files_lfs_iceberg() {
             retention_duration_ms: u64::MAX,
         },
     );
-    let result = gc.run(0).unwrap();
+    let result = gc.run(0).await.unwrap();
     assert_eq!(result.expired_epochs, vec![1, 2, 3, 4]);
     assert_eq!(result.deleted_files.len(), 4);
     assert!(result.metrics.cold_gc_bytes_reclaimed > 0);
@@ -96,7 +96,7 @@ async fn test_cold_gc_count_retention_reclaims_real_files_lfs_iceberg() {
 
     // The two newest snapshots (5, 6) remain readable.
     let sink = catalog.lock().unwrap();
-    let remaining = ColdGcCatalog::list_snapshots(&*sink).unwrap();
+    let remaining = ColdGcCatalog::list_snapshots(&*sink).await.unwrap();
     let mut remaining_epochs: Vec<_> = remaining.iter().map(|s| s.epoch).collect();
     remaining_epochs.sort();
     assert_eq!(remaining_epochs, vec![5, 6]);
@@ -127,7 +127,7 @@ async fn test_cold_gc_count_retention_reclaims_real_files_lfs_delta() {
             retention_duration_ms: u64::MAX,
         },
     );
-    let result = gc.run(0).unwrap();
+    let result = gc.run(0).await.unwrap();
     assert_eq!(result.expired_epochs, vec![1, 2, 3, 4]);
     assert_eq!(result.deleted_files.len(), 4);
 
@@ -139,7 +139,7 @@ async fn test_cold_gc_count_retention_reclaims_real_files_lfs_delta() {
     }
 
     let sink = catalog.lock().unwrap();
-    let remaining = ColdGcCatalog::list_snapshots(&*sink).unwrap();
+    let remaining = ColdGcCatalog::list_snapshots(&*sink).await.unwrap();
     let mut remaining_epochs: Vec<_> = remaining.iter().map(|s| s.epoch).collect();
     remaining_epochs.sort();
     assert_eq!(remaining_epochs, vec![5, 6]);
@@ -160,16 +160,17 @@ async fn test_cold_gc_resumes_after_simulated_crash_mid_delete_lfs() {
     // pending-delete list but before deleting the files or clearing the
     // marker: manually stage epoch 1's files as pending deletes.
     let epoch_1_files = ColdGcCatalog::list_snapshots(&sink)
+        .await
         .unwrap()
         .into_iter()
         .find(|s| s.epoch == 1)
         .unwrap()
         .files;
-    sink.write_pending_deletes(&epoch_1_files).unwrap();
+    sink.write_pending_deletes(&epoch_1_files).await.unwrap();
     // Also actually delete one of the two files to model a crash that got
     // partway through the delete loop before dying.
     if let Some(first) = epoch_1_files.first() {
-        sink.delete_file(first).unwrap();
+        sink.delete_file(first).await.unwrap();
     }
 
     let catalog = Arc::new(Mutex::new(sink));
@@ -180,7 +181,7 @@ async fn test_cold_gc_resumes_after_simulated_crash_mid_delete_lfs() {
             retention_duration_ms: u64::MAX,
         },
     );
-    let result = gc.run(0).unwrap();
+    let result = gc.run(0).await.unwrap();
     assert!(
         result.resumed_from_crash,
         "expected GC to detect and resume the pending-delete marker"
@@ -190,7 +191,7 @@ async fn test_cold_gc_resumes_after_simulated_crash_mid_delete_lfs() {
     // cleared.
     let sink = catalog.lock().unwrap();
     assert_eq!(
-        sink.read_pending_deletes().unwrap(),
+        sink.read_pending_deletes().await.unwrap(),
         Vec::<String>::new(),
         "pending-delete marker must be cleared after resume"
     );
@@ -227,14 +228,17 @@ async fn test_cold_gc_never_overlaps_commit_real_sink() {
     const EXTRA_EPOCHS: u64 = 20;
 
     let commit_catalog = Arc::clone(&catalog);
+    let handle = tokio::runtime::Handle::current();
     let commit_thread = std::thread::spawn(move || {
         for epoch in (NUM_EPOCHS + 1)..=(NUM_EPOCHS + EXTRA_EPOCHS) {
             let mut guard = commit_catalog.lock().unwrap();
             let batch = make_cumulative_batch(epoch as i64);
             guard.set_staged_batch(batch.clone());
             guard.set_cluster_committed(epoch);
-            let state = guard.pre_commit(epoch, batch.num_rows()).unwrap();
-            guard.commit(epoch, &state).unwrap();
+            let state = handle
+                .block_on(guard.pre_commit(epoch, batch.num_rows()))
+                .unwrap();
+            handle.block_on(guard.commit(epoch, &state)).unwrap();
             drop(guard);
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
@@ -249,7 +253,7 @@ async fn test_cold_gc_never_overlaps_commit_real_sink() {
     );
     let mut gc_runs = 0;
     for _ in 0..40 {
-        if gc.run(0).is_ok() {
+        if gc.run(0).await.is_ok() {
             gc_runs += 1;
         }
         std::thread::sleep(std::time::Duration::from_micros(150));
@@ -265,7 +269,7 @@ async fn test_cold_gc_never_overlaps_commit_real_sink() {
     // deterministic end state to assert against (mid-race GC runs already
     // proved no torn/interleaved corruption occurred; this pass just
     // settles retention on the fully-committed epoch range).
-    let _ = gc.run(0);
+    let _ = gc.run(0).await;
     drop(gc);
 
     // Final state must be exactly what strict serialization guarantees:
@@ -273,7 +277,7 @@ async fn test_cold_gc_never_overlaps_commit_real_sink() {
     // truncation/corruption from an interleaved write.
     let remaining_epochs = {
         let sink = catalog.lock().unwrap();
-        let remaining = ColdGcCatalog::list_snapshots(&*sink).unwrap();
+        let remaining = ColdGcCatalog::list_snapshots(&*sink).await.unwrap();
         assert_eq!(
             remaining.len(),
             3,

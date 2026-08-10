@@ -28,8 +28,8 @@ mod sim_coordination {
     const TX_TIMEOUT_PROBABILITY: f64 = 0.5;
     const SEEDS: [u64; 5] = [11, 22, 33, 44, 55];
 
-    #[test]
-    fn seeded_kafka_tx_timeout_fault_injection_across_seeds() {
+    #[tokio::test]
+    async fn seeded_kafka_tx_timeout_fault_injection_across_seeds() {
         for &seed in &SEEDS {
             buggify_init(seed);
 
@@ -40,9 +40,10 @@ mod sim_coordination {
             for epoch in 0..NUM_EPOCHS {
                 let state = sink
                     .pre_commit(epoch, (epoch as usize) + 1)
+                    .await
                     .expect("pre_commit must not fail within backpressure bound");
 
-                if sink.commit(epoch, &state).is_err() {
+                if sink.commit(epoch, &state).await.is_err() {
                     // The broker force-aborted the open transaction
                     // (`kafka.tx_timeout` fired): the epoch was never
                     // delivered. Recovery's `CheckBeforeCommit` path queries
@@ -61,6 +62,7 @@ mod sim_coordination {
                         pending_handle: vec![],
                     };
                     sink.recover(action)
+                        .await
                         .expect("CheckBeforeCommit recovery must deliver the aborted epoch");
                 }
 

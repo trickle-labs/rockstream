@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -17,6 +18,7 @@ struct RecordingSource {
     acknowledgements: Vec<(Epoch, OffsetToken)>,
 }
 
+#[async_trait]
 impl SourceConnector for RecordingSource {
     fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
         Ok(Arc::new(Schema::new(vec![Field::new(
@@ -26,7 +28,7 @@ impl SourceConnector for RecordingSource {
         )])))
     }
 
-    fn start_snapshot(
+    async fn start_snapshot(
         &mut self,
         _frontier: Epoch,
         _partition_filter: Option<PartitionFilter>,
@@ -34,7 +36,7 @@ impl SourceConnector for RecordingSource {
         Ok(SnapshotStream::new(vec![]))
     }
 
-    fn poll_delta(
+    async fn poll_delta(
         &mut self,
         _after: OffsetToken,
         _max_bytes: usize,
@@ -44,16 +46,20 @@ impl SourceConnector for RecordingSource {
         unreachable!("coordination tests commit explicit source input")
     }
 
-    fn commit_offset(&mut self, epoch: Epoch, offset: OffsetToken) -> Result<(), SourceError> {
+    async fn commit_offset(
+        &mut self,
+        epoch: Epoch,
+        offset: OffsetToken,
+    ) -> Result<(), SourceError> {
         self.acknowledgements.push((epoch, offset));
         Ok(())
     }
 
-    fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
+    async fn pause(&mut self, _reason: String) -> Result<(), SourceError> {
         Ok(())
     }
 
-    fn resume(&mut self) -> Result<(), SourceError> {
+    async fn resume(&mut self) -> Result<(), SourceError> {
         Ok(())
     }
 }
@@ -196,7 +202,7 @@ async fn seeded_owner_crash_after_m3_commit_acks_once_after_recovery() {
     );
     coordinator.recover().await.unwrap();
     let owner = coordinator.acquire_owner("owner-b").unwrap();
-    coordinator.acknowledge_recovered(&owner).unwrap();
+    coordinator.acknowledge_recovered(&owner).await.unwrap();
 
     assert_eq!(
         coordinator.into_inner().acknowledgements,
@@ -251,7 +257,7 @@ async fn seeded_lifecycle_race_never_revives_dropped_or_paused_source() {
     let mut coordinator = runtime(connector_id).await;
     coordinator.recover().await.unwrap();
     let owner = coordinator.acquire_owner("owner-a").unwrap();
-    coordinator.pause("paused by operator").unwrap();
+    coordinator.pause("paused by operator").await.unwrap();
     let paused_commit = coordinator
         .commit_epoch(
             &owner,
@@ -300,18 +306,18 @@ async fn seeded_lifecycle_race_never_revives_dropped_or_paused_source() {
     rockstream_sim::buggify::buggify_disable();
 }
 
-#[test]
-fn seeded_cdc_lsn_restart() {
+#[tokio::test]
+async fn seeded_cdc_lsn_restart() {
     seeded_owner_crash_after_prepare_retries_from_last_committed_token();
 }
 
-#[test]
-fn seeded_slot_invalidation_recovery() {
+#[tokio::test]
+async fn seeded_slot_invalidation_recovery() {
     seeded_owner_crash_after_m3_commit_acks_once_after_recovery();
 }
 
-#[test]
-fn seeded_wal_lag_backpressure() {
+#[tokio::test]
+async fn seeded_wal_lag_backpressure() {
     seeded_lifecycle_race_never_revives_dropped_or_paused_source();
 }
 
@@ -357,8 +363,9 @@ async fn recovery_uses_only_committed_checkpoint_and_fences_replaced_owner() {
     let owner = coordinator.acquire_owner("owner-b").unwrap();
     let stale = coordinator
         .acknowledge_recovered(&replaced_owner)
+        .await
         .unwrap_err();
-    coordinator.acknowledge_recovered(&owner).unwrap();
+    coordinator.acknowledge_recovered(&owner).await.unwrap();
 
     assert_eq!(
         (
