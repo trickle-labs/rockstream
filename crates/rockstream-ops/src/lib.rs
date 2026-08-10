@@ -39,6 +39,7 @@ pub mod scheduler;
 pub mod sink;
 pub mod snapshot;
 pub mod source;
+pub mod spill;
 pub mod task;
 pub mod tco;
 pub mod time_window;
@@ -46,6 +47,8 @@ pub mod topk;
 pub mod view_ref;
 pub mod window;
 pub mod zset;
+
+pub use spill::{SerdeSpill, SpillKey, SpillValue, SpillableArrangement};
 
 pub use aggregate::{
     load_frontier, persist_agg_state, persist_bucketed_agg_state, persist_frontier, AggState,

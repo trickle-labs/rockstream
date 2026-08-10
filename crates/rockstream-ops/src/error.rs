@@ -188,6 +188,13 @@ impl OpError {
         }
     }
 
+    pub fn storage_error(msg: impl Into<String>) -> Self {
+        Self::Storage {
+            source: rockstream_storage::StorageError::KeyEncoding(msg.into()),
+            code: RS_0001,
+        }
+    }
+
     pub fn group_commit_full(current: usize) -> Self {
         use rockstream_types::error_code::RS_1015;
         Self::GroupCommitFull {

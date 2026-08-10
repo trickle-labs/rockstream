@@ -216,6 +216,8 @@ struct MetricRegistry {
     flush_duration_sum_ms: AtomicU64,
     flush_duration_count: AtomicU64,
     flush_duration_last_ms: AtomicU64,
+    ops_spilled_bytes: AtomicU64,
+    ops_spill_faults_total: AtomicU64,
     operator_runtime: HashMap<OperatorId, OperatorRuntimeWindow>,
     operator_frontiers: HashMap<(String, OperatorId, u32), OperatorFrontierEntry>,
 }
@@ -289,6 +291,8 @@ impl MetricRegistry {
             flush_duration_sum_ms: AtomicU64::new(0),
             flush_duration_count: AtomicU64::new(0),
             flush_duration_last_ms: AtomicU64::new(0),
+            ops_spilled_bytes: AtomicU64::new(0),
+            ops_spill_faults_total: AtomicU64::new(0),
             operator_runtime: HashMap::new(),
             operator_frontiers: HashMap::new(),
         }
@@ -709,8 +713,32 @@ pub fn reset_all() {
         reg.flush_duration_sum_ms.store(0, Ordering::Relaxed);
         reg.flush_duration_count.store(0, Ordering::Relaxed);
         reg.flush_duration_last_ms.store(0, Ordering::Relaxed);
+        reg.ops_spilled_bytes.store(0, Ordering::Relaxed);
+        reg.ops_spill_faults_total.store(0, Ordering::Relaxed);
         reg.operator_runtime.clear();
     });
+}
+
+// ─── Spill Metrics Helpers ───────────────────────────────────────────────────
+
+pub fn inc_spilled_bytes(bytes: u64) {
+    with_registry(|reg| {
+        reg.ops_spilled_bytes.fetch_add(bytes, Ordering::Relaxed);
+    });
+}
+
+pub fn read_spilled_bytes() -> u64 {
+    with_registry(|reg| reg.ops_spilled_bytes.load(Ordering::Relaxed))
+}
+
+pub fn inc_spill_faults_total() {
+    with_registry(|reg| {
+        reg.ops_spill_faults_total.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub fn read_spill_faults_total() -> u64 {
+    with_registry(|reg| reg.ops_spill_faults_total.load(Ordering::Relaxed))
 }
 
 // ─── SRE Observability Metrics Helpers ────────────────────────────────────────

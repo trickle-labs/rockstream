@@ -22,6 +22,10 @@ harness = false
 name = "tco"
 harness = false
 
+[[bench]]
+name = "spill_latency"
+harness = false
+
 [dependencies]
 rockstream-types = { workspace = true }
 rockstream-plan = { workspace = true }

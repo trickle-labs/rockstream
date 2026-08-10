@@ -113,6 +113,7 @@ pub struct TopKOp {
     k: usize,
     rank_col: usize,
     partition_by: Vec<usize>,
+    db: Mutex<Option<Arc<ShardDb>>>,
     state: Mutex<TopKState>,
     fill_level: Arc<AtomicUsize>,
 }
@@ -127,9 +128,19 @@ impl TopKOp {
             k,
             rank_col,
             partition_by,
+            db: Mutex::new(None),
             state: Mutex::new(TopKState::new()),
             fill_level: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn with_db(self, db: Arc<ShardDb>) -> Self {
+        *self.db.lock().unwrap() = Some(db);
+        self
+    }
+
+    pub fn set_db(&self, db: Arc<ShardDb>) {
+        *self.db.lock().unwrap() = Some(db);
     }
 
     pub fn fill_level(&self) -> usize {
@@ -198,13 +209,24 @@ impl TopKOp {
                         // New positive-weight entry: always buffer (correctness requirement).
                         // Entries above TOPK_BUFFER_LIMIT trigger an error to prevent unbounded growth.
                         if positive_count >= TOPK_BUFFER_LIMIT {
-                            return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
+                            let has_db = self.db.lock().unwrap().is_some();
+                            if !has_db {
+                                return Err(OpError::topk_buffer_overflow(TOPK_BUFFER_LIMIT));
+                            }
+                            if let Some(db) = self.db.lock().unwrap().as_ref() {
+                                let db_key = [b"topk_spill:".as_slice(), &part_key[..], &row_id.to_be_bytes()[..]].concat();
+                                let v_bytes = encode_topk_value(rank_value, w, &row_vals);
+                                crate::spill::block_on_future(db.put(&db_key, &v_bytes))
+                                    .map_err(|e| OpError::storage_error(format!("topk spill put err: {e}")))?;
+                                rockstream_types::metrics::inc_spilled_bytes((db_key.len() + v_bytes.len()) as u64);
+                            }
+                        } else {
+                            entry_vac.insert(BufferEntry {
+                                rank_value,
+                                row_vals,
+                                net_weight: w,
+                            });
                         }
-                        entry_vac.insert(BufferEntry {
-                            rank_value,
-                            row_vals,
-                            net_weight: w,
-                        });
                     }
                 }
             }
@@ -225,7 +247,8 @@ impl TopKOp {
             // rank_value descending, then by full row bytes ascending (stable
             // tiebreaker). Consume each entry's full positive multiplicity so
             // duplicate input rows occupy duplicate Top-K positions.
-            let new_topk = select_topk(part, self.k);
+            let db_guard = self.db.lock().unwrap();
+            let new_topk = select_topk(part, self.k, db_guard.as_ref(), part_key, self.n_input_cols);
 
             // Retract rows no longer in top-K.
             for (rid, (old_vals, old_count)) in &part.emitted {
@@ -305,7 +328,13 @@ fn extract_row_vals(batch: &RecordBatch, row_idx: usize, n_cols: usize) -> Vec<i
         .collect()
 }
 
-fn select_topk(part: &PartitionState, k: usize) -> HashMap<u128, (Vec<i64>, i64)> {
+fn select_topk(
+    part: &PartitionState,
+    k: usize,
+    db_opt: Option<&Arc<ShardDb>>,
+    part_key: &[u8],
+    n_input_cols: usize,
+) -> HashMap<u128, (Vec<i64>, i64)> {
     let mut sorted: Vec<(i64, u128, Vec<i64>, i64)> = part
         .buffer
         .iter()
@@ -319,6 +348,26 @@ fn select_topk(part: &PartitionState, k: usize) -> HashMap<u128, (Vec<i64>, i64)
             )
         })
         .collect();
+
+    if let Some(db) = db_opt {
+        let prefix = [b"topk_spill:".as_slice(), part_key].concat();
+        let raw_pairs = crate::spill::block_on_future(db.scan_prefix(&prefix)).unwrap_or_default();
+        let prefix_len = prefix.len();
+        for (k_buf, v_buf) in raw_pairs {
+            if k_buf.len() >= prefix_len + 16 {
+                let row_id_bytes: [u8; 16] = k_buf[prefix_len..prefix_len + 16].try_into().unwrap_or([0; 16]);
+                let row_id = u128::from_be_bytes(row_id_bytes);
+                if !part.buffer.contains_key(&row_id) {
+                    if let Some((rank_val, w, row_vals)) = decode_topk_value(&v_buf, n_input_cols) {
+                        if w > 0 {
+                            rockstream_types::metrics::inc_spill_faults_total();
+                            sorted.push((rank_val, row_id, row_vals, w));
+                        }
+                    }
+                }
+            }
+        }
+    }
     sorted.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then_with(|| encode_row(&a.2).cmp(&encode_row(&b.2)))
@@ -498,9 +547,11 @@ pub async fn load_topk_state(
         }
     }
 
-    // Reconstruct emitted top-K for each partition using the same selection as process_epoch.
-    for part in st.partitions.values_mut() {
-        part.emitted = select_topk(part, k);
+    {
+        let db_guard = op.db.lock().unwrap();
+        for (pk, part) in &mut st.partitions {
+            part.emitted = select_topk(part, k, db_guard.as_ref(), pk, n_input_cols);
+        }
     }
 
     let total = st.total_entries();
