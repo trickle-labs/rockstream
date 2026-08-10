@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e approve clean error-codes exit-criteria coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
+.PHONY: build test clippy fmt check e2e e2e-lfs approve clean error-codes exit-criteria coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
 
 # Build the workspace
 build:
@@ -163,6 +163,13 @@ e2e:
 	@echo "MinIO backend tests PASSED (or skipped if Docker not available)"
 	@echo ""
 	@echo "=== e2e PASSED ==="
+
+# Fast local E2E check (LFS backend only, no Docker required)
+e2e-lfs:
+	@cargo build -p rockstream-cli
+	@echo "=== RockStream e2e-lfs test ==="
+	@cargo test -p rockstream-storage --test lfs_backend -- --test-threads=4 2>&1
+	@echo "=== e2e-lfs PASSED ==="
 
 # Bump the workspace version, commit, tag, and push.
 # Usage: make release VERSION=0.5.0
