@@ -59,6 +59,11 @@ impl LinearPipeline {
         }
         Ok(acc)
     }
+
+    /// Return total state bytes across all stages in this pipeline.
+    pub fn state_bytes(&self) -> u64 {
+        self.stages.iter().map(|s| s.state_bytes()).sum()
+    }
 }
 
 impl Default for LinearPipeline {

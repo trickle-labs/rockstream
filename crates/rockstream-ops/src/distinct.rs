@@ -121,18 +121,25 @@ fn build_output(schema: &SchemaRef, rows: Vec<(Vec<i64>, i64)>) -> Result<ArrowZ
 #[derive(Debug, Default)]
 pub struct DistinctState {
     entries: HashMap<Vec<u8>, (i64, Vec<i64>)>,
+    state_bytes: u64,
 }
 
 impl DistinctState {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            state_bytes: 0,
         }
     }
 
     /// Number of live distinct rows (fill level metric).
     pub fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        self.state_bytes
     }
 }
 
@@ -161,9 +168,22 @@ impl DistinctOp {
     pub fn fill_level(&self) -> usize {
         self.fill_level.load(Ordering::Relaxed)
     }
+
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().state_bytes()
+    }
 }
 
 impl Operator for DistinctOp {
+    fn name(&self) -> &str {
+        "DistinctOp"
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
+    }
+
     fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
         if delta.is_empty() {
             return Ok(ArrowZSet::empty(self.schema.clone()));
@@ -182,12 +202,18 @@ impl Operator for DistinctOp {
 
             let old_w = state.entries.get(&key).map(|(w, _)| *w).unwrap_or(0);
             let new_w = old_w + delta_w;
+            let is_new = !state.entries.contains_key(&key);
+            let entry_bytes = (key.len() + 8 + row_vals.len() * 8) as u64;
 
             // Maintain arrangement (no range delete — point writes only).
             if new_w != 0 {
+                if is_new {
+                    state.state_bytes += entry_bytes;
+                }
                 state.entries.insert(key, (new_w, row_vals.clone()));
-            } else {
+            } else if !is_new {
                 state.entries.remove(&key);
+                state.state_bytes = state.state_bytes.saturating_sub(entry_bytes);
             }
 
             // Zero-crossing emission.
@@ -203,10 +229,6 @@ impl Operator for DistinctOp {
         drop(state);
 
         build_output(&self.schema, out_rows)
-    }
-
-    fn name(&self) -> &str {
-        "DistinctOp"
     }
 }
 

@@ -170,6 +170,10 @@ impl LateralOp {
             vec![input.weights[row_idx]; expanded.len()],
         )))
     }
+
+    pub fn state_bytes(&self) -> u64 {
+        0
+    }
 }
 
 impl Operator for LateralOp {
@@ -179,6 +183,10 @@ impl Operator for LateralOp {
 
     fn name(&self) -> &str {
         "LateralOp"
+    }
+
+    fn state_bytes(&self) -> u64 {
+        0
     }
 }
 

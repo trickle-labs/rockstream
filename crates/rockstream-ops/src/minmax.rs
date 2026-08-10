@@ -110,6 +110,11 @@ impl MinMaxState {
         self.multiset.values().map(|m| m.len()).sum()
     }
 
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        ((self.multiset.len() * 24) + (self.live_entries() * 16)) as u64
+    }
+
     /// Number of live groups (groups with at least one value).
     pub fn live_groups(&self) -> usize {
         self.multiset.len()
@@ -370,6 +375,11 @@ impl MinMaxOp {
 
         Ok(Self::with_state(op_id, state))
     }
+
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().state_bytes()
+    }
 }
 
 impl Operator for MinMaxOp {
@@ -378,6 +388,10 @@ impl Operator for MinMaxOp {
             MinMaxKind::Min => "MinOp",
             MinMaxKind::Max => "MaxOp",
         }
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
     }
 
     fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {

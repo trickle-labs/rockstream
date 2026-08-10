@@ -163,6 +163,23 @@ impl TumbleWindowState {
             .filter(|(_, w)| *w > 0)
             .count()
     }
+
+    fn state_bytes(&self) -> u64 {
+        let mut bytes = (self.finalized.len() * 8) as u64;
+        for wmap in self.windows.values() {
+            bytes += 8;
+            for (gk, (vals, _)) in wmap {
+                bytes += (gk.len() + vals.len() * 8 + 8) as u64;
+            }
+        }
+        for omap in self.prev_output.values() {
+            bytes += 8;
+            for (gk, vals) in omap {
+                bytes += (gk.len() + vals.len() * 8) as u64;
+            }
+        }
+        bytes
+    }
 }
 
 #[derive(Clone)]
@@ -191,6 +208,23 @@ impl HopWindowState {
             .flat_map(|m| m.values())
             .filter(|(_, w)| *w > 0)
             .count()
+    }
+
+    fn state_bytes(&self) -> u64 {
+        let mut bytes = (self.finalized.len() * 8) as u64;
+        for wmap in self.windows.values() {
+            bytes += 8;
+            for (gk, (vals, _)) in wmap {
+                bytes += (gk.len() + vals.len() * 8 + 8) as u64;
+            }
+        }
+        for omap in self.prev_output.values() {
+            bytes += 8;
+            for (gk, vals) in omap {
+                bytes += (gk.len() + vals.len() * 8) as u64;
+            }
+        }
+        bytes
     }
 }
 
@@ -222,6 +256,20 @@ impl SessionWindowState {
             .values()
             .map(|partition| partition.live_session_count)
             .sum()
+    }
+
+    fn state_bytes(&self) -> u64 {
+        let mut bytes = 0u64;
+        for (pk, ppart) in &self.partitions {
+            bytes += pk.len() as u64;
+            for (gk, (vals, _)) in &ppart.rows {
+                bytes += (gk.len() + vals.len() * 8 + 8) as u64;
+            }
+            for (gk, vals) in &ppart.prev_output {
+                bytes += (gk.len() + vals.len() * 8) as u64;
+            }
+        }
+        bytes
     }
 }
 
@@ -290,6 +338,10 @@ impl TumbleWindowOp {
     /// Exact late rows routed to the configured side channel, in arrival order.
     pub fn routed_late_rows(&self) -> Vec<Vec<i64>> {
         self.late_route_rows.lock().unwrap().clone()
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().state_bytes()
     }
 
     /// Load persisted state from `db` into this already-constructed
@@ -594,6 +646,10 @@ impl Operator for TumbleWindowOp {
         self.process_epoch(delta, 0)
     }
 
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
+    }
+
     fn push_input_frontier(
         &self,
         frontier: rockstream_types::frontier::FreshnessToken,
@@ -663,6 +719,10 @@ impl HopWindowOp {
             .as_ref()
             .and_then(|f| f.watermark_ms())
             .unwrap_or(state.watermark.watermark_ms)
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().state_bytes()
     }
 
     pub fn process_epoch(&self, delta: ArrowZSet, _epoch: u64) -> Result<ArrowZSet, OpError> {
@@ -827,6 +887,10 @@ impl Operator for HopWindowOp {
         self.process_epoch(delta, 0)
     }
 
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
+    }
+
     fn push_input_frontier(
         &self,
         frontier: rockstream_types::frontier::FreshnessToken,
@@ -893,6 +957,10 @@ impl SessionWindowOp {
 
     pub fn fill_level(&self) -> usize {
         self.fill_level.load(Ordering::Relaxed)
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().state_bytes()
     }
 
     /// Load persisted state from `db` into this already-constructed
@@ -1082,6 +1150,10 @@ impl Operator for SessionWindowOp {
 
     fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
         self.process_epoch(delta, 0)
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
     }
 
     fn push_input_frontier(

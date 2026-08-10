@@ -118,6 +118,7 @@ pub struct JoinState {
     left_arr: HashMap<Vec<u8>, HashMap<u128, ArrRow>>,
     /// join_key_bytes → HashMap<row_id, ArrRow>
     right_arr: HashMap<Vec<u8>, HashMap<u128, ArrRow>>,
+    state_bytes: u64,
 }
 
 impl JoinState {
@@ -125,30 +126,76 @@ impl JoinState {
         JoinState::default()
     }
 
+    pub fn state_bytes(&self) -> u64 {
+        self.state_bytes
+    }
+
     /// Apply a delta to the left arrangement.
     /// Tracks net weight per row_id; removes when weight reaches 0.
     fn update_left(&mut self, join_key: Vec<u8>, row_id: u128, row_bytes: Vec<u8>, delta_w: i64) {
-        let bucket = self.left_arr.entry(join_key).or_default();
-        let entry = bucket.entry(row_id).or_insert_with(|| ArrRow {
-            row_bytes: row_bytes.clone(),
-            weight: 0,
-        });
-        entry.weight += delta_w;
-        if entry.weight == 0 {
-            bucket.remove(&row_id);
+        let is_new_key = !self.left_arr.contains_key(&join_key);
+        let key_len = join_key.len() as u64;
+        let bucket = self.left_arr.entry(join_key.clone()).or_default();
+        if is_new_key {
+            self.state_bytes += key_len;
+        }
+
+        if let Some(entry) = bucket.get_mut(&row_id) {
+            entry.weight += delta_w;
+            if entry.weight == 0 {
+                let removed = bucket.remove(&row_id).unwrap();
+                self.state_bytes = self
+                    .state_bytes
+                    .saturating_sub(16 + 8 + removed.row_bytes.len() as u64);
+                if bucket.is_empty() {
+                    self.left_arr.remove(&join_key);
+                    self.state_bytes = self.state_bytes.saturating_sub(key_len);
+                }
+            }
+        } else if delta_w != 0 {
+            let row_len = row_bytes.len() as u64;
+            bucket.insert(
+                row_id,
+                ArrRow {
+                    row_bytes,
+                    weight: delta_w,
+                },
+            );
+            self.state_bytes += 16 + 8 + row_len;
         }
     }
 
     /// Apply a delta to the right arrangement.
     fn update_right(&mut self, join_key: Vec<u8>, row_id: u128, row_bytes: Vec<u8>, delta_w: i64) {
-        let bucket = self.right_arr.entry(join_key).or_default();
-        let entry = bucket.entry(row_id).or_insert_with(|| ArrRow {
-            row_bytes: row_bytes.clone(),
-            weight: 0,
-        });
-        entry.weight += delta_w;
-        if entry.weight == 0 {
-            bucket.remove(&row_id);
+        let is_new_key = !self.right_arr.contains_key(&join_key);
+        let key_len = join_key.len() as u64;
+        let bucket = self.right_arr.entry(join_key.clone()).or_default();
+        if is_new_key {
+            self.state_bytes += key_len;
+        }
+
+        if let Some(entry) = bucket.get_mut(&row_id) {
+            entry.weight += delta_w;
+            if entry.weight == 0 {
+                let removed = bucket.remove(&row_id).unwrap();
+                self.state_bytes = self
+                    .state_bytes
+                    .saturating_sub(16 + 8 + removed.row_bytes.len() as u64);
+                if bucket.is_empty() {
+                    self.right_arr.remove(&join_key);
+                    self.state_bytes = self.state_bytes.saturating_sub(key_len);
+                }
+            }
+        } else if delta_w != 0 {
+            let row_len = row_bytes.len() as u64;
+            bucket.insert(
+                row_id,
+                ArrRow {
+                    row_bytes,
+                    weight: delta_w,
+                },
+            );
+            self.state_bytes += 16 + 8 + row_len;
         }
     }
 
@@ -188,11 +235,19 @@ impl JoinState {
 struct StagedDelta {
     /// (join_key, row_id, row_bytes, weight)
     rows: Vec<(Vec<u8>, u128, Vec<u8>, i64)>,
+    staged_bytes: u64,
 }
 
 impl StagedDelta {
     fn push(&mut self, join_key: Vec<u8>, row_id: u128, row_bytes: Vec<u8>, weight: i64) {
+        self.staged_bytes += (join_key.len() + 16 + row_bytes.len() + 8) as u64;
         self.rows.push((join_key, row_id, row_bytes, weight));
+    }
+
+    #[allow(dead_code)]
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.staged_bytes = 0;
     }
 }
 
@@ -447,6 +502,8 @@ impl JoinOp {
         for (join_key, row_id, row_bytes, w) in right_s.rows.drain(..) {
             state.update_right(join_key, row_id, row_bytes, w);
         }
+        left_s.staged_bytes = 0;
+        right_s.staged_bytes = 0;
 
         let batch = Self::make_output_batch(&left_cols, &right_cols, &schema)?;
         Ok(ArrowZSet::new(batch, out_weights))
@@ -471,6 +528,14 @@ impl JoinOp {
     /// Fill-level metric for the right arrangement.
     pub fn right_entry_count(&self) -> usize {
         self.state.lock().unwrap().right_entry_count()
+    }
+
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap();
+        let left_s = self.left_staged.lock().unwrap();
+        let right_s = self.right_staged.lock().unwrap();
+        state.state_bytes() + left_s.staged_bytes + right_s.staged_bytes
     }
 
     /// Persist the arrangement state to a `ShardDb` using only point puts.
@@ -642,6 +707,20 @@ impl JoinOp {
     /// Operator ID.
     pub fn op_id(&self) -> OperatorId {
         self.op_id
+    }
+}
+
+impl crate::op::Operator for JoinOp {
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_left_delta(delta)
+    }
+
+    fn name(&self) -> &str {
+        "JoinOp"
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
     }
 }
 

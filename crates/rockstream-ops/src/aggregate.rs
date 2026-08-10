@@ -91,6 +91,11 @@ impl AggState {
         self.entries.len()
     }
 
+    /// State bytes metric (24 bytes per (k, sum, count) tuple).
+    pub fn state_bytes(&self) -> u64 {
+        (self.entries.len() * 24) as u64
+    }
+
     /// Apply one delta `(key, value_delta * weight)` to the arrangement.
     ///
     /// Returns `(old_state, new_state)` where each is `Option<(sum, count)>`.
@@ -262,11 +267,20 @@ impl AggregateOp {
         *self.state.lock().expect("AggregateOp mutex poisoned") = state;
         Ok(())
     }
+
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().state_bytes()
+    }
 }
 
 impl Operator for AggregateOp {
     fn name(&self) -> &str {
         "AggregateOp"
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
     }
 
     /// Apply one Z-set delta batch through the aggregate arrangement.

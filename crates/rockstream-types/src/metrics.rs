@@ -927,6 +927,10 @@ pub fn read_pipeline_state_bytes(pipeline_id: &str) -> Option<u64> {
     })
 }
 
+pub fn get_pipeline_state_bytes(pipeline_id: &str) -> u64 {
+    read_pipeline_state_bytes(pipeline_id).unwrap_or(0)
+}
+
 pub fn set_state_budget(bytes: u64) {
     with_registry(|reg| {
         reg.state_budget_bytes.store(bytes, Ordering::Relaxed);

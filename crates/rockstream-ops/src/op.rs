@@ -45,6 +45,11 @@ pub trait Operator: Send + Sync {
     fn input_frontier(&self) -> Option<rockstream_types::frontier::FreshnessToken> {
         None
     }
+
+    /// Return current state size in bytes held by this operator (default 0 for stateless).
+    fn state_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// Output produced by an operator for one epoch.

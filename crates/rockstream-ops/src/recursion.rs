@@ -52,6 +52,22 @@ struct RecursionState {
     audit_events: Vec<AuditEvent>,
 }
 
+impl RecursionState {
+    fn state_bytes(&self) -> u64 {
+        let mut bytes = 0u64;
+        for vals in self.input_relation.keys() {
+            bytes += (vals.len() * 8 + 8) as u64;
+        }
+        for vals in self.output_relation.keys() {
+            bytes += (vals.len() * 8 + 8) as u64;
+        }
+        for (vals, _) in self.iteration_rows.values() {
+            bytes += (28 + vals.len() * 8) as u64;
+        }
+        bytes
+    }
+}
+
 pub struct RecursionOp {
     schema: SchemaRef,
     base: PlanNode,
@@ -252,6 +268,11 @@ impl RecursionOp {
 
         Err(OpError::recursion_max_iterations(self.max_iterations))
     }
+
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().state_bytes()
+    }
 }
 
 impl Operator for RecursionOp {
@@ -261,6 +282,10 @@ impl Operator for RecursionOp {
 
     fn name(&self) -> &str {
         "RecursionOp"
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
     }
 }
 

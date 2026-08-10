@@ -206,8 +206,9 @@ impl Image for MinIO2024 {
     }
 }
 
-static SHARED_MINIO: tokio::sync::OnceCell<Option<(testcontainers::ContainerAsync<MinIO2024>, u16)>> =
-    tokio::sync::OnceCell::const_new();
+static SHARED_MINIO: tokio::sync::OnceCell<
+    Option<(testcontainers::ContainerAsync<MinIO2024>, u16)>,
+> = tokio::sync::OnceCell::const_new();
 
 /// Return the port of a shared MinIO container instance.
 async fn get_shared_minio() -> Option<u16> {

@@ -187,6 +187,24 @@ impl Stage {
         }
     }
 
+    pub fn state_bytes(&self) -> u64 {
+        match self {
+            Stage::Stateless(op) => op.state_bytes(),
+            Stage::Aggregate(op) => op.state_bytes(),
+            Stage::MinMax(op, _) => op.state_bytes(),
+            Stage::Distinct(op, _) => op.state_bytes(),
+            Stage::TumbleWindow(op, _) => op.state_bytes(),
+            Stage::HopWindow(op, _) => op.state_bytes(),
+            Stage::SessionWindow(op, _) => op.state_bytes(),
+            Stage::Window(op, _) => op.state_bytes(),
+            Stage::TopK(op, _) => op.state_bytes(),
+            Stage::KeyPack(_, _) | Stage::KeyUnpack(_, _) => 0,
+            Stage::Utf8KeyPack(_, _) | Stage::Utf8KeyUnpack(_, _) => 0,
+            Stage::Utf8ColumnPack(_, _, _) | Stage::Utf8ColumnUnpack(_, _, _) => 0,
+            Stage::MultiAggregate(op) => op.state_bytes(),
+        }
+    }
+
     async fn persist(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
             Stage::Stateless(_) => Ok(()),
@@ -883,6 +901,11 @@ impl StatefulPipeline {
         }
         Ok(())
     }
+
+    /// Return sum of state bytes held by all stages in this pipeline.
+    pub fn state_bytes(&self) -> u64 {
+        self.stages.iter().map(|s| s.state_bytes()).sum()
+    }
 }
 
 /// How `MultiAggregatePipeline::process` extracts one final output column
@@ -951,6 +974,12 @@ impl MultiAggregatePipeline {
             joins,
             finalize,
         }
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        let lane_bytes: u64 = self.lanes.iter().map(|l| l.state_bytes()).sum();
+        let join_bytes: u64 = self.joins.iter().map(|j| j.state_bytes()).sum();
+        lane_bytes + join_bytes
     }
 
     /// Drop column `drop_idx` from `zset`, keeping every other column in

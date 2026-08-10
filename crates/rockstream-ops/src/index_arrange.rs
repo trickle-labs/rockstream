@@ -19,7 +19,7 @@
 //! deletes are point-deletes keyed by `(index_key_bytes ++ pk_bytes)`.
 
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
     Arc,
 };
 
@@ -29,6 +29,7 @@ use rockstream_storage::{ShardDb, ShardPrefix, WriteBatch};
 use rockstream_types::ids::OperatorId;
 
 use crate::error::OpError;
+use crate::op::Operator;
 use crate::zset::ArrowZSet;
 
 /// Default maximum rows in an index arrangement.
@@ -43,10 +44,11 @@ pub struct BackfillRow {
     pub pk_val: i64,
 }
 
-/// Index arrangement operator (v0.32-S3).
+/// Incremental index maintenance operator.
 ///
-/// Maintains a `(index_key_bytes ++ pk_bytes) → row_bytes` point-write arrangement.
-/// Bounded by `max_rows`; fill level exposed via `row_count()`.
+/// Maintains `(index_key_bytes ++ pk_bytes) → row_bytes` in storage.
+/// Inserts are point puts; retractions are point deletes.
+/// NEVER performs range deletion.
 ///
 /// Optional partial-index filter: when `filter_col` and `filter_val` are set,
 /// only rows where `row[filter_col] == filter_val` are arranged (S7).
@@ -57,6 +59,7 @@ pub struct IndexArrangeOp {
     pk_cols: Vec<usize>,
     // Signed counter to handle spurious decrements gracefully.
     row_count: Arc<AtomicI64>,
+    state_bytes: Arc<AtomicU64>,
     max_rows: u64,
     /// Partial-index filter: (column index, required value). Rows not matching
     /// are silently skipped.
@@ -78,6 +81,7 @@ impl IndexArrangeOp {
             index_cols,
             pk_cols,
             row_count: Arc::new(AtomicI64::new(0)),
+            state_bytes: Arc::new(AtomicU64::new(0)),
             max_rows,
             filter: None,
         }
@@ -101,6 +105,7 @@ impl IndexArrangeOp {
             index_cols,
             pk_cols,
             row_count: Arc::new(AtomicI64::new(0)),
+            state_bytes: Arc::new(AtomicU64::new(0)),
             max_rows,
             filter: Some((filter_col, filter_val)),
         }
@@ -109,6 +114,11 @@ impl IndexArrangeOp {
     /// Current number of rows in the arrangement (fill metric).
     pub fn row_count(&self) -> u64 {
         self.row_count.load(Ordering::Relaxed).max(0) as u64
+    }
+
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        self.state_bytes.load(Ordering::Relaxed)
     }
 
     /// Returns `true` if the arrangement has reached its row limit (backpressure signal).
@@ -152,12 +162,20 @@ impl IndexArrangeOp {
             let key = self.encode_arrangement_key(delta, row)?;
             if weight > 0 {
                 let value = self.encode_row_value(delta, row)?;
+                let len = (key.len() + value.len()) as u64;
                 batch.put(&key, &value);
                 self.row_count.fetch_add(1, Ordering::Relaxed);
+                self.state_bytes.fetch_add(len, Ordering::Relaxed);
             } else {
-                // weight < 0: point-delete — never range-delete
+                let value = self.encode_row_value(delta, row).unwrap_or_default();
+                let len = (key.len() + value.len()) as u64;
                 batch.delete(&key);
                 self.row_count.fetch_sub(1, Ordering::Relaxed);
+                let _ = self
+                    .state_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                        Some(b.saturating_sub(len))
+                    });
             }
         }
 
@@ -318,5 +336,27 @@ impl IndexArrangeOp {
             Self::write_backfill_frontier(&db, index_name, new_frontier).await?;
         }
         Ok(())
+    }
+}
+
+impl Operator for IndexArrangeOp {
+    fn name(&self) -> &str {
+        "IndexArrangeOp"
+    }
+
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(self.apply_delta(&delta)))?;
+        } else {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(|e| OpError::unimplemented(e.to_string()))?;
+            rt.block_on(self.apply_delta(&delta))?;
+        }
+        Ok(delta)
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
     }
 }

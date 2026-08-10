@@ -61,10 +61,12 @@ struct ArrRow {
 #[derive(Debug, Default)]
 struct StagedDelta {
     rows: Vec<(Vec<u8>, u128, Vec<u8>, i64)>,
+    staged_bytes: u64,
 }
 
 impl StagedDelta {
     fn push(&mut self, join_key: Vec<u8>, row_id: u128, row_bytes: Vec<u8>, weight: i64) {
+        self.staged_bytes += (join_key.len() + 16 + row_bytes.len() + 8) as u64;
         self.rows.push((join_key, row_id, row_bytes, weight));
     }
 }
@@ -80,6 +82,7 @@ struct OuterJoinState {
     right_key_weight: HashMap<Vec<u8>, i64>,
     /// Per-key total net left-side weight (for Right/Full tracking).
     left_key_weight: HashMap<Vec<u8>, i64>,
+    state_bytes: u64,
 }
 
 impl OuterJoinState {
@@ -87,27 +90,73 @@ impl OuterJoinState {
         Self::default()
     }
 
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes
+    }
+
     fn update_left(&mut self, join_key: Vec<u8>, row_id: u128, row_bytes: Vec<u8>, delta_w: i64) {
-        let bucket = self.left_arr.entry(join_key).or_default();
-        let entry = bucket.entry(row_id).or_insert_with(|| ArrRow {
-            row_bytes: row_bytes.clone(),
-            weight: 0,
-        });
-        entry.weight += delta_w;
-        if entry.weight == 0 {
-            bucket.remove(&row_id);
+        let is_new_key = !self.left_arr.contains_key(&join_key);
+        let key_len = join_key.len() as u64;
+        let bucket = self.left_arr.entry(join_key.clone()).or_default();
+        if is_new_key {
+            self.state_bytes += key_len;
+        }
+
+        if let Some(entry) = bucket.get_mut(&row_id) {
+            entry.weight += delta_w;
+            if entry.weight == 0 {
+                let removed = bucket.remove(&row_id).unwrap();
+                self.state_bytes = self
+                    .state_bytes
+                    .saturating_sub(16 + 8 + removed.row_bytes.len() as u64);
+                if bucket.is_empty() {
+                    self.left_arr.remove(&join_key);
+                    self.state_bytes = self.state_bytes.saturating_sub(key_len);
+                }
+            }
+        } else if delta_w != 0 {
+            let row_len = row_bytes.len() as u64;
+            bucket.insert(
+                row_id,
+                ArrRow {
+                    row_bytes,
+                    weight: delta_w,
+                },
+            );
+            self.state_bytes += 16 + 8 + row_len;
         }
     }
 
     fn update_right(&mut self, join_key: Vec<u8>, row_id: u128, row_bytes: Vec<u8>, delta_w: i64) {
-        let bucket = self.right_arr.entry(join_key).or_default();
-        let entry = bucket.entry(row_id).or_insert_with(|| ArrRow {
-            row_bytes: row_bytes.clone(),
-            weight: 0,
-        });
-        entry.weight += delta_w;
-        if entry.weight == 0 {
-            bucket.remove(&row_id);
+        let is_new_key = !self.right_arr.contains_key(&join_key);
+        let key_len = join_key.len() as u64;
+        let bucket = self.right_arr.entry(join_key.clone()).or_default();
+        if is_new_key {
+            self.state_bytes += key_len;
+        }
+
+        if let Some(entry) = bucket.get_mut(&row_id) {
+            entry.weight += delta_w;
+            if entry.weight == 0 {
+                let removed = bucket.remove(&row_id).unwrap();
+                self.state_bytes = self
+                    .state_bytes
+                    .saturating_sub(16 + 8 + removed.row_bytes.len() as u64);
+                if bucket.is_empty() {
+                    self.right_arr.remove(&join_key);
+                    self.state_bytes = self.state_bytes.saturating_sub(key_len);
+                }
+            }
+        } else if delta_w != 0 {
+            let row_len = row_bytes.len() as u64;
+            bucket.insert(
+                row_id,
+                ArrRow {
+                    row_bytes,
+                    weight: delta_w,
+                },
+            );
+            self.state_bytes += 16 + 8 + row_len;
         }
     }
 
@@ -923,22 +972,37 @@ impl OuterJoinOp {
             state.update_right(join_key, row_id, row_bytes, w);
         }
 
+        left_s.staged_bytes = 0;
+        right_s.staged_bytes = 0;
+
         // Update right_key_weight.
         for (key, delta) in delta_rw {
+            let is_new = !state.right_key_weight.contains_key(key);
+            let key_len = key.len() as u64;
+            if is_new {
+                state.state_bytes += key_len + 8;
+            }
             let entry = state.right_key_weight.entry(key.clone()).or_insert(0);
             *entry += delta;
             if *entry == 0 {
                 state.right_key_weight.remove(key);
+                state.state_bytes = state.state_bytes.saturating_sub(key_len + 8);
             }
         }
 
         // Update left_key_weight (for RIGHT and FULL joins).
         if let Some(dlw) = delta_lw {
             for (key, delta) in dlw {
+                let is_new = !state.left_key_weight.contains_key(key);
+                let key_len = key.len() as u64;
+                if is_new {
+                    state.state_bytes += key_len + 8;
+                }
                 let entry = state.left_key_weight.entry(key.clone()).or_insert(0);
                 *entry += delta;
                 if *entry == 0 {
                     state.left_key_weight.remove(key);
+                    state.state_bytes = state.state_bytes.saturating_sub(key_len + 8);
                 }
             }
         }
@@ -954,6 +1018,14 @@ impl OuterJoinOp {
     /// Fill-level metric for the right arrangement.
     pub fn right_entry_count(&self) -> usize {
         self.state.lock().unwrap().right_entry_count()
+    }
+
+    /// State bytes metric.
+    pub fn state_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap();
+        let left_s = self.left_staged.lock().unwrap();
+        let right_s = self.right_staged.lock().unwrap();
+        state.state_bytes() + left_s.staged_bytes + right_s.staged_bytes
     }
 
     /// Number of keys with nonzero match-count tracking (unmatched tracking).
@@ -1038,7 +1110,9 @@ impl OuterJoinOp {
         db.write_batch(batch).await.map_err(OpError::storage)
     }
 
-    /// Load operator state from a `ShardDb` (crash-replay).
+    /// Load arrangement state and match-count state from a `ShardDb` (crash-replay).
+    ///
+    /// Scans left/right arrangement prefixes and key-weight prefixes; no range deletion.
     pub async fn load_from_storage(
         db: &ShardDb,
         op_id: OperatorId,
@@ -1059,13 +1133,7 @@ impl OuterJoinOp {
             let join_key = key[11..key.len() - 16].to_vec();
             let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
             let row_bytes = value.to_vec();
-            st.left_arr.entry(join_key).or_default().insert(
-                row_id,
-                ArrRow {
-                    row_bytes,
-                    weight: 1,
-                },
-            );
+            st.update_left(join_key, row_id, row_bytes, 1);
         }
 
         // Load right arrangement.
@@ -1081,13 +1149,7 @@ impl OuterJoinOp {
             let join_key = key[11..key.len() - 16].to_vec();
             let row_id = u128::from_be_bytes(key[key.len() - 16..].try_into().unwrap_or([0u8; 16]));
             let row_bytes = value.to_vec();
-            st.right_arr.entry(join_key).or_default().insert(
-                row_id,
-                ArrRow {
-                    row_bytes,
-                    weight: 1,
-                },
-            );
+            st.update_right(join_key, row_id, row_bytes, 1);
         }
 
         // Load right_key_weight.
@@ -1102,7 +1164,9 @@ impl OuterJoinOp {
             let key_bytes = key[header_len..].to_vec();
             let weight = i64::from_be_bytes(value[..8].try_into().unwrap_or([0u8; 8]));
             if weight != 0 {
+                let key_len = key_bytes.len() as u64;
                 st.right_key_weight.insert(key_bytes, weight);
+                st.state_bytes += key_len + 8;
             }
         }
 
@@ -1117,7 +1181,9 @@ impl OuterJoinOp {
             let key_bytes = key[header_len..].to_vec();
             let weight = i64::from_be_bytes(value[..8].try_into().unwrap_or([0u8; 8]));
             if weight != 0 {
+                let key_len = key_bytes.len() as u64;
                 st.left_key_weight.insert(key_bytes, weight);
+                st.state_bytes += key_len + 8;
             }
         }
 
@@ -1140,6 +1206,21 @@ impl OuterJoinOp {
         let loaded_st = loaded.state.into_inner().unwrap();
         *self.state.lock().unwrap() = loaded_st;
         Ok(())
+    }
+}
+
+impl crate::op::Operator for OuterJoinOp {
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        let empty_right = ArrowZSet::empty(crate::live_exec::int64_schema(self.right_n_cols));
+        self.process_epoch(delta, empty_right)
+    }
+
+    fn name(&self) -> &str {
+        "OuterJoinOp"
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
     }
 }
 

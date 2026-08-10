@@ -66,6 +66,10 @@ jobs:
         run: bash scripts/check-no-mock-connectors.test.sh
       - name: exit criteria sign-offs
         run: bash scripts/check-exit-criteria.sh
+      - name: operator-state-bytes check
+        run: bash scripts/check-operator-state-bytes.sh
+      - name: operator-state-bytes checker self-test
+        run: bash scripts/check-operator-state-bytes.test.sh
       - name: path-coupling check
         run: bash scripts/check-path-coupling.sh
 

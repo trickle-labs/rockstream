@@ -22,6 +22,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use crate::op::Operator;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -87,6 +88,20 @@ impl TopKState {
             .filter(|e| e.net_weight > 0)
             .count()
     }
+
+    fn state_bytes(&self) -> u64 {
+        let mut bytes = 0u64;
+        for (pk, part) in &self.partitions {
+            bytes += pk.len() as u64;
+            for entry in part.buffer.values() {
+                bytes += (32 + entry.row_vals.len() * 8) as u64;
+            }
+            for (row_vals, _) in part.emitted.values() {
+                bytes += (24 + row_vals.len() * 8) as u64;
+            }
+        }
+        bytes
+    }
 }
 
 // ─── TopKOp ──────────────────────────────────────────────────────────────────
@@ -119,6 +134,10 @@ impl TopKOp {
 
     pub fn fill_level(&self) -> usize {
         self.fill_level.load(Ordering::Relaxed)
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().state_bytes()
     }
 
     /// Process one epoch: apply `delta` and return the output delta.
@@ -245,6 +264,20 @@ impl TopKOp {
             key.extend_from_slice(&v.to_be_bytes());
         }
         key
+    }
+}
+
+impl Operator for TopKOp {
+    fn name(&self) -> &str {
+        "TopKOp"
+    }
+
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_epoch(delta, 0)
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
     }
 }
 

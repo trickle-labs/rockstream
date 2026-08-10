@@ -21,6 +21,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use crate::op::Operator;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -283,6 +284,23 @@ impl WindowState {
             .filter(|(_, _, w)| *w > 0)
             .count()
     }
+
+    fn state_bytes(&self) -> u64 {
+        let mut bytes = 0u64;
+        for (pk, pmap) in &self.arrangement {
+            bytes += pk.len() as u64;
+            for (order_key, input_vals, _) in pmap.values() {
+                bytes += (16 + order_key.len() + input_vals.len() * 8 + 8) as u64;
+            }
+        }
+        for (pk, ocache) in &self.prev_output {
+            bytes += pk.len() as u64;
+            for output_vals in ocache.values() {
+                bytes += (16 + output_vals.len() * 8) as u64;
+            }
+        }
+        bytes
+    }
 }
 
 // ─── WindowOp ────────────────────────────────────────────────────────────────
@@ -314,6 +332,10 @@ impl WindowOp {
             fill_level: Arc::new(AtomicUsize::new(0)),
             oversized_partitions: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().state_bytes()
     }
 
     /// Create an LFS-backed WindowOp.
@@ -462,6 +484,20 @@ impl WindowOp {
         } else {
             vec![]
         }
+    }
+}
+
+impl Operator for WindowOp {
+    fn name(&self) -> &str {
+        "WindowOp"
+    }
+
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_epoch(delta, 0)
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
     }
 }
 
