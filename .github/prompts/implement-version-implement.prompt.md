@@ -27,17 +27,22 @@ and proof-claim → test mapping before writing any code.
 
 ---
 
-## Test Output: Summary Lines Only
+## ⚡ Fast Test Execution & Summary Lines Only
 
-**After any `cargo test` run, extract only the summary — do not paste full passing
-test output into the conversation:**
+1. **Targeted Test Scoping**:
+   - **DO NOT run `cargo test --workspace` or `make e2e` during slice development.** Full workspace verification and E2E proofs belong in Phase 4 (`implement-version-prove`).
+   - Scope every test command strictly to the modified crate, test target, and test function:
+     ```bash
+     rtk cargo test -p <crate> --test <test_target> <test_name> 2>&1 | grep -E "^test .* (ok|FAILED|ignored)|^test result:|^FAILED$|^error"
+     ```
+   - If `cargo-nextest` is available, use nextest for fast parallel test execution:
+     ```bash
+     rtk cargo nextest run -p <crate> --test <test_target> <filter>
+     ```
 
-```bash
-rtk cargo test ... 2>&1 | grep -E "^test .* (ok|FAILED|ignored)|^test result:|^FAILED$|^error"
-```
-
-Show full output **only for FAILED tests**. Passing test noise balloons the cache
-and gets re-read on every subsequent turn, multiplying token costs 10–30×.
+2. **Extract Summary Lines Only**:
+   Show full output **only for FAILED tests**. Passing test noise balloons the context
+   cache and gets re-read on every subsequent turn, multiplying token costs 10–30×.
 
 ---
 
@@ -66,8 +71,8 @@ Work one slice at a time. For each slice:
 7. Add a fill-level metric and a bound to any new queue/buffer/scan window.
 8. Keep `main` runnable through the single `rockstream` binary.
 
-Re-run the relevant tests after each slice. Diagnose and fix failures at the root
-cause; do not paper over them.
+Re-run only the relevant targeted tests (`-p <crate> --test <target>`) after each slice.
+Diagnose and fix failures at the root cause; do not paper over them.
 
 ---
 

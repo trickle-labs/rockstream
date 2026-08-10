@@ -18,6 +18,21 @@ table before writing the sign-off.
 
 ---
 
+## ⚡ Fast Test Execution & Summary Lines Only
+
+1. **Leverage Fast E2E & Nextest**:
+   - For E2E verification, run `rtk make e2e` (or `rtk make e2e-nextest`), which executes warm in ~9 seconds.
+   - Extract summary lines only to keep context windows clean and token costs low:
+     ```bash
+     rtk cargo test -p <crate> --test <test_target> <test_name> 2>&1 | grep -E "^test .* (ok|FAILED|ignored)|^test result:|^FAILED$|^error"
+     ```
+
+2. **Extract Summary Lines Only**:
+   Show full output **only for FAILED tests**. Passing test noise balloons the context
+   cache and gets re-read on every subsequent turn, multiplying token costs 10–30×.
+
+---
+
 ## Phase 5: Sign Off
 
 1. Create the sign-off template: `rtk make approve VERSION=<X.Y>` (pass the
@@ -28,7 +43,7 @@ table before writing the sign-off.
    if any `- [ ]` remains.
 3. Update the version's status in the roadmap to `✅ Done` only after the
    sign-off is complete.
-4. Run `rtk ./scripts/check-exit-criteria.sh` and `rtk make e2e` and confirm
+4. Run `rtk ./scripts/check-exit-criteria.sh` and `rtk make e2e` (or `rtk make e2e-nextest`) and confirm
    both pass.
 
 ---
