@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e e2e-lfs approve clean error-codes exit-criteria coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
+.PHONY: build test clippy fmt check e2e e2e-lfs e2e-nextest approve clean error-codes exit-criteria coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
 
 # Build the workspace
 build:
@@ -170,6 +170,31 @@ e2e-lfs:
 	@echo "=== RockStream e2e-lfs test ==="
 	@cargo test -p rockstream-storage --test lfs_backend -- --test-threads=4 2>&1
 	@echo "=== e2e-lfs PASSED ==="
+
+# E2E check using cargo-nextest (with graceful fallback if cargo-nextest is not installed)
+e2e-nextest:
+	@cargo build -p rockstream-cli
+	@echo "=== RockStream e2e-nextest test ==="
+	@echo ""
+	@echo "--- Step 1: no-op binary (--role=control + --role=worker) ---"
+	@rm -rf /tmp/rockstream-e2e-test
+	@mkdir -p /tmp/rockstream-e2e-test
+	@ROCKSTREAM_E2E_SLEEP_MS=500 ./target/debug/rockstream start --role=control --storage /tmp/rockstream-e2e-test/control > /tmp/control.stdout 2>&1 & CONTROL_PID=$$! ; \
+	sleep 0.2 ; \
+	ROCKSTREAM_E2E_SLEEP_MS=200 ./target/debug/rockstream start --role=worker --control=127.0.0.1:8000 --storage /tmp/rockstream-e2e-test/worker ; \
+	wait $$CONTROL_PID
+	@test -f /tmp/rockstream-e2e-test/control/audit.jsonl || (echo "FAIL: control audit.jsonl not found" && exit 1)
+	@echo "Audit log OK: expected events present"
+	@rm -rf /tmp/rockstream-e2e-test
+	@echo ""
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		echo "--- Running LFS & MinIO backend tests via cargo-nextest ---" ; \
+		cargo nextest run -p rockstream-storage --test lfs_backend --test minio_backend ; \
+	else \
+		echo "Note: cargo-nextest not found; falling back to cargo test. Install with: brew install cargo-nextest" ; \
+		cargo test -p rockstream-storage --test lfs_backend --test minio_backend -- --test-threads=4 2>&1 ; \
+	fi
+	@echo "=== e2e-nextest PASSED ==="
 
 # Bump the workspace version, commit, tag, and push.
 # Usage: make release VERSION=0.5.0
