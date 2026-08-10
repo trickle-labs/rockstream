@@ -127,15 +127,16 @@ bench-baseline-update:
 # Satisfies the v0.3 proof: "make e2e brings up MinIO + 1 worker + 1 control and tears
 # it down."  The MinIO tests use TestContainers to provision a real MinIO instance; the
 # LFS tests run against a local-filesystem-backed SlateDB without containers.
-e2e: build
+e2e:
+	@cargo build -p rockstream-cli
 	@echo "=== RockStream e2e test ==="
 	@echo ""
 	@echo "--- Step 1: no-op binary (--role=control + --role=worker) ---"
 	@rm -rf /tmp/rockstream-e2e-test
 	@mkdir -p /tmp/rockstream-e2e-test
-	@ROCKSTREAM_E2E_SLEEP_MS=4000 ./target/debug/rockstream start --role=control --storage /tmp/rockstream-e2e-test/control > /tmp/control.stdout 2>&1 & CONTROL_PID=$$! ; \
-	sleep 1 ; \
-	ROCKSTREAM_E2E_SLEEP_MS=1000 ./target/debug/rockstream start --role=worker --control=127.0.0.1:8000 --storage /tmp/rockstream-e2e-test/worker ; \
+	@ROCKSTREAM_E2E_SLEEP_MS=500 ./target/debug/rockstream start --role=control --storage /tmp/rockstream-e2e-test/control > /tmp/control.stdout 2>&1 & CONTROL_PID=$$! ; \
+	sleep 0.2 ; \
+	ROCKSTREAM_E2E_SLEEP_MS=200 ./target/debug/rockstream start --role=worker --control=127.0.0.1:8000 --storage /tmp/rockstream-e2e-test/worker ; \
 	wait $$CONTROL_PID
 	@test -f /tmp/rockstream-e2e-test/control/audit.jsonl || (echo "FAIL: control audit.jsonl not found" && exit 1)
 	@grep -q "pipeline.created" /tmp/rockstream-e2e-test/control/audit.jsonl || (echo "FAIL: pipeline.created event missing" && exit 1)
@@ -158,7 +159,7 @@ e2e: build
 	@echo ""
 	@echo "--- Step 3: MinIO backend integration tests (SlateDB on S3 via TestContainers) ---"
 	@echo "Note: requires Docker; tests auto-skip if Docker is unavailable."
-	@cargo test -p rockstream-storage --test minio_backend -- --test-threads=1 2>&1
+	@cargo test -p rockstream-storage --test minio_backend -- --test-threads=4 2>&1
 	@echo "MinIO backend tests PASSED (or skipped if Docker not available)"
 	@echo ""
 	@echo "=== e2e PASSED ==="

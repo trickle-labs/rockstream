@@ -27,10 +27,22 @@ use tempfile::TempDir;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
+fn fast_settings() -> slatedb::config::Settings {
+    slatedb::config::Settings {
+        flush_interval: Some(std::time::Duration::from_millis(10)),
+        manifest_poll_interval: std::time::Duration::from_millis(10),
+        ..slatedb::config::Settings::default()
+    }
+}
+
 /// Open a `ShardDb` rooted at `dir` using the local filesystem object store.
 async fn lfs_shard(dir: &TempDir) -> ShardDb {
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-    ShardDb::builder("shard", store).build().await.unwrap()
+    ShardDb::builder("shard", store)
+        .with_settings(fast_settings())
+        .build()
+        .await
+        .unwrap()
 }
 
 /// Open a `ShardReader` rooted at `dir` using the local filesystem store.
@@ -245,7 +257,11 @@ async fn lfs_scan_and_delete_cleanup_no_range_delete() {
 async fn lfs_determinism_gate_bit_identical_kv_state() {
     async fn run_workload(dir: &TempDir) -> Vec<(Bytes, Bytes)> {
         let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-        let db = ShardDb::builder("shard", store).build().await.unwrap();
+        let db = ShardDb::builder("shard", store)
+            .with_settings(fast_settings())
+            .build()
+            .await
+            .unwrap();
 
         // ── deterministic puts ──────────────────────────────────────────────
         for i in 0u64..100 {
@@ -318,7 +334,11 @@ async fn lfs_determinism_gate_bit_identical_kv_state() {
 async fn lfs_determinism_gate_interleaved_operations() {
     async fn run_interleaved(dir: &TempDir) -> Vec<(Bytes, Bytes)> {
         let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-        let db = ShardDb::builder("shard", store).build().await.unwrap();
+        let db = ShardDb::builder("shard", store)
+            .with_settings(fast_settings())
+            .build()
+            .await
+            .unwrap();
 
         for epoch in 0u64..5 {
             // Puts for this epoch.
@@ -384,7 +404,11 @@ async fn lfs_data_survives_close_and_reopen() {
     // Round 1: write and flush.
     {
         let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-        let db = ShardDb::builder("shard", store).build().await.unwrap();
+        let db = ShardDb::builder("shard", store)
+            .with_settings(fast_settings())
+            .build()
+            .await
+            .unwrap();
         db.put(b"persistent", b"yes").await.unwrap();
         db.flush().await.unwrap();
         db.close().await.unwrap();
@@ -393,7 +417,11 @@ async fn lfs_data_survives_close_and_reopen() {
     // Round 2: re-open and verify.
     {
         let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-        let db = ShardDb::builder("shard", store).build().await.unwrap();
+        let db = ShardDb::builder("shard", store)
+            .with_settings(fast_settings())
+            .build()
+            .await
+            .unwrap();
         assert_eq!(
             db.get(b"persistent").await.unwrap(),
             Some(Bytes::from("yes")),
@@ -438,6 +466,7 @@ async fn fencing_lfs() {
 
     // 1. Open writer 1 and write a key.
     let db1 = ShardDb::builder("shard", store.clone())
+        .with_settings(fast_settings())
         .build()
         .await
         .unwrap();
@@ -445,6 +474,7 @@ async fn fencing_lfs() {
 
     // 2. Open writer 2 on the same prefix. This should fence out writer 1.
     let db2 = ShardDb::builder("shard", store.clone())
+        .with_settings(fast_settings())
         .build()
         .await
         .unwrap();

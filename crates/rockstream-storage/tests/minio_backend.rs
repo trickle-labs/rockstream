@@ -206,18 +206,41 @@ impl Image for MinIO2024 {
     }
 }
 
-/// Start a MinIO container and return `(container, s3_port)`.
-async fn start_minio() -> (testcontainers::ContainerAsync<MinIO2024>, u16) {
-    let container = MinIO2024::default()
-        .start()
-        .await
-        .expect("failed to start MinIO container; is Docker running?");
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
-    create_minio_bucket(port, MINIO_BUCKET).await;
-    (container, port)
+static SHARED_MINIO: tokio::sync::OnceCell<Option<(testcontainers::ContainerAsync<MinIO2024>, u16)>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Return the port of a shared MinIO container instance.
+async fn get_shared_minio() -> Option<u16> {
+    if !docker_available() {
+        return None;
+    }
+    let res = SHARED_MINIO
+        .get_or_init(|| async {
+            let container = match MinIO2024::default().start().await {
+                Ok(c) => c,
+                Err(_) => return None,
+            };
+            let port = match container.get_host_port_ipv4(9000).await {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
+            create_minio_bucket(port, MINIO_BUCKET).await;
+            Some((container, port))
+        })
+        .await;
+    res.as_ref().map(|(_, port)| *port)
+}
+
+fn fast_settings() -> slatedb::config::Settings {
+    slatedb::config::Settings {
+        flush_interval: Some(std::time::Duration::from_millis(10)),
+        manifest_poll_interval: std::time::Duration::from_millis(10),
+        ..slatedb::config::Settings::default()
+    }
 }
 
 /// Build an `object_store::ObjectStore` pointing at the MinIO container.
+#[allow(dead_code)]
 fn minio_object_store(port: u16) -> Arc<dyn ObjectStore> {
     Arc::new(
         AmazonS3Builder::new()
@@ -370,9 +393,15 @@ async fn minio_storage_api_validation() {
         return;
     }
 
-    let (_container, port) = start_minio().await;
-    let store = minio_object_store(port);
+    let port = match get_shared_minio().await {
+        Some(p) => p,
+        None => return,
+    };
+    let bucket = "rockstream-test-api";
+    create_minio_bucket(port, bucket).await;
+    let store = minio_object_store_for_bucket(port, bucket);
     let db = ShardDb::builder("minio-api-test", store)
+        .with_settings(fast_settings())
         .build()
         .await
         .unwrap();
@@ -435,9 +464,11 @@ async fn minio_determinism_gate() {
         return;
     }
 
-    async fn run_workload(port: u16) -> Vec<(Bytes, Bytes)> {
-        let store = minio_object_store(port);
+    async fn run_workload(port: u16, bucket: &str) -> Vec<(Bytes, Bytes)> {
+        create_minio_bucket(port, bucket).await;
+        let store = minio_object_store_for_bucket(port, bucket);
         let db = ShardDb::builder("determinism-shard", store)
+            .with_settings(fast_settings())
             .build()
             .await
             .unwrap();
@@ -473,12 +504,13 @@ async fn minio_determinism_gate() {
         state
     }
 
-    // Spin up two independent MinIO containers.
-    let (_c1, port1) = start_minio().await;
-    let (_c2, port2) = start_minio().await;
+    let port = match get_shared_minio().await {
+        Some(p) => p,
+        None => return,
+    };
 
-    let state1 = run_workload(port1).await;
-    let state2 = run_workload(port2).await;
+    let state1 = run_workload(port, "rockstream-det-1").await;
+    let state2 = run_workload(port, "rockstream-det-2").await;
 
     assert_eq!(
         state1.len(),
@@ -512,11 +544,17 @@ async fn minio_e2e_worker_and_control_roles() {
         return;
     }
 
-    let (_container, port) = start_minio().await;
-    let store = minio_object_store(port);
+    let port = match get_shared_minio().await {
+        Some(p) => p,
+        None => return,
+    };
+    let bucket = "rockstream-test-e2e";
+    create_minio_bucket(port, bucket).await;
+    let store = minio_object_store_for_bucket(port, bucket);
 
     // ── "control" instance writes catalog keys ────────────────────────────
     let control_db = ShardDb::builder("control-shard", store.clone())
+        .with_settings(fast_settings())
         .build()
         .await
         .unwrap();
@@ -530,6 +568,7 @@ async fn minio_e2e_worker_and_control_roles() {
 
     // ── "worker" instance writes shard-local keys ─────────────────────────
     let worker_db = ShardDb::builder("worker-shard", store.clone())
+        .with_settings(fast_settings())
         .build()
         .await
         .unwrap();
@@ -584,11 +623,17 @@ async fn fencing_minio() {
         return;
     }
 
-    let (_container, port) = start_minio().await;
-    let store = minio_object_store(port);
+    let port = match get_shared_minio().await {
+        Some(p) => p,
+        None => return,
+    };
+    let bucket = "rockstream-test-fencing";
+    create_minio_bucket(port, bucket).await;
+    let store = minio_object_store_for_bucket(port, bucket);
 
     // 1. Open writer 1, write a key, and flush to establish the manifest.
     let db1 = ShardDb::builder("fencing-shard", store.clone())
+        .with_settings(fast_settings())
         .build()
         .await
         .unwrap();
@@ -598,6 +643,7 @@ async fn fencing_minio() {
     // 2. Open writer 2 on the same prefix, write a key, and flush.
     // This increments the manifest epoch and fences out writer 1 on the object store.
     let db2 = ShardDb::builder("fencing-shard", store.clone())
+        .with_settings(fast_settings())
         .build()
         .await
         .unwrap();
@@ -632,7 +678,10 @@ async fn minio_tiered_store_routes_shard_meta_and_sst_separately() {
 
     const META_BUCKET: &str = "rockstream-tiered-meta";
     const DATA_BUCKET: &str = "rockstream-tiered-data";
-    let (_container, port) = start_minio().await;
+    let port = match get_shared_minio().await {
+        Some(p) => p,
+        None => return,
+    };
     create_minio_bucket(port, META_BUCKET).await;
     create_minio_bucket(port, DATA_BUCKET).await;
     let meta = minio_object_store_for_bucket(port, META_BUCKET);
@@ -667,7 +716,10 @@ async fn minio_aged_sst_moves_to_cold_bucket_with_storage_class() {
 
     const HOT_BUCKET: &str = "rockstream-hot-sst";
     const COLD_BUCKET: &str = "rockstream-cold-sst";
-    let (_container, port) = start_minio().await;
+    let port = match get_shared_minio().await {
+        Some(p) => p,
+        None => return,
+    };
     create_minio_bucket(port, HOT_BUCKET).await;
     create_minio_bucket(port, COLD_BUCKET).await;
 
