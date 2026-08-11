@@ -223,7 +223,11 @@ pub const RS_2404: ErrorCode = ErrorCode::new(2404);
 /// next_steps: "Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process."
 pub const RS_2405: ErrorCode = ErrorCode::new(2405);
 
-// 3xxx: Merge / arrangement
+/// mTLS connection cap reached; handshake rejected because `MTLS_CN_BY_PEER_ADDR`
+/// is at `MAX_CONNECTIONS` capacity (v0.51.26, `auth.mtls_connection_cap_exceeded`).
+/// next_steps: "Reduce concurrent connections or raise MAX_CONNECTIONS. The gateway rejected the handshake to avoid silently dropping the peer identity."
+pub const RS_2406: ErrorCode = ErrorCode::new(2406);
+
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
 /// Durable shuffle rate-limit retry budget exhausted (v0.45.7, split from RS-3010).
@@ -405,6 +409,7 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2403 => "auth.mtls_requires_ca_cert",
         2404 => "auth.mtls_no_verified_cert",
         2405 => "auth.tls_config_invalid",
+        2406 => "auth.mtls_connection_cap_exceeded",
         1014 => "workload.has_assigned_views",
         9001 => "admission_control.rejected",
         1731 => "control.not_leader",
@@ -518,6 +523,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         2403 => "--auth=mtls configured without tls_ca_cert_path; gateway refused to start",
         2404 => "mTLS connection has no verified client certificate CN for its peer address",
         2405 => "Gateway TLS certificate/key/CA material failed to load or parse",
+        2406 => "mTLS handshake rejected: connection identity map is at capacity",
         _ => "Unknown error",
     }
 }
@@ -555,6 +561,7 @@ pub fn severity(code: ErrorCode) -> Severity {
         2403 => Severity::Fatal,
         2404 => Severity::Fatal,
         2405 => Severity::Fatal,
+        2406 => Severity::Error,
         _ => Severity::Error,
     }
 }
@@ -662,6 +669,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2403 => "Set --tls-ca-cert-path (or gateway.tls_ca_cert_path in rockstream.toml) to the CA that signs client certificates.",
         2404 => "Connect with a client certificate signed by the configured CA over sslmode=verify-full; a bare TCP or TLS connection without a client cert cannot use --auth=mtls.",
         2405 => "Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process.",
+        2406 => "Reduce concurrent connections or raise MAX_CONNECTIONS. The gateway rejected the handshake to avoid silently dropping the peer identity.",
         _ => "See documentation for this error code.",
     }
 }
@@ -713,7 +721,7 @@ mod tests {
             RS_8002, RS_8003, // v0.45.6 frontier-lease publisher fencing (M2-S3)
             RS_2013, RS_2022, // v0.48 UPDATE/DELETE RETURNING (Track A)
             RS_1019, // v0.51.4 Slice 8 — CREATE VIEW compile-failure is a real error
-            RS_2403, RS_2404, RS_2405, // v0.51.5 gateway TLS/mTLS
+            RS_2403, RS_2404, RS_2405, RS_2406, // v0.51.5-v0.51.26 gateway TLS/mTLS
             RS_2028, // v0.51.12 bounded late-data side-channel
         ];
         for code in codes {

@@ -317,7 +317,11 @@ impl WorkerStreamMultiplexer {
                 if tx.send(frame.clone()).await.is_ok() {
                     fast_path_ok = true;
                 } else {
-                    self.streams.lock().remove(&target_worker);
+                    let mut streams = self.streams.lock();
+                    streams.remove(&target_worker);
+                    rockstream_types::metrics::set_exchange_multiplexer_streams_size(
+                        streams.len() as u64
+                    );
                 }
             }
         }
@@ -367,7 +371,13 @@ impl WorkerStreamMultiplexer {
                                 }
                             });
 
-                            self.streams.lock().insert(target_worker, tx.clone());
+                            {
+                                let mut streams = self.streams.lock();
+                                streams.insert(target_worker, tx.clone());
+                                rockstream_types::metrics::set_exchange_multiplexer_streams_size(
+                                    streams.len() as u64,
+                                );
+                            }
                             if tx.send(frame.clone()).await.is_ok() {
                                 fast_path_ok = true;
                             }
@@ -607,5 +617,12 @@ impl WorkerStreamMultiplexer {
     /// Returns the number of active cached worker-to-worker streams.
     pub fn connection_count(&self) -> usize {
         self.streams.lock().len()
+    }
+
+    /// Evict a dead or drained worker's stream from the multiplexer and update metrics gauge.
+    pub fn evict_worker(&self, worker_id: WorkerId) {
+        let mut streams = self.streams.lock();
+        streams.remove(&worker_id);
+        rockstream_types::metrics::set_exchange_multiplexer_streams_size(streams.len() as u64);
     }
 }

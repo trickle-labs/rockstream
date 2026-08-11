@@ -16,6 +16,8 @@ pub const HTTP_WEBHOOK_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const HTTP_WEBHOOK_LOCAL_BUFFER_MAX_EPOCHS: usize = 1024;
 /// Maximum committed delivery identities retained for exactly-once retries.
 pub const HTTP_WEBHOOK_DEDUP_MAX_ENTRIES: usize = 4096;
+/// Default TTL for unacknowledged pending webhook deliveries.
+pub const HTTP_WEBHOOK_PENDING_DEFAULT_TTL_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebhookFormat {
@@ -94,6 +96,8 @@ pub struct HttpWebhookSource {
     paused: bool,
     accepted: VecDeque<WebhookEpoch>,
     pending: HashSet<String>,
+    pending_timestamps: std::collections::HashMap<String, std::time::Instant>,
+    pending_ttl: std::time::Duration,
     committed: HashSet<String>,
     committed_order: VecDeque<String>,
     watermark: Option<u64>,
@@ -109,11 +113,62 @@ impl HttpWebhookSource {
             paused: false,
             accepted: VecDeque::new(),
             pending: HashSet::new(),
+            pending_timestamps: std::collections::HashMap::new(),
+            pending_ttl: std::time::Duration::from_secs(HTTP_WEBHOOK_PENDING_DEFAULT_TTL_SECS),
             committed: HashSet::new(),
             committed_order: VecDeque::new(),
             watermark: None,
             next_epoch: 0,
         }
+    }
+
+    pub fn set_pending_ttl(&mut self, ttl: std::time::Duration) {
+        self.pending_ttl = ttl;
+    }
+
+    pub fn with_pending_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.pending_ttl = ttl;
+        self
+    }
+
+    fn update_metric(&self) {
+        rockstream_types::metrics::set_webhook_pending_size(self.pending.len() as u64);
+    }
+
+    /// Evict unacknowledged pending deliveries older than `pending_ttl`.
+    pub fn evict_expired_pending(&mut self) -> usize {
+        self.evict_expired_pending_at(std::time::Instant::now())
+    }
+
+    /// Evict unacknowledged pending deliveries older than `pending_ttl` relative to `now`.
+    pub fn evict_expired_pending_at(&mut self, now: std::time::Instant) -> usize {
+        let ttl = self.pending_ttl;
+        let expired_ids: Vec<String> = self
+            .pending_timestamps
+            .iter()
+            .filter_map(|(id, &created)| {
+                if now.duration_since(created) >= ttl {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let count = expired_ids.len();
+        for id in &expired_ids {
+            self.pending.remove(id);
+            self.pending_timestamps.remove(id);
+            if let Some(index) = self
+                .accepted
+                .iter()
+                .position(|epoch| epoch.delivery_id == *id)
+            {
+                self.accepted.remove(index);
+            }
+        }
+        self.update_metric();
+        count
     }
 
     pub fn set_paused(&mut self, paused: bool) {
@@ -146,6 +201,7 @@ impl HttpWebhookSource {
         delivery_id: Option<&str>,
         payload: &[u8],
     ) -> WebhookResult {
+        self.evict_expired_pending();
         if !constant_time_eq(token, &self.expected_token) {
             return WebhookResult::Unauthorized;
         }
@@ -170,6 +226,9 @@ impl HttpWebhookSource {
             return WebhookResult::Full;
         }
         self.pending.insert(identity.clone());
+        self.pending_timestamps
+            .insert(identity.clone(), std::time::Instant::now());
+        self.update_metric();
         self.next_epoch += 1;
         self.accepted.push_back(WebhookEpoch {
             source_epoch: self.next_epoch,
@@ -198,6 +257,8 @@ impl HttpWebhookSource {
             .position(|epoch| epoch.delivery_id == delivery_id)?;
         let epoch = self.accepted.remove(index)?;
         self.pending.remove(&epoch.delivery_id);
+        self.pending_timestamps.remove(&epoch.delivery_id);
+        self.update_metric();
         self.committed.insert(epoch.delivery_id.clone());
         self.committed_order.push_back(epoch.delivery_id.clone());
         while self.committed_order.len() > HTTP_WEBHOOK_DEDUP_MAX_ENTRIES {
@@ -227,7 +288,10 @@ impl HttpWebhookSource {
         let Some(epoch) = self.accepted.remove(index) else {
             return false;
         };
-        self.pending.remove(&epoch.delivery_id)
+        self.pending_timestamps.remove(&epoch.delivery_id);
+        let removed = self.pending.remove(&epoch.delivery_id);
+        self.update_metric();
+        removed
     }
 }
 
@@ -275,5 +339,32 @@ mod tests {
             WebhookResult::Duplicate
         );
         assert_eq!((source.buffered_epochs(), source.commit_next()), (0, None));
+    }
+
+    #[test]
+    fn unacknowledged_delivery_ttl_eviction() {
+        let mut source = HttpWebhookSource::new("secret", WebhookFormat::Json)
+            .with_pending_ttl(std::time::Duration::from_secs(10));
+        let now = std::time::Instant::now();
+
+        assert_eq!(
+            source.accept(b"secret", Some("delivery-1"), br#"{"id":1}"#),
+            WebhookResult::Accepted
+        );
+        assert_eq!(
+            source.accept(b"secret", Some("delivery-1"), br#"{"id":1}"#),
+            WebhookResult::InFlight
+        );
+
+        let evicted = source.evict_expired_pending_at(now + std::time::Duration::from_secs(5));
+        assert_eq!(evicted, 0);
+
+        let evicted = source.evict_expired_pending_at(now + std::time::Duration::from_secs(15));
+        assert_eq!(evicted, 1);
+
+        assert_eq!(
+            source.accept(b"secret", Some("delivery-1"), br#"{"id":1}"#),
+            WebhookResult::Accepted
+        );
     }
 }

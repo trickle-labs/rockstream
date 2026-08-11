@@ -69,6 +69,34 @@ impl FlowController {
             .map(|state| state.rows_in_flight as u64)
             .sum::<u64>();
         rockstream_types::metrics::set_shuffle_rows_in_flight(rows_in_flight);
+        rockstream_types::metrics::set_exchange_flow_control_channels_size(channels.len() as u64);
+    }
+
+    /// Purge all channel credit state and notifier entries for the given exchange.
+    pub fn teardown_exchange(&self, exchange_id: u64) {
+        {
+            let mut channels = self.channels.lock();
+            channels.retain(|k, _| k.0 != exchange_id);
+            Self::update_metric(&channels);
+        }
+        let notified: Vec<Arc<Notify>> = {
+            let mut notifiers = self.notifiers.lock();
+            let keys: Vec<CreditKey> = notifiers
+                .keys()
+                .filter(|k| k.0 == exchange_id)
+                .cloned()
+                .collect();
+            let mut list = Vec::new();
+            for k in keys {
+                if let Some(n) = notifiers.remove(&k) {
+                    list.push(n);
+                }
+            }
+            list
+        };
+        for n in notified {
+            n.notify_waiters();
+        }
     }
 
     fn channel_state<'a>(

@@ -18,6 +18,7 @@ use rustls::{DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureS
 use tokio_rustls::TlsAcceptor;
 
 use crate::server::MAX_CONNECTIONS;
+use rockstream_types::error_code::RS_2406;
 
 /// Error building the gateway's TLS configuration from configured
 /// cert/key/CA paths, or a startup misconfiguration (mTLS without a CA).
@@ -206,10 +207,20 @@ impl ClientCertVerifier for MtlsCnExtractingVerifier {
             .verify_client_cert(end_entity, intermediates, now)?;
         if let Some(cn) = parse_leaf_cn(end_entity) {
             if let Ok(peer_addr) = crate::server::PEER_ADDR.try_with(|a| *a) {
-                if MTLS_CN_BY_PEER_ADDR.len() < MAX_CONNECTIONS {
-                    MTLS_CN_BY_PEER_ADDR.insert(peer_addr, cn);
-                    MTLS_CN_RECORDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                if MTLS_CN_BY_PEER_ADDR.len() >= MAX_CONNECTIONS {
+                    tracing::error!(
+                        code = %RS_2406,
+                        peer_addr = %peer_addr,
+                        max_connections = MAX_CONNECTIONS,
+                        "[RS-2406] mTLS handshake rejected: identity map at capacity. next_steps: Reduce concurrent connections or raise MAX_CONNECTIONS."
+                    );
+                    return Err(rustls::Error::General(format!(
+                        "[RS-2406] mTLS connection cap ({MAX_CONNECTIONS}) reached; handshake rejected. next_steps: Reduce concurrent connections or raise MAX_CONNECTIONS."
+                    )));
                 }
+                MTLS_CN_BY_PEER_ADDR.insert(peer_addr, cn);
+                rockstream_types::metrics::set_mtls_cn_cache_size(MTLS_CN_BY_PEER_ADDR.len() as u64);
+                MTLS_CN_RECORDED_TOTAL.fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(verified)
@@ -242,6 +253,7 @@ impl ClientCertVerifier for MtlsCnExtractingVerifier {
 /// unbounded across reconnects.
 pub fn remove_mtls_cn(peer_addr: &SocketAddr) {
     MTLS_CN_BY_PEER_ADDR.remove(peer_addr);
+    rockstream_types::metrics::set_mtls_cn_cache_size(MTLS_CN_BY_PEER_ADDR.len() as u64);
 }
 
 /// Look up the CN recorded for `peer_addr` during the mTLS handshake (called

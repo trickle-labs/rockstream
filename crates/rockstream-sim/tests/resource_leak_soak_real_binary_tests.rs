@@ -3,6 +3,9 @@
 //! This target is deliberately Docker-only. Its scheduled invocation supplies
 //! the four-hour wall-clock budget; developers may set a short duration while
 //! retaining the identical pgwire/source/view workload and resource gate.
+//!
+//! The three soak tests are serialized by `SOAK_SERIALIZATION_LOCK` so that
+//! concurrent Docker containers do not cause false resource-gate failures.
 
 #![cfg(feature = "docker_tests")]
 
@@ -10,6 +13,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Child, Command},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -24,6 +28,12 @@ use tokio::{
     time::sleep,
 };
 use tokio_postgres::NoTls;
+
+/// Serializes the Docker-based soak tests within the same test binary.
+/// Without this, parallel container workloads inflate RSS/FD/socket baselines
+/// and cause false gate failures.
+static SOAK_SERIALIZATION_LOCK: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
 
 const IMAGE_NAME: &str = "rockstream-tc-test";
 const IMAGE_TAG: &str = "latest";
@@ -569,15 +579,18 @@ async fn run_soak(inject_teardown_leak: bool, use_minio: bool) {
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_lfs_churn_is_flat() {
+    let _lock = SOAK_SERIALIZATION_LOCK.lock().unwrap();
     run_soak(false, false).await;
 }
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_minio_churn_is_flat() {
+    let _lock = SOAK_SERIALIZATION_LOCK.lock().unwrap();
     run_soak(false, true).await;
 }
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_injected_teardown_deregistration_leak_fails_gate() {
+    let _lock = SOAK_SERIALIZATION_LOCK.lock().unwrap();
     run_soak(true, false).await;
 }

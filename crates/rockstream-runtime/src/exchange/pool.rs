@@ -86,15 +86,32 @@ impl ShuffleClientPool {
         failures.get(&worker_id).copied().unwrap_or(0) >= self.config.max_retries
     }
 
+    fn update_metric(&self) {
+        let count = self.clients.read().len() + self.shm_clients.read().len();
+        rockstream_types::metrics::set_exchange_pool_clients_size(count as u64);
+    }
+
+    /// Evict cached gRPC and SHM clients, peer address, peer info, and failure count for a dead or drained worker.
+    pub fn evict_worker(&self, worker_id: WorkerId) {
+        self.peers.write().remove(&worker_id);
+        self.peer_infos.write().remove(&worker_id);
+        self.clients.write().remove(&worker_id);
+        self.shm_clients.write().remove(&worker_id);
+        self.consecutive_failures.write().remove(&worker_id);
+        self.update_metric();
+    }
+
     pub fn reset_circuit_breaker(&self, worker_id: WorkerId) {
         self.consecutive_failures.write().remove(&worker_id);
         self.clients.write().remove(&worker_id);
+        self.update_metric();
     }
 
     pub fn record_failure(&self, worker_id: WorkerId) {
         let mut failures = self.consecutive_failures.write();
         *failures.entry(worker_id).or_insert(0) += 1;
         self.clients.write().remove(&worker_id);
+        self.update_metric();
     }
 
     pub fn record_success(&self, worker_id: WorkerId) {
@@ -159,6 +176,7 @@ impl ShuffleClientPool {
                     let client = ShuffleServiceClient::new(channel);
                     self.record_success(worker_id);
                     self.clients.write().insert(worker_id, client.clone());
+                    self.update_metric();
                     return Ok(client);
                 }
                 Err(e) => {
@@ -191,6 +209,7 @@ impl ShuffleClientPool {
         }
         let client = SharedMemoryClient::new(worker_id);
         self.shm_clients.write().insert(worker_id, client);
+        self.update_metric();
         Ok(client)
     }
 }

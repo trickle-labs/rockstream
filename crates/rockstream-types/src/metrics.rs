@@ -211,6 +211,11 @@ struct MetricRegistry {
     shuffle_rows_in_flight: AtomicU64,
     shuffle_compression_disabled_total: AtomicU64,
     shuffle_compression_state_entries: AtomicU64,
+    exchange_flow_control_channels_size: AtomicU64,
+    exchange_multiplexer_streams_size: AtomicU64,
+    exchange_pool_clients_size: AtomicU64,
+    webhook_pending_size: AtomicU64,
+    mtls_cn_cache_size: AtomicU64,
 
     // Flush duration metrics
     flush_duration_sum_ms: AtomicU64,
@@ -288,6 +293,11 @@ impl MetricRegistry {
             shuffle_rows_in_flight: AtomicU64::new(0),
             shuffle_compression_disabled_total: AtomicU64::new(0),
             shuffle_compression_state_entries: AtomicU64::new(0),
+            exchange_flow_control_channels_size: AtomicU64::new(0),
+            exchange_multiplexer_streams_size: AtomicU64::new(0),
+            exchange_pool_clients_size: AtomicU64::new(0),
+            webhook_pending_size: AtomicU64::new(0),
+            mtls_cn_cache_size: AtomicU64::new(0),
             flush_duration_sum_ms: AtomicU64::new(0),
             flush_duration_count: AtomicU64::new(0),
             flush_duration_last_ms: AtomicU64::new(0),
@@ -710,6 +720,13 @@ pub fn reset_all() {
             .store(0, Ordering::Relaxed);
         reg.shuffle_compression_state_entries
             .store(0, Ordering::Relaxed);
+        reg.exchange_flow_control_channels_size
+            .store(0, Ordering::Relaxed);
+        reg.exchange_multiplexer_streams_size
+            .store(0, Ordering::Relaxed);
+        reg.exchange_pool_clients_size.store(0, Ordering::Relaxed);
+        reg.webhook_pending_size.store(0, Ordering::Relaxed);
+        reg.mtls_cn_cache_size.store(0, Ordering::Relaxed);
         reg.flush_duration_sum_ms.store(0, Ordering::Relaxed);
         reg.flush_duration_count.store(0, Ordering::Relaxed);
         reg.flush_duration_last_ms.store(0, Ordering::Relaxed);
@@ -1128,6 +1145,65 @@ pub fn set_shuffle_rows_in_flight(rows: u64) {
 
 pub fn read_shuffle_rows_in_flight() -> u64 {
     with_registry(|reg| reg.shuffle_rows_in_flight.load(Ordering::Relaxed))
+}
+
+pub fn set_exchange_flow_control_channels_size(size: u64) {
+    with_registry(|reg| {
+        reg.exchange_flow_control_channels_size
+            .store(size, Ordering::Relaxed);
+    });
+}
+
+pub fn read_exchange_flow_control_channels_size() -> u64 {
+    with_registry(|reg| {
+        reg.exchange_flow_control_channels_size
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn set_exchange_multiplexer_streams_size(size: u64) {
+    with_registry(|reg| {
+        reg.exchange_multiplexer_streams_size
+            .store(size, Ordering::Relaxed);
+    });
+}
+
+pub fn read_exchange_multiplexer_streams_size() -> u64 {
+    with_registry(|reg| {
+        reg.exchange_multiplexer_streams_size
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn set_exchange_pool_clients_size(size: u64) {
+    with_registry(|reg| {
+        reg.exchange_pool_clients_size
+            .store(size, Ordering::Relaxed);
+    });
+}
+
+pub fn read_exchange_pool_clients_size() -> u64 {
+    with_registry(|reg| reg.exchange_pool_clients_size.load(Ordering::Relaxed))
+}
+
+pub fn set_webhook_pending_size(size: u64) {
+    with_registry(|reg| {
+        reg.webhook_pending_size.store(size, Ordering::Relaxed);
+    });
+}
+
+pub fn read_webhook_pending_size() -> u64 {
+    with_registry(|reg| reg.webhook_pending_size.load(Ordering::Relaxed))
+}
+
+pub fn set_mtls_cn_cache_size(size: u64) {
+    with_registry(|reg| {
+        reg.mtls_cn_cache_size.store(size, Ordering::Relaxed);
+    });
+}
+
+pub fn read_mtls_cn_cache_size() -> u64 {
+    with_registry(|reg| reg.mtls_cn_cache_size.load(Ordering::Relaxed))
 }
 
 pub fn inc_shuffle_compression_disabled_total() {
@@ -1552,6 +1628,49 @@ pub fn generate_prometheus_metrics() -> String {
             }
             out.push('\n');
         }
+
+        out.push_str("# HELP exchange_flow_control_channels_size Gauge showing active flow control channels count.\n");
+        out.push_str("# TYPE exchange_flow_control_channels_size gauge\n");
+        out.push_str(&format!(
+            "exchange_flow_control_channels_size {}\n\n",
+            reg.exchange_flow_control_channels_size
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP exchange_multiplexer_streams_size Gauge showing active multiplexer outgoing streams count.\n");
+        out.push_str("# TYPE exchange_multiplexer_streams_size gauge\n");
+        out.push_str(&format!(
+            "exchange_multiplexer_streams_size {}\n\n",
+            reg.exchange_multiplexer_streams_size
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP exchange_pool_clients_size Gauge showing cached shuffle pool clients count.\n",
+        );
+        out.push_str("# TYPE exchange_pool_clients_size gauge\n");
+        out.push_str(&format!(
+            "exchange_pool_clients_size {}\n\n",
+            reg.exchange_pool_clients_size.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP webhook_pending_size Gauge showing unacknowledged pending webhooks count.\n",
+        );
+        out.push_str("# TYPE webhook_pending_size gauge\n");
+        out.push_str(&format!(
+            "webhook_pending_size {}\n\n",
+            reg.webhook_pending_size.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP mtls_cn_cache_size Gauge showing active mTLS CN peer entries count.\n",
+        );
+        out.push_str("# TYPE mtls_cn_cache_size gauge\n");
+        out.push_str(&format!(
+            "mtls_cn_cache_size {}\n\n",
+            reg.mtls_cn_cache_size.load(Ordering::Relaxed)
+        ));
     });
     out
 }
