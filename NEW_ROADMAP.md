@@ -7,6 +7,9 @@ into an ordered, evidence-producing build sequence. It complements:
 - [IVM.md](IVM.md) — how the incremental view maintenance engine works.
 - [NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) — the focused,
   two-pillar engineering plan this roadmap implements.
+- [ROCKSTREAM_PROJECT_FOCUS.md](ROCKSTREAM_PROJECT_FOCUS.md) — the strategic
+  classification (Tier A/B/C) and roadmap admission rule that new milestones
+  below must pass before they are added to this roadmap.
 
 It is deliberately narrow. The only goals are the **cloud-native IVM engine**
 and the **PostgreSQL wire access layer**. Everything outside those two pillars

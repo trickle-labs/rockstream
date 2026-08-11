@@ -19,6 +19,9 @@ strict dependency order with a named test gate at every step.
 > - [DESIGN.md](DESIGN.md) — system architecture.
 > - [IVM.md](IVM.md) — the IVM engine internals (PlanIR, differentiation pass,
 >   operator runtime). The milestone tags `IVM-n` below reference IVM.md §13.
+> - [ROCKSTREAM_PROJECT_FOCUS.md](ROCKSTREAM_PROJECT_FOCUS.md) — the v1
+>   public contract and strategic scope (what stays core vs. maintained-only)
+>   that governs which future phases get admitted to this plan.
 
 ---
 

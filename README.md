@@ -239,6 +239,7 @@ progressively more detail:
 | [IVM.md](IVM.md) | IVM specialists | How the incremental-view-maintenance engine itself works — DBSP-native operators, the differentiation pass, the circuit runtime, arrangements on SlateDB, and pg_trickle as a correctness oracle |
 | [NEW_IMPLEMENTATION_PLAN.md](NEW_IMPLEMENTATION_PLAN.md) | Implementers | The focused, two-pillar engineering plan (cloud-native IVM engine + PostgreSQL wire access layer) this roadmap implements |
 | [NEW_ROADMAP.md](NEW_ROADMAP.md) | Builders / planners | Version-by-version delivery roadmap, with each roadmap version sized at about 6 person-weeks and tied to concrete proof |
+| [ROCKSTREAM_PROJECT_FOCUS.md](ROCKSTREAM_PROJECT_FOCUS.md) | Maintainers / design partners | Strategic scope past v0.51.26: what stays core (Tier A), what stays maintained-only (Tier B), and the admission rule new breadth (Tier C) must pass |
 
 ## Roadmap
 

@@ -320,6 +320,12 @@ object storage.
 >   *what* the system is; IVM.md tells you *how the IVM core works*.
 > - [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — phased build plan that
 >   operationalizes both.
+> - [ROCKSTREAM_PROJECT_FOCUS.md](ROCKSTREAM_PROJECT_FOCUS.md) — this
+>   document describes what RockStream's architecture is *capable* of; that
+>   document decides which of those capabilities remain strategic-growth
+>   areas (Tier A), maintained-only (Tier B), or require admission before
+>   further investment (Tier C). A capability being designed and built here
+>   does not by itself commit the roadmap to expanding it further.
 
 ---
 

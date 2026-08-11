@@ -457,21 +457,37 @@ This prevents "Done" from being interpreted as "we must keep expanding this subs
 
 For public-facing features, track:
 
-| Capability | Implementation | Strategic tier | v1 guarantee |
-|---|---|---|---|
-| PostgreSQL CDC | Done | Core | Yes |
-| Kafka source/sink | Done | Core | Yes |
-| Materialized-view IVM | Done | Core | Yes |
-| Checkpoint/recovery | Done | Core | Yes |
-| PostgreSQL wire serving | Done | Core | Yes |
-| Arrangement spill | Done | Core | Yes |
-| Iceberg/Delta cold tier | Done | Maintain | Narrow existing contract |
-| Hot-key virtual bucketing | Done | Maintain | Existing behavior, no automatic expansion |
-| Advanced ad hoc analytics | Done/varied | Maintain | Separate from core IVM guarantee |
-| New connector family | Not applicable | Candidate | No without admission |
-| General local serializable OLTP | Planned | Candidate | No by default |
+| Capability | Implementation | Shipped at | Strategic tier | v1 guarantee |
+|---|---|---|---|---|
+| PostgreSQL CDC source | Done | v0.51.16 | Core | Yes |
+| Kafka source/sink | Done | v0.28, v0.51.21 (real client) | Core | Yes |
+| Materialized-view IVM (single-shard + distributed) | Done | v0.4–v0.22 | Core | Yes |
+| Checkpoint/recovery & fencing | Done | v0.20–v0.22 | Core | Yes |
+| PostgreSQL wire serving (auth, txn, LISTEN/NOTIFY) | Done | v0.23–v0.42 | Core | Yes |
+| Arrangement spill-to-SlateDB | Done | v0.51.24 | Core | Yes |
+| Operator state-size accounting & admission control | Done | v0.51.23 | Core | Yes |
+| Async-runtime hygiene / timeout & retry budgets | Done | v0.51.25 | Core | Yes |
+| Long-lived registry leak closure | Done | v0.51.26 | Core | Yes |
+| HTTP webhook/push source | Done | v0.51.16 | Maintain | Existing behavior, no automatic expansion |
+| Object-store / S3 source & sink | Done | v0.27–v0.29 | Maintain | Existing behavior, no automatic expansion |
+| Iceberg/Delta cold-tier sink | Done | v0.44 | Maintain | Narrow existing contract |
+| Secondary indexes | Done | v0.32, v0.51.2 | Maintain | Existing behavior, no automatic expansion |
+| Hot-key virtual buckets & proactive shard splitting | Done | v0.47 | Maintain | Existing behavior, no automatic expansion |
+| Autoscaling signals | Done | v0.47 | Maintain | Tied to IVM SLO only, not general elasticity |
+| Advanced ad hoc / multi-shard scatter-gather SQL | Done | v0.51.13 | Maintain | Separate from core IVM guarantee |
+| Advanced DML & scatter pruning | Done | v0.48, v0.51.1 | Maintain | Separate from core IVM guarantee |
+| Honest failure semantics (no silent-wrong-answer paths) | Planned | v0.51.27 | Core | Yes |
+| Inline expectations & lineage diagnostics | Planned | v0.52 | Candidate | Narrow to quarantine/DLQ per §6, no broad policy language |
+| DLQ routing & state degradation | Planned | v0.53 | Candidate | Narrow to durable quarantine per §6 |
+| Isolation & validation hooks (broader transactional semantics) | Planned | v0.54 | Candidate | No by default; requires concrete workload evidence per §6 |
+| Admin CLI & arrangement debugger | Planned | v0.55 | Core | Yes |
+| mTLS, secrets management & security review | Planned | v0.56 | Core | Yes |
+| Rolling upgrade proof & disaster recovery | Planned | v0.57 | Core | Yes |
+| New connector family (beyond PostgreSQL CDC / Kafka) | Not applicable | — | Candidate | No without admission |
+| General local `SERIALIZABLE` / broader OLTP semantics | Planned (v0.54 scope, contested) | v0.54 | Candidate | No by default |
 
-The exact rows should be generated from the current repository rather than copied blindly from this example.
+Rows above were generated from [NEW_ROADMAP.md](NEW_ROADMAP.md)'s version table as of v0.51.26;
+regenerate this matrix whenever the roadmap's Done/Planned status changes materially.
 
 ### 9.5 Stop using feature completeness as the primary roadmap metric
 
