@@ -90,7 +90,7 @@ impl TieredObjectStore {
                 Err(err) => return Err(err),
             }
         }
-        primary.get(location).await.map(|_| unreachable!())
+        op(primary).await
     }
 }
 

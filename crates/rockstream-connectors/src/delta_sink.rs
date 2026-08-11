@@ -787,7 +787,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cold_gc_reclaims_expired_snapshots_via_real_sink() {
         use crate::cold_gc::{ColdGc, ColdGcCatalog, ColdGcConfig};
-        use std::sync::Mutex;
+        use tokio::sync::Mutex;
 
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = Arc::new(FaultInjectingObjectStore::new(inner));
@@ -819,7 +819,7 @@ mod tests {
         drop(gc);
 
         let remaining_epochs = {
-            let sink = catalog.lock().unwrap();
+            let sink = catalog.lock().await;
             let snapshots_after = ColdGcCatalog::list_snapshots(&*sink).await.unwrap();
             let mut remaining_epochs: Vec<Epoch> =
                 snapshots_after.iter().map(|s| s.epoch).collect();
@@ -828,14 +828,9 @@ mod tests {
         };
         assert_eq!(remaining_epochs, vec![3, 4]);
 
-        // Drop the mutex lock before the `.await` points below (holding a
-        // std::sync::MutexGuard across an await is flagged by clippy and is
-        // a genuine footgun on a multi-threaded runtime), by taking the sink
-        // out of the Arc<Mutex> now that GC mutation is complete.
         let sink = Arc::try_unwrap(catalog)
             .unwrap_or_else(|_| panic!("catalog still shared"))
-            .into_inner()
-            .unwrap();
+            .into_inner();
         assert!(sink.read_snapshot(3).await.is_ok());
         assert!(sink.read_snapshot(4).await.is_ok());
     }

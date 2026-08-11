@@ -909,6 +909,24 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                     shards_remaining,
                     "control: drain ack received"
                 );
+                let state = if shards_remaining == 0 {
+                    WorkerLifecycleState::Decommissioned {
+                        completed_at_ms: now_ms(),
+                    }
+                } else {
+                    WorkerLifecycleState::Draining {
+                        shards_remaining,
+                        started_at_ms: now_ms(),
+                    }
+                };
+                if let Some(worker) = catalog.set_lifecycle(worker_id, state) {
+                    persist_worker_if_needed(topology_store.as_ref(), &worker).await;
+                }
+                if shards_remaining == 0 {
+                    shard_manager.release_worker(worker_id);
+                    let mut guard = drain_state.lock().await;
+                    guard.queue.retain(|task| task.donor_worker_id != worker_id);
+                }
             }
             WorkerMessage::LifecycleState { worker_id, state } => {
                 tracing::info!(
@@ -916,6 +934,14 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                     state = ?state,
                     "control: worker lifecycle state update"
                 );
+                if matches!(
+                    state,
+                    WorkerLifecycleState::Decommissioned { .. }
+                ) || matches!(state, WorkerLifecycleState::Draining { shards_remaining, .. } if shards_remaining == 0) {
+                    shard_manager.release_worker(worker_id);
+                    let mut guard = drain_state.lock().await;
+                    guard.queue.retain(|task| task.donor_worker_id != worker_id);
+                }
                 if let Some(worker) = catalog.set_lifecycle(worker_id, state) {
                     persist_worker_if_needed(topology_store.as_ref(), &worker).await;
                 }

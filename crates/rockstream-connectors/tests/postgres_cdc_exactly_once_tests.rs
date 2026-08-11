@@ -16,8 +16,7 @@ fn source() -> PostgresCdcSource {
     )
 }
 
-#[tokio::test]
-async fn worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
+async fn do_worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
     let mut first_worker = source();
     first_worker
         .decode_and_enqueue(b"B|0/10|9|I|one|1")
@@ -72,6 +71,16 @@ async fn worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
 }
 
 #[tokio::test]
+async fn worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output() {
+    do_worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output().await;
+}
+
+#[tokio::test]
+async fn real_pg18_lsn_restart_zero_duplicates() {
+    do_worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output().await;
+}
+
+#[tokio::test]
 async fn pgoutput_snapshot_matches_initial_table_state() {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut source =
@@ -109,11 +118,6 @@ async fn wal2json_snapshot_matches_initial_table_state() {
     let snapshot_records: Vec<_> = stream.collect();
     assert_eq!(snapshot_records.len(), 1);
     assert_eq!(snapshot_records[0].num_rows(), 2);
-}
-
-#[tokio::test]
-async fn real_pg18_lsn_restart_zero_duplicates() {
-    worker_restart_resumes_committed_lsn_with_exact_keyed_cdc_output();
 }
 
 #[test]

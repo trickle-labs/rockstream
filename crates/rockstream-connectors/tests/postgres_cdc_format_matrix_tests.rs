@@ -40,8 +40,7 @@ async fn exact_rows(source: &mut PostgresCdcSource) -> (Vec<Vec<i64>>, Vec<i64>)
     (rows, weights)
 }
 
-#[tokio::test]
-async fn pgoutput_insert_matches_batch_oracle() {
+async fn do_pgoutput_insert_matches_batch_oracle() {
     let mut source = source(CdcWireFormat::PgOutput);
     source
         .decode_and_enqueue(b"B|0/10|7|I|order-1|1,100")
@@ -50,7 +49,11 @@ async fn pgoutput_insert_matches_batch_oracle() {
 }
 
 #[tokio::test]
-async fn pgoutput_update_retracts_and_reinserts_same_row_id() {
+async fn pgoutput_insert_matches_batch_oracle() {
+    do_pgoutput_insert_matches_batch_oracle().await;
+}
+
+async fn do_pgoutput_update_retracts_and_reinserts_same_row_id() {
     let mut source = source(CdcWireFormat::PgOutput);
     source
         .decode_and_enqueue(b"B|0/20|7|U|order-1|1,100|1,125")
@@ -65,7 +68,11 @@ async fn pgoutput_update_retracts_and_reinserts_same_row_id() {
 }
 
 #[tokio::test]
-async fn pgoutput_delete_retracts_keyed_row() {
+async fn pgoutput_update_retracts_and_reinserts_same_row_id() {
+    do_pgoutput_update_retracts_and_reinserts_same_row_id().await;
+}
+
+async fn do_pgoutput_delete_retracts_keyed_row() {
     let mut source = source(CdcWireFormat::PgOutput);
     source
         .decode_and_enqueue(b"B|0/30|7|D|order-1|1,125")
@@ -77,7 +84,11 @@ async fn pgoutput_delete_retracts_keyed_row() {
 }
 
 #[tokio::test]
-async fn wal2json_insert_matches_batch_oracle() {
+async fn pgoutput_delete_retracts_keyed_row() {
+    do_pgoutput_delete_retracts_keyed_row().await;
+}
+
+async fn do_wal2json_insert_matches_batch_oracle() {
     let mut source = source(CdcWireFormat::Wal2Json);
     source
         .decode_and_enqueue(
@@ -88,7 +99,11 @@ async fn wal2json_insert_matches_batch_oracle() {
 }
 
 #[tokio::test]
-async fn wal2json_update_retracts_and_reinserts_same_row_id() {
+async fn wal2json_insert_matches_batch_oracle() {
+    do_wal2json_insert_matches_batch_oracle().await;
+}
+
+async fn do_wal2json_update_retracts_and_reinserts_same_row_id() {
     let mut source = source(CdcWireFormat::Wal2Json);
     source
         .decode_and_enqueue(br#"{"lsn":"0/20","table_id":7,"op":"update","key":"order-1","old":[1,100],"new":[1,125]}"#)
@@ -100,7 +115,11 @@ async fn wal2json_update_retracts_and_reinserts_same_row_id() {
 }
 
 #[tokio::test]
-async fn wal2json_delete_retracts_keyed_row() {
+async fn wal2json_update_retracts_and_reinserts_same_row_id() {
+    do_wal2json_update_retracts_and_reinserts_same_row_id().await;
+}
+
+async fn do_wal2json_delete_retracts_keyed_row() {
     let mut source = source(CdcWireFormat::Wal2Json);
     source
         .decode_and_enqueue(
@@ -114,33 +133,38 @@ async fn wal2json_delete_retracts_keyed_row() {
 }
 
 #[tokio::test]
+async fn wal2json_delete_retracts_keyed_row() {
+    do_wal2json_delete_retracts_keyed_row().await;
+}
+
+#[tokio::test]
 async fn pgoutput_insert_produces_exact_positive_zset_delta() {
-    pgoutput_insert_matches_batch_oracle();
+    do_pgoutput_insert_matches_batch_oracle().await;
 }
 
 #[tokio::test]
 async fn pgoutput_update_produces_retract_and_insert_zset_delta() {
-    pgoutput_update_retracts_and_reinserts_same_row_id();
+    do_pgoutput_update_retracts_and_reinserts_same_row_id().await;
 }
 
 #[tokio::test]
 async fn pgoutput_delete_produces_exact_negative_zset_delta() {
-    pgoutput_delete_retracts_keyed_row();
+    do_pgoutput_delete_retracts_keyed_row().await;
 }
 
 #[tokio::test]
 async fn wal2json_insert_produces_exact_positive_zset_delta() {
-    wal2json_insert_matches_batch_oracle();
+    do_wal2json_insert_matches_batch_oracle().await;
 }
 
 #[tokio::test]
 async fn wal2json_update_produces_retract_and_insert_zset_delta() {
-    wal2json_update_retracts_and_reinserts_same_row_id();
+    do_wal2json_update_retracts_and_reinserts_same_row_id().await;
 }
 
 #[tokio::test]
 async fn wal2json_delete_produces_exact_negative_zset_delta() {
-    wal2json_delete_retracts_keyed_row();
+    do_wal2json_delete_retracts_keyed_row().await;
 }
 
 #[tokio::test]

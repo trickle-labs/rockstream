@@ -108,7 +108,7 @@ fn eval_window_batch(
     sorted_rows: &[(Vec<u8>, Vec<i64>)],
     window_exprs: &[WindowExpr],
     n_input_cols: usize,
-) -> Vec<Vec<i64>> {
+) -> Result<Vec<Vec<i64>>, OpError> {
     let n = sorted_rows.len();
     let mut result = vec![vec![0i64; n]; window_exprs.len()];
 
@@ -239,15 +239,15 @@ fn eval_window_batch(
             }
 
             WindowFunc::Ntile(_) => {
-                // RS-1016: NTILE is unsupported in v0.11. Return 0 placeholder.
-                for i in 0..n {
-                    out[i] = 0;
-                }
+                return Err(OpError::Unimplemented {
+                    feature: "NTILE window function is not supported".to_string(),
+                    code: rockstream_types::error_code::RS_1016,
+                });
             }
         }
     }
 
-    result
+    Ok(result)
 }
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -433,7 +433,7 @@ impl WindowOp {
 
             // Compute new output.
             if !rows_in_part.is_empty() {
-                let window_results = eval_window_batch(&rows_in_part, &self.window_exprs, n_in);
+                let window_results = eval_window_batch(&rows_in_part, &self.window_exprs, n_in)?;
                 let mut new_prev: OutputCache = HashMap::with_capacity(rows_in_part.len());
 
                 for i in 0..rows_in_part.len() {

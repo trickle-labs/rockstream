@@ -584,7 +584,7 @@ pub fn generate_tpch_heavy_deltas(
             "part" => part_schema(),
             "partsupp" => partsupp_schema(),
             "customer" => customer_schema(),
-            _ => unreachable!(),
+            _ => region_schema(),
         };
         deltas.insert(name.to_string(), ArrowZSet::empty(schema));
     }

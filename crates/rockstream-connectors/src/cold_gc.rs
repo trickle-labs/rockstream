@@ -354,7 +354,7 @@ mod tests {
 
         let remaining: Vec<Epoch> = catalog
             .lock()
-            .unwrap()
+            .await
             .snapshots
             .iter()
             .map(|s| s.epoch)
@@ -400,7 +400,7 @@ mod tests {
         );
         let result = gc.run(1_000_000).await.unwrap();
         assert!(result.expired_epochs.is_empty());
-        assert_eq!(catalog.lock().unwrap().snapshots.len(), 1);
+        assert_eq!(catalog.lock().await.snapshots.len(), 1);
     }
 
     // ── P6: shared-file safety ──────────────────────────────────────────────
@@ -430,7 +430,7 @@ mod tests {
         );
         assert!(catalog
             .lock()
-            .unwrap()
+            .await
             .existing_files
             .contains("data/shared.parquet"));
     }
@@ -459,7 +459,7 @@ mod tests {
             vec!["epoch1_only.parquet".to_string()]
         );
 
-        let guard = catalog.lock().unwrap();
+        let guard = catalog.lock().await;
         assert!(guard.existing_files.contains("shared.parquet"));
     }
 
@@ -473,7 +473,7 @@ mod tests {
         ];
         let catalog = Arc::new(Mutex::new(MockCatalog::with_snapshots(snapshots)));
         {
-            let mut catalog = catalog.lock().unwrap();
+            let mut catalog = catalog.lock().await;
             catalog.snapshots.retain(|s| s.epoch != 1);
             catalog.pending_deletes = vec!["data/epoch-1.parquet".to_string()];
         }
@@ -561,11 +561,9 @@ mod tests {
             let max_concurrent = Arc::clone(&max_concurrent);
             tokio::spawn(async move {
                 for _ in 0..10 {
-                    {
-                        let _guard = catalog.lock().unwrap();
-                        let now = active_ops.fetch_add(1, Ordering::SeqCst) + 1;
-                        max_concurrent.fetch_max(now, Ordering::SeqCst);
-                    }
+                    let _guard = catalog.lock().await;
+                    let now = active_ops.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_concurrent.fetch_max(now, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(2)).await;
                     active_ops.fetch_sub(1, Ordering::SeqCst);
                 }

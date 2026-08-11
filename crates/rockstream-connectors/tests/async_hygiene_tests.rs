@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use rockstream_connectors::{DeltaSink, FaultInjectingObjectStore, IcebergSink, SinkConnector};
 use rockstream_types::ids::ConnectorId;
-use rockstream_types::sink::RecoveryAction;
 
 fn test_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![

@@ -566,11 +566,45 @@ fn plan_kind(plan: &PlanNode) -> OpKind {
         PlanNode::Map { .. } => OpKind::Map,
         PlanNode::Aggregate { .. } => OpKind::Aggregate,
         PlanNode::Distinct { .. } => OpKind::Distinct,
-        PlanNode::Window { .. } => unreachable!(),
-        PlanNode::TumbleWindow { .. }
-        | PlanNode::HopWindow { .. }
-        | PlanNode::SessionWindow { .. } => unreachable!(),
-        PlanNode::TopK { .. } => unreachable!(),
+        PlanNode::Window { .. } => OpKind::Window {
+            strategy: rockstream_plan::WindowStrategy::PartitionRecompute,
+        },
+        PlanNode::TumbleWindow {
+            window_size_ms,
+            late_data_policy,
+            ..
+        } => OpKind::TumbleWindow {
+            window_size_ms: *window_size_ms,
+            late_data_policy: late_data_policy.clone(),
+        },
+        PlanNode::HopWindow {
+            window_size_ms,
+            slide_ms,
+            late_data_policy,
+            ..
+        } => OpKind::HopWindow {
+            window_size_ms: *window_size_ms,
+            slide_ms: *slide_ms,
+            late_data_policy: late_data_policy.clone(),
+        },
+        PlanNode::SessionWindow {
+            gap_ms,
+            late_data_policy,
+            ..
+        } => OpKind::SessionWindow {
+            gap_ms: *gap_ms,
+            late_data_policy: late_data_policy.clone(),
+        },
+        PlanNode::TopK {
+            k,
+            rank_col,
+            partition_by,
+            ..
+        } => OpKind::TopK {
+            k: *k,
+            rank_col: *rank_col,
+            partition_by: partition_by.clone(),
+        },
         PlanNode::Recursion {
             max_iterations,
             monotone,
@@ -610,7 +644,7 @@ fn plan_kind(plan: &PlanNode) -> OpKind {
         PlanNode::Union { .. } => OpKind::Union,
         PlanNode::Intersect { all, .. } => OpKind::Intersect { all: *all },
         PlanNode::Except { all, .. } => OpKind::Except { all: *all },
-        PlanNode::IndexArrange { .. } => unreachable!(),
+        PlanNode::IndexArrange { .. } => OpKind::Map,
     }
 }
 

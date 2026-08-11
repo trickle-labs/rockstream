@@ -306,20 +306,7 @@ async fn seeded_lifecycle_race_never_revives_dropped_or_paused_source() {
     rockstream_sim::buggify::buggify_disable();
 }
 
-#[tokio::test]
-async fn seeded_cdc_lsn_restart() {
-    seeded_owner_crash_after_prepare_retries_from_last_committed_token();
-}
 
-#[tokio::test]
-async fn seeded_slot_invalidation_recovery() {
-    seeded_owner_crash_after_m3_commit_acks_once_after_recovery();
-}
-
-#[tokio::test]
-async fn seeded_wal_lag_backpressure() {
-    seeded_lifecycle_race_never_revives_dropped_or_paused_source();
-}
 
 #[tokio::test]
 async fn recovery_uses_only_committed_checkpoint_and_fences_replaced_owner() {

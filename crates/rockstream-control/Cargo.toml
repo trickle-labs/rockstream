@@ -45,4 +45,5 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 rockstream-ops = { workspace = true }
+rockstream-runtime = { workspace = true }
 serde_json = { workspace = true }

@@ -185,7 +185,7 @@ impl IndexArrangeOp {
         Ok(())
     }
 
-    /// Look up rows by exact index key value (first index column only for now).
+    /// Look up rows by exact index key bytes.
     ///
     /// Returns the encoded row bytes for all matching rows.
     pub async fn point_lookup(&self, index_key_bytes: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
@@ -200,6 +200,18 @@ impl IndexArrangeOp {
             .await
             .map_err(OpError::storage)?;
         Ok(entries.into_iter().map(|(_, v)| v.to_vec()).collect())
+    }
+
+    /// Look up rows by multi-column index key values (full or prefix key).
+    ///
+    /// `values`: values for the index columns (1 or more prefix columns).
+    /// Returns the encoded row bytes for all matching rows.
+    pub async fn point_lookup_values(&self, values: &[i64]) -> Result<Vec<Vec<u8>>, OpError> {
+        let mut key_bytes = Vec::with_capacity(values.len() * 8);
+        for &v in values {
+            key_bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        self.point_lookup(&key_bytes).await
     }
 
     /// Encode the arrangement key for a given row.

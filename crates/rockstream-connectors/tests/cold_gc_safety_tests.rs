@@ -15,7 +15,8 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
@@ -95,7 +96,7 @@ async fn test_cold_gc_count_retention_reclaims_real_files_lfs_iceberg() {
     }
 
     // The two newest snapshots (5, 6) remain readable.
-    let sink = catalog.lock().unwrap();
+    let sink = catalog.lock().await;
     let remaining = ColdGcCatalog::list_snapshots(&*sink).await.unwrap();
     let mut remaining_epochs: Vec<_> = remaining.iter().map(|s| s.epoch).collect();
     remaining_epochs.sort();
@@ -138,7 +139,7 @@ async fn test_cold_gc_count_retention_reclaims_real_files_lfs_delta() {
         );
     }
 
-    let sink = catalog.lock().unwrap();
+    let sink = catalog.lock().await;
     let remaining = ColdGcCatalog::list_snapshots(&*sink).await.unwrap();
     let mut remaining_epochs: Vec<_> = remaining.iter().map(|s| s.epoch).collect();
     remaining_epochs.sort();
@@ -189,7 +190,7 @@ async fn test_cold_gc_resumes_after_simulated_crash_mid_delete_lfs() {
 
     // Resuming and re-running is idempotent: no error, and the marker is
     // cleared.
-    let sink = catalog.lock().unwrap();
+    let sink = catalog.lock().await;
     assert_eq!(
         sink.read_pending_deletes().await.unwrap(),
         Vec::<String>::new(),
@@ -209,7 +210,7 @@ async fn test_cold_gc_resumes_after_simulated_crash_mid_delete_lfs() {
 // `Arc<Mutex<IcebergSink>>`, so mutual exclusion is structural (the type
 // system enforces it), not timing-dependent. What this test demonstrates
 // empirically is the *consequence* of that structural guarantee: racing
-// real commit and GC threads against the same locked sink for many
+// real commit and GC tasks against the same locked sink for many
 // iterations never produces a torn/inconsistent result — every snapshot
 // that should be retained is fully readable and the file set is exactly
 // what a strictly-serialized execution would produce, which would not hold
@@ -228,19 +229,16 @@ async fn test_cold_gc_never_overlaps_commit_real_sink() {
     const EXTRA_EPOCHS: u64 = 20;
 
     let commit_catalog = Arc::clone(&catalog);
-    let handle = tokio::runtime::Handle::current();
-    let commit_thread = std::thread::spawn(move || {
+    let commit_task = tokio::spawn(async move {
         for epoch in (NUM_EPOCHS + 1)..=(NUM_EPOCHS + EXTRA_EPOCHS) {
-            let mut guard = commit_catalog.lock().unwrap();
+            let mut guard = commit_catalog.lock().await;
             let batch = make_cumulative_batch(epoch as i64);
             guard.set_staged_batch(batch.clone());
             guard.set_cluster_committed(epoch);
-            let state = handle
-                .block_on(guard.pre_commit(epoch, batch.num_rows()))
-                .unwrap();
-            handle.block_on(guard.commit(epoch, &state)).unwrap();
+            let state = guard.pre_commit(epoch, batch.num_rows()).await.unwrap();
+            guard.commit(epoch, &state).await.unwrap();
             drop(guard);
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            tokio::time::sleep(std::time::Duration::from_micros(200)).await;
         }
     });
 
@@ -256,14 +254,14 @@ async fn test_cold_gc_never_overlaps_commit_real_sink() {
         if gc.run(0).await.is_ok() {
             gc_runs += 1;
         }
-        std::thread::sleep(std::time::Duration::from_micros(150));
+        tokio::time::sleep(std::time::Duration::from_micros(150)).await;
     }
     assert!(
         gc_runs > 0,
         "expected at least one successful GC run during the race"
     );
 
-    commit_thread.join().unwrap();
+    commit_task.await.unwrap();
 
     // One final GC pass after all commits have landed guarantees a
     // deterministic end state to assert against (mid-race GC runs already
@@ -276,7 +274,7 @@ async fn test_cold_gc_never_overlaps_commit_real_sink() {
     // the 3 newest snapshots retained, all fully readable with no
     // truncation/corruption from an interleaved write.
     let remaining_epochs = {
-        let sink = catalog.lock().unwrap();
+        let sink = catalog.lock().await;
         let remaining = ColdGcCatalog::list_snapshots(&*sink).await.unwrap();
         assert_eq!(
             remaining.len(),
@@ -302,14 +300,9 @@ async fn test_cold_gc_never_overlaps_commit_real_sink() {
         "expected the 3 newest epochs to survive GC with no gaps from a torn interleaving"
     );
 
-    // Take the sink out of the Arc<Mutex> (only one strong ref remains now
-    // that `gc` has been dropped) before the final `.await`, since holding a
-    // std::sync::MutexGuard across an await point is a genuine footgun on a
-    // multi-threaded runtime and is flagged by clippy.
     let sink = Arc::try_unwrap(catalog)
         .unwrap_or_else(|_| panic!("catalog still shared"))
-        .into_inner()
-        .unwrap();
+        .into_inner();
     let observed = sink.read_snapshot(max_epoch).await.unwrap();
     assert!(
         !observed.is_empty(),

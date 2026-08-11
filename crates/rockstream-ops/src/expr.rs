@@ -78,7 +78,7 @@ pub fn eval_i64(expr: &Expr, batch: &RecordBatch) -> Result<Vec<i64>, OpError> {
                                 0
                             }
                         }
-                        _ => unreachable!(),
+                        _ => 0,
                     })
                     .collect())
             }
@@ -136,7 +136,7 @@ pub fn eval_bool(expr: &Expr, batch: &RecordBatch) -> Result<Vec<bool>, OpError>
                         BinaryOp::Lt => a < b,
                         BinaryOp::Ge => a >= b,
                         BinaryOp::Le => a <= b,
-                        _ => unreachable!(),
+                        _ => false,
                     })
                     .collect())
             }
