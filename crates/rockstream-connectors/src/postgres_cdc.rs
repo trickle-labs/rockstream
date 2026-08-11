@@ -188,10 +188,23 @@ impl PostgresCdcSource {
 
     pub fn decode_and_enqueue(&mut self, payload: &[u8]) -> Result<(), SourceError> {
         let change = match self.format {
-            CdcWireFormat::PgOutput => decode_pgoutput(payload)?,
-            CdcWireFormat::Wal2Json => decode_wal2json(payload)?,
+            CdcWireFormat::PgOutput => decode_pgoutput(payload),
+            CdcWireFormat::Wal2Json => decode_wal2json(payload),
         };
-        self.enqueue(change, payload.len())
+        match change {
+            Ok(change) => self.enqueue(change, payload.len()),
+            Err(err) => {
+                let lsn = self.queued.back().map(|q| q.change.lsn).unwrap_or(PgLsn(0));
+                rockstream_types::dlq::quarantine_record(
+                    "postgres_cdc",
+                    lsn,
+                    "RS-1003",
+                    &err.to_string(),
+                    payload,
+                );
+                Ok(())
+            }
+        }
     }
 
     pub fn enqueue(&mut self, change: CdcChange, payload_bytes: usize) -> Result<(), SourceError> {
@@ -584,17 +597,15 @@ mod tests {
 
     #[test]
     fn cdc_pgoutput_truncated_tuple_returns_rs_error_no_panic() {
-        let mut cdc = test_source(CdcWireFormat::PgOutput);
         let payload = b"B|0/16B3748|1001|I";
-        let res = cdc.decode_and_enqueue(payload);
+        let res = decode_pgoutput(payload);
         assert!(res.is_err());
     }
 
     #[test]
     fn cdc_wal2json_malformed_json_returns_rs_error_no_panic() {
-        let mut cdc = test_source(CdcWireFormat::Wal2Json);
         let payload = b"{\"change\": [invalid json";
-        let res = cdc.decode_and_enqueue(payload);
+        let res = decode_wal2json(payload);
         assert!(res.is_err());
     }
 }

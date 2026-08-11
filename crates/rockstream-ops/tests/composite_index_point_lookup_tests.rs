@@ -19,19 +19,10 @@ use tempfile::TempDir;
 async fn test_composite_index_point_lookup_and_prefix_scan() {
     let _dir = TempDir::new().unwrap();
     let store = Arc::new(InMemory::new());
-    let db = Arc::new(ShardDb::builder("test_shard", store)
-        .build()
-        .await
-        .unwrap());
+    let db = Arc::new(ShardDb::builder("test_shard", store).build().await.unwrap());
 
     // 2 index columns (col0, col1), 1 pk column (col2)
-    let op = IndexArrangeOp::new(
-        db,
-        OperatorId(42),
-        vec![0, 1],
-        vec![2],
-        1000,
-    );
+    let op = IndexArrangeOp::new(db, OperatorId(42), vec![0, 1], vec![2], 1000);
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("col0", DataType::Int64, false),
@@ -58,11 +49,19 @@ async fn test_composite_index_point_lookup_and_prefix_scan() {
 
     // 2. Prefix key lookup (col0=10) -> 2 matches
     let matches_prefix = op.point_lookup_values(&[10]).await.unwrap();
-    assert_eq!(matches_prefix.len(), 2, "Expected 2 prefix matches for col0=10");
+    assert_eq!(
+        matches_prefix.len(),
+        2,
+        "Expected 2 prefix matches for col0=10"
+    );
 
     // 3. Non-matching key lookup -> 0 matches
     let matches_none = op.point_lookup_values(&[10, 999]).await.unwrap();
-    assert_eq!(matches_none.len(), 0, "Expected 0 matches for non-existent composite key");
+    assert_eq!(
+        matches_none.len(),
+        0,
+        "Expected 0 matches for non-existent composite key"
+    );
 }
 
 #[test]

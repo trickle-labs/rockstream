@@ -15,6 +15,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
 lru = "0.18.0"
+hex = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]

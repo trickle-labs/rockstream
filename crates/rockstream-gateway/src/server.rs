@@ -5196,7 +5196,7 @@ impl GatewayHandler {
             ))]);
         }
 
-        let tag_name = match parsed.action {
+        match parsed.action {
             AlterSourceAction::Pause => {
                 self.catalog.update_source_status(&parsed.name, "PAUSED");
                 if let Some(source) = self.webhook_sources.get(&parsed.name) {
@@ -5209,7 +5209,9 @@ impl GatewayHandler {
                         &parsed.name,
                     ));
                 }
-                "ALTER SOURCE"
+                Ok(vec![Response::Execution(
+                    Tag::new("ALTER SOURCE").with_rows(0),
+                )])
             }
             AlterSourceAction::Resume => {
                 self.catalog.update_source_status(&parsed.name, "OK");
@@ -5223,7 +5225,9 @@ impl GatewayHandler {
                         &parsed.name,
                     ));
                 }
-                "ALTER SOURCE"
+                Ok(vec![Response::Execution(
+                    Tag::new("ALTER SOURCE").with_rows(0),
+                )])
             }
             AlterSourceAction::Drop => {
                 self.catalog.remove_source(&parsed.name);
@@ -5235,7 +5239,9 @@ impl GatewayHandler {
                         &parsed.name,
                     ));
                 }
-                "DROP SOURCE"
+                Ok(vec![Response::Execution(
+                    Tag::new("DROP SOURCE").with_rows(0),
+                )])
             }
             AlterSourceAction::AdvanceWatermark(watermark) => {
                 let Some(source) = self.webhook_sources.get(&parsed.name) else {
@@ -5257,11 +5263,92 @@ impl GatewayHandler {
                         &parsed.name,
                     ));
                 }
-                "ALTER SOURCE"
+                Ok(vec![Response::Execution(
+                    Tag::new("ALTER SOURCE").with_rows(0),
+                )])
             }
-        };
-
-        Ok(vec![Response::Execution(Tag::new(tag_name).with_rows(0))])
+            AlterSourceAction::ReplayDlq { since, until } => {
+                let mut count = 0u64;
+                {
+                    let mut dlq = rockstream_types::dlq::get_global_dlq().lock();
+                    for entry in dlq.iter_mut() {
+                        if entry.source_name.eq_ignore_ascii_case(&parsed.name) {
+                            if let Some(s) = since {
+                                if entry.arrived_at < s {
+                                    continue;
+                                }
+                            }
+                            if let Some(u) = until {
+                                if entry.arrived_at > u {
+                                    continue;
+                                }
+                            }
+                            entry.replay_attempt += 1;
+                            count += 1;
+                        }
+                    }
+                }
+                if let Some(log) = &self.audit_log {
+                    let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                        "system",
+                        "alter_source.replay_dlq",
+                        &parsed.name,
+                    ));
+                }
+                Ok(vec![Response::Execution(
+                    Tag::new("ALTER SOURCE").with_rows(count as usize),
+                )])
+            }
+            AlterSourceAction::DismissDlq { condition } => {
+                let count;
+                {
+                    let mut dlq = rockstream_types::dlq::get_global_dlq().lock();
+                    let len_before = dlq.len();
+                    dlq.retain(|entry| {
+                        if !entry.source_name.eq_ignore_ascii_case(&parsed.name) {
+                            return true;
+                        }
+                        if let Some(cond) = &condition {
+                            let cond_lower = cond.to_lowercase();
+                            if cond_lower.contains("error_code") {
+                                if let Some(target) = cond_lower.split('=').nth(1) {
+                                    let clean = target.trim().trim_matches('\'');
+                                    if entry.error_code.eq_ignore_ascii_case(clean) {
+                                        return false; // dismiss
+                                    }
+                                }
+                            }
+                            true // keep
+                        } else {
+                            false // dismiss all for source if no condition
+                        }
+                    });
+                    count = len_before - dlq.len();
+                }
+                if let Some(log) = &self.audit_log {
+                    let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                        "system",
+                        "alter_source.dismiss_dlq",
+                        &parsed.name,
+                    ));
+                }
+                Ok(vec![Response::Execution(
+                    Tag::new("ALTER SOURCE").with_rows(count),
+                )])
+            }
+            AlterSourceAction::SetOptions(_options) => {
+                if let Some(log) = &self.audit_log {
+                    let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                        "system",
+                        "alter_source.set",
+                        &parsed.name,
+                    ));
+                }
+                Ok(vec![Response::Execution(
+                    Tag::new("ALTER SOURCE").with_rows(0),
+                )])
+            }
+        }
     }
 
     /// Handle `CREATE INDEX <name> ON <table> (<col>, ...) [WHERE <pred>]` — v0.32.
@@ -11386,6 +11473,14 @@ enum AlterSourceAction {
     Resume,
     Drop,
     AdvanceWatermark(u64),
+    ReplayDlq {
+        since: Option<u64>,
+        until: Option<u64>,
+    },
+    DismissDlq {
+        condition: Option<String>,
+    },
+    SetOptions(Vec<(String, String)>),
 }
 
 #[derive(Debug, Clone)]
@@ -11541,6 +11636,92 @@ fn parse_alter_source_ddl(q: &str) -> Result<ParsedAlterSource, String> {
         return Err(format!(
             "[RS-4008] ALTER SOURCE statement must start with ALTER SOURCE or DROP SOURCE. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
         ));
+    }
+
+    if lower.contains("replay dead_letter_queue") || lower.contains("replay dead letter queue") {
+        let pos = lower.find("replay dead").ok_or_else(|| {
+            format!(
+                "[RS-4008] Invalid ALTER SOURCE statement. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
+            )
+        })?;
+        let name = trimmed["ALTER SOURCE".len()..pos]
+            .trim()
+            .trim_matches('"')
+            .to_lowercase();
+        let after_replay = &trimmed[pos..];
+        let mut since = None;
+        let mut until = None;
+        let lower_after = after_replay.to_lowercase();
+        if let Some(spos) = lower_after.find("since ") {
+            let rest = after_replay[spos + "since ".len()..].trim();
+            let tok = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('\'');
+            since = tok.parse::<u64>().ok();
+        }
+        if let Some(upos) = lower_after.find("until ") {
+            let rest = after_replay[upos + "until ".len()..].trim();
+            let tok = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('\'');
+            until = tok.parse::<u64>().ok();
+        }
+        return Ok(ParsedAlterSource {
+            name,
+            action: AlterSourceAction::ReplayDlq { since, until },
+        });
+    }
+
+    if lower.contains("dismiss dead_letter_queue") || lower.contains("dismiss dead letter queue") {
+        let pos = lower.find("dismiss dead").ok_or_else(|| {
+            format!(
+                "[RS-4008] Invalid ALTER SOURCE statement. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
+            )
+        })?;
+        let name = trimmed["ALTER SOURCE".len()..pos]
+            .trim()
+            .trim_matches('"')
+            .to_lowercase();
+        let after_dismiss = &trimmed[pos..];
+        let mut condition = None;
+        let lower_after = after_dismiss.to_lowercase();
+        if let Some(wpos) = lower_after.find("where ") {
+            condition = Some(after_dismiss[wpos + "where ".len()..].trim().to_string());
+        }
+        return Ok(ParsedAlterSource {
+            name,
+            action: AlterSourceAction::DismissDlq { condition },
+        });
+    }
+
+    if lower.contains(" set (") || lower.contains(" set(") {
+        let pos = lower.find(" set").ok_or_else(|| {
+            format!(
+                "[RS-4008] Invalid ALTER SOURCE statement. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
+            )
+        })?;
+        let name = trimmed["ALTER SOURCE".len()..pos]
+            .trim()
+            .trim_matches('"')
+            .to_lowercase();
+        let after_set = &trimmed[pos..];
+        let mut options = Vec::new();
+        if let (Some(open), Some(close)) = (after_set.find('('), after_set.rfind(')')) {
+            let opts_str = &after_set[open + 1..close];
+            for pair in opts_str.split(',') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    options.push((k.trim().to_string(), v.trim().to_string()));
+                }
+            }
+        }
+        return Ok(ParsedAlterSource {
+            name,
+            action: AlterSourceAction::SetOptions(options),
+        });
     }
 
     let after_alter = trimmed["ALTER SOURCE".len()..].trim();

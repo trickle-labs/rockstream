@@ -934,10 +934,9 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                     state = ?state,
                     "control: worker lifecycle state update"
                 );
-                if matches!(
-                    state,
-                    WorkerLifecycleState::Decommissioned { .. }
-                ) || matches!(state, WorkerLifecycleState::Draining { shards_remaining, .. } if shards_remaining == 0) {
+                if matches!(state, WorkerLifecycleState::Decommissioned { .. })
+                    || matches!(state, WorkerLifecycleState::Draining { shards_remaining, .. } if shards_remaining == 0)
+                {
                     shard_manager.release_worker(worker_id);
                     let mut guard = drain_state.lock().await;
                     guard.queue.retain(|task| task.donor_worker_id != worker_id);

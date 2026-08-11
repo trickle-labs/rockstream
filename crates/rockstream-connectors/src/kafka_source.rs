@@ -253,17 +253,20 @@ impl KafkaSource {
                 reason: "Kafka record has no payload. Next steps: publish JSON source records"
                     .to_string(),
             })?;
-        let body: KafkaPayload = serde_json::from_slice(payload).map_err(|error| {
-            SourceError::PollDeltaFailed {
-                reason: format!(
-                    "Kafka record payload is not the required JSON shape: {error}. Next steps: publish timestamp, values, and optional weight"
-                ),
+        let offset = u64::try_from(message.offset()).unwrap_or(0);
+        let body: KafkaPayload = match serde_json::from_slice(payload) {
+            Ok(body) => body,
+            Err(error) => {
+                rockstream_types::dlq::quarantine_record(
+                    &self.topic,
+                    offset,
+                    "RS-1003",
+                    &format!("Kafka record payload is not valid JSON shape: {error}"),
+                    payload,
+                );
+                return self.next_record();
             }
-        })?;
-        let offset = u64::try_from(message.offset()).map_err(|_| SourceError::PollDeltaFailed {
-            reason: "Kafka record has a negative offset. Next steps: retry from the committed source epoch"
-                .to_string(),
-        })?;
+        };
         Ok(Some(KafkaRecord {
             offset,
             partition: message.partition(),

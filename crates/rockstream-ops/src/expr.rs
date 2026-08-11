@@ -64,20 +64,8 @@ pub fn eval_i64(expr: &Expr, batch: &RecordBatch) -> Result<Vec<i64>, OpError> {
                         BinaryOp::Add => a.saturating_add(b),
                         BinaryOp::Sub => a.saturating_sub(b),
                         BinaryOp::Mul => a.saturating_mul(b),
-                        BinaryOp::Div => {
-                            if b != 0 {
-                                a / b
-                            } else {
-                                0
-                            }
-                        }
-                        BinaryOp::Mod => {
-                            if b != 0 {
-                                a % b
-                            } else {
-                                0
-                            }
-                        }
+                        BinaryOp::Div if b != 0 => a / b,
+                        BinaryOp::Mod if b != 0 => a % b,
                         _ => 0,
                     })
                     .collect())

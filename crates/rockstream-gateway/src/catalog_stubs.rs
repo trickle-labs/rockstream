@@ -1043,6 +1043,11 @@ impl CatalogStubs {
         if ql.contains("rockstream_catalog.workload_resource_usage") {
             return Some(self.workload_resource_usage(&requested_cols));
         }
+        if ql.contains("rockstream_catalog.dead_letter_queue")
+            || (ql.contains("dead_letter_queue") && !ql.starts_with("alter "))
+        {
+            return Some(self.dead_letter_queue(query, &requested_cols));
+        }
 
         // S7: bootstrap functions and identity keywords (SELECT without FROM)
         if ql.starts_with("select ") && !ql.contains(" from ") {
@@ -1398,6 +1403,63 @@ impl CatalogStubs {
             .workload_resource_usage_entries()
             .into_iter()
             .map(|entry| project_workload_resource_usage(&cols, &entry))
+            .collect();
+        CatalogResponse::rows(cols, rows)
+    }
+
+    pub fn dead_letter_queue(&self, query: &str, requested_cols: &[String]) -> CatalogResponse {
+        let cols = if requested_cols.is_empty()
+            || (requested_cols.len() == 1 && requested_cols[0] == "*")
+        {
+            dead_letter_queue_columns()
+        } else {
+            requested_cols.to_vec()
+        };
+        let dlq = rockstream_types::dlq::get_global_dlq().lock();
+        let ql = query.to_lowercase();
+        let rows = dlq
+            .iter()
+            .filter(|entry| {
+                if ql.contains("where") {
+                    if ql.contains("source_name =") || ql.contains("source_name=") {
+                        let target = ql
+                            .split("source_name")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim()
+                            .trim_start_matches('=')
+                            .trim()
+                            .trim_matches('\'')
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .trim_matches('\'');
+                        if !target.is_empty() && !entry.source_name.to_lowercase().contains(target)
+                        {
+                            return false;
+                        }
+                    }
+                    if ql.contains("error_code =") || ql.contains("error_code=") {
+                        let target = ql
+                            .split("error_code")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim()
+                            .trim_start_matches('=')
+                            .trim()
+                            .trim_matches('\'')
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .trim_matches('\'');
+                        if !target.is_empty() && !entry.error_code.to_lowercase().contains(target) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .map(|entry| project_dead_letter_queue(&cols, entry))
             .collect();
         CatalogResponse::rows(cols, rows)
     }
@@ -2544,6 +2606,36 @@ fn workload_id_for_name(name: &str) -> WorkloadId {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     WorkloadId(hash)
+}
+
+pub(crate) fn dead_letter_queue_columns() -> Vec<String> {
+    vec![
+        "arrived_at".to_string(),
+        "source_name".to_string(),
+        "source_offset".to_string(),
+        "error_code".to_string(),
+        "error_message".to_string(),
+        "raw_bytes_hex".to_string(),
+        "replay_attempt".to_string(),
+    ]
+}
+
+pub(crate) fn project_dead_letter_queue(
+    cols: &[String],
+    entry: &rockstream_types::dlq::DlqEntry,
+) -> Vec<Option<String>> {
+    cols.iter()
+        .map(|col| match col.as_str() {
+            "arrived_at" => Some(entry.arrived_at.to_string()),
+            "source_name" => Some(entry.source_name.clone()),
+            "source_offset" => Some(entry.source_offset.clone()),
+            "error_code" => Some(entry.error_code.clone()),
+            "error_message" => Some(entry.error_message.clone()),
+            "raw_bytes_hex" => Some(entry.raw_bytes_hex.clone()),
+            "replay_attempt" => Some(entry.replay_attempt.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn project_view_resource_usage(

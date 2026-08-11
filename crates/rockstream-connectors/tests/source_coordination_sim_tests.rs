@@ -306,8 +306,6 @@ async fn seeded_lifecycle_race_never_revives_dropped_or_paused_source() {
     rockstream_sim::buggify::buggify_disable();
 }
 
-
-
 #[tokio::test]
 async fn recovery_uses_only_committed_checkpoint_and_fences_replaced_owner() {
     let connector_id = ConnectorId(5125);

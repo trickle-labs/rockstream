@@ -212,6 +212,13 @@ impl HttpWebhookSource {
             return WebhookResult::PayloadTooLarge;
         }
         if !valid_payload(self.format, payload) {
+            rockstream_types::dlq::quarantine_record(
+                "webhook",
+                delivery_id.unwrap_or("0"),
+                "RS-1003",
+                "webhook payload fails format verification",
+                payload,
+            );
             return WebhookResult::InvalidPayload;
         }
         let digest = format!("{:x}", Sha256::digest(payload));
