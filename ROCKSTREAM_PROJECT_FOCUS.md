@@ -1,771 +1,640 @@
-# Rockstream: Recommended Project Focus and Path Forward
+# Rockstream: Recommended Project Focus After v0.51.26
 
-**Status:** Proposed project direction  
+**Status:** Proposed strategic direction  
+**Baseline:** All roadmap versions through **v0.51.26 are implemented and signed off**  
 **Audience:** Maintainers, contributors, design partners, and early adopters  
-**Decision horizon:** The next major release and the work required to make it production-ready
+**Decision horizon:** The remaining path to v1.0 and the roadmap that follows it
 
 ---
 
 ## Executive summary
 
-Rockstream should focus on being a **cloud-native incremental view maintenance (IVM) service** with a deliberately small public surface:
+Rockstream should move forward as a **cloud-native incremental view maintenance (IVM) system** whose defining strength is not feature breadth, but the ability to keep SQL-defined materialized views correct, fresh, durable, and recoverable on object-storage-backed state.
 
-- Continuously maintain SQL-defined materialized views.
-- Store authoritative state in object storage.
-- Accept data through PostgreSQL CDC, Kafka, and PostgreSQL-wire DML.
-- Serve committed tables and materialized views through the PostgreSQL wire protocol.
-- Recover predictably from crashes without lost, duplicated, or partially visible data.
+That recommendation does **not** mean undoing the work already completed.
 
-Rockstream should **not** try to become a smaller version of a general-purpose streaming database, analytical warehouse, lakehouse platform, or PostgreSQL replacement.
+By v0.51.26, Rockstream has already implemented and verified a broad set of capabilities: distributed IVM, checkpointing and recovery, PostgreSQL wire access, real connector clients, cold-tier sinks, shard migration, hot-key handling, autoscaling signals, query-time SQL, operator state accounting, spill-to-SlateDB, async-runtime hardening, and long-lived registry cleanup. Those capabilities are now part of the project's implemented baseline.
 
-The practical strategy is:
+The strategic question is therefore no longer:
 
-> **Promise less, make those promises extremely reliable, and keep advanced work outside the default compatibility contract.**
+> What should Rockstream remove so that it becomes small?
 
-The project already contains many of the right technical foundations: Z-set/DBSP-style incremental operators, SlateDB-backed durable state, epochs and frontiers, coordinated checkpoints, deterministic simulation, PostgreSQL wire access, connector offset tracking, and bounded operator state. The next phase should therefore emphasize **scope control and lifecycle correctness**, rather than adding more SQL features, connectors, catalogs, or scaling mechanisms.
+It is:
+
+> **Where should Rockstream stop expanding, and which remaining investments are necessary to turn the existing system into an exceptionally reliable IVM product?**
+
+The recommended answer is:
+
+1. **Keep the capabilities already built.** Do not rip out proven functionality merely because it is outside the strategic core.
+2. **Stop treating every shipped subsystem as a new product pillar.** Existing lakehouse, advanced SQL, elasticity, and integration features do not automatically justify further expansion.
+3. **Put future engineering disproportionately into correctness, failure semantics, operability, security, upgrades, disaster recovery, and production validation.**
+4. **Apply a strict feature-admission rule to new breadth.** New SQL families, connectors, catalogs, transactional semantics, and governance languages should require concrete evidence that they materially improve the IVM product.
+5. **Rebaseline the remaining roadmap from the v0.51.26 reality.** Preserve work that closes production-readiness gaps; defer or narrow work whose primary effect is turning Rockstream into a broader database or data platform.
+
+The goal is not a smaller codebase at any cost. The goal is a **smaller strategic promise** backed by unusually strong implementation evidence.
 
 ---
 
-## 1. The recommended product definition
+## 1. Start from the actual v0.51.26 baseline
+
+This strategy takes the current repository state as its starting point, not as a list of missing features.
+
+Rockstream has already completed the difficult foundational work that a cloud-native IVM system needs:
+
+- DBSP/Z-set-derived incremental semantics and an incremental-versus-batch correctness oracle.
+- Single-shard and distributed operator execution.
+- Frontiers, epochs, barriers, cluster checkpoints, fencing, and exactly-once recovery machinery.
+- SlateDB-backed durable state on object storage.
+- PostgreSQL wire serving and direct DML.
+- Kafka, PostgreSQL CDC, object-store, and other implemented connector paths.
+- Materialized-view and index lifecycle/backfill machinery with durability and crash-recovery coverage.
+- Cold-tier Iceberg/Delta functionality.
+- Online shard migration, proactive split/merge, hot-key virtual bucketing, and autoscaling signals.
+- Query-time execution and PostgreSQL compatibility work.
+- Real operator state-size accounting and workload admission enforcement.
+- Bounded arrangement spill-to-SlateDB instead of OOM behavior.
+- Async-runtime hygiene, task supervision, timeout/retry budgets, and circuit-breaking work.
+- Leak-free long-lived registries and identity-safe resource caps through v0.51.26.
+
+The project should preserve this investment.
+
+The scope change proposed here is about **future prioritization and compatibility commitments**, not retroactively pretending these features were never built.
+
+---
+
+## 2. The strategic product definition
 
 ### North star
 
-> **Rockstream maintains continuously fresh SQL materialized views over durable changing tables, using disposable compute and object-storage-backed state.**
+> **Rockstream continuously maintains correct SQL materialized views over changing data using disposable compute and object-storage-backed durable state.**
 
-A user should be able to:
+A production user should be able to:
 
-1. Connect a PostgreSQL database or Kafka topic, or write rows through PostgreSQL wire DML.
-2. Define a materialized view with a supported SQL query.
-3. Query the latest globally committed result through a normal PostgreSQL client.
-4. Restart, rescale, or replace workers without rebuilding authoritative state from scratch.
-5. Understand exactly what consistency, recovery, and delivery guarantees apply.
+1. Ingest changes from a small set of well-supported sources.
+2. Define a materialized view using a clearly documented incremental SQL surface.
+3. Query committed results through ordinary PostgreSQL tooling.
+4. Survive worker, process, network, and object-store failures without losing committed state or producing wrong answers.
+5. Scale compute without making local disk authoritative.
+6. Understand why a view is stale, blocked, spilling, recovering, or unhealthy.
+7. Upgrade or restore the system without rebuilding the world from external sources.
 
-### Primary use cases
+### What Rockstream should optimize for
 
-Rockstream should optimize for a small set of recurring use cases:
+The primary workloads should remain those where IVM provides the central value:
 
-- Live operational dashboards backed by continuously maintained aggregates.
-- Application-facing projections and denormalized read models.
-- Continuously maintained joins between operational tables.
-- Incremental metrics and ranking views over high-change datasets.
-- A freshness layer between operational change streams and downstream consumers.
+- Live operational aggregates and dashboards.
+- Continuously maintained joins and denormalized read models.
+- Application-facing materialized projections.
+- Incremental metrics, ranking, and monitoring views.
+- High-change datasets where full recomputation is too expensive or too stale.
+- A durable freshness layer between operational change streams and consumers.
 
-These use cases benefit directly from IVM. They do not require Rockstream to provide a broad ad hoc analytical engine or a complete transactional database.
+### What Rockstream should not optimize for
 
-### The product boundary
-
-Rockstream’s supported product should contain three durable user concepts:
-
-1. **Table** — a durable append-only or keyed current-state input owned by Rockstream.
-2. **Materialized view** — a continuously maintained query result.
-3. **Sink** — an optional delivery target for a table or materialized view.
-
-Connections and connector runtimes may exist in the catalog, but they do not need to become a large user-facing object model.
-
----
-
-## 2. The public contract
-
-The public contract is the set of behaviors users may safely build production systems around. It should be substantially smaller than the set of experiments or proof harnesses present in the repository.
-
-### Supported ingestion
-
-The default product should support only these input paths:
-
-| Input path | Supported role |
-|---|---|
-| PostgreSQL logical replication | Shared CDC source for one or more upstream tables |
-| Kafka | Append-only, keyed upsert, or CDC-formatted input |
-| PostgreSQL wire DML | Direct `INSERT`, `UPDATE`, and `DELETE` into Rockstream tables |
-| Object storage | Bounded bulk import and export, not a general continuous file-watching platform |
-
-A strict connector cap keeps the system testable and makes end-to-end guarantees credible.
-
-### Supported serving
-
-The PostgreSQL wire protocol should remain Rockstream’s primary access interface. The default query path should support:
-
-- Scans of tables and materialized views.
-- Projection and filtering.
-- Primary-key and bounded range lookup.
-- Simple ordering and limiting.
-- Introspection of tables, views, freshness, backfill status, and connector status.
-
-Expensive ad hoc joins, grouped aggregation, subqueries, and general analytical SQL should require a materialized view or remain explicitly experimental. PostgreSQL wire compatibility should be an **access protocol**, not a promise to implement PostgreSQL or a distributed warehouse.
-
-### Supported incremental SQL
-
-A defensible core SQL subset is:
-
-- Projection and filtering.
-- Deterministic scalar expressions.
-- Inner equi-join.
-- Left equi-join.
-- `GROUP BY`.
-- `SUM`, `COUNT`, `AVG`, `MIN`, and `MAX`.
-- `DISTINCT`.
-- `UNION ALL`.
-- Top-K / `ORDER BY ... LIMIT` where incrementally maintainable.
-- View-on-view composition.
-
-The initial compatibility contract should exclude:
-
-- Recursive CTEs.
-- Lateral joins and general set-returning functions.
-- Full and right outer joins.
-- General SQL window functions.
-- Session and hopping windows.
-- Arbitrary correlated subqueries.
-- Full TPC-H compatibility as a product goal.
-
-These features may remain in the codebase as experiments, but they should not drive the default architecture or release criteria.
-
-### Consistency contract
-
-Rockstream should state consistency in simple terms:
-
-- An epoch is the atomic unit of input and IVM progress.
-- A cluster checkpoint defines globally committed visibility.
-- Queries read the newest globally committed checkpoint, never a mixture of independently advanced shards.
-- A write may be accepted before it becomes query-visible.
-- Clients that require synchronization use an explicit freshness token, `FLUSH`, or `WAIT FOR EPOCH` mechanism.
-
-### Delivery contract
-
-Rockstream should distinguish internal processing guarantees from external sink guarantees:
-
-- Internal state and view maintenance can be exactly-once across checkpoint recovery.
-- External delivery depends on the destination and connector mode.
-- Each sink declares its changelog and delivery capabilities.
-
-For example:
-
-```rust
-enum ChangelogMode {
-    AppendOnly,
-    Upsert { key: Vec<ColumnId> },
-    Retract,
-}
-
-enum DeliveryGuarantee {
-    TransactionalExactlyOnce,
-    IdempotentUpsert,
-    AtLeastOnce,
-}
-```
-
-The planner should reject an incompatible view-to-sink combination instead of implying a universal exactly-once guarantee.
-
----
-
-## 3. Explicit non-goals
-
-The following should not be part of Rockstream’s core product direction:
+Rockstream should not let the roadmap be driven primarily by becoming:
 
 - A general-purpose OLTP database.
-- A distributed ad hoc OLAP engine.
-- Full PostgreSQL syntax or behavioral compatibility.
-- A large connector marketplace.
-- An Iceberg, Delta, or lakehouse catalog platform.
-- General-purpose stream-processing APIs.
-- Multi-region active-active writes.
-- User-defined CRDTs or general merge-law DDL.
-- Automatic semantic rewriting for every hot-key case.
-- Multiple specialized backfill products or selectable backfill algorithms.
-- Serverless resource management as a prerequisite for the core engine.
+- A distributed ad hoc analytical warehouse.
+- A full PostgreSQL implementation.
+- A connector marketplace.
+- A general lakehouse management platform.
+- A broad stream-processing framework.
+- A general data-governance product.
 
-A feature should enter the supported core only when it directly improves one of four actions:
-
-> **Ingest durable changes, maintain materialized views, recover safely, or serve committed results.**
+Some capabilities in those directions already exist. They can remain useful. They simply should not define what the project builds next.
 
 ---
 
-## 4. Target architecture
+## 3. Strategic core versus implemented capability
 
-```text
- PostgreSQL CDC         Kafka          PostgreSQL-wire DML
-       │                  │                    │
-       └──────────┬───────┴───────────┬────────┘
-                  ▼                   ▼
-          Shared connector runtimes / input transactions
-                              │
-                              ▼
-                    Durable base tables
-                 (checkpointed in SlateDB)
-                              │
-                              ▼
-                   Incremental operator graph
-             (Z-sets, arrangements, epochs, frontiers)
-                              │
-                              ▼
-                  Durable materialized views
-                       │               │
-                       ▼               ▼
-               PostgreSQL serving   Durable sink outbox
-                                           │
-                                           ▼
-                                     Kafka or export sink
+The project needs two different classifications:
 
- Authoritative state: object storage
- Disposable compute: gateway, worker, connector, and control roles
- Global visibility: checkpoint manifest
-```
+1. **Implementation status** — whether a capability exists and is verified.
+2. **Strategic status** — whether further investment in that capability advances Rockstream's core product.
 
-### Architectural principles
+Conflating these creates the false choice between "keep expanding it" and "rip it out."
 
-#### Durable tables are the ingestion boundary
+### Tier A — Strategic core
 
-Long-running materialized views should read Rockstream-owned tables or other materialized views, not live external connectors directly. This makes later backfill, replay, schema validation, and multi-view sharing independent of external retention settings.
+These areas should receive continued roadmap priority and the strongest compatibility guarantees:
 
-#### One incremental engine and one serving truth
+- Incremental correctness and operator semantics.
+- Materialized-view lifecycle correctness.
+- Durable object-storage-backed state.
+- Checkpointing, recovery, fencing, and replay.
+- PostgreSQL wire access to committed state.
+- A small number of high-value ingestion paths, especially PostgreSQL CDC and Kafka.
+- Resource bounds, backpressure, spill, and storage-pressure handling.
+- Observability and diagnostics for IVM state and freshness.
+- Rolling upgrades and disaster recovery.
+- Security required to operate the service in production.
+- Deterministic simulation, formal models, chaos tests, and real-backend proof.
 
-There should be no separate batch recomputation path that silently serves different semantics from the IVM engine. Batch execution remains useful as an oracle, bootstrap mechanism, and explicitly bounded query path, but maintained view results come from one authoritative incremental data plane.
+### Tier B — Supported, but not a strategic growth area
 
-#### Object storage is authoritative; compute is disposable
+These capabilities are already implemented and should remain available and regression-tested, but should not automatically generate new feature families:
 
-Workers own leases and caches, not irreplaceable data. Losing a worker should require reassignment and state reopening, not rebuilding the entire dataset from an upstream system.
+- Iceberg/Delta cold-tier integration.
+- Existing catalog integration work.
+- Advanced ad hoc analytical SQL already shipped.
+- Secondary indexes beyond what serving genuinely needs.
+- Automatic hot-key virtual bucketing and advanced elasticity controls.
+- Existing advanced DML or PostgreSQL compatibility features.
+- HTTP/webhook and other already implemented non-core ingestion paths.
 
-#### Lifecycle correctness comes before feature breadth
+The default posture for Tier B is:
 
-Backfill, checkpointing, source offsets, crash recovery, sink recovery, schema transitions, and deletion are the product. A feature is not production-ready merely because its happy-path query result is correct.
+> **Maintain correctness, security, and compatibility; do not expand the surface without a demonstrated production need.**
 
-#### Every resource is bounded
+### Tier C — New breadth
 
-Every queue, buffer, catch-up log, outbox, alignment window, cache, registry, and in-memory arrangement must have:
+Any new capability that substantially enlarges the product surface starts here:
 
-- A named bound.
-- A fill-level metric.
-- A defined backpressure or rejection behavior.
-- A recovery test.
+- A new connector family.
+- A new external catalog or protocol.
+- A new SQL feature family.
+- General transactional-database semantics.
+- A new governance DSL or policy subsystem.
+- A new lakehouse management responsibility.
+- A second general-purpose execution path.
 
-#### Advanced mechanisms stay behind stable abstractions
-
-Hot-key splitting, specialized caches, alternative backfill algorithms, extra connectors, and lakehouse integrations may evolve behind interfaces without expanding the supported contract.
+Tier C work requires explicit admission before entering the roadmap.
 
 ---
 
-## 5. Production-critical lifecycle paths to harden
+## 4. The scope rule: freeze expansion, not implementation
 
-### 5.1 Unified, resumable backfill
+The phrase **"limit Rockstream's scope"** should mean:
 
-Backfill is the most important missing production contract. Creating a view over existing data requires a consistent transition from a historical snapshot to live changes.
+- Do not remove already-proven functionality simply to make the repository visually smaller.
+- Do not break users of a shipped capability without a separate deprecation decision.
+- Do not spend roadmap capacity extending a non-core subsystem merely because it exists.
+- Do not let completeness goals such as "support every SQL feature" or "support every sink" become implicit product requirements.
+- Do not treat code coverage of a capability as evidence that the capability deserves more product investment.
 
-Rockstream should implement one generalized state machine:
+This is a **scope freeze on strategic expansion**, not a rollback.
 
-```text
-CREATING
-   ↓
-SNAPSHOTTING(snapshot epoch E)
-   ↓
-CATCHING_UP(replaying changes after E)
-   ↓
-PUBLISHING(checkpoint-aligned cutover)
-   ↓
-RUNNING
-```
+A useful test is:
 
-The implementation should include:
+> If Rockstream did not already have this feature, would we choose to build it today because it materially improves cloud-native IVM?
 
-- An atomic snapshot/offset fence.
-- A deterministic primary-key scan order.
-- Durable per-partition scan cursors.
-- A bounded durable catch-up log for changes after the snapshot point.
-- Rate limiting and backpressure.
-- Checkpointed recovery of scan and catch-up progress.
-- Atomic publication only after the view reaches a committed frontier.
-
-A minimal fence could be:
-
-```rust
-struct SnapshotFence {
-    snapshot_token: Vec<u8>,
-    delta_offset: OffsetToken,
-    schema_fingerprint: [u8; 32],
-}
-```
-
-A minimal persisted progress record could be:
-
-```rust
-struct BackfillProgress {
-    view_id: ViewId,
-    logical_partition: u16,
-    snapshot_epoch: Epoch,
-    snapshot_offset: OffsetToken,
-    last_primary_key: Option<Vec<u8>>,
-    snapshot_rows: u64,
-    catchup_epoch: Epoch,
-    snapshot_complete: bool,
-}
-```
-
-The view must not expose a partially built result as `RUNNING`.
-
-### 5.2 Shared PostgreSQL CDC with transaction-preserving fan-out
-
-One replication connection should be able to feed multiple Rockstream tables from the same upstream database. This avoids duplicate work and, more importantly, preserves cross-table transaction ordering.
-
-The connector should emit committed transaction envelopes:
-
-```rust
-struct SourceTransaction {
-    transaction_id: Vec<u8>,
-    commit_offset: OffsetToken,
-    commit_timestamp: Option<Timestamp>,
-    changes: Vec<TableChange>,
-}
-```
-
-All changes in one upstream transaction should become visible in one atomic Rockstream input commit. Oversized transactions may spill to durable input storage, but they should not be silently divided into independently visible epochs.
-
-### 5.3 Checkpoint-coupled source offsets
-
-Rockstream already has strong source-offset primitives. The supported contract should make the ordering explicit:
-
-1. Decode and validate input.
-2. Persist input mutations and the source checkpoint together.
-3. Commit the Rockstream epoch/checkpoint.
-4. Acknowledge or advance the external source offset.
-
-A crash before step 3 must not acknowledge the source. A crash between steps 3 and 4 must retry only the acknowledgment, not duplicate the input mutation.
-
-### 5.4 Durable sink outbox
-
-External sink availability should not immediately stall every internal checkpoint. Materialized changes should first enter a durable outbox committed with Rockstream state, then drain independently.
-
-```text
-IVM checkpoint
-   ├── commits view state
-   ├── commits view output
-   └── appends sink changelog to durable outbox
-                         ↓
-               independent sink drainer
-                         ↓
-           external commit + cursor advance
-```
-
-The outbox needs:
-
-- Stable record identity such as `(sink_id, epoch, sequence)`.
-- An independently checkpointed drain cursor.
-- A hard byte and age limit.
-- Fill-level and lag metrics.
-- Defined escalation from decoupled operation to upstream backpressure.
-- Recovery for a crash after external commit but before cursor advancement.
-
-### 5.5 Barrier and checkpoint priority
-
-Control progress must not be starved behind ordinary data. Barrier delivery should use a dedicated bounded channel or a prioritized lane so a large batch or backfill cannot indefinitely prevent checkpoint completion.
-
-Track separately:
-
-- Barrier propagation latency.
-- Alignment wait time.
-- Checkpoint persistence latency.
-- Global commit latency.
-- Data-processing latency.
-
-### 5.6 Storage and compaction pressure
-
-Object-storage-backed state remains healthy only when compaction keeps pace with logical writes. Compute scaling that increases write pressure without accounting for compaction debt can make the system slower.
-
-Rockstream should expose and act on:
-
-- L0 file count and bytes.
-- Oldest uncompacted L0 age.
-- Pending compaction bytes.
-- Logical and compacted bytes written.
-- Write amplification.
-- Cache hit ratio.
-- Object-store request latency and failure rate.
-- Read amplification where available.
-
-A normalized control signal can be defined as:
-
-```text
-storage_debt = max(
-  l0_bytes / target_l0_bytes,
-  oldest_l0_age / target_compaction_age,
-  pending_compaction_bytes / target_pending_bytes,
-  write_amplification / target_write_amplification
-)
-```
-
-Storage debt should influence connector credits, backfill rate, admission control, and bounded compaction concurrency.
+If the answer is no, the feature should usually remain maintenance-only rather than becoming a new roadmap branch.
 
 ---
 
-## 6. Scaling model
+## 5. What should happen next
 
-### Supported v1 model: stable logical partitions
+### 5.1 Finish the current hardening review
 
-The supported scaling model should use a fixed logical partition space per table or namespace:
+The immediate post-v0.51.26 work should continue the hardening trajectory rather than pivoting back to feature expansion.
 
-```text
-logical_partition = stable_hash(key) % partition_count
-```
+The roadmap's v0.51.27 focus on **honest failure semantics** is strongly aligned with the product direction. In particular, Rockstream should eliminate:
 
-Durable state keys include the logical partition. The control plane maps logical partitions to workers and may move them without changing query semantics or key identity.
+- Reachable `unreachable!()` or panic paths driven by external/runtime state.
+- Operator implementations capable of returning silently wrong results even when the SQL frontend currently blocks them.
+- Features whose documented semantics exceed what their execution path actually does.
+- Control-plane messages that are accepted, logged, and discarded rather than acted on.
+- Any branch where a partial implementation can become reachable through future wiring and return an incorrect answer.
 
-This gives Rockstream:
+For an IVM system, "fail clearly rather than return a wrong answer" is a core product property.
 
-- Stable recovery units.
-- Bounded movement during rescaling.
-- Per-partition backfill progress.
-- Per-partition checkpoint and skew metrics.
-- A clean separation between logical state and physical worker placement.
+### 5.2 Make operability a first-class product feature
 
-### Experimental model: automatic hot-key rewriting
+After correctness hardening, the highest-value remaining work is not another SQL family. It is making the existing engine understandable in production.
 
-Automatic hot-key salting and partial-state recombination should remain experimental. It requires operator-specific proofs and special behavior for non-composable state such as `DISTINCT`, outer joins, and Top-K.
+Prioritize:
 
-The supported contract should initially be:
+- Operator and view status that explains freshness lag.
+- Source lag, compute lag, checkpoint lag, sink lag, spill activity, and compaction/storage pressure as distinct signals.
+- An arrangement debugger capable of inspecting intermediate IVM state.
+- A support bundle with secret redaction.
+- Worker drain and migration visibility.
+- Checkpoint inspection and recovery tooling.
+- A stable CLI over already-existing control-plane APIs.
 
-- Detect and report hot keys.
-- Spill bounded state safely.
-- Move logical partitions.
-- Allow an operator override or manual repartitioning decision.
+The planned operator CLI and arrangement debugger work is therefore highly aligned with the strategic core.
 
-Automatic semantic rewriting may be promoted only after it is demonstrably needed by production workloads.
+### 5.3 Finish production security
 
----
+A cloud-native IVM service cannot call itself production-ready if internal communication and connector credentials are handled as development conveniences.
 
-## 7. Managing the existing repository
+Prioritize the security work necessary to operate the existing product safely:
 
-The project does not need to discard advanced work. It needs to classify it and prevent it from expanding the default maintenance burden.
+- Internal mTLS.
+- Secret storage and rotation.
+- Removal of plaintext connector credentials from persistent/configuration surfaces where practical.
+- Audit coverage for secret access and lifecycle changes.
+- Redaction in logs and support bundles.
+- Independent security review before v1.0.
 
-### Core
+This is not "enterprise feature breadth." It is production hygiene for the system Rockstream already is.
 
-The default build and compatibility contract should include:
+### 5.4 Prove rolling upgrades and disaster recovery
 
-- Z-set and DBSP-derived incremental semantics.
-- The core operator subset.
-- SlateDB-backed arrangements and view output.
-- Epochs, frontiers, checkpoints, fencing, and recovery.
-- PostgreSQL wire serving and direct DML.
-- PostgreSQL CDC and Kafka.
-- Bounded object-storage import/export.
-- Oracle, property, simulation, integration, and chaos tests.
-- Operational status, metrics, and support tooling.
+This should remain a top-tier pre-1.0 milestone.
 
-### Experimental
+A cloud-native system whose state is authoritative in object storage should prove that:
 
-Keep behind feature flags, separate binaries, or a clearly marked experimental workspace:
+- N/N+1 workers can coexist safely during a rolling upgrade.
+- Storage-format and protocol-version incompatibilities fail closed.
+- Shard assignment respects version compatibility.
+- A checkpoint can be exported independently of the live cluster.
+- A fresh cluster can restore that checkpoint and reproduce committed state.
+- The recovery procedure is documented and rehearsed rather than inferred from unit tests.
 
-- General ad hoc joins and grouped analytical queries.
-- Secondary indexes beyond primary serving needs.
-- Recursive CTEs and lateral joins.
-- General window functions and advanced event-time windows.
-- Automatic hot-key virtual bucketing.
-- Advanced autoscaling controllers.
-- Iceberg and Delta output.
-- Lakehouse catalog integrations.
+Rolling upgrades and disaster recovery are more important to the v1 promise than additional query or governance features.
 
-Suggested feature families:
+### 5.5 Continue simulation and failure-matrix maturity
 
-```text
-experimental-analytics
-experimental-lakehouse
-experimental-elasticity
-experimental-sql-advanced
-```
+The deterministic simulator, FizzBee models, runtime invariant pairing, and real-backend tests are differentiators. Keep investing in them where they validate the strategic core.
 
-### Remove or extract from the default product
+The objective should be coverage of production failure modes, not simply larger test counts:
 
-Connector and catalog code that is not part of the core contract should leave the default dependency graph. Options include:
-
-- A separate `rockstream-extras` repository.
-- Non-default workspace members.
-- Independently versioned integration crates.
-
-This reduces build time, dependency risk, security surface, CI cost, and accidental compatibility commitments.
-
-### Documentation and version discipline
-
-The README, Cargo version, roadmap, release notes, and capability matrix must describe the same release. A feature should not be advertised as supported merely because a proof harness or sign-off document exists.
-
-Every feature should have one status:
-
-- **Supported** — stable compatibility contract and release-gated lifecycle tests.
-- **Experimental** — available without compatibility guarantees.
-- **Not planned** — intentionally outside the product direction.
+- Worker and control-node loss.
+- Exchange interruption and retry exhaustion.
+- Source disconnect and offset recovery.
+- Object-store brownouts and throttling.
+- Spill and compaction pressure.
+- Checkpoint interruption.
+- Sink failure during commit/recovery.
+- Shard migration interruption.
+- Rolling upgrades.
+- Resource exhaustion and recovery.
 
 ---
 
-## 8. Phased path to the target
+## 6. Rebaseline the remaining roadmap
 
-### Phase 0 — Scope freeze and compatibility reset
+The remaining roadmap should be evaluated against the strategic core rather than executed automatically because it was previously written down.
 
-**Goal:** Establish one authoritative product contract before adding more functionality.
+### Keep / prioritize
 
-Actions:
+#### v0.51.27 — Honest failure semantics
 
-- Approve a project-focus ADR based on this document.
-- Publish the Supported / Experimental / Not planned capability matrix.
-- Label every connector, SQL feature, control loop, and catalog integration.
-- Move non-core features out of the default build.
-- Align README, roadmap, Cargo version, and release status.
-- Replace broad benchmark goals such as full TPC-H compatibility with an IVM-focused correctness corpus.
+**Recommendation:** Keep and prioritize.
 
-Exit criteria:
+Why: eliminating silent wrong answers, reachable panics, and acknowledged-but-discarded control messages is directly part of IVM correctness.
 
-- The default binary cannot dispatch an unsupported connector.
-- Unsupported ad hoc analytical SQL is rejected with a clear error.
-- The default dependency graph contains only core integrations.
-- The documentation has one unambiguous product definition.
+#### Operator CLI and arrangement debugging
 
-### Phase 1 — Unified backfill and publication
+**Recommendation:** Keep and prioritize.
 
-**Goal:** Make view creation over existing data safe, bounded, resumable, and atomic.
+Why: the system is already sophisticated; production users need to inspect and diagnose the existing IVM engine rather than receive more hidden machinery.
 
-Actions:
+#### Internal mTLS, secrets, and security review
 
-- Add the atomic snapshot fence to the source contract.
-- Add durable per-partition backfill progress.
-- Add the bounded catch-up log.
-- Add checkpoint-aligned publication.
-- Extend view lifecycle states to represent snapshotting and catch-up separately.
-- Reject or conservatively restart schema changes during active backfill.
+**Recommendation:** Keep and prioritize.
 
-Required tests:
+Why: necessary to operate the existing distributed system safely.
 
-- Crash after snapshot output but before cursor commit.
-- Crash after cursor commit but before reading the next page.
-- Crash after snapshot completion but before catch-up starts.
-- Crash midway through catch-up.
-- Insert, update, and delete of a key before and after its snapshot position.
-- Repeated crash/recovery with byte-identical final output.
-- Backfill buffer and catch-up log reaching their configured bounds.
+#### Rolling upgrades and disaster recovery
 
-Exit criteria:
+**Recommendation:** Keep and prioritize.
 
-- A view never publishes a partial result as running.
-- Recovery resumes from the last durable cursor rather than restarting blindly.
-- Incremental output after cutover matches a full batch oracle.
+Why: necessary to make object-storage-backed disposable compute a credible production promise.
 
-### Phase 2 — Transactional shared-source ingestion
+#### Simulator maturity and final production soaks
 
-**Goal:** Make connector-backed tables a stable, reusable input boundary.
+**Recommendation:** Keep, but tie the work to concrete IVM/recovery failure modes rather than generic platform expansion.
 
-Actions:
+#### v1.0 release verification
 
-- Implement shared PostgreSQL CDC runtimes.
-- Add committed transaction envelopes and cross-table fan-out.
-- Couple consistent snapshot creation to the WAL offset fence.
-- Require stable primary keys for current-state CDC tables.
-- Define append-only and upsert Kafka table semantics.
-- Preserve the existing checkpoint-before-acknowledgment ordering.
+**Recommendation:** Keep, but define success primarily around the strategic contract: correct maintained views, safe lifecycle behavior, operability, bounded resources, security, upgradeability, and recoverability.
 
-Required proof:
+### Narrow / reconsider
 
-> A transaction that changes multiple upstream tables becomes visible in all corresponding Rockstream tables and dependent views in the same committed Rockstream epoch.
+#### v0.52–v0.53 declarative data-governance work
 
-Exit criteria:
+**Recommendation:** Split the operationally necessary part from the product-language expansion.
 
-- Multiple tables can share one PostgreSQL replication connection.
-- Source reconnection cannot expose half of a committed upstream transaction.
-- Replaying a committed source offset produces no duplicate visible state.
+A minimal durable quarantine/DLQ for connector decode failures can be justified because malformed source data is a real ingestion lifecycle problem. A broad expectations/governance subsystem should be deferred unless concrete design partners require it.
 
-### Phase 3 — Explicit sink semantics and durable outbox
+Prefer:
 
-**Goal:** Make output guarantees accurate and isolate internal progress from temporary sink failures.
+- Durable failed-record quarantine.
+- Clear error codes and metrics.
+- Bounded retention.
+- A simple inspect/retry operational path.
 
-Actions:
+Be skeptical of:
 
-- Add changelog and delivery capability declarations.
-- Implement the durable sink outbox.
-- Implement Kafka transactional and idempotent-upsert modes.
-- Define bounded object-storage export semantics.
-- Remove universal exactly-once wording from the generic sink trait.
+- A large policy language.
+- Rich governance workflow as a new product pillar.
+- Expanding catalog surface primarily to compete with data-quality platforms.
 
-Required tests:
+#### v0.54 broader transactional semantics
 
-- External commit succeeds and the worker crashes before cursor advancement.
-- The destination is unavailable while internal checkpoints continue.
-- The outbox reaches its hard bound and applies predictable backpressure.
-- Recovery dispatch differs correctly by delivery capability.
+**Recommendation:** Defer by default.
 
-Exit criteria:
+Single-shard `SERIALIZABLE LOCAL` and broader ACID workflows move Rockstream toward being an OLTP database. Direct DML is useful as an ingestion/access convenience, but full transactional semantics are not central to cloud-native IVM.
 
-- The system reports the actual end-to-end guarantee for every sink.
-- No sink can silently request a changelog shape it cannot represent.
-- Temporary sink failure does not immediately block internal checkpoint progress.
+Only promote this work if a concrete target workload cannot reasonably use PostgreSQL/Kafka as its source of truth and requires Rockstream itself to become the transactional authority.
 
-### Phase 4 — Storage-pressure and serving isolation
+### Maintain, do not expand without evidence
 
-**Goal:** Keep the IVM loop healthy under real cloud-storage and query pressure.
+The following already-shipped areas should remain supported, tested, and secure, but should not receive automatic roadmap expansion:
 
-Actions:
-
-- Complete SlateDB metrics wiring.
-- Introduce `storage_debt` and integrate it with admission and backfill rate.
-- Separate CPU and concurrency budgets for streaming, gateway queries, connectors, sinks, and compaction.
-- Keep gateway queries from starving checkpoint and operator execution.
-- Add an optional non-authoritative local cache when local disk is configured.
-
-Exit criteria:
-
-- Sustained compaction debt triggers bounded corrective action before unbounded L0 growth.
-- Query load cannot indefinitely block checkpoints.
-- All caches and queues expose byte bounds and fill metrics.
-
-### Phase 5 — Scaling simplification
-
-**Goal:** Make rescaling predictable without making advanced skew rewriting part of the core promise.
-
-Actions:
-
-- Introduce or standardize the stable logical partition space.
-- Persist partition-to-worker assignments in the catalog.
-- Move logical partitions through checkpointed migration.
-- Track backfill, state size, and lag per logical partition.
-- Keep automatic hot-key bucketing behind an experimental feature.
-
-Exit criteria:
-
-- Worker replacement and scale-out do not change row identity or query semantics.
-- A failed migration resumes or rolls back deterministically.
-- Rescaling does not require replaying an entire external source.
-
-### Phase 6 — Production release gate
-
-**Goal:** Release a narrow product with evidence-backed lifecycle guarantees.
-
-Release gates:
-
-- Core operator oracle tests remain bit-identical to batch computation.
-- Crash and checkpoint tests show no lost or duplicate committed input.
-- Backfill fault matrix passes on local object storage and a real S3-compatible backend.
-- Shared PostgreSQL CDC transaction tests pass.
-- Sink outbox recovery tests pass.
-- Storage-pressure soak remains bounded.
-- The core connector count remains within the approved cap.
-- The capability matrix and default build agree.
+- Iceberg/Delta and cold-tier integration.
+- Catalog integrations.
+- Advanced ad hoc SQL.
+- Secondary-index sophistication.
+- Automatic hot-key rewriting.
+- Autoscaling control loops beyond what is required to keep the IVM SLO healthy.
+- Additional connector families.
 
 ---
 
-## 9. Feature admission rules
+## 7. Define the v1 public contract now
 
-A proposed feature should enter the supported core only when every answer below is satisfactory.
+The project should write the v1 compatibility contract before implementing more surface area.
+
+### Core product promise
+
+A reasonable v1 promise is:
+
+> Rockstream ingests changing data, continuously maintains a documented SQL subset as durable materialized views, and serves globally committed results through PostgreSQL-compatible clients while surviving ordinary distributed-system failures without losing or silently corrupting committed state.
+
+### Core connectors
+
+Keep the strategic connector set intentionally small.
+
+Recommended core external streaming connectors:
+
+- **PostgreSQL CDC** — the most natural operational-database input.
+- **Kafka** — the most broadly useful durable event-stream input/output.
+
+PostgreSQL-wire DML remains a native access path rather than a connector.
+
+Existing S3/object-store, HTTP/webhook, Iceberg/Delta, and related integrations may remain supported, but they should not imply a commitment to build a wide connector ecosystem.
+
+### Core SQL
+
+The v1 SQL contract should be defined from the operator set users actually need for maintained views, not from PostgreSQL or TPC-H completeness.
+
+The project does not need to remove already-implemented SQL. It should distinguish:
+
+- **Core incremental SQL:** release-gated as part of the IVM promise.
+- **Additional supported SQL:** maintained and regression-tested.
+- **Compatibility/experimental SQL:** no guarantee of continued expansion.
+
+The important metric is not feature count. It is whether the system can state the incremental, backfill, recovery, state-growth, and failure semantics of every core operator.
+
+---
+
+## 8. Add a roadmap admission rule
+
+No new product-surface milestone should enter the roadmap without answering the following questions.
 
 ### Product fit
 
-- Does it directly improve durable ingestion, IVM, recovery, or serving?
-- Is it required by a concrete target workload?
-- Can the same need be met through a materialized view rather than a broader ad hoc engine?
+- Does it improve ingestion, incremental maintenance, recovery, serving, or operation of maintained views?
+- Is it required by a concrete production workload or design partner?
+- Would we build it if the current repository did not already contain adjacent machinery?
 
-### Semantic clarity
+### Semantic fit
 
-- Is its consistency behavior defined?
-- Is its changelog behavior defined for inserts, updates, and deletes?
-- Is its interaction with backfill and schema change defined?
-- Can `EXPLAIN INCREMENTAL` describe the behavior honestly?
+- Are insert, update, delete, replay, and backfill semantics defined?
+- Is its checkpoint and crash-recovery behavior defined?
+- Is state growth understood and bounded?
+- Can the system fail clearly instead of returning a partial or wrong result?
 
-### Operational safety
+### Operational fit
 
-- Are memory, disk, queue, and retry bounds named?
-- Are fill-level and lag metrics present?
-- Is backpressure or rejection behavior defined?
-- Does it recover correctly after interruption at every durable boundary?
+- Are all queues, retries, caches, and buffers bounded?
+- Are fill level, lag, and failure mode observable?
+- Does it behave predictably under object-store and network failure?
+- Is there a useful operator-facing diagnostic path?
 
 ### Scope cost
 
-- Does it add a connector family, external protocol, catalog, or major dependency?
-- Does it require a second execution engine?
-- Does it create a compatibility obligation beyond IVM?
-- Can it live in an experimental crate without burdening the core?
+- Does it create a new connector family or protocol?
+- Does it create a new SQL compatibility obligation?
+- Does it move Rockstream toward OLTP, warehouse, governance, or lakehouse-platform responsibilities?
+- Does it require ongoing expertise and dependencies disproportionate to its IVM value?
 
 ### Proof
 
-- Is there an incremental-versus-batch oracle test?
-- Is there a deterministic simulation test for coordination changes?
-- Are real-network and real-object-store tests present where needed?
-- Are negative and recovery tests release-gating rather than optional?
+- Is incremental output checked against a batch oracle where applicable?
+- Are coordination changes modeled or deterministically simulated?
+- Are durable paths tested on LFS and a real S3-compatible backend where relevant?
+- Are real external systems used for connector guarantees?
+- Are negative/failure tests release-gating?
+
+If these answers are weak, the feature should stay out of the strategic roadmap even if it sounds useful.
 
 ---
 
-## 10. Measures of success
+## 9. Concrete repository and planning changes
 
-The project is moving in the right direction when the following become true:
+### 9.1 Replace the old focus document
 
-### Scope
+This document should supersede the earlier project-focus document that described already-implemented lifecycle capabilities as future gaps.
 
-- The core connector set remains intentionally small.
-- The default build excludes experimental lakehouse and analytical dependencies.
-- The README can describe the complete supported product on one page.
-- Every public feature has a clear support status.
+The older document may be retained in history, but should not remain an authoritative source of current next steps.
+
+### 9.2 Link strategy into the planning corpus
+
+Avoid another standalone strategy document that drifts away from implementation.
+
+Add references from:
+
+- `README.md` — product definition and strategic scope.
+- `NEW_ROADMAP.md` — roadmap admission rule and strategic classifications.
+- `NEW_IMPLEMENTATION_PLAN.md` — the v1 contract and non-goals.
+- `DESIGN.md` — a short statement separating architecture capability from strategic product scope.
+
+### 9.3 Give roadmap items a strategic status
+
+Keep the existing implementation status (`✅ Done`, planned, etc.), but add a separate classification where useful:
+
+- **Core** — advances the IVM product and is part of the strategic compatibility contract.
+- **Maintain** — already shipped; keep correct and secure, but do not expand by default.
+- **Candidate** — proposed breadth requiring explicit admission.
+
+This prevents "Done" from being interpreted as "we must keep expanding this subsystem forever."
+
+### 9.4 Publish one capability matrix
+
+For public-facing features, track:
+
+| Capability | Implementation | Strategic tier | v1 guarantee |
+|---|---|---|---|
+| PostgreSQL CDC | Done | Core | Yes |
+| Kafka source/sink | Done | Core | Yes |
+| Materialized-view IVM | Done | Core | Yes |
+| Checkpoint/recovery | Done | Core | Yes |
+| PostgreSQL wire serving | Done | Core | Yes |
+| Arrangement spill | Done | Core | Yes |
+| Iceberg/Delta cold tier | Done | Maintain | Narrow existing contract |
+| Hot-key virtual bucketing | Done | Maintain | Existing behavior, no automatic expansion |
+| Advanced ad hoc analytics | Done/varied | Maintain | Separate from core IVM guarantee |
+| New connector family | Not applicable | Candidate | No without admission |
+| General local serializable OLTP | Planned | Candidate | No by default |
+
+The exact rows should be generated from the current repository rather than copied blindly from this example.
+
+### 9.5 Stop using feature completeness as the primary roadmap metric
+
+Avoid goals such as:
+
+- "Complete PostgreSQL behavior."
+- "Support all TPC-H queries" as a product objective.
+- "Add another connector because competitors have it."
+- "Expose every implemented subsystem through SQL."
+
+Prefer release objectives such as:
+
+- No silent wrong answers.
+- No lost/duplicated committed state under the supported failure model.
+- Predictable recovery time.
+- Bounded memory and state behavior.
+- Explainable freshness lag.
+- Rehearsed rolling upgrades and disaster recovery.
+- Secure credential handling.
+- Known performance envelopes for core maintained-view workloads.
+
+---
+
+## 10. Recommended path from v0.51.26 to v1.0
+
+### Stage 1 — Correctness hardening
+
+Start from v0.51.27 and complete the post-v0.51 hardening review.
+
+Exit when:
+
+- No known reachable silent-wrong-answer branches remain.
+- No external/runtime input can trigger an intentional `unreachable!()` or equivalent panic on a supported path.
+- Partially implemented behavior fails with a documented error rather than pretending to work.
+- Worker lifecycle/control messages are actually consumed by the relevant state machines.
+
+### Stage 2 — Operational completeness
+
+Build the operator-facing tools necessary to understand the already-complex engine.
+
+Exit when an operator can diagnose:
+
+- Why a view is stale.
+- Which source or shard is behind.
+- Whether an operator is spilling.
+- Whether checkpoint alignment is stalled.
+- What intermediate arrangement state exists for a key.
+- Why a migration or drain is not progressing.
+
+without reading source code or attaching an ad hoc debugger.
+
+### Stage 3 — Security readiness
+
+Finish internal identity, secret handling, credential rotation, redaction, and independent security review.
+
+Exit when the system can be deployed without plaintext operational shortcuts or unauthenticated internal trust assumptions.
+
+### Stage 4 — Upgrade and disaster-recovery proof
+
+Prove rolling upgrade and restore into a fresh cluster from independently stored checkpoint material.
+
+Exit when the procedures are executable runbooks backed by automated tests and a real drill.
+
+### Stage 5 — Final IVM production validation
+
+Run long-duration chaos, scale, object-store-pressure, spill, and connector-failure workloads against the v1 core contract.
+
+The release gate should prioritize:
+
+- Correctness.
+- Recovery.
+- Bounded resources.
+- Operability.
+- Upgradeability.
+- Security.
+- Performance stability of core IVM workloads.
+
+Only after those gates are satisfied should broader feature expansion become a default roadmap activity again.
+
+---
+
+## 11. Measures of success
+
+The strategy is working when:
+
+### Product clarity
+
+- The README can explain Rockstream's core value in one page.
+- A user can tell which capabilities are strategic core versus retained extras.
+- The roadmap is not implicitly trying to match PostgreSQL, RisingWave, Flink, and a lakehouse platform at the same time.
+
+### Engineering focus
+
+- Most pre-v1 work closes production-readiness gaps rather than adds feature families.
+- New connectors and SQL families are rare and justified by concrete workload evidence.
+- Existing advanced functionality does not create automatic roadmap commitments.
 
 ### Correctness
 
-- Every supported operator has incremental-versus-batch property coverage.
-- Backfill and CDC recovery produce byte-identical committed results after repeated crashes.
-- No query can observe a partially published view or cross-shard checkpoint mixture.
+- Every core operator retains incremental-versus-batch proof.
+- No supported path silently returns a known-wrong result.
+- Checkpoint, source, migration, spill, and sink recovery retain their failure proofs.
 
 ### Operability
 
-- Operators can distinguish source lag, compute lag, checkpoint lag, sink lag, and compaction debt.
-- Every bounded resource reports its current usage and limit.
-- Failures produce a named state and an actionable next step.
+- Freshness and failure are explainable from metrics and tooling.
+- Arrangement state can be inspected safely.
+- Every long-lived resource has a lifecycle, bound, and observable fill level.
+- Operators can drain, upgrade, recover, and restore the cluster using documented procedures.
 
 ### Reliability
 
-- Worker replacement does not require full external-source replay.
-- Source offsets never advance ahead of durable Rockstream state.
-- Sink recovery behavior matches the declared delivery capability.
-- Storage pressure is controlled before it becomes an outage.
-
-### User experience
-
-- The path from empty installation to a maintained view requires only a few stable concepts.
-- PostgreSQL clients can query committed results without a custom driver.
-- Users do not need to understand shards, antichains, arrangements, or compaction to operate a normal workload.
+- Worker loss does not require source reconstruction.
+- Memory pressure degrades through spill/backpressure instead of OOM.
+- Temporary external-system failures remain bounded.
+- Rolling upgrades preserve committed epochs.
+- Disaster recovery reproduces committed state in a fresh cluster.
 
 ---
 
-## 11. Immediate decisions and actions
+## 12. Immediate decisions
 
-1. **Adopt the product definition:** Rockstream is a cloud-native IVM service, not a general streaming database.
-2. **Freeze core scope:** no new connector, SQL family, catalog, or broad query feature enters the default product until the lifecycle milestones are complete.
-3. **Create the capability matrix:** classify the current repository into Supported, Experimental, and Not planned.
-4. **Update the roadmap:** replace feature-expansion milestones with backfill, CDC transactionality, sink outbox, and storage-pressure milestones.
-5. **Write the backfill protocol specification:** make it the next normative architecture document and implementation focus.
-6. **Gate non-core modules:** remove lakehouse, advanced analytical SQL, and automatic skew rewriting from the default build.
-7. **Align version and documentation:** one release number, one status, and one public compatibility story.
+The project should make the following decisions now:
+
+1. **Adopt the strategic north star:** Rockstream is primarily a cloud-native IVM system.
+2. **Take v0.51.26 as the baseline:** do not describe already-shipped capabilities as missing future architecture.
+3. **Do not rip out proven features:** use strategic tiers instead of retroactive de-scoping.
+4. **Freeze unqualified feature expansion until v1 production-readiness work is complete.**
+5. **Keep v0.51.27-style correctness hardening as the immediate priority.**
+6. **Prioritize operator tooling, security, rolling upgrades, disaster recovery, and final production validation.**
+7. **Reconsider broad governance and OLTP-style transactional milestones unless concrete target workloads require them.**
+8. **Classify existing lakehouse, advanced SQL, and elasticity work as maintained capabilities rather than default growth areas.**
+9. **Add a strategic-status layer and feature-admission rule to `NEW_ROADMAP.md`.**
+10. **Link this strategy from the README, roadmap, implementation plan, and design documentation so it cannot drift independently from the repository again.**
 
 ---
 
 ## Final recommendation
 
-Rockstream’s differentiator is not the number of connectors or SQL features it can accumulate. Its differentiator is the combination of:
+Rockstream has already built more than a minimal IVM prototype. That is now an asset, not a reason to keep widening the product indefinitely.
 
-- Theory-grounded incremental computation.
-- Durable object-storage-backed state.
-- Disposable cloud-native compute.
-- Familiar PostgreSQL access.
-- Deterministic, evidence-driven correctness testing.
+The next stage should convert breadth into confidence.
 
-The project should protect that differentiator by narrowing its promise and concentrating engineering effort on the lifecycle paths that determine whether users can trust it in production.
+Preserve what has been implemented. Harden it. Make it observable. Make it secure. Make upgrades and recovery boring. Make every supported failure mode either recover correctly or fail loudly. Then call the resulting contract v1.
 
-The intended result is simple:
+The intended product identity is:
 
-> **A small, reliable system that ingests durable changes, maintains a well-defined set of materialized views, survives failure predictably, and serves committed answers through tools users already know.**
+> **Rockstream is the cloud-native IVM engine you choose when continuously maintained SQL results must remain correct, durable, scalable, and understandable under real failure.**
+
+Future breadth should earn its place by strengthening that identity rather than diluting it.
 
 ---
 
-## Reference material
+## Repository references
 
-This recommendation is informed by the current Rockstream architecture and implementation documents, including:
+This direction should be maintained alongside, and reconciled continuously with:
 
-- [Rockstream README](https://github.com/trickle-labs/rockstream/blob/main/README.md)
-- [Rockstream Architecture](https://github.com/trickle-labs/rockstream/blob/main/ARCHITECTURE.md)
-- [Rockstream IVM Design](https://github.com/trickle-labs/rockstream/blob/main/IVM.md)
-- [Rockstream Focused Implementation Plan](https://github.com/trickle-labs/rockstream/blob/main/NEW_IMPLEMENTATION_PLAN.md)
-- [Rockstream Roadmap](https://github.com/trickle-labs/rockstream/blob/main/NEW_ROADMAP.md)
+- [`README.md`](README.md)
+- [`ARCHITECTURE.md`](ARCHITECTURE.md)
+- [`DESIGN.md`](DESIGN.md)
+- [`IVM.md`](IVM.md)
+- [`NEW_IMPLEMENTATION_PLAN.md`](NEW_IMPLEMENTATION_PLAN.md)
+- [`NEW_ROADMAP.md`](NEW_ROADMAP.md)
+- [`sign-offs/v0.51.26.md`](sign-offs/v0.51.26.md)
 
-It also incorporates selected architectural lessons from RisingWave’s public documentation, particularly around durable tables, barriers and checkpoints, CDC ingestion, backfill, sink delivery, and compute/storage separation:
-
-- [RisingWave introduction](https://docs.risingwave.com/get-started/intro)
-- [RisingWave architecture](https://docs.risingwave.com/get-started/architecture)
-- [Source, table, materialized view, and sink](https://docs.risingwave.com/get-started/source-table-mv-sink)
-- [CDC ingestion](https://docs.risingwave.com/ingestion/cdc-with-risingwave)
-- [Sink delivery](https://docs.risingwave.com/delivery/overview)
+The roadmap and sign-offs remain the source of truth for **what is implemented**. This document is intended to be the source of truth for **what the project should optimize for next**.
