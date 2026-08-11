@@ -307,6 +307,10 @@ Why: necessary to make object-storage-backed disposable compute a credible produ
 
 **Recommendation:** Split the operationally necessary part from the product-language expansion.
 
+**Applied (2026-08-11):** [NEW_ROADMAP.md](NEW_ROADMAP.md) now carries only the
+durable connector quarantine, as v0.52; the expectation/governance surface is
+recorded under "Deferred by decision" with its readmission evidence.
+
 A minimal durable quarantine/DLQ for connector decode failures can be justified because malformed source data is a real ingestion lifecycle problem. A broad expectations/governance subsystem should be deferred unless concrete design partners require it.
 
 Prefer:
@@ -325,6 +329,10 @@ Be skeptical of:
 #### v0.54 broader transactional semantics
 
 **Recommendation:** Defer by default.
+
+**Applied (2026-08-11):** removed from the roadmap's version table and recorded
+under "Deferred by decision"; `DESIGN.md` §1.1 and §12.6's isolation table, and
+`docs/language-features.md`, now say deferred rather than naming a version.
 
 Single-shard `SERIALIZABLE LOCAL` and broader ACID workflows move Rockstream toward being an OLTP database. Direct DML is useful as an ingestion/access convenience, but full transactional semantics are not central to cloud-native IVM.
 
@@ -477,16 +485,19 @@ For public-facing features, track:
 | Advanced ad hoc / multi-shard scatter-gather SQL | Done | v0.51.13 | Maintain | Separate from core IVM guarantee |
 | Advanced DML & scatter pruning | Done | v0.48, v0.51.1 | Maintain | Separate from core IVM guarantee |
 | Honest failure semantics (no silent-wrong-answer paths) | Planned | v0.51.27 | Core | Yes |
-| Inline expectations & lineage diagnostics | Planned | v0.52 | Candidate | Narrow to quarantine/DLQ per §6, no broad policy language |
-| DLQ routing & state degradation | Planned | v0.53 | Candidate | Narrow to durable quarantine per §6 |
-| Isolation & validation hooks (broader transactional semantics) | Planned | v0.54 | Candidate | No by default; requires concrete workload evidence per §6 |
-| Admin CLI & arrangement debugger | Planned | v0.55 | Core | Yes |
-| mTLS, secrets management & security review | Planned | v0.56 | Core | Yes |
-| Rolling upgrade proof & disaster recovery | Planned | v0.57 | Core | Yes |
+| Durable connector quarantine (bounded, replayable DLQ) | Planned | v0.52 | Core | Yes |
+| Operator CLI & arrangement debugger | Planned | v0.53 | Core | Yes |
+| Freshness explainability & lag decomposition | Planned | v0.54 | Core | Yes |
+| Internal mTLS, secrets management & security review | Planned | v0.55 | Core | Yes |
+| Rolling upgrade proof & disaster recovery | Planned | v0.56 | Core | Yes |
+| The v1 public contract & compatibility freeze | Planned | v0.57 | Core | Yes |
+| Production failure-matrix proof | Planned | v0.58 | Core | Yes |
+| Inline expectations, lineage diagnostics & governance policy language | Deferred by decision | — | Candidate | No; readmission requires a design partner needing policy in the engine |
+| Isolation & validation hooks (broader transactional semantics) | Deferred by decision | — | Candidate | No; readmission requires a workload that cannot use PostgreSQL/Kafka as source of truth |
 | New connector family (beyond PostgreSQL CDC / Kafka) | Not applicable | — | Candidate | No without admission |
-| General local `SERIALIZABLE` / broader OLTP semantics | Planned (v0.54 scope, contested) | v0.54 | Candidate | No by default |
 
-Rows above were generated from [NEW_ROADMAP.md](NEW_ROADMAP.md)'s version table as of v0.51.26;
+Rows above were generated from [NEW_ROADMAP.md](NEW_ROADMAP.md)'s version table as of the
+2026-08-11 rebaseline of v0.52–v0.59;
 regenerate this matrix whenever the roadmap's Done/Planned status changes materially.
 
 ### 9.5 Stop using feature completeness as the primary roadmap metric

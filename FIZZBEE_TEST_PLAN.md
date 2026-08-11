@@ -926,6 +926,7 @@ the implementation mirror of the model's liveness/coverage claims.
 | Phase 12 | `m5_cold_tier_sink.fizz` (✅ Done, v0.43) | M5 | Precondition for v0.43/v0.44 cold-tier exactly-once exit |
 | Phase 12.5 | `m7_control_plane_ha.fizz` (✅ Done, v0.45.2) | M7 | Precondition for v0.45.2 control-plane HA exit |
 | Phase 13 | `m6_shard_migration.fizz` (✅ Done, v0.46) | M6 | Precondition for v0.46 shard-migration exit |
+| Phase 17 | Mixed-version rolling-upgrade `SimRuntime` scenario (v0.56) — no new `.fizz` model: the version gate is a monotonic refuse-if-incompatible check, not a new distributed race | — | Precondition for the v0.56 rolling-upgrade / disaster-recovery exit; the relaxed-bounds sweep is re-run at the v0.59 RC1 gate |
 
 ---
 

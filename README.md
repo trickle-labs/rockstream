@@ -268,8 +268,9 @@ evidence behind every completed version.
 | Wire Protocol End-User Complete ✅ Done | v0.42 | SCRAM/MD5 auth, full transaction/savepoint state machine, LISTEN/NOTIFY, a certified driver-compatibility matrix, and an unmodified reference app running end to end over pgwire |
 | Elastically Scalable | v0.47 | Hot keys split into virtual buckets and shards split before they get too big, entirely in the background; the cluster exports autoscaling signals a standard Kubernetes HPA/KEDA can act on — no manual re-sharding |
 | Public Demo Ready | v0.51.6 | A vanilla, autocommitting psql/ORM/BI-tool connection round-trips data with zero private ritual; ad hoc queries honor WHERE/JOIN/GROUP BY; the gateway serves views through the real incremental engine on one unified data plane instead of a disconnected batch recompute; the wire is TLS-terminated for a standard client |
-| Operationally Complete | v0.57 | Full operator CLI + arrangement debugger, internal mTLS, secrets management, an independent security review, and a proven rolling-upgrade/disaster-recovery path |
-| 1.0 Release | v0.59 | All v0.1–v0.58 features integrated; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
+| Operationally Complete | v0.56 | Full operator CLI + arrangement debugger, explainable freshness lag, internal mTLS, secrets management, an independent security review, and a proven rolling-upgrade/disaster-recovery path |
+| v1 Contract Published | v0.57 | Every capability carries a strategic tier (Core/Maintain/Experimental), every Core operator's incremental/backfill/recovery/state-growth/failure semantics are documented, and CI fails if the published capability matrix drifts from the roadmap |
+| 1.0 Release | v0.59 | All v0.1–v0.58 features integrated; the seven v1 release gates each signed off against a named artifact; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
 
 ### Phase Summary
 
@@ -292,8 +293,8 @@ evidence behind every completed version.
 | 14 | Network efficiency and advanced DML: scatter pruning, zero-copy IPC, AZ-aware shuffle |
 | 15 | Complex analytics and compute tuning: recursive CTEs, lateral joins, hopping/session windows, hot-path optimizations |
 | 15.5 | Standard wire compatibility and the real incremental serving path: standard autocommit/idempotency/immediate-view-population semantics, query-time WHERE/JOIN/GROUP BY execution, gateway+runtime unified into one incrementally-served data plane, TLS termination, binary wire format, bounded session state |
-| 16 | Declarative data governance: inline expectations, lineage diagnostics, dead-letter-queue routing |
-| 17 | Enterprise validation and 1.0 finalization: isolation/validation hooks, the operator CLI + arrangement debugger, mTLS/secrets/security review, rolling-upgrade + disaster-recovery proof, simulator maturity, the v1.0 release candidate |
+| 16 | Ingestion failure containment: a durable, bounded, inspectable, replayable connector quarantine |
+| 17 | Production readiness and 1.0 finalization: the operator CLI + arrangement debugger, freshness explainability, mTLS/secrets/security review, rolling-upgrade + disaster-recovery proof, the written v1 contract, the production failure matrix, the v1.0 release candidate |
 
 ## Crate Architecture
 
@@ -313,7 +314,7 @@ The project is a Cargo workspace of purpose-built crates:
 | `rockstream-connectors` | Connector implementations: Kafka source/sink and S3 source are done; a generic exactly-once object-store sink is done; Postgres CDC source and Iceberg/Delta Lake sinks are planned (Phase 12) |
 | `rockstream-oracle` | Batch reference engine and property-test harness (DBSP soundness tests) |
 | `rockstream-sim` | Deterministic simulation harness: `SimRuntime`, `buggify!()`, fault model |
-| `rockstream-cli` | Operator CLI — `rockstream start` today; `shard migrate`/`cluster workers drain` land at v0.46, `explain`/`resource` at v0.45, the workload quota/admission-control substrate at v0.45.1, control-plane Raft HA at v0.45.2, and the rest (`workload`/`view`/`schema`/`source`/`checkpoint`/`audit`/`support bundle`/`debug arrangement`) at v0.55 |
+| `rockstream-cli` | Operator CLI — `rockstream start` today; `shard migrate`/`cluster workers drain` land at v0.46, `explain`/`resource` at v0.45, the workload quota/admission-control substrate at v0.45.1, control-plane Raft HA at v0.45.2, and the rest (`workload`/`view`/`schema`/`source`/`checkpoint`/`audit`/`support bundle`/`debug arrangement`) at v0.53 |
 ## How Do I Know It’s Working?
 
 The system exposes one primary health indicator per pipeline: **SLO compliance** —

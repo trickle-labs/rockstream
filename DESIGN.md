@@ -408,8 +408,12 @@ attempting them would compromise the rest of the design:
   sequence number, which is an explicit non-goal (see below). `READ COMMITTED`
   and `REPEATABLE READ` are fully supported by the existing vector-frontier
   model (§12.6) and cover the vast majority of analytical and streaming
-  workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is scheduled
-  for v0.52 (Phase 16). Optimistic exact-key guarded writes for non-CRDT columns
+  workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is **deferred
+  by decision** and no longer scheduled — the 2026-08-11 strategic rebaseline
+  removed it from `NEW_ROADMAP.md` because broader transactional semantics move
+  RockStream toward being an OLTP database rather than an IVM system; see that
+  document's "Deferred by decision" table. Optimistic exact-key guarded writes
+  for non-CRDT columns
   and blind commutative writes for CRDT columns are planned pre-1.0 (§13.5.1).
   A *global* cross-shard `SERIALIZABLE` coordinator (one covering every shard)
   is an explicit non-goal. See
@@ -2804,7 +2808,7 @@ streaming workloads.
 | `READ COMMITTED` | Each statement pins to the latest published vector frontier at statement start. |
 | `REPEATABLE READ` | `BEGIN` pins the session to a specific vector frontier; all statements in the transaction see that snapshot. |
 | `SERIALIZABLE` | **Not supported** for cross-shard transactions (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
-| `SERIALIZABLE LOCAL` | v0.52: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
+| `SERIALIZABLE LOCAL` | **Deferred by decision** (2026-08-11 rebaseline): would delegate to per-shard SlateDB transaction semantics when the planner proves all reads/writes touch one shard, but is no longer scheduled — see `NEW_ROADMAP.md`'s "Deferred by decision" table. |
 
 **Optimistic write semantics** (§13.5.1): direct-write transactions may use
 optimistic exact-key guards (`RS-2008` on conflict) and blind CRDT writes
@@ -4726,7 +4730,7 @@ range and the prior occupant retained for its original meaning:
   text for `protocol.version_not_supported`, even though the canonical table
   above already reserved `RS-5002` for `merge.unknown_law` — found during the
   <=v0.42.3 roadmap review (2026-07-11). `protocol.version_not_supported`
-  moves to `RS-5021`, implemented and tested at `NEW_ROADMAP.md` v0.55.
+  moves to `RS-5021`, implemented and tested at `NEW_ROADMAP.md` v0.56.
 
 **`next_steps` requirement.** Every `RS-XXXX` error must include a
 `next_steps` field containing actionable remediation guidance. This is
@@ -4990,7 +4994,7 @@ The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
 adaptive per-operator parallelism**.
 
-**GA vs. Data Lake GA scope.** At v1.0 (v0.54 RC1), the cold-tier
+**GA vs. Data Lake GA scope.** At v1.0 (v0.59 RC1), the cold-tier
 Iceberg/Delta sink (v0.44) and DuckDB/Spark/Trino table discovery via
 registered external catalogs ship before the RC1 gate. The Iceberg REST
 Catalog server (§13.7) and the DuckLake catalog server (§13.8) remain
@@ -5017,8 +5021,16 @@ a dedicated assertion language, DLQ routing, per-row vs. batch-level
 semantics, and integration with alerting — each of which is a meaningful
 scope addition.
 
-**Planned phase.** Data quality is scheduled for **v0.50–v0.51** (Phase 15 —
-Declarative Data Governance), designed as a plugin/extension layer:
+**Status: deferred by decision (2026-08-11 strategic rebaseline).** An earlier
+revision of this section scheduled data quality for "v0.50–v0.51 (Phase 15 —
+Declarative Data Governance)"; that phase no longer exists. The expectation
+language below — `CREATE EXPECTATION`, expectation-scoped DLQ routing, and
+pipeline-level quality metrics — is a policy subsystem rather than an IVM
+capability and is recorded in `NEW_ROADMAP.md`'s "Deferred by decision" table,
+readmissible only against a design partner requiring policy evaluation inside
+the engine. What *is* scheduled, at **v0.52**, is the operational half: a
+durable, bounded, replayable connector quarantine (§13.3.1). Retained here as
+the design of record should the expectation layer ever be readmitted:
 
 - `CREATE EXPECTATION <name> ON <view> AS <predicate>` DDL.
 - Failing rows routed to a configurable DLQ sink with the expectation name

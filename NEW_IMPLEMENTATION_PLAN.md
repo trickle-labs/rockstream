@@ -158,14 +158,14 @@ phase.
 | 11 | Both | Network efficiency & advanced DML | Zero-copy IPC; >90% shard pruning on Bloom filters |
 | 12 | IVM | Complex analytics & compute tuning | Recursive CTEs correct against oracle; +30% DAG throughput |
 | 12.5 | Both | Standard wire compatibility & the real incremental serving path | A vanilla autocommitting psql/ORM connection round-trips data with zero private ritual; ad hoc WHERE/JOIN/GROUP BY execute correctly; the gateway and runtime unify into one data plane serving views incrementally, not via full-table batch recompute |
-| 13 | Both | Declarative data governance | Malformed records never reach ViewSink; DLQ durable |
-| 14 | Both | Enterprise validation & v1.0 finalization | 2-week chaos; zero P0/P1; `v1.0.0` tagged |
+| 13 | Both | Ingestion failure containment | Malformed records durably quarantined without stalling the source or breaking exactly-once |
+| 14 | Both | Production readiness & v1.0 finalization | Operable, secure, upgradeable, recoverable; v1 contract enforced by CI; 2-week chaos; zero P0/P1; `v1.0.0` tagged |
 
 **Note on Phase numbering (2026-07-19 fix)**: this table's Elastic Scaling
 row was previously numbered "11" (with every later row shifted +1 to 12–15)
 when it was added by the 2026-07-11 review, but the actual `## Phase N`
 section headings below it were never renumbered to match — they still read
-Phase 11 (Network Efficiency) through Phase 14 (Enterprise Validation). The
+Phase 11 (Network Efficiency) through Phase 14 (Production Readiness). The
 table is now corrected back to decimal insertions (`10.5`, `12.5`) that match
 the real, unchanged section numbers, the same mechanism already used
 elsewhere in this document.
@@ -951,58 +951,95 @@ version-by-version proof obligations):
 
 ---
 
-## Phase 13 — Declarative Data Governance
+## Phase 13 — Ingestion Failure Containment
 
-**Goal**: Protect the persistent LSM state from malformed records with an
-inline expectation layer and durable dead-letter routing.
+**Goal**: Protect the persistent LSM state from malformed records with a
+durable, bounded, replayable connector quarantine.
+
+> **Rebaselined 2026-08-11.** This phase previously specified an inline
+> expectation layer (`CREATE EXPECTATION`, the expectation operator, `warn`/
+> `degrade`/`block` state-degradation policies, lineage diagnostics). That is a
+> policy language and a new product pillar, not an IVM capability, and it is
+> now **deferred by decision** — see [ROCKSTREAM_PROJECT_FOCUS.md](ROCKSTREAM_PROJECT_FOCUS.md)
+> §6 and `NEW_ROADMAP.md`'s "Deferred by decision" table. What remains is the
+> ingestion-lifecycle half a production system genuinely needs.
 
 **Deliverables**
 
-- **`CREATE EXPECTATION`** (DESIGN.md §15.1): new DDL injecting an
-  "Expectation Operator" into the operator DAG before `ViewSink`; rows failing
-  the predicate have their Z-set weight zeroed and are never written to view
-  state.
-- **DLQ routing**: failed rows forwarded transactionally to an internal
-  base-table shard (the canonical Dead Letter Queue); surfaced via
-  `rockstream_catalog.dead_letter_queue` with `REPLAY` / `DISMISS` commands.
-- **State degradation policies**: `warn`, `degrade`, `block` modes controlling
-  upstream consumption when the error threshold is crossed.
-- **`EXPLAIN INCREMENTAL ANALYZE`** integration for expectation evaluation.
+- **Connector-tier quarantine** (DESIGN.md §13.3.1): a record a source cannot
+  decode is written to `rockstream_catalog.dead_letter_queue` inside the same
+  M3 commit that advances that source's `OffsetToken`, so quarantining a poison
+  record neither stalls the source nor breaks exactly-once ingestion.
+- **Operator path**: `ALTER SOURCE ... REPLAY DEAD_LETTER_QUEUE [SINCE .. UNTIL ..]`
+  and `ALTER SOURCE ... DISMISS DEAD_LETTER_QUEUE WHERE ...`, with
+  `RS-1003 connector.decode_error` and `RS-1004 connector.dlq_growing`.
+- **Enforced bounded retention**: `DLQ_RETENTION`/`dlq_warn_threshold` are
+  actually applied, and a source producing only undecodable records reaches
+  `BLOCKED` rather than buffering without bound.
 
 **Exit criteria**:
-- Malformed records injected into upstream sources never reach downstream
-  `ViewSink` outputs.
-- Failed records are durably queryable in `rockstream_catalog.dead_letter_queue`
-  alongside exactly-once commit boundaries.
+- Malformed records are durably queryable in
+  `rockstream_catalog.dead_letter_queue` while the source's committed
+  offset/LSN still advances exactly once past them, proven across a crash at
+  every prepare/commit boundary.
+- Replay and dismissal affect exactly the selected records, and the quarantine
+  table's size stays flat under continuous decode failure.
 
 ---
 
-## Phase 14 — Enterprise Validation & v1.0 Finalization
+## Phase 14 — Production Readiness & v1.0 Finalization
 
-**Goal**: Prove the full integrated system survives maximum cloud pressure;
-tag v1.0.0.
+**Goal**: Make the already-shipped system operable, secure, upgradeable, and
+recoverable; write the v1 contract down; prove it; tag v1.0.0.
+
+> **Rebaselined 2026-08-11.** `SERIALIZABLE LOCAL` and per-row version
+> validation for non-CRDT exact-key writes are **deferred by decision**: they
+> move RockStream toward being the transactional authority, which is not what
+> this project optimizes for. They return only against a workload that cannot
+> use PostgreSQL or Kafka as its source of truth.
 
 **Deliverables**
 
-- **`SERIALIZABLE LOCAL` isolation** (DESIGN.md §1.1, §12.6): validate
-  non-CRDT exact-key writes against per-row versions to prevent blind
-  overwrites; single-shard `SERIALIZABLE LOCAL` isolation via SlateDB
-  transactions.
-- **Simulator maturity & auto-tuning lock**: finalize SLO-driven adaptive
-  control loops; model Kafka broker-side transaction timeouts
-  (`transaction.timeout.ms`) in `SimRuntime`, closing the final simulation gap
-  (DESIGN.md §17 gap 2).
+- **Operator CLI and IVM arrangement debugger** (DESIGN.md §14.7/§14.7.1/§14.19):
+  thin wrappers over already-shipped control-plane/catalog/`DbReader` APIs, plus
+  read-only inspection of intermediate Z-set state.
+- **Freshness explainability**: end-to-end lag decomposed into source, ingest,
+  compute, checkpoint, sink, spill, and storage-pressure components, with an
+  enumerated, coded, runbook-linked reason behind every stall or degradation.
+- **Internal mTLS, secrets management, and an independent security review**
+  (DESIGN.md §14.18): control↔worker and worker↔worker mTLS, `CREATE SECRET`
+  envelope encryption, zero-restart rotation, full redaction, and every P0/P1
+  review finding closed.
+- **Rolling upgrade and disaster recovery** (DESIGN.md §5.5): the storage-format
+  version gate, `rockstream migrate`, a proven N/N+1 mixed-version upgrade, and
+  a rehearsed checkpoint-export/restore-into-a-new-cluster drill.
+- **The v1 public contract**: a strategic tier per capability
+  (`Core`/`Maintain`/`Experimental`), documented incremental/backfill/recovery/
+  state-growth/failure semantics for every `Core` operator, PostgreSQL CDC and
+  Kafka as the release-gated connectors, a generated capability matrix, and a
+  deprecation policy — all enforced by CI, not prose.
+- **Production failure-matrix proof**: an enumerated failure matrix (worker and
+  control-node loss, exchange interruption, source disconnect, object-store
+  brownout, spill/compaction pressure, checkpoint interruption, sink failure in
+  commit and in recovery, migration interruption, rolling upgrade, resource
+  exhaustion), each cell with a deterministic scenario, a real-backend
+  counterpart, and an asserted recovery outcome.
 - **v1.0 RC1 chaos soak**: activate all features from Phase 0 through 13
   simultaneously; run a 2-week comprehensive chaos, performance, and scaling
   soak under maximum cluster pressure within a single cloud region.
 
 **Exit criteria**:
-- Concurrent conflicting writes to the same key on a single shard correctly
-  trigger serialization anomalies/aborts.
-- Simulator accurately reproduces and recovers from aborted Kafka transaction
-  edge-cases.
+- An operator can diagnose a stale or wrong view, drain, upgrade, recover, and
+  restore the cluster using only documented commands.
+- Every `Core` capability carries a tier, its five documented semantics, and a
+  linked passing proof test; CI fails if the capability matrix drifts from the
+  roadmap.
+- Every failure-matrix cell has a passing scenario with an asserted recovery
+  outcome; none enters the RC gate uncovered.
 - No P0 or P1 bugs discovered during the 2-week continuous automated chaos
-  cycle. Tag release `v1.0.0`.
+  cycle, and each of the seven v1 release gates (correctness, recovery, bounded
+  resources, operability, upgradeability, security, performance stability) is
+  signed off against a named artifact. Tag release `v1.0.0`.
 
 ---
 
@@ -1068,7 +1105,7 @@ The build order is fixed:
    under real cloud pressure.
 5. **HTAP ergonomics, data lake bridge, FinOps, network efficiency, and
    complex analytics** (Phases 9–12) extend the surface.
-6. **Data governance and enterprise validation** (Phases 13–14) close out v1.0.
+6. **Ingestion failure containment and production readiness** (Phases 13–14) close out v1.0.
 
 The remaining deferred capabilities (user-facing CRDTs, native Iceberg REST
 catalog, DuckLake catalog server, external connector plugin APIs, multi-region
