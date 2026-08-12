@@ -96,5 +96,5 @@ jq '.system_info, .metrics' support-bundle-*.json
 ```
 
 A two-word `rockstream support bundle` CLI command that regenerates or
-re-exports this bundle on demand is roadmapped for v0.53 and is not yet
+re-exports this bundle on demand is roadmapped for v0.53.1 and is not yet
 available.

@@ -268,8 +268,8 @@ evidence behind every completed version.
 | Wire Protocol End-User Complete ✅ Done | v0.42 | SCRAM/MD5 auth, full transaction/savepoint state machine, LISTEN/NOTIFY, a certified driver-compatibility matrix, and an unmodified reference app running end to end over pgwire |
 | Elastically Scalable | v0.47 | Hot keys split into virtual buckets and shards split before they get too big, entirely in the background; the cluster exports autoscaling signals a standard Kubernetes HPA/KEDA can act on — no manual re-sharding |
 | Public Demo Ready | v0.51.6 | A vanilla, autocommitting psql/ORM/BI-tool connection round-trips data with zero private ritual; ad hoc queries honor WHERE/JOIN/GROUP BY; the gateway serves views through the real incremental engine on one unified data plane instead of a disconnected batch recompute; the wire is TLS-terminated for a standard client |
-| Operationally Complete | v0.56 | Full operator CLI + arrangement debugger, explainable freshness lag, internal mTLS, secrets management, an independent security review, and a proven rolling-upgrade/disaster-recovery path |
-| v1 Contract Published | v0.57 | Every capability carries a strategic tier (Core/Maintain/Experimental), every Core operator's incremental/backfill/recovery/state-growth/failure semantics are documented, and CI fails if the published capability matrix drifts from the roadmap |
+| Operationally Complete | v0.56.1 | Full operator CLI + arrangement debugger, explainable freshness lag, internal mTLS, secrets management, an independent security review, and a proven rolling-upgrade/disaster-recovery path |
+| v1 Contract Published | v0.57.1 | Every capability carries a strategic tier (Core/Maintain/Experimental), every Core operator's incremental/backfill/recovery/state-growth/failure semantics are documented, and CI fails if the published capability matrix drifts from the roadmap |
 | 1.0 Release | v0.59 | All v0.1–v0.58 features integrated; the seven v1 release gates each signed off against a named artifact; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
 
 ### Phase Summary
