@@ -9969,7 +9969,6 @@ pub struct GatewayServer {
 impl GatewayServer {
     fn from_handler(addr: std::net::SocketAddr, handler: GatewayHandler) -> Self {
         let handler = Arc::new(handler);
-        handler.bind_server(&handler);
         GatewayServer {
             addr,
             handler,
@@ -10210,6 +10209,7 @@ impl GatewayServer {
 
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
+        self.handler.bind_server(&self.handler);
         self.handler.recover_compiled_views().await;
         let factory = Arc::new(GatewayHandlerFactory {
             handler: self.handler.clone(),
@@ -10390,6 +10390,7 @@ impl GatewayServer {
     pub async fn serve_background(
         self,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        self.handler.bind_server(&self.handler);
         self.handler.recover_compiled_views().await;
         let factory = Arc::new(GatewayHandlerFactory {
             handler: self.handler.clone(),
