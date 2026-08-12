@@ -539,7 +539,7 @@ impl SharedPgOutputCoordinator {
             .envelope_buffer
             .scan_all()
             .map_err(|error| coordinator_error(&format!("scan pgoutput spill: {error}")))?;
-        entries.sort_by(|left, right| left.0.to_spill_bytes().cmp(&right.0.to_spill_bytes()));
+        entries.sort_by_key(|entry| entry.0.to_spill_bytes());
         let changes = entries
             .into_iter()
             .filter(|(key, _)| key.xid == xid)
@@ -961,6 +961,68 @@ mod tests {
         assert_eq!(
             collision.register(&db).await.unwrap_err().to_string(),
             "[RS-2026] query.query_time_execution_failed: query-time execution failed: RS-4013: source identity hash collision has a different stored preimage. next_steps: Simplify the query, validate referenced table/view schemas, or materialize the query into a view."
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cdc_tx_spilled_two_tables_exact_atomic_batch_oracle() {
+        let mut coordinator = coordinator().await;
+        coordinator
+            .relation_routes
+            .insert(7, route(vec![column("id", 25)]));
+        let mut second = route(vec![column("id", 25)]);
+        second.relation_id = 8;
+        second.imported_table_name = "payments".to_string();
+        coordinator.relation_routes.insert(8, second);
+        coordinator.envelope_buffer.set_memory_limit(64);
+        let payload = "x".repeat(65);
+        coordinator.begin(55).unwrap();
+        coordinator
+            .push_change(
+                55,
+                7,
+                CdcOperation::Insert,
+                None,
+                Some(vec![Some(payload.clone())]),
+            )
+            .unwrap();
+        coordinator
+            .push_change(
+                55,
+                8,
+                CdcOperation::Insert,
+                None,
+                Some(vec![Some(payload.clone())]),
+            )
+            .unwrap();
+        let envelope = coordinator.finish_envelope(55, PgLsn(0x55)).unwrap();
+        assert_eq!(
+            (
+                coordinator.spill_bytes() > 0,
+                coordinator.envelope_bytes(),
+                envelope
+                    .changes
+                    .iter()
+                    .map(|change| (change.relation_id, change.new_values.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                true,
+                serde_json::to_vec(&EncodedChange {
+                    relation_id: 7,
+                    operation: CdcOperation::Insert,
+                    old_values: None,
+                    new_values: Some(vec![Some(payload.clone())]),
+                    schema_version: 1,
+                })
+                .unwrap()
+                .len()
+                    * 2,
+                vec![
+                    (7, Some(vec![Some(payload.clone())])),
+                    (8, Some(vec![Some(payload)])),
+                ],
+            ),
         );
     }
 }

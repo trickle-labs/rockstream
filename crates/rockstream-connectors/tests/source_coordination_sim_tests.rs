@@ -554,7 +554,7 @@ async fn globally_allocated_epoch_gap_commits_exact_runtime_state() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replayable_commit_writes_one_visibility_batch_then_acknowledges_exact_lsn() {
     let connector_id = ConnectorId(5127);
     let db = Arc::new(
@@ -592,7 +592,13 @@ async fn replayable_commit_writes_one_visibility_batch_then_acknowledges_exact_l
     let mut batch = WriteBatch::new();
     batch.put(b"visible/base-row", b"row-1");
     coordinator
-        .commit_replayable_epoch(&owner, 7, offset.clone(), &[lifecycle.clone()], batch)
+        .commit_replayable_epoch(
+            &owner,
+            7,
+            offset.clone(),
+            std::slice::from_ref(&lifecycle),
+            batch,
+        )
         .await
         .unwrap();
 
