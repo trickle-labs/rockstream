@@ -22,6 +22,7 @@ pub mod copy_state;
 pub mod error;
 pub mod multi_shard_reader;
 pub mod notify_registry;
+pub mod pgoutput_coordinator;
 pub mod protocol;
 pub mod role_catalog;
 pub mod server;

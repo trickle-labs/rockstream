@@ -518,11 +518,11 @@ async fn recovery_uses_only_committed_checkpoint_and_fences_replaced_owner() {
 }
 
 #[tokio::test]
-async fn invalid_epoch_blocks_without_advancing_runtime_state() {
+async fn globally_allocated_epoch_gap_commits_exact_runtime_state() {
     let mut coordinator = runtime(ConnectorId(5126)).await;
     coordinator.recover().await.unwrap();
     let owner = coordinator.acquire_owner("owner-a").unwrap();
-    let error = coordinator
+    coordinator
         .commit_epoch(
             &owner,
             2,
@@ -530,26 +530,90 @@ async fn invalid_epoch_blocks_without_advancing_runtime_state() {
             WriteBatch::new(),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
     assert_eq!(
         (
-            error.to_string(),
+            coordinator.committed_epoch(),
             coordinator.committed_offset().clone(),
             coordinator.blocked_reason().map(str::to_string),
             coordinator.metrics().await.unwrap(),
             coordinator.into_inner().acknowledgements,
         ),
         (
-            "RS-4001: source I/O error: RS-4015: source epoch 2 is not the next fenced epoch 1; next steps: recover the committed checkpoint and retry".to_string(),
-            OffsetToken::new(vec![]),
-            Some("RS-4015: source epoch 2 is not the next fenced epoch 1; next steps: recover the committed checkpoint and retry".to_string()),
+            2,
+            OffsetToken::new(b"offset-02".to_vec()),
+            None,
             rockstream_connectors::SourceRuntimeMetrics {
                 source_runtime_in_flight_epochs: 0,
-                source_checkpoint_history_entries: 0,
+                source_checkpoint_history_entries: 1,
                 source_cleanup_scan_pages: 0,
             },
-            vec![],
+            vec![(2, OffsetToken::new(b"offset-02".to_vec()))],
+        )
+    );
+}
+
+#[tokio::test]
+async fn replayable_commit_writes_one_visibility_batch_then_acknowledges_exact_lsn() {
+    let connector_id = ConnectorId(5127);
+    let db = Arc::new(
+        ShardDb::builder("source-replayable", Arc::new(InMemory::new()))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let store = SourceCheckpointStore::new(Arc::clone(&db), 0, connector_id);
+    let mut coordinator = SourceRuntimeCoordinator::new(
+        RecordingSource {
+            acknowledgements: vec![],
+        },
+        connector_id,
+        OffsetToken::new(vec![]),
+        store.clone(),
+    );
+    coordinator.recover().await.unwrap();
+    let owner = coordinator.acquire_owner("owner-pgoutput").unwrap();
+    let offset = OffsetToken::new(b"0/52".to_vec());
+    let lifecycle = BackfillLifecycle::new(
+        BackfillPhase::Running,
+        BackfillCursor::new(
+            "view_a",
+            0,
+            offset.as_bytes().to_vec(),
+            SnapshotDeltaFence::new(OffsetToken::new(b"0/1".to_vec()), offset.clone()),
+            7,
+        ),
+        0,
+        3,
+        0,
+        Some(7),
+    );
+    let mut batch = WriteBatch::new();
+    batch.put(b"visible/base-row", b"row-1");
+    coordinator
+        .commit_replayable_epoch(&owner, 7, offset.clone(), &[lifecycle.clone()], batch)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            db.get(b"visible/base-row").await.unwrap(),
+            coordinator.backfill_lifecycle("view_a").await.unwrap(),
+            store.highest_committed().await.unwrap(),
+            coordinator.metrics().await.unwrap(),
+            coordinator.into_inner().acknowledgements,
+        ),
+        (
+            Some(bytes::Bytes::from_static(b"row-1")),
+            Some(lifecycle),
+            Some(SourceCheckpoint::prepared(connector_id, 7, offset.clone()).committed()),
+            rockstream_connectors::SourceRuntimeMetrics {
+                source_runtime_in_flight_epochs: 0,
+                source_checkpoint_history_entries: 1,
+                source_cleanup_scan_pages: 0,
+            },
+            vec![(7, offset)],
         )
     );
 }

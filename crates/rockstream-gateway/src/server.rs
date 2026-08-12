@@ -6,7 +6,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -62,9 +62,10 @@ use tokio::net::TcpListener;
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
 use rockstream_connectors::{
-    BackfillCursor, BackfillLifecycle, BackfillPhase, KafkaSource, OffsetToken, PgOutputConfig,
-    PostgresCdcSource, S3Source, SnapshotDeltaFence, SourceCheckpointStore, SourceConnector,
-    SourceOwnerLease, SourceRuntimeCoordinator,
+    BackfillCursor, BackfillLifecycle, BackfillPhase, CdcOperation, KafkaSource, OffsetToken,
+    PgOutputConfig, PgOutputEvent, PgOutputRelationMetadata, PostgresCdcSource, S3Source,
+    SnapshotDeltaFence, SourceCheckpointStore, SourceConnector, SourceOwnerLease,
+    SourceRuntimeCoordinator,
 };
 use rockstream_ops::sink::{column_values_to_tsv_bytes, materialize_view_state};
 use rockstream_ops::ArrowZSet;
@@ -81,13 +82,18 @@ use crate::auth::{
 };
 use crate::catalog_stubs::{
     arrow_type_to_pg_oid, CatalogColumn, CatalogResponse, CatalogSinkEntry, CatalogSourceEntry,
-    CatalogStubs, CatalogTable,
+    CatalogStubs, CatalogTable, PgOutputSourceRuntimeDetail,
 };
 
 use crate::copy_state::{
     CopyState, COPY_IN_BUFFER_ROWS, COPY_IN_FLUSH_BYTES, MAX_COPY_IN_BATCH_ROWS,
 };
 use crate::notify_registry::NotifyRegistry;
+use crate::pgoutput_coordinator::{
+    append_blocked_state, BlockedRelationState, BufferedPgOutputEnvelope, ColumnRoute,
+    EncodedChange, RelationChange, RelationRoute, ReplicaIdentity, SharedPgOutputCoordinator,
+    SourceIdentityV1,
+};
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
@@ -1711,6 +1717,14 @@ pub struct GatewayHandler {
     /// exit when the server releases its handler.
     self_ref: Arc<Mutex<Weak<GatewayHandler>>>,
     source_workers: Arc<DashMap<String, ()>>,
+    pgoutput_coordinators:
+        Arc<DashMap<ConnectorId, Arc<tokio::sync::Mutex<SharedPgOutputCoordinator>>>>,
+    /// ponytail: source creation is rare; replace this global lock with
+    /// per-identity locks only after measured contention.
+    pgoutput_registry_lock: Arc<tokio::sync::Mutex<()>>,
+    /// ponytail: shard-wide serialization is the correctness ceiling; split
+    /// by dependency component only after measured contention.
+    shard_commit_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl GatewayHandler {
@@ -1839,6 +1853,9 @@ impl GatewayHandler {
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
+            pgoutput_coordinators: Arc::new(DashMap::new()),
+            pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
+            shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1876,6 +1893,9 @@ impl GatewayHandler {
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
+            pgoutput_coordinators: Arc::new(DashMap::new()),
+            pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
+            shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -2095,7 +2115,7 @@ impl GatewayHandler {
                         let mut estimated_rows = 0;
                         let mut all_running = true;
                         for source in &sources {
-                            let connector_id = source_view_connector_id(&source.name, &view.name);
+                            let connector_id = source_checkpoint_connector_id(source, &view.name);
                             let lifecycle = SourceCheckpointStore::new(
                                 Arc::clone(&shard_db),
                                 connector_id.0 as u128,
@@ -2260,26 +2280,57 @@ impl GatewayHandler {
 
     fn reachable_compiled_views(&self, changed_relations: &HashSet<String>) -> Vec<String> {
         let mut reachable = changed_relations.clone();
-        let mut ordered = Vec::new();
-        let mut scheduled = HashSet::new();
         loop {
             let mut progressed = false;
             for view in self.catalog.list_views() {
-                if scheduled.contains(&view.name) {
-                    continue;
-                }
                 let deps = self.catalog.get_view_deps(&view.name);
-                if deps.iter().any(|dep| reachable.contains(dep)) {
-                    reachable.insert(view.name.clone());
-                    scheduled.insert(view.name.clone());
-                    if self.compiled_views.contains_key(&view.name) {
-                        ordered.push(view.name.clone());
-                    }
+                if deps.iter().any(|dep| reachable.contains(dep)) && reachable.insert(view.name) {
                     progressed = true;
                 }
             }
             if !progressed {
                 break;
+            }
+        }
+
+        let candidates = reachable
+            .iter()
+            .filter(|name| self.compiled_views.contains_key(*name))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut indegree = BTreeMap::new();
+        let mut dependents = HashMap::<String, Vec<String>>::new();
+        for view in &candidates {
+            let dependencies = self.catalog.get_view_deps(view);
+            indegree.insert(
+                view.clone(),
+                dependencies
+                    .iter()
+                    .filter(|dependency| candidates.contains(*dependency))
+                    .count(),
+            );
+            for dependency in dependencies {
+                if candidates.contains(&dependency) {
+                    dependents.entry(dependency).or_default().push(view.clone());
+                }
+            }
+        }
+        let mut ready = indegree
+            .iter()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(view, _)| view.clone())
+            .collect::<BTreeSet<_>>();
+        let mut ordered = Vec::with_capacity(candidates.len());
+        while let Some(view) = ready.iter().next().cloned() {
+            ready.remove(&view);
+            ordered.push(view.clone());
+            for dependent in dependents.get(&view).into_iter().flatten() {
+                if let Some(degree) = indegree.get_mut(dependent) {
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.insert(dependent.clone());
+                    }
+                }
             }
         }
         ordered
@@ -2760,7 +2811,7 @@ impl GatewayHandler {
     async fn build_postgres_cdc_source(
         &self,
         source: &CatalogSourceEntry,
-        view_name: &str,
+        _view_name: &str,
     ) -> Result<(CatalogTable, ConnectorId, PostgresCdcSource), GatewayError> {
         if source.format != "pgoutput" {
             return Err(GatewayError::QueryTimeExecutionFailed {
@@ -2802,43 +2853,26 @@ impl GatewayHandler {
                 ),
             });
         };
-        let connector_id = source_view_connector_id(&source.name, view_name);
-        let port = source.options.get("port").map_or(Ok(5432), |port| {
-            port.parse()
-                .map_err(|_| GatewayError::QueryTimeExecutionFailed {
-                    detail: format!(
-                        "PostgreSQL CDC source '{}' has invalid port '{port}'",
-                        source.name
-                    ),
-                })
-        })?;
-        let runtime = PostgresCdcSource::connect_pgoutput(
+        let identity = pgoutput_source_identity(source)?;
+        let connector_id = identity.connector_id();
+        let runtime = PostgresCdcSource::configured_pgoutput(
             connector_id,
             catalog_columns_to_schema(&table.columns),
             PgOutputConfig {
-                host: source
-                    .options
-                    .get("host")
-                    .cloned()
-                    .unwrap_or_else(|| "127.0.0.1".to_string()),
-                port,
-                database: source
-                    .options
-                    .get("database")
-                    .cloned()
-                    .unwrap_or_else(|| "postgres".to_string()),
-                user: source
-                    .options
-                    .get("user")
-                    .cloned()
-                    .unwrap_or_else(|| "postgres".to_string()),
+                host: identity.host,
+                port: identity.port,
+                database: identity.database,
+                user: identity.auth_principal,
                 password,
-                slot: option("slot")?,
-                publication: option("publication")?,
-                table: table.name.clone(),
+                slot: identity.slot,
+                publication: identity.publication,
+                table: source
+                    .options
+                    .get("table")
+                    .cloned()
+                    .unwrap_or_else(|| table.name.clone()),
             },
         )
-        .await
         .map_err(source_backfill_error)?;
         Ok((table, connector_id, runtime))
     }
@@ -2944,6 +2978,30 @@ impl GatewayHandler {
         publish: bool,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
+        if self.catalog.is_backfill_published(view_name) {
+            self.catalog.begin_backfill(view_name, 0);
+        }
+        let identity = pgoutput_source_identity(source)?;
+        let _registry_guard = self.pgoutput_registry_lock.lock().await;
+        {
+            let _guard = self.shard_commit_lock.lock().await;
+            identity.register(shard_db).await?;
+        }
+        if let Some(coordinator) = self
+            .pgoutput_coordinators
+            .get(&identity.connector_id())
+            .map(|entry| entry.value().clone())
+        {
+            if !coordinator.lock().await.shares_shard(shard_db) {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: "RS-4013: pgoutput aliases and dependent views must share one shard"
+                        .to_string(),
+                });
+            }
+            return self
+                .backfill_attached_pgoutput_view(source, view_name, publish, coordinator, shard_db)
+                .await;
+        }
         if let crate::admission::BackfillAdmissionDecision::Reject { code, reason } =
             self.backfill_admission.reserve(
                 BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
@@ -2958,23 +3016,8 @@ impl GatewayHandler {
             controller: Arc::clone(&self.backfill_admission),
             bytes: BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
         };
-        let (_, connector_id, source_runtime) =
-            self.build_postgres_cdc_source(source, view_name).await?;
-        let checkpoint_store =
-            SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
-        self.backfill_bound_source(
-            &source.name,
-            view_name,
-            SourceRuntimeCoordinator::new(
-                source_runtime,
-                connector_id,
-                OffsetToken::new(Vec::new()),
-                checkpoint_store,
-            ),
-            publish,
-            shard_db,
-        )
-        .await?;
+        self.backfill_new_pgoutput_coordinator(source, view_name, publish, shard_db)
+            .await?;
         if publish {
             self.spawn_postgres_cdc_source_worker(
                 source.clone(),
@@ -2985,12 +3028,267 @@ impl GatewayHandler {
         Ok(())
     }
 
+    async fn backfill_new_pgoutput_coordinator(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+        publish: bool,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let identity = pgoutput_source_identity(source)?;
+        let connector_id = identity.connector_id();
+        let aliases = self.pgoutput_source_aliases(connector_id);
+        let (_, _, source_runtime) = self.build_postgres_cdc_source(source, view_name).await?;
+        let checkpoint_store =
+            SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
+        let coordinator = Arc::new(tokio::sync::Mutex::new(SharedPgOutputCoordinator::new(
+            identity,
+            SourceRuntimeCoordinator::new(
+                source_runtime,
+                connector_id,
+                OffsetToken::new(Vec::new()),
+                checkpoint_store,
+            ),
+            Arc::clone(shard_db),
+        )));
+        let mut needs_attachment = false;
+        {
+            let mut coordinator = coordinator.lock().await;
+            for alias in &aliases {
+                coordinator.attach_alias(alias.name.clone());
+            }
+            coordinator.restore_catalog(shard_db).await?;
+            if let Some(blocked) = &coordinator.blocked_state {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "{}: pgoutput source remains blocked at xid {} after incompatible relation {}",
+                        blocked.code, blocked.xid, blocked.relation.relation_id
+                    ),
+                });
+            }
+            coordinator
+                .runtime
+                .recover()
+                .await
+                .map_err(source_backfill_error)?;
+            self.validate_pgoutput_lifecycles(&coordinator).await?;
+            let lease = coordinator
+                .runtime
+                .acquire_owner(format!("gateway:pgoutput:{}", connector_id.0))
+                .map_err(source_backfill_error)?;
+            coordinator.owner_lease = Some(lease.clone());
+            coordinator
+                .runtime
+                .open_pgoutput(&lease)
+                .await
+                .map_err(source_backfill_error)?;
+            if coordinator.runtime.committed_epoch() != 0 {
+                needs_attachment = true;
+                let durable = rockstream_connectors::PgLsn::from_offset_token(
+                    coordinator.runtime.committed_offset(),
+                )
+                .map_err(source_backfill_error)?;
+                if coordinator
+                    .runtime
+                    .pgoutput_confirmed_lsn(&lease)
+                    .await
+                    .map_err(source_backfill_error)?
+                    .is_some_and(|slot| slot > durable)
+                {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: "RS-4013: PostgreSQL slot is ahead of the durable M3 checkpoint"
+                            .to_string(),
+                    });
+                }
+                coordinator
+                    .runtime
+                    .acknowledge_recovered(&lease)
+                    .await
+                    .map_err(source_backfill_error)?;
+                coordinator.cleanup_recovered_spill(shard_db).await?;
+            } else {
+                let relations = aliases
+                    .iter()
+                    .filter_map(|alias| {
+                        let table = self.catalog.source_table(&alias.name)?;
+                        Some((
+                            alias
+                                .options
+                                .get("table")
+                                .cloned()
+                                .unwrap_or_else(|| table.name.clone()),
+                            catalog_columns_to_schema(&table.columns),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let snapshot = coordinator
+                    .runtime
+                    .capture_pgoutput_source_snapshot(&lease, &relations)
+                    .await
+                    .map_err(source_backfill_error)?;
+                let estimated_rows = snapshot
+                    .relations
+                    .iter()
+                    .map(|relation| relation.rows.len() as u64)
+                    .sum();
+                self.catalog.begin_backfill(view_name, estimated_rows);
+                coordinator.begin(0)?;
+                coordinator.activate_view(view_name);
+                for relation in snapshot.relations {
+                    let relation_id = relation.relation.relation_id;
+                    self.stage_pgoutput_relation(
+                        &mut coordinator,
+                        &aliases,
+                        0,
+                        relation.relation,
+                        &relation.column_policies,
+                        shard_db,
+                    )
+                    .await?;
+                    for row in relation.rows {
+                        coordinator.push_change(
+                            0,
+                            relation_id,
+                            CdcOperation::Insert,
+                            None,
+                            Some(row),
+                        )?;
+                    }
+                }
+                let envelope = coordinator.finish_envelope(0, snapshot.lsn)?;
+                if let Err(error) = coordinator.commit_envelope(envelope, self, shard_db).await {
+                    self.restore_compiled_pipeline_state(shard_db).await;
+                    return Err(error);
+                }
+                self.catalog.update_backfill_progress(
+                    view_name,
+                    coordinator.runtime.committed_epoch().to_string(),
+                    0,
+                    estimated_rows,
+                );
+            }
+        }
+        self.pgoutput_coordinators
+            .insert(connector_id, Arc::clone(&coordinator));
+        if needs_attachment {
+            self.backfill_attached_pgoutput_view(source, view_name, publish, coordinator, shard_db)
+                .await?;
+        }
+        if publish {
+            self.catalog.publish_backfill(view_name);
+        }
+        Ok(())
+    }
+
+    async fn backfill_attached_pgoutput_view(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+        publish: bool,
+        coordinator: Arc<tokio::sync::Mutex<SharedPgOutputCoordinator>>,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let mut coordinator = coordinator.lock().await;
+        let _guard = self.shard_commit_lock.lock().await;
+        let compiled = self
+            .compiled_views
+            .get(view_name)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled view '{view_name}' is unavailable"),
+            })?;
+        let epoch = shard_db
+            .try_next_epoch()
+            .ok_or(GatewayError::CommitEpochExhausted)?;
+        let output = if self.catalog.backfill_has_cursor(view_name) {
+            None
+        } else {
+            Some(
+                if let Some(join) = &compiled.join {
+                    let left = self.full_table_zset(&join.left_source, shard_db).await?;
+                    let right = self.full_table_zset(&join.right_source, shard_db).await?;
+                    join.pipeline.process(left, right)
+                } else {
+                    let dependency = self
+                        .catalog
+                        .get_view_deps(view_name)
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("compiled view '{view_name}' has no dependency"),
+                        })?;
+                    compiled
+                        .pipeline
+                        .process(self.full_table_zset(&dependency, shard_db).await?)
+                }
+                .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled pipeline backfill({view_name}): {error}"),
+                })?,
+            )
+        };
+        let mut m3 = rockstream_storage::WriteBatch::new();
+        if let Some(output) = &output {
+            compiled.sink.append_epoch(&mut m3, output, epoch);
+            if let Some(join) = &compiled.join {
+                join.pipeline.append_state(shard_db, &mut m3).await
+            } else {
+                compiled.pipeline.append_state(shard_db, &mut m3).await
+            }
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("append compiled pipeline backfill state({view_name}): {error}"),
+            })?;
+        }
+        m3.put(
+            &rockstream_storage::ShardKeyEncoder::frontier_key(),
+            &epoch.to_be_bytes(),
+        );
+        let offset = coordinator.runtime.committed_offset().clone();
+        let lifecycle = BackfillLifecycle::new(
+            BackfillPhase::Running,
+            BackfillCursor::new(
+                view_name,
+                0,
+                offset.as_bytes().to_vec(),
+                SnapshotDeltaFence::new(offset.clone(), offset),
+                epoch,
+            ),
+            0,
+            output.as_ref().map_or(0, ArrowZSet::num_rows) as u64,
+            0,
+            Some(epoch),
+        );
+        let lease = coordinator.owner_lease.clone().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
+            }
+        })?;
+        coordinator
+            .runtime
+            .commit_attachment(&lease, &lifecycle, m3)
+            .await
+            .map_err(source_backfill_error)?;
+        coordinator.attach_alias(source.name.clone());
+        if let Some(output) = output {
+            self.catalog.update_backfill_progress(
+                view_name,
+                epoch.to_string(),
+                0,
+                output.num_rows() as u64,
+            );
+        }
+        if publish {
+            self.catalog.publish_backfill(view_name);
+        }
+        Ok(())
+    }
+
     async fn backfill_source_view(
         &self,
         sources: &[CatalogSourceEntry],
         view_name: &str,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
+        let mut pgoutput_identities = HashSet::new();
         for source in sources {
             match source.source_type.as_str() {
                 "s3" => {
@@ -3002,6 +3300,10 @@ impl GatewayHandler {
                         .await?
                 }
                 "postgres_cdc" => {
+                    let connector_id = pgoutput_source_identity(source)?.connector_id();
+                    if !pgoutput_identities.insert(connector_id) {
+                        continue;
+                    }
                     self.backfill_postgres_cdc_source(source, view_name, false, shard_db)
                         .await?
                 }
@@ -3057,7 +3359,7 @@ impl GatewayHandler {
         let mut rows_remaining = 0;
         let mut estimated_rows = 0;
         for source in &sources {
-            let connector_id = source_view_connector_id(&source.name, view_name);
+            let connector_id = source_checkpoint_connector_id(source, view_name);
             let Ok(Some(lifecycle)) = SourceCheckpointStore::new(
                 Arc::clone(shard_db),
                 connector_id.0 as u128,
@@ -3146,7 +3448,11 @@ impl GatewayHandler {
         view_name: String,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) {
-        let key = format!("{}:{view_name}", source.name);
+        let Ok(identity) = pgoutput_source_identity(&source) else {
+            return;
+        };
+        let connector_id = identity.connector_id();
+        let key = format!("pgoutput:{}", connector_id.0);
         if self.source_workers.insert(key.clone(), ()).is_some() {
             return;
         }
@@ -3165,6 +3471,7 @@ impl GatewayHandler {
             .await;
             if let Some(handler) = weak.upgrade() {
                 handler.source_workers.remove(&key);
+                handler.pgoutput_coordinators.remove(&connector_id);
             }
         });
     }
@@ -3211,28 +3518,759 @@ impl GatewayHandler {
         let Some(handler) = weak.upgrade() else {
             return;
         };
-        let Ok((table, connector_id, source_runtime)) =
-            handler.build_postgres_cdc_source(&source, &view_name).await
-        else {
+        let Ok(identity) = pgoutput_source_identity(&source) else {
             return;
         };
-        drop(handler);
-        let checkpoint_store =
-            SourceCheckpointStore::new(Arc::clone(&shard_db), connector_id.0 as u128, connector_id);
-        Self::run_live_source_worker(
-            weak,
-            source,
-            view_name,
-            table,
-            SourceRuntimeCoordinator::new(
-                source_runtime,
+        let connector_id = identity.connector_id();
+        let registry_guard = handler.pgoutput_registry_lock.lock().await;
+        let (coordinator, created) = if let Some(existing) = handler
+            .pgoutput_coordinators
+            .get(&connector_id)
+            .map(|entry| entry.value().clone())
+        {
+            if !existing.lock().await.shares_shard(&shard_db) {
+                handler.block_pgoutput_aliases(
+                    std::slice::from_ref(&source),
+                    "RS-4013: pgoutput aliases and dependent views must share one shard"
+                        .to_string(),
+                );
+                return;
+            }
+            (existing, false)
+        } else {
+            let Ok((_, _, source_runtime)) =
+                handler.build_postgres_cdc_source(&source, &view_name).await
+            else {
+                return;
+            };
+            let checkpoint_store = SourceCheckpointStore::new(
+                Arc::clone(&shard_db),
+                connector_id.0 as u128,
                 connector_id,
-                OffsetToken::new(Vec::new()),
-                checkpoint_store,
-            ),
-            shard_db,
-        )
+            );
+            let coordinator = Arc::new(tokio::sync::Mutex::new(SharedPgOutputCoordinator::new(
+                identity,
+                SourceRuntimeCoordinator::new(
+                    source_runtime,
+                    connector_id,
+                    OffsetToken::new(Vec::new()),
+                    checkpoint_store,
+                ),
+                Arc::clone(&shard_db),
+            )));
+            handler
+                .pgoutput_coordinators
+                .insert(connector_id, Arc::clone(&coordinator));
+            (coordinator, true)
+        };
+        let initialized = async {
+            let mut coordinator = coordinator.lock().await;
+            if coordinator.owner_lease.is_none() {
+                coordinator.attach_alias(source.name.clone());
+                coordinator
+                    .restore_catalog(&shard_db)
+                    .await
+                    .map_err(|_| ())?;
+                if coordinator.blocked_state.is_some() {
+                    handler.block_pgoutput_aliases(
+                        std::slice::from_ref(&source),
+                        "RS-1002: pgoutput source remains blocked by an incompatible relation"
+                            .to_string(),
+                    );
+                    return Err(());
+                }
+                coordinator.runtime.resume().await.map_err(|_| ())?;
+                handler
+                    .validate_pgoutput_lifecycles(&coordinator)
+                    .await
+                    .map_err(|_| ())?;
+                let lease = coordinator
+                    .runtime
+                    .acquire_owner(format!("gateway:pgoutput:{}", connector_id.0))
+                    .map_err(|_| ())?;
+                coordinator.owner_lease = Some(lease.clone());
+                coordinator
+                    .runtime
+                    .open_pgoutput(&lease)
+                    .await
+                    .map_err(|_| ())?;
+                let durable_lsn = rockstream_connectors::PgLsn::from_offset_token(
+                    coordinator.runtime.committed_offset(),
+                )
+                .map_err(|_| ())?;
+                let slot_lsn = coordinator
+                    .runtime
+                    .pgoutput_confirmed_lsn(&lease)
+                    .await
+                    .map_err(|_| ())?;
+                if coordinator.runtime.committed_epoch() != 0
+                    && slot_lsn.is_some_and(|slot_lsn| slot_lsn > durable_lsn)
+                {
+                    handler.block_pgoutput_aliases(
+                        std::slice::from_ref(&source),
+                        "RS-4013: PostgreSQL slot is ahead of the durable M3 checkpoint"
+                            .to_string(),
+                    );
+                    return Err(());
+                }
+                coordinator
+                    .runtime
+                    .acknowledge_recovered(&lease)
+                    .await
+                    .map_err(|_| ())?;
+                coordinator
+                    .cleanup_recovered_spill(&shard_db)
+                    .await
+                    .map_err(|_| ())?;
+            }
+            Ok::<(), ()>(())
+        }
         .await;
+        if initialized.is_err() {
+            if created {
+                handler.pgoutput_coordinators.remove(&connector_id);
+            }
+            return;
+        }
+        drop(registry_guard);
+        drop(handler);
+
+        loop {
+            let Some(handler) = weak.upgrade() else {
+                break;
+            };
+            let aliases = handler.pgoutput_source_aliases(connector_id);
+            if aliases.is_empty() {
+                let mut coordinator = coordinator.lock().await;
+                let dropped = handler.pgoutput_registered_aliases(connector_id).is_empty();
+                let cleaned = if dropped {
+                    coordinator.drop_durable_state(&shard_db).await.is_ok()
+                } else if let Some(lease) = coordinator.owner_lease.clone() {
+                    let closed = coordinator.runtime.close_pgoutput(&lease);
+                    coordinator.owner_lease = None;
+                    closed
+                } else {
+                    true
+                };
+                drop(coordinator);
+                if dropped && cleaned {
+                    handler.pgoutput_coordinators.remove(&connector_id);
+                }
+                break;
+            }
+            let mut coordinator = coordinator.lock().await;
+            for alias in &aliases {
+                coordinator.attach_alias(alias.name.clone());
+            }
+            let Some(lease) = coordinator.owner_lease.clone() else {
+                break;
+            };
+            let event = match coordinator
+                .runtime
+                .poll_pgoutput_event(&lease, BACKFILL_BATCH_MAX_ROWS)
+                .await
+            {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    drop(coordinator);
+                    drop(handler);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => {
+                    handler
+                        .block_pgoutput_aliases(&aliases, format!("pgoutput poll failed: {error}"));
+                    break;
+                }
+            };
+            let result = match event {
+                PgOutputEvent::Begin { xid } => coordinator.begin(xid),
+                PgOutputEvent::Relation { xid, relation } => {
+                    match coordinator
+                        .runtime
+                        .pgoutput_relation_column_policies(&lease, relation.relation_id)
+                        .await
+                    {
+                        Ok(column_policies) => {
+                            handler
+                                .stage_pgoutput_relation(
+                                    &mut coordinator,
+                                    &aliases,
+                                    xid,
+                                    relation,
+                                    &column_policies,
+                                    &shard_db,
+                                )
+                                .await
+                        }
+                        Err(error) => Err(source_backfill_error(error)),
+                    }
+                }
+                PgOutputEvent::Insert {
+                    xid,
+                    relation_id,
+                    new_values,
+                } => coordinator.push_change(
+                    xid,
+                    relation_id,
+                    CdcOperation::Insert,
+                    None,
+                    Some(new_values),
+                ),
+                PgOutputEvent::Update {
+                    xid,
+                    relation_id,
+                    old_values,
+                    new_values,
+                } => coordinator.push_change(
+                    xid,
+                    relation_id,
+                    CdcOperation::Update,
+                    Some(old_values),
+                    Some(new_values),
+                ),
+                PgOutputEvent::Delete {
+                    xid,
+                    relation_id,
+                    old_values,
+                } => coordinator.push_change(
+                    xid,
+                    relation_id,
+                    CdcOperation::Delete,
+                    Some(old_values),
+                    None,
+                ),
+                PgOutputEvent::Commit { xid, commit_lsn } => {
+                    match coordinator.finish_envelope(xid, commit_lsn) {
+                        Ok(envelope) => {
+                            coordinator
+                                .commit_envelope(envelope, &handler, &shard_db)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            if let Err(error) = result {
+                handler.block_pgoutput_aliases(&aliases, error.to_string());
+                handler.restore_compiled_pipeline_state(&shard_db).await;
+                let _ = coordinator.runtime.close_pgoutput(&lease);
+                coordinator.owner_lease = None;
+                break;
+            }
+            handler.project_pgoutput_status(&coordinator);
+        }
+    }
+
+    fn pgoutput_source_aliases(&self, connector_id: ConnectorId) -> Vec<CatalogSourceEntry> {
+        self.pgoutput_registered_aliases(connector_id)
+            .into_iter()
+            .filter(|source| source.status == "OK")
+            .collect()
+    }
+
+    fn pgoutput_registered_aliases(&self, connector_id: ConnectorId) -> Vec<CatalogSourceEntry> {
+        self.catalog
+            .list_sources()
+            .into_iter()
+            .filter(|source| {
+                source.source_type == "postgres_cdc"
+                    && source.format == "pgoutput"
+                    && pgoutput_source_identity(source)
+                        .is_ok_and(|identity| identity.connector_id() == connector_id)
+            })
+            .collect()
+    }
+
+    fn block_pgoutput_aliases(&self, aliases: &[CatalogSourceEntry], reason: String) {
+        for alias in aliases {
+            self.catalog.update_source_status(&alias.name, "BLOCKED");
+            self.catalog.update_source_runtime_detail(
+                &alias.name,
+                Some("gateway:pgoutput:fenced".to_string()),
+                None,
+                alias.live_offset.clone(),
+                alias.live_lag,
+                None,
+                Some(reason.clone()),
+            );
+        }
+    }
+
+    fn project_pgoutput_status(&self, coordinator: &SharedPgOutputCoordinator) {
+        let detail = PgOutputSourceRuntimeDetail {
+            source_identity_hash: format!("{:016x}", coordinator.connector_id.0),
+            active_xid: coordinator
+                .active_envelope
+                .as_ref()
+                .map(|active| active.xid),
+            envelope_bytes: coordinator.envelope_bytes(),
+            in_memory_bytes: coordinator.in_memory_bytes(),
+            spill_bytes: coordinator.spill_bytes(),
+            attached_view_count: coordinator.attached_view_count,
+            affected_view_count: coordinator.affected_view_count,
+            relation_schema_version: coordinator
+                .relation_routes
+                .values()
+                .map(|route| route.schema_version)
+                .max()
+                .unwrap_or(0),
+        };
+        for alias in coordinator.aliases() {
+            self.catalog
+                .update_pgoutput_source_runtime(alias, detail.clone());
+        }
+    }
+
+    async fn restore_compiled_pipeline_state(&self, shard_db: &rockstream_storage::ShardDb) {
+        let compiled = self
+            .compiled_views
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        for view in compiled {
+            let result = if let Some(join) = &view.join {
+                join.pipeline.restore(shard_db).await
+            } else {
+                view.pipeline.restore(shard_db).await
+            };
+            if let Err(error) = result {
+                tracing::error!(view = %view.view_name, %error, "restore fenced pgoutput pipeline failed");
+            }
+        }
+    }
+
+    async fn validate_pgoutput_lifecycles(
+        &self,
+        coordinator: &SharedPgOutputCoordinator,
+    ) -> Result<(), GatewayError> {
+        if coordinator.runtime.committed_epoch() == 0 {
+            return Ok(());
+        }
+        let relations = coordinator
+            .aliases()
+            .filter_map(|alias| self.catalog.source_table(alias))
+            .map(|table| table.name)
+            .collect::<HashSet<_>>();
+        for view in self
+            .reachable_compiled_views(&relations)
+            .into_iter()
+            .filter(|view| self.catalog.is_backfill_published(view))
+        {
+            let lifecycle = coordinator
+                .runtime
+                .backfill_lifecycle(&view)
+                .await
+                .map_err(source_backfill_error)?
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4019: active pgoutput view '{view}' has no durable lifecycle"
+                    ),
+                })?;
+            if lifecycle.cursor.last_key != coordinator.runtime.committed_offset().as_bytes() {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4019: active pgoutput view '{view}' cursor differs from source checkpoint"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn stage_pgoutput_relation(
+        &self,
+        coordinator: &mut SharedPgOutputCoordinator,
+        aliases: &[CatalogSourceEntry],
+        xid: u32,
+        relation: PgOutputRelationMetadata,
+        column_policies: &[(bool, bool)],
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        if let Some(existing) = coordinator.relation_routes.get(&relation.relation_id) {
+            if existing.upstream_namespace != relation.namespace
+                || existing.upstream_relation != relation.name
+            {
+                return self
+                    .block_relation_change(coordinator, xid, relation, shard_db)
+                    .await;
+            }
+        }
+        let Some(alias) = aliases.iter().find(|alias| {
+            let configured = alias
+                .options
+                .get("table")
+                .map(String::as_str)
+                .or(alias.table_name.as_deref())
+                .unwrap_or(&alias.name);
+            let (namespace, name) = configured.split_once('.').unwrap_or(("public", configured));
+            namespace == relation.namespace && name == relation.name
+        }) else {
+            return coordinator.stage_unrouted(xid, relation.relation_id);
+        };
+        let table = self.catalog.source_table(&alias.name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("source '{}' is not bound to an imported table", alias.name),
+            }
+        })?;
+        if column_policies.len() != relation.columns.len()
+            || relation
+                .columns
+                .iter()
+                .any(|column| !matches!(column.type_oid, 20 | 23 | 25 | 1043 | 1700))
+        {
+            return self
+                .block_relation_change(coordinator, xid, relation, shard_db)
+                .await;
+        }
+        let previous = coordinator
+            .relation_routes
+            .get(&relation.relation_id)
+            .cloned();
+        let next_schema_version = coordinator.next_schema_version()?;
+        if previous.is_none()
+            && (table.columns.len() != relation.columns.len()
+                || table
+                    .columns
+                    .iter()
+                    .zip(&relation.columns)
+                    .any(|(imported, upstream)| {
+                        imported.name != upstream.name
+                            || !catalog_type_accepts_pg_oid(&imported.data_type, upstream.type_oid)
+                    }))
+        {
+            return self
+                .block_relation_change(coordinator, xid, relation, shard_db)
+                .await;
+        }
+        let route = RelationRoute {
+            version: 1,
+            relation_id: relation.relation_id,
+            upstream_namespace: relation.namespace,
+            upstream_relation: relation.name,
+            imported_table_id: rockstream_types::rendezvous::fnv1a_64(table.name.as_bytes()),
+            imported_table_name: table.name,
+            columns: relation
+                .columns
+                .into_iter()
+                .enumerate()
+                .map(|(index, upstream)| {
+                    let imported_name = previous
+                        .as_ref()
+                        .and_then(|route| route.columns.get(index))
+                        .map_or_else(
+                            || {
+                                table
+                                    .columns
+                                    .get(index)
+                                    .map(|column| column.name.clone())
+                                    .unwrap_or_else(|| upstream.name.clone())
+                            },
+                            |column| column.imported_name.clone(),
+                        );
+                    ColumnRoute {
+                        upstream_name: upstream.name,
+                        imported_name,
+                        type_oid: upstream.type_oid,
+                        type_modifier: upstream.type_modifier,
+                        nullable: column_policies[index].0,
+                        has_default: column_policies[index].1,
+                        key: upstream.flags & 1 != 0,
+                    }
+                })
+                .collect(),
+            replica_identity: ReplicaIdentity::from_wire(relation.replica_identity)?,
+            schema_version: next_schema_version,
+        };
+        if let Some(previous) = &previous {
+            match previous.classify(&route) {
+                RelationChange::Unchanged => return Ok(()),
+                RelationChange::Compatible => {}
+                RelationChange::Breaking(_) => {
+                    let relation = PgOutputRelationMetadata {
+                        relation_id: route.relation_id,
+                        namespace: route.upstream_namespace,
+                        name: route.upstream_relation,
+                        replica_identity: relation.replica_identity,
+                        columns: route
+                            .columns
+                            .into_iter()
+                            .map(|column| rockstream_connectors::PgOutputColumn {
+                                flags: u8::from(column.key),
+                                name: column.upstream_name,
+                                type_oid: column.type_oid,
+                                type_modifier: column.type_modifier,
+                            })
+                            .collect(),
+                    };
+                    return self
+                        .block_relation_change(coordinator, xid, relation, shard_db)
+                        .await;
+                }
+            }
+        }
+        coordinator.stage_route(xid, route)
+    }
+
+    async fn block_relation_change(
+        &self,
+        coordinator: &mut SharedPgOutputCoordinator,
+        xid: u32,
+        relation: PgOutputRelationMetadata,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let _guard = self.shard_commit_lock.lock().await;
+        let last_safe_lsn =
+            rockstream_connectors::PgLsn::from_offset_token(coordinator.runtime.committed_offset())
+                .map_err(source_backfill_error)?;
+        let mut batch = rockstream_storage::WriteBatch::new();
+        let blocked = BlockedRelationState {
+            code: "RS-1002".to_string(),
+            xid,
+            relation,
+            last_safe_lsn,
+        };
+        append_blocked_state(&mut batch, coordinator.connector_id, &blocked)?;
+        shard_db.write_batch(batch).await?;
+        shard_db.flush().await?;
+        coordinator.blocked_state = Some(blocked);
+        Err(GatewayError::QueryTimeExecutionFailed {
+            detail: "RS-1002: incompatible upstream relation change blocked the pgoutput source"
+                .to_string(),
+        })
+    }
+
+    pub(crate) async fn commit_pgoutput_envelope(
+        &self,
+        coordinator: &mut SharedPgOutputCoordinator,
+        envelope: BufferedPgOutputEnvelope,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let _guard = self.shard_commit_lock.lock().await;
+        let epoch = shard_db
+            .try_next_epoch()
+            .ok_or(GatewayError::CommitEpochExhausted)?;
+        let staged_routes = envelope
+            .route_updates
+            .iter()
+            .map(|route| (route.relation_id, route))
+            .collect::<HashMap<_, _>>();
+        let route_schemas = coordinator
+            .relation_routes
+            .values()
+            .chain(&envelope.route_updates)
+            .map(|route| {
+                (
+                    route.imported_table_name.clone(),
+                    relation_route_schema(route),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut ops = Vec::new();
+        for change in &envelope.changes {
+            let route = staged_routes
+                .get(&change.relation_id)
+                .copied()
+                .or_else(|| coordinator.relation_routes.get(&change.relation_id))
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4013: pgoutput relation {} has no durable route",
+                        change.relation_id
+                    ),
+                })?;
+            if route.schema_version != change.schema_version {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-1002: pgoutput relation {} change used schema version {}, expected {}",
+                        change.relation_id, change.schema_version, route.schema_version
+                    ),
+                });
+            }
+            ops.push(pgoutput_change_to_dml(route, change)?);
+        }
+        let changed_relations = ops
+            .iter()
+            .map(dml_table_name)
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let mut attached_relations = coordinator
+            .relation_routes
+            .values()
+            .chain(&envelope.route_updates)
+            .map(|route| route.imported_table_name.clone())
+            .collect::<HashSet<_>>();
+        for alias in coordinator.aliases() {
+            if let Some(table) = self.catalog.source_table(alias) {
+                attached_relations.insert(table.name);
+            }
+        }
+        let mut active_views = self
+            .reachable_compiled_views(&attached_relations)
+            .into_iter()
+            .filter(|view| self.catalog.is_backfill_published(view))
+            .collect::<Vec<_>>();
+        for view in coordinator.activating_views() {
+            if !active_views.iter().any(|active| active == view) {
+                active_views.push(view.to_string());
+            }
+        }
+        active_views.sort();
+        let affected = self
+            .reachable_compiled_views(&changed_relations)
+            .into_iter()
+            .filter(|view| active_views.contains(view))
+            .collect::<Vec<_>>();
+        coordinator.attached_view_count = active_views.len();
+        coordinator.affected_view_count = affected.len();
+
+        let mut m3 = rockstream_storage::WriteBatch::new();
+        append_dml_ops(&mut m3, &ops);
+        let mut deltas = HashMap::<String, ArrowZSet>::new();
+        for relation in &changed_relations {
+            deltas.insert(
+                relation.clone(),
+                build_delta_zset_for_table(
+                    relation,
+                    &ops,
+                    route_schemas
+                        .get(relation)
+                        .cloned()
+                        .unwrap_or_else(|| query_time_relation_schema(&self.catalog, relation)),
+                )?,
+            );
+        }
+        for view_name in &affected {
+            let compiled = self
+                .compiled_views
+                .get(view_name)
+                .map(|entry| entry.value().clone())
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled view '{view_name}' is unavailable"),
+                })?;
+            let output = if let Some(join) = &compiled.join {
+                let left = deltas.get(&join.left_source).cloned().unwrap_or_else(|| {
+                    ArrowZSet::empty(query_time_relation_schema(&self.catalog, &join.left_source))
+                });
+                let right = deltas.get(&join.right_source).cloned().unwrap_or_else(|| {
+                    ArrowZSet::empty(query_time_relation_schema(
+                        &self.catalog,
+                        &join.right_source,
+                    ))
+                });
+                join.pipeline.process(left, right)
+            } else {
+                let deps = self.catalog.get_view_deps(view_name);
+                let schema = deps
+                    .first()
+                    .map(|dep| query_time_relation_schema(&self.catalog, dep))
+                    .unwrap_or_else(|| query_time_relation_schema(&self.catalog, view_name));
+                let inputs = deps
+                    .iter()
+                    .filter_map(|dep| deltas.get(dep).cloned())
+                    .collect::<Vec<_>>();
+                let input =
+                    rockstream_ops::join::concat_zsets(inputs, schema).map_err(|error| {
+                        GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("combine compiled view input({view_name}): {error}"),
+                        }
+                    })?;
+                compiled.pipeline.process(input)
+            }
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled pipeline process({view_name}): {error}"),
+            })?;
+            compiled.sink.append_epoch(&mut m3, &output, epoch);
+            if let Some(join) = &compiled.join {
+                join.pipeline.append_state(shard_db, &mut m3).await
+            } else {
+                compiled.pipeline.append_state(shard_db, &mut m3).await
+            }
+            .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("append compiled pipeline state({view_name}): {error}"),
+            })?;
+            deltas.insert(view_name.clone(), output);
+        }
+        coordinator.append_route_updates(&mut m3, &envelope.route_updates)?;
+        m3.put(
+            &rockstream_storage::ShardKeyEncoder::frontier_key(),
+            &epoch.to_be_bytes(),
+        );
+
+        let offset = envelope.commit_lsn.to_offset_token();
+        let activating_views = coordinator
+            .activating_views()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let mut lifecycles = Vec::with_capacity(active_views.len());
+        for view_name in &active_views {
+            let previous = coordinator
+                .runtime
+                .backfill_lifecycle(view_name)
+                .await
+                .map_err(source_backfill_error)?;
+            if previous.is_none() && !activating_views.contains(view_name) {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "RS-4019: active pgoutput view '{view_name}' has no lifecycle cursor"
+                    ),
+                });
+            }
+            let fence = previous
+                .as_ref()
+                .map(|lifecycle| lifecycle.cursor.fence.clone())
+                .unwrap_or_else(|| SnapshotDeltaFence::new(offset.clone(), offset.clone()));
+            let estimated_rows = previous
+                .as_ref()
+                .map_or(envelope.changes.len() as u64, |lifecycle| {
+                    lifecycle.estimated_rows
+                });
+            lifecycles.push(BackfillLifecycle::new(
+                BackfillPhase::Running,
+                BackfillCursor::new(view_name, 0, offset.as_bytes().to_vec(), fence, epoch),
+                0,
+                estimated_rows,
+                0,
+                Some(epoch),
+            ));
+        }
+        let lease = coordinator.owner_lease.clone().ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: "RS-4013: pgoutput coordinator owner is fenced".to_string(),
+            }
+        })?;
+        coordinator
+            .runtime
+            .commit_replayable_epoch(&lease, epoch, offset, &lifecycles, m3)
+            .await
+            .map_err(source_backfill_error)?;
+        coordinator.cleanup_committed(shard_db).await?;
+        for route in &envelope.route_updates {
+            self.catalog.update_table_columns(
+                &route.imported_table_name,
+                route
+                    .columns
+                    .iter()
+                    .map(|column| CatalogColumn {
+                        name: column.imported_name.clone(),
+                        data_type: pg_oid_catalog_type(column.type_oid).to_string(),
+                    })
+                    .collect(),
+            );
+        }
+        self.frontier_published_at_ms
+            .store(current_time_ms(), Ordering::SeqCst);
+        for alias in coordinator.aliases() {
+            self.catalog.update_source_runtime_detail(
+                alias,
+                Some(format!("gateway:pgoutput:{}", coordinator.connector_id.0)),
+                Some(epoch),
+                envelope.commit_lsn.to_string(),
+                0,
+                Some(0),
+                None,
+            );
+        }
+        Ok(())
     }
 
     async fn run_s3_source_worker(
@@ -3426,6 +4464,11 @@ impl GatewayHandler {
         estimated_rows: u64,
         shard_db: &Arc<rockstream_storage::ShardDb>,
     ) -> Result<(), GatewayError> {
+        let _guard = self.shard_commit_lock.lock().await;
+        let epoch = shard_db
+            .try_next_epoch()
+            .ok_or(GatewayError::CommitEpochExhausted)?;
+        let published_frontier = published_frontier.map(|_| epoch);
         let compiled = self
             .compiled_views
             .get(view_name)
@@ -3464,7 +4507,6 @@ impl GatewayHandler {
                 }
             })?
         };
-        let epoch = runtime.next_epoch().map_err(source_backfill_error)?;
         let cursor = BackfillCursor::new(
             view_name,
             0,
@@ -6403,6 +7445,33 @@ impl GatewayHandler {
             live_lag: 0,
         };
 
+        if entry.source_type == "postgres_cdc" && entry.format == "pgoutput" {
+            let identity = match pgoutput_source_identity(&entry) {
+                Ok(identity) => identity,
+                Err(error) => return Ok(vec![create_source_error_response(error.to_string())]),
+            };
+            if let Some((owner, _)) = self
+                .catalog
+                .list_sources()
+                .into_iter()
+                .filter(|source| {
+                    source.source_type == "postgres_cdc" && source.format == "pgoutput"
+                })
+                .filter_map(|source| {
+                    pgoutput_source_identity(&source)
+                        .ok()
+                        .map(|existing| (source.name, existing))
+                })
+                .find(|(_, existing)| {
+                    identity.has_same_physical_slot(existing) && identity != *existing
+                })
+            {
+                return Ok(vec![create_source_error_response(format!(
+                    "[RS-4013] physical pgoutput slot is already owned by source '{owner}'"
+                ))]);
+            }
+        }
+
         if !self.catalog.add_source(entry) {
             return Ok(vec![create_source_error_response(format!(
                 "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
@@ -6474,6 +7543,24 @@ impl GatewayHandler {
             }
             AlterSourceAction::Resume => {
                 self.catalog.update_source_status(&parsed.name, "OK");
+                if let (Some(source), Some(shard_db)) = (
+                    self.catalog.get_source(&parsed.name),
+                    self.shard_db.as_ref(),
+                ) {
+                    if source.source_type == "postgres_cdc" && source.format == "pgoutput" {
+                        if let Some(view) = self.catalog.list_views().into_iter().find(|view| {
+                            self.catalog
+                                .get_view_deps(&view.name)
+                                .contains(&source.name)
+                        }) {
+                            self.spawn_postgres_cdc_source_worker(
+                                source,
+                                view.name,
+                                Arc::clone(shard_db),
+                            );
+                        }
+                    }
+                }
                 if let Some(source) = self.webhook_sources.get(&parsed.name) {
                     source.lock().set_paused(false);
                 }
@@ -6489,8 +7576,51 @@ impl GatewayHandler {
                 )])
             }
             AlterSourceAction::Drop => {
+                let source = self.catalog.get_source(&parsed.name);
+                if source.as_ref().is_some_and(|source| {
+                    source.source_type == "postgres_cdc"
+                        && self.catalog.list_views().into_iter().any(|view| {
+                            self.catalog
+                                .get_view_deps(&view.name)
+                                .contains(&parsed.name)
+                        })
+                }) {
+                    return Ok(vec![create_source_error_response(format!(
+                        "[RS-4013] pgoutput source '{}' still has dependent views; drop them before DROP SOURCE",
+                        parsed.name
+                    ))]);
+                }
+                let pgoutput_id = source.as_ref().and_then(|source| {
+                    (source.source_type == "postgres_cdc" && source.format == "pgoutput")
+                        .then(|| pgoutput_source_identity(source).ok())
+                        .flatten()
+                        .map(|identity| identity.connector_id())
+                });
                 self.catalog.remove_source(&parsed.name);
                 self.webhook_sources.remove(&parsed.name);
+                if let (Some(connector_id), Some(shard_db), Ok(runtime)) = (
+                    pgoutput_id.filter(|connector_id| {
+                        self.pgoutput_registered_aliases(*connector_id).is_empty()
+                    }),
+                    self.shard_db.as_ref(),
+                    tokio::runtime::Handle::try_current(),
+                ) {
+                    if let Some(coordinator) = self
+                        .pgoutput_coordinators
+                        .get(&connector_id)
+                        .map(|entry| entry.value().clone())
+                    {
+                        let shard_db = Arc::clone(shard_db);
+                        let registry = Arc::clone(&self.pgoutput_coordinators);
+                        runtime.spawn(async move {
+                            let mut coordinator = coordinator.lock().await;
+                            if coordinator.drop_durable_state(&shard_db).await.is_ok() {
+                                drop(coordinator);
+                                registry.remove(&connector_id);
+                            }
+                        });
+                    }
+                }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                         "system",
@@ -6596,6 +7726,14 @@ impl GatewayHandler {
                 )])
             }
             AlterSourceAction::SetOptions(_options) => {
+                if self.catalog.get_source(&parsed.name).is_some_and(|source| {
+                    source.source_type == "postgres_cdc" && source.status == "OK"
+                }) {
+                    return Ok(vec![create_source_error_response(
+                        "[RS-4013] pgoutput identity options are immutable while running; pause, drain, and explicitly rebind the source"
+                            .to_string(),
+                    )]);
+                }
                 if let Some(log) = &self.audit_log {
                     let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                         "system",
@@ -7175,6 +8313,7 @@ impl GatewayHandler {
         let ops = entry.drain();
         let affected = ops.len();
         drop(entry); // release DashMap entry guard before await
+        let _commit_guard = self.shard_commit_lock.lock().await;
 
         // Allocate next epoch
         let epoch = shard_db.try_next_epoch().ok_or_else(|| {
@@ -8478,6 +9617,7 @@ impl GatewayHandler {
         let Some(shard_db) = &self.shard_db else {
             return Ok(rows.len()); // no storage — pretend success
         };
+        let _commit_guard = self.shard_commit_lock.lock().await;
 
         let epoch = shard_db.try_next_epoch().ok_or_else(|| {
             PgWireError::ApiError(Box::new(crate::error::GatewayError::CommitEpochExhausted))
@@ -11530,6 +12670,165 @@ fn source_view_connector_id(source_name: &str, view_name: &str) -> ConnectorId {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     ConnectorId(hash)
+}
+
+fn source_checkpoint_connector_id(source: &CatalogSourceEntry, view_name: &str) -> ConnectorId {
+    if source.source_type == "postgres_cdc" && source.format == "pgoutput" {
+        if let Ok(identity) = pgoutput_source_identity(source) {
+            return identity.connector_id();
+        }
+    }
+    source_view_connector_id(&source.name, view_name)
+}
+
+fn pgoutput_source_identity(source: &CatalogSourceEntry) -> Result<SourceIdentityV1, GatewayError> {
+    let port = source.options.get("port").map_or(Ok(None), |port| {
+        port.parse::<u16>()
+            .map(Some)
+            .map_err(|_| GatewayError::QueryTimeExecutionFailed {
+                detail: format!(
+                    "PostgreSQL CDC source '{}' has invalid port '{port}'",
+                    source.name
+                ),
+            })
+    })?;
+    let required =
+        |name: &str| {
+            source.options.get(name).cloned().ok_or_else(|| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("PostgreSQL CDC source '{}' requires {name}", source.name),
+                }
+            })
+        };
+    SourceIdentityV1::new(
+        source
+            .options
+            .get("host")
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        port,
+        source
+            .options
+            .get("database")
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string()),
+        required("slot")?,
+        required("publication")?,
+        source
+            .options
+            .get("user")
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string()),
+        required("credential_ref")?,
+    )
+}
+
+fn catalog_type_accepts_pg_oid(data_type: &str, oid: u32) -> bool {
+    match data_type.to_ascii_lowercase().as_str() {
+        "int32" | "int" | "integer" => oid == 23,
+        "int64" | "bigint" => oid == 20 || oid == 23,
+        "utf8" | "text" | "varchar" => matches!(oid, 25 | 1043),
+        data_type if data_type.starts_with("decimal") || data_type.starts_with("numeric") => {
+            oid == 1700
+        }
+        _ => false,
+    }
+}
+
+fn pg_oid_catalog_type(oid: u32) -> &'static str {
+    match oid {
+        20 => "Int64",
+        23 => "Int32",
+        25 | 1043 => "Utf8",
+        1700 => "Decimal128(38, 10)",
+        _ => "Utf8",
+    }
+}
+
+fn relation_route_schema(route: &RelationRoute) -> SchemaRef {
+    Arc::new(Schema::new(
+        route
+            .columns
+            .iter()
+            .map(|column| {
+                Field::new(
+                    &column.imported_name,
+                    string_to_arrow_datatype(pg_oid_catalog_type(column.type_oid)),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn pgoutput_change_to_dml(
+    route: &RelationRoute,
+    change: &EncodedChange,
+) -> Result<DmlOp, GatewayError> {
+    let names = route
+        .columns
+        .iter()
+        .map(|column| column.imported_name.clone())
+        .collect::<Vec<_>>();
+    let row = |values: &Option<Vec<Option<String>>>, kind: &str| {
+        let values = values
+            .as_ref()
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("pgoutput {kind} is missing its row image"),
+            })?;
+        if values.len() != names.len() {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!(
+                    "RS-1002: pgoutput {kind} tuple has {} columns, route has {}",
+                    values.len(),
+                    names.len()
+                ),
+            });
+        }
+        let values = values
+            .iter()
+            .map(|value| value.clone().unwrap_or_else(|| r"\N".to_string()))
+            .collect::<Vec<_>>();
+        Ok((values.join("\t"), build_row_key(&names, &values)))
+    };
+    match change.operation {
+        CdcOperation::Insert => {
+            let (values_tsv, row_key) = row(&change.new_values, "INSERT")?;
+            Ok(DmlOp::Insert {
+                table: route.imported_table_name.clone(),
+                cols: names,
+                values_tsv,
+                row_key,
+            })
+        }
+        CdcOperation::Update => {
+            let (old_tsv, old_row_key) = row(&change.old_values, "UPDATE old")?;
+            let (new_tsv, new_row_key) = row(&change.new_values, "UPDATE new")?;
+            Ok(DmlOp::Update {
+                table: route.imported_table_name.clone(),
+                old_row_key,
+                old_tsv,
+                new_row_key,
+                new_tsv,
+            })
+        }
+        CdcOperation::Delete => {
+            let (returning_tsv, row_key) = row(&change.old_values, "DELETE")?;
+            Ok(DmlOp::Delete {
+                table: route.imported_table_name.clone(),
+                row_key,
+                returning_tsv: Some(returning_tsv),
+            })
+        }
+    }
+}
+
+fn dml_table_name(op: &DmlOp) -> &str {
+    match op {
+        DmlOp::Insert { table, .. } | DmlOp::Update { table, .. } | DmlOp::Delete { table, .. } => {
+            table
+        }
+    }
 }
 
 fn source_backfill_error(error: rockstream_connectors::SourceError) -> GatewayError {

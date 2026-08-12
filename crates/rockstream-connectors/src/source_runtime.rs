@@ -1,6 +1,6 @@
 //! Fenced, checkpoint-coupled source runtime coordination.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use rockstream_storage::WriteBatch;
 use rockstream_types::ids::ConnectorId;
@@ -11,6 +11,7 @@ use crate::source_epoch::SnapshotDeltaFence;
 use crate::source_epoch::{
     BackfillLifecycle, OffsetToken, SourceCheckpoint, SourceCheckpointStore, SourceEpochRegistry,
 };
+use crate::{PgOutputEvent, PostgresCdcSource};
 
 /// Maximum epochs that may have durable input pending upstream acknowledgement.
 pub const SOURCE_RUNTIME_MAX_IN_FLIGHT_EPOCHS: usize = 64;
@@ -252,7 +253,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         let Some(next_epoch) = self.source_epochs.current_epoch().checked_add(1) else {
             return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying");
         };
-        if epoch != next_epoch {
+        if epoch < next_epoch {
             return self.block(&format!(
                 "RS-4015: source epoch {epoch} is not the next fenced epoch {}; next steps: recover the committed checkpoint and retry",
                 next_epoch
@@ -282,9 +283,9 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         }
 
         self.source_epochs
-            .commit_epoch(
+            .commit_epoch_monotonic(
                 self.source_epochs
-                    .prepare_commit(BTreeMap::from([(0, committed.token.clone())]))
+                    .prepare_commit_at(epoch, BTreeMap::from([(0, committed.token.clone())]))
                     .map_err(|error| SourceError::Io(error.to_string()))?,
             )
             .map_err(|error| SourceError::Io(error.to_string()))?;
@@ -330,7 +331,7 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         let Some(next_epoch) = self.source_epochs.current_epoch().checked_add(1) else {
             return self.block("RS-4018: source epoch exhausted; next_steps: create a new connector before retrying");
         };
-        if epoch != next_epoch {
+        if epoch < next_epoch {
             return self.block(&format!(
                 "RS-4015: source epoch {epoch} is not the next fenced epoch {}; next steps: recover the committed checkpoint and retry",
                 next_epoch
@@ -366,9 +367,9 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         }
 
         self.source_epochs
-            .commit_epoch(
+            .commit_epoch_monotonic(
                 self.source_epochs
-                    .prepare_commit(BTreeMap::from([(0, committed.token.clone())]))
+                    .prepare_commit_at(epoch, BTreeMap::from([(0, committed.token.clone())]))
                     .map_err(|error| SourceError::Io(error.to_string()))?,
             )
             .map_err(|error| SourceError::Io(error.to_string()))?;
@@ -380,6 +381,92 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         }
         self.in_flight_epochs -= 1;
         Ok(())
+    }
+
+    /// Commit one replayable upstream transaction as one caller-built M3
+    /// batch, then acknowledge it. Unlike generic sources, PostgreSQL's slot
+    /// is the replay log, so no durable `Prepared` checkpoint is written.
+    pub async fn commit_replayable_epoch(
+        &mut self,
+        lease: &SourceOwnerLease,
+        epoch: Epoch,
+        offset: OffsetToken,
+        lifecycles: &[BackfillLifecycle],
+        mut m3_input: WriteBatch,
+    ) -> Result<(), SourceError> {
+        self.require_active_lease(lease)?;
+        if self.in_flight_epochs != 0 {
+            return self.block(
+                "RS-4014: replayable source already has an unacknowledged M3 epoch; next steps: recover and acknowledge it before polling",
+            );
+        }
+        let entry = self
+            .source_epochs
+            .prepare_commit_at(epoch, BTreeMap::from([(0, offset.clone())]))
+            .map_err(|error| SourceError::Io(error.to_string()))?;
+        let mut views = HashSet::with_capacity(lifecycles.len());
+        for lifecycle in lifecycles {
+            if lifecycle.phase != crate::source_epoch::BackfillPhase::Running
+                || lifecycle.cursor.committed_epoch != epoch
+                || lifecycle.cursor.last_key != offset.as_bytes()
+                || lifecycle.published_frontier != Some(epoch)
+                || !views.insert(lifecycle.view_name.as_str())
+            {
+                return self.block(
+                    "RS-4019: replayable source lifecycle coverage is duplicate or mismatched; next_steps: restore attachments from the committed source checkpoint",
+                );
+            }
+            self.checkpoint_store
+                .append_backfill_lifecycle(&mut m3_input, lifecycle)
+                .map_err(storage_error)?;
+        }
+        let committed = self
+            .checkpoint_store
+            .append_replayable_committed(&mut m3_input, epoch, offset)
+            .map_err(storage_error)?;
+        self.in_flight_epochs = 1;
+        if let Err(error) = self.checkpoint_store.commit_m3(m3_input).await {
+            self.in_flight_epochs = 0;
+            return self.block(&storage_error(error).to_string());
+        }
+
+        self.source_epochs
+            .commit_epoch_monotonic(entry)
+            .map_err(|error| SourceError::Io(error.to_string()))?;
+        self.committed_offset = committed.token.clone();
+        if let Err(error) = self.source.commit_offset(epoch, committed.token).await {
+            return self.block(&format!(
+                "RS-4016: M3 source transaction committed but upstream acknowledgement failed: {error}; next_steps: recover and acknowledge the durable checkpoint"
+            ));
+        }
+        self.in_flight_epochs = 0;
+        Ok(())
+    }
+
+    /// Atomically publish a newly attached view at the current source
+    /// checkpoint without advancing or acknowledging the upstream source.
+    pub async fn commit_attachment(
+        &mut self,
+        lease: &SourceOwnerLease,
+        lifecycle: &BackfillLifecycle,
+        mut m3_input: WriteBatch,
+    ) -> Result<(), SourceError> {
+        self.require_active_lease(lease)?;
+        if lifecycle.phase != crate::source_epoch::BackfillPhase::Running
+            || lifecycle.cursor.last_key != self.committed_offset.as_bytes()
+            || lifecycle.published_frontier != Some(lifecycle.cursor.committed_epoch)
+        {
+            return self.block(
+                "RS-4019: pgoutput attachment cursor does not match the current source checkpoint",
+            );
+        }
+        self.checkpoint_store
+            .append_backfill_lifecycle(&mut m3_input, lifecycle)
+            .map_err(storage_error)?;
+        self.checkpoint_store
+            .commit_m3(m3_input)
+            .await
+            .map_err(storage_error)
     }
 
     /// Retry the upstream acknowledgement for the checkpoint recovered after a
@@ -408,6 +495,10 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
 
     pub fn committed_offset(&self) -> &OffsetToken {
         &self.committed_offset
+    }
+
+    pub fn committed_epoch(&self) -> Epoch {
+        self.source_epochs.current_epoch()
     }
 
     pub fn blocked_reason(&self) -> Option<&str> {
@@ -443,6 +534,66 @@ impl<S: SourceConnector> SourceRuntimeCoordinator<S> {
         self.blocked_reason = Some(reason.to_string());
         drop(self.source.pause(reason.to_string()));
         Err(SourceError::Io(reason.to_string()))
+    }
+}
+
+impl SourceRuntimeCoordinator<PostgresCdcSource> {
+    /// Open PostgreSQL only after recovery and the source owner fence.
+    pub async fn open_pgoutput(&mut self, lease: &SourceOwnerLease) -> Result<(), SourceError> {
+        self.require_active_lease(lease)?;
+        if !self.recovered {
+            return Err(SourceError::Io(
+                "RS-4012: pgoutput cannot open before checkpoint recovery".to_string(),
+            ));
+        }
+        self.source
+            .open_pgoutput(self.source_epochs.current_epoch() != 0)
+            .await
+    }
+
+    /// Poll one decoded event while retaining acknowledgement authority here.
+    pub async fn poll_pgoutput_event(
+        &mut self,
+        lease: &SourceOwnerLease,
+        max_messages: usize,
+    ) -> Result<Option<PgOutputEvent>, SourceError> {
+        self.require_active_lease(lease)?;
+        self.source.poll_pgoutput_event(max_messages).await
+    }
+
+    pub async fn pgoutput_confirmed_lsn(
+        &self,
+        lease: &SourceOwnerLease,
+    ) -> Result<Option<crate::PgLsn>, SourceError> {
+        self.require_active_lease(lease)?;
+        self.source.confirmed_flush_lsn().await
+    }
+
+    pub async fn capture_pgoutput_source_snapshot(
+        &mut self,
+        lease: &SourceOwnerLease,
+        relations: &[(String, arrow::datatypes::SchemaRef)],
+    ) -> Result<crate::PgOutputSourceSnapshot, SourceError> {
+        self.require_active_lease(lease)?;
+        self.source.capture_source_snapshot(relations).await
+    }
+
+    pub async fn pgoutput_relation_column_policies(
+        &self,
+        lease: &SourceOwnerLease,
+        relation_id: u32,
+    ) -> Result<Vec<(bool, bool)>, SourceError> {
+        self.require_active_lease(lease)?;
+        self.source.relation_column_policies(relation_id).await
+    }
+
+    pub fn close_pgoutput(&mut self, lease: &SourceOwnerLease) -> bool {
+        if self.active_lease.as_ref() != Some(lease) {
+            return false;
+        }
+        self.source.close_pgoutput();
+        self.active_lease = None;
+        true
     }
 }
 

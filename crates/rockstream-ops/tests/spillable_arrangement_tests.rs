@@ -56,3 +56,26 @@ async fn test_spillable_arrangement_evicts_to_shard_db_and_faults_back() {
     let all = arr.scan_all().unwrap();
     assert_eq!(all.len(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sole_oversized_entry_spills_and_scans_exactly() {
+    let db = open_test_db("spill-test-sole-entry").await;
+    let mut arr: SpillableArrangement<Vec<u8>, Vec<u8>> =
+        SpillableArrangement::new(Some(db.clone()), b"spill:sole:".to_vec(), 7);
+
+    arr.insert(b"key".to_vec(), b"value".to_vec()).unwrap();
+
+    assert_eq!(arr.in_memory_entry_count(), 0);
+    assert_eq!(arr.spilled_entry_count(), 1);
+    assert_eq!(
+        arr.scan_all().unwrap(),
+        vec![(b"key".to_vec(), b"value".to_vec())]
+    );
+    assert_eq!(
+        db.scan_prefix(b"spill:sole:").await.unwrap(),
+        vec![(
+            bytes::Bytes::from_static(b"spill:sole:key"),
+            bytes::Bytes::from_static(b"value"),
+        )]
+    );
+}

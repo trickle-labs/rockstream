@@ -276,6 +276,26 @@ struct CatalogSourceRuntimeEntry {
     committed_checkpoint: u64,
     buffer_fill: usize,
     blocked_reason: Option<String>,
+    source_identity_hash: Option<String>,
+    active_xid: Option<u32>,
+    envelope_bytes: usize,
+    in_memory_bytes: u64,
+    spill_bytes: u64,
+    attached_view_count: usize,
+    affected_view_count: usize,
+    relation_schema_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgOutputSourceRuntimeDetail {
+    pub source_identity_hash: String,
+    pub active_xid: Option<u32>,
+    pub envelope_bytes: usize,
+    pub in_memory_bytes: u64,
+    pub spill_bytes: u64,
+    pub attached_view_count: usize,
+    pub affected_view_count: usize,
+    pub relation_schema_version: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -578,6 +598,13 @@ impl CatalogStubs {
         }
     }
 
+    pub fn update_table_columns(&self, table_name: &str, columns: Vec<CatalogColumn>) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(table) = inner.tables.get_mut(table_name) {
+            table.columns = columns;
+        }
+    }
+
     /// Set the `OperatorId` (as u64) of the compiled `ViewSinkOp` backing a
     /// view (v0.51.3 Slice 4). Called by `handle_create_view` once
     /// `rockstream_ops::compile_plan` succeeds for the view's SELECT.
@@ -793,6 +820,14 @@ impl CatalogStubs {
                 committed_checkpoint: 0,
                 buffer_fill: 0,
                 blocked_reason: None,
+                source_identity_hash: None,
+                active_xid: None,
+                envelope_bytes: 0,
+                in_memory_bytes: 0,
+                spill_bytes: 0,
+                attached_view_count: 0,
+                affected_view_count: 0,
+                relation_schema_version: 0,
             },
         );
         inner.sources.insert(entry.name.clone(), entry);
@@ -874,6 +909,26 @@ impl CatalogStubs {
             runtime.buffer_fill = buffer_fill;
         }
         runtime.blocked_reason = blocked_reason;
+        true
+    }
+
+    pub fn update_pgoutput_source_runtime(
+        &self,
+        name: &str,
+        detail: PgOutputSourceRuntimeDetail,
+    ) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let Some(runtime) = inner.source_runtime.get_mut(name) else {
+            return false;
+        };
+        runtime.source_identity_hash = Some(detail.source_identity_hash);
+        runtime.active_xid = detail.active_xid;
+        runtime.envelope_bytes = detail.envelope_bytes;
+        runtime.in_memory_bytes = detail.in_memory_bytes;
+        runtime.spill_bytes = detail.spill_bytes;
+        runtime.attached_view_count = detail.attached_view_count;
+        runtime.affected_view_count = detail.affected_view_count;
+        runtime.relation_schema_version = detail.relation_schema_version;
         true
     }
 
@@ -963,6 +1018,16 @@ impl CatalogStubs {
                     Some(runtime.buffer_fill.to_string()),
                     runtime.blocked_reason,
                     Some(opts_json),
+                    runtime.source_identity_hash,
+                    s.options.get("slot").cloned(),
+                    s.options.get("publication").cloned(),
+                    runtime.active_xid.map(|xid| xid.to_string()),
+                    Some(runtime.envelope_bytes.to_string()),
+                    Some(runtime.in_memory_bytes.to_string()),
+                    Some(runtime.spill_bytes.to_string()),
+                    Some(runtime.attached_view_count.to_string()),
+                    Some(runtime.affected_view_count.to_string()),
+                    Some(runtime.relation_schema_version.to_string()),
                 ]
             })
             .collect();
@@ -1633,6 +1698,14 @@ impl CatalogStubs {
             progress.rows_remaining = rows_remaining;
             progress.estimated_rows = estimated_rows;
         }
+    }
+
+    pub fn backfill_has_cursor(&self, view_name: &str) -> bool {
+        self.backfills
+            .read()
+            .unwrap()
+            .get(view_name)
+            .is_some_and(|progress| progress.cursor_position.is_some())
     }
 
     /// Publish only after the snapshot/output commit reaches its frontier.
@@ -2712,6 +2785,16 @@ pub(crate) fn show_source_status_columns() -> Vec<String> {
         "buffer_fill".to_string(),
         "blocked_reason".to_string(),
         "options".to_string(),
+        "source_identity_hash".to_string(),
+        "slot".to_string(),
+        "publication".to_string(),
+        "active_xid".to_string(),
+        "envelope_bytes".to_string(),
+        "in_memory_bytes".to_string(),
+        "spill_bytes".to_string(),
+        "attached_view_count".to_string(),
+        "affected_view_count".to_string(),
+        "relation_schema_version".to_string(),
     ]
 }
 

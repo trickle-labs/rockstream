@@ -428,7 +428,7 @@ impl<K: SpillKey, V: SpillValue> SpillableArrangement<K, V> {
     }
 
     fn evict_if_needed(&mut self) -> Result<(), OpError> {
-        while self.in_memory_bytes > self.memory_limit_bytes && self.in_memory.len() > 1 {
+        while self.in_memory_bytes > self.memory_limit_bytes && !self.in_memory.is_empty() {
             let cold_key = match self.access_queue.pop_front() {
                 Some(k) => k,
                 None => break,

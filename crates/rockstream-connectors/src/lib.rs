@@ -36,10 +36,12 @@ pub use kafka_sink::KafkaSink;
 pub use kafka_source::KafkaSource;
 pub use object_store_sink::{ObjectStoreSink, OBJECT_STORE_SINK_MAX_PENDING_EPOCHS};
 pub use postgres_cdc::{
-    CdcChange, CdcOperation, CdcWireFormat, PgLsn, PgOutputConfig, PostgresCdcFailure,
-    PostgresCdcSource, PostgresCdcStatus, POSTGRES_CDC_MAX_IN_FLIGHT_BYTES,
-    POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS, POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS,
-    POSTGRES_CDC_MAX_WAL_LAG_BYTES,
+    CdcChange, CdcOperation, CdcTransactionEnvelope, CdcWireFormat, PgLsn, PgOutputColumn,
+    PgOutputConfig, PgOutputEvent, PgOutputRelationMetadata, PgOutputSnapshotRelation,
+    PgOutputSourceSnapshot, PostgresCdcFailure, PostgresCdcSource, PostgresCdcStatus,
+    POSTGRES_CDC_MAX_IN_FLIGHT_BYTES, POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS,
+    POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS, POSTGRES_CDC_MAX_TRANSACTION_BYTES,
+    POSTGRES_CDC_MAX_WAL_LAG_BYTES, POSTGRES_CDC_TRANSACTION_MEMORY_BYTES,
 };
 pub use s3_source::S3Source;
 pub use sink_connector::{

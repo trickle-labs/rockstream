@@ -432,6 +432,21 @@ impl SourceCheckpointStore {
         Ok(committed)
     }
 
+    /// Add a replayable-source checkpoint directly to its visibility batch.
+    /// PostgreSQL's unacknowledged logical slot is the durable replay log, so
+    /// this path deliberately has no separate prepared write.
+    pub fn append_replayable_committed(
+        &self,
+        batch: &mut WriteBatch,
+        source_epoch: Epoch,
+        token: OffsetToken,
+    ) -> Result<SourceCheckpoint, StorageError> {
+        self.append_committed(
+            batch,
+            &SourceCheckpoint::prepared(self.connector_id, source_epoch, token),
+        )
+    }
+
     /// Commit source input and its checkpoint atomically, then make the durable
     /// commit visible to restart recovery.
     pub async fn commit_m3(&self, batch: WriteBatch) -> Result<(), StorageError> {
@@ -610,6 +625,31 @@ impl SourceEpochRegistry {
         })
     }
 
+    /// Prepare a globally allocated shard epoch. Other shard commits may
+    /// create gaps, but a source may never move backwards or repeat an epoch.
+    pub fn prepare_commit_at(
+        &self,
+        source_epoch: Epoch,
+        partition_offsets: BTreeMap<u64, OffsetToken>,
+    ) -> Result<SourceEpochEntry, SourceEpochError> {
+        let expected = self.current_epoch.checked_add(1).ok_or({
+            SourceEpochError::Exhausted {
+                connector_id: self.connector_id,
+            }
+        })?;
+        if source_epoch < expected {
+            return Err(SourceEpochError::NonMonotone {
+                connector_id: self.connector_id,
+                expected,
+                got: source_epoch,
+            });
+        }
+        Ok(SourceEpochEntry {
+            source_epoch,
+            partition_offsets,
+        })
+    }
+
     /// Advance to the next epoch after the `WriteBatch` has been durably flushed.
     ///
     /// `entry` must be the value returned by a previous [`prepare_commit`] call
@@ -636,6 +676,34 @@ impl SourceEpochRegistry {
         self.last_committed = Some(entry.clone());
 
         // Maintain bounded history ring.
+        self.history.insert(entry.source_epoch, entry);
+        while self.history.len() > MAX_HISTORY {
+            if let Some(oldest_key) = self.history.keys().next().copied() {
+                self.history.remove(&oldest_key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit an entry returned by [`Self::prepare_commit_at`].
+    pub fn commit_epoch_monotonic(
+        &mut self,
+        entry: SourceEpochEntry,
+    ) -> Result<(), SourceEpochError> {
+        let expected = self.current_epoch.checked_add(1).ok_or({
+            SourceEpochError::Exhausted {
+                connector_id: self.connector_id,
+            }
+        })?;
+        if entry.source_epoch < expected {
+            return Err(SourceEpochError::NonMonotone {
+                connector_id: self.connector_id,
+                expected,
+                got: entry.source_epoch,
+            });
+        }
+        self.current_epoch = entry.source_epoch;
+        self.last_committed = Some(entry.clone());
         self.history.insert(entry.source_epoch, entry);
         while self.history.len() > MAX_HISTORY {
             if let Some(oldest_key) = self.history.keys().next().copied() {
@@ -693,6 +761,23 @@ mod tests {
             reg.commit_epoch(entry).unwrap();
         }
         assert_eq!(reg.current_epoch(), 10);
+    }
+
+    #[test]
+    fn globally_allocated_epoch_may_gap_but_not_repeat() {
+        let mut reg = SourceEpochRegistry::new(ConnectorId(22));
+        let entry = reg
+            .prepare_commit_at(7, offsets(&[("p0", "offset-7")]))
+            .unwrap();
+        reg.commit_epoch_monotonic(entry).unwrap();
+
+        assert_eq!(reg.current_epoch(), 7);
+        assert_eq!(
+            reg.prepare_commit_at(7, offsets(&[("p0", "repeat")]))
+                .unwrap_err()
+                .to_string(),
+            "RS-4006: source_epoch must advance monotonically: connector=22, expected=8, got=7"
+        );
     }
 
     #[test]
