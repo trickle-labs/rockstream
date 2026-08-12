@@ -7,6 +7,55 @@
 
 ---
 
+## Amendment (2026-08-12): the connector surface is reduced, not maintained
+
+[ROCKSTREAM_CONNEXTORS_CLEANUP.md](ROCKSTREAM_CONNEXTORS_CLEANUP.md) was
+accepted and scheduled as **v0.52.3 – v0.52.5** ([NEW_ROADMAP.md](NEW_ROADMAP.md)
+Phase 16.6). This amendment governs where it conflicts with the original text
+below; everything it does not touch stands unchanged.
+
+Rockstream's supported external integration boundary becomes:
+
+```text
+Sources: PostgreSQL CDC, Kafka
+Sink:    Kafka
+```
+
+The S3 source, the HTTP/webhook source, the object-store sink, the Iceberg
+sink, the Delta Lake sink, the generic cold-tier sink infrastructure,
+connector-specific cold-tier garbage collection, and external lakehouse catalog
+registration (Glue/Hive/REST/DuckLake) are **deleted from the codebase**, not
+deprecated, feature-flagged, or left in maintenance mode.
+
+**Why this reverses §4's "scope freeze on expansion, not a rollback" for one
+subsystem.** The original document's reasoning — do not rip out proven
+functionality merely to make the repository smaller — was correct as a general
+rule and still governs everything else in Tier B. It fails for connectors
+specifically, because `Maintain` tier is not a free classification. Every
+retained connector is a permanent compatibility commitment, a dependency, CI
+wall time, a security surface, a set of failure and recovery semantics, and a
+row that v0.58's failure matrix and v0.59's unscoped reachability sweep must
+both cover honestly. Paying that forever, for connectors whose integration
+value Kafka already carries, is a worse trade than deleting them once — and
+making the decision before v0.57 freezes the v1 contract means the contract is
+written over the surface that actually exists.
+
+**Three boundaries this amendment does not cross.** The PostgreSQL wire
+protocol is Rockstream's native query and application interface, not an
+optional connector, and is untouched. Rockstream's internal use of object
+storage — SlateDB state, checkpoints, spill, recovery, disaster-recovery export
+— is untouched; removing an object-store *sink* is not removing object storage
+from the storage architecture. The sink two-phase-commit machinery and the M3
+model that verifies it stay, now covering the single remaining sink.
+
+**What this does not change.** Nothing else already shipped is removed.
+Secondary indexes, hot-key virtual bucketing, autoscaling signals, advanced ad
+hoc SQL, and advanced DML remain `Maintain` tier under the original rules. The
+admission rule in §8 is unchanged and is now *machine-enforced* for connectors
+by `scripts/check-connector-admission.sh` (v0.52.5).
+
+---
+
 ## Executive summary
 
 Rockstream should move forward as a **cloud-native incremental view maintenance (IVM) system** whose defining strength is not feature breadth, but the ability to keep SQL-defined materialized views correct, fresh, durable, and recoverable on object-storage-backed state.
@@ -25,7 +74,7 @@ It is:
 
 The recommended answer is:
 
-1. **Keep the capabilities already built.** Do not rip out proven functionality merely because it is outside the strategic core.
+1. **Keep the capabilities already built.** Do not rip out proven functionality merely because it is outside the strategic core. *(Amended 2026-08-12: this holds for everything except the non-core connector surface, which is deleted at v0.52.3–v0.52.5 — see the amendment above.)*
 2. **Stop treating every shipped subsystem as a new product pillar.** Existing lakehouse, advanced SQL, elasticity, and integration features do not automatically justify further expansion.
 3. **Put future engineering disproportionately into correctness, failure semantics, operability, security, upgrades, disaster recovery, and production validation.**
 4. **Apply a strict feature-admission rule to new breadth.** New SQL families, connectors, catalogs, transactional semantics, and governance languages should require concrete evidence that they materially improve the IVM product.
@@ -141,6 +190,13 @@ These capabilities are already implemented and should remain available and regre
 - Automatic hot-key virtual bucketing and advanced elasticity controls.
 - Existing advanced DML or PostgreSQL compatibility features.
 - HTTP/webhook and other already implemented non-core ingestion paths.
+
+**Amended 2026-08-12.** The connector entries above — Iceberg/Delta cold-tier
+integration, catalog integration, and HTTP/webhook and other non-core ingestion
+paths, plus the S3 source and object-store sink — are **no longer Tier B**. They
+are removed at v0.52.3–v0.52.5. Tier B is now the non-connector list only:
+advanced ad hoc analytical SQL, secondary indexes, hot-key virtual bucketing and
+elasticity controls, and advanced DML/PostgreSQL compatibility features.
 
 The default posture for Tier B is:
 
@@ -275,6 +331,25 @@ The remaining roadmap should be evaluated against the strategic core rather than
 
 Why: eliminating silent wrong answers, reachable panics, and acknowledged-but-discarded control messages is directly part of IVM correctness.
 
+#### v0.52.3–v0.52.5 — Connector surface reduction
+
+**Recommendation:** Keep and prioritize; it is a prerequisite of v0.57.
+
+**Applied (2026-08-12):** [NEW_ROADMAP.md](NEW_ROADMAP.md) Phase 16.6 schedules
+the accepted [ROCKSTREAM_CONNEXTORS_CLEANUP.md](ROCKSTREAM_CONNEXTORS_CLEANUP.md)
+proposal as three versions — announced fail-closed removal (v0.52.3), deletion
+of implementations, dependencies, and dead abstractions (v0.52.4), and the
+three-connector guarantee matrix plus a machine-enforced admission gate
+(v0.52.5).
+
+Why: the v1 contract names PostgreSQL CDC and Kafka as the release-gated
+connectors. Deleting the rest *before* the contract is frozen means v0.57
+describes the system that exists, rather than committing the project to keep
+five additional connectors correct, secure, and failure-matrix-covered through
+v1 and beyond. The measurable outcome — dependency count, build time, CI time —
+is published in the v0.52.4 sign-off, because a deletion version has to be
+falsifiable like any other.
+
 #### Operator CLI and arrangement debugging
 
 **Recommendation:** Keep and prioritize.
@@ -350,6 +425,10 @@ The following already-shipped areas should remain supported, tested, and secure,
 - Autoscaling control loops beyond what is required to keep the IVM SLO healthy.
 - Additional connector families.
 
+**Amended 2026-08-12.** The first two entries are superseded: Iceberg/Delta,
+cold-tier, and catalog integration are not maintained — they are removed at
+v0.52.3–v0.52.5. The remainder stands.
+
 ---
 
 ## 7. Define the v1 public contract now
@@ -373,7 +452,18 @@ Recommended core external streaming connectors:
 
 PostgreSQL-wire DML remains a native access path rather than a connector.
 
-Existing S3/object-store, HTTP/webhook, Iceberg/Delta, and related integrations may remain supported, but they should not imply a commitment to build a wide connector ecosystem.
+**Amended 2026-08-12.** These are not merely the *core* connectors; after
+v0.52.5 they are the *only* connectors. The sentence that stood here — "Existing
+S3/object-store, HTTP/webhook, Iceberg/Delta, and related integrations may
+remain supported" — is superseded. Those integrations are removed, every
+removed surface fails closed with `RS-4017` naming its replacement path, and
+`docs/connector-migration.md` plus `docs/connectors.md` are the two documents
+the v1 contract cites. The integration story becomes small enough to state in
+one sentence:
+
+> Rockstream ingests operational changes from PostgreSQL or Kafka, continuously
+> maintains SQL materialized views, serves them through PostgreSQL-compatible
+> interfaces, and can publish derived streams to Kafka.
 
 ### Core SQL
 
@@ -476,9 +566,9 @@ For public-facing features, track:
 | Operator state-size accounting & admission control | Done | v0.51.23 | Core | Yes |
 | Async-runtime hygiene / timeout & retry budgets | Done | v0.51.25 | Core | Yes |
 | Long-lived registry leak closure | Done | v0.51.26 | Core | Yes |
-| HTTP webhook/push source | Done | v0.51.16 | Maintain | Existing behavior, no automatic expansion |
-| Object-store / S3 source & sink | Done | v0.27–v0.29 | Maintain | Existing behavior, no automatic expansion |
-| Iceberg/Delta cold-tier sink | Done | v0.44 | Maintain | Narrow existing contract |
+| HTTP webhook/push source | Removed | Shipped v0.51.16, removed v0.52.3–v0.52.4 | — | No; replacement is an external HTTP→Kafka adapter |
+| Object-store / S3 source & sink | Removed | Shipped v0.27–v0.29, removed v0.52.3–v0.52.4 | — | No; replacement is an external loader via pgwire/Kafka |
+| Iceberg/Delta cold-tier sink, cold-tier GC & catalog registration | Removed | Shipped v0.44, removed v0.52.3–v0.52.4 | — | No; replacement is Rockstream → Kafka → a downstream lakehouse writer |
 | Secondary indexes | Done | v0.32, v0.51.2 | Maintain | Existing behavior, no automatic expansion |
 | Hot-key virtual buckets & proactive shard splitting | Done | v0.47 | Maintain | Existing behavior, no automatic expansion |
 | Autoscaling signals | Done | v0.47 | Maintain | Tied to IVM SLO only, not general elasticity |
@@ -486,6 +576,9 @@ For public-facing features, track:
 | Advanced DML & scatter pruning | Done | v0.48, v0.51.1 | Maintain | Separate from core IVM guarantee |
 | Honest failure semantics (no silent-wrong-answer paths) | Planned | v0.51.27 | Core | Yes |
 | Durable connector quarantine (bounded, replayable DLQ) | Planned | v0.52 | Core | Yes |
+| Resumable online backfill & the snapshot/delta fence | Planned | v0.52.1 | Core | Yes |
+| Transaction-preserving PostgreSQL CDC & upstream schema evolution | Planned | v0.52.2 | Core | Yes |
+| Connector surface reduction to 2 sources / 1 sink (`RS-4017`, deletion, three-connector guarantee matrix) | Planned | v0.52.3–v0.52.5 | Core | Yes |
 | Operator CLI & arrangement debugger | Planned | v0.53 | Core | Yes |
 | Freshness explainability & lag decomposition | Planned | v0.54 | Core | Yes |
 | Internal mTLS, secrets management & security review | Planned | v0.55 | Core | Yes |
@@ -494,7 +587,7 @@ For public-facing features, track:
 | Production failure-matrix proof | Planned | v0.58 | Core | Yes |
 | Inline expectations, lineage diagnostics & governance policy language | Deferred by decision | — | Candidate | No; readmission requires a design partner needing policy in the engine |
 | Isolation & validation hooks (broader transactional semantics) | Deferred by decision | — | Candidate | No; readmission requires a workload that cannot use PostgreSQL/Kafka as source of truth |
-| New connector family (beyond PostgreSQL CDC / Kafka) | Not applicable | — | Candidate | No without admission |
+| New connector family (beyond PostgreSQL CDC / Kafka) | Not applicable | — | Candidate | No without admission, machine-enforced from v0.52.5 |
 
 Rows above were generated from [NEW_ROADMAP.md](NEW_ROADMAP.md)'s version table as of the
 2026-08-11 rebaseline of v0.52–v0.59;
@@ -625,12 +718,12 @@ The project should make the following decisions now:
 
 1. **Adopt the strategic north star:** Rockstream is primarily a cloud-native IVM system.
 2. **Take v0.51.26 as the baseline:** do not describe already-shipped capabilities as missing future architecture.
-3. **Do not rip out proven features:** use strategic tiers instead of retroactive de-scoping.
+3. **Do not rip out proven features:** use strategic tiers instead of retroactive de-scoping — *with one deliberate exception, the connector surface, removed at v0.52.3–v0.52.5 (see the 2026-08-12 amendment).*
 4. **Freeze unqualified feature expansion until v1 production-readiness work is complete.**
 5. **Keep v0.51.27-style correctness hardening as the immediate priority.**
 6. **Prioritize operator tooling, security, rolling upgrades, disaster recovery, and final production validation.**
 7. **Reconsider broad governance and OLTP-style transactional milestones unless concrete target workloads require them.**
-8. **Classify existing lakehouse, advanced SQL, and elasticity work as maintained capabilities rather than default growth areas.**
+8. **Classify existing advanced SQL and elasticity work as maintained capabilities rather than default growth areas, and reduce the external connector surface to PostgreSQL CDC, Kafka source, and Kafka sink.**
 9. **Add a strategic-status layer and feature-admission rule to `NEW_ROADMAP.md`.**
 10. **Link this strategy from the README, roadmap, implementation plan, and design documentation so it cannot drift independently from the repository again.**
 
@@ -662,6 +755,7 @@ This direction should be maintained alongside, and reconciled continuously with:
 - [`IVM.md`](IVM.md)
 - [`NEW_IMPLEMENTATION_PLAN.md`](NEW_IMPLEMENTATION_PLAN.md)
 - [`NEW_ROADMAP.md`](NEW_ROADMAP.md)
+- [`ROCKSTREAM_CONNEXTORS_CLEANUP.md`](ROCKSTREAM_CONNEXTORS_CLEANUP.md)
 - [`sign-offs/v0.51.26.md`](sign-offs/v0.51.26.md)
 
 The roadmap and sign-offs remain the source of truth for **what is implemented**. This document is intended to be the source of truth for **what the project should optimize for next**.
