@@ -483,10 +483,10 @@ fn decode_topk_value(bytes: &[u8], n_input_cols: usize) -> Option<(i64, i64, Vec
 /// Persist TopKOp state to a ShardDb.
 ///
 /// Uses only point Put/Delete operations — never DeleteRange.
-pub async fn persist_topk_state(
-    db: &ShardDb,
+pub fn append_topk_state(
     op: &TopKOp,
     op_id: OperatorId,
+    target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
         let state = op.state.lock().unwrap();
@@ -503,10 +503,20 @@ pub async fn persist_topk_state(
         batch
     };
 
-    if batch.is_empty() {
-        return Ok(());
+    target.merge_from(batch);
+    Ok(())
+}
+
+pub async fn persist_topk_state(
+    db: &ShardDb,
+    op: &TopKOp,
+    op_id: OperatorId,
+) -> Result<(), OpError> {
+    let mut batch = WriteBatch::new();
+    append_topk_state(op, op_id, &mut batch)?;
+    if !batch.is_empty() {
+        db.write_batch(batch).await.map_err(OpError::storage)?;
     }
-    db.write_batch(batch).await.map_err(OpError::storage)?;
     Ok(())
 }
 

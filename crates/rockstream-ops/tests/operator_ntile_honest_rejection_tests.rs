@@ -10,7 +10,6 @@ use arrow::record_batch::RecordBatch;
 use rockstream_ops::window::WindowOp;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_plan::{WindowExpr, WindowFunc};
-use rockstream_types::error_code::RS_1016;
 
 #[test]
 fn operator_ntile_returns_rs1016_error() {

@@ -4,15 +4,16 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use object_store::memory::InMemory;
 use rockstream_connectors::{
-    OffsetToken, PollDeltaResult, SnapshotStream, SourceCheckpoint, SourceCheckpointStore,
-    SourceConnector, SourceError, SourceRuntimeCoordinator,
+    BackfillCursor, BackfillLifecycle, BackfillPhase, OffsetToken, PollDeltaResult,
+    SnapshotDeltaFence, SnapshotStream, SourceCheckpoint, SourceCheckpointStore, SourceConnector,
+    SourceError, SourceRuntimeCoordinator,
 };
-use rockstream_storage::{ShardDb, WriteBatch};
+use rockstream_storage::{keys::ShardKeyEncoder, ShardDb, WriteBatch};
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
 
-const SEED: u64 = 0x51_15_0003;
+const SEED: u64 = 0x5115_0003;
 
 struct RecordingSource {
     acknowledgements: Vec<(Epoch, OffsetToken)>,
@@ -30,7 +31,8 @@ impl SourceConnector for RecordingSource {
 
     async fn start_snapshot(
         &mut self,
-        _frontier: Epoch,
+        _fence: &SnapshotDeltaFence,
+        _after: Option<OffsetToken>,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
         Ok(SnapshotStream::new(vec![]))
@@ -118,6 +120,141 @@ async fn seeded_competing_owners_commit_one_fenced_token_per_epoch() {
         )
     );
     rockstream_sim::buggify::buggify_disable();
+}
+
+#[tokio::test]
+async fn backfill_fence_simruntime_restarts_preserve_exactly_once() {
+    for seed in [0x52_01_u64, 0x52_02, 0x52_03] {
+        rockstream_sim::buggify::buggify_init(seed);
+        let _snapshot_capture = rockstream_sim::buggify!("backfill.snapshot_capture", 1.0);
+        let _m3_prepare = rockstream_sim::buggify!("backfill.m3_prepare", 1.0);
+        let _interleave_drain = rockstream_sim::buggify!("backfill.interleave_drain", 1.0);
+        let _publish = rockstream_sim::buggify!("backfill.publish", 1.0);
+        let connector_id = ConnectorId(5201);
+        let db = Arc::new(
+            ShardDb::builder(
+                format!("backfill-fence-sim-{seed}"),
+                Arc::new(InMemory::new()),
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let store = SourceCheckpointStore::new(db.clone(), 0, connector_id);
+        let fence = SnapshotDeltaFence::new(
+            OffsetToken::new(b"snapshot-at-2".to_vec()),
+            OffsetToken::new(b"live-at-2".to_vec()),
+        );
+        let records = [b"snapshot-1".as_slice(), b"snapshot-2", b"live-3"];
+        let mut coordinator = SourceRuntimeCoordinator::new(
+            RecordingSource {
+                acknowledgements: vec![],
+            },
+            connector_id,
+            OffsetToken::new(vec![]),
+            store.clone(),
+        );
+        coordinator.recover().await.unwrap();
+        let mut owner = coordinator.acquire_owner("worker-a").unwrap();
+
+        for (index, record) in records.into_iter().enumerate() {
+            let epoch = index as u64 + 1;
+            let cursor = BackfillCursor::new("orders_mv", 0, record.to_vec(), fence.clone(), epoch);
+            let phase = if epoch == 1 {
+                BackfillPhase::Snapshotting
+            } else if epoch == 2 {
+                BackfillPhase::CatchingUp
+            } else {
+                BackfillPhase::Running
+            };
+            let lifecycle = BackfillLifecycle::new(
+                phase,
+                cursor,
+                (records.len() - index - 1) as u64,
+                records.len() as u64,
+                if epoch == 3 { record.len() as u64 } else { 0 },
+                (epoch == 3).then_some(epoch),
+            );
+            let mut batch = WriteBatch::new();
+            batch.put(format!("view_output/orders_mv/{epoch}").as_bytes(), record);
+            batch.put(&ShardKeyEncoder::frontier_key(), &epoch.to_be_bytes());
+            coordinator
+                .commit_backfill_epoch(
+                    &owner,
+                    epoch,
+                    OffsetToken::new(format!("offset-{epoch}").into_bytes()),
+                    lifecycle,
+                    batch,
+                )
+                .await
+                .unwrap();
+
+            if epoch == 1 || epoch == 2 {
+                let mut recovered = SourceRuntimeCoordinator::new(
+                    RecordingSource {
+                        acknowledgements: vec![],
+                    },
+                    connector_id,
+                    OffsetToken::new(vec![]),
+                    store.clone(),
+                );
+                assert_eq!(
+                    recovered.recover().await.unwrap(),
+                    Some(
+                        SourceCheckpoint::prepared(
+                            connector_id,
+                            epoch,
+                            OffsetToken::new(format!("offset-{epoch}").into_bytes()),
+                        )
+                        .committed()
+                    )
+                );
+                owner = recovered.acquire_owner("worker-b").unwrap();
+                coordinator = recovered;
+            }
+        }
+
+        let output = db
+            .scan_prefix(b"view_output/orders_mv/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, value)| value.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (
+                output,
+                store
+                    .backfill_lifecycle("orders_mv")
+                    .await
+                    .unwrap(),
+                db.get(&ShardKeyEncoder::frontier_key())
+                    .await
+                    .unwrap()
+                    .map(|bytes| bytes.to_vec()),
+            ),
+            (
+                records.into_iter().map(Vec::from).collect::<Vec<_>>(),
+                Some(BackfillLifecycle::new(
+                    BackfillPhase::Running,
+                    BackfillCursor::new(
+                        "orders_mv",
+                        0,
+                        b"live-3".to_vec(),
+                        fence,
+                        3,
+                    ),
+                    0,
+                    3,
+                    b"live-3".len() as u64,
+                    Some(3),
+                )),
+                Some(3_u64.to_be_bytes().to_vec()),
+            ),
+            "seed={seed}: a committed cursor must resume without replaying snapshot or delta output"
+        );
+        rockstream_sim::buggify::buggify_disable();
+    }
 }
 
 #[tokio::test]

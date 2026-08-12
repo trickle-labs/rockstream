@@ -382,12 +382,16 @@ type JoinSideCompilation = (
 fn pack_utf8_columns(
     stages: &mut Vec<Stage>,
     schema: &SchemaRef,
+    shared_packers: &HashMap<usize, Arc<Utf8ColumnPacker>>,
 ) -> (SchemaRef, Vec<(usize, Arc<Utf8ColumnPacker>)>) {
     let mut utf8_packers = Vec::new();
     let mut int64_fields = Vec::new();
     for (i, field) in schema.fields().iter().enumerate() {
         if field.data_type() == &DataType::Utf8 {
-            let packer = Arc::new(Utf8ColumnPacker::new());
+            let packer = shared_packers
+                .get(&i)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Utf8ColumnPacker::new()));
             stages.push(Stage::Utf8ColumnPack(
                 packer.clone(),
                 i,
@@ -423,6 +427,7 @@ fn unpack_utf8_columns(
 fn compile_join_side(
     node: &PlanNode,
     table_schemas: &HashMap<String, SchemaRef>,
+    shared_packers: &HashMap<usize, Arc<Utf8ColumnPacker>>,
 ) -> Result<JoinSideCompilation, OpError> {
     let table_name = find_source_name(node).ok_or_else(|| {
         OpError::unsupported_plan_node(
@@ -434,7 +439,7 @@ fn compile_join_side(
         .cloned()
         .unwrap_or_else(|| Arc::new(Schema::empty()));
     let (mut stages, out_schema) = compile_node(node, &schema)?;
-    let (packed_schema, utf8_packers) = pack_utf8_columns(&mut stages, &out_schema);
+    let (packed_schema, utf8_packers) = pack_utf8_columns(&mut stages, &out_schema, shared_packers);
     Ok((stages, packed_schema, table_name, utf8_packers))
 }
 
@@ -460,9 +465,19 @@ fn try_compile_join_shape(
             ..
         } => {
             let (left_pre, left_schema, left_source, left_utf8) =
-                compile_join_side(left, table_schemas)?;
+                compile_join_side(left, table_schemas, &HashMap::new())?;
+            let shared_right_packers = left_keys
+                .iter()
+                .zip(right_keys)
+                .filter_map(|(left_key, right_key)| {
+                    left_utf8
+                        .iter()
+                        .find(|(index, _)| index == left_key)
+                        .map(|(_, packer)| (*right_key, packer.clone()))
+                })
+                .collect();
             let (right_pre, right_schema, right_source, right_utf8) =
-                compile_join_side(right, table_schemas)?;
+                compile_join_side(right, table_schemas, &shared_right_packers)?;
             if !schema_all_int64(&left_schema) || !schema_all_int64(&right_schema) {
                 return Err(OpError::unsupported_plan_node(
                     "InnerJoin over a non-Int64-only side schema (JoinOp only supports Int64 columns)",
@@ -498,9 +513,19 @@ fn try_compile_join_shape(
             ..
         } => {
             let (left_pre, left_schema, left_source, left_utf8) =
-                compile_join_side(left, table_schemas)?;
+                compile_join_side(left, table_schemas, &HashMap::new())?;
+            let shared_right_packers = left_keys
+                .iter()
+                .zip(right_keys)
+                .filter_map(|(left_key, right_key)| {
+                    left_utf8
+                        .iter()
+                        .find(|(index, _)| index == left_key)
+                        .map(|(_, packer)| (*right_key, packer.clone()))
+                })
+                .collect();
             let (right_pre, right_schema, right_source, right_utf8) =
-                compile_join_side(right, table_schemas)?;
+                compile_join_side(right, table_schemas, &shared_right_packers)?;
             if !schema_all_int64(&left_schema) || !schema_all_int64(&right_schema) {
                 return Err(OpError::unsupported_plan_node(
                     "OuterJoin over a non-Int64-only side schema (OuterJoinOp only supports Int64 columns)",
@@ -910,7 +935,8 @@ fn compile_node(
             // not the time column, not part of any arithmetic) is packed
             // into an `Int64` surrogate — `TumbleWindowOp` itself only ever
             // sees `Int64` columns, same as `JoinOp`'s side inputs.
-            let (packed_schema, utf8_packers) = pack_utf8_columns(&mut stages, &in_schema);
+            let (packed_schema, utf8_packers) =
+                pack_utf8_columns(&mut stages, &in_schema, &HashMap::new());
             if !schema_all_int64(&packed_schema) {
                 return Err(OpError::unsupported_plan_node(
                     "TumbleWindow over a non-Int64/Utf8 input schema (TumbleWindowOp only supports Int64 columns, plus Utf8 passthrough)",
@@ -949,7 +975,8 @@ fn compile_node(
             late_data_policy,
         } => {
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
-            let (packed_schema, utf8_packers) = pack_utf8_columns(&mut stages, &in_schema);
+            let (packed_schema, utf8_packers) =
+                pack_utf8_columns(&mut stages, &in_schema, &HashMap::new());
             if !schema_all_int64(&packed_schema) {
                 return Err(OpError::unsupported_plan_node(
                     "HopWindow over a non-Int64/Utf8 input schema (HopWindowOp only supports Int64 columns, plus Utf8 passthrough)",
@@ -990,19 +1017,34 @@ fn compile_node(
             late_data_policy,
         } => {
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
-            if !schema_all_int64(&in_schema) {
+            let (packed_schema, utf8_packers) =
+                pack_utf8_columns(&mut stages, &in_schema, &HashMap::new());
+            if !schema_all_int64(&packed_schema) {
                 return Err(OpError::unsupported_plan_node(
-                    "SessionWindow over a non-Int64-only input schema (SessionWindowOp only supports Int64 columns)",
+                    "SessionWindow over a non-Int64/Utf8 input schema (SessionWindowOp only supports Int64 columns, plus Utf8 passthrough)",
                 ));
             }
             let op = Arc::new(SessionWindowOp::new(
-                in_schema.clone(),
+                packed_schema.clone(),
                 *time_col,
                 *gap_ms,
                 late_data_policy.clone(),
             ));
             stages.push(Stage::SessionWindow(op, next_stateful_op_id()));
-            Ok((stages, SessionWindowOp::output_schema(&in_schema)))
+            unpack_utf8_columns(&mut stages, 2, utf8_packers);
+            let fields: Vec<Field> = SessionWindowOp::output_schema(&packed_schema)
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    if index < 2 {
+                        field.as_ref().clone()
+                    } else {
+                        in_schema.field(index - 2).clone()
+                    }
+                })
+                .collect();
+            Ok((stages, Arc::new(Schema::new(fields))))
         }
 
         // ── v0.51.4 Slice 4: Window (ROW_NUMBER/sliding aggregates) / TopK ─
@@ -1011,16 +1053,28 @@ fn compile_node(
             window_exprs,
         } => {
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
-            if !schema_all_int64(&in_schema) {
+            let (packed_schema, utf8_packers) =
+                pack_utf8_columns(&mut stages, &in_schema, &HashMap::new());
+            if !schema_all_int64(&packed_schema) {
                 return Err(OpError::unsupported_plan_node(
-                    "Window over a non-Int64-only input schema (WindowOp only supports Int64 columns)",
+                    "Window over a non-Int64/Utf8 input schema (WindowOp only supports Int64 columns, plus Utf8 passthrough)",
                 ));
             }
-            let out_n = in_schema.fields().len() + window_exprs.len();
-            let schema = int64_schema(out_n);
-            let op = Arc::new(WindowOp::new(schema.clone(), window_exprs.clone()));
+            let out_n = packed_schema.fields().len() + window_exprs.len();
+            let packed_out_schema = int64_schema(out_n);
+            let op = Arc::new(WindowOp::new(packed_out_schema, window_exprs.clone()));
             stages.push(Stage::Window(op, next_stateful_op_id()));
-            Ok((stages, schema))
+            unpack_utf8_columns(&mut stages, 0, utf8_packers);
+            let fields: Vec<Field> = in_schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .chain(
+                    (0..window_exprs.len())
+                        .map(|index| Field::new(format!("window_{index}"), DataType::Int64, false)),
+                )
+                .collect();
+            Ok((stages, Arc::new(Schema::new(fields))))
         }
         PlanNode::TopK {
             input,
@@ -1088,14 +1142,6 @@ fn compile_node(
             // is safe here too — `HopWindow`'s date_bin lowering path
             // (`try_lower_hop_window_aggregate`) was not touched by that fix
             // and remains rejected.
-            if group_by.len() > 1 && matches!(input.as_ref(), PlanNode::HopWindow { .. }) {
-                return Err(OpError::unsupported_plan_node(format!(
-                    "Aggregate with {} group-by columns over a HopWindow input \
-                     (composite-key packing over a HopWindow input has a known \
-                     date_bin/timestamp-precision correctness gap, unlike TumbleWindow)",
-                    group_by.len()
-                )));
-            }
             // v0.51.4 Slice 8: multiple aggregates sharing one group-by key
             // (e.g. Nexmark q15's `SUM(...)`, `COUNT(DISTINCT ...)` x2, all
             // `GROUP BY date_bin(...)`) — each aggregate is compiled as an
@@ -1184,6 +1230,13 @@ fn compile_node(
                 Utf8(Arc<Utf8KeyPacker>),
             }
             let packer = if has_real_group_by
+                && n_keys == 1
+                && static_expr_type(&effective_group_by[0], &in_schema) == Some(DataType::Utf8)
+            {
+                let packer = Arc::new(Utf8KeyPacker::new());
+                stages.push(Stage::Utf8KeyPack(packer.clone(), next_stateful_op_id()));
+                KeyPacking::Utf8(packer)
+            } else if has_real_group_by
                 && (n_keys > 1 || !expr_is_int64(&effective_group_by[0], &in_schema))
             {
                 let packer = Arc::new(GroupKeyPacker::new(n_keys));
@@ -1433,6 +1486,85 @@ mod tests {
         // existed after the first. k=2 (new group) emits 1 insert row.
         // Total: 1 + 2 + 1 = 4.
         assert_eq!(out.num_rows(), 4);
+    }
+
+    #[tokio::test]
+    async fn text_group_by_restores_its_surrogate_before_processing_live_rows() {
+        use rockstream_plan::{AggregateExpr, AggregateFunc};
+        use rockstream_storage::WriteBatch;
+
+        let (_dir, db) = make_db().await;
+        let plan = PlanNode::ViewSink {
+            view_name: "text_total".to_string(),
+            pk: vec![0],
+            child: Box::new(PlanNode::Aggregate {
+                input: Box::new(PlanNode::Source {
+                    name: "orders".to_string(),
+                }),
+                group_by: vec![Expr::Column(0)],
+                aggregates: vec![AggregateExpr {
+                    func: AggregateFunc::Sum,
+                    input: Expr::Column(1),
+                    distinct: false,
+                }],
+            }),
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let mut schemas = HashMap::new();
+        schemas.insert("orders".to_string(), schema.clone());
+        let sink_id = OperatorId(700);
+        let first = compile_plan_with_sink_id(&plan, db.clone(), &schemas, sink_id).unwrap();
+        let first_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["alpha"])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        first
+            .pipeline
+            .process(ArrowZSet::new(first_batch, vec![1]))
+            .unwrap();
+        let mut m3 = WriteBatch::new();
+        first.pipeline.append_state(&db, &mut m3).await.unwrap();
+        db.write_batch(m3).await.unwrap();
+
+        let recovered = compile_plan_with_sink_id(&plan, db.clone(), &schemas, sink_id).unwrap();
+        recovered.pipeline.restore(&db).await.unwrap();
+        let live_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["alpha"])),
+                Arc::new(Int64Array::from(vec![5])),
+            ],
+        )
+        .unwrap();
+        let output = recovered
+            .pipeline
+            .process(ArrowZSet::new(live_batch, vec![1]))
+            .unwrap();
+        let keys = output
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let totals = output
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            keys.iter().collect::<Vec<_>>(),
+            vec![Some("alpha"), Some("alpha")]
+        );
+        assert_eq!(totals.values().as_ref(), &[10, 15]);
+        assert_eq!(output.weights, vec![-1, 1]);
     }
 
     #[tokio::test]

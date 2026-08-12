@@ -21,6 +21,61 @@ use rockstream_types::view_lifecycle::ViewState;
 
 use crate::catalog_stubs::CatalogStubs;
 
+/// Independent bounded reservation lane for snapshot/delta backfills. Unlike
+/// ordinary admission it never pauses a running view to make room.
+#[derive(Debug, Default)]
+pub struct BackfillAdmissionController {
+    reserved_bytes: std::sync::Mutex<u64>,
+}
+
+/// Result of a backfill reservation request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackfillAdmissionDecision {
+    Admit,
+    Reject { code: &'static str, reason: String },
+}
+
+impl BackfillAdmissionController {
+    /// Reserve bounded backfill memory without changing normal view state.
+    pub fn reserve(&self, requested_bytes: u64, capacity_bytes: u64) -> BackfillAdmissionDecision {
+        let mut reserved = self.reserved_bytes.lock().unwrap();
+        if requested_bytes > capacity_bytes
+            || reserved.saturating_add(requested_bytes) > capacity_bytes
+        {
+            return BackfillAdmissionDecision::Reject {
+                code: "RS-4021",
+                reason: format!(
+                    "backfill.admission_rejected: requested {requested_bytes} bytes exceeds the available backfill reservation under capacity {capacity_bytes}; next_steps: wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES"
+                ),
+            };
+        }
+        *reserved += requested_bytes;
+        BackfillAdmissionDecision::Admit
+    }
+
+    /// Account bounded live deltas against an admitted reservation.
+    pub fn admit_live_delta(&self, bytes: u64, max_bytes: u64) -> BackfillAdmissionDecision {
+        if bytes > max_bytes {
+            return BackfillAdmissionDecision::Reject {
+                code: "RS-4020",
+                reason: format!(
+                    "backfill.live_delta_buffer_full: live delta buffer is {bytes} bytes, above BACKFILL_LIVE_DELTA_MAX_BYTES={max_bytes}; next_steps: wait for snapshot catch-up before retrying"
+                ),
+            };
+        }
+        BackfillAdmissionDecision::Admit
+    }
+
+    pub fn release(&self, bytes: u64) {
+        let mut reserved = self.reserved_bytes.lock().unwrap();
+        *reserved = reserved.saturating_sub(bytes);
+    }
+
+    pub fn reserved_bytes(&self) -> u64 {
+        *self.reserved_bytes.lock().unwrap()
+    }
+}
+
 /// Outcome of an admission-control decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionDecision {
@@ -235,5 +290,41 @@ mod tests {
         let decision = AdmissionController::evaluate_and_admit(&catalog, "high", 500, 1_000, None);
         assert_eq!(decision, AdmissionDecision::Reject);
         assert_eq!(catalog.view_state("peer_view"), ViewState::Running);
+    }
+
+    #[test]
+    fn backfill_budget_rejects_without_degrading_running_view() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        reset_all();
+        let catalog = CatalogStubs::new();
+        catalog.add_workload(WorkloadDef::new("fast").with_priority(WorkloadPriority::HIGH));
+        add_workload_view(&catalog, "fast", "running_view", 900);
+        let admission = BackfillAdmissionController::default();
+
+        assert_eq!(
+            admission.reserve(900, 1_000),
+            BackfillAdmissionDecision::Admit
+        );
+        assert_eq!(
+            admission.reserve(200, 1_000),
+            BackfillAdmissionDecision::Reject {
+                code: "RS-4021",
+                reason: "backfill.admission_rejected: requested 200 bytes exceeds the available backfill reservation under capacity 1000; next_steps: wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES".to_string(),
+            }
+        );
+        assert_eq!(catalog.view_state("running_view"), ViewState::Running);
+        assert_eq!(admission.reserved_bytes(), 900);
+    }
+
+    #[test]
+    fn full_live_delta_buffer_returns_rs4020() {
+        let admission = BackfillAdmissionController::default();
+        assert_eq!(
+            admission.admit_live_delta(101, 100),
+            BackfillAdmissionDecision::Reject {
+                code: "RS-4020",
+                reason: "backfill.live_delta_buffer_full: live delta buffer is 101 bytes, above BACKFILL_LIVE_DELTA_MAX_BYTES=100; next_steps: wait for snapshot catch-up before retrying".to_string(),
+            }
+        );
     }
 }

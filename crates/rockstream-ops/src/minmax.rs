@@ -485,7 +485,11 @@ impl Operator for MinMaxOp {
 /// 1. Scan all existing multiset entries for `op_id`.
 /// 2. Delete entries whose sort_key is no longer in live state.
 /// 3. Write all live multiset entries and extremum cache entries.
-pub async fn persist_minmax_state(db: &ShardDb, op: &MinMaxOp) -> Result<(), OpError> {
+pub async fn append_minmax_state(
+    db: &ShardDb,
+    op: &MinMaxOp,
+    target: &mut WriteBatch,
+) -> Result<(), OpError> {
     let multiset_prefix = ShardKeyEncoder::minmax_operator_prefix(op.op_id.0);
     let extremum_prefix = ShardKeyEncoder::minmax_extremum_op_prefix(op.op_id.0);
 
@@ -541,8 +545,16 @@ pub async fn persist_minmax_state(db: &ShardDb, op: &MinMaxOp) -> Result<(), OpE
         // Lock released here.
     };
 
-    if !wb.is_empty() {
-        db.write_batch(wb).await.map_err(OpError::storage)?;
+    target.merge_from(wb);
+    Ok(())
+}
+
+/// Persist MIN/MAX state as one standalone batch for legacy callers.
+pub async fn persist_minmax_state(db: &ShardDb, op: &MinMaxOp) -> Result<(), OpError> {
+    let mut batch = WriteBatch::new();
+    append_minmax_state(db, op, &mut batch).await?;
+    if !batch.is_empty() {
+        db.write_batch(batch).await.map_err(OpError::storage)?;
     }
     Ok(())
 }

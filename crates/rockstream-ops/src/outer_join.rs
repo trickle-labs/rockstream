@@ -30,14 +30,19 @@ use rockstream_storage::{JoinSide, ShardDb, ShardKeyEncoder, WriteBatch};
 use rockstream_types::ids::OperatorId;
 
 use crate::error::OpError;
-use crate::join::{concat_zsets, join_output_schema_n, stable_row_id};
+use crate::join::{concat_zsets, stable_row_id};
 use crate::zset::ArrowZSet;
 
 // ─── Schema ──────────────────────────────────────────────────────────────────
 
 /// Output schema for outer join (LEFT/RIGHT/FULL): left + right columns (nullable).
 pub fn outer_join_output_schema_n(left_n_cols: usize, right_n_cols: usize) -> SchemaRef {
-    join_output_schema_n(left_n_cols, right_n_cols)
+    Arc::new(Schema::new(
+        (0..left_n_cols)
+            .map(|i| Field::new(format!("l_{i}"), DataType::Int64, true))
+            .chain((0..right_n_cols).map(|i| Field::new(format!("r_{i}"), DataType::Int64, true)))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// Output schema for semi/anti join: left columns only.
@@ -273,13 +278,23 @@ impl OuterJoinOp {
         left_row_vals: &[Vec<i64>],
         right_row_vals: &[Vec<i64>],
         schema: &SchemaRef,
+        left_is_null: bool,
+        right_is_null: bool,
     ) -> Result<RecordBatch, OpError> {
         let mut cols: Vec<ArrayRef> = Vec::new();
         for col in left_row_vals {
-            cols.push(Arc::new(Int64Array::from(col.clone())) as ArrayRef);
+            let values = col
+                .iter()
+                .map(|value| (!left_is_null).then_some(*value))
+                .collect::<Vec<_>>();
+            cols.push(Arc::new(Int64Array::from(values)) as ArrayRef);
         }
         for col in right_row_vals {
-            cols.push(Arc::new(Int64Array::from(col.clone())) as ArrayRef);
+            let values = col
+                .iter()
+                .map(|value| (!right_is_null).then_some(*value))
+                .collect::<Vec<_>>();
+            cols.push(Arc::new(Int64Array::from(values)) as ArrayRef);
         }
         RecordBatch::try_new(Arc::clone(schema), cols).map_err(OpError::arrow)
     }
@@ -407,8 +422,13 @@ impl OuterJoinOp {
                 }
             }
             if !null_pad_rows.2.is_empty() {
-                let batch =
-                    Self::make_output_batch(&null_pad_rows.0, &null_pad_rows.1, &out_schema)?;
+                let batch = Self::make_output_batch(
+                    &null_pad_rows.0,
+                    &null_pad_rows.1,
+                    &out_schema,
+                    false,
+                    true,
+                )?;
                 outputs.push(ArrowZSet::new(batch, null_pad_rows.2));
             }
 
@@ -437,8 +457,13 @@ impl OuterJoinOp {
                     }
                 }
                 if !null_new_rows.2.is_empty() {
-                    let batch =
-                        Self::make_output_batch(&null_new_rows.0, &null_new_rows.1, &out_schema)?;
+                    let batch = Self::make_output_batch(
+                        &null_new_rows.0,
+                        &null_new_rows.1,
+                        &out_schema,
+                        false,
+                        true,
+                    )?;
                     outputs.push(ArrowZSet::new(batch, null_new_rows.2));
                 }
             }
@@ -515,8 +540,13 @@ impl OuterJoinOp {
                 }
             }
             if !null_pad_rows.2.is_empty() {
-                let batch =
-                    Self::make_output_batch(&null_pad_rows.0, &null_pad_rows.1, &out_schema)?;
+                let batch = Self::make_output_batch(
+                    &null_pad_rows.0,
+                    &null_pad_rows.1,
+                    &out_schema,
+                    true,
+                    false,
+                )?;
                 outputs.push(ArrowZSet::new(batch, null_pad_rows.2));
             }
 
@@ -545,8 +575,13 @@ impl OuterJoinOp {
                     }
                 }
                 if !null_new_rows.2.is_empty() {
-                    let batch =
-                        Self::make_output_batch(&null_new_rows.0, &null_new_rows.1, &out_schema)?;
+                    let batch = Self::make_output_batch(
+                        &null_new_rows.0,
+                        &null_new_rows.1,
+                        &out_schema,
+                        true,
+                        false,
+                    )?;
                     outputs.push(ArrowZSet::new(batch, null_new_rows.2));
                 }
             }
@@ -631,8 +666,13 @@ impl OuterJoinOp {
                 }
             }
             if !null_pad_left.2.is_empty() {
-                let batch =
-                    Self::make_output_batch(&null_pad_left.0, &null_pad_left.1, &out_schema)?;
+                let batch = Self::make_output_batch(
+                    &null_pad_left.0,
+                    &null_pad_left.1,
+                    &out_schema,
+                    false,
+                    true,
+                )?;
                 outputs.push(ArrowZSet::new(batch, null_pad_left.2));
             }
 
@@ -663,8 +703,13 @@ impl OuterJoinOp {
                 }
             }
             if !null_pad_right.2.is_empty() {
-                let batch =
-                    Self::make_output_batch(&null_pad_right.0, &null_pad_right.1, &out_schema)?;
+                let batch = Self::make_output_batch(
+                    &null_pad_right.0,
+                    &null_pad_right.1,
+                    &out_schema,
+                    true,
+                    false,
+                )?;
                 outputs.push(ArrowZSet::new(batch, null_pad_right.2));
             }
 
@@ -693,8 +738,13 @@ impl OuterJoinOp {
                     }
                 }
                 if !null_new_left.2.is_empty() {
-                    let batch =
-                        Self::make_output_batch(&null_new_left.0, &null_new_left.1, &out_schema)?;
+                    let batch = Self::make_output_batch(
+                        &null_new_left.0,
+                        &null_new_left.1,
+                        &out_schema,
+                        false,
+                        true,
+                    )?;
                     outputs.push(ArrowZSet::new(batch, null_new_left.2));
                 }
             }
@@ -724,8 +774,13 @@ impl OuterJoinOp {
                     }
                 }
                 if !null_new_right.2.is_empty() {
-                    let batch =
-                        Self::make_output_batch(&null_new_right.0, &null_new_right.1, &out_schema)?;
+                    let batch = Self::make_output_batch(
+                        &null_new_right.0,
+                        &null_new_right.1,
+                        &out_schema,
+                        true,
+                        false,
+                    )?;
                     outputs.push(ArrowZSet::new(batch, null_new_right.2));
                 }
             }
@@ -946,7 +1001,7 @@ impl OuterJoinOp {
             }
         }
 
-        let batch = Self::make_output_batch(&left_cols, &right_cols, out_schema)?;
+        let batch = Self::make_output_batch(&left_cols, &right_cols, out_schema, false, false)?;
         Ok(ArrowZSet::new(batch, out_weights))
     }
 
@@ -1043,7 +1098,7 @@ impl OuterJoinOp {
     /// Persist the arrangement state and match-count state to a `ShardDb`.
     ///
     /// Uses only point puts — no range deletion.
-    pub async fn persist_state(&self, db: &ShardDb) -> Result<(), OpError> {
+    pub fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
         let mut batch = WriteBatch::new();
 
         {
@@ -1104,10 +1159,17 @@ impl OuterJoinOp {
             }
         }
 
-        if batch.is_empty() {
-            return Ok(());
+        target.merge_from(batch);
+        Ok(())
+    }
+
+    pub async fn persist_state(&self, db: &ShardDb) -> Result<(), OpError> {
+        let mut batch = WriteBatch::new();
+        self.append_state(&mut batch)?;
+        if !batch.is_empty() {
+            db.write_batch(batch).await.map_err(OpError::storage)?;
         }
-        db.write_batch(batch).await.map_err(OpError::storage)
+        Ok(())
     }
 
     /// Load arrangement state and match-count state from a `ShardDb` (crash-replay).

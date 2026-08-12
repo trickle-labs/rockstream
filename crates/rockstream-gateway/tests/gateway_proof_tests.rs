@@ -75,10 +75,12 @@ async fn connect_port(port: u16) -> tokio_postgres::Client {
     client
 }
 
+#[allow(dead_code)]
 fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 
+#[allow(dead_code)]
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = HmacSha256::new_from_slice(key).unwrap();
@@ -86,6 +88,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+#[allow(dead_code)]
 fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let sod = secs % 86400;
     let mut days = (secs / 86400) as u32;
@@ -129,6 +132,7 @@ fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     (year, month + 1, days + 1, h, m, s)
 }
 
+#[allow(dead_code)]
 async fn create_minio_bucket(port: u16, bucket: &str) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

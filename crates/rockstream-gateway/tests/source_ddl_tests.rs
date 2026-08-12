@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio_postgres::NoTls;
 
 use rockstream_gateway::{
-    catalog_stubs::CatalogStubs,
+    catalog_stubs::{CatalogStubs, CatalogView},
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
@@ -25,6 +25,141 @@ impl ViewReader for NoopViewReader {
     fn published_frontier(&self) -> Option<u64> {
         None
     }
+}
+
+async fn simple_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|index| row.get(index).map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn show_backfill_status_pgwire_reachable() {
+    let catalog = CatalogStubs::new();
+    catalog.add_view(CatalogView {
+        name: "orders_mv".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    catalog.begin_backfill("orders_mv", 12);
+    catalog.catch_up_backfill("orders_mv", Some("partition=0,key=42".to_string()));
+    let (addr, _handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+
+    assert_eq!(
+        simple_rows(
+            &client,
+            "SHOW BACKFILL STATUS FOR MATERIALIZED VIEW orders_mv",
+        )
+        .await,
+        vec![vec![
+            Some("orders_mv".to_string()),
+            Some("CATCHING_UP".to_string()),
+            Some("partition=0,key=42".to_string()),
+            Some("0".to_string()),
+            Some("12".to_string()),
+            Some("ADMITTED".to_string()),
+            None,
+        ]]
+    );
+
+    let error = client
+        .query("SELECT * FROM orders_mv", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "[RS-4022] backfill.not_published: materialized view 'orders_mv' is not published yet. Next steps: run SHOW BACKFILL STATUS FOR MATERIALIZED VIEW orders_mv and retry when phase is RUNNING."
+    );
+}
+
+#[tokio::test]
+async fn backfill_publication_gate_blocks_partial_relation() {
+    let catalog = CatalogStubs::new();
+    catalog.add_view(CatalogView {
+        name: "orders_mv".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    catalog.begin_backfill("orders_mv", 12);
+    let (addr, _handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+
+    let error = client
+        .query("SELECT * FROM orders_mv", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "[RS-4022] backfill.not_published: materialized view 'orders_mv' is not published yet. Next steps: run SHOW BACKFILL STATUS FOR MATERIALIZED VIEW orders_mv and retry when phase is RUNNING."
+    );
+}
+
+#[tokio::test]
+async fn show_backfill_status_rejects_missing_name_with_rs2001() {
+    let (addr, _handle) = start_gateway(CatalogStubs::new()).await;
+    let client = connect(&addr).await;
+    let error = client.query("SHOW BACKFILL STATUS", &[]).await.unwrap_err();
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name."
+    );
+}
+
+#[tokio::test]
+async fn show_backfill_status_unknown_view_returns_rs4022() {
+    let (addr, _handle) = start_gateway(CatalogStubs::new()).await;
+    let client = connect(&addr).await;
+    let error = client
+        .query("SHOW BACKFILL STATUS FOR MATERIALIZED VIEW missing_mv", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "[RS-4022] backfill.not_published: materialized view 'missing_mv' does not exist. Next steps: run CREATE MATERIALIZED VIEW missing_mv AS SELECT ... first."
+    );
+}
+
+#[tokio::test]
+async fn show_backfill_status_reports_exact_phase_cursor_remaining_and_estimate() {
+    let (addr, _handle) = start_gateway(CatalogStubs::new()).await;
+    let client = connect(&addr).await;
+    client
+        .execute("CREATE MATERIALIZED VIEW orders_mv AS SELECT 1 AS id", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        simple_rows(
+            &client,
+            "SHOW BACKFILL STATUS FOR MATERIALIZED VIEW orders_mv",
+        )
+        .await,
+        vec![vec![
+            Some("orders_mv".to_string()),
+            Some("RUNNING".to_string()),
+            None,
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("ADMITTED".to_string()),
+            None,
+        ]]
+    );
 }
 
 async fn start_gateway(catalog: CatalogStubs) -> (String, tokio::task::JoinHandle<()>) {
@@ -144,6 +279,49 @@ async fn test_create_alter_show_sources_e2e() {
     assert_eq!(after_drop_rows.len(), 1);
     let remaining_name: String = after_drop_rows[0].get(0);
     assert_eq!(remaining_name, "kafka_src");
+}
+
+#[tokio::test]
+async fn create_source_binds_same_named_existing_table_schema() {
+    let catalog = Arc::new(CatalogStubs::new());
+    let server = GatewayServer::with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        catalog.clone(),
+        Arc::new(NoopViewReader),
+    );
+    let (addr, _handle) = server.serve_background().await.unwrap();
+    let client = connect(&addr.to_string()).await;
+
+    client
+        .simple_query("CREATE TABLE orders (id BIGINT, customer TEXT)")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE SOURCE orders TYPE s3 (bucket='orders', prefix='snapshot/') FORMAT json",
+        )
+        .await
+        .unwrap();
+
+    let source = catalog.get_source("orders").unwrap();
+    let table = catalog.source_table("orders").unwrap();
+    assert_eq!(
+        (source.table_name, table.name, table.columns),
+        (
+            Some("orders".to_string()),
+            "orders".to_string(),
+            vec![
+                rockstream_gateway::catalog_stubs::CatalogColumn {
+                    name: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                rockstream_gateway::catalog_stubs::CatalogColumn {
+                    name: "customer".to_string(),
+                    data_type: "Utf8".to_string(),
+                },
+            ],
+        )
+    );
 }
 
 #[tokio::test]

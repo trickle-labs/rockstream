@@ -9,8 +9,8 @@ use arrow::record_batch::RecordBatch;
 use object_store::memory::InMemory;
 use rockstream_connectors::{
     validate_window_watermark, ObjectStoreSink, OffsetToken, PollDeltaResult, SinkConnector,
-    SnapshotStream, SourceConnector, SourceError, SourcePollLifecycle, WatermarkCapability,
-    OBJECT_STORE_SINK_MAX_PENDING_EPOCHS,
+    SnapshotDeltaFence, SnapshotStream, SourceConnector, SourceError, SourcePollLifecycle,
+    WatermarkCapability, OBJECT_STORE_SINK_MAX_PENDING_EPOCHS,
 };
 use rockstream_ops::time_window::TumbleWindowOp;
 use rockstream_ops::zset::ArrowZSet;
@@ -137,7 +137,8 @@ impl SourceConnector for ScriptedSource {
 
     async fn start_snapshot(
         &mut self,
-        _frontier: Epoch,
+        _fence: &SnapshotDeltaFence,
+        _after: Option<OffsetToken>,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
         Ok(SnapshotStream::new(vec![]))
@@ -243,7 +244,7 @@ async fn edge_source_failure_pauses_preserves_offset_and_recovers_exactly_once()
             lifecycle.committed_offset().clone()
         ),
         (
-            "RS-4001: source poll delta failed: temporary broker outage".to_string(),
+            "RS-4004: source poll failed: temporary broker outage".to_string(),
             true,
             before,
         ),

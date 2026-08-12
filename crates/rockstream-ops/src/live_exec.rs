@@ -17,13 +17,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use rockstream_storage::{ShardDb, WriteBatch};
 use rockstream_types::ids::OperatorId;
 
-use crate::aggregate::{persist_agg_state, AggregateOp};
+use crate::aggregate::{append_agg_state, persist_agg_state, AggregateOp};
 use crate::distinct::{persist_distinct_state, DistinctOp};
 use crate::error::OpError;
 use crate::join::JoinOp;
@@ -107,6 +107,54 @@ pub fn with_view_id_scope<T>(view_name: &str, f: impl FnOnce() -> T) -> T {
 /// (distinct from any `ShardPrefix` variant used elsewhere — this table is
 /// local to `rockstream-ops`'s live-exec wiring, not a core shard concept).
 const GROUP_KEY_PACKER_PREFIX: &[u8] = &[0x01, 0x4B, 0x50];
+const UTF8_PACKER_PREFIX: &[u8] = &[0x01, 0x55, 0x50];
+
+fn append_utf8_packer_state(
+    forward: &Mutex<HashMap<String, i64>>,
+    op_id: OperatorId,
+    target: &mut WriteBatch,
+) {
+    let forward = forward.lock().unwrap();
+    for (value, surrogate) in forward.iter() {
+        let mut key = Vec::with_capacity(UTF8_PACKER_PREFIX.len() + 8 + value.len());
+        key.extend_from_slice(UTF8_PACKER_PREFIX);
+        key.extend_from_slice(&op_id.0.to_be_bytes());
+        key.extend_from_slice(value.as_bytes());
+        target.put(&key, &surrogate.to_be_bytes());
+    }
+}
+
+async fn restore_utf8_packer_state(
+    db: &ShardDb,
+    op_id: OperatorId,
+    forward: &Mutex<HashMap<String, i64>>,
+    reverse: &Mutex<HashMap<i64, String>>,
+    next_id: &Mutex<i64>,
+) -> Result<(), OpError> {
+    let mut prefix = Vec::with_capacity(UTF8_PACKER_PREFIX.len() + 8);
+    prefix.extend_from_slice(UTF8_PACKER_PREFIX);
+    prefix.extend_from_slice(&op_id.0.to_be_bytes());
+    let entries = db.scan_prefix(&prefix).await.map_err(OpError::storage)?;
+    let mut forward = forward.lock().unwrap();
+    let mut reverse = reverse.lock().unwrap();
+    let mut max_id = -1;
+    for (key, value) in entries {
+        if value.len() != 8 {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&key[prefix.len()..]) else {
+            continue;
+        };
+        let mut raw = [0; 8];
+        raw.copy_from_slice(&value);
+        let surrogate = i64::from_be_bytes(raw);
+        forward.insert(text.to_string(), surrogate);
+        reverse.insert(surrogate, text.to_string());
+        max_id = max_id.max(surrogate);
+    }
+    *next_id.lock().unwrap() = max_id + 1;
+    Ok(())
+}
 
 pub fn next_stateful_op_id() -> OperatorId {
     let scoped = VIEW_ID_SCOPE.with(|c| match c.get() {
@@ -230,16 +278,51 @@ impl Stage {
             // the same table).
             Stage::KeyPack(packer, id) => packer.persist(db, *id).await,
             Stage::KeyUnpack(_, _) => Ok(()),
-            // Same restart-durability scope note as `KeyPack`/`KeyUnpack`
-            // above: `Utf8KeyPacker`/`Utf8ColumnPacker`'s intern tables are
-            // in-process only.
-            Stage::Utf8KeyPack(_, _) | Stage::Utf8KeyUnpack(_, _) => Ok(()),
-            Stage::Utf8ColumnPack(_, _, _) | Stage::Utf8ColumnUnpack(_, _, _) => Ok(()),
+            Stage::Utf8KeyPack(packer, id) => packer.persist(db, *id).await,
+            Stage::Utf8KeyUnpack(_, _) => Ok(()),
+            Stage::Utf8ColumnPack(packer, _, id) => packer.persist(db, *id).await,
+            Stage::Utf8ColumnUnpack(_, _, _) => Ok(()),
             // `MultiAggregatePipeline::persist` recurses back into
             // `StatefulPipeline::persist` (each lane) → `Stage::persist`,
             // which the compiler can't size without an explicit `Box::pin`
             // indirection somewhere in the cycle.
             Stage::MultiAggregate(op) => Box::pin(op.persist(db)).await,
+        }
+    }
+
+    async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
+        match self {
+            Stage::Stateless(_) => Ok(()),
+            Stage::Aggregate(op) => append_agg_state(db, op, target).await,
+            Stage::MinMax(op, _) => crate::minmax::append_minmax_state(db, op, target).await,
+            Stage::Distinct(op, id) => crate::distinct::append_distinct_state(op, *id, target),
+            Stage::TumbleWindow(op, id) => {
+                crate::time_window::append_tumble_window_state(op, *id, target)
+            }
+            Stage::HopWindow(op, id) => {
+                crate::time_window::append_hop_window_state(op, *id, target)
+            }
+            Stage::SessionWindow(op, id) => {
+                crate::time_window::append_session_window_state(op, *id, target)
+            }
+            Stage::Window(op, id) => crate::window::append_window_state(op, *id, target),
+            Stage::TopK(op, id) => crate::topk::append_topk_state(op, *id, target),
+            Stage::KeyPack(packer, id) => {
+                packer.append_state(*id, target);
+                Ok(())
+            }
+            Stage::KeyUnpack(_, _)
+            | Stage::Utf8KeyUnpack(_, _)
+            | Stage::Utf8ColumnUnpack(_, _, _) => Ok(()),
+            Stage::Utf8KeyPack(packer, id) => {
+                packer.append_state(*id, target);
+                Ok(())
+            }
+            Stage::Utf8ColumnPack(packer, _, id) => {
+                packer.append_state(*id, target);
+                Ok(())
+            }
+            Stage::MultiAggregate(op) => Box::pin(op.append_state(db, target)).await,
         }
     }
 
@@ -264,6 +347,8 @@ impl Stage {
             // `KeyUnpack` stage shares the same `Arc<GroupKeyPacker>`, so
             // restoring once via `KeyPack`'s id is sufficient.
             Stage::KeyPack(packer, id) => packer.restore_in_place(db, *id).await,
+            Stage::Utf8KeyPack(packer, id) => packer.restore_in_place(db, *id).await,
+            Stage::Utf8ColumnPack(packer, _, id) => packer.restore_in_place(db, *id).await,
             Stage::MinMax(op, _) => op.restore_in_place(db).await,
             Stage::MultiAggregate(op) => Box::pin(op.restore_in_place(db)).await,
             _ => Ok(()),
@@ -317,22 +402,24 @@ impl GroupKeyPacker {
     /// be assigned a *new* surrogate id post-restart — silently duplicating
     /// output rows instead of merging into the pre-restart group/session).
     pub async fn persist(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
-        let batch = {
-            let forward = self.forward.lock().unwrap();
-            let mut batch = WriteBatch::new();
-            for (encoded_key, &surrogate) in forward.iter() {
-                let mut key = Vec::with_capacity(3 + 8 + encoded_key.len());
-                key.extend_from_slice(GROUP_KEY_PACKER_PREFIX);
-                key.extend_from_slice(&op_id.0.to_be_bytes());
-                key.extend_from_slice(encoded_key);
-                batch.put(&key, &surrogate.to_be_bytes());
-            }
-            batch
-        };
+        let mut batch = WriteBatch::new();
+        self.append_state(op_id, &mut batch);
         if batch.is_empty() {
             return Ok(());
         }
         db.write_batch(batch).await.map_err(OpError::storage)
+    }
+
+    /// Add the surrogate-key intern table to a caller-owned M3 write.
+    pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
+        let forward = self.forward.lock().unwrap();
+        for (encoded_key, &surrogate) in forward.iter() {
+            let mut key = Vec::with_capacity(3 + 8 + encoded_key.len());
+            key.extend_from_slice(GROUP_KEY_PACKER_PREFIX);
+            key.extend_from_slice(&op_id.0.to_be_bytes());
+            key.extend_from_slice(encoded_key);
+            target.put(&key, &surrogate.to_be_bytes());
+        }
     }
 
     /// Load the persisted surrogate-key intern table from `db` into this
@@ -607,8 +694,6 @@ impl GroupKeyPacker {
 /// `GroupKeyPacker`'s exact-tuple interning technique but for a value-type
 /// mismatch rather than a column-count mismatch (e.g. Nexmark-adjacent
 /// `SELECT url, COUNT(*) FROM clicks GROUP BY url`, `url` being `TEXT`).
-/// Same restart-durability scope note as `GroupKeyPacker`: the intern table
-/// is in-process bookkeeping, not persisted — out of this slice's scope.
 pub struct Utf8KeyPacker {
     forward: Mutex<HashMap<String, i64>>,
     reverse: Mutex<HashMap<i64, String>>,
@@ -627,6 +712,23 @@ impl Utf8KeyPacker {
     /// Number of distinct keys interned so far (fill-level metric).
     pub fn entry_count(&self) -> usize {
         self.forward.lock().unwrap().len()
+    }
+
+    pub async fn persist(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        let mut batch = WriteBatch::new();
+        self.append_state(op_id, &mut batch);
+        if batch.is_empty() {
+            return Ok(());
+        }
+        db.write_batch(batch).await.map_err(OpError::storage)
+    }
+
+    pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
+        append_utf8_packer_state(&self.forward, op_id, target);
+    }
+
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        restore_utf8_packer_state(db, op_id, &self.forward, &self.reverse, &self.next_id).await
     }
 
     fn surrogate_for(&self, key: &str) -> i64 {
@@ -733,8 +835,7 @@ impl Default for Utf8KeyPacker {
 /// E.g. a view-of-view join like `campaigns c JOIN campaign_totals t ON
 /// c.campaign_id = t.campaign_id` where `campaigns.name`/`campaigns.channel`
 /// are `TEXT` and only ever pass through unchanged, never used as a join
-/// key or arithmetic operand. Same restart-durability scope note as
-/// `Utf8KeyPacker`/`GroupKeyPacker`: the intern table is in-process only.
+/// key or arithmetic operand.
 pub struct Utf8ColumnPacker {
     forward: Mutex<HashMap<String, i64>>,
     reverse: Mutex<HashMap<i64, String>>,
@@ -748,6 +849,23 @@ impl Utf8ColumnPacker {
             reverse: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
         }
+    }
+
+    pub async fn persist(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        let mut batch = WriteBatch::new();
+        self.append_state(op_id, &mut batch);
+        if batch.is_empty() {
+            return Ok(());
+        }
+        db.write_batch(batch).await.map_err(OpError::storage)
+    }
+
+    pub fn append_state(&self, op_id: OperatorId, target: &mut WriteBatch) {
+        append_utf8_packer_state(&self.forward, op_id, target);
+    }
+
+    pub async fn restore_in_place(&self, db: &ShardDb, op_id: OperatorId) -> Result<(), OpError> {
+        restore_utf8_packer_state(db, op_id, &self.forward, &self.reverse, &self.next_id).await
     }
 
     fn surrogate_for(&self, key: &str) -> i64 {
@@ -813,8 +931,12 @@ impl Utf8ColumnPacker {
                 OpError::unsupported_plan_node("Utf8ColumnPacker::unpack: column is not Int64")
             })?;
         let reverse = self.reverse.lock().unwrap();
-        let restored: Vec<String> = (0..batch.num_rows())
-            .map(|r| reverse.get(&col.value(r)).cloned().unwrap_or_default())
+        let restored: Vec<Option<String>> = (0..batch.num_rows())
+            .map(|r| {
+                (!col.is_null(r))
+                    .then(|| reverse.get(&col.value(r)).cloned())
+                    .flatten()
+            })
             .collect();
         let mut arrays: Vec<ArrayRef> = batch.columns().to_vec();
         arrays[col_idx] = Arc::new(arrow::array::StringArray::from(restored)) as ArrayRef;
@@ -825,7 +947,7 @@ impl Utf8ColumnPacker {
             .enumerate()
             .map(|(i, f)| {
                 if i == col_idx {
-                    Field::new(f.name(), DataType::Utf8, false)
+                    Field::new(f.name(), DataType::Utf8, f.is_nullable())
                 } else {
                     f.as_ref().clone()
                 }
@@ -888,6 +1010,15 @@ impl StatefulPipeline {
     pub async fn persist(&self, db: &ShardDb) -> Result<(), OpError> {
         for stage in &self.stages {
             stage.persist(db).await?;
+        }
+        Ok(())
+    }
+
+    /// Append state without committing it. Source backfill combines this with
+    /// output, checkpoint, cursor, lifecycle, and frontier in one M3 batch.
+    pub async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
+        for stage in &self.stages {
+            stage.append_state(db, target).await?;
         }
         Ok(())
     }
@@ -1084,6 +1215,16 @@ impl MultiAggregatePipeline {
         Ok(())
     }
 
+    pub async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
+        for lane in &self.lanes {
+            lane.append_state(db, target).await?;
+        }
+        for join in &self.joins {
+            join.append_state(target)?;
+        }
+        Ok(())
+    }
+
     pub async fn restore_in_place(&self, db: &ShardDb) -> Result<(), OpError> {
         for lane in &self.lanes {
             lane.restore(db).await?;
@@ -1114,6 +1255,13 @@ impl JoinKind {
         match self {
             JoinKind::Inner(op) => op.persist_state(db).await,
             JoinKind::Outer(op) => op.persist_state(db).await,
+        }
+    }
+
+    fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
+        match self {
+            JoinKind::Inner(op) => op.append_state(target),
+            JoinKind::Outer(op) => op.append_state(target),
         }
     }
 
@@ -1207,6 +1355,19 @@ impl JoinPipeline {
         }
         for stage in &self.post {
             stage.persist(db).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
+        self.join.append_state(target)?;
+        for stage in self
+            .left_pre
+            .iter()
+            .chain(&self.right_pre)
+            .chain(&self.post)
+        {
+            stage.append_state(db, target).await?;
         }
         Ok(())
     }
@@ -1328,6 +1489,63 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(keys.values().as_ref(), &[2, 0]);
+    }
+
+    #[tokio::test]
+    async fn utf8_packer_state_restores_from_the_caller_owned_batch() {
+        let (_dir, db) = make_db().await;
+        let op_id = OperatorId(43);
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["beta", "alpha"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let original = Utf8KeyPacker::new();
+        original.pack(ArrowZSet::new(source, vec![1, 1])).unwrap();
+        let mut m3 = WriteBatch::new();
+        original.append_state(op_id, &mut m3);
+        db.write_batch(m3).await.unwrap();
+
+        let restored = Utf8KeyPacker::new();
+        restored.restore_in_place(&db, op_id).await.unwrap();
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["alpha", "gamma"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let packed = restored.pack(ArrowZSet::new(source, vec![1, 1])).unwrap();
+        let keys = packed
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(keys.values().as_ref(), &[1, 2]);
+
+        let unpacked = restored.unpack(packed).unwrap();
+        let keys = unpacked
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(
+            keys.iter().collect::<Vec<_>>(),
+            vec![Some("alpha"), Some("gamma")]
+        );
+        assert_eq!(unpacked.weights, vec![1, 1]);
     }
 
     /// Regression test for a v0.51.4 fix: `TumbleWindowOp` used to drop

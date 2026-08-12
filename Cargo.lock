@@ -6586,6 +6586,7 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -6670,6 +6671,7 @@ dependencies = [
  "proptest",
  "rand 0.8.6",
  "rcgen",
+ "rdkafka",
  "reqwest 0.12.28",
  "rockstream-connectors",
  "rockstream-control",

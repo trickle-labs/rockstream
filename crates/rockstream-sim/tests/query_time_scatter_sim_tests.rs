@@ -76,7 +76,7 @@ async fn start_gateway(
 
 #[tokio::test]
 async fn scatter_frontier_buggify_preserves_complete_exact_result() {
-    for seed in [0x51_13_0001u64, 0x51_13_0002, 0x51_13_0003] {
+    for seed in [0x5113_0001_u64, 0x5113_0002, 0x5113_0003] {
         let runtime = SimRuntime::new(seed);
         buggify_init(seed);
         assert!(buggify!("query_time_scatter.before_reader_selection", 1.0));

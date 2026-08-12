@@ -44,6 +44,102 @@ impl OffsetToken {
     }
 }
 
+/// The immutable boundary between a source snapshot and its live delta.
+/// Adapters capture both tokens before polling live records; the fence travels
+/// in the same M3 batch as the cursor that consumes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDeltaFence {
+    pub version: u16,
+    pub snapshot: OffsetToken,
+    pub live: OffsetToken,
+}
+
+impl SnapshotDeltaFence {
+    pub fn new(snapshot: OffsetToken, live: OffsetToken) -> Self {
+        Self {
+            version: 1,
+            snapshot,
+            live,
+        }
+    }
+}
+
+/// Durable restart point for one view/source-partition backfill stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillCursor {
+    pub version: u16,
+    pub view_name: String,
+    pub partition_id: u64,
+    pub last_key: Vec<u8>,
+    pub fence: SnapshotDeltaFence,
+    pub committed_epoch: Epoch,
+}
+
+/// Durable phase for a source-backed materialized-view backfill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackfillPhase {
+    Snapshotting,
+    CatchingUp,
+    Running,
+    Blocked,
+}
+
+/// Durable lifecycle record written in the same M3 batch as its cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillLifecycle {
+    pub version: u16,
+    pub view_name: String,
+    pub phase: BackfillPhase,
+    pub cursor: BackfillCursor,
+    pub rows_remaining: u64,
+    pub estimated_rows: u64,
+    pub live_delta_bytes: u64,
+    pub published_frontier: Option<Epoch>,
+    pub blocked_reason: Option<String>,
+}
+
+impl BackfillLifecycle {
+    pub fn new(
+        phase: BackfillPhase,
+        cursor: BackfillCursor,
+        rows_remaining: u64,
+        estimated_rows: u64,
+        live_delta_bytes: u64,
+        published_frontier: Option<Epoch>,
+    ) -> Self {
+        Self {
+            version: 1,
+            view_name: cursor.view_name.clone(),
+            phase,
+            cursor,
+            rows_remaining,
+            estimated_rows,
+            live_delta_bytes,
+            published_frontier,
+            blocked_reason: None,
+        }
+    }
+}
+
+impl BackfillCursor {
+    pub fn new(
+        view_name: impl Into<String>,
+        partition_id: u64,
+        last_key: Vec<u8>,
+        fence: SnapshotDeltaFence,
+        committed_epoch: Epoch,
+    ) -> Self {
+        Self {
+            version: 1,
+            view_name: view_name.into(),
+            partition_id,
+            last_key,
+            fence,
+            committed_epoch,
+        }
+    }
+}
+
 // ─── SourceEpochEntry ─────────────────────────────────────────────────────────
 
 /// One committed entry in the epoch map.
@@ -168,6 +264,11 @@ impl SourceCheckpointStore {
         }
     }
 
+    /// Shared shard store used by the source M3 transaction.
+    pub fn db(&self) -> Arc<ShardDb> {
+        Arc::clone(&self.db)
+    }
+
     fn prefix(&self, state: SourceCheckpointState) -> Vec<u8> {
         let state: &[u8] = match state {
             SourceCheckpointState::Prepared => b"source_checkpoint/prepared/",
@@ -191,6 +292,104 @@ impl SourceCheckpointStore {
 
     fn encode(checkpoint: &SourceCheckpoint) -> Result<Vec<u8>, StorageError> {
         serde_json::to_vec(checkpoint).map_err(|error| StorageError::KeyEncoding(error.to_string()))
+    }
+
+    fn cursor_key(&self, view_name: &str, partition_id: u64) -> Vec<u8> {
+        let mut key = self.cursor_prefix();
+        key.extend_from_slice(view_name.as_bytes());
+        key.push(0);
+        key.extend_from_slice(&partition_id.to_be_bytes());
+        key
+    }
+
+    fn cursor_prefix(&self) -> Vec<u8> {
+        CatalogKeyEncoder::encode_with_suffix(
+            CatalogType::Connector,
+            self.namespace_id,
+            self.connector_id.0 as u128,
+            b"backfill_cursor/",
+        )
+    }
+
+    fn lifecycle_key(&self, view_name: &str) -> Vec<u8> {
+        let mut key = self.cursor_prefix();
+        key.extend_from_slice(b"lifecycle/");
+        key.extend_from_slice(view_name.as_bytes());
+        key
+    }
+
+    /// Add a cursor to the caller's M3 batch. The cursor is not recoverable
+    /// unless its corresponding source checkpoint and output are committed.
+    pub fn append_backfill_cursor(
+        &self,
+        batch: &mut WriteBatch,
+        cursor: &BackfillCursor,
+    ) -> Result<(), StorageError> {
+        if cursor.version != 1 || cursor.view_name.is_empty() {
+            return Err(StorageError::KeyEncoding(
+                "RS-4019: backfill.cursor_limit_exceeded: invalid cursor; next_steps: recreate the materialized view".to_string(),
+            ));
+        }
+        batch.put(
+            &self.cursor_key(&cursor.view_name, cursor.partition_id),
+            &serde_json::to_vec(cursor)
+                .map_err(|error| StorageError::KeyEncoding(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    /// Recover one committed cursor. A cursor is only written through M3.
+    pub async fn backfill_cursor(
+        &self,
+        view_name: &str,
+        partition_id: u64,
+    ) -> Result<Option<BackfillCursor>, StorageError> {
+        self.db
+            .get(&self.cursor_key(view_name, partition_id))
+            .await?
+            .map(|value| {
+                serde_json::from_slice(&value)
+                    .map_err(|error| StorageError::KeyEncoding(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Add lifecycle metadata to the caller's M3 batch with its cursor.
+    pub fn append_backfill_lifecycle(
+        &self,
+        batch: &mut WriteBatch,
+        lifecycle: &BackfillLifecycle,
+    ) -> Result<(), StorageError> {
+        if lifecycle.version != 1
+            || lifecycle.view_name.is_empty()
+            || lifecycle.view_name != lifecycle.cursor.view_name
+        {
+            return Err(StorageError::KeyEncoding(
+                "RS-4019: backfill.cursor_limit_exceeded: invalid lifecycle; next_steps: recreate the materialized view".to_string(),
+            ));
+        }
+        self.append_backfill_cursor(batch, &lifecycle.cursor)?;
+        batch.put(
+            &self.lifecycle_key(&lifecycle.view_name),
+            &serde_json::to_vec(lifecycle)
+                .map_err(|error| StorageError::KeyEncoding(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    /// Recover the last atomically committed lifecycle record for a view.
+    pub async fn backfill_lifecycle(
+        &self,
+        view_name: &str,
+    ) -> Result<Option<BackfillLifecycle>, StorageError> {
+        self.db
+            .get(&self.lifecycle_key(view_name))
+            .await?
+            .map(|value| {
+                serde_json::from_slice(&value)
+                    .map_err(|error| StorageError::KeyEncoding(error.to_string()))
+            })
+            .transpose()
     }
 
     /// Persist a prepared record before the M3 input commit starts.
@@ -306,6 +505,23 @@ impl SourceCheckpointStore {
                 removed += records.len();
                 self.cleanup_scan_pages.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        loop {
+            let (records, _) = self
+                .db
+                .scan_prefix_bounded(&self.cursor_prefix(), SOURCE_CLEANUP_SCAN_PAGE_LIMIT)
+                .await?;
+            if records.is_empty() {
+                break;
+            }
+            let mut batch = WriteBatch::new();
+            for (key, _) in &records {
+                batch.delete(key);
+            }
+            self.db.write_batch(batch).await?;
+            self.db.flush().await?;
+            removed += records.len();
+            self.cleanup_scan_pages.fetch_add(1, Ordering::Relaxed);
         }
         Ok(removed)
     }
@@ -545,6 +761,37 @@ mod tests {
             reg.prepare_commit(BTreeMap::new()).unwrap_err().to_string(),
             "RS-4018: source epoch exhausted for connector connector-8; next_steps: create a new connector before retrying"
         );
+    }
+
+    proptest! {
+        #[test]
+        fn snapshot_delta_fence_property_exactly_once_under_restarts(
+            snapshot_len in 0usize..32,
+            live_len in 0usize..32,
+            restart_points in proptest::collection::vec(0usize..64, 0..8),
+        ) {
+            let fence = SnapshotDeltaFence::new(
+                OffsetToken::new(snapshot_len.to_be_bytes().to_vec()),
+                OffsetToken::new(live_len.to_be_bytes().to_vec()),
+            );
+            let expected: Vec<usize> = (0..snapshot_len + live_len).collect();
+            let mut pending_restarts: std::collections::BTreeSet<_> =
+                restart_points.into_iter().collect();
+            let mut delivered = Vec::new();
+            let mut committed_cursor = 0;
+            while committed_cursor < expected.len() {
+                if pending_restarts.remove(&committed_cursor) {
+                    prop_assert_eq!(fence.version, 1);
+                    continue;
+                }
+                delivered.push(expected[committed_cursor]);
+                committed_cursor += 1;
+            }
+            prop_assert_eq!(&delivered, &expected);
+            for id in 0..snapshot_len + live_len {
+                prop_assert_eq!(delivered.iter().filter(|&&seen| seen == id).count(), 1);
+            }
+        }
     }
 
     proptest! {

@@ -1332,10 +1332,10 @@ fn decode_window_value(bytes: &[u8], n_input_cols: usize) -> Option<(Vec<i64>, i
 /// Persist TumbleWindowOp state to a ShardDb.
 ///
 /// Uses only point Put/Delete operations — never DeleteRange.
-pub async fn persist_tumble_window_state(
-    db: &ShardDb,
+pub fn append_tumble_window_state(
     op: &TumbleWindowOp,
     op_id: OperatorId,
+    target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
         let state = op.state.lock().unwrap();
@@ -1357,8 +1357,18 @@ pub async fn persist_tumble_window_state(
         batch
     };
 
-    db.write_batch(batch).await.map_err(OpError::storage)?;
+    target.merge_from(batch);
     Ok(())
+}
+
+pub async fn persist_tumble_window_state(
+    db: &ShardDb,
+    op: &TumbleWindowOp,
+    op_id: OperatorId,
+) -> Result<(), OpError> {
+    let mut batch = WriteBatch::new();
+    append_tumble_window_state(op, op_id, &mut batch)?;
+    db.write_batch(batch).await.map_err(OpError::storage)
 }
 
 /// Load TumbleWindowOp state from a ShardDb.
@@ -1414,10 +1424,10 @@ pub async fn load_tumble_window_state(
 }
 
 /// Persist HopWindowOp state to a ShardDb using the shared TW keyspace.
-pub async fn persist_hop_window_state(
-    db: &ShardDb,
+pub fn append_hop_window_state(
     op: &HopWindowOp,
     op_id: OperatorId,
+    target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
         let state = op.state.lock().unwrap();
@@ -1435,8 +1445,18 @@ pub async fn persist_hop_window_state(
         batch
     };
 
-    db.write_batch(batch).await.map_err(OpError::storage)?;
+    target.merge_from(batch);
     Ok(())
+}
+
+pub async fn persist_hop_window_state(
+    db: &ShardDb,
+    op: &HopWindowOp,
+    op_id: OperatorId,
+) -> Result<(), OpError> {
+    let mut batch = WriteBatch::new();
+    append_hop_window_state(op, op_id, &mut batch)?;
+    db.write_batch(batch).await.map_err(OpError::storage)
 }
 
 /// Load HopWindowOp state from a ShardDb using the shared TW keyspace.
@@ -1494,10 +1514,10 @@ pub async fn load_hop_window_state(
 }
 
 /// Persist SessionWindowOp state to a ShardDb using the shared TW keyspace.
-pub async fn persist_session_window_state(
-    db: &ShardDb,
+pub fn append_session_window_state(
     op: &SessionWindowOp,
     op_id: OperatorId,
+    target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
         let state = op.state.lock().unwrap();
@@ -1515,8 +1535,18 @@ pub async fn persist_session_window_state(
         batch.put(&wm_key, &state.watermark.watermark_ms.to_be_bytes());
         batch
     };
-    db.write_batch(batch).await.map_err(OpError::storage)?;
+    target.merge_from(batch);
     Ok(())
+}
+
+pub async fn persist_session_window_state(
+    db: &ShardDb,
+    op: &SessionWindowOp,
+    op_id: OperatorId,
+) -> Result<(), OpError> {
+    let mut batch = WriteBatch::new();
+    append_session_window_state(op, op_id, &mut batch)?;
+    db.write_batch(batch).await.map_err(OpError::storage)
 }
 
 /// Load SessionWindowOp state from a ShardDb using the shared TW keyspace.

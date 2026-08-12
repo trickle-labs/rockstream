@@ -1,5 +1,7 @@
 //! v0.52 Slice 3 — ALTER SOURCE REPLAY / DISMISS DEAD_LETTER_QUEUE DDL Command Tests.
 
+#![allow(clippy::await_holding_lock)]
+
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 
@@ -51,6 +53,7 @@ async fn test_alter_source_replay_and_dismiss_dlq() {
     opts.insert("topic".to_string(), "orders".to_string());
     let source = rockstream_gateway::catalog_stubs::CatalogSourceEntry {
         name: "orders_src".to_string(),
+        table_name: None,
         source_type: "kafka".to_string(),
         options: opts,
         format: "json".to_string(),

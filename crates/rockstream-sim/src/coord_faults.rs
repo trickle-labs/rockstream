@@ -7,6 +7,18 @@ use crate::fault_model::{FaultCategory, FaultEntry, FaultModel};
 
 /// Register all epoch coordinator fault entries into a `FaultModel`.
 pub fn register_coord_faults(model: &mut FaultModel) {
+    for (id, description) in [
+        ("backfill.snapshot_capture", "Backfill captures the snapshot/delta fence before scanning; restart must retain the captured boundary."),
+        ("backfill.m3_prepare", "Backfill prepares an M3 batch before its cursor/checkpoint commit; prepared state must never advance recovery."),
+        ("backfill.interleave_drain", "Backfill drains bounded live deltas while snapshot rows commit; recovery must preserve exactly-once output."),
+        ("backfill.publish", "Backfill publishes only after the committed frontier includes its output and cursor."),
+    ] {
+        model.register(FaultEntry {
+            id,
+            description,
+            category: FaultCategory::Io,
+        });
+    }
     // EpochCoordinator::commit_epoch — partial WriteBatch failure.
     model.register(FaultEntry {
         id: "epoch.write_batch_partial_failure",
@@ -96,6 +108,10 @@ pub fn register_coord_faults(model: &mut FaultModel) {
 
 /// Fault-model entries registered by `register_coord_faults`.
 pub const COORD_FAULT_IDS: &[&str] = &[
+    "backfill.snapshot_capture",
+    "backfill.m3_prepare",
+    "backfill.interleave_drain",
+    "backfill.publish",
     "epoch.write_batch_partial_failure",
     "epoch.frontier_write_delay",
     "task.output_channel_closed",

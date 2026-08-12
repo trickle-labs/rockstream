@@ -726,7 +726,11 @@ pub async fn load_frontier(db: &ShardDb) -> Result<Option<u64>, OpError> {
 /// This scan-and-delete pattern satisfies the "no range deletion" constraint.
 ///
 /// Call this after each epoch commit to ensure storage reflects current state.
-pub async fn persist_agg_state(db: &ShardDb, op: &AggregateOp) -> Result<(), OpError> {
+pub async fn append_agg_state(
+    db: &ShardDb,
+    op: &AggregateOp,
+    target: &mut WriteBatch,
+) -> Result<(), OpError> {
     let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op.op_id.0);
 
     // Scan all existing state entries (64 MB cap — a bound on the scan).
@@ -764,8 +768,16 @@ pub async fn persist_agg_state(db: &ShardDb, op: &AggregateOp) -> Result<(), OpE
         // `state` (MutexGuard) is dropped here — before any await
     };
 
-    if !wb.is_empty() {
-        db.write_batch(wb).await.map_err(OpError::storage)?;
+    target.merge_from(wb);
+    Ok(())
+}
+
+/// Persist aggregate state as one standalone batch for legacy callers.
+pub async fn persist_agg_state(db: &ShardDb, op: &AggregateOp) -> Result<(), OpError> {
+    let mut batch = WriteBatch::new();
+    append_agg_state(db, op, &mut batch).await?;
+    if !batch.is_empty() {
+        db.write_batch(batch).await.map_err(OpError::storage)?;
     }
     Ok(())
 }

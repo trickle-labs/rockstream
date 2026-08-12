@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 use std::sync::Arc;
 
 use object_store::memory::InMemory;

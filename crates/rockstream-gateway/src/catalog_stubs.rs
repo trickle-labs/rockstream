@@ -166,6 +166,31 @@ pub struct CatalogView {
     pub op_id: Option<u64>,
 }
 
+/// Runtime progress for a materialized-view backfill. Kept separate from the
+/// catalog definition so ordinary views stay on the existing read path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackfillProgress {
+    pub phase: &'static str,
+    pub cursor_position: Option<String>,
+    pub rows_remaining: u64,
+    pub estimated_rows: u64,
+    pub budget_state: String,
+    pub blocked_reason: Option<String>,
+}
+
+impl BackfillProgress {
+    fn snapshotting() -> Self {
+        Self {
+            phase: "SNAPSHOTTING",
+            cursor_position: None,
+            rows_remaining: 0,
+            estimated_rows: 0,
+            budget_state: "ADMITTED".to_string(),
+            blocked_reason: None,
+        }
+    }
+}
+
 /// A table entry registered by `CREATE TABLE` commands.
 #[derive(Debug, Clone)]
 pub struct CatalogTable {
@@ -174,7 +199,7 @@ pub struct CatalogTable {
 }
 
 /// A column in a catalog view entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogColumn {
     pub name: String,
     /// Arrow data type name (e.g. "Int64", "Utf8").
@@ -228,6 +253,9 @@ pub struct CatalogSinkEntry {
 #[derive(Debug, Clone)]
 pub struct CatalogSourceEntry {
     pub name: String,
+    /// Existing same-named table this source can feed. `None` preserves
+    /// metadata-only source DDL that has no relational binding.
+    pub table_name: Option<String>,
     pub source_type: String,
     pub options: HashMap<String, String>,
     pub format: String,
@@ -331,6 +359,7 @@ pub struct CatalogStubs {
     workload_budgets: RwLock<HashMap<String, Arc<WorkloadBudget>>>,
     view_budgets: RwLock<HashMap<String, Arc<StateBudget>>>,
     view_states: RwLock<HashMap<String, ViewState>>,
+    backfills: RwLock<HashMap<String, BackfillProgress>>,
     /// Monotonic counter minting gateway-local `op_id`s for `CREATE INDEX`
     /// automatic backfill (Slice 5, v0.51.2). Not derived from any real
     /// runtime-DAG `IndexArrangeOp` — see v0.51.2 plan §2 scoping decision.
@@ -351,6 +380,7 @@ impl CatalogStubs {
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
+            backfills: RwLock::new(HashMap::new()),
             next_index_op_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -364,6 +394,7 @@ impl CatalogStubs {
             workload_budgets: RwLock::new(HashMap::new()),
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
+            backfills: RwLock::new(HashMap::new()),
             next_index_op_id: std::sync::atomic::AtomicU64::new(1),
         };
         let workloads = workload_catalog.load_all_workloads().await?;
@@ -779,6 +810,14 @@ impl CatalogStubs {
         Some(source)
     }
 
+    /// Return the bound source table schema, if this source was created after
+    /// a same-named table.
+    pub fn source_table(&self, name: &str) -> Option<CatalogTable> {
+        let inner = self.inner.read().unwrap();
+        let source = inner.sources.get(name)?;
+        inner.tables.get(source.table_name.as_ref()?).cloned()
+    }
+
     /// Update the status of an existing source ("OK", "PAUSED").
     pub fn update_source_status(&self, name: &str, status: &str) -> bool {
         let mut inner = self.inner.write().unwrap();
@@ -931,6 +970,46 @@ impl CatalogStubs {
             columns: show_source_status_columns(),
             rows,
         }
+    }
+
+    /// Return the durable lifecycle summary used by `SHOW BACKFILL STATUS`.
+    /// The catalog is the shared read path, so this intentionally has no
+    /// gateway-local cache that could expose a stale publication state.
+    pub fn backfill_status_response(&self, view_name: &str) -> CatalogResponse {
+        let progress = self
+            .backfills
+            .read()
+            .unwrap()
+            .get(view_name)
+            .cloned()
+            .unwrap_or(BackfillProgress {
+                phase: "RUNNING",
+                cursor_position: None,
+                rows_remaining: 0,
+                estimated_rows: 0,
+                budget_state: "ADMITTED".to_string(),
+                blocked_reason: None,
+            });
+        CatalogResponse::rows(
+            vec![
+                "view_name".to_string(),
+                "phase".to_string(),
+                "cursor_position".to_string(),
+                "rows_remaining".to_string(),
+                "estimated_rows".to_string(),
+                "budget_state".to_string(),
+                "blocked_reason".to_string(),
+            ],
+            vec![vec![
+                Some(view_name.to_string()),
+                Some(progress.phase.to_string()),
+                progress.cursor_position,
+                Some(progress.rows_remaining.to_string()),
+                Some(progress.estimated_rows.to_string()),
+                Some(progress.budget_state),
+                progress.blocked_reason,
+            ]],
+        )
     }
 
     /// Dispatch a query string to a catalog handler. Returns `Some(rows)` if
@@ -1174,6 +1253,14 @@ impl CatalogStubs {
                 .trim_matches('"');
             self.get_source(source_name)?;
             return Some(self.source_status_response(Some(source_name)));
+        }
+        if ql.starts_with("show backfill status for materialized view ") {
+            let view_name = q["show backfill status for materialized view ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            self.get_view(view_name)?;
+            return Some(self.backfill_status_response(view_name));
         }
 
         // S7: SHOW client_encoding / SHOW server_encoding
@@ -1500,6 +1587,71 @@ impl CatalogStubs {
             .write()
             .unwrap()
             .insert(view_name.to_string(), state);
+    }
+
+    /// Start a materialized-view backfill before it can be read.
+    pub fn begin_backfill(&self, view_name: &str, estimated_rows: u64) {
+        self.set_view_state(view_name, ViewState::BackfillingFromEpoch(0));
+        let mut progress = BackfillProgress::snapshotting();
+        progress.estimated_rows = estimated_rows;
+        progress.rows_remaining = estimated_rows;
+        self.backfills
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), progress);
+    }
+
+    /// Advance the in-process lifecycle after snapshot rows are committed.
+    pub fn catch_up_backfill(&self, view_name: &str, cursor_position: Option<String>) {
+        self.set_view_state(view_name, ViewState::BackfillingFromEpoch(0));
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.phase = "CATCHING_UP";
+            if cursor_position.is_some() {
+                progress.cursor_position = cursor_position;
+            }
+            progress.rows_remaining = 0;
+        }
+    }
+
+    /// Reflect the most recent durable source M3 cursor without changing phase.
+    pub fn update_backfill_cursor(&self, view_name: &str, cursor_position: String) {
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.cursor_position = Some(cursor_position);
+        }
+    }
+
+    /// Reflect the progress record that was committed with the source M3.
+    pub fn update_backfill_progress(
+        &self,
+        view_name: &str,
+        cursor_position: String,
+        rows_remaining: u64,
+        estimated_rows: u64,
+    ) {
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.cursor_position = Some(cursor_position);
+            progress.rows_remaining = rows_remaining;
+            progress.estimated_rows = estimated_rows;
+        }
+    }
+
+    /// Publish only after the snapshot/output commit reaches its frontier.
+    pub fn publish_backfill(&self, view_name: &str) {
+        self.set_view_state(view_name, ViewState::Running);
+        if let Some(progress) = self.backfills.write().unwrap().get_mut(view_name) {
+            progress.phase = "RUNNING";
+            progress.rows_remaining = 0;
+            progress.blocked_reason = None;
+        }
+    }
+
+    /// A view without a tracked materialized backfill is legacy-published.
+    pub fn is_backfill_published(&self, view_name: &str) -> bool {
+        self.backfills
+            .read()
+            .unwrap()
+            .get(view_name)
+            .is_none_or(|progress| progress.phase == "RUNNING")
     }
 
     pub fn workload_status_entries(&self) -> Vec<CatalogWorkloadStatusEntry> {
@@ -2733,6 +2885,52 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
+    fn show_backfill_status_reports_exact_running_row() {
+        let catalog = CatalogStubs::new();
+        catalog.add_view(CatalogView {
+            name: "orders_by_customer".to_string(),
+            sql: "SELECT 1".to_string(),
+            columns: vec![],
+            namespace: "public".to_string(),
+            op_id: None,
+        });
+
+        let response = catalog
+            .handle_query(
+                "SHOW BACKFILL STATUS FOR MATERIALIZED VIEW orders_by_customer",
+                &SessionInfo::default(),
+            )
+            .unwrap();
+        let CatalogResponse::Rows { columns, rows } = response else {
+            panic!("SHOW BACKFILL STATUS must return rows");
+        };
+        assert_eq!(
+            columns,
+            [
+                "view_name",
+                "phase",
+                "cursor_position",
+                "rows_remaining",
+                "estimated_rows",
+                "budget_state",
+                "blocked_reason",
+            ]
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("orders_by_customer".to_string()),
+                Some("RUNNING".to_string()),
+                None,
+                Some("0".to_string()),
+                Some("0".to_string()),
+                Some("ADMITTED".to_string()),
+                None,
+            ]]
+        );
+    }
+
+    #[test]
     fn workload_memory_limit_transitions_views_and_audits() {
         let _guard = METRICS_TEST_LOCK.lock().unwrap();
         reset_all();
@@ -2800,6 +2998,7 @@ mod tests {
 
         let source = CatalogSourceEntry {
             name: "kafka_test".to_string(),
+            table_name: None,
             source_type: "kafka".to_string(),
             options: opts,
             format: "json".to_string(),

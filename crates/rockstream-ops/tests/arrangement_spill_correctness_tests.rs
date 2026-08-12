@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 use std::sync::Arc;
 
 use arrow::array::Int64Array;

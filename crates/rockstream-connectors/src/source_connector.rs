@@ -8,7 +8,7 @@
 //! - `pause` / `resume`: controls lifecycle state.
 //! - `partition_filter_support`: declares if the connector supports partition pushdown.
 
-use crate::source_epoch::{OffsetToken, SourceEpochRegistry};
+use crate::source_epoch::{OffsetToken, SnapshotDeltaFence, SourceEpochRegistry};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -44,7 +44,7 @@ impl std::fmt::Display for SourceError {
                 write!(f, "RS-4001: source start snapshot failed: {reason}")
             }
             Self::PollDeltaFailed { reason } => {
-                write!(f, "RS-4001: source poll delta failed: {reason}")
+                write!(f, "RS-4004: source poll failed: {reason}")
             }
             Self::CommitOffsetFailed { epoch, reason } => {
                 write!(
@@ -108,23 +108,51 @@ pub fn validate_window_watermark(
 
 /// A stream of record batches for the initial snapshot (§13.3).
 pub struct SnapshotStream {
-    batches: Vec<RecordBatch>,
+    batches: Vec<SnapshotBatch>,
     index: usize,
+    remaining_rows: usize,
+}
+
+/// One bounded snapshot chunk together with the exact resume position after it.
+#[derive(Debug, Clone)]
+pub struct SnapshotBatch {
+    pub batch: RecordBatch,
+    pub resume_offset: OffsetToken,
 }
 
 impl SnapshotStream {
-    pub fn new(batches: Vec<RecordBatch>) -> Self {
-        Self { batches, index: 0 }
+    pub fn new(batches: Vec<SnapshotBatch>) -> Self {
+        let remaining_rows = batches.iter().map(|chunk| chunk.batch.num_rows()).sum();
+        Self {
+            batches,
+            index: 0,
+            remaining_rows,
+        }
+    }
+
+    /// A connector may return just its next bounded chunk while reporting the
+    /// complete fenced tail so lifecycle status remains accurate.
+    pub fn with_remaining(batches: Vec<SnapshotBatch>, remaining_rows: usize) -> Self {
+        Self {
+            batches,
+            index: 0,
+            remaining_rows,
+        }
+    }
+
+    pub fn remaining_rows(&self) -> usize {
+        self.remaining_rows
     }
 }
 
 impl Iterator for SnapshotStream {
-    type Item = RecordBatch;
+    type Item = SnapshotBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.batches.len() {
             let batch = self.batches[self.index].clone();
             self.index += 1;
+            self.remaining_rows = self.remaining_rows.saturating_sub(batch.batch.num_rows());
             Some(batch)
         } else {
             None
@@ -149,12 +177,35 @@ pub trait SourceConnector: Send + Sync {
     /// Returns the Arrow schema of the source data.
     fn discover_schema(&self) -> Result<SchemaRef, SourceError>;
 
-    /// Start the initial snapshot stream from a given checkpoint frontier.
+    /// Capture the immutable snapshot/delta boundary without consuming input.
+    async fn capture_snapshot_delta_fence(
+        &mut self,
+        _partition_filter: Option<PartitionFilter>,
+    ) -> Result<SnapshotDeltaFence, SourceError> {
+        Err(SourceError::Io(
+            "RS-4019: backfill.cursor_limit_exceeded: connector does not implement atomic snapshot/delta fence capture; next_steps: upgrade the connector before creating a materialized view".to_string(),
+        ))
+    }
+
+    /// Start the initial snapshot stream bound to the captured fence.
     async fn start_snapshot(
         &mut self,
-        frontier: Epoch,
+        fence: &SnapshotDeltaFence,
+        after: Option<OffsetToken>,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError>;
+
+    /// Start the snapshot in chunks no larger than `max_rows`. Connectors
+    /// whose native snapshot is already bounded can use the default.
+    async fn start_snapshot_bounded(
+        &mut self,
+        fence: &SnapshotDeltaFence,
+        after: Option<OffsetToken>,
+        partition_filter: Option<PartitionFilter>,
+        _max_rows: usize,
+    ) -> Result<SnapshotStream, SourceError> {
+        self.start_snapshot(fence, after, partition_filter).await
+    }
 
     /// Poll new delta records starting after the given offset.
     async fn poll_delta(
@@ -183,6 +234,81 @@ pub trait SourceConnector: Send + Sync {
     /// Declares the source's event-time watermark capability.
     fn watermark_capability(&self) -> WatermarkCapability {
         WatermarkCapability::None
+    }
+}
+
+#[async_trait]
+impl<T: SourceConnector + ?Sized> SourceConnector for Box<T> {
+    fn discover_schema(&self) -> Result<SchemaRef, SourceError> {
+        (**self).discover_schema()
+    }
+
+    async fn capture_snapshot_delta_fence(
+        &mut self,
+        partition_filter: Option<PartitionFilter>,
+    ) -> Result<SnapshotDeltaFence, SourceError> {
+        (**self)
+            .capture_snapshot_delta_fence(partition_filter)
+            .await
+    }
+
+    async fn start_snapshot(
+        &mut self,
+        fence: &SnapshotDeltaFence,
+        after: Option<OffsetToken>,
+        partition_filter: Option<PartitionFilter>,
+    ) -> Result<SnapshotStream, SourceError> {
+        (**self)
+            .start_snapshot(fence, after, partition_filter)
+            .await
+    }
+
+    async fn start_snapshot_bounded(
+        &mut self,
+        fence: &SnapshotDeltaFence,
+        after: Option<OffsetToken>,
+        partition_filter: Option<PartitionFilter>,
+        max_rows: usize,
+    ) -> Result<SnapshotStream, SourceError> {
+        (**self)
+            .start_snapshot_bounded(fence, after, partition_filter, max_rows)
+            .await
+    }
+
+    async fn poll_delta(
+        &mut self,
+        after: OffsetToken,
+        max_bytes: usize,
+        credits_available: usize,
+        partition_filter: Option<PartitionFilter>,
+    ) -> Result<PollDeltaResult, SourceError> {
+        (**self)
+            .poll_delta(after, max_bytes, credits_available, partition_filter)
+            .await
+    }
+
+    async fn commit_offset(
+        &mut self,
+        epoch: Epoch,
+        offset: OffsetToken,
+    ) -> Result<(), SourceError> {
+        (**self).commit_offset(epoch, offset).await
+    }
+
+    async fn pause(&mut self, reason: String) -> Result<(), SourceError> {
+        (**self).pause(reason).await
+    }
+
+    async fn resume(&mut self) -> Result<(), SourceError> {
+        (**self).resume().await
+    }
+
+    fn partition_filter_support(&self) -> bool {
+        (**self).partition_filter_support()
+    }
+
+    fn watermark_capability(&self) -> WatermarkCapability {
+        (**self).watermark_capability()
     }
 }
 
@@ -315,9 +441,20 @@ mod tests {
             Ok(self.schema.clone())
         }
 
+        async fn capture_snapshot_delta_fence(
+            &mut self,
+            _partition_filter: Option<PartitionFilter>,
+        ) -> Result<SnapshotDeltaFence, SourceError> {
+            Ok(SnapshotDeltaFence::new(
+                OffsetToken::new(b"snapshot".to_vec()),
+                OffsetToken::new(b"live".to_vec()),
+            ))
+        }
+
         async fn start_snapshot(
             &mut self,
-            _frontier: Epoch,
+            _fence: &SnapshotDeltaFence,
+            _after: Option<OffsetToken>,
             _partition_filter: Option<PartitionFilter>,
         ) -> Result<SnapshotStream, SourceError> {
             Ok(SnapshotStream::new(vec![]))
@@ -369,6 +506,13 @@ mod tests {
         };
         assert_eq!(source.discover_schema().unwrap().fields().len(), 1);
         assert!(!source.partition_filter_support());
+        assert_eq!(
+            source.capture_snapshot_delta_fence(None).await.unwrap(),
+            SnapshotDeltaFence::new(
+                OffsetToken::new(b"snapshot".to_vec()),
+                OffsetToken::new(b"live".to_vec()),
+            )
+        );
         source.pause("test".to_string()).await.unwrap();
         assert!(source.paused);
         source.resume().await.unwrap();

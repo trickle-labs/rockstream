@@ -541,7 +541,7 @@ impl JoinOp {
     /// Persist the arrangement state to a `ShardDb` using only point puts.
     ///
     /// No range deletion is used.  Keys are `join_arr_key(side, op_id, ...)`.
-    pub async fn persist_state(&self, db: &ShardDb) -> Result<(), OpError> {
+    pub fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
         let mut batch = WriteBatch::new();
 
         {
@@ -575,10 +575,17 @@ impl JoinOp {
             }
         }
 
-        if batch.is_empty() {
-            return Ok(());
+        target.merge_from(batch);
+        Ok(())
+    }
+
+    pub async fn persist_state(&self, db: &ShardDb) -> Result<(), OpError> {
+        let mut batch = WriteBatch::new();
+        self.append_state(&mut batch)?;
+        if !batch.is_empty() {
+            db.write_batch(batch).await.map_err(OpError::storage)?;
         }
-        db.write_batch(batch).await.map_err(OpError::storage)
+        Ok(())
     }
 
     /// Load arrangement state from a `ShardDb` (crash-replay).

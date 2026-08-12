@@ -11,19 +11,21 @@ use std::collections::VecDeque;
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array};
-use arrow::datatypes::SchemaRef;
+use arrow::array::{ArrayRef, Decimal128Array, Int32Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use rockstream_types::arrow_batch::append_weight_column;
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
 use rockstream_types::timestamp::Epoch;
 use serde::Deserialize;
+use tokio_postgres::{Client, NoTls};
 
 use crate::source_connector::{
-    PollDeltaResult, SnapshotStream, SourceConnector, SourceError, WatermarkCapability,
+    PollDeltaResult, SnapshotBatch, SnapshotStream, SourceConnector, SourceError,
+    WatermarkCapability,
 };
-use crate::source_epoch::OffsetToken;
+use crate::source_epoch::{OffsetToken, SnapshotDeltaFence};
 
 /// Maximum decoded records retained before replication reads are paused.
 pub const POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS: usize = 4_096;
@@ -157,6 +159,42 @@ pub struct PostgresCdcSource {
     recovery_attempts: u8,
     status: PostgresCdcStatus,
     committed: Option<(Epoch, PgLsn)>,
+    pgoutput: Option<PgOutputConnection>,
+}
+
+/// Connection details for a native pgoutput source. Credentials are resolved
+/// by the gateway before this value is constructed.
+#[derive(Debug, Clone)]
+pub struct PgOutputConfig {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    pub password: Option<String>,
+    pub slot: String,
+    pub publication: String,
+    pub table: String,
+}
+
+struct PgOutputConnection {
+    client: Client,
+    slot: String,
+    publication: String,
+    table: String,
+    snapshot_lsn: Option<PgLsn>,
+    relations: std::collections::HashMap<u32, PgOutputRelation>,
+}
+
+#[derive(Debug, Clone)]
+struct PgOutputRelation {
+    columns: usize,
+}
+
+struct PgOutputTextChange {
+    lsn: PgLsn,
+    operation: CdcOperation,
+    old_values: Option<Vec<String>>,
+    new_values: Option<Vec<String>>,
 }
 
 struct QueuedChange {
@@ -179,7 +217,56 @@ impl PostgresCdcSource {
             recovery_attempts: 0,
             status: PostgresCdcStatus::Running,
             committed: None,
+            pgoutput: None,
         }
+    }
+
+    /// Connect to PostgreSQL's native pgoutput logical-decoding stream.
+    ///
+    /// This intentionally supports only PostgreSQL's text tuple representation.
+    /// Refusing another physical schema is safer than
+    /// coercing a change before it reaches the M3 fence.
+    pub async fn connect_pgoutput(
+        connector_id: ConnectorId,
+        schema: SchemaRef,
+        config: PgOutputConfig,
+    ) -> Result<Self, SourceError> {
+        if schema.fields().iter().any(|field| {
+            !matches!(
+                field.data_type(),
+                DataType::Int64 | DataType::Int32 | DataType::Utf8 | DataType::Decimal128(_, _)
+            )
+        }) {
+            return Err(SourceError::DiscoverSchemaFailed {
+                reason: "native pgoutput currently requires INT, BIGINT, TEXT, or DECIMAL bound source columns".to_string(),
+            });
+        }
+        let mut connection_config = tokio_postgres::Config::new();
+        connection_config
+            .host(&config.host)
+            .port(config.port)
+            .dbname(&config.database)
+            .user(&config.user);
+        if let Some(password) = &config.password {
+            connection_config.password(password);
+        }
+        let (client, connection) = connection_config
+            .connect(NoTls)
+            .await
+            .map_err(|error| SourceError::Io(format!("connect PostgreSQL CDC source: {error}")))?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut source = Self::new(connector_id, schema, CdcWireFormat::PgOutput);
+        source.pgoutput = Some(PgOutputConnection {
+            client,
+            slot: config.slot,
+            publication: config.publication,
+            table: quote_relation(&config.table)?,
+            snapshot_lsn: None,
+            relations: std::collections::HashMap::new(),
+        });
+        Ok(source)
     }
 
     pub fn set_snapshot_batches(&mut self, batches: Vec<RecordBatch>) {
@@ -365,14 +452,302 @@ impl PostgresCdcSource {
         }
         let arrays: Vec<ArrayRef> = columns
             .into_iter()
-            .map(|values| Arc::new(Int64Array::from(values)) as ArrayRef)
-            .collect();
+            .zip(schema.fields())
+            .map(|(values, field)| match field.data_type() {
+                DataType::Int64 => Ok(Arc::new(Int64Array::from(values)) as ArrayRef),
+                DataType::Int32 => values
+                    .into_iter()
+                    .map(|value| {
+                        i32::try_from(value).map_err(|_| SourceError::PollDeltaFailed {
+                            reason: format!("pgoutput value {value} does not fit INT"),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|values| Arc::new(arrow::array::Int32Array::from(values)) as ArrayRef),
+                data_type => Err(SourceError::PollDeltaFailed {
+                    reason: format!("native pgoutput does not support {data_type} columns"),
+                }),
+            })
+            .collect::<Result<_, _>>()?;
         let batch =
             RecordBatch::try_new(schema, arrays).map_err(|error| SourceError::PollDeltaFailed {
                 reason: format!("failed to build CDC record batch: {error}"),
             })?;
         append_weight_column(batch, &weights).map_err(|error| SourceError::PollDeltaFailed {
             reason: format!("failed to append CDC weights: {error}"),
+        })
+    }
+
+    fn pgoutput_text_batch(
+        changes: &[PgOutputTextChange],
+        schema: SchemaRef,
+    ) -> Result<RecordBatch, SourceError> {
+        let mut rows = Vec::new();
+        let mut weights = Vec::new();
+        for change in changes {
+            match change.operation {
+                CdcOperation::Insert => {
+                    rows.push(change.new_values.clone().ok_or_else(|| {
+                        SourceError::PollDeltaFailed {
+                            reason: "pgoutput INSERT is missing values".to_string(),
+                        }
+                    })?);
+                    weights.push(1);
+                }
+                CdcOperation::Delete => {
+                    rows.push(change.old_values.clone().ok_or_else(|| {
+                        SourceError::PollDeltaFailed {
+                            reason: "pgoutput DELETE is missing REPLICA IDENTITY FULL values"
+                                .to_string(),
+                        }
+                    })?);
+                    weights.push(-1);
+                }
+                CdcOperation::Update => {
+                    rows.push(change.old_values.clone().ok_or_else(|| {
+                        SourceError::PollDeltaFailed {
+                            reason: "pgoutput UPDATE is missing old values".to_string(),
+                        }
+                    })?);
+                    rows.push(change.new_values.clone().ok_or_else(|| {
+                        SourceError::PollDeltaFailed {
+                            reason: "pgoutput UPDATE is missing new values".to_string(),
+                        }
+                    })?);
+                    weights.extend([-1, 1]);
+                }
+            }
+        }
+        if rows.iter().any(|row| row.len() != schema.fields().len()) {
+            return Err(SourceError::PollDeltaFailed {
+                reason: "pgoutput tuple width differs from the bound source schema".to_string(),
+            });
+        }
+        let arrays = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let values = rows
+                    .iter()
+                    .map(|row| row[index].as_str())
+                    .collect::<Vec<_>>();
+                match field.data_type() {
+                    DataType::Int64 => values
+                        .into_iter()
+                        .map(|value| {
+                            value.parse().map_err(|_| SourceError::PollDeltaFailed {
+                                reason: format!("pgoutput value '{value}' is not BIGINT"),
+                            })
+                        })
+                        .collect::<Result<Vec<i64>, _>>()
+                        .map(|values| Arc::new(Int64Array::from(values)) as ArrayRef),
+                    DataType::Int32 => values
+                        .into_iter()
+                        .map(|value| {
+                            value.parse().map_err(|_| SourceError::PollDeltaFailed {
+                                reason: format!("pgoutput value '{value}' is not INT"),
+                            })
+                        })
+                        .collect::<Result<Vec<i32>, _>>()
+                        .map(|values| Arc::new(Int32Array::from(values)) as ArrayRef),
+                    DataType::Utf8 => Ok(Arc::new(StringArray::from(values)) as ArrayRef),
+                    DataType::Decimal128(precision, scale) => values
+                        .into_iter()
+                        .map(|value| decimal_scaled(value, *scale))
+                        .collect::<Result<Vec<i128>, _>>()
+                        .and_then(|values| {
+                            Decimal128Array::from(values)
+                                .with_precision_and_scale(*precision, *scale)
+                                .map(|array| Arc::new(array) as ArrayRef)
+                                .map_err(|error| SourceError::PollDeltaFailed {
+                                    reason: format!("pgoutput DECIMAL: {error}"),
+                                })
+                        }),
+                    data_type => Err(SourceError::PollDeltaFailed {
+                        reason: format!("native pgoutput does not support {data_type} columns"),
+                    }),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let batch =
+            RecordBatch::try_new(schema, arrays).map_err(|error| SourceError::PollDeltaFailed {
+                reason: format!("build pgoutput batch: {error}"),
+            })?;
+        append_weight_column(batch, &weights).map_err(|error| SourceError::PollDeltaFailed {
+            reason: format!("add pgoutput weights: {error}"),
+        })
+    }
+
+    async fn capture_pgoutput_snapshot(&mut self) -> Result<SnapshotDeltaFence, SourceError> {
+        let pgoutput = self.pgoutput.as_mut().ok_or_else(|| {
+            SourceError::Io("native pgoutput connection is unavailable".to_string())
+        })?;
+        let existing = pgoutput
+            .client
+            .query_opt(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                &[&pgoutput.slot],
+            )
+            .await
+            .map_err(|error| SourceError::StartSnapshotFailed {
+                reason: format!("inspect pgoutput slot: {error}"),
+            })?;
+        if existing.is_none() {
+            pgoutput
+                .client
+                .query_one(
+                    "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+                    &[&pgoutput.slot],
+                )
+                .await
+                .map_err(|error| SourceError::StartSnapshotFailed {
+                    reason: format!("create pgoutput slot '{}': {error}", pgoutput.slot),
+                })?;
+        }
+        pgoutput
+            .client
+            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .map_err(|error| SourceError::StartSnapshotFailed {
+                reason: format!("begin PostgreSQL snapshot: {error}"),
+            })?;
+        let result = async {
+            let snapshot_lsn: String = pgoutput
+                .client
+                .query_one("SELECT pg_current_wal_lsn()::text", &[])
+                .await
+                .map_err(|error| SourceError::StartSnapshotFailed {
+                    reason: format!("capture PostgreSQL snapshot LSN: {error}"),
+                })?
+                .get(0);
+            let projection = self
+                .schema
+                .fields()
+                .iter()
+                .map(|field| format!("\"{}\"::text", field.name().replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = pgoutput
+                .client
+                .query(&format!("SELECT {projection} FROM {}", pgoutput.table), &[])
+                .await
+                .map_err(|error| SourceError::StartSnapshotFailed {
+                    reason: format!("read PostgreSQL snapshot: {error}"),
+                })?;
+            let rows = rows
+                .into_iter()
+                .map(|row| {
+                    (0..self.schema.fields().len())
+                        .map(|index| {
+                            row.try_get::<_, String>(index).map_err(|error| {
+                                SourceError::StartSnapshotFailed {
+                                    reason: format!(
+                                        "decode PostgreSQL snapshot column {index}: {error}"
+                                    ),
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, SourceError>((PgLsn::parse(&snapshot_lsn)?, rows))
+        }
+        .await;
+        let rollback = pgoutput.client.batch_execute("ROLLBACK").await;
+        let (snapshot_lsn, rows) = result?;
+        rollback.map_err(|error| SourceError::StartSnapshotFailed {
+            reason: format!("finish PostgreSQL snapshot: {error}"),
+        })?;
+        let batch = Self::pgoutput_text_batch(
+            &rows
+                .into_iter()
+                .map(|new_values| PgOutputTextChange {
+                    lsn: snapshot_lsn,
+                    operation: CdcOperation::Insert,
+                    old_values: None,
+                    new_values: Some(new_values),
+                })
+                .collect::<Vec<_>>(),
+            self.schema.clone(),
+        )
+        .map_err(|error| SourceError::StartSnapshotFailed {
+            reason: error.to_string(),
+        })?;
+        self.snapshot_batches = if batch.num_rows() > 0 {
+            vec![batch]
+        } else {
+            Vec::new()
+        };
+        pgoutput.snapshot_lsn = Some(snapshot_lsn);
+        Ok(SnapshotDeltaFence::new(
+            snapshot_lsn.to_offset_token(),
+            snapshot_lsn.to_offset_token(),
+        ))
+    }
+
+    async fn poll_pgoutput(
+        &mut self,
+        after: PgLsn,
+        max_bytes: usize,
+        credits_available: usize,
+    ) -> Result<PollDeltaResult, SourceError> {
+        if credits_available == 0 || max_bytes == 0 {
+            return Ok(PollDeltaResult {
+                batches: Vec::new(),
+                new_offset: after.to_offset_token(),
+                watermark: None,
+            });
+        }
+        let pgoutput = self.pgoutput.as_mut().ok_or_else(|| {
+            SourceError::Io("native pgoutput connection is unavailable".to_string())
+        })?;
+        let limit = i32::try_from(credits_available.saturating_mul(4)).unwrap_or(i32::MAX);
+        let messages = pgoutput
+            .client
+            .query(
+                "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, $2, 'proto_version', '1', 'publication', $3)",
+                &[&pgoutput.slot, &limit, &pgoutput.publication],
+            )
+            .await
+            .map_err(|error| SourceError::PollDeltaFailed {
+                reason: format!("peek pgoutput changes: {error}"),
+            })?;
+        let mut changes = Vec::new();
+        let mut used_bytes = 0usize;
+        for message in messages {
+            let lsn = PgLsn::parse(message.get::<_, String>(0).as_str())?;
+            let payload = message.get::<_, Vec<u8>>(1);
+            if lsn <= after {
+                continue;
+            }
+            if !changes.is_empty() && used_bytes.saturating_add(payload.len()) > max_bytes {
+                break;
+            }
+            used_bytes += payload.len();
+            if let Some(change) = decode_native_pgoutput_text_message(
+                &mut pgoutput.relations,
+                self.schema.fields().len(),
+                lsn,
+                &payload,
+            )? {
+                changes.push(change);
+                if changes.len() == credits_available {
+                    break;
+                }
+            }
+        }
+        let Some(last_lsn) = changes.last().map(|change| change.lsn) else {
+            return Ok(PollDeltaResult {
+                batches: Vec::new(),
+                new_offset: after.to_offset_token(),
+                watermark: None,
+            });
+        };
+        Ok(PollDeltaResult {
+            batches: vec![Self::pgoutput_text_batch(&changes, self.schema.clone())?],
+            new_offset: last_lsn.to_offset_token(),
+            watermark: Some(last_lsn.0),
         })
     }
 }
@@ -383,13 +758,51 @@ impl SourceConnector for PostgresCdcSource {
         Ok(self.schema.clone())
     }
 
+    async fn capture_snapshot_delta_fence(
+        &mut self,
+        _partition_filter: Option<PartitionFilter>,
+    ) -> Result<SnapshotDeltaFence, SourceError> {
+        if self.pgoutput.is_some() {
+            return self.capture_pgoutput_snapshot().await;
+        }
+        let snapshot = self
+            .committed
+            .map(|(_, lsn)| lsn.to_offset_token())
+            .unwrap_or_else(|| PgLsn(0).to_offset_token());
+        let live = self
+            .queued
+            .back()
+            .map(|queued| queued.change.lsn.to_offset_token())
+            .unwrap_or_else(|| snapshot.clone());
+        Ok(SnapshotDeltaFence::new(snapshot, live))
+    }
+
     async fn start_snapshot(
         &mut self,
-        _frontier: Epoch,
+        _fence: &SnapshotDeltaFence,
+        after: Option<OffsetToken>,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
-        let batches = std::mem::take(&mut self.snapshot_batches);
-        Ok(SnapshotStream::new(batches))
+        let start = after
+            .as_ref()
+            .and_then(|offset| std::str::from_utf8(offset.as_bytes()).ok())
+            .and_then(|offset| offset.strip_prefix("snapshot:"))
+            .and_then(|index| index.parse::<usize>().ok())
+            .unwrap_or(0);
+        Ok(SnapshotStream::new(
+            self.snapshot_batches
+                .iter()
+                .skip(start)
+                .cloned()
+                .enumerate()
+                .map(|(index, batch)| SnapshotBatch {
+                    batch,
+                    resume_offset: OffsetToken::new(
+                        format!("snapshot:{}", start + index + 1).into_bytes(),
+                    ),
+                })
+                .collect(),
+        ))
     }
 
     async fn poll_delta(
@@ -399,6 +812,15 @@ impl SourceConnector for PostgresCdcSource {
         credits_available: usize,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
+        if self.pgoutput.is_some() {
+            return self
+                .poll_pgoutput(
+                    PgLsn::from_offset_token(&after)?,
+                    max_bytes,
+                    credits_available,
+                )
+                .await;
+        }
         let after = PgLsn::from_offset_token(&after)?;
         if credits_available == 0 || max_bytes == 0 {
             return Ok(PollDeltaResult {
@@ -468,7 +890,24 @@ impl SourceConnector for PostgresCdcSource {
         epoch: Epoch,
         offset: OffsetToken,
     ) -> Result<(), SourceError> {
-        self.committed = Some((epoch, PgLsn::from_offset_token(&offset)?));
+        let lsn = PgLsn::from_offset_token(&offset)?;
+        if let Some(pgoutput) = &mut self.pgoutput {
+            if lsn != PgLsn::ZERO {
+                let target = lsn.to_string();
+                pgoutput
+                    .client
+                    .query(
+                        "SELECT lsn FROM pg_logical_slot_get_binary_changes($1, $2::pg_lsn, NULL, 'proto_version', '1', 'publication', $3)",
+                        &[&pgoutput.slot, &target, &pgoutput.publication],
+                    )
+                    .await
+                    .map_err(|error| SourceError::CommitOffsetFailed {
+                        epoch,
+                        reason: format!("advance pgoutput slot: {error}"),
+                    })?;
+            }
+        }
+        self.committed = Some((epoch, lsn));
         Ok(())
     }
 
@@ -485,6 +924,388 @@ impl SourceConnector for PostgresCdcSource {
     fn watermark_capability(&self) -> WatermarkCapability {
         WatermarkCapability::Native
     }
+}
+
+fn quote_relation(relation: &str) -> Result<String, SourceError> {
+    let quoted = relation
+        .split('.')
+        .map(|part| {
+            (!part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+            .then(|| format!("\"{part}\""))
+            .ok_or_else(|| SourceError::DiscoverSchemaFailed {
+                reason: format!("invalid PostgreSQL source table '{relation}'"),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    (!quoted.is_empty() && quoted.len() <= 2)
+        .then(|| quoted.join("."))
+        .ok_or_else(|| SourceError::DiscoverSchemaFailed {
+            reason: format!("invalid PostgreSQL source table '{relation}'"),
+        })
+}
+
+#[cfg(test)]
+fn decode_native_pgoutput_message(
+    relations: &mut std::collections::HashMap<u32, PgOutputRelation>,
+    schema_columns: usize,
+    lsn: PgLsn,
+    payload: &[u8],
+) -> Result<Option<CdcChange>, SourceError> {
+    let Some((&tag, mut data)) = payload.split_first() else {
+        return Err(SourceError::PollDeltaFailed {
+            reason: "empty pgoutput message".to_string(),
+        });
+    };
+    match tag {
+        b'B' | b'C' | b'O' | b'Y' | b'T' => Ok(None),
+        b'R' => {
+            let relation_id = take_u32(&mut data)?;
+            take_cstring(&mut data)?;
+            take_cstring(&mut data)?;
+            take_byte(&mut data)?;
+            let columns = usize::from(take_u16(&mut data)?);
+            for _ in 0..columns {
+                take_byte(&mut data)?;
+                take_cstring(&mut data)?;
+                take_u32(&mut data)?;
+                take_u32(&mut data)?;
+            }
+            if columns != schema_columns {
+                return Err(SourceError::PollDeltaFailed {
+                    reason: format!(
+                        "pgoutput relation {relation_id} has {columns} columns but bound source schema has {schema_columns}"
+                    ),
+                });
+            }
+            relations.insert(relation_id, PgOutputRelation { columns });
+            Ok(None)
+        }
+        b'I' => {
+            let relation_id = take_u32(&mut data)?;
+            ensure_relation(relations, relation_id, schema_columns)?;
+            expect_byte(&mut data, b'N')?;
+            let new_values = parse_pgoutput_tuple(&mut data, schema_columns)?;
+            Ok(Some(native_change(
+                lsn,
+                relation_id,
+                CdcOperation::Insert,
+                None,
+                Some(new_values),
+            )))
+        }
+        b'U' => {
+            let relation_id = take_u32(&mut data)?;
+            ensure_relation(relations, relation_id, schema_columns)?;
+            let old_tag = take_byte(&mut data)?;
+            if old_tag != b'O' {
+                return Err(SourceError::PollDeltaFailed {
+                    reason: "pgoutput UPDATE requires REPLICA IDENTITY FULL to persist a delete preimage".to_string(),
+                });
+            }
+            let old_values = parse_pgoutput_tuple(&mut data, schema_columns)?;
+            expect_byte(&mut data, b'N')?;
+            let new_values = parse_pgoutput_tuple(&mut data, schema_columns)?;
+            Ok(Some(native_change(
+                lsn,
+                relation_id,
+                CdcOperation::Update,
+                Some(old_values),
+                Some(new_values),
+            )))
+        }
+        b'D' => {
+            let relation_id = take_u32(&mut data)?;
+            ensure_relation(relations, relation_id, schema_columns)?;
+            if take_byte(&mut data)? != b'O' {
+                return Err(SourceError::PollDeltaFailed {
+                    reason: "pgoutput DELETE requires REPLICA IDENTITY FULL to persist a delete preimage".to_string(),
+                });
+            }
+            let old_values = parse_pgoutput_tuple(&mut data, schema_columns)?;
+            Ok(Some(native_change(
+                lsn,
+                relation_id,
+                CdcOperation::Delete,
+                Some(old_values),
+                None,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn decode_native_pgoutput_text_message(
+    relations: &mut std::collections::HashMap<u32, PgOutputRelation>,
+    schema_columns: usize,
+    lsn: PgLsn,
+    payload: &[u8],
+) -> Result<Option<PgOutputTextChange>, SourceError> {
+    let Some((&tag, mut data)) = payload.split_first() else {
+        return Err(SourceError::PollDeltaFailed {
+            reason: "empty pgoutput message".to_string(),
+        });
+    };
+    match tag {
+        b'B' | b'C' | b'O' | b'Y' | b'T' => Ok(None),
+        b'R' => {
+            let relation_id = take_u32(&mut data)?;
+            take_cstring(&mut data)?;
+            take_cstring(&mut data)?;
+            take_byte(&mut data)?;
+            let columns = usize::from(take_u16(&mut data)?);
+            for _ in 0..columns {
+                take_byte(&mut data)?;
+                take_cstring(&mut data)?;
+                take_u32(&mut data)?;
+                take_u32(&mut data)?;
+            }
+            if columns != schema_columns {
+                return Err(SourceError::PollDeltaFailed { reason: format!("pgoutput relation {relation_id} has {columns} columns but bound source schema has {schema_columns}") });
+            }
+            relations.insert(relation_id, PgOutputRelation { columns });
+            Ok(None)
+        }
+        b'I' => {
+            let relation = take_u32(&mut data)?;
+            ensure_relation(relations, relation, schema_columns)?;
+            expect_byte(&mut data, b'N')?;
+            Ok(Some(PgOutputTextChange {
+                lsn,
+                operation: CdcOperation::Insert,
+                old_values: None,
+                new_values: Some(parse_pgoutput_text_tuple(&mut data, schema_columns)?),
+            }))
+        }
+        b'U' => {
+            let relation = take_u32(&mut data)?;
+            ensure_relation(relations, relation, schema_columns)?;
+            if take_byte(&mut data)? != b'O' {
+                return Err(SourceError::PollDeltaFailed { reason: "pgoutput UPDATE requires REPLICA IDENTITY FULL to persist a delete preimage".to_string() });
+            }
+            let old_values = parse_pgoutput_text_tuple(&mut data, schema_columns)?;
+            expect_byte(&mut data, b'N')?;
+            Ok(Some(PgOutputTextChange {
+                lsn,
+                operation: CdcOperation::Update,
+                old_values: Some(old_values),
+                new_values: Some(parse_pgoutput_text_tuple(&mut data, schema_columns)?),
+            }))
+        }
+        b'D' => {
+            let relation = take_u32(&mut data)?;
+            ensure_relation(relations, relation, schema_columns)?;
+            if take_byte(&mut data)? != b'O' {
+                return Err(SourceError::PollDeltaFailed { reason: "pgoutput DELETE requires REPLICA IDENTITY FULL to persist a delete preimage".to_string() });
+            }
+            Ok(Some(PgOutputTextChange {
+                lsn,
+                operation: CdcOperation::Delete,
+                old_values: Some(parse_pgoutput_text_tuple(&mut data, schema_columns)?),
+                new_values: None,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+fn native_change(
+    lsn: PgLsn,
+    table_id: u32,
+    operation: CdcOperation,
+    old_values: Option<Vec<i64>>,
+    new_values: Option<Vec<i64>>,
+) -> CdcChange {
+    let key = old_values
+        .as_ref()
+        .or(new_values.as_ref())
+        .and_then(|values| values.first())
+        .map(|value| value.to_be_bytes().to_vec())
+        .unwrap_or_default();
+    CdcChange {
+        lsn,
+        table_id,
+        row_id: CdcChange::row_id_for(table_id, &key),
+        primary_key: key,
+        operation,
+        old_values,
+        new_values,
+    }
+}
+
+fn ensure_relation(
+    relations: &std::collections::HashMap<u32, PgOutputRelation>,
+    relation_id: u32,
+    schema_columns: usize,
+) -> Result<(), SourceError> {
+    relations
+        .get(&relation_id)
+        .filter(|relation| relation.columns == schema_columns)
+        .map(|_| ())
+        .ok_or_else(|| SourceError::PollDeltaFailed {
+            reason: format!(
+                "pgoutput relation metadata for relation {relation_id} was not received"
+            ),
+        })
+}
+
+#[cfg(test)]
+fn parse_pgoutput_tuple(data: &mut &[u8], columns: usize) -> Result<Vec<i64>, SourceError> {
+    let count = usize::from(take_u16(data)?);
+    if count != columns {
+        return Err(SourceError::PollDeltaFailed {
+            reason: format!("pgoutput tuple has {count} columns but source schema has {columns}"),
+        });
+    }
+    (0..count)
+        .map(|_| {
+            if take_byte(data)? != b't' {
+                return Err(SourceError::PollDeltaFailed {
+                    reason: "pgoutput source requires non-NULL text-format BIGINT tuple values"
+                        .to_string(),
+                });
+            }
+            let length =
+                usize::try_from(take_i32(data)?).map_err(|_| SourceError::PollDeltaFailed {
+                    reason: "pgoutput tuple has a negative value length".to_string(),
+                })?;
+            let bytes = take_bytes(data, length)?;
+            std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| SourceError::PollDeltaFailed {
+                    reason: "pgoutput tuple value is not a BIGINT".to_string(),
+                })
+        })
+        .collect()
+}
+
+fn parse_pgoutput_text_tuple(data: &mut &[u8], columns: usize) -> Result<Vec<String>, SourceError> {
+    let count = usize::from(take_u16(data)?);
+    if count != columns {
+        return Err(SourceError::PollDeltaFailed {
+            reason: format!("pgoutput tuple has {count} columns but source schema has {columns}"),
+        });
+    }
+    (0..count)
+        .map(|_| {
+            if take_byte(data)? != b't' {
+                return Err(SourceError::PollDeltaFailed {
+                    reason: "pgoutput source requires non-NULL text tuple values".to_string(),
+                });
+            }
+            let length =
+                usize::try_from(take_i32(data)?).map_err(|_| SourceError::PollDeltaFailed {
+                    reason: "pgoutput tuple has a negative value length".to_string(),
+                })?;
+            std::str::from_utf8(take_bytes(data, length)?)
+                .map(str::to_string)
+                .map_err(|_| SourceError::PollDeltaFailed {
+                    reason: "pgoutput tuple is not UTF-8".to_string(),
+                })
+        })
+        .collect()
+}
+
+fn decimal_scaled(value: &str, scale: i8) -> Result<i128, SourceError> {
+    let negative = value.starts_with('-');
+    let value = value.trim_start_matches(['-', '+']);
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let scale = usize::try_from(scale).map_err(|_| SourceError::PollDeltaFailed {
+        reason: "negative DECIMAL scale is unsupported".to_string(),
+    })?;
+    if fraction.len() > scale
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(SourceError::PollDeltaFailed {
+            reason: format!("pgoutput value '{value}' is not a compatible DECIMAL"),
+        });
+    }
+    let digits = format!("{whole}{fraction:0<scale$}");
+    let scaled = digits
+        .parse::<i128>()
+        .map_err(|_| SourceError::PollDeltaFailed {
+            reason: format!("pgoutput DECIMAL '{value}' overflows"),
+        })?;
+    Ok(if negative { -scaled } else { scaled })
+}
+
+fn take_byte(data: &mut &[u8]) -> Result<u8, SourceError> {
+    let Some((&byte, rest)) = data.split_first() else {
+        return Err(SourceError::PollDeltaFailed {
+            reason: "truncated pgoutput message".to_string(),
+        });
+    };
+    *data = rest;
+    Ok(byte)
+}
+
+fn expect_byte(data: &mut &[u8], expected: u8) -> Result<(), SourceError> {
+    (take_byte(data)? == expected)
+        .then_some(())
+        .ok_or_else(|| SourceError::PollDeltaFailed {
+            reason: format!(
+                "invalid pgoutput tuple marker; expected '{}",
+                expected as char
+            ),
+        })
+}
+
+fn take_bytes<'a>(data: &mut &'a [u8], length: usize) -> Result<&'a [u8], SourceError> {
+    if data.len() < length {
+        return Err(SourceError::PollDeltaFailed {
+            reason: "truncated pgoutput message".to_string(),
+        });
+    }
+    let (value, rest) = data.split_at(length);
+    *data = rest;
+    Ok(value)
+}
+
+fn take_u16(data: &mut &[u8]) -> Result<u16, SourceError> {
+    Ok(u16::from_be_bytes(
+        take_bytes(data, 2)?
+            .try_into()
+            .map_err(|_| SourceError::PollDeltaFailed {
+                reason: "truncated pgoutput message".to_string(),
+            })?,
+    ))
+}
+
+fn take_u32(data: &mut &[u8]) -> Result<u32, SourceError> {
+    Ok(u32::from_be_bytes(
+        take_bytes(data, 4)?
+            .try_into()
+            .map_err(|_| SourceError::PollDeltaFailed {
+                reason: "truncated pgoutput message".to_string(),
+            })?,
+    ))
+}
+
+fn take_i32(data: &mut &[u8]) -> Result<i32, SourceError> {
+    Ok(i32::from_be_bytes(
+        take_bytes(data, 4)?
+            .try_into()
+            .map_err(|_| SourceError::PollDeltaFailed {
+                reason: "truncated pgoutput message".to_string(),
+            })?,
+    ))
+}
+
+fn take_cstring<'a>(data: &mut &'a [u8]) -> Result<&'a [u8], SourceError> {
+    let length =
+        data.iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| SourceError::PollDeltaFailed {
+                reason: "unterminated pgoutput string".to_string(),
+            })?;
+    let value = take_bytes(data, length)?;
+    take_byte(data)?;
+    Ok(value)
 }
 
 fn decode_pgoutput(payload: &[u8]) -> Result<CdcChange, SourceError> {
@@ -596,6 +1417,68 @@ mod tests {
     }
 
     #[test]
+    fn native_pgoutput_relation_insert_and_update_preserve_exact_images() {
+        let relation_id = 42_u32;
+        let mut relation = vec![b'R'];
+        relation.extend_from_slice(&relation_id.to_be_bytes());
+        relation.extend_from_slice(b"public\0orders\0d");
+        relation.extend_from_slice(&1_u16.to_be_bytes());
+        relation.extend_from_slice(&[0]);
+        relation.extend_from_slice(b"id\0");
+        relation.extend_from_slice(&20_u32.to_be_bytes());
+        relation.extend_from_slice(&(-1_i32).to_be_bytes());
+        let mut relations = std::collections::HashMap::new();
+        assert_eq!(
+            decode_native_pgoutput_message(&mut relations, 1, PgLsn(9), &relation).unwrap(),
+            None
+        );
+
+        let tuple = |value: i64| {
+            let text = value.to_string();
+            let mut bytes = Vec::from(*b"N");
+            bytes.extend_from_slice(&1_u16.to_be_bytes());
+            bytes.push(b't');
+            bytes.extend_from_slice(&(text.len() as i32).to_be_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+            bytes
+        };
+        let mut insert = vec![b'I'];
+        insert.extend_from_slice(&relation_id.to_be_bytes());
+        insert.extend(tuple(7));
+        assert_eq!(
+            decode_native_pgoutput_message(&mut relations, 1, PgLsn(10), &insert).unwrap(),
+            Some(CdcChange {
+                lsn: PgLsn(10),
+                table_id: relation_id,
+                primary_key: 7_i64.to_be_bytes().to_vec(),
+                row_id: CdcChange::row_id_for(relation_id, &7_i64.to_be_bytes()),
+                operation: CdcOperation::Insert,
+                old_values: None,
+                new_values: Some(vec![7]),
+            })
+        );
+
+        let mut update = vec![b'U'];
+        update.extend_from_slice(&relation_id.to_be_bytes());
+        let mut old = tuple(7);
+        old[0] = b'O';
+        update.extend(old);
+        update.extend(tuple(8));
+        assert_eq!(
+            decode_native_pgoutput_message(&mut relations, 1, PgLsn(11), &update).unwrap(),
+            Some(CdcChange {
+                lsn: PgLsn(11),
+                table_id: relation_id,
+                primary_key: 7_i64.to_be_bytes().to_vec(),
+                row_id: CdcChange::row_id_for(relation_id, &7_i64.to_be_bytes()),
+                operation: CdcOperation::Update,
+                old_values: Some(vec![7]),
+                new_values: Some(vec![8]),
+            })
+        );
+    }
+
+    #[test]
     fn cdc_pgoutput_truncated_tuple_returns_rs_error_no_panic() {
         let payload = b"B|0/16B3748|1001|I";
         let res = decode_pgoutput(payload);
@@ -607,5 +1490,32 @@ mod tests {
         let payload = b"{\"change\": [invalid json";
         let res = decode_wal2json(payload);
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn cdc_fence_captures_committed_snapshot_and_queued_live_lsn() {
+        let mut source = test_source(CdcWireFormat::PgOutput);
+        source
+            .commit_offset(4, PgLsn(10).to_offset_token())
+            .await
+            .unwrap();
+        source
+            .enqueue(
+                CdcChange {
+                    lsn: PgLsn(20),
+                    table_id: 1,
+                    primary_key: b"key".to_vec(),
+                    row_id: 1,
+                    operation: CdcOperation::Insert,
+                    old_values: None,
+                    new_values: Some(vec![1]),
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            source.capture_snapshot_delta_fence(None).await.unwrap(),
+            SnapshotDeltaFence::new(PgLsn(10).to_offset_token(), PgLsn(20).to_offset_token())
+        );
     }
 }

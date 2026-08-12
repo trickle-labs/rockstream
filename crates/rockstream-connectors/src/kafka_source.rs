@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
@@ -15,7 +14,8 @@ use rockstream_types::timestamp::{Epoch, EventTimeWatermark};
 use serde::Deserialize;
 
 use crate::source_connector::{PollDeltaResult, SnapshotStream, SourceConnector, SourceError};
-use crate::source_epoch::OffsetToken;
+use crate::source_epoch::{OffsetToken, SnapshotDeltaFence};
+use crate::source_json::{json_rows_to_batch, JsonRow};
 
 /// Native Kafka queue bound in KiB; one overflow record is retained locally.
 pub const KAFKA_SOURCE_BUFFER_LIMIT: usize = 50_000;
@@ -25,7 +25,7 @@ struct KafkaRecord {
     offset: u64,
     partition: i32,
     timestamp: i64,
-    values: Vec<i64>,
+    values: JsonRow,
     weight: i64,
     bytes: usize,
 }
@@ -33,7 +33,7 @@ struct KafkaRecord {
 #[derive(Deserialize)]
 struct KafkaPayload {
     timestamp: i64,
-    values: Vec<i64>,
+    values: JsonRow,
     #[serde(default = "default_weight")]
     weight: i64,
 }
@@ -278,29 +278,17 @@ impl KafkaSource {
     }
 
     fn build_batch(&self, records: &[KafkaRecord]) -> Result<Vec<RecordBatch>, SourceError> {
-        use arrow::array::Int64Array;
         use rockstream_types::arrow_batch::append_weight_column;
 
-        let num_rows = records.len();
-        let num_cols = self.schema.fields().len();
-        let mut columns: Vec<Vec<i64>> = vec![vec![0; num_rows]; num_cols];
-        let mut weights = vec![0; num_rows];
-        for (row, record) in records.iter().enumerate() {
-            weights[row] = record.weight;
-            for (column, values) in columns.iter_mut().enumerate() {
-                values[row] = record.values.get(column).copied().unwrap_or(0);
-            }
-        }
-        let data = RecordBatch::try_new(
-            self.schema.clone(),
-            columns
-                .into_iter()
-                .map(|values| Arc::new(Int64Array::from(values)) as arrow::array::ArrayRef)
-                .collect(),
-        )
-        .map_err(|error| SourceError::PollDeltaFailed {
-            reason: format!("failed to build Kafka RecordBatch: {error}"),
-        })?;
+        let rows = records
+            .iter()
+            .map(|record| record.values.clone())
+            .collect::<Vec<_>>();
+        let weights = records
+            .iter()
+            .map(|record| record.weight)
+            .collect::<Vec<_>>();
+        let data = json_rows_to_batch(&self.schema, &rows, "Kafka")?;
         append_weight_column(data, &weights)
             .map(|batch| vec![batch])
             .map_err(|error| SourceError::PollDeltaFailed {
@@ -320,9 +308,33 @@ impl SourceConnector for KafkaSource {
         Ok(self.schema.clone())
     }
 
+    async fn capture_snapshot_delta_fence(
+        &mut self,
+        _partition_filter: Option<PartitionFilter>,
+    ) -> Result<SnapshotDeltaFence, SourceError> {
+        let assigned = self.refresh_assignment()?;
+        let offsets = self
+            .last_polled
+            .clone()
+            .or_else(|| self.last_committed.as_ref().map(|(_, token)| token.clone()))
+            .map(Ok)
+            .unwrap_or_else(|| {
+                serde_json::to_vec(
+                    &assigned
+                        .iter()
+                        .map(|partition| (*partition as u64, 0_u64))
+                        .collect::<BTreeMap<_, _>>(),
+                )
+                .map(OffsetToken::new)
+                .map_err(|error| SourceError::Io(format!("Kafka fence encoding failed: {error}")))
+            })?;
+        Ok(SnapshotDeltaFence::new(offsets.clone(), offsets))
+    }
+
     async fn start_snapshot(
         &mut self,
-        _frontier: Epoch,
+        _fence: &SnapshotDeltaFence,
+        _after: Option<OffsetToken>,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
         Ok(SnapshotStream::new(vec![]))
@@ -390,11 +402,7 @@ impl SourceConnector for KafkaSource {
         })?);
         self.last_polled = Some(new_offset.clone());
         Ok(PollDeltaResult {
-            batches: if records.is_empty() {
-                vec![]
-            } else {
-                self.build_batch(&records)?
-            },
+            batches: self.build_batch(&records)?,
             new_offset,
             watermark: self.current_global_watermark(),
         })

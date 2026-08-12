@@ -4,8 +4,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use object_store::memory::InMemory;
 use rockstream_connectors::{
-    OffsetToken, PollDeltaResult, SnapshotStream, SourceCheckpoint, SourceCheckpointStore,
-    SourceConnector, SourceError, SourceRuntimeCoordinator,
+    OffsetToken, PollDeltaResult, SnapshotDeltaFence, SnapshotStream, SourceCheckpoint,
+    SourceCheckpointStore, SourceConnector, SourceError, SourceRuntimeCoordinator,
 };
 use rockstream_storage::{ShardDb, WriteBatch};
 use rockstream_types::connector::PartitionFilter;
@@ -29,7 +29,8 @@ impl SourceConnector for PausableSource {
 
     async fn start_snapshot(
         &mut self,
-        _frontier: Epoch,
+        _fence: &SnapshotDeltaFence,
+        _after: Option<OffsetToken>,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
         Ok(SnapshotStream::new(vec![]))

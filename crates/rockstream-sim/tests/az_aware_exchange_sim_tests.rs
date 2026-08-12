@@ -301,12 +301,9 @@ async fn same_host_shared_memory_peer_crash_falls_back_to_grpc_without_duplicati
     }
     // Fast-path elision: neither the sender outbox (0x05) nor the receiver inbox
     // (0x04) is persisted for the successfully delivered gRPC-fallback frame.
-    assert_eq!(
-        delete_outbox_if_present(&src_db, 100, 1, 1, 5)
-            .await
-            .unwrap(),
-        false
-    );
+    assert!(!delete_outbox_if_present(&src_db, 100, 1, 1, 5)
+        .await
+        .unwrap());
     assert_eq!(src_db.scan_prefix(&[0x05]).await.unwrap().len(), 0);
     assert_eq!(target_db.scan_prefix(&[0x04]).await.unwrap().len(), 0);
 

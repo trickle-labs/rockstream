@@ -57,5 +57,5 @@ fn test_dlq_retention_gc_purges_expired_entries() {
 #[test]
 fn test_dlq_capacity_bounded() {
     let _guard = TEST_LOCK.lock().unwrap();
-    assert!(MAX_DLQ_CAPACITY > 0);
+    const { assert!(MAX_DLQ_CAPACITY > 0) }
 }

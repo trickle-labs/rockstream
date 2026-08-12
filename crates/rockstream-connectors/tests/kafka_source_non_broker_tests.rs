@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use rockstream_connectors::{KafkaSource, OffsetToken, SourceConnector};
+use rockstream_connectors::{KafkaSource, OffsetToken, SnapshotDeltaFence, SourceConnector};
 use rockstream_types::ids::ConnectorId;
 
 fn schema() -> Arc<Schema> {
@@ -44,7 +44,18 @@ async fn broker_free_fast_paths_preserve_offsets_and_reject_invalid_commits() {
     assert_eq!(
         (
             source.discover_schema().unwrap().fields().len(),
-            source.start_snapshot(0, None).await.unwrap().count(),
+            source
+                .start_snapshot(
+                    &SnapshotDeltaFence::new(
+                        OffsetToken::new(Vec::new()),
+                        OffsetToken::new(Vec::new()),
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .count(),
             source.get_partition_offset(&OffsetToken::new(vec![]), 3),
             source.get_partition_offset(&token, 3),
             source.get_partition_offset(&token, 4),

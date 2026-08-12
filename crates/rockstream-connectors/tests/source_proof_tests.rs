@@ -6,8 +6,8 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use rockstream_connectors::{
-    OffsetToken, PollDeltaResult, S3Source, SnapshotStream, SourceConnector, SourceEpochRegistry,
-    SourceError,
+    OffsetToken, PollDeltaResult, S3Source, SnapshotDeltaFence, SnapshotStream, SourceConnector,
+    SourceEpochRegistry, SourceError,
 };
 use rockstream_ops::time_window::TumbleWindowOp;
 use rockstream_plan::LateDataPolicy;
@@ -85,7 +85,8 @@ impl SourceConnector for RecordedSource {
 
     async fn start_snapshot(
         &mut self,
-        _frontier: Epoch,
+        _fence: &SnapshotDeltaFence,
+        _after: Option<OffsetToken>,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
         Ok(SnapshotStream::new(vec![]))
@@ -721,10 +722,13 @@ impl<'a, S: SourceConnector> SourceConnector for ChaosSource<'a, S> {
 
     async fn start_snapshot(
         &mut self,
-        frontier: Epoch,
+        fence: &SnapshotDeltaFence,
+        after: Option<OffsetToken>,
         partition_filter: Option<PartitionFilter>,
     ) -> Result<SnapshotStream, SourceError> {
-        self.inner.start_snapshot(frontier, partition_filter).await
+        self.inner
+            .start_snapshot(fence, after, partition_filter)
+            .await
     }
 
     async fn poll_delta(

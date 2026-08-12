@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -61,13 +61,18 @@ use tokio::net::TcpListener;
 
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine as _;
+use rockstream_connectors::{
+    BackfillCursor, BackfillLifecycle, BackfillPhase, KafkaSource, OffsetToken, PgOutputConfig,
+    PostgresCdcSource, S3Source, SnapshotDeltaFence, SourceCheckpointStore, SourceConnector,
+    SourceOwnerLease, SourceRuntimeCoordinator,
+};
 use rockstream_ops::sink::{column_values_to_tsv_bytes, materialize_view_state};
 use rockstream_ops::ArrowZSet;
 use rockstream_sql::SqlFrontend;
 use rockstream_types::config::ScatterPruningConfig;
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
-use rockstream_types::ids::{OperatorId, ShardId, ViewId};
+use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId};
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
 use crate::auth::{
@@ -459,6 +464,17 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
 
 fn string_to_arrow_datatype(dt: &str) -> datafusion::arrow::datatypes::DataType {
     use datafusion::arrow::datatypes::DataType;
+    if let Some((precision, scale)) = dt
+        .strip_prefix("Decimal(")
+        .or_else(|| dt.strip_prefix("DECIMAL("))
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.split_once(','))
+        .and_then(|(precision, scale)| {
+            Some((precision.trim().parse().ok()?, scale.trim().parse().ok()?))
+        })
+    {
+        return DataType::Decimal128(precision, scale);
+    }
     match dt {
         "Int16" => DataType::Int16,
         "Int32" => DataType::Int32,
@@ -791,6 +807,23 @@ pub const QUERY_TIME_SCATTER_PATHOLOGICAL_BYTE_LIMIT: usize = 32 * 1024 * 1024 *
 pub const MAX_COMPILED_VIEW_SOURCE_ROWS: usize = 1_000_000;
 /// Byte bound paired with `MAX_COMPILED_VIEW_SOURCE_ROWS`.
 pub const MAX_COMPILED_VIEW_SOURCE_SCAN_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum source rows consumed in one bounded backfill poll.
+pub const BACKFILL_BATCH_MAX_ROWS: usize = 2_000;
+/// Maximum bytes a connector may return for one catch-up M3 step.
+pub const BACKFILL_LIVE_DELTA_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Reservation capacity dedicated to source backfill; it never evicts views.
+pub const BACKFILL_ADMISSION_CAPACITY_BYTES: u64 = BACKFILL_LIVE_DELTA_MAX_BYTES as u64;
+
+struct BackfillReservation {
+    controller: Arc<crate::admission::BackfillAdmissionController>,
+    bytes: u64,
+}
+
+impl Drop for BackfillReservation {
+    fn drop(&mut self) {
+        self.controller.release(self.bytes);
+    }
+}
 
 /// Observable current fill-levels for the bounded query-time scatter source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1673,9 +1706,18 @@ pub struct GatewayHandler {
     // Audit: each guard protects a synchronous source-state transition that
     // remains valid after a holder panic; guards are dropped before awaits.
     webhook_sources: Arc<DashMap<String, Arc<Mutex<HttpWebhookSource>>>>,
+    backfill_admission: Arc<crate::admission::BackfillAdmissionController>,
+    /// Bound only by `GatewayServer`; source tasks upgrade it per poll and
+    /// exit when the server releases its handler.
+    self_ref: Arc<Mutex<Weak<GatewayHandler>>>,
+    source_workers: Arc<DashMap<String, ()>>,
 }
 
 impl GatewayHandler {
+    fn bind_server(&self, handler: &Arc<Self>) {
+        *self.self_ref.lock() = Arc::downgrade(handler);
+    }
+
     /// Fill-level snapshot of every per-connection state map (v0.51.6
     /// Slice 2). Used to prove abnormal-disconnect cleanup (raw TCP kill,
     /// not graceful `Terminate`/`DISCARD ALL`) removes all per-connection
@@ -1794,6 +1836,9 @@ impl GatewayHandler {
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
             webhook_sources: Arc::new(DashMap::new()),
+            backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
+            self_ref: Arc::new(Mutex::new(Weak::new())),
+            source_workers: Arc::new(DashMap::new()),
         }
     }
 
@@ -1828,6 +1873,9 @@ impl GatewayHandler {
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
             webhook_sources: Arc::new(DashMap::new()),
+            backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
+            self_ref: Arc::new(Mutex::new(Weak::new())),
+            source_workers: Arc::new(DashMap::new()),
         }
     }
 
@@ -2035,6 +2083,77 @@ impl GatewayHandler {
                     }
                     self.compiled_views
                         .insert(view.name.clone(), Arc::new(compiled));
+                    let sources = compile_deps
+                        .iter()
+                        .filter_map(|relation| {
+                            self.catalog.get_source(relation).filter(|source| {
+                                source.table_name.as_deref() == Some(relation.as_str())
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if !sources.is_empty() {
+                        let mut estimated_rows = 0;
+                        let mut all_running = true;
+                        for source in &sources {
+                            let connector_id = source_view_connector_id(&source.name, &view.name);
+                            let lifecycle = SourceCheckpointStore::new(
+                                Arc::clone(&shard_db),
+                                connector_id.0 as u128,
+                                connector_id,
+                            )
+                            .backfill_lifecycle(&view.name)
+                            .await;
+                            match lifecycle {
+                                Ok(Some(lifecycle)) => {
+                                    estimated_rows += lifecycle.estimated_rows;
+                                    all_running &= lifecycle.phase == BackfillPhase::Running;
+                                }
+                                Ok(None) => all_running = false,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        view = %view.name,
+                                        error = %error,
+                                        "recover_compiled_views: failed to load source backfill lifecycle"
+                                    );
+                                    all_running = false;
+                                }
+                            }
+                        }
+                        self.catalog.begin_backfill(&view.name, estimated_rows);
+                        if all_running {
+                            self.refresh_backfill_progress(&view.name).await;
+                            self.catalog.publish_backfill(&view.name);
+                            for source in sources {
+                                match source.source_type.as_str() {
+                                    "s3" => self.spawn_s3_source_worker(
+                                        source,
+                                        view.name.clone(),
+                                        Arc::clone(&shard_db),
+                                    ),
+                                    "kafka" => self.spawn_kafka_source_worker(
+                                        source,
+                                        view.name.clone(),
+                                        Arc::clone(&shard_db),
+                                    ),
+                                    "postgres_cdc" => self.spawn_postgres_cdc_source_worker(
+                                        source,
+                                        view.name.clone(),
+                                        Arc::clone(&shard_db),
+                                    ),
+                                    _ => {}
+                                }
+                            }
+                        } else if let Err(error) = self
+                            .backfill_source_view(&sources, &view.name, &shard_db)
+                            .await
+                        {
+                            tracing::warn!(
+                                view = %view.name,
+                                error = %error,
+                                "recover_compiled_views: source backfill remains unpublished"
+                            );
+                        }
+                    }
                     tracing::info!(
                         view = %view.name,
                         op_id,
@@ -2349,6 +2468,1053 @@ impl GatewayHandler {
         Ok(())
     }
 
+    /// Drive one source through snapshot, bounded catch-up, then publication.
+    /// Every accepted batch uses `commit_backfill_epoch`, so table input, view
+    /// output, operator state, checkpoint, cursor, lifecycle, and frontier
+    /// share one M3 write.
+    async fn backfill_bound_source<S: SourceConnector>(
+        &self,
+        source_name: &str,
+        view_name: &str,
+        mut runtime: SourceRuntimeCoordinator<S>,
+        publish: bool,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let table = self.catalog.source_table(source_name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("source '{source_name}' is not bound to a table"),
+            }
+        })?;
+        runtime.recover().await.map_err(source_backfill_error)?;
+        let lease = runtime
+            .acquire_owner(format!("gateway:{view_name}"))
+            .map_err(source_backfill_error)?;
+        let recovered = runtime
+            .backfill_lifecycle(view_name)
+            .await
+            .map_err(source_backfill_error)?;
+        if recovered
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.phase == BackfillPhase::Running)
+        {
+            if publish {
+                self.catalog.publish_backfill(view_name);
+            }
+            return Ok(());
+        }
+        let fence = recovered
+            .as_ref()
+            .map(|lifecycle| lifecycle.cursor.fence.clone())
+            .unwrap_or(
+                runtime
+                    .capture_snapshot_delta_fence()
+                    .await
+                    .map_err(source_backfill_error)?,
+            );
+        if recovered.is_none() {
+            runtime
+                .persist_backfill_intent(&BackfillLifecycle::new(
+                    BackfillPhase::Snapshotting,
+                    BackfillCursor::new(view_name, 0, Vec::new(), fence.clone(), 0),
+                    0,
+                    0,
+                    0,
+                    None,
+                ))
+                .await
+                .map_err(source_backfill_error)?;
+        }
+        let mut snapshot_after = recovered.as_ref().and_then(|lifecycle| {
+            (lifecycle.phase == BackfillPhase::Snapshotting)
+                .then(|| OffsetToken::new(lifecycle.cursor.last_key.clone()))
+        });
+        let snapshot = if recovered
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.phase == BackfillPhase::CatchingUp)
+        {
+            rockstream_connectors::SnapshotStream::new(Vec::new())
+        } else {
+            runtime
+                .start_snapshot(&fence, snapshot_after.clone(), BACKFILL_BATCH_MAX_ROWS)
+                .await
+                .map_err(source_backfill_error)?
+        };
+        let estimated_rows = recovered
+            .as_ref()
+            .map(|lifecycle| lifecycle.estimated_rows)
+            .filter(|estimated_rows| *estimated_rows > 0)
+            .unwrap_or(snapshot.remaining_rows() as u64);
+        let mut snapshot_rows_remaining = snapshot.remaining_rows() as u64;
+        if recovered.is_none() {
+            self.catalog.begin_backfill(view_name, estimated_rows);
+        }
+        let mut live_offset = recovered
+            .as_ref()
+            .filter(|lifecycle| lifecycle.phase == BackfillPhase::CatchingUp)
+            .map(|lifecycle| OffsetToken::new(lifecycle.cursor.last_key.clone()))
+            .unwrap_or_else(|| fence.live.clone());
+
+        let mut snapshot = snapshot;
+        loop {
+            let mut committed_chunk = false;
+            for chunk in snapshot {
+                snapshot_rows_remaining =
+                    snapshot_rows_remaining.saturating_sub(chunk.batch.num_rows() as u64);
+                snapshot_after = Some(chunk.resume_offset.clone());
+                self.commit_bound_source_batch(
+                    &mut runtime,
+                    &lease,
+                    view_name,
+                    &table,
+                    &fence,
+                    chunk.resume_offset,
+                    &chunk.batch,
+                    BackfillPhase::Snapshotting,
+                    None,
+                    snapshot_rows_remaining,
+                    estimated_rows,
+                    shard_db,
+                )
+                .await?;
+                committed_chunk = true;
+            }
+            if !committed_chunk
+                || snapshot_after
+                    .as_ref()
+                    .is_some_and(|cursor| cursor == &fence.snapshot)
+            {
+                break;
+            }
+            snapshot = runtime
+                .start_snapshot(&fence, snapshot_after.clone(), BACKFILL_BATCH_MAX_ROWS)
+                .await
+                .map_err(source_backfill_error)?;
+            snapshot_rows_remaining = snapshot.remaining_rows() as u64;
+        }
+        self.catalog.catch_up_backfill(view_name, None);
+
+        loop {
+            let delta = runtime
+                .poll_delta_after(
+                    live_offset.clone(),
+                    BACKFILL_LIVE_DELTA_MAX_BYTES,
+                    BACKFILL_BATCH_MAX_ROWS,
+                )
+                .await
+                .map_err(source_backfill_error)?;
+            if delta.batches.is_empty() {
+                break;
+            }
+            let delta_bytes = delta
+                .batches
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .sum::<usize>();
+            if delta_bytes > BACKFILL_LIVE_DELTA_MAX_BYTES {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "[RS-4020] backfill.live_delta_buffer_full: live delta buffer is {delta_bytes} bytes, above BACKFILL_LIVE_DELTA_MAX_BYTES={BACKFILL_LIVE_DELTA_MAX_BYTES}"
+                    ),
+                });
+            }
+            let mut combined = Vec::new();
+            for batch in &delta.batches {
+                combined.extend(
+                    source_batch_to_dml_ops(&table.name, &table.columns, batch)
+                        .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?,
+                );
+            }
+            self.commit_bound_source_ops(
+                &mut runtime,
+                &lease,
+                view_name,
+                &table,
+                &fence,
+                delta.new_offset.clone(),
+                combined,
+                BackfillPhase::CatchingUp,
+                None,
+                0,
+                estimated_rows,
+                shard_db,
+            )
+            .await?;
+            live_offset = delta.new_offset;
+        }
+
+        let epoch = runtime.next_epoch().map_err(source_backfill_error)?;
+        self.commit_bound_source_ops(
+            &mut runtime,
+            &lease,
+            view_name,
+            &table,
+            &fence,
+            live_offset,
+            Vec::new(),
+            BackfillPhase::Running,
+            Some(epoch),
+            0,
+            estimated_rows,
+            shard_db,
+        )
+        .await?;
+        if publish {
+            self.catalog.publish_backfill(view_name);
+        }
+        Ok(())
+    }
+
+    fn build_s3_source(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+    ) -> Result<(CatalogTable, ConnectorId, S3Source), GatewayError> {
+        let table = self.catalog.source_table(&source.name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("source '{}' is not bound to a table", source.name),
+            }
+        })?;
+        let bucket =
+            source
+                .options
+                .get("bucket")
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("S3 source '{}' requires bucket", source.name),
+                })?;
+        let connector_id = source_view_connector_id(&source.name, view_name);
+        let mut builder = object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_region(
+                source
+                    .options
+                    .get("region")
+                    .map(String::as_str)
+                    .unwrap_or("us-east-1"),
+            );
+        if let Some(endpoint) = source.options.get("endpoint") {
+            builder = builder
+                .with_endpoint(endpoint)
+                .with_allow_http(endpoint.starts_with("http://"));
+        }
+        if let Some(access_key) = source.options.get("access_key") {
+            builder = builder.with_access_key_id(access_key);
+        }
+        if let Some(secret_key) = source.options.get("secret_key") {
+            builder = builder.with_secret_access_key(secret_key);
+        }
+        let object_store =
+            Arc::new(
+                builder
+                    .build()
+                    .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("build S3 source '{}': {error}", source.name),
+                    })?,
+            );
+        let runtime = S3Source::new(connector_id, catalog_columns_to_schema(&table.columns))
+            .with_object_store(object_store, source.options.get("prefix").cloned());
+        Ok((table, connector_id, runtime))
+    }
+
+    fn build_kafka_source(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+    ) -> Result<(CatalogTable, ConnectorId, KafkaSource), GatewayError> {
+        let table = self.catalog.source_table(&source.name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("source '{}' is not bound to a table", source.name),
+            }
+        })?;
+        let bootstrap = source
+            .options
+            .get("bootstrap.servers")
+            .or_else(|| source.options.get("bootstrap_servers"))
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("Kafka source '{}' requires bootstrap.servers", source.name),
+            })?;
+        let topic =
+            source
+                .options
+                .get("topic")
+                .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("Kafka source '{}' requires topic", source.name),
+                })?;
+        let connector_id = source_view_connector_id(&source.name, view_name);
+        let group_id = source
+            .options
+            .get("group.id")
+            .or_else(|| source.options.get("group_id"))
+            .cloned()
+            .unwrap_or_else(|| format!("rockstream-{connector_id}"));
+        let runtime = KafkaSource::connect(
+            connector_id,
+            catalog_columns_to_schema(&table.columns),
+            bootstrap,
+            topic,
+            &group_id,
+        )
+        .map_err(source_backfill_error)?;
+        Ok((table, connector_id, runtime))
+    }
+
+    async fn build_postgres_cdc_source(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+    ) -> Result<(CatalogTable, ConnectorId, PostgresCdcSource), GatewayError> {
+        if source.format != "pgoutput" {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!(
+                    "PostgreSQL CDC source '{}' requires FORMAT pgoutput; wal2json has no native gateway runtime",
+                    source.name
+                ),
+            });
+        }
+        let table = self.catalog.source_table(&source.name).ok_or_else(|| {
+            GatewayError::QueryTimeExecutionFailed {
+                detail: format!("source '{}' is not bound to a table", source.name),
+            }
+        })?;
+        let option = |name: &str| {
+            source.options.get(name).cloned().ok_or_else(|| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("PostgreSQL CDC source '{}' requires {name}", source.name),
+                }
+            })
+        };
+        let credential_ref = option("credential_ref")?;
+        let password = if let Some(variable) = credential_ref.strip_prefix("env://") {
+            Some(
+                std::env::var(variable).map_err(|_| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                    "PostgreSQL CDC source '{}' cannot resolve credential_ref '{credential_ref}'",
+                    source.name
+                ),
+                })?,
+            )
+        } else if credential_ref == "none://trusted" {
+            None
+        } else {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!(
+                    "PostgreSQL CDC source '{}' requires credential_ref env://<PASSWORD_ENV> or none://trusted",
+                    source.name
+                ),
+            });
+        };
+        let connector_id = source_view_connector_id(&source.name, view_name);
+        let port = source.options.get("port").map_or(Ok(5432), |port| {
+            port.parse()
+                .map_err(|_| GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "PostgreSQL CDC source '{}' has invalid port '{port}'",
+                        source.name
+                    ),
+                })
+        })?;
+        let runtime = PostgresCdcSource::connect_pgoutput(
+            connector_id,
+            catalog_columns_to_schema(&table.columns),
+            PgOutputConfig {
+                host: source
+                    .options
+                    .get("host")
+                    .cloned()
+                    .unwrap_or_else(|| "127.0.0.1".to_string()),
+                port,
+                database: source
+                    .options
+                    .get("database")
+                    .cloned()
+                    .unwrap_or_else(|| "postgres".to_string()),
+                user: source
+                    .options
+                    .get("user")
+                    .cloned()
+                    .unwrap_or_else(|| "postgres".to_string()),
+                password,
+                slot: option("slot")?,
+                publication: option("publication")?,
+                table: table.name.clone(),
+            },
+        )
+        .await
+        .map_err(source_backfill_error)?;
+        Ok((table, connector_id, runtime))
+    }
+
+    async fn backfill_s3_source(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+        publish: bool,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        if let crate::admission::BackfillAdmissionDecision::Reject { code, reason } =
+            self.backfill_admission.reserve(
+                BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
+                BACKFILL_ADMISSION_CAPACITY_BYTES,
+            )
+        {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!("[{code}] {reason}"),
+            });
+        }
+        let _reservation = BackfillReservation {
+            controller: Arc::clone(&self.backfill_admission),
+            bytes: BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
+        };
+        let (_, connector_id, source_runtime) = self.build_s3_source(source, view_name)?;
+        let checkpoint_store =
+            SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
+        self.backfill_bound_source(
+            &source.name,
+            view_name,
+            SourceRuntimeCoordinator::new(
+                source_runtime,
+                connector_id,
+                OffsetToken::new(Vec::new()),
+                checkpoint_store,
+            ),
+            publish,
+            shard_db,
+        )
+        .await?;
+        if publish {
+            self.spawn_s3_source_worker(
+                source.clone(),
+                view_name.to_string(),
+                Arc::clone(shard_db),
+            );
+        }
+        Ok(())
+    }
+
+    async fn backfill_kafka_source(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+        publish: bool,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        if let crate::admission::BackfillAdmissionDecision::Reject { code, reason } =
+            self.backfill_admission.reserve(
+                BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
+                BACKFILL_ADMISSION_CAPACITY_BYTES,
+            )
+        {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!("[{code}] {reason}"),
+            });
+        }
+        let _reservation = BackfillReservation {
+            controller: Arc::clone(&self.backfill_admission),
+            bytes: BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
+        };
+        let (_, connector_id, source_runtime) = self.build_kafka_source(source, view_name)?;
+        let checkpoint_store =
+            SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
+        self.backfill_bound_source(
+            &source.name,
+            view_name,
+            SourceRuntimeCoordinator::new(
+                source_runtime,
+                connector_id,
+                OffsetToken::new(Vec::new()),
+                checkpoint_store,
+            ),
+            publish,
+            shard_db,
+        )
+        .await?;
+        if publish {
+            self.spawn_kafka_source_worker(
+                source.clone(),
+                view_name.to_string(),
+                Arc::clone(shard_db),
+            );
+        }
+        Ok(())
+    }
+
+    async fn backfill_postgres_cdc_source(
+        &self,
+        source: &CatalogSourceEntry,
+        view_name: &str,
+        publish: bool,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        if let crate::admission::BackfillAdmissionDecision::Reject { code, reason } =
+            self.backfill_admission.reserve(
+                BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
+                BACKFILL_ADMISSION_CAPACITY_BYTES,
+            )
+        {
+            return Err(GatewayError::QueryTimeExecutionFailed {
+                detail: format!("[{code}] {reason}"),
+            });
+        }
+        let _reservation = BackfillReservation {
+            controller: Arc::clone(&self.backfill_admission),
+            bytes: BACKFILL_LIVE_DELTA_MAX_BYTES as u64,
+        };
+        let (_, connector_id, source_runtime) =
+            self.build_postgres_cdc_source(source, view_name).await?;
+        let checkpoint_store =
+            SourceCheckpointStore::new(Arc::clone(shard_db), connector_id.0 as u128, connector_id);
+        self.backfill_bound_source(
+            &source.name,
+            view_name,
+            SourceRuntimeCoordinator::new(
+                source_runtime,
+                connector_id,
+                OffsetToken::new(Vec::new()),
+                checkpoint_store,
+            ),
+            publish,
+            shard_db,
+        )
+        .await?;
+        if publish {
+            self.spawn_postgres_cdc_source_worker(
+                source.clone(),
+                view_name.to_string(),
+                Arc::clone(shard_db),
+            );
+        }
+        Ok(())
+    }
+
+    async fn backfill_source_view(
+        &self,
+        sources: &[CatalogSourceEntry],
+        view_name: &str,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        for source in sources {
+            match source.source_type.as_str() {
+                "s3" => {
+                    self.backfill_s3_source(source, view_name, false, shard_db)
+                        .await?
+                }
+                "kafka" => {
+                    self.backfill_kafka_source(source, view_name, false, shard_db)
+                        .await?
+                }
+                "postgres_cdc" => {
+                    self.backfill_postgres_cdc_source(source, view_name, false, shard_db)
+                        .await?
+                }
+                source_type => {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
+                            "source type '{source_type}' has no gateway backfill runtime; materialized view '{view_name}' remains unpublished"
+                        ),
+                    });
+                }
+            }
+        }
+        self.refresh_backfill_progress(view_name).await;
+        self.catalog.publish_backfill(view_name);
+        for source in sources {
+            match source.source_type.as_str() {
+                "s3" => self.spawn_s3_source_worker(
+                    source.clone(),
+                    view_name.to_string(),
+                    Arc::clone(shard_db),
+                ),
+                "kafka" => self.spawn_kafka_source_worker(
+                    source.clone(),
+                    view_name.to_string(),
+                    Arc::clone(shard_db),
+                ),
+                "postgres_cdc" => self.spawn_postgres_cdc_source_worker(
+                    source.clone(),
+                    view_name.to_string(),
+                    Arc::clone(shard_db),
+                ),
+                _ => unreachable!("source type was checked above"),
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_backfill_progress(&self, view_name: &str) {
+        let Some(shard_db) = &self.shard_db else {
+            return;
+        };
+        let sources = self
+            .catalog
+            .get_view_deps(view_name)
+            .into_iter()
+            .filter_map(|relation| {
+                self.catalog
+                    .get_source(&relation)
+                    .filter(|source| source.table_name.as_deref() == Some(relation.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let mut cursor_positions = Vec::with_capacity(sources.len());
+        let mut rows_remaining = 0;
+        let mut estimated_rows = 0;
+        for source in &sources {
+            let connector_id = source_view_connector_id(&source.name, view_name);
+            let Ok(Some(lifecycle)) = SourceCheckpointStore::new(
+                Arc::clone(shard_db),
+                connector_id.0 as u128,
+                connector_id,
+            )
+            .backfill_lifecycle(view_name)
+            .await
+            else {
+                return;
+            };
+            rows_remaining += lifecycle.rows_remaining;
+            estimated_rows += lifecycle.estimated_rows;
+            cursor_positions.push((source.name.clone(), lifecycle.cursor.committed_epoch));
+        }
+        if cursor_positions.is_empty() {
+            return;
+        }
+        cursor_positions.sort_by(|left, right| left.0.cmp(&right.0));
+        let cursor_position = if cursor_positions.len() == 1 {
+            cursor_positions[0].1.to_string()
+        } else {
+            cursor_positions
+                .into_iter()
+                .map(|(source, epoch)| format!("{source}:{epoch}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        self.catalog.update_backfill_progress(
+            view_name,
+            cursor_position,
+            rows_remaining,
+            estimated_rows,
+        );
+    }
+
+    fn spawn_s3_source_worker(
+        &self,
+        source: CatalogSourceEntry,
+        view_name: String,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+    ) {
+        let key = format!("{}:{view_name}", source.name);
+        if self.source_workers.insert(key.clone(), ()).is_some() {
+            return;
+        }
+        let weak = self.self_ref.lock().clone();
+        if weak.strong_count() == 0 {
+            self.source_workers.remove(&key);
+            return;
+        }
+        tokio::spawn(async move {
+            GatewayHandler::run_s3_source_worker(weak.clone(), source, view_name, shard_db).await;
+            if let Some(handler) = weak.upgrade() {
+                handler.source_workers.remove(&key);
+            }
+        });
+    }
+
+    fn spawn_kafka_source_worker(
+        &self,
+        source: CatalogSourceEntry,
+        view_name: String,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+    ) {
+        let key = format!("{}:{view_name}", source.name);
+        if self.source_workers.insert(key.clone(), ()).is_some() {
+            return;
+        }
+        let weak = self.self_ref.lock().clone();
+        if weak.strong_count() == 0 {
+            self.source_workers.remove(&key);
+            return;
+        }
+        tokio::spawn(async move {
+            GatewayHandler::run_kafka_source_worker(weak.clone(), source, view_name, shard_db)
+                .await;
+            if let Some(handler) = weak.upgrade() {
+                handler.source_workers.remove(&key);
+            }
+        });
+    }
+
+    fn spawn_postgres_cdc_source_worker(
+        &self,
+        source: CatalogSourceEntry,
+        view_name: String,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+    ) {
+        let key = format!("{}:{view_name}", source.name);
+        if self.source_workers.insert(key.clone(), ()).is_some() {
+            return;
+        }
+        let weak = self.self_ref.lock().clone();
+        if weak.strong_count() == 0 {
+            self.source_workers.remove(&key);
+            return;
+        }
+        tokio::spawn(async move {
+            GatewayHandler::run_postgres_cdc_source_worker(
+                weak.clone(),
+                source,
+                view_name,
+                shard_db,
+            )
+            .await;
+            if let Some(handler) = weak.upgrade() {
+                handler.source_workers.remove(&key);
+            }
+        });
+    }
+
+    async fn run_kafka_source_worker(
+        weak: Weak<GatewayHandler>,
+        source: CatalogSourceEntry,
+        view_name: String,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+    ) {
+        let Some(handler) = weak.upgrade() else {
+            return;
+        };
+        let Ok((table, connector_id, source_runtime)) =
+            handler.build_kafka_source(&source, &view_name)
+        else {
+            return;
+        };
+        drop(handler);
+        let checkpoint_store =
+            SourceCheckpointStore::new(Arc::clone(&shard_db), connector_id.0 as u128, connector_id);
+        Self::run_live_source_worker(
+            weak,
+            source,
+            view_name,
+            table,
+            SourceRuntimeCoordinator::new(
+                source_runtime,
+                connector_id,
+                OffsetToken::new(Vec::new()),
+                checkpoint_store,
+            ),
+            shard_db,
+        )
+        .await;
+    }
+
+    async fn run_postgres_cdc_source_worker(
+        weak: Weak<GatewayHandler>,
+        source: CatalogSourceEntry,
+        view_name: String,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+    ) {
+        let Some(handler) = weak.upgrade() else {
+            return;
+        };
+        let Ok((table, connector_id, source_runtime)) =
+            handler.build_postgres_cdc_source(&source, &view_name).await
+        else {
+            return;
+        };
+        drop(handler);
+        let checkpoint_store =
+            SourceCheckpointStore::new(Arc::clone(&shard_db), connector_id.0 as u128, connector_id);
+        Self::run_live_source_worker(
+            weak,
+            source,
+            view_name,
+            table,
+            SourceRuntimeCoordinator::new(
+                source_runtime,
+                connector_id,
+                OffsetToken::new(Vec::new()),
+                checkpoint_store,
+            ),
+            shard_db,
+        )
+        .await;
+    }
+
+    async fn run_s3_source_worker(
+        weak: Weak<GatewayHandler>,
+        source: CatalogSourceEntry,
+        view_name: String,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+    ) {
+        let Some(handler) = weak.upgrade() else {
+            return;
+        };
+        let Ok((table, connector_id, source_runtime)) =
+            handler.build_s3_source(&source, &view_name)
+        else {
+            return;
+        };
+        drop(handler);
+        let checkpoint_store =
+            SourceCheckpointStore::new(Arc::clone(&shard_db), connector_id.0 as u128, connector_id);
+        Self::run_live_source_worker(
+            weak,
+            source,
+            view_name,
+            table,
+            SourceRuntimeCoordinator::new(
+                source_runtime,
+                connector_id,
+                OffsetToken::new(Vec::new()),
+                checkpoint_store,
+            ),
+            shard_db,
+        )
+        .await;
+    }
+
+    async fn run_live_source_worker<S: SourceConnector>(
+        weak: Weak<GatewayHandler>,
+        source: CatalogSourceEntry,
+        view_name: String,
+        table: CatalogTable,
+        mut runtime: SourceRuntimeCoordinator<S>,
+        shard_db: Arc<rockstream_storage::ShardDb>,
+    ) {
+        if runtime.recover().await.is_err() {
+            return;
+        }
+        let Ok(lease) = runtime.acquire_owner(format!("gateway:{view_name}:live")) else {
+            return;
+        };
+        loop {
+            let Some(handler) = weak.upgrade() else {
+                break;
+            };
+            if handler.catalog.get_source(&source.name).is_none() {
+                break;
+            }
+            drop(handler);
+            let Ok(Some(lifecycle)) = runtime.backfill_lifecycle(&view_name).await else {
+                break;
+            };
+            if lifecycle.phase != BackfillPhase::Running {
+                break;
+            }
+            let delta = match runtime
+                .poll_delta_after(
+                    OffsetToken::new(lifecycle.cursor.last_key.clone()),
+                    BACKFILL_LIVE_DELTA_MAX_BYTES,
+                    BACKFILL_BATCH_MAX_ROWS,
+                )
+                .await
+            {
+                Ok(delta) => delta,
+                Err(error) => {
+                    tracing::warn!(view = %view_name, error = %error, "live source poll failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            if delta.batches.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let delta_bytes = delta
+                .batches
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .sum::<usize>();
+            if delta_bytes > BACKFILL_LIVE_DELTA_MAX_BYTES {
+                tracing::warn!(
+                    view = %view_name,
+                    delta_bytes,
+                    "live source exceeded BACKFILL_LIVE_DELTA_MAX_BYTES"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let mut ops = Vec::new();
+            let mut decode_failed = false;
+            for batch in &delta.batches {
+                match source_batch_to_dml_ops(&table.name, &table.columns, batch) {
+                    Ok(batch_ops) => ops.extend(batch_ops),
+                    Err(error) => {
+                        tracing::warn!(view = %view_name, %error, "live source batch decode failed");
+                        decode_failed = true;
+                        break;
+                    }
+                }
+            }
+            if decode_failed {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let Ok(epoch) = runtime.next_epoch() else {
+                break;
+            };
+            let Some(handler) = weak.upgrade() else {
+                break;
+            };
+            if let Err(error) = handler
+                .commit_bound_source_ops(
+                    &mut runtime,
+                    &lease,
+                    &view_name,
+                    &table,
+                    &lifecycle.cursor.fence,
+                    delta.new_offset,
+                    ops,
+                    BackfillPhase::Running,
+                    Some(epoch),
+                    0,
+                    lifecycle.estimated_rows,
+                    &shard_db,
+                )
+                .await
+            {
+                tracing::warn!(view = %view_name, %error, "live source M3 commit failed");
+            } else {
+                handler.refresh_backfill_progress(&view_name).await;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_bound_source_batch<S: SourceConnector>(
+        &self,
+        runtime: &mut SourceRuntimeCoordinator<S>,
+        lease: &SourceOwnerLease,
+        view_name: &str,
+        table: &CatalogTable,
+        fence: &SnapshotDeltaFence,
+        offset: OffsetToken,
+        batch: &RecordBatch,
+        phase: BackfillPhase,
+        published_frontier: Option<u64>,
+        rows_remaining: u64,
+        estimated_rows: u64,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let ops = source_batch_to_dml_ops(&table.name, &table.columns, batch)
+            .map_err(|detail| GatewayError::QueryTimeExecutionFailed { detail })?;
+        self.commit_bound_source_ops(
+            runtime,
+            lease,
+            view_name,
+            table,
+            fence,
+            offset,
+            ops,
+            phase,
+            published_frontier,
+            rows_remaining,
+            estimated_rows,
+            shard_db,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_bound_source_ops<S: SourceConnector>(
+        &self,
+        runtime: &mut SourceRuntimeCoordinator<S>,
+        lease: &SourceOwnerLease,
+        view_name: &str,
+        table: &CatalogTable,
+        fence: &SnapshotDeltaFence,
+        offset: OffsetToken,
+        ops: Vec<DmlOp>,
+        phase: BackfillPhase,
+        published_frontier: Option<u64>,
+        rows_remaining: u64,
+        estimated_rows: u64,
+        shard_db: &Arc<rockstream_storage::ShardDb>,
+    ) -> Result<(), GatewayError> {
+        let compiled = self
+            .compiled_views
+            .get(view_name)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                detail: format!("compiled view '{view_name}' is unavailable"),
+            })?;
+        let input = build_delta_zset_for_table(
+            &table.name,
+            &ops,
+            query_time_relation_schema(&self.catalog, &table.name),
+        )?;
+        let output = if let Some(join) = &compiled.join {
+            let left = if join.left_source == table.name {
+                input.clone()
+            } else {
+                ArrowZSet::empty(query_time_relation_schema(&self.catalog, &join.left_source))
+            };
+            let right = if join.right_source == table.name {
+                input
+            } else {
+                ArrowZSet::empty(query_time_relation_schema(
+                    &self.catalog,
+                    &join.right_source,
+                ))
+            };
+            join.pipeline.process(left, right).map_err(|error| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled join pipeline process({view_name}): {error}"),
+                }
+            })?
+        } else {
+            compiled.pipeline.process(input).map_err(|error| {
+                GatewayError::QueryTimeExecutionFailed {
+                    detail: format!("compiled pipeline process({view_name}): {error}"),
+                }
+            })?
+        };
+        let epoch = runtime.next_epoch().map_err(source_backfill_error)?;
+        let cursor = BackfillCursor::new(
+            view_name,
+            0,
+            offset.as_bytes().to_vec(),
+            fence.clone(),
+            epoch,
+        );
+        let lifecycle = BackfillLifecycle::new(
+            phase,
+            cursor,
+            rows_remaining,
+            estimated_rows,
+            0,
+            published_frontier,
+        );
+        let mut m3 = rockstream_storage::WriteBatch::new();
+        append_dml_ops(&mut m3, &ops);
+        compiled.sink.append_epoch(&mut m3, &output, epoch);
+        if let Some(join) = &compiled.join {
+            join.pipeline.append_state(shard_db.as_ref(), &mut m3).await
+        } else {
+            compiled
+                .pipeline
+                .append_state(shard_db.as_ref(), &mut m3)
+                .await
+        }
+        .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+            detail: format!("persist compiled pipeline state({view_name}): {error}"),
+        })?;
+        m3.put(
+            &rockstream_storage::ShardKeyEncoder::frontier_key(),
+            &epoch.to_be_bytes(),
+        );
+        runtime
+            .commit_backfill_epoch(lease, epoch, offset, lifecycle, m3)
+            .await
+            .map_err(source_backfill_error)?;
+        self.catalog.update_backfill_progress(
+            view_name,
+            epoch.to_string(),
+            rows_remaining,
+            estimated_rows,
+        );
+        if phase == BackfillPhase::CatchingUp {
+            self.catalog
+                .catch_up_backfill(view_name, Some(epoch.to_string()));
+        }
+        Ok(())
+    }
+
     fn published_frontier_age_ms(&self) -> Option<u64> {
         let published_at = self.frontier_published_at_ms.load(Ordering::SeqCst);
         if published_at == 0 {
@@ -2448,6 +3614,11 @@ impl GatewayHandler {
         // COPY OUT: stream CopyData messages directly through the client sink.
         if ql.starts_with("copy ") && ql.contains(" to stdout") {
             if let Some(view_name) = parse_copy_to_stdout_view(query) {
+                if self.catalog.get_view(&view_name).is_some()
+                    && !self.catalog.is_backfill_published(&view_name)
+                {
+                    return Ok(backfill_not_published_response(&view_name));
+                }
                 let rows = self
                     .view_reader
                     .read_view(&view_name, None, ViewReadStrategy::HotOnly)
@@ -3508,6 +4679,32 @@ impl GatewayHandler {
                 self.catalog.source_status_response(Some(source_name)),
             ))]);
         }
+        if ql.starts_with("show backfill status for materialized view ") {
+            let view_name = q["show backfill status for materialized view ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            if self.catalog.get_view(view_name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-4022] backfill.not_published: materialized view '{}' does not exist. Next steps: run CREATE MATERIALIZED VIEW {} AS SELECT ... first.",
+                        view_name, view_name
+                    ),
+                ))))]);
+            }
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.backfill_status_response(view_name),
+            ))]);
+        }
+        if ql.starts_with("show backfill status") {
+            return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name.".to_owned(),
+            ))))]);
+        }
         if ql.trim_end_matches(';') == "show resource usage" {
             return Ok(vec![catalog_resp_to_response(
                 self.catalog.view_resource_usage(&[]),
@@ -3856,6 +5053,13 @@ impl GatewayHandler {
                                     ),
                                 ),
                             )))]);
+                        }
+
+                        if let Some(view_name) = select_plan.referenced_tables.iter().find(|name| {
+                            self.catalog.get_view(name).is_some()
+                                && !self.catalog.is_backfill_published(name)
+                        }) {
+                            return Ok(backfill_not_published_response(view_name));
                         }
 
                         let view_name = target_rel;
@@ -4289,7 +5493,7 @@ impl GatewayHandler {
             let col_count = schema_ref.len();
             let fields: Vec<&str> = row_str.split('\t').collect();
             for i in 0..col_count {
-                let val: Option<&str> = fields.get(i).copied();
+                let val = fields.get(i).copied().filter(|value| *value != r"\N");
                 let datatype = schema_ref[i].datatype();
                 encode_typed_field(&mut encoder, datatype, val)?;
             }
@@ -4433,6 +5637,11 @@ impl GatewayHandler {
         if let Some(error_responses) = self.select_access_error_response(view_name, conn_id) {
             return Ok(error_responses);
         }
+        if self.catalog.get_view(view_name).is_some()
+            && !self.catalog.is_backfill_published(view_name)
+        {
+            return Ok(backfill_not_published_response(view_name));
+        }
 
         let schema_fields: Vec<FieldInfo> = if let Some(cv) = self.catalog.get_view(view_name) {
             cv.columns
@@ -4550,7 +5759,7 @@ impl GatewayHandler {
             let col_count = schema_ref.len();
             let fields: Vec<&str> = row_str.split('\t').collect();
             for i in 0..col_count {
-                let val: Option<&str> = fields.get(i).copied();
+                let val = fields.get(i).copied().filter(|value| *value != r"\N");
                 let datatype = schema_ref[i].datatype();
                 encode_typed_field(&mut encoder, datatype, val)?;
             }
@@ -4756,6 +5965,9 @@ impl GatewayHandler {
                 },
                 deps.clone(),
             );
+            if is_materialized {
+                self.catalog.begin_backfill(&view_name, 0);
+            }
             if let Some(workload_name) = workload_name {
                 self.catalog
                     .assign_view_workload(&view_name, &workload_name);
@@ -4785,26 +5997,69 @@ impl GatewayHandler {
             // the compiled view's own initial-backfill path is the *only*
             // population step now — no redundant double-write through a
             // separately-materialized legacy pass.
+            let bound_sources = if is_materialized {
+                deps.iter()
+                    .filter_map(|relation| {
+                        self.catalog.get_source(relation).filter(|source| {
+                            source.table_name.as_deref() == Some(relation.as_str())
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let mut backfill_ready = !is_materialized;
             if let Some(shard_db) = &self.shard_db {
-                if self.compiled_views.contains_key(&view_name) {
+                if !bound_sources.is_empty() {
+                    let result = self
+                        .backfill_source_view(&bound_sources, &view_name, shard_db)
+                        .await;
+                    if let Err(error) = result {
+                        return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "55000".to_owned(),
+                            format!(
+                                "[RS-4022] backfill.not_published: materialized view '{view_name}' failed during source backfill: {error}"
+                            ),
+                        )))]);
+                    }
+                    backfill_ready = true;
+                } else if self.compiled_views.contains_key(&view_name) {
                     if let Err(error) = self
                         .populate_compiled_view_from_scratch(&view_name, shard_db)
                         .await
                     {
-                        tracing::warn!(
-                            view = %view_name,
-                            error = %error,
-                            "compiled immediate materialization failed"
-                        );
+                        return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "55000".to_owned(),
+                            format!(
+                                "[RS-4022] backfill.not_published: materialized view '{view_name}' failed during initial backfill: {error}"
+                            ),
+                        )))]);
+                    } else {
+                        backfill_ready = true;
                     }
                 }
-                if is_materialized {
+                if is_materialized && bound_sources.is_empty() {
+                    self.catalog.catch_up_backfill(&view_name, None);
                     if let Err(e) = shard_db.flush().await {
                         tracing::warn!(
                             "post-CREATE-MATERIALIZED-VIEW shard flush failed (non-fatal): {e}"
                         );
+                    } else if backfill_ready {
+                        self.catalog.publish_backfill(&view_name);
                     }
                 }
+            } else if is_materialized && bound_sources.is_empty() {
+                self.catalog.publish_backfill(&view_name);
+            } else if is_materialized {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "55000".to_owned(),
+                    format!(
+                        "[RS-4022] backfill.not_published: materialized view '{view_name}' requires a shard-backed source runtime"
+                    ),
+                )))]);
             }
         }
 
@@ -5136,6 +6391,10 @@ impl GatewayHandler {
 
         let entry = CatalogSourceEntry {
             name: parsed.name.clone(),
+            table_name: self
+                .catalog
+                .get_table(&parsed.name)
+                .map(|_| parsed.name.clone()),
             source_type: parsed.source_type.clone(),
             options: parsed.options.clone(),
             format: parsed.format.clone(),
@@ -5922,37 +7181,8 @@ impl GatewayHandler {
             PgWireError::ApiError(Box::new(crate::error::GatewayError::CommitEpochExhausted))
         })?;
 
-        // Build WriteBatch from DmlOps — only Put and Delete, no range-delete.
         let mut batch = rockstream_storage::WriteBatch::new();
-        for op in &ops {
-            match op {
-                DmlOp::Insert {
-                    table,
-                    row_key,
-                    values_tsv,
-                    ..
-                } => {
-                    let key = format!("view_output/{table}/{row_key}");
-                    batch.put(key.as_bytes(), values_tsv.as_bytes());
-                }
-                DmlOp::Update {
-                    table,
-                    old_row_key,
-                    new_row_key,
-                    new_tsv,
-                    ..
-                } => {
-                    let old_key = format!("view_output/{table}/{old_row_key}");
-                    let new_key = format!("view_output/{table}/{new_row_key}");
-                    batch.delete(old_key.as_bytes());
-                    batch.put(new_key.as_bytes(), new_tsv.as_bytes());
-                }
-                DmlOp::Delete { table, row_key, .. } => {
-                    let key = format!("view_output/{table}/{row_key}");
-                    batch.delete(key.as_bytes());
-                }
-            }
-        }
+        append_dml_ops(&mut batch, &ops);
         // Persist idempotency key so replays are no-ops
         if let Some(key_hash) = idempotency_key {
             let now_ms = std::time::SystemTime::now()
@@ -6228,6 +7458,11 @@ impl GatewayHandler {
 
         // Execute the inner query to collect rows
         let rows: Vec<Vec<u8>> = if let Some(view_name) = extract_view_name_from_select(inner_sql) {
+            if self.catalog.get_view(&view_name).is_some()
+                && !self.catalog.is_backfill_published(&view_name)
+            {
+                return Ok(backfill_not_published_response(&view_name));
+            }
             if let Some(shard_db) = &self.shard_db {
                 let prefix = format!("view_output/{view_name}/");
                 shard_db
@@ -8732,6 +9967,16 @@ pub struct GatewayServer {
 }
 
 impl GatewayServer {
+    fn from_handler(addr: std::net::SocketAddr, handler: GatewayHandler) -> Self {
+        let handler = Arc::new(handler);
+        handler.bind_server(&handler);
+        GatewayServer {
+            addr,
+            handler,
+            tls_acceptor: None,
+        }
+    }
+
     /// Attach the complete pinned shard-reader topology to a server created by
     /// any constructor, including the authentication-bearing constructors.
     /// Query-time execution keeps that topology intact rather than reverting to
@@ -8758,11 +10003,7 @@ impl GatewayServer {
     /// Create a new gateway server listening on `addr`.
     pub fn new(addr: std::net::SocketAddr, view_reader: Arc<dyn ViewReader>) -> Self {
         let catalog = Arc::new(CatalogStubs::new());
-        GatewayServer {
-            addr,
-            handler: Arc::new(GatewayHandler::new(catalog, view_reader)),
-            tls_acceptor: None,
-        }
+        GatewayServer::from_handler(addr, GatewayHandler::new(catalog, view_reader))
     }
 
     /// Create a new gateway server with an explicit catalog (for testing).
@@ -8771,11 +10012,7 @@ impl GatewayServer {
         catalog: Arc<CatalogStubs>,
         view_reader: Arc<dyn ViewReader>,
     ) -> Self {
-        GatewayServer {
-            addr,
-            handler: Arc::new(GatewayHandler::new(catalog, view_reader)),
-            tls_acceptor: None,
-        }
+        GatewayServer::from_handler(addr, GatewayHandler::new(catalog, view_reader))
     }
 
     /// Create a gateway server with a catalog and ShardDb for direct-write DML.
@@ -8785,15 +10022,10 @@ impl GatewayServer {
         view_reader: Arc<dyn ViewReader>,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) -> Self {
-        GatewayServer {
+        GatewayServer::from_handler(
             addr,
-            handler: Arc::new(GatewayHandler::with_shard_db(
-                catalog,
-                view_reader,
-                shard_db,
-            )),
-            tls_acceptor: None,
-        }
+            GatewayHandler::with_shard_db(catalog, view_reader, shard_db),
+        )
     }
 
     /// Create a shard-backed gateway whose query-time reads scatter across the
@@ -8819,11 +10051,7 @@ impl GatewayServer {
         let mut handler = GatewayHandler::new(catalog, view_reader);
         handler.auth_mode = AuthMode::Scram;
         handler.role_catalog = role_catalog;
-        GatewayServer {
-            addr,
-            handler: Arc::new(handler),
-            tls_acceptor: None,
-        }
+        GatewayServer::from_handler(addr, handler)
     }
 
     /// Create a gateway with MD5 auth and a pre-populated RoleCatalog.
@@ -8836,11 +10064,7 @@ impl GatewayServer {
         let mut handler = GatewayHandler::new(catalog, view_reader);
         handler.auth_mode = AuthMode::Md5;
         handler.role_catalog = role_catalog;
-        GatewayServer {
-            addr,
-            handler: Arc::new(handler),
-            tls_acceptor: None,
-        }
+        GatewayServer::from_handler(addr, handler)
     }
 
     /// Create a gateway with SCRAM-SHA-256 auth, ShardDb, and RoleCatalog.
@@ -8854,11 +10078,7 @@ impl GatewayServer {
         let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
         handler.auth_mode = AuthMode::Scram;
         handler.role_catalog = role_catalog;
-        GatewayServer {
-            addr,
-            handler: Arc::new(handler),
-            tls_acceptor: None,
-        }
+        GatewayServer::from_handler(addr, handler)
     }
 
     /// Create a gateway with MD5 auth, ShardDb, and RoleCatalog.
@@ -8872,11 +10092,7 @@ impl GatewayServer {
         let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
         handler.auth_mode = AuthMode::Md5;
         handler.role_catalog = role_catalog;
-        GatewayServer {
-            addr,
-            handler: Arc::new(handler),
-            tls_acceptor: None,
-        }
+        GatewayServer::from_handler(addr, handler)
     }
 
     /// Create a gateway with OIDC auth enabled (for auth integration tests).
@@ -8890,11 +10106,7 @@ impl GatewayServer {
         let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
         handler.auth_mode = AuthMode::Oidc;
         handler.jwt_verifier = Some(Arc::new(JwtVerifier::with_hs256_key(jwt_secret.to_vec())));
-        GatewayServer {
-            addr,
-            handler: Arc::new(handler),
-            tls_acceptor: None,
-        }
+        GatewayServer::from_handler(addr, handler)
     }
 
     /// v0.51.5: enable gateway-facing TLS termination (and, when
@@ -8932,11 +10144,7 @@ impl GatewayServer {
     ) -> Self {
         let mut handler = GatewayHandler::with_shard_db(catalog, view_reader, shard_db);
         handler.auth_mode = AuthMode::Mtls;
-        GatewayServer {
-            addr,
-            handler: Arc::new(handler),
-            tls_acceptor: None,
-        }
+        GatewayServer::from_handler(addr, handler)
     }
 
     /// Return a reference to the handler (for seeding ACL and sessions in tests).
@@ -9971,6 +11179,17 @@ fn analyze_select_query(catalog: &CatalogStubs, q: &str) -> Option<AnalyzedSelec
     })
 }
 
+fn backfill_not_published_response(view_name: &str) -> Vec<Response<'static>> {
+    vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "55000".to_owned(),
+        format!(
+            "[RS-4022] backfill.not_published: materialized view '{}' is not published yet. Next steps: run SHOW BACKFILL STATUS FOR MATERIALIZED VIEW {} and retry when phase is RUNNING.",
+            view_name, view_name
+        ),
+    ))))]
+}
+
 fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response<'static>> {
     use datafusion::arrow::array::{
         Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
@@ -10158,7 +11377,12 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
         let s = String::from_utf8_lossy(row);
         let fields: Vec<&str> = s.split('\t').collect();
         for (i, col) in col_strs.iter_mut().enumerate() {
-            col.push(fields.get(i).map(|v| v.to_string()));
+            col.push(
+                fields
+                    .get(i)
+                    .filter(|value| **value != r"\N")
+                    .map(|value| (*value).to_string()),
+            );
         }
     }
 
@@ -10262,6 +11486,111 @@ fn build_delta_zset_for_table(
         }
     })?;
     Ok(ArrowZSet::new(batch, weights))
+}
+
+/// Append logical table mutations to an existing M3 write. This is shared by
+/// client COMMIT and source-backed ingestion so they use identical row keys.
+fn append_dml_ops(batch: &mut rockstream_storage::WriteBatch, ops: &[DmlOp]) {
+    for op in ops {
+        match op {
+            DmlOp::Insert {
+                table,
+                row_key,
+                values_tsv,
+                ..
+            } => {
+                let key = format!("view_output/{table}/{row_key}");
+                batch.put(key.as_bytes(), values_tsv.as_bytes());
+            }
+            DmlOp::Update {
+                table,
+                old_row_key,
+                new_row_key,
+                new_tsv,
+                ..
+            } => {
+                let old_key = format!("view_output/{table}/{old_row_key}");
+                let new_key = format!("view_output/{table}/{new_row_key}");
+                batch.delete(old_key.as_bytes());
+                batch.put(new_key.as_bytes(), new_tsv.as_bytes());
+            }
+            DmlOp::Delete { table, row_key, .. } => {
+                let key = format!("view_output/{table}/{row_key}");
+                batch.delete(key.as_bytes());
+            }
+        }
+    }
+}
+
+fn source_view_connector_id(source_name: &str, view_name: &str) -> ConnectorId {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in source_name.bytes().chain([0]).chain(view_name.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    ConnectorId(hash)
+}
+
+fn source_backfill_error(error: rockstream_connectors::SourceError) -> GatewayError {
+    GatewayError::QueryTimeExecutionFailed {
+        detail: format!("source-backed backfill: {error}"),
+    }
+}
+
+/// Convert a weighted connector batch to the same DML shape as pgwire writes.
+/// Connector deletes retain their pre-image so downstream views can retract
+/// them in the M3 transaction that advances the source cursor.
+fn source_batch_to_dml_ops(
+    table: &str,
+    columns: &[CatalogColumn],
+    batch: &RecordBatch,
+) -> Result<Vec<DmlOp>, String> {
+    use datafusion::arrow::util::display::array_value_to_string;
+
+    let (data, weights) = rockstream_types::arrow_batch::split_weight_column(batch)
+        .unwrap_or_else(|| (batch.clone(), vec![1; batch.num_rows()]));
+    if data.num_columns() != columns.len() {
+        return Err(format!(
+            "source batch has {} column(s), but table '{table}' has {}",
+            data.num_columns(),
+            columns.len()
+        ));
+    }
+    let names = columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    let mut ops = Vec::with_capacity(data.num_rows());
+    for (row, &weight) in weights.iter().enumerate().take(data.num_rows()) {
+        let values = data
+            .columns()
+            .iter()
+            .map(|column| {
+                if column.is_null(row) {
+                    Ok(r"\N".to_string())
+                } else {
+                    array_value_to_string(column.as_ref(), row).map_err(|error| error.to_string())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let values_tsv = values.join("\t");
+        let row_key = build_row_key(&names, &values);
+        match weight {
+            weight if weight > 0 => ops.push(DmlOp::Insert {
+                table: table.to_string(),
+                cols: names.clone(),
+                values_tsv,
+                row_key,
+            }),
+            weight if weight < 0 => ops.push(DmlOp::Delete {
+                table: table.to_string(),
+                row_key,
+                returning_tsv: Some(values_tsv),
+            }),
+            _ => {}
+        }
+    }
+    Ok(ops)
 }
 
 async fn query_time_datafusion_select(
@@ -12153,7 +13482,7 @@ fn extract_sql_refs(sql: &str) -> Vec<String> {
         if tok_lower == "from" || tok_lower == "join" {
             if let Some(next) = tokens_orig.get(i + 1) {
                 // Skip subquery openers
-                if next.starts_with('(') {
+                if next.starts_with('(') || next.contains('(') {
                     continue;
                 }
                 // v0.51.4 Slice 4: strip a trailing `)` too — a `FROM
@@ -13371,6 +14700,513 @@ mod parse_delete_returning_tests {
         assert!(
             err.contains("RS-2022"),
             "expected RS-2022 error, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod source_batch_tests {
+    use super::*;
+
+    struct NoopViewReader;
+
+    #[async_trait]
+    impl ViewReader for NoopViewReader {
+        async fn read_view(
+            &self,
+            _view_name: &str,
+            _limit: Option<usize>,
+            _strategy: ViewReadStrategy,
+        ) -> Result<Vec<Vec<u8>>, GatewayError> {
+            Ok(Vec::new())
+        }
+
+        fn published_frontier(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn source_batch_preserves_exact_insert_and_delete_preimages() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from(vec![7, 8])) as datafusion::arrow::array::ArrayRef,
+            ),
+            (
+                "customer",
+                Arc::new(StringArray::from(vec!["ada", "bea"])) as _,
+            ),
+        ])
+        .unwrap();
+        let batch = rockstream_types::arrow_batch::append_weight_column(batch, &[1, -1]).unwrap();
+        let ops = source_batch_to_dml_ops(
+            "orders",
+            &[
+                CatalogColumn {
+                    name: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                CatalogColumn {
+                    name: "customer".to_string(),
+                    data_type: "Utf8".to_string(),
+                },
+            ],
+            &batch,
+        )
+        .unwrap();
+
+        assert_eq!(ops.len(), 2);
+        match &ops[0] {
+            DmlOp::Insert {
+                table,
+                cols,
+                values_tsv,
+                row_key,
+            } => assert_eq!(
+                (table, cols, values_tsv, row_key),
+                (
+                    &"orders".to_string(),
+                    &vec!["id".to_string(), "customer".to_string()],
+                    &"7\tada".to_string(),
+                    &"id=7|customer=ada".to_string(),
+                )
+            ),
+            _ => panic!("positive source weight must insert"),
+        }
+        match &ops[1] {
+            DmlOp::Delete {
+                table,
+                row_key,
+                returning_tsv,
+            } => assert_eq!(
+                (table, row_key, returning_tsv),
+                (
+                    &"orders".to_string(),
+                    &"id=8|customer=bea".to_string(),
+                    &Some("8\tbea".to_string()),
+                )
+            ),
+            _ => panic!("negative source weight must retain a delete preimage"),
+        }
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_publishes_output_cursor_and_frontier_in_m3() {
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder(
+                "source-snapshot-m3",
+                Arc::new(object_store::memory::InMemory::new()),
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStubs::new());
+        assert!(catalog.add_table(CatalogTable {
+            name: "orders".to_string(),
+            columns: vec![
+                CatalogColumn {
+                    name: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                CatalogColumn {
+                    name: "amount".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+            ],
+        }));
+        let handler = GatewayHandler::with_shard_db(
+            Arc::clone(&catalog),
+            Arc::new(NoopViewReader),
+            Arc::clone(&shard_db),
+        );
+        handler
+            .handle_create_view(
+                "CREATE MATERIALIZED VIEW order_rows AS SELECT id, amount FROM orders",
+            )
+            .await
+            .unwrap();
+        assert!(catalog.add_source(CatalogSourceEntry {
+            name: "orders".to_string(),
+            table_name: Some("orders".to_string()),
+            source_type: "s3".to_string(),
+            options: HashMap::new(),
+            format: "json".to_string(),
+            status: "OK".to_string(),
+            live_offset: "0".to_string(),
+            live_lag: 0,
+        }));
+        catalog.begin_backfill("order_rows", 2);
+
+        let connector_id = ConnectorId(99);
+        let mut source = S3Source::new(
+            connector_id,
+            catalog_columns_to_schema(&catalog.get_table("orders").unwrap().columns),
+        );
+        source.add_file("snapshot.json".to_string(), vec![vec![1, 10], vec![2, 20]]);
+        handler
+            .backfill_bound_source(
+                "orders",
+                "order_rows",
+                SourceRuntimeCoordinator::new(
+                    source,
+                    connector_id,
+                    OffsetToken::new(Vec::new()),
+                    SourceCheckpointStore::new(Arc::clone(&shard_db), 99, connector_id),
+                ),
+                true,
+                &shard_db,
+            )
+            .await
+            .unwrap();
+
+        let view = catalog.get_view("order_rows").unwrap();
+        assert_eq!(
+            handler
+                .read_compiled_view_rows("order_rows", &view, &shard_db)
+                .await
+                .unwrap(),
+            vec![b"1\t10".to_vec(), b"2\t20".to_vec()]
+        );
+        let lifecycle = SourceCheckpointStore::new(Arc::clone(&shard_db), 99, connector_id)
+            .backfill_lifecycle("order_rows")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            BackfillLifecycle::new(
+                BackfillPhase::Running,
+                BackfillCursor::new(
+                    "order_rows",
+                    0,
+                    serde_json::to_vec(&vec![("snapshot.json".to_string(), 2_usize)]).unwrap(),
+                    SnapshotDeltaFence::new(
+                        OffsetToken::new(
+                            serde_json::to_vec(&vec![("snapshot.json".to_string(), 2_usize)])
+                                .unwrap(),
+                        ),
+                        OffsetToken::new(
+                            serde_json::to_vec(&vec![("snapshot.json".to_string(), 2_usize)])
+                                .unwrap(),
+                        ),
+                    ),
+                    2,
+                ),
+                0,
+                2,
+                0,
+                Some(2),
+            )
+        );
+        assert_eq!(
+            shard_db
+                .get(&rockstream_storage::ShardKeyEncoder::frontier_key())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&2_u64.to_be_bytes()[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn source_backfill_uses_the_configured_snapshot_batch_bound() {
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder(
+                "source-snapshot-bounded-m3",
+                Arc::new(object_store::memory::InMemory::new()),
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStubs::new());
+        assert!(catalog.add_table(CatalogTable {
+            name: "orders".to_string(),
+            columns: vec![
+                CatalogColumn {
+                    name: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                CatalogColumn {
+                    name: "amount".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+            ],
+        }));
+        let handler = GatewayHandler::with_shard_db(
+            Arc::clone(&catalog),
+            Arc::new(NoopViewReader),
+            Arc::clone(&shard_db),
+        );
+        handler
+            .handle_create_view(
+                "CREATE MATERIALIZED VIEW order_rows AS SELECT id, amount FROM orders",
+            )
+            .await
+            .unwrap();
+        assert!(catalog.add_source(CatalogSourceEntry {
+            name: "orders".to_string(),
+            table_name: Some("orders".to_string()),
+            source_type: "s3".to_string(),
+            options: HashMap::new(),
+            format: "json".to_string(),
+            status: "OK".to_string(),
+            live_offset: "0".to_string(),
+            live_lag: 0,
+        }));
+        catalog.begin_backfill("order_rows", BACKFILL_BATCH_MAX_ROWS as u64 + 1);
+
+        let connector_id = ConnectorId(101);
+        let rows = (0..=BACKFILL_BATCH_MAX_ROWS as i64)
+            .map(|id| vec![id, id * 10])
+            .collect::<Vec<_>>();
+        let mut source = S3Source::new(
+            connector_id,
+            catalog_columns_to_schema(&catalog.get_table("orders").unwrap().columns),
+        );
+        source.add_file("snapshot.json".to_string(), rows);
+        handler
+            .backfill_bound_source(
+                "orders",
+                "order_rows",
+                SourceRuntimeCoordinator::new(
+                    source,
+                    connector_id,
+                    OffsetToken::new(Vec::new()),
+                    SourceCheckpointStore::new(Arc::clone(&shard_db), 101, connector_id),
+                ),
+                true,
+                &shard_db,
+            )
+            .await
+            .unwrap();
+
+        let view = catalog.get_view("order_rows").unwrap();
+        let mut actual = handler
+            .read_compiled_view_rows("order_rows", &view, &shard_db)
+            .await
+            .unwrap();
+        let mut expected = (0..=BACKFILL_BATCH_MAX_ROWS as i64)
+            .map(|id| format!("{id}\t{}", id * 10).into_bytes())
+            .collect::<Vec<_>>();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        let lifecycle = SourceCheckpointStore::new(Arc::clone(&shard_db), 101, connector_id)
+            .backfill_lifecycle("order_rows")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                lifecycle.phase,
+                lifecycle.cursor.last_key,
+                lifecycle.cursor.committed_epoch,
+                lifecycle.published_frontier,
+            ),
+            (
+                BackfillPhase::Running,
+                serde_json::to_vec(&vec![(
+                    "snapshot.json".to_string(),
+                    BACKFILL_BATCH_MAX_ROWS + 1
+                )])
+                .unwrap(),
+                3,
+                Some(3),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_restart_resumes_at_committed_cursor_without_replay() {
+        let shard_db = Arc::new(
+            rockstream_storage::ShardDb::builder(
+                "source-snapshot-restart",
+                Arc::new(object_store::memory::InMemory::new()),
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let catalog = Arc::new(CatalogStubs::new());
+        assert!(catalog.add_table(CatalogTable {
+            name: "orders".to_string(),
+            columns: vec![
+                CatalogColumn {
+                    name: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                CatalogColumn {
+                    name: "amount".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+            ],
+        }));
+        let handler = GatewayHandler::with_shard_db(
+            Arc::clone(&catalog),
+            Arc::new(NoopViewReader),
+            Arc::clone(&shard_db),
+        );
+        handler
+            .handle_create_view(
+                "CREATE MATERIALIZED VIEW order_rows AS SELECT id, amount FROM orders",
+            )
+            .await
+            .unwrap();
+        assert!(catalog.add_source(CatalogSourceEntry {
+            name: "orders".to_string(),
+            table_name: Some("orders".to_string()),
+            source_type: "s3".to_string(),
+            options: HashMap::new(),
+            format: "json".to_string(),
+            status: "OK".to_string(),
+            live_offset: "0".to_string(),
+            live_lag: 0,
+        }));
+        catalog.begin_backfill("order_rows", BACKFILL_BATCH_MAX_ROWS as u64 + 1);
+
+        let connector_id = ConnectorId(100);
+        let schema = catalog_columns_to_schema(&catalog.get_table("orders").unwrap().columns);
+        let mut source = S3Source::new(connector_id, schema.clone());
+        source.add_file(
+            "snapshot.json".to_string(),
+            (0..=BACKFILL_BATCH_MAX_ROWS as i64)
+                .map(|id| vec![id, id * 10])
+                .collect(),
+        );
+        let checkpoint_store = SourceCheckpointStore::new(Arc::clone(&shard_db), 100, connector_id);
+        let mut runtime = SourceRuntimeCoordinator::new(
+            source,
+            connector_id,
+            OffsetToken::new(Vec::new()),
+            checkpoint_store,
+        );
+        runtime.recover().await.unwrap();
+        let lease = runtime.acquire_owner("gateway:order_rows").unwrap();
+        let fence = runtime.capture_snapshot_delta_fence().await.unwrap();
+        let chunk = runtime
+            .start_snapshot(&fence, None, BACKFILL_BATCH_MAX_ROWS)
+            .await
+            .unwrap()
+            .next()
+            .unwrap();
+        handler
+            .commit_bound_source_batch(
+                &mut runtime,
+                &lease,
+                "order_rows",
+                &catalog.get_table("orders").unwrap(),
+                &fence,
+                chunk.resume_offset,
+                &chunk.batch,
+                BackfillPhase::Snapshotting,
+                None,
+                1,
+                BACKFILL_BATCH_MAX_ROWS as u64 + 1,
+                &shard_db,
+            )
+            .await
+            .unwrap();
+        let CatalogResponse::Rows { columns, rows } =
+            catalog.backfill_status_response("order_rows")
+        else {
+            panic!("backfill status must be tabular");
+        };
+        assert_eq!(
+            (columns, rows),
+            (
+                vec![
+                    "view_name".to_string(),
+                    "phase".to_string(),
+                    "cursor_position".to_string(),
+                    "rows_remaining".to_string(),
+                    "estimated_rows".to_string(),
+                    "budget_state".to_string(),
+                    "blocked_reason".to_string(),
+                ],
+                vec![vec![
+                    Some("order_rows".to_string()),
+                    Some("SNAPSHOTTING".to_string()),
+                    Some("1".to_string()),
+                    Some("1".to_string()),
+                    Some((BACKFILL_BATCH_MAX_ROWS + 1).to_string()),
+                    Some("ADMITTED".to_string()),
+                    None,
+                ]],
+            )
+        );
+
+        let restarted = GatewayHandler::with_shard_db(
+            Arc::clone(&catalog),
+            Arc::new(NoopViewReader),
+            Arc::clone(&shard_db),
+        );
+        restarted.recover_compiled_views().await;
+        let mut resumed_source = S3Source::new(connector_id, schema);
+        resumed_source.add_file(
+            "snapshot.json".to_string(),
+            (0..=BACKFILL_BATCH_MAX_ROWS as i64)
+                .map(|id| vec![id, id * 10])
+                .collect(),
+        );
+        restarted
+            .backfill_bound_source(
+                "orders",
+                "order_rows",
+                SourceRuntimeCoordinator::new(
+                    resumed_source,
+                    connector_id,
+                    OffsetToken::new(Vec::new()),
+                    SourceCheckpointStore::new(Arc::clone(&shard_db), 100, connector_id),
+                ),
+                true,
+                &shard_db,
+            )
+            .await
+            .unwrap();
+
+        let view = catalog.get_view("order_rows").unwrap();
+        let mut actual = restarted
+            .read_compiled_view_rows("order_rows", &view, &shard_db)
+            .await
+            .unwrap();
+        let mut expected = (0..=BACKFILL_BATCH_MAX_ROWS as i64)
+            .map(|id| format!("{id}\t{}", id * 10).into_bytes())
+            .collect::<Vec<_>>();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        let lifecycle = SourceCheckpointStore::new(Arc::clone(&shard_db), 100, connector_id)
+            .backfill_lifecycle("order_rows")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                lifecycle.phase,
+                lifecycle.cursor.last_key,
+                lifecycle.cursor.committed_epoch,
+                lifecycle.rows_remaining,
+                lifecycle.estimated_rows,
+                lifecycle.published_frontier,
+            ),
+            (
+                BackfillPhase::Running,
+                serde_json::to_vec(&vec![(
+                    "snapshot.json".to_string(),
+                    BACKFILL_BATCH_MAX_ROWS + 1
+                )])
+                .unwrap(),
+                3,
+                0,
+                BACKFILL_BATCH_MAX_ROWS as u64 + 1,
+                Some(3),
+            )
         );
     }
 }

@@ -525,10 +525,10 @@ fn decode_distinct_value(bytes: &[u8]) -> Option<(i64, Vec<i64>)> {
 /// Uses a WriteBatch with only point writes (no range deletion).
 /// All non-zero entries are written; any previously written entries for
 /// rows that now have zero weight must be explicitly deleted.
-pub async fn persist_distinct_state(
-    db: &ShardDb,
+pub fn append_distinct_state(
     op: &DistinctOp,
     op_id: OperatorId,
+    target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
         let state = op.state.lock().unwrap();
@@ -546,10 +546,20 @@ pub async fn persist_distinct_state(
         batch
     };
 
-    if batch.is_empty() {
-        return Ok(());
+    target.merge_from(batch);
+    Ok(())
+}
+
+pub async fn persist_distinct_state(
+    db: &ShardDb,
+    op: &DistinctOp,
+    op_id: OperatorId,
+) -> Result<(), OpError> {
+    let mut batch = WriteBatch::new();
+    append_distinct_state(op, op_id, &mut batch)?;
+    if !batch.is_empty() {
+        db.write_batch(batch).await.map_err(OpError::storage)?;
     }
-    db.write_batch(batch).await.map_err(OpError::storage)?;
     Ok(())
 }
 

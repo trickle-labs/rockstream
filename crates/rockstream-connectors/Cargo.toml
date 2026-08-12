@@ -31,6 +31,7 @@ rdkafka = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 csv = { workspace = true }
+tokio-postgres = { workspace = true }
 
 
 [dev-dependencies]

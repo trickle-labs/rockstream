@@ -19,6 +19,7 @@ pub mod s3_source;
 pub mod sink_connector;
 pub mod source_connector;
 pub mod source_epoch;
+mod source_json;
 pub mod source_runtime;
 
 pub use catalog_registrar::{
@@ -35,9 +36,10 @@ pub use kafka_sink::KafkaSink;
 pub use kafka_source::KafkaSource;
 pub use object_store_sink::{ObjectStoreSink, OBJECT_STORE_SINK_MAX_PENDING_EPOCHS};
 pub use postgres_cdc::{
-    CdcChange, CdcOperation, CdcWireFormat, PgLsn, PostgresCdcFailure, PostgresCdcSource,
-    PostgresCdcStatus, POSTGRES_CDC_MAX_IN_FLIGHT_BYTES, POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS,
-    POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS, POSTGRES_CDC_MAX_WAL_LAG_BYTES,
+    CdcChange, CdcOperation, CdcWireFormat, PgLsn, PgOutputConfig, PostgresCdcFailure,
+    PostgresCdcSource, PostgresCdcStatus, POSTGRES_CDC_MAX_IN_FLIGHT_BYTES,
+    POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS, POSTGRES_CDC_MAX_RESNAPSHOT_ATTEMPTS,
+    POSTGRES_CDC_MAX_WAL_LAG_BYTES,
 };
 pub use s3_source::S3Source;
 pub use sink_connector::{
@@ -50,7 +52,8 @@ pub use source_connector::{
     SourcePollLifecycle, WatermarkCapability, WindowWatermarkPolicy,
 };
 pub use source_epoch::{
-    OffsetToken, SourceCheckpoint, SourceCheckpointState, SourceCheckpointStore, SourceEpochEntry,
+    BackfillCursor, BackfillLifecycle, BackfillPhase, OffsetToken, SnapshotDeltaFence,
+    SourceCheckpoint, SourceCheckpointState, SourceCheckpointStore, SourceEpochEntry,
     SourceEpochRegistry, SOURCE_CHECKPOINT_HISTORY_MAX_ENTRIES,
 };
 pub use source_runtime::{

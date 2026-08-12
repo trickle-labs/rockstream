@@ -206,7 +206,6 @@ mod tests {
         let dlq = get_global_dlq().lock();
         assert_eq!(dlq.len(), 1);
         assert_eq!(dlq[0].arrived_at, two_days_ago);
-        dlq.clone();
         drop(dlq);
         get_global_dlq().lock().clear();
     }

@@ -33,6 +33,7 @@ const TAG_INT64: u8 = 0;
 const TAG_UTF8: u8 = 1;
 const TAG_BOOLEAN: u8 = 2;
 const TAG_FLOAT64: u8 = 3;
+const TAG_NULL: u8 = 4;
 
 /// A decoded column value read back from `view_output` storage.
 ///
@@ -40,6 +41,7 @@ const TAG_FLOAT64: u8 = 3;
 /// encoding currently supports: `Int64`, `Utf8`, `Boolean`, `Float64`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnValue {
+    Null,
     Int64(i64),
     Utf8(String),
     Boolean(bool),
@@ -107,6 +109,10 @@ impl ViewSinkOp {
     fn encode_row(batch: &ArrowZSet, row: usize) -> Vec<u8> {
         let mut buf = Vec::with_capacity((batch.data.num_columns() + 1) * 9);
         for col in batch.data.columns() {
+            if col.is_null(row) {
+                buf.push(TAG_NULL);
+                continue;
+            }
             match col.data_type() {
                 DataType::Int64 => {
                     let arr = col
@@ -221,16 +227,15 @@ impl ViewSinkOp {
         buf
     }
 
-    /// Write one delta batch to storage.
+    /// Append one delta batch to an existing atomic write.
     ///
     /// Each row becomes one key-value entry in the `view_output` namespace.
-    pub async fn write_epoch(&self, batch: &ArrowZSet, epoch: Epoch) -> Result<(), OpError> {
+    pub fn append_epoch(&self, wb: &mut WriteBatch, batch: &ArrowZSet, epoch: Epoch) {
         if batch.is_empty() {
-            return Ok(());
+            return;
         }
         let op_id_raw = self.op_id.0;
         let epoch_bytes = epoch.to_be_bytes();
-        let mut wb = WriteBatch::new();
 
         for row in 0..batch.num_rows() {
             let mut key = Vec::with_capacity(1 + 8 + 8 + 8);
@@ -248,7 +253,15 @@ impl ViewSinkOp {
             rows = batch.num_rows(),
             "ViewSink: writing epoch"
         );
+    }
 
+    /// Write one delta batch to storage.
+    pub async fn write_epoch(&self, batch: &ArrowZSet, epoch: Epoch) -> Result<(), OpError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut wb = WriteBatch::new();
+        self.append_epoch(&mut wb, batch, epoch);
         self.db.write_batch(wb).await.map_err(OpError::storage)
     }
 
@@ -271,6 +284,7 @@ pub(crate) fn decode_row(vb: &[u8], num_cols: usize) -> Option<(Vec<ColumnValue>
         let tag = *vb.get(pos)?;
         pos += 1;
         match tag {
+            TAG_NULL => cols.push(ColumnValue::Null),
             TAG_INT64 => {
                 let end = pos.checked_add(8)?;
                 let v = i64::from_be_bytes(vb.get(pos..end)?.try_into().ok()?);
@@ -375,6 +389,7 @@ fn decode_view_output_entries(
 
 fn serialize_column_value(value: &ColumnValue) -> String {
     match value {
+        ColumnValue::Null => "n".to_string(),
         ColumnValue::Int64(v) => format!("i:{v}"),
         ColumnValue::Utf8(v) => format!("s:{}:{v}", v.len()),
         ColumnValue::Boolean(v) => format!("b:{}", u8::from(*v)),
@@ -436,6 +451,7 @@ pub fn materialize_view_state(
 pub fn column_values_to_tsv_bytes(row: &[ColumnValue]) -> Vec<u8> {
     row.iter()
         .map(|value| match value {
+            ColumnValue::Null => r"\N".to_string(),
             ColumnValue::Int64(v) => v.to_string(),
             ColumnValue::Utf8(v) => v.clone(),
             ColumnValue::Boolean(v) => v.to_string(),

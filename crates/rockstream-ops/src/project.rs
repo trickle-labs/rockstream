@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use arrow::array::Array;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use rockstream_plan::Expr;
@@ -69,7 +70,13 @@ impl ProjectOp {
             .exprs
             .iter()
             .zip(cols.iter())
-            .map(|(ne, col)| Field::new(&ne.name, col.data_type().clone(), false))
+            .map(|(ne, col)| {
+                let nullable = match &ne.expr {
+                    Expr::Column(index) => input.data.schema().field(*index).is_nullable(),
+                    _ => col.null_count() > 0,
+                };
+                Field::new(&ne.name, col.data_type().clone(), nullable)
+            })
             .collect();
         let schema = Arc::new(Schema::new(fields));
         let new_data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;

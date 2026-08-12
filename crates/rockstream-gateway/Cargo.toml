@@ -47,6 +47,7 @@ uuid.workspace = true
 rust_decimal.workspace = true
 postgres-types.workspace = true
 object_store = { version = "0.12", features = ["aws"] }
+rockstream-connectors.workspace = true
 
 
 [dev-dependencies]
@@ -54,7 +55,8 @@ rockstream-test-support.workspace = true
 tokio-postgres.workspace = true
 tempfile.workspace = true
 testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["kafka", "minio"] }
+rdkafka.workspace = true
 rockstream-oracle = { workspace = true }
 datafusion = { workspace = true }
 reqwest = { workspace = true }
@@ -66,5 +68,4 @@ async-trait.workspace = true
 rcgen.workspace = true
 tokio-postgres-rustls.workspace = true
 uuid = { workspace = true, features = ["v4"] }
-rockstream-connectors = { workspace = true }
 serde_yaml.workspace = true

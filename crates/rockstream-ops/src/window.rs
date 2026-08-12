@@ -605,10 +605,10 @@ fn decode_output_value(bytes: &[u8], n_cols: usize) -> Option<Vec<i64>> {
 /// Persist WindowOp arrangement and output cache to a ShardDb.
 ///
 /// Uses only point Put/Delete operations — never DeleteRange.
-pub async fn persist_window_state(
-    db: &ShardDb,
+pub fn append_window_state(
     op: &WindowOp,
     op_id: OperatorId,
+    target: &mut WriteBatch,
 ) -> Result<(), OpError> {
     let batch = {
         let state = op.state.lock().unwrap();
@@ -635,10 +635,20 @@ pub async fn persist_window_state(
         batch
     };
 
-    if batch.is_empty() {
-        return Ok(());
+    target.merge_from(batch);
+    Ok(())
+}
+
+pub async fn persist_window_state(
+    db: &ShardDb,
+    op: &WindowOp,
+    op_id: OperatorId,
+) -> Result<(), OpError> {
+    let mut batch = WriteBatch::new();
+    append_window_state(op, op_id, &mut batch)?;
+    if !batch.is_empty() {
+        db.write_batch(batch).await.map_err(OpError::storage)?;
     }
-    db.write_batch(batch).await.map_err(OpError::storage)?;
     Ok(())
 }
 

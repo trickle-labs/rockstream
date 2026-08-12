@@ -76,7 +76,7 @@ async fn migration_converges_under_buggify_seed() {
     coordinator
         .drive_planned_to_copying(
             &mut record,
-            &[donor.clone()],
+            std::slice::from_ref(&donor),
             &recipient,
             &checkpoints,
             PhaseClocks {
