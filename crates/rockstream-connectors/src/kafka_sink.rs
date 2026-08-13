@@ -273,7 +273,7 @@ impl SinkConnector for KafkaSink {
                     && buggify!("kafka.tx_timeout", self.kafka_tx_timeout_probability)
                 {
                     // The broker force-aborted the open transaction before it
-                    // could commit (`transaction.timeout.ms` exceeded, M5/S3
+                    // could commit (`transaction.timeout.ms` exceeded, S3
                     // gap 2). The epoch was never delivered; the caller must
                     // retry via `recover()`'s `CheckBeforeCommit` path, which
                     // will find the topic absent and re-commit in a fresh

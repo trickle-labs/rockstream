@@ -202,18 +202,9 @@ async fn test_create_alter_show_sources_e2e() {
         .await
         .unwrap();
 
-    // 2. Create S3 source
-    client
-        .execute(
-            "CREATE SOURCE s3_src TYPE s3 (bucket='mybucket', prefix='data/') FORMAT csv;",
-            &[],
-        )
-        .await
-        .unwrap();
-
-    // 3. SHOW SOURCES
+    // 2. SHOW SOURCES
     let rows = client.query("SHOW SOURCES;", &[]).await.unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 1);
     let name0: String = rows[0].get(0);
     let type0: String = rows[0].get(1);
     let format0: String = rows[0].get(2);
@@ -223,16 +214,7 @@ async fn test_create_alter_show_sources_e2e() {
     assert_eq!(format0, "json");
     assert_eq!(status0, "OK");
 
-    let name1: String = rows[1].get(0);
-    let type1: String = rows[1].get(1);
-    let format1: String = rows[1].get(2);
-    let status1: String = rows[1].get(3);
-    assert_eq!(name1, "s3_src");
-    assert_eq!(type1, "s3");
-    assert_eq!(format1, "csv");
-    assert_eq!(status1, "OK");
-
-    // 4. SHOW SOURCE STATUS FOR kafka_src
+    // 3. SHOW SOURCE STATUS FOR kafka_src
     let status_rows = client
         .query("SHOW SOURCE STATUS FOR kafka_src;", &[])
         .await
@@ -243,7 +225,7 @@ async fn test_create_alter_show_sources_e2e() {
     assert_eq!(st_name, "kafka_src");
     assert_eq!(st_status, "OK");
 
-    // 5. ALTER SOURCE PAUSE
+    // 4. ALTER SOURCE PAUSE
     client
         .execute("ALTER SOURCE kafka_src PAUSE;", &[])
         .await
@@ -256,7 +238,7 @@ async fn test_create_alter_show_sources_e2e() {
     let st_status_paused: String = paused_rows[0].get(3);
     assert_eq!(st_status_paused, "PAUSED");
 
-    // 6. ALTER SOURCE RESUME
+    // 5. ALTER SOURCE RESUME
     client
         .execute("ALTER SOURCE kafka_src RESUME;", &[])
         .await
@@ -269,16 +251,14 @@ async fn test_create_alter_show_sources_e2e() {
     let st_status_resumed: String = resumed_rows[0].get(3);
     assert_eq!(st_status_resumed, "OK");
 
-    // 7. DROP SOURCE s3_src
+    // 6. DROP SOURCE kafka_src
     client
-        .execute("ALTER SOURCE s3_src DROP;", &[])
+        .execute("ALTER SOURCE kafka_src DROP;", &[])
         .await
         .unwrap();
 
     let after_drop_rows = client.query("SHOW SOURCES;", &[]).await.unwrap();
-    assert_eq!(after_drop_rows.len(), 1);
-    let remaining_name: String = after_drop_rows[0].get(0);
-    assert_eq!(remaining_name, "kafka_src");
+    assert!(after_drop_rows.is_empty());
 }
 
 #[tokio::test]
@@ -298,7 +278,7 @@ async fn create_source_binds_same_named_existing_table_schema() {
         .unwrap();
     client
         .simple_query(
-            "CREATE SOURCE orders TYPE s3 (bucket='orders', prefix='snapshot/') FORMAT json",
+            "CREATE SOURCE orders TYPE kafka (bootstrap.servers='localhost:9092', topic='orders') FORMAT json",
         )
         .await
         .unwrap();

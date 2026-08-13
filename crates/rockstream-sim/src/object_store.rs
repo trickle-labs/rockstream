@@ -402,37 +402,4 @@ mod tests {
         store.put("data/a", Bytes::from("1")).unwrap();
         assert_eq!(store.list("data/"), vec!["data/a"]);
     }
-
-    // Regression seed proving the `object_store.list_staleness` fault never
-    // trips any `assert_*` correctness invariant in
-    // `rockstream-connectors::sink_connector` (DESIGN.md §17.8 gap 3 is
-    // informational only: CALM epoch manifest reads are direct-key reads,
-    // never LIST-based, so LIST staleness cannot affect commit correctness).
-    #[test]
-    fn list_staleness_does_not_affect_sink_connector_asserts() {
-        use rockstream_connectors::assert_commit_pointer_atomic;
-        use rockstream_types::ids::ConnectorId;
-
-        let store = SimObjectStoreHandle::new();
-        store.set_list_staleness_epochs(5);
-
-        let connector_id = ConnectorId(1);
-        let epoch = 3;
-        let final_key = "final/000003";
-        let payload = Bytes::from("committed-payload");
-        // Advance the epoch clock first so the upcoming `put` lands at a
-        // recent epoch that staleness=5 will keep hidden from LIST.
-        for _ in 0..3 {
-            store.advance_epoch();
-        }
-        store.put(final_key, payload.clone()).unwrap();
-
-        // LIST does not yet observe the just-written key (current epoch=3,
-        // staleness=5 -> visible_epoch=0), but the sink's commit-path
-        // invariant is checked against a direct read, which is always
-        // immediately consistent regardless of LIST staleness.
-        assert!(store.list("final/").is_empty());
-        let observed = store.get(final_key).unwrap();
-        assert_commit_pointer_atomic(connector_id, epoch, observed.len(), payload.len());
-    }
 }

@@ -10,7 +10,6 @@ use tokio::net::TcpStream;
 
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs, view_reader::ViewReader, GatewayError, GatewayServer,
-    HttpWebhookSource, WebhookFormat, WebhookResult,
 };
 use rockstream_sql::frontend::SqlFrontend;
 
@@ -166,20 +165,4 @@ fn sql_parser_invalid_ddl_find_returns_rs_error_no_panic() {
     assert!(frontend.parse_ddl("DROP INDEX").is_err());
     assert!(frontend.parse_ddl("REBUILD INDEX").is_err());
     assert!(frontend.parse_ddl("").is_err());
-}
-
-#[test]
-fn webhook_json_malformed_body_returns_rs4008_no_panic() {
-    let mut source = HttpWebhookSource::new("secret", WebhookFormat::Json);
-    let malformed_payload = b"{\"invalid_json: 123";
-    let res = source.accept(b"secret", Some("deliv-1"), malformed_payload);
-    assert_eq!(res, WebhookResult::InvalidPayload);
-}
-
-#[test]
-fn webhook_csv_unclosed_quote_returns_rs4008_no_panic() {
-    let mut source = HttpWebhookSource::new("secret", WebhookFormat::Csv);
-    let malformed_csv = b"col1,col2\n\"unclosed quote,val2";
-    let res = source.accept(b"secret", Some("deliv-2"), malformed_csv);
-    assert_eq!(res, WebhookResult::InvalidPayload);
 }

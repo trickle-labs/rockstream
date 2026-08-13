@@ -36,9 +36,3 @@ name = "fuzz_postgres_cdc"
 path = "fuzz_targets/fuzz_postgres_cdc.rs"
 test = false
 doc = false
-
-[[bin]]
-name = "fuzz_webhook_body"
-path = "fuzz_targets/fuzz_webhook_body.rs"
-test = false
-doc = false

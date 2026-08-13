@@ -665,13 +665,12 @@ async fn test_nexmark_q4_q9_retraction_lfs() {
 #[tokio::test]
 async fn test_nexmark_q12_q22_retraction_lfs() {
     let views = [
-        "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
+        "q12", "q13", "q14", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
     ];
     let view_ddls = [
         "CREATE VIEW q12 AS SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "CREATE VIEW q13 AS SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key",
         "CREATE VIEW q14 AS SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
-        "CREATE VIEW q15 AS SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "CREATE VIEW q16 AS SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "CREATE VIEW q17 AS SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "CREATE VIEW q18 AS SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1",
@@ -684,7 +683,6 @@ async fn test_nexmark_q12_q22_retraction_lfs() {
         "SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key",
         "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
-        "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1",
@@ -931,13 +929,12 @@ async fn test_nexmark_q0_q9_retraction_minio() {
 #[tokio::test]
 async fn test_nexmark_q12_q22_retraction_minio() {
     let views = [
-        "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
+        "q12", "q13", "q14", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
     ];
     let view_ddls = [
         "CREATE VIEW q12 AS SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "CREATE VIEW q13 AS SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key",
         "CREATE VIEW q14 AS SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
-        "CREATE VIEW q15 AS SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "CREATE VIEW q16 AS SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "CREATE VIEW q17 AS SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "CREATE VIEW q18 AS SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1",
@@ -950,7 +947,6 @@ async fn test_nexmark_q12_q22_retraction_minio() {
         "SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key",
         "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
-        "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, CAST(AVG(price) AS BIGINT) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1",

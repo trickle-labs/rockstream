@@ -6,11 +6,9 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use object_store::memory::InMemory;
 use rockstream_connectors::{
-    validate_window_watermark, ObjectStoreSink, OffsetToken, PollDeltaResult, SinkConnector,
-    SnapshotDeltaFence, SnapshotStream, SourceConnector, SourceError, SourcePollLifecycle,
-    WatermarkCapability, OBJECT_STORE_SINK_MAX_PENDING_EPOCHS,
+    validate_window_watermark, OffsetToken, PollDeltaResult, SnapshotDeltaFence, SnapshotStream,
+    SourceConnector, SourceError, SourcePollLifecycle, WatermarkCapability,
 };
 use rockstream_ops::time_window::TumbleWindowOp;
 use rockstream_ops::zset::ArrowZSet;
@@ -274,51 +272,6 @@ async fn edge_source_failure_pauses_preserves_offset_and_recovers_exactly_once()
         (vec![7], vec![after], false),
         "EDGE-SOURCEFAIL: recovery must emit and commit the exact output once"
     );
-}
-
-#[tokio::test]
-async fn edge_object_store_brownout_caps_buffer_backpressures_and_drains() {
-    let mut sink = ObjectStoreSink::new(ConnectorId(51_12), Arc::new(InMemory::new()));
-    sink.set_cluster_committed(100);
-    let mut states = Vec::new();
-    for epoch in 1..=OBJECT_STORE_SINK_MAX_PENDING_EPOCHS as u64 {
-        let state = sink.pre_commit(epoch, epoch as usize).await.unwrap();
-        states.push((epoch, state));
-    }
-    let rejected = sink.pre_commit(6, 6).await.unwrap_err().to_string();
-    for (epoch, state) in &states {
-        sink.commit(*epoch, state).await.unwrap();
-    }
-    let mut finals = Vec::new();
-    for epoch in 1..=OBJECT_STORE_SINK_MAX_PENDING_EPOCHS as u64 {
-        finals.push(sink.final_exists(epoch).await);
-    }
-    assert_eq!(
-        (
-            rejected,
-            sink.object_store_sink_pending_epochs_count(),
-            sink.backpressure_active(),
-            finals,
-        ),
-        (
-            "RS-4003: sink pre-commit failed for epoch 6: backpressure: pending_epochs=5 >= max=5"
-                .to_string(),
-            0,
-            false,
-            vec![true, true, true, true, true],
-        ),
-        "EDGE-BROWNOUT: recovery must cap, backpressure, and drain every epoch in order"
-    );
-}
-
-#[test]
-fn edge_brownout_lfs_exact_recovery() {
-    edge_object_store_brownout_caps_buffer_backpressures_and_drains();
-}
-
-#[test]
-fn edge_brownout_minio_exact_recovery() {
-    edge_object_store_brownout_caps_buffer_backpressures_and_drains();
 }
 
 #[test]

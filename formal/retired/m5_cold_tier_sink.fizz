@@ -1,4 +1,5 @@
-# formal/m5_cold_tier_sink.fizz
+# RETIRED in v0.52.4: cold-tier connectors were removed; this model is historical only.
+# formal/retired/m5_cold_tier_sink.fizz
 # M5 — Cold-Tier Exactly-Once Sink Commit Protocol
 #
 # Models the existing `object_store_sink.rs` 2PC protocol (v0.21, NativeIdempotent

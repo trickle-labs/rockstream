@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array};
+use arrow::array::{Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use tracing::debug;
@@ -60,6 +60,128 @@ fn output_schema() -> SchemaRef {
         Field::new("count", DataType::Int64, false),
         Field::new("avg_v", DataType::Float64, false),
     ]))
+}
+
+/// Converts scaled integer aggregate state to exact decimal text for storage.
+pub struct DecimalAggregateFormatOp {
+    scale: i8,
+    average: bool,
+}
+
+impl DecimalAggregateFormatOp {
+    pub fn new(scale: i8, average: bool) -> Self {
+        Self { scale, average }
+    }
+
+    fn format_scaled(value: i64, scale: i8) -> String {
+        let divisor = 10_i64.pow(scale as u32) as u64;
+        let sign = if value < 0 { "-" } else { "" };
+        let value = value.unsigned_abs();
+        let whole = value / divisor;
+        let fraction = format!("{:0width$}", value % divisor, width = scale as usize)
+            .trim_end_matches('0')
+            .to_string();
+        if scale == 0 || fraction.is_empty() {
+            format!("{sign}{whole}")
+        } else {
+            format!("{sign}{whole}.{fraction}")
+        }
+    }
+
+    fn format_average(sum: i64, count: i64, scale: i8) -> Result<String, OpError> {
+        if count == 0 {
+            return Err(OpError::unimplemented("decimal average with zero count"));
+        }
+        let negative = (sum < 0) != (count < 0);
+        let numerator = sum.unsigned_abs() as u128;
+        let denominator = (count.unsigned_abs() as u128) * 10_u128.pow(scale as u32);
+        let whole = numerator / denominator;
+        let mut remainder = numerator % denominator;
+        let mut fraction = String::new();
+        for _ in 0..18 {
+            if remainder == 0 {
+                break;
+            }
+            remainder *= 10;
+            fraction.push((b'0' + (remainder / denominator) as u8) as char);
+            remainder %= denominator;
+        }
+        if remainder != 0 {
+            return Err(OpError::unimplemented(
+                "decimal average requires more than 18 decimal places",
+            ));
+        }
+        let sign = if negative { "-" } else { "" };
+        Ok(if fraction.is_empty() {
+            format!("{sign}{whole}")
+        } else {
+            format!("{sign}{whole}.{fraction}")
+        })
+    }
+}
+
+impl Operator for DecimalAggregateFormatOp {
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("agg", DataType::Utf8, false),
+        ]));
+        if delta.is_empty() {
+            return Ok(ArrowZSet::empty(schema));
+        }
+        let keys = delta
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                OpError::column_type_mismatch(
+                    "Int64",
+                    format!("{:?}", delta.data.column(0).data_type()),
+                )
+            })?;
+        let sums = delta
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                OpError::column_type_mismatch(
+                    "Int64",
+                    format!("{:?}", delta.data.column(1).data_type()),
+                )
+            })?;
+        let counts = delta
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                OpError::column_type_mismatch(
+                    "Int64",
+                    format!("{:?}", delta.data.column(2).data_type()),
+                )
+            })?;
+        let values = (0..delta.num_rows())
+            .map(|row| {
+                if self.average {
+                    Self::format_average(sums.value(row), counts.value(row), self.scale)
+                } else {
+                    Ok(Self::format_scaled(sums.value(row), self.scale))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let data = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(keys.clone()), Arc::new(StringArray::from(values))],
+        )
+        .map_err(OpError::arrow)?;
+        Ok(ArrowZSet::new(data, delta.weights))
+    }
+
+    fn name(&self) -> &str {
+        "DecimalAggregateFormatOp"
+    }
 }
 
 // ─── AggState ────────────────────────────────────────────────────────────────
@@ -309,6 +431,16 @@ impl Operator for AggregateOp {
         let v_raw = delta.data.column(1);
         let v_col_owned = if let Some(arr) = v_raw.as_any().downcast_ref::<Int64Array>() {
             arr.clone()
+        } else if let Some(arr) = v_raw.as_any().downcast_ref::<Decimal128Array>() {
+            Int64Array::from(
+                (0..arr.len())
+                    .map(|row| {
+                        i64::try_from(arr.value(row)).map_err(|_| {
+                            OpError::column_type_mismatch("Decimal128 fitting Int64", "Decimal128")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
         } else if let Ok(cast_arr) = arrow::compute::cast(v_raw.as_ref(), &DataType::Int64) {
             cast_arr
                 .as_any()
@@ -916,6 +1048,78 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn decimal_sum_and_avg_keep_the_full_scaled_value() {
+        use arrow::array::Decimal128Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Decimal128(12, 2), false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 2])),
+                Arc::new(
+                    Decimal128Array::from(vec![1025_i128, 550, 375])
+                        .with_precision_and_scale(12, 2)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let aggregate = AggregateOp::new(OperatorId(0));
+        let output = aggregate
+            .process_delta(ArrowZSet::new(data, vec![1, 1, 1]))
+            .unwrap();
+        let sum = DecimalAggregateFormatOp::new(2, false)
+            .process_delta(output.clone())
+            .unwrap();
+        let avg = DecimalAggregateFormatOp::new(2, true)
+            .process_delta(output)
+            .unwrap();
+        let rows = |batch: &ArrowZSet| {
+            let keys = batch
+                .data
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let values = batch
+                .data
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|row| {
+                    (
+                        keys.value(row),
+                        values.value(row).to_string(),
+                        batch.weights[row],
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows(&sum),
+            vec![
+                (1, "10.25".to_string(), 1),
+                (1, "10.25".to_string(), -1),
+                (1, "15.75".to_string(), 1),
+                (2, "3.75".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            rows(&avg),
+            vec![
+                (1, "10.25".to_string(), 1),
+                (1, "10.25".to_string(), -1),
+                (1, "7.875".to_string(), 1),
+                (2, "3.75".to_string(), 1),
+            ]
+        );
     }
 
     #[test]

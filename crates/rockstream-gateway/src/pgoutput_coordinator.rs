@@ -31,6 +31,7 @@ pub struct SourceIdentityV1 {
 pub type SourceIdentity = SourceIdentityV1;
 
 impl SourceIdentityV1 {
+    // Source identity is a complete durable key, so construction takes every key dimension.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: impl Into<String>,

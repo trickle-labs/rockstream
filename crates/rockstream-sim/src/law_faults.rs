@@ -95,24 +95,16 @@ pub fn register_law_faults(model: &mut FaultModel) {
         category: FaultCategory::Network,
     });
 
-    // PartialWriteRecoveryTest (v0.43, DESIGN.md §17.8 gap 1) — cold-tier
-    // sink partial object writes during the commit-time atomic rename.
-    model.register(FaultEntry {
-        id: "object_store.partial_write",
-        description: "PartialWriteRecoveryTest: SimObjectStore truncates the bytes of an \
-                       in-progress `put` mid-write, mirroring a real S3/GCS crashed or \
-                       interrupted multi-part upload leaving a truncated object visible at \
-                       the final prefix. The cold-tier sink's 2PC commit protocol \
-                       (`object_store_sink.rs`) must detect the truncation via \
-                       `assert_commit_pointer_atomic` and recover by scan-and-delete cleanup \
-                       followed by a retried rename, never treating a truncated object as a \
-                       successful commit.",
-        category: FaultCategory::Io,
-    });
-
     // KafkaTxTimeoutRecoveryTest (v0.43, DESIGN.md §17.8 gap 2) — Kafka
     // transactional producer's open transaction times out and is
     // broker-side force-aborted before the sink can commit it.
+    model.register(FaultEntry {
+        id: "object_store.partial_write",
+        description:
+            "FaultInjectingObjectStore truncates a write for retained connector fault tests.",
+        category: FaultCategory::Io,
+    });
+
     model.register(FaultEntry {
         id: "kafka.tx_timeout",
         description: "KafkaTxTimeoutRecoveryTest: the Kafka broker force-aborts an open \

@@ -1195,9 +1195,6 @@ impl PostgresCdcSource {
         for message in messages.into_iter().skip(self.native_seen_messages) {
             let lsn = PgLsn::parse(message.get::<_, String>(0).as_str())?;
             let payload = message.get::<_, Vec<u8>>(1);
-            if lsn <= after {
-                continue;
-            }
             self.native_seen_messages += 1;
             match payload.first() {
                 Some(b'B') => {
@@ -1220,6 +1217,9 @@ impl PostgresCdcSource {
                     if bytes.saturating_add(payload.len()) > POSTGRES_CDC_MAX_TRANSACTION_BYTES {
                         self.replication_read_paused = true;
                         return Err(SourceError::PollDeltaFailed { reason: "[RS-4014] pgoutput transaction exceeds POSTGRES_CDC_MAX_TRANSACTION_BYTES; replication is paused. Next steps: increase the bound or reduce upstream transaction size".to_string() });
+                    }
+                    if end_lsn <= after {
+                        continue;
                     }
                     self.native_seen_messages = 0;
                     return Ok(PollDeltaResult {
@@ -1402,7 +1402,10 @@ impl SourceConnector for PostgresCdcSource {
                 .take(transaction_len)
                 .map(|queued| queued.bytes)
                 .sum::<usize>();
-            if transaction_len > allowance || transaction_bytes > max_bytes {
+            if transaction_len > allowance
+                || changes.len().saturating_add(transaction_len) > allowance
+                || transaction_bytes > max_bytes
+            {
                 if changes.is_empty() {
                     return Err(SourceError::PollDeltaFailed {
                         reason: "[RS-4014] pgoutput transaction exceeds poll credits or byte budget; replication remains paused. Next steps: raise the source epoch budget".to_string(),

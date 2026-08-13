@@ -280,6 +280,9 @@ impl KafkaSource {
     fn build_batch(&self, records: &[KafkaRecord]) -> Result<Vec<RecordBatch>, SourceError> {
         use rockstream_types::arrow_batch::append_weight_column;
 
+        if records.is_empty() {
+            return Ok(vec![]);
+        }
         let rows = records
             .iter()
             .map(|record| record.values.clone())
@@ -422,6 +425,10 @@ impl SourceConnector for KafkaSource {
                 ),
                 }
             })?;
+        if offsets.is_empty() {
+            self.last_committed = Some((epoch, offset));
+            return Ok(());
+        }
         let mut commit = TopicPartitionList::new();
         for (partition, next_offset) in offsets {
             let partition =

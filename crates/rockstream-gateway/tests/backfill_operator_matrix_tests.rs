@@ -227,6 +227,25 @@ async fn pgoutput_aggregate_rows(
     ] {
         client.execute(sql, &[]).await.unwrap();
     }
+    if value_type == "DECIMAL(12,2)" {
+        assert_eq!(
+            catalog.get_table("input").unwrap().columns[2].data_type,
+            "Decimal(12,2)"
+        );
+        let source_rows = client
+            .simple_query("SELECT * FROM input")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => {
+                    Some(row.get(2).unwrap().to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(source_rows, vec!["10.25", "5.50", "3.75"]);
+    }
     let expected = result_string_rows(&client).await;
     upstream
         .batch_execute("INSERT INTO input VALUES (99, 99, 11); DELETE FROM input WHERE id = 99;")
@@ -250,7 +269,7 @@ async fn pgoutput_aggregate_rows(
                 == vec![vec![
                     Some("result".to_string()),
                     Some("RUNNING".to_string()),
-                    Some("3".to_string()),
+                    Some("1".to_string()),
                     Some("0".to_string()),
                     Some("3".to_string()),
                     Some("ADMITTED".to_string()),
@@ -643,7 +662,7 @@ async fn pgoutput_join_rows(
                 == vec![vec![
                     Some("result".to_string()),
                     Some("RUNNING".to_string()),
-                    Some("left_input:3,right_input:2".to_string()),
+                    Some("left_input:1,right_input:2".to_string()),
                     Some("0".to_string()),
                     Some("4".to_string()),
                     Some("ADMITTED".to_string()),
@@ -928,7 +947,7 @@ async fn pgoutput_window_rows(
                 == vec![vec![
                     Some("result".to_string()),
                     Some("RUNNING".to_string()),
-                    Some("3".to_string()),
+                    Some("1".to_string()),
                     Some("0".to_string()),
                     Some(estimated_rows.to_string()),
                     Some("ADMITTED".to_string()),

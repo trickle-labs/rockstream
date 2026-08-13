@@ -44,7 +44,7 @@ use rockstream_plan::{AggregateFunc, Expr, PlanNode};
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::OperatorId;
 
-use crate::aggregate::AggregateOp;
+use crate::aggregate::{AggregateOp, DecimalAggregateFormatOp};
 use crate::distinct::DistinctOp;
 use crate::error::OpError;
 use crate::expr::lit;
@@ -1191,6 +1191,14 @@ fn compile_node(
 
             let agg = &aggregates[0];
             let (mut stages, in_schema) = compile_node(input, source_schema)?;
+            let decimal_scale = match static_expr_type(&agg.input, &in_schema) {
+                Some(DataType::Decimal128(_, scale))
+                    if matches!(agg.func, AggregateFunc::Sum | AggregateFunc::Avg) =>
+                {
+                    Some(scale)
+                }
+                _ => None,
+            };
 
             // v0.51.4 Slice 8: a global aggregate with no GROUP BY at all
             // (e.g. `SELECT SUM(balance) FROM accounts`) is compiled as a
@@ -1212,6 +1220,14 @@ fn compile_node(
                 vec![lit(0)]
             };
             let n_keys = effective_group_by.len();
+            if decimal_scale.is_some()
+                && has_real_group_by
+                && (n_keys != 1 || !expr_is_int64(&effective_group_by[0], &in_schema))
+            {
+                return Err(OpError::unsupported_plan_node(
+                    "decimal SUM/AVG requires a single Int64 group-by key",
+                ));
+            }
 
             // Project (arbitrary) input rows down to the fixed (k0..k(n-1), v)
             // shape AggregateOp (via GroupKeyPacker, when n_keys > 1 or key is non-Int64) requires.
@@ -1293,20 +1309,48 @@ fn compile_node(
                     // AggregateOp always emits (k, sum_v, count, avg_v);
                     // project down to the two columns the SQL surface
                     // actually asked for.
-                    stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
-                        NamedExpr::new("k", Expr::Column(0)),
-                        NamedExpr::new("agg", Expr::Column(result_col)),
-                    ]))));
-                    Ok((stages, int64_schema(2)))
+                    if let Some(scale) = decimal_scale {
+                        stages.push(Stage::Stateless(Arc::new(DecimalAggregateFormatOp::new(
+                            scale,
+                            agg.func == AggregateFunc::Avg,
+                        ))));
+                        Ok((
+                            stages,
+                            Arc::new(Schema::new(vec![
+                                Field::new("k", DataType::Int64, false),
+                                Field::new("agg", DataType::Utf8, false),
+                            ])),
+                        ))
+                    } else {
+                        stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                            NamedExpr::new("k", Expr::Column(0)),
+                            NamedExpr::new("agg", Expr::Column(result_col)),
+                        ]))));
+                        Ok((stages, int64_schema(2)))
+                    }
                 }
                 KeyPacking::None => {
                     // No real GROUP BY: drop the synthetic key entirely —
                     // the frontend expects column 0 to be the aggregate
                     // result itself, not a key (see comment above).
-                    stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
-                        NamedExpr::new("agg", Expr::Column(result_col)),
-                    ]))));
-                    Ok((stages, int64_schema(1)))
+                    if let Some(scale) = decimal_scale {
+                        stages.push(Stage::Stateless(Arc::new(DecimalAggregateFormatOp::new(
+                            scale,
+                            agg.func == AggregateFunc::Avg,
+                        ))));
+                        stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                            NamedExpr::new("agg", Expr::Column(1)),
+                        ]))));
+                        Ok((
+                            stages,
+                            Arc::new(Schema::new(vec![Field::new("agg", DataType::Utf8, false)])),
+                        ))
+                    } else {
+                        stages.push(Stage::Stateless(Arc::new(ProjectOp::new(vec![
+                            NamedExpr::new("agg", Expr::Column(result_col)),
+                        ]))));
+                        Ok((stages, int64_schema(1)))
+                    }
                 }
             }
         }

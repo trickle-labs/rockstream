@@ -87,6 +87,24 @@ async fn real_broker_source_assignment_poll_and_commit() {
         KafkaSource::connect(ConnectorId(101), schema, &bootstrap, topic, "source-proof").unwrap();
     let first = poll_until(&mut source, OffsetToken::new(vec![]), 1).await;
     let second = poll_until(&mut source, first.new_offset.clone(), 1).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while source.assigned_partition_count() != 2 {
+        let _ = source
+            .poll_delta(second.new_offset.clone(), 4096, 1, None)
+            .await
+            .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "Kafka source did not receive both assignments"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        [0, 1]
+            .map(|partition| source.get_partition_offset(&second.new_offset, partition))
+            .to_vec(),
+        vec![Some(1), Some(1)]
+    );
     source
         .commit_offset(7, second.new_offset.clone())
         .await

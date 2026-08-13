@@ -1,17 +1,16 @@
 //! Scoped Clippy Lint Gate Test.
 //!
-//! Asserts that a reintroduced `.unwrap()` or `.expect()` in any of the four audited
-//! untrusted-input modules (`server.rs`, `frontend.rs`, `postgres_cdc.rs`, `webhook_source.rs`)
+//! Asserts that a reintroduced `.unwrap()` or `.expect()` in an audited
+//! untrusted-input module is denied by clippy lints.
 //! is denied by clippy lints.
 
 #[test]
 fn deliberate_unwrap_reintroduction_fails_clippy_lint() {
-    // Assert that all four audited files contain `#![deny(clippy::unwrap_used, clippy::expect_used)]`
+    // Assert that every audited file contains the deny annotation.
     let audited_files = [
         "crates/rockstream-gateway/src/server.rs",
         "crates/rockstream-sql/src/frontend.rs",
         "crates/rockstream-connectors/src/postgres_cdc.rs",
-        "crates/rockstream-gateway/src/webhook_source.rs",
     ];
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());

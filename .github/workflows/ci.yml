@@ -74,7 +74,7 @@ jobs:
         run: bash scripts/check-path-coupling.sh
 
   formal-verify:
-    name: Formal verify (M1–M5)
+    name: Formal verify (M1–M4, M6–M7)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -136,7 +136,7 @@ jobs:
           echo "$install_dir" >> "$GITHUB_PATH"
           "$install_dir/fizzbee" --version || true
       # M1 (smoke + epoch-commit), M2 (frontier aggregation), M3 (sink 2PC),
-      # M4 (self-fencing), M5 (cold-tier exactly-once sink, v0.43), and M7
+      # M4 (self-fencing), M6 (shard migration), and M7
       # (control-plane Raft leader election, v0.45.2) are all genuinely green
       # (safety + liveness) — see formal/findings.md "Post-v0.42.3
       # Remediation" and the M7 entry. All seven specs are a hard gate: a red
@@ -146,15 +146,12 @@ jobs:
       # committed value — see formal/m4_self_fencing.fizz and findings.md
       # for the full state-space analysis); its former
       # `continue-on-error`/non-blocking special-casing and per-subshell
-      # memory/wall-clock caps are removed. M5 formalizes the existing
-      # `object_store_sink.rs` 2PC protocol with an explicit mid-rename
-      # crash-yield point (DESIGN.md §17.8 gap 1) ahead of v0.44's
-      # Iceberg/Delta sinks reusing the same protocol. M7 completes in ~5s /
+      # memory/wall-clock caps are removed. M7 completes in ~5s /
       # ~37,000 nodes at NUM_CONTROL_NODES=3, MAX_ELECTIONS=2,
       # MAX_WRITE_ATTEMPTS=2 — the pre-implementation gate for v0.45.2's
       # `rockstream-control` Raft group, per the binding v0.18 rule that
       # S0 (the model) must be green before S1+ (implementation) is written.
-      - name: Formal verify — smoke, M1, M2, M3, M4, M5, M7, edge models (hard gate)
+      - name: Formal verify — smoke, M1, M2, M3, M4, M6, M7, edge models (hard gate)
         if: steps.filter.outputs.run == 'true'
         run: |
           fizz formal/smoke.fizz
@@ -162,7 +159,7 @@ jobs:
           fizz formal/m2_frontier_agg.fizz
           fizz formal/m3_sink_2pc.fizz
           fizz formal/m4_self_fencing.fizz
-          fizz formal/m5_cold_tier_sink.fizz
+          fizz formal/m6_shard_migration.fizz
           fizz formal/m7_control_plane_ha.fizz
           fizz formal/edge_quota_exhaustion.fizz
           fizz formal/edge_late_data.fizz

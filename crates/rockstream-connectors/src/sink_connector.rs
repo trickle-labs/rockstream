@@ -16,12 +16,6 @@
 //! | M3-S3 | [`assert_epoch_committed_only_after_cluster_checkpoint`] |
 //! | M3-S4 | [`assert_recovery_dispatch_idempotent`] |
 //!
-//! ## Paired assertions (M5, v0.43)
-//!
-//! | FizzBee invariant | Assertion |
-//! |---|---|
-//! | M5-S1 / M5-S3 | [`assert_commit_pointer_atomic`] |
-
 use async_trait::async_trait;
 use std::collections::BTreeSet;
 
@@ -34,7 +28,7 @@ use rockstream_types::timestamp::Epoch;
 /// Trait implemented by every exactly-once sink connector.
 ///
 /// The concrete implementations (Kafka, object-store) live in the sub-modules
-/// [`kafka_sink`] and [`object_store_sink`].
+/// [`kafka_sink`].
 #[async_trait]
 pub trait SinkConnector: Send + Sync {
     /// Returns the idempotency profile for this connector.
@@ -226,42 +220,6 @@ pub fn assert_no_lost_delivery_after_checkpoint(
     }
 }
 
-/// M5-S1 / M5-S3 paired assertion: assert that the final-prefix pointer
-/// produced by the cold-tier sink's commit-time atomic rename is never
-/// observed in a partially-written state (DESIGN.md §17.8 gap 1). A
-/// truncated final-prefix object is both a duplicate-output risk (M5-S1: the
-/// retried rename would otherwise re-append/re-fragment the same epoch's
-/// output) and an atomicity violation (M5-S3), so this single check
-/// implements both invariants per FIZZBEE_TEST_PLAN.md §3.7.
-///
-/// Real object stores (S3/GCS) do not implement the `_pending/{epoch}/` →
-/// final-prefix rename as a single atomic operation; a crash mid-rename (or
-/// a crashed/interrupted multi-part upload) can leave a truncated object
-/// visible at the final key. This assertion compares the observed byte
-/// length of the final-prefix object against the expected length staged
-/// during `pre_commit`, so any such truncation is caught immediately rather
-/// than being silently treated as a successful commit.
-///
-/// # Panics
-///
-/// Panics if `observed_len != expected_len`.
-pub fn assert_commit_pointer_atomic(
-    connector_id: ConnectorId,
-    epoch: Epoch,
-    observed_len: usize,
-    expected_len: usize,
-) {
-    assert!(
-        observed_len == expected_len,
-        "RS-4006: M5-S1/M5-S3 violation — commit pointer not atomic: \
-         connector={connector_id}, epoch={epoch} observed final-prefix object length={observed_len} \
-         but expected={expected_len} (a partial/truncated write is visible at the final prefix). \
-         next_steps: This indicates a crash mid-rename (DESIGN.md §17.8 gap 1). Recovery must \
-         scan-and-delete the truncated object (never SlateDB range deletion) and retry the \
-         rename with the full staged bytes before reporting the epoch as committed."
-    );
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -386,20 +344,6 @@ mod tests {
     fn assert_no_lost_delivery_passes_when_epoch_not_yet_committed() {
         // cluster_committed=2 < epoch=5; no assertion needed.
         assert_no_lost_delivery_after_checkpoint(ConnectorId(1), 5, 2, &SinkState::Idle);
-    }
-
-    // ── M5-S1 / M5-S3: Commit pointer atomicity ───────────────────────────────
-
-    #[test]
-    fn assert_commit_pointer_atomic_passes_when_lengths_match() {
-        assert_commit_pointer_atomic(ConnectorId(1), 3, 100, 100);
-        assert_commit_pointer_atomic(ConnectorId(1), 3, 0, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "RS-4006")]
-    fn assert_commit_pointer_atomic_panics_on_truncated_object() {
-        assert_commit_pointer_atomic(ConnectorId(1), 3, 42, 100);
     }
 
     // ── M3-S3 + test_m3_runtime_asserts (exhaustive paths) ───────────────────

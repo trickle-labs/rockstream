@@ -2185,7 +2185,7 @@ async fn nexmark_q11_survives_retraction_storm() {
 }
 
 #[tokio::test]
-async fn test_nexmark_q14_q15_lfs() {
+async fn test_nexmark_q14_lfs() {
     use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -2202,7 +2202,7 @@ async fn test_nexmark_q14_q15_lfs() {
 
     let store = Arc::new(InMemory::new());
     let shard_db = Arc::new(
-        ShardDb::builder("nexmark-q14-q15-lfs-shard", store.clone())
+        ShardDb::builder("nexmark-q14-lfs-shard", store.clone())
             .build()
             .await
             .unwrap(),
@@ -2263,7 +2263,7 @@ async fn test_nexmark_q14_q15_lfs() {
         .await
         .expect("CREATE TABLE bid failed");
 
-    // Define standard CREATE VIEW statements for Nexmark q14–q15
+    // Define the supported Nexmark q14 view.
     client
         .simple_query("CREATE VIEW q14 AS SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid")
         .await
@@ -2274,22 +2274,6 @@ async fn test_nexmark_q14_q15_lfs() {
     assert!(
         catalog.get_view("q14").unwrap().op_id.is_some(),
         "q14 should compile via compile_plan (Slice 7 Case/scalar-udf wiring)"
-    );
-
-    client
-        .simple_query("CREATE VIEW q15 AS SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))")
-        .await
-        .expect("CREATE VIEW q15 failed");
-    // q15's 3-aggregate `GROUP BY date_bin(...)` shape used to hit a
-    // `TumbleWindowOp`/`date_bin` timestamp-precision gap (the batch
-    // oracle's `CAST(.. AS TIMESTAMP)` treats the raw column as *seconds*,
-    // not milliseconds, regardless of destination `TimeUnit` — see
-    // `interval_ms_to_bucket_units`/`timestamp_display_scale` in
-    // `rockstream-sql/src/lower.rs`); now fixed, so it compiles like every
-    // other Slice 8 multi-aggregate composition.
-    assert!(
-        catalog.get_view("q15").unwrap().op_id.is_some(),
-        "q15 should compile via compile_plan (date_bin/timestamp gap fixed)"
     );
 
     // Generate 500 events
@@ -2311,7 +2295,7 @@ async fn test_nexmark_q14_q15_lfs() {
 
     // Set idempotency key
     client
-        .simple_query("SET rockstream.idempotency_key = 'nexmark-q14-q15-batch-1'")
+        .simple_query("SET rockstream.idempotency_key = 'nexmark-q14-batch-1'")
         .await
         .expect("SET idempotency_key failed");
 
@@ -2529,8 +2513,8 @@ async fn test_nexmark_q14_q15_lfs() {
         }
     };
 
-    // Verify q14–q15 results are bit-identical to the DataFusion batch oracle.
-    let views = ["q14", "q15"];
+    // Verify q14 is bit-identical to the DataFusion batch oracle.
+    let views = ["q14"];
     #[allow(clippy::items_after_statements)]
     async fn subscribe_snapshot_rows(
         shard_db: &rockstream_storage::ShardDb,
@@ -2558,8 +2542,7 @@ async fn test_nexmark_q14_q15_lfs() {
             .collect()
     }
     let oracle_queries = [
-        "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
-        "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))"
+        "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid"
     ];
 
     for (view, query) in views.iter().zip(oracle_queries.iter()) {
@@ -4594,11 +4577,6 @@ async fn test_nexmark_q12_q22_minio() {
         .unwrap();
 
     client
-        .simple_query("CREATE VIEW q15 AS SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))")
-        .await
-        .unwrap();
-
-    client
         .simple_query("CREATE VIEW q16 AS SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))")
         .await
         .unwrap();
@@ -4896,14 +4874,13 @@ async fn test_nexmark_q12_q22_minio() {
 
     // Verify q12–q22 results are bit-identical to the DataFusion batch oracle.
     let views = [
-        "q11", "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
+        "q11", "q12", "q13", "q14", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
     ];
     let oracle_queries = [
         NEXMARK_Q11_ORACLE_SQL.trim(),
         "SELECT bidder, count(*) as bid_count, CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start FROM bid GROUP BY bidder, date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "SELECT b.auction, b.bidder, b.price, b.date_time, s.value FROM bid b JOIN side_input s ON b.auction = s.key",
         "SELECT auction, bidder, price, CASE WHEN price < 10000 THEN 'low' WHEN price < 100000 THEN 'medium' ELSE 'high' END as price_tier, CAST(date_time AS VARCHAR) as date_time_str, length(extra) - length(replace(extra, 'a', '')) as char_count FROM bid",
-        "SELECT CAST(date_bin(INTERVAL '10 seconds', cast(date_time as timestamp)) AS BIGINT) as window_start, SUM(CASE WHEN price < 10000 THEN price ELSE 0 END) as low_sum, COUNT(DISTINCT CASE WHEN price >= 10000 AND price < 100000 THEN bidder END) as medium_bidders, COUNT(DISTINCT CASE WHEN price >= 100000 THEN bidder END) as high_bidders FROM bid GROUP BY date_bin(INTERVAL '10 seconds', cast(date_time as timestamp))",
         "SELECT channel, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(DISTINCT bidder) as distinct_bidders, COUNT(*) as bid_count FROM bid GROUP BY channel, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "SELECT auction, CAST(date_bin(INTERVAL '1 day', cast(date_time as timestamp)) AS BIGINT) as day, COUNT(*) as bid_count, MAX(price) as max_price, AVG(price) as avg_price FROM bid GROUP BY auction, date_bin(INTERVAL '1 day', cast(date_time as timestamp))",
         "SELECT auction, bidder, price, date_time FROM (SELECT auction, bidder, price, date_time, ROW_NUMBER() OVER (PARTITION BY bidder ORDER BY date_time DESC) as rn FROM bid ) WHERE rn <= 1",

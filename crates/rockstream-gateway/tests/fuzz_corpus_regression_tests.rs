@@ -7,7 +7,7 @@ use arrow::datatypes::Schema;
 use rockstream_connectors::postgres_cdc::{CdcWireFormat, PostgresCdcSource};
 use rockstream_gateway::{
     catalog_stubs::CatalogStubs, view_reader::ViewReadStrategy, GatewayError, GatewayServer,
-    HttpWebhookSource, ViewReader, WebhookFormat,
+    ViewReader,
 };
 use rockstream_sql::frontend::SqlFrontend;
 use std::fs;
@@ -104,17 +104,6 @@ fn run_fuzz_postgres_cdc_corpus() {
     }
 }
 
-fn run_fuzz_webhook_body_corpus() {
-    let corpus = read_corpus_files("fuzz_webhook_body");
-    for (_path, data) in corpus {
-        let mut json_source = HttpWebhookSource::new("secret", WebhookFormat::Json);
-        let _ = json_source.accept(b"secret", Some("delivery-1"), &data);
-
-        let mut csv_source = HttpWebhookSource::new("secret", WebhookFormat::Csv);
-        let _ = csv_source.accept(b"secret", Some("delivery-2"), &data);
-    }
-}
-
 #[tokio::test]
 async fn replay_fuzz_sql_parser_corpus() {
     run_fuzz_sql_parser_corpus().await;
@@ -130,15 +119,9 @@ fn replay_fuzz_postgres_cdc_corpus() {
     run_fuzz_postgres_cdc_corpus();
 }
 
-#[test]
-fn replay_fuzz_webhook_body_corpus() {
-    run_fuzz_webhook_body_corpus();
-}
-
 #[tokio::test]
 async fn replay_all_fuzz_corpora() {
     run_fuzz_sql_parser_corpus().await;
     run_fuzz_pgwire_decoder_corpus().await;
     run_fuzz_postgres_cdc_corpus();
-    run_fuzz_webhook_body_corpus();
 }

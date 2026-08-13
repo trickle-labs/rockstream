@@ -21,20 +21,18 @@ TMP_M2S3="$(mktemp -d)"
 TMP_M4S1="$(mktemp -d)"
 TMP_EDGE_QUOTA="$(mktemp -d)"
 TMP_EDGE_SOURCEFAIL="$(mktemp -d)"
-TMP_EDGE_BROWNOUT="$(mktemp -d)"
 TMP_EDGE_MISCONFIG="$(mktemp -d)"
 TMP_EDGE_LATE="$(mktemp -d)"
 OUT_M2S3="$(mktemp)"
 OUT_M4S1="$(mktemp)"
 OUT_EDGE_QUOTA="$(mktemp)"
 OUT_EDGE_SOURCEFAIL="$(mktemp)"
-OUT_EDGE_BROWNOUT="$(mktemp)"
 OUT_EDGE_MISCONFIG="$(mktemp)"
 OUT_EDGE_LATE="$(mktemp)"
 OUT_REAL="$(mktemp)"
 cleanup() {
-  rm -rf "$TMP_M2S3" "$TMP_M4S1" "$TMP_EDGE_QUOTA" "$TMP_EDGE_SOURCEFAIL" "$TMP_EDGE_BROWNOUT" "$TMP_EDGE_MISCONFIG" "$TMP_EDGE_LATE"
-  rm -f "$OUT_M2S3" "$OUT_M4S1" "$OUT_EDGE_QUOTA" "$OUT_EDGE_SOURCEFAIL" "$OUT_EDGE_BROWNOUT" "$OUT_EDGE_MISCONFIG" "$OUT_EDGE_LATE" "$OUT_REAL"
+  rm -rf "$TMP_M2S3" "$TMP_M4S1" "$TMP_EDGE_QUOTA" "$TMP_EDGE_SOURCEFAIL" "$TMP_EDGE_MISCONFIG" "$TMP_EDGE_LATE"
+  rm -f "$OUT_M2S3" "$OUT_M4S1" "$OUT_EDGE_QUOTA" "$OUT_EDGE_SOURCEFAIL" "$OUT_EDGE_MISCONFIG" "$OUT_EDGE_LATE" "$OUT_REAL"
 }
 trap cleanup EXIT
 
@@ -75,7 +73,7 @@ fi
 grep -q "M4-S1" "$OUT_M4S1" || fail "checker's failure output did not name M4-S1"
 
 # ── Cases 3-7: every EDGE recovery proof needs a real Rust assert! ─────────
-for edge in EDGE-QUOTA EDGE-SOURCEFAIL EDGE-BROWNOUT EDGE-MISCONFIG EDGE-LATE; do
+for edge in EDGE-QUOTA EDGE-SOURCEFAIL EDGE-MISCONFIG EDGE-LATE; do
   normalized="${edge//-/_}"
   tmp_var="TMP_${normalized}"
   out_var="OUT_${normalized}"

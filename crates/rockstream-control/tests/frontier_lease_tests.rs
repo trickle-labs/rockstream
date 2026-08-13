@@ -108,8 +108,7 @@ async fn frontier_leader_lease_cas_survives_restart_lfs() {
 /// **S7 focused regression**: directly exercises S5's
 /// `assert_flush_before_lease_handoff_read` panic path by forcing an
 /// unflushed write ahead of a lease handoff, mirroring the existing
-/// `commit_panics_via_assert_commit_pointer_atomic_on_truncated_write`
-/// pattern in `object_store_sink.rs` (`crates/rockstream-connectors/src/`).
+/// `assert_valid_publisher` panic-path pattern in `frontier.rs`.
 ///
 /// `FrontierLeaseStore` itself always writes with `await_durable: true`
 /// (there is no code path that produces an unflushed publish), so this
