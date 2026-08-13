@@ -56,6 +56,7 @@ pub enum WebhookResult {
     InvalidPayload,
     DurabilityFailed,
     InFlight,
+    Removed,
 }
 
 impl WebhookResult {
@@ -70,6 +71,7 @@ impl WebhookResult {
             Self::InvalidPayload => 400,
             Self::DurabilityFailed => 500,
             Self::InFlight => 409,
+            Self::Removed => 410,
         }
     }
 
@@ -83,6 +85,7 @@ impl WebhookResult {
             Self::InvalidPayload => Some("RS-4016"),
             Self::DurabilityFailed => Some("RS-4017"),
             Self::InFlight => Some("RS-4018"),
+            Self::Removed => Some("RS-4017"),
             Self::Accepted | Self::Duplicate => None,
         }
     }

@@ -1755,6 +1755,9 @@ impl GatewayHandler {
         delivery_id: Option<&str>,
         payload: &[u8],
     ) -> WebhookResult {
+        if webhook_ingress_removed() {
+            return WebhookResult::Removed;
+        }
         let Some(source_entry) = self.catalog.get_source(source_name) else {
             return WebhookResult::NotFound;
         };
@@ -3835,7 +3838,7 @@ impl GatewayHandler {
                 view.pipeline.restore(shard_db).await
             };
             if let Err(error) = result {
-                tracing::error!(view = %view.view_name, %error, "restore fenced pgoutput pipeline failed");
+                tracing::error!(code = "RS-4013", view = %view.view_name, %error, "restore fenced pgoutput pipeline failed");
             }
         }
     }
@@ -4767,6 +4770,10 @@ impl GatewayHandler {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        if is_removed_connector_ddl(&ql) {
+            return Some(Ok(vec![connector_removed_error_response()]));
+        }
+
         // SERIALIZABLE → RS-2003
         if ql.contains("serializable") && ql.contains("isolation") {
             return Some(Ok(vec![Response::Error(Box::new(ErrorInfo::new(
@@ -5695,6 +5702,11 @@ impl GatewayHandler {
         if ql.trim_end_matches(';') == "show sources" {
             return Ok(vec![promote_response(catalog_resp_to_response(
                 self.catalog.sources_response(),
+            ))]);
+        }
+        if ql.trim_end_matches(';') == "show sinks" {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.sinks_response(),
             ))]);
         }
         if ql.trim_end_matches(';') == "show source status" {
@@ -11349,6 +11361,13 @@ impl GatewayServer {
 
     /// Start listening.  Blocks until the future is dropped.
     pub async fn serve(self) -> std::io::Result<()> {
+        if let Some(shard_db) = &self.handler.shard_db {
+            self.handler
+                .catalog
+                .load_v0522_removed_connectors(shard_db)
+                .await
+                .map_err(std::io::Error::other)?;
+        }
         self.handler.bind_server(&self.handler);
         self.handler.recover_compiled_views().await;
         let factory = Arc::new(GatewayHandlerFactory {
@@ -11530,6 +11549,13 @@ impl GatewayServer {
     pub async fn serve_background(
         self,
     ) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        if let Some(shard_db) = &self.handler.shard_db {
+            self.handler
+                .catalog
+                .load_v0522_removed_connectors(shard_db)
+                .await
+                .map_err(std::io::Error::other)?;
+        }
         self.handler.bind_server(&self.handler);
         self.handler.recover_compiled_views().await;
         let factory = Arc::new(GatewayHandlerFactory {
@@ -12851,7 +12877,7 @@ fn source_batch_to_dml_ops(
         .unwrap_or_else(|| (batch.clone(), vec![1; batch.num_rows()]));
     if data.num_columns() != columns.len() {
         return Err(format!(
-            "source batch has {} column(s), but table '{table}' has {}",
+            "[RS-4008] source batch has {} column(s), but table '{table}' has {}",
             data.num_columns(),
             columns.len()
         ));
@@ -13707,6 +13733,25 @@ fn create_sink_error_response(message: String) -> Response<'static> {
     )))
 }
 
+fn connector_removed_error_response() -> Response<'static> {
+    create_sink_error_response(
+        "[RS-4017] connector.removed: This connector has been removed. Next steps: use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.".to_string(),
+    )
+}
+
+fn is_removed_connector_ddl(query: &str) -> bool {
+    let removed_sink = query.starts_with("create sink ")
+        && query.contains(" for view ")
+        && (query.contains(" to iceberg")
+            || query.contains(" to delta")
+            || query.contains(" to parquet")
+            || query.contains(" to s3")
+            || query.contains(" to object_store"));
+    removed_sink
+        || (query.starts_with("create source ")
+            && (query.contains(" type s3") || query.contains(" type http_webhook")))
+}
+
 fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
     let trimmed = q.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_lowercase();
@@ -14122,6 +14167,10 @@ async fn serve_webhook_connection(
     mut socket: tokio::net::TcpStream,
     handler: Arc<GatewayHandler>,
 ) -> std::io::Result<()> {
+    if webhook_ingress_removed() {
+        return write_webhook_response(&mut socket, WebhookResult::Removed).await;
+    }
+
     use tokio::io::AsyncReadExt;
 
     const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -14214,15 +14263,22 @@ async fn serve_webhook_connection(
     write_webhook_response(&mut socket, result).await
 }
 
+fn webhook_ingress_removed() -> bool {
+    true
+}
+
 async fn write_webhook_response(
     socket: &mut tokio::net::TcpStream,
     result: WebhookResult,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let body = match result.error_code() {
+    let body = match result {
+        WebhookResult::Removed => "[RS-4017] connector.removed: HTTP/webhook sources have been removed. Next steps: use an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter outside RockStream.\n".to_string(),
+        _ => match result.error_code() {
         Some(code) => format!("{code}: webhook request rejected. Next steps: verify source, bearer token, payload, and source capacity\n"),
         None => "accepted\n".to_string(),
+        },
     };
     let reason = match result.status_code() {
         202 => "Accepted",
@@ -14230,6 +14286,7 @@ async fn write_webhook_response(
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        410 => "Gone",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         _ => "Internal Server Error",
@@ -15444,7 +15501,7 @@ mod s4_tests {
             handler
                 .accept_webhook("orders", b"secret", Some("delivery-1"), br#"{}"#)
                 .await,
-            WebhookResult::Accepted
+            WebhookResult::Removed
         );
         assert!(handler
             .handle_alter_source("ALTER SOURCE orders PAUSE")
@@ -15453,7 +15510,7 @@ mod s4_tests {
             handler
                 .accept_webhook("orders", b"secret", Some("delivery-2"), br#"{}"#)
                 .await,
-            WebhookResult::Paused
+            WebhookResult::Removed
         );
         assert!(handler
             .handle_alter_source("ALTER SOURCE orders RESUME")
@@ -15466,7 +15523,7 @@ mod s4_tests {
             handler
                 .accept_webhook("orders", b"secret", Some("delivery-3"), br#"{}"#)
                 .await,
-            WebhookResult::NotFound
+            WebhookResult::Removed
         );
     }
 

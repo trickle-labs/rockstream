@@ -13,7 +13,7 @@
 
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
-use rockstream_types::error_code::{ErrorCode, RS_0002, RS_0003};
+use rockstream_types::error_code::{ErrorCode, RS_0002, RS_0003, RS_4017};
 use rockstream_types::topology::{
     ControlMessage, WorkerCapabilities, WorkerLocation, WorkerMessage,
 };
@@ -432,6 +432,17 @@ pub async fn start_gateway_with_shard(
 pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let started_ms = now_ms();
     validate_role(&opts.role)?;
+
+    if opts.config.storage.tiering.shard_meta_backend.is_some()
+        || opts.config.storage.tiering.cold_sst_backend.is_some()
+        || opts.config.storage.tiering.cold_sst_age_threshold.is_some()
+    {
+        return Err(CliError::new(
+            RS_4017,
+            "connector.removed: cold-tier configuration has been removed",
+            "Use RockStream to Kafka to a downstream writer for cold-tier output.",
+        ));
+    }
 
     let auth_mode_norm = opts.auth_mode.trim().to_lowercase();
     let valid_auth_modes = ["off", "scram", "md5", "oidc", "mtls", ""];
@@ -1100,6 +1111,27 @@ mod tests {
             err.to_string(),
             "RS-0002 unknown auth mode `invalid`\n  next steps: Pass --auth with one of: off, scram, md5, oidc, mtls."
         );
+    }
+
+    #[test]
+    fn cold_tier_config_fields_fail_closed_with_rs4017() {
+        for config in [
+            RockstreamConfig::load_from_str("[storage.tiering]\nshard_meta_backend = 's3express'").unwrap(),
+            RockstreamConfig::load_from_str("[storage.tiering]\ncold_sst_backend = 'standard-ia'").unwrap(),
+            RockstreamConfig::load_from_str("[storage.tiering]\ncold_sst_age_threshold = 3600").unwrap(),
+            RockstreamConfig::load_from_str("[storage.tiering]\nshard_meta_backend = 's3express'\ncold_sst_backend = 'standard-ia'\ncold_sst_age_threshold = 3600").unwrap(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let err = run_start(&StartOptions {
+                storage: dir.path().to_path_buf(), role: "all".to_string(), control: None,
+                auth_mode: "off".to_string(), worker_location: WorkerLocation::default(),
+                worker_capabilities: WorkerCapabilities::default(), config, metrics_addr: None,
+                listen_addr: None, raft_peers: None, raft_node_id: None, raft_bind: None,
+                raft_bootstrap: false, daemon: false, control_bind: None,
+                control_shared_storage: None, query_time_shard_dirs: Vec::new(),
+            }).unwrap_err();
+            assert_eq!(err.to_string(), "RS-4017 connector.removed: cold-tier configuration has been removed\n  next steps: Use RockStream to Kafka to a downstream writer for cold-tier output.");
+        }
     }
 
     #[test]

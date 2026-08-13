@@ -325,6 +325,8 @@ pub const RS_4014: ErrorCode = ErrorCode::new(4014);
 pub const RS_4015: ErrorCode = ErrorCode::new(4015);
 /// Webhook payload or watermark is invalid.
 pub const RS_4016: ErrorCode = ErrorCode::new(4016);
+/// Connector surface removed; creation and ingress are fail-closed.
+pub const RS_4017: ErrorCode = ErrorCode::new(4017);
 
 /// Self-fencing configuration invalid: self_fence_after must satisfy
 /// dead_after < self_fence_after < 2 × shard_recovery_budget.
@@ -413,6 +415,7 @@ pub fn slug(code: ErrorCode) -> &'static str {
         1014 => "workload.has_assigned_views",
         9001 => "admission_control.rejected",
         1731 => "control.not_leader",
+        4017 => "connector.removed",
         _ => "unknown",
     }
 }
@@ -492,6 +495,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         4005 => "Sink 2PC duplicate delivery detected and suppressed",
         4006 => "Source-epoch registry full; too many uncommitted epochs in flight",
         4007 => "CREATE SINK DDL parse or validation failed",
+        4017 => "Connector has been removed",
         3005 => "Self-fencing configuration invalid: self_fence_after constraint violated",
         5001 => "Incompatible storage format",
         5002 => "Unknown merge law in arrangement header",
@@ -562,6 +566,7 @@ pub fn severity(code: ErrorCode) -> Severity {
         2404 => Severity::Fatal,
         2405 => Severity::Fatal,
         2406 => Severity::Error,
+        4017 => Severity::Error,
         _ => Severity::Error,
     }
 }
@@ -648,6 +653,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         4005 => "This is informational; the duplicate was suppressed. Check source for duplicate delivery.",
         4006 => "Reduce source epoch rate or increase max_in_flight_source_epochs.",
         4007 => "Check CREATE SINK syntax, referenced view name, and WITH option types; use catalog=filesystem|glue|rest|hive|ducklake.",
+        4017 => "Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.",
         3005 => "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.",
         5001 => "Run the storage migration tool before upgrading.",
         5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
@@ -714,8 +720,8 @@ mod tests {
             RS_5030, RS_5031, RS_5032, RS_5035, RS_5036, RS_1512, RS_1513, RS_3601, RS_3602,
             RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016,
             RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
-            RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_3005, RS_1018, RS_2400, RS_2401,
-            RS_2402, // v0.26 auth
+            RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4017, RS_3005, RS_1018, RS_2400,
+            RS_2401, RS_2402, // v0.26 auth
             RS_9001, // v0.45.1 admission control
             RS_1731, // v0.45.2 control-plane leader-only write gating (M7-S2)
             RS_8002, RS_8003, // v0.45.6 frontier-lease publisher fencing (M2-S3)

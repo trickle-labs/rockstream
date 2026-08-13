@@ -1027,12 +1027,9 @@ window (`CHANGE_LOG_MAX_ENTRIES`) rather than a per-view SQL `retention`
 option. Falling behind that window returns `RS-2006`
 (`crates/rockstream-gateway/src/subscribe_handler.rs`).
 
-For ad-hoc analytics over a longer history, the **cold tier** remains
-the intended shape: `CREATE SINK ... FOR VIEW ... TO ICEBERG|DELTA ...`
-is real DDL, and the sink connector implementations exist, but
-`handle_create_sink()` currently registers sink metadata in the gateway
-catalog rather than wiring the sink automatically into the epoch-commit
-loop (`crates/rockstream-gateway/src/server.rs`, `docs/cold-tier-sinks.md`).
+For ad-hoc analytics over a longer history, export to Kafka and use a
+downstream writer. The prior cold-tier connector surface is removed; see
+[connector migration](connector-migration.md).
 
 ### 23. Recursive Queries and Graphs
 
@@ -1712,14 +1709,10 @@ view referenced across many materialized views as a common subplan. In
 that case, materializing it once and having other views read from it is
 more efficient than each view independently inlining and recomputing it.
 
-**"Should I enable the cold tier?"**
+**"How do I export to a data lake?"**
 
-Use the cold tier when you want lakehouse-style export semantics, but
-remember the current boundary: `CREATE SINK ... TO ICEBERG|DELTA ...` is
-real DDL and the sink connector implementations exist, yet the gateway
-currently registers sink metadata rather than wiring the sink
-automatically into the view commit loop. So this is a strong near-term
-surface, not a fully automatic "flip it on and forget it" path today.
+Use RockStream to Kafka and a downstream writer. The removed connector
+frontends return `RS-4017`; see [connector migration](connector-migration.md).
 
 **"How tight should my freshness SLO be?"**
 

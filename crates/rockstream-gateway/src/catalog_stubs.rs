@@ -19,6 +19,7 @@ use rockstream_types::metrics::{
 use rockstream_types::state_budget::{StateBudget, WorkloadBudget};
 use rockstream_types::view_lifecycle::ViewState;
 use rockstream_types::workload::WorkloadDef;
+use serde::{Deserialize, Serialize};
 
 /// Session context passed to catalog query handlers.
 #[derive(Debug, Clone)]
@@ -227,7 +228,7 @@ pub struct CatalogIndexEntry {
 }
 
 /// A sink entry registered via `CREATE SINK` through the pgwire layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogSinkEntry {
     pub name: String,
     pub view: String,
@@ -250,7 +251,7 @@ pub struct CatalogSinkEntry {
 }
 
 /// A source entry registered via `CREATE SOURCE` through the pgwire layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogSourceEntry {
     pub name: String,
     /// Existing same-named table this source can feed. `None` preserves
@@ -386,6 +387,16 @@ pub struct CatalogStubs {
     next_index_op_id: std::sync::atomic::AtomicU64,
 }
 
+const V0522_CONNECTOR_CATALOG_KEY: &[u8] = b"rockstream/catalog/connectors/v0522";
+const REMOVED_CONNECTOR_REMEDIATION: &str = "[RS-4017] connector.removed: Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.";
+
+/// Exact v0.52.2 connector-catalog envelope, read by one bounded key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V0522ConnectorCatalog {
+    pub sinks: Vec<CatalogSinkEntry>,
+    pub sources: Vec<CatalogSourceEntry>,
+}
+
 impl Default for CatalogStubs {
     fn default() -> Self {
         Self::new()
@@ -393,6 +404,47 @@ impl Default for CatalogStubs {
 }
 
 impl CatalogStubs {
+    pub async fn load_v0522_removed_connectors(
+        &self,
+        shard_db: &rockstream_storage::ShardDb,
+    ) -> Result<(), String> {
+        let Some(bytes) = shard_db
+            .get(V0522_CONNECTOR_CATALOG_KEY)
+            .await
+            .map_err(|error| {
+                format!(
+                    "[RS-4017] connector.removed: cannot load legacy connector catalog: {error}"
+                )
+            })?
+        else {
+            return Ok(());
+        };
+        let legacy: V0522ConnectorCatalog = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("[RS-4017] connector.removed: invalid legacy connector catalog: {error}")
+        })?;
+        for mut sink in legacy.sinks {
+            sink.state = "REMOVED".to_string();
+            self.add_sink(sink);
+        }
+        for mut source in legacy.sources {
+            if matches!(source.source_type.as_str(), "s3" | "http_webhook") {
+                source.status = "REMOVED".to_string();
+            }
+            self.add_source(source);
+        }
+        Ok(())
+    }
+
+    pub async fn seed_v0522_connector_catalog(
+        shard_db: &rockstream_storage::ShardDb,
+        catalog: &V0522ConnectorCatalog,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec(catalog).map_err(|error| error.to_string())?;
+        shard_db
+            .put(V0522_CONNECTOR_CATALOG_KEY, &bytes)
+            .await
+            .map_err(|error| error.to_string())
+    }
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(CatalogStubsInner::default()),
@@ -975,14 +1027,36 @@ impl CatalogStubs {
                     Some(s.name),
                     Some(s.source_type),
                     Some(s.format),
-                    Some(s.status),
+                    Some(s.status.clone()),
                     Some(s.live_offset),
                     Some(s.live_lag.to_string()),
+                    (s.status == "REMOVED").then(|| REMOVED_CONNECTOR_REMEDIATION.to_string()),
                 ]
             })
             .collect();
         CatalogResponse::Rows {
             columns: show_sources_columns(),
+            rows,
+        }
+    }
+
+    pub fn sinks_response(&self) -> CatalogResponse {
+        let rows = self
+            .list_sinks()
+            .into_iter()
+            .map(|sink| {
+                vec![
+                    Some(sink.name),
+                    Some(sink.format),
+                    Some(sink.path),
+                    Some(sink.catalog),
+                    Some(sink.state.clone()),
+                    (sink.state == "REMOVED").then(|| REMOVED_CONNECTOR_REMEDIATION.to_string()),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: show_sinks_columns(),
             rows,
         }
     }
@@ -2769,7 +2843,15 @@ pub(crate) fn show_sources_columns() -> Vec<String> {
         "status".to_string(),
         "offset".to_string(),
         "lag".to_string(),
+        "remediation".to_string(),
     ]
+}
+
+pub(crate) fn show_sinks_columns() -> Vec<String> {
+    vec!["name", "format", "path", "catalog", "state", "remediation"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 pub(crate) fn show_source_status_columns() -> Vec<String> {

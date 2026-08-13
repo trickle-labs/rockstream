@@ -179,19 +179,11 @@ The practical result: when you put RockStream into production, the kinds of
 distributed-systems surprises that usually fill a runbook have already been
 discovered — and fixed — on a developer's laptop.
 
-### Feeds the Data Lake *(planned — Phase 12 / v0.44, not yet implemented)*
+### Data-lake export
 
-RockStream can act as a **freshness layer that feeds columnar analytics tools**.
-At any cadence you specify, it writes view snapshots to object storage as
-[**Iceberg v2**](https://iceberg.apache.org/) or **Delta Lake** tables. From
-there, DuckDB, Trino, Spark, and similar tools can query view snapshots
-directly — no RockStream in the read path.
-
-RockStream can also *be* the catalog. The gateway exposes a native
-**Iceberg REST Catalog** endpoint (`/iceberg/v1/`) so any Iceberg-native tool
-can discover views by name with no extra infrastructure. Catalog registration
-backends include filesystem (self-contained), AWS Glue, any Iceberg REST
-catalog (Polaris, Unity Catalog, Gravitino), Hive Metastore, and DuckLake.
+The Iceberg, Delta, and object-store sink frontends are removed. Use
+RockStream to Kafka with a downstream writer; see
+[connector migration](docs/connector-migration.md).
 
 ## Inspiration
 
@@ -229,7 +221,7 @@ released version is **v0.42** ("Wire Protocol End-User Complete" — see
 distributed frontier/fault-tolerance protocols, and the PostgreSQL wire
 gateway (auth, transactions/savepoints, LISTEN/NOTIFY, and a certified
 driver-compatibility matrix) are all done and proven. Work is proceeding
-through Phase 12 onward (the cold-tier data-lake bridge) toward the v1.0
+through the supported Kafka-based export path toward the v1.0
 release candidate at v0.59. Four documents describe the system in
 progressively more detail:
 
@@ -288,7 +280,7 @@ evidence behind every completed version.
 | 9 | Operational HTAP ergonomics: secondary indexes, session controls, private-beta readiness |
 | 10 | Nexmark correctness suite: q0–q9, q12–q22 bit-identical to batch under mixed INSERT/UPDATE/DELETE |
 | 11 | PostgreSQL wire protocol hardening: extended query protocol, full type/OID and `pg_catalog` coverage, SCRAM/MD5 auth, transactions/savepoints, LISTEN/NOTIFY, reference-app and driver-matrix certification |
-| 12 | The data lake bridge: FizzBee cold-tier protocol model, Iceberg/Delta sinks, deep FinOps optimizations |
+| 12 | Kafka-based downstream export and data-lake writer integrations |
 | 13 | Elastic scaling and skew handling: online shard migration, hot-key virtual buckets, proactive shard splitting, cluster autoscaling signals |
 | 14 | Network efficiency and advanced DML: scatter pruning, zero-copy IPC, AZ-aware shuffle |
 | 15 | Complex analytics and compute tuning: recursive CTEs, lateral joins, hopping/session windows, hot-path optimizations |
@@ -310,8 +302,8 @@ The project is a Cargo workspace of purpose-built crates:
 | `rockstream-sql` | SQL frontend built on DataFusion |
 | `rockstream-runtime` | Worker process, circuit executor, async scheduler, exchange subsystem |
 | `rockstream-control` | Control-plane service (topology, shard leasing, placement) |
-| `rockstream-gateway` | Postgres wire protocol gateway (Iceberg REST catalog endpoint planned, Phase 12; unifies with `rockstream-runtime`/`-ops`/`-diff` into one incrementally-served data plane at v0.51.3, Phase 15.5) |
-| `rockstream-connectors` | Connector implementations: Kafka source/sink and S3 source are done; a generic exactly-once object-store sink is done; Postgres CDC source and Iceberg/Delta Lake sinks are planned (Phase 12) |
+| `rockstream-gateway` | Postgres wire protocol gateway |
+| `rockstream-connectors` | Connector implementations; removed connector frontends remain compiled for catalog compatibility. |
 | `rockstream-oracle` | Batch reference engine and property-test harness (DBSP soundness tests) |
 | `rockstream-sim` | Deterministic simulation harness: `SimRuntime`, `buggify!()`, fault model |
 | `rockstream-cli` | Operator CLI — `rockstream start` today; `shard migrate`/`cluster workers drain` land at v0.46, `explain`/`resource` at v0.45, the workload quota/admission-control substrate at v0.45.1, control-plane Raft HA at v0.45.2, and the rest (`workload`/`view`/`schema`/`source`/`checkpoint`/`audit`/`support bundle`/`debug arrangement`) at v0.53 |

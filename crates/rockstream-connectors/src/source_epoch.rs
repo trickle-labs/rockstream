@@ -776,7 +776,7 @@ mod tests {
             reg.prepare_commit_at(7, offsets(&[("p0", "repeat")]))
                 .unwrap_err()
                 .to_string(),
-            "RS-4006: source_epoch must advance monotonically: connector=22, expected=8, got=7"
+            "RS-4006: source_epoch must advance monotonically: connector=connector-22, expected=8, got=7"
         );
     }
 

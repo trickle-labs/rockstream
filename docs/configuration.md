@@ -102,13 +102,9 @@ TLS is explicitly configured.
 
 ### `[storage.tiering]` Section (optional)
 
-Omitted by default (`StorageConfig::default()`'s `tiering` field is
-`StorageTieringConfig::default()`, all three sub-fields `None`) — cold-tier
-storage backends are disabled unless explicitly configured.
-
-- **`shard_meta_backend`** (string, default: `None`): Object-store backend class for shard metadata (e.g. `"s3express"`). Unset disables the backend override.
-- **`cold_sst_backend`** (string, default: `None`): Object-store backend class for cold SSTs (e.g. `"standard-ia"`). Unset disables cold-tiering.
-- **`cold_sst_age_threshold`** (integer, default: `None`): Age, in seconds, after which an SST becomes eligible for the cold backend. Unset disables age-based tiering.
+Omit this section. Its former fields are removed; any populated field fails
+startup with `RS-4017`. See [connector migration](connector-migration.md) for
+the supported replacement.
 
 ### `[pricing]` Section (optional)
 
