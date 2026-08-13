@@ -1255,6 +1255,9 @@ impl PostgresCdcSource {
                     &payload,
                 )?;
             }
+            if lsn <= after {
+                continue;
+            }
             if is_relation {
                 continue;
             }
