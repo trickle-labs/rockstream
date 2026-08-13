@@ -356,7 +356,7 @@ async fn multi_shard_group_by_float_sum_count_matches_single_shard_oracle() {
             vec![("sales", "02", "1.5\t3.5")],
         ],
         vec![
-            vec!["1.5".into(), "6".into(), "2".into()],
+            vec!["1.5".into(), "6.0".into(), "2".into()],
             vec!["3.5".into(), "5.5".into(), "1".into()],
         ],
     )
