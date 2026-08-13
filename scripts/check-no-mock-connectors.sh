@@ -9,7 +9,7 @@ violations=0
 CONNECTOR_FILES=(
   crates/rockstream-connectors/src/kafka_source.rs
   crates/rockstream-connectors/src/kafka_sink.rs
-  crates/rockstream-connectors/src/object_store_sink.rs
+  crates/rockstream-connectors/src/postgres_cdc.rs
 )
 
 while IFS= read -r file; do

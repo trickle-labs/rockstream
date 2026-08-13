@@ -21,7 +21,7 @@ fail() {
 
 mkdir -p "$TMP_ROOT/crates/rockstream-connectors/src"
 printf '/// This is a simulated connector.\n' > "$TMP_ROOT/crates/rockstream-connectors/src/kafka_source.rs"
-touch "$TMP_ROOT/crates/rockstream-connectors/src/kafka_sink.rs" "$TMP_ROOT/crates/rockstream-connectors/src/object_store_sink.rs"
+touch "$TMP_ROOT/crates/rockstream-connectors/src/kafka_sink.rs" "$TMP_ROOT/crates/rockstream-connectors/src/postgres_cdc.rs"
 
 if bash "$CHECKER" "$TMP_ROOT" >"$OUT_BAD" 2>&1; then
   cat "$OUT_BAD"

@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -11,11 +12,88 @@ use arrow::record_batch::RecordBatch;
 use hmac::{Hmac, Mac};
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::ClientConfig;
 use sha2::{Digest, Sha256};
+use testcontainers::core::WaitFor;
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers_modules::kafka::apache::{self, KAFKA_PORT};
+use tokio_postgres::{Client, NoTls};
 
 pub const MINIO_USER: &str = "minioadmin";
 pub const MINIO_PASS: &str = "minioadmin";
 pub const RNG_SEED: u64 = 0x4400_0044;
+
+pub struct ConnectorFixture {
+    pub _postgres: ContainerAsync<GenericImage>,
+    pub _kafka: ContainerAsync<apache::Kafka>,
+    pub postgres: Client,
+    pub postgres_host: String,
+    pub postgres_port: u16,
+    pub kafka_bootstrap: String,
+}
+
+pub async fn connector_fixture(label: &str) -> ConnectorFixture {
+    assert!(
+        docker_available(),
+        "Docker is required for connector guarantees"
+    );
+    let postgres = GenericImage::new("postgres", "11-alpine")
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_cmd(["postgres", "-c", "wal_level=logical"])
+        .start()
+        .await
+        .unwrap();
+    let postgres_host = postgres.get_host().await.unwrap().to_string();
+    let postgres_port = postgres.get_host_port_ipv4(5432).await.unwrap();
+    let dsn = format!(
+        "host={postgres_host} port={postgres_port} user=postgres password=postgres dbname=postgres"
+    );
+    let (postgres_client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    postgres_client
+        .batch_execute(&format!(
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY); ALTER TABLE orders REPLICA IDENTITY FULL; CREATE PUBLICATION orders_pub FOR TABLE orders; CREATE TABLE health_{label} (id BIGINT);"
+        ))
+        .await
+        .unwrap();
+    postgres_client.query_one("SELECT 1", &[]).await.unwrap();
+
+    let kafka = apache::Kafka::default()
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .start()
+        .await
+        .unwrap();
+    let kafka_bootstrap = format!(
+        "127.0.0.1:{}",
+        kafka.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
+    );
+    let health: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &kafka_bootstrap)
+        .create()
+        .unwrap();
+    health
+        .fetch_metadata(None, Duration::from_secs(10))
+        .unwrap();
+
+    ConnectorFixture {
+        _postgres: postgres,
+        _kafka: kafka,
+        postgres: postgres_client,
+        postgres_host,
+        postgres_port,
+        kafka_bootstrap,
+    }
+}
 
 pub fn docker_available() -> bool {
     rockstream_test_support::docker_available()

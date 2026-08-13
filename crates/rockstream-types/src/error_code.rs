@@ -315,18 +315,28 @@ pub const RS_4009: ErrorCode = ErrorCode::new(4009);
 pub const RS_4010: ErrorCode = ErrorCode::new(4010);
 /// PostgreSQL CDC replication cannot proceed without recovery.
 pub const RS_4011: ErrorCode = ErrorCode::new(4011);
-/// Webhook request authentication failed.
+/// Source owner registration requires checkpoint recovery.
 pub const RS_4012: ErrorCode = ErrorCode::new(4012);
-/// Webhook source is paused.
+/// PostgreSQL CDC protocol or ownership validation failed.
 pub const RS_4013: ErrorCode = ErrorCode::new(4013);
-/// Webhook request exceeded the configured byte bound.
+/// Source bounded in-flight capacity was exceeded.
 pub const RS_4014: ErrorCode = ErrorCode::new(4014);
-/// Webhook epoch buffer is full.
+/// Source checkpoint fence did not advance monotonically.
 pub const RS_4015: ErrorCode = ErrorCode::new(4015);
-/// Webhook payload or watermark is invalid.
+/// Source checkpoint acknowledgement failed.
 pub const RS_4016: ErrorCode = ErrorCode::new(4016);
 /// Connector surface removed; creation and ingress are fail-closed.
 pub const RS_4017: ErrorCode = ErrorCode::new(4017);
+/// Source epoch exhausted; no further fenced epoch can be created.
+pub const RS_4018: ErrorCode = ErrorCode::new(4018);
+/// Source backfill cursor or lifecycle is invalid.
+pub const RS_4019: ErrorCode = ErrorCode::new(4019);
+/// Backfill live-delta buffer exceeded its configured bound.
+pub const RS_4020: ErrorCode = ErrorCode::new(4020);
+/// Backfill admission reservation exceeded its configured capacity.
+pub const RS_4021: ErrorCode = ErrorCode::new(4021);
+/// Materialized view backfill is not published.
+pub const RS_4022: ErrorCode = ErrorCode::new(4022);
 
 /// Self-fencing configuration invalid: self_fence_after must satisfy
 /// dead_after < self_fence_after < 2 × shard_recovery_budget.
@@ -415,7 +425,28 @@ pub fn slug(code: ErrorCode) -> &'static str {
         1014 => "workload.has_assigned_views",
         9001 => "admission_control.rejected",
         1731 => "control.not_leader",
+        4001 => "source.connection_failed",
+        4002 => "sink.write_failed",
+        4003 => "sink.pre_commit_failed",
+        4004 => "sink.commit_failed",
+        4005 => "sink.duplicate_delivery",
+        4006 => "source.epoch_registry_full",
+        4007 => "sink.ddl_invalid",
+        4008 => "source.ddl_invalid",
+        4009 => "source.not_found",
+        4010 => "source.already_exists",
+        4011 => "postgres_cdc.recovery_required",
+        4012 => "source.owner_recovery_required",
+        4013 => "postgres_cdc.protocol_error",
+        4014 => "source.bounds_exceeded",
+        4015 => "source.fence_mismatch",
+        4016 => "source.acknowledgement_failed",
         4017 => "connector.removed",
+        4018 => "source.epoch_exhausted",
+        4019 => "source.backfill_cursor_invalid",
+        4020 => "backfill.live_delta_buffer_full",
+        4021 => "backfill.admission_rejected",
+        4022 => "backfill.not_published",
         _ => "unknown",
     }
 }
@@ -495,7 +526,21 @@ pub fn description(code: ErrorCode) -> &'static str {
         4005 => "Sink 2PC duplicate delivery detected and suppressed",
         4006 => "Source-epoch registry full; too many uncommitted epochs in flight",
         4007 => "CREATE SINK DDL parse or validation failed",
+        4008 => "CREATE SOURCE DDL parse or validation failed",
+        4009 => "Source not found",
+        4010 => "Source already exists",
+        4011 => "PostgreSQL CDC replication cannot proceed without recovery",
+        4012 => "Source owner registration requires checkpoint recovery",
+        4013 => "PostgreSQL CDC protocol or ownership validation failed",
+        4014 => "Source bounded in-flight capacity was exceeded",
+        4015 => "Source checkpoint fence did not advance monotonically",
+        4016 => "Source checkpoint acknowledgement failed",
         4017 => "Connector has been removed",
+        4018 => "Source epoch exhausted",
+        4019 => "Source backfill cursor or lifecycle is invalid",
+        4020 => "Backfill live-delta buffer is full",
+        4021 => "Backfill admission reservation rejected",
+        4022 => "Materialized view backfill is not published",
         3005 => "Self-fencing configuration invalid: self_fence_after constraint violated",
         5001 => "Incompatible storage format",
         5002 => "Unknown merge law in arrangement header",
@@ -650,10 +695,24 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         4002 => "Check sink availability and credentials.",
         4003 => "Retry the epoch; check sink connector health and connectivity.",
         4004 => "Trigger manual recovery or restart the connector; check sink idempotency profile.",
-        4005 => "This is informational; the duplicate was suppressed. Check source for duplicate delivery.",
+        4005 => "This is informational; the duplicate was suppressed. Check the source for duplicate delivery.",
         4006 => "Reduce source epoch rate or increase max_in_flight_source_epochs.",
         4007 => "Check CREATE SINK syntax, referenced view name, and WITH option types; use catalog=filesystem|glue|rest|hive|ducklake.",
+        4008 => "Check CREATE SOURCE syntax, connector options, and source credentials.",
+        4009 => "Check the source name and ensure it has been created.",
+        4010 => "Use a different source name or drop the existing source first.",
+        4011 => "Repair the PostgreSQL slot or publication, then run the bounded resnapshot workflow.",
+        4012 => "Run checkpoint recovery before registering the source owner, then retry owner registration.",
+        4013 => "Validate pgoutput protocol, source identity, slot ownership, and durable routing before retrying.",
+        4014 => "Drain the source or reduce transaction and epoch size before increasing the configured bound.",
+        4015 => "Recover the highest committed source checkpoint and retry with the next fenced epoch.",
+        4016 => "Retain source ownership, recover the committed checkpoint, and retry upstream acknowledgement.",
         4017 => "Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.",
+        4018 => "Create a new connector before retrying.",
+        4019 => "Recover or recreate the committed backfill cursor or lifecycle, then retry.",
+        4020 => "Wait for snapshot catch-up or reduce live-delta volume before retrying.",
+        4021 => "Wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES before retrying.",
+        4022 => "Run SHOW BACKFILL STATUS and retry after the materialized view reaches RUNNING, or create it first.",
         3005 => "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.",
         5001 => "Run the storage migration tool before upgrading.",
         5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
@@ -720,8 +779,9 @@ mod tests {
             RS_5030, RS_5031, RS_5032, RS_5035, RS_5036, RS_1512, RS_1513, RS_3601, RS_3602,
             RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016,
             RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
-            RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4017, RS_3005, RS_1018, RS_2400,
-            RS_2401, RS_2402, // v0.26 auth
+            RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4008, RS_4009, RS_4010, RS_4011,
+            RS_4012, RS_4013, RS_4014, RS_4015, RS_4016, RS_4017, RS_4018, RS_4019, RS_4020,
+            RS_4021, RS_4022, RS_3005, RS_1018, RS_2400, RS_2401, RS_2402, // v0.26 auth
             RS_9001, // v0.45.1 admission control
             RS_1731, // v0.45.2 control-plane leader-only write gating (M7-S2)
             RS_8002, RS_8003, // v0.45.6 frontier-lease publisher fencing (M2-S3)
@@ -745,6 +805,41 @@ mod tests {
                 !next_steps(code).is_empty(),
                 "Code {code} has empty next steps"
             );
+        }
+    }
+
+    #[test]
+    fn connector_error_codes_registered_and_actionable() {
+        let expected = [
+            (RS_4001, "source.connection_failed", "Source connection failed", "Verify source connection settings and network connectivity."),
+            (RS_4002, "sink.write_failed", "Sink write failed", "Check sink availability and credentials."),
+            (RS_4003, "sink.pre_commit_failed", "Sink 2PC pre-commit failed; epoch not staged", "Retry the epoch; check sink connector health and connectivity."),
+            (RS_4004, "sink.commit_failed", "Sink 2PC commit failed after pre-commit; recovery required", "Trigger manual recovery or restart the connector; check sink idempotency profile."),
+            (RS_4005, "sink.duplicate_delivery", "Sink 2PC duplicate delivery detected and suppressed", "This is informational; the duplicate was suppressed. Check the source for duplicate delivery."),
+            (RS_4006, "source.epoch_registry_full", "Source-epoch registry full; too many uncommitted epochs in flight", "Reduce source epoch rate or increase max_in_flight_source_epochs."),
+            (RS_4007, "sink.ddl_invalid", "CREATE SINK DDL parse or validation failed", "Check CREATE SINK syntax, referenced view name, and WITH option types; use catalog=filesystem|glue|rest|hive|ducklake."),
+            (RS_4008, "source.ddl_invalid", "CREATE SOURCE DDL parse or validation failed", "Check CREATE SOURCE syntax, connector options, and source credentials."),
+            (RS_4009, "source.not_found", "Source not found", "Check the source name and ensure it has been created."),
+            (RS_4010, "source.already_exists", "Source already exists", "Use a different source name or drop the existing source first."),
+            (RS_4011, "postgres_cdc.recovery_required", "PostgreSQL CDC replication cannot proceed without recovery", "Repair the PostgreSQL slot or publication, then run the bounded resnapshot workflow."),
+            (RS_4012, "source.owner_recovery_required", "Source owner registration requires checkpoint recovery", "Run checkpoint recovery before registering the source owner, then retry owner registration."),
+            (RS_4013, "postgres_cdc.protocol_error", "PostgreSQL CDC protocol or ownership validation failed", "Validate pgoutput protocol, source identity, slot ownership, and durable routing before retrying."),
+            (RS_4014, "source.bounds_exceeded", "Source bounded in-flight capacity was exceeded", "Drain the source or reduce transaction and epoch size before increasing the configured bound."),
+            (RS_4015, "source.fence_mismatch", "Source checkpoint fence did not advance monotonically", "Recover the highest committed source checkpoint and retry with the next fenced epoch."),
+            (RS_4016, "source.acknowledgement_failed", "Source checkpoint acknowledgement failed", "Retain source ownership, recover the committed checkpoint, and retry upstream acknowledgement."),
+            (RS_4017, "connector.removed", "Connector has been removed", "Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output."),
+            (RS_4018, "source.epoch_exhausted", "Source epoch exhausted", "Create a new connector before retrying."),
+            (RS_4019, "source.backfill_cursor_invalid", "Source backfill cursor or lifecycle is invalid", "Recover or recreate the committed backfill cursor or lifecycle, then retry."),
+            (RS_4020, "backfill.live_delta_buffer_full", "Backfill live-delta buffer is full", "Wait for snapshot catch-up or reduce live-delta volume before retrying."),
+            (RS_4021, "backfill.admission_rejected", "Backfill admission reservation rejected", "Wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES before retrying."),
+            (RS_4022, "backfill.not_published", "Materialized view backfill is not published", "Run SHOW BACKFILL STATUS and retry after the materialized view reaches RUNNING, or create it first."),
+        ];
+
+        for (code, expected_slug, expected_description, expected_next_steps) in expected {
+            assert_eq!(code.to_string(), format!("RS-{:04}", code.value()));
+            assert_eq!(slug(code), expected_slug);
+            assert_eq!(description(code), expected_description);
+            assert_eq!(next_steps(code), expected_next_steps);
         }
     }
 

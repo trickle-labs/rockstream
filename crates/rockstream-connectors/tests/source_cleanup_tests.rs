@@ -143,7 +143,7 @@ async fn resume_recovers_from_exact_committed_checkpoint() {
 }
 
 #[tokio::test]
-async fn drop_scan_deletes_only_named_source_runtime_without_range_delete() {
+async fn backfill_cleanup_uses_bounded_scan_and_point_delete() {
     let db = Arc::new(
         ShardDb::builder("source-cleanup-drop", Arc::new(InMemory::new()))
             .build()

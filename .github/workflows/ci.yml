@@ -64,6 +64,10 @@ jobs:
         run: bash scripts/check-no-mock-connectors.sh
       - name: no-mock-connectors checker self-test
         run: bash scripts/check-no-mock-connectors.test.sh
+      - name: connector-admission gate
+        run: bash scripts/check-connector-admission.sh
+      - name: connector-admission checker self-test
+        run: bash scripts/check-connector-admission.test.sh
       - name: exit criteria sign-offs
         run: bash scripts/check-exit-criteria.sh
       - name: operator-state-bytes check

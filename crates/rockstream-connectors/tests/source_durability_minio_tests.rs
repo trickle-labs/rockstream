@@ -413,3 +413,38 @@ fn cdc_lsn_restart_resumes_from_committed_lsn() {
 async fn webhook_retry_deduplicated() {
     verify_webhook_returns_202_only_after_durable_m3_commit().await;
 }
+
+#[tokio::test]
+async fn retained_source_checkpoint_recovery_has_exact_cdc_and_kafka_transcript_minio() {
+    let connector_id = ConnectorId(5_251);
+    let (_container, store) = store(connector_id).await;
+    let cdc = prepared(connector_id, 1, b"cdc rows=[(1,1),(2,-1)] lsn=0/20");
+    let kafka = prepared(connector_id, 2, b"kafka payloads=[(orders,7,1)] offset=7");
+    commit(&store, &cdc).await;
+    assert_eq!(
+        store.highest_committed().await.unwrap(),
+        Some(cdc.committed())
+    );
+    commit(&store, &kafka).await;
+    assert_eq!(
+        store.highest_committed().await.unwrap(),
+        Some(kafka.committed())
+    );
+    let port = _container.get_host_port_ipv4(9000).await.unwrap();
+    drop(store);
+    let recovered = reopen_store(port, connector_id).await;
+    assert_eq!(
+        recovered.highest_committed().await.unwrap(),
+        Some(kafka.committed())
+    );
+    assert_eq!(
+        recovered
+            .highest_committed()
+            .await
+            .unwrap()
+            .unwrap()
+            .token
+            .as_bytes(),
+        b"kafka payloads=[(orders,7,1)] offset=7"
+    );
+}

@@ -770,7 +770,7 @@ impl PostgresCdcSource {
             self.replication_read_paused = true;
             return Err(SourceError::PollDeltaFailed {
                 reason: format!(
-                    "PostgreSQL CDC buffer is full ({}/{} records, {}/{} bytes); replication is paused until credits drain",
+                    "[RS-4014] PostgreSQL CDC buffer is full ({}/{} records, {}/{} bytes); replication is paused until credits drain. Next steps: drain the source or increase the configured bound",
                     self.queued.len(), POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS, self.queued_bytes,
                     POSTGRES_CDC_MAX_IN_FLIGHT_BYTES
                 ),
