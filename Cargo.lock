@@ -2367,7 +2367,7 @@ dependencies = [
  "parquet 58.3.0",
  "rand 0.9.4",
  "regex",
- "sqlparser",
+ "sqlparser 0.61.0",
  "tempfile",
  "tokio",
  "url",
@@ -2443,7 +2443,7 @@ dependencies = [
  "parquet 58.3.0",
  "paste",
  "recursive",
- "sqlparser",
+ "sqlparser 0.61.0",
  "tokio",
  "web-time",
 ]
@@ -2644,7 +2644,7 @@ dependencies = [
  "paste",
  "recursive",
  "serde_json",
- "sqlparser",
+ "sqlparser 0.61.0",
 ]
 
 [[package]]
@@ -2981,7 +2981,7 @@ dependencies = [
  "log",
  "recursive",
  "regex",
- "sqlparser",
+ "sqlparser 0.61.0",
 ]
 
 [[package]]
@@ -3035,7 +3035,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "sqlparser",
+ "sqlparser 0.61.0",
  "strum",
  "thiserror 2.0.18",
  "tokio",
@@ -6691,7 +6691,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
- "sqlparser",
+ "sqlparser 0.62.0",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
@@ -7658,6 +7658,16 @@ dependencies = [
  "log",
  "recursive",
  "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec"
+dependencies = [
+ "log",
+ "recursive",
 ]
 
 [[package]]
