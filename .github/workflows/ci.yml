@@ -40,7 +40,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.94.1"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Require Docker
@@ -218,7 +218,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.94.1"
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - name: Require Docker
@@ -406,7 +406,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.94.1"
       - uses: Swatinem/rust-cache@v2
       - name: run nexmark bench
         env:
@@ -427,7 +427,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.94.1"
       - uses: Swatinem/rust-cache@v2
       - name: run rockstream-ops bench
         run: cargo bench -p rockstream-ops --bench perf_regression -- --noplot | tee ops-bench.out

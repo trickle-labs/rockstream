@@ -1,4 +1,4 @@
-FROM rust:1.88-slim-bookworm AS builder
+FROM rust:1.94.1-slim-bookworm AS builder
 WORKDIR /usr/src/rockstream
 RUN apt-get update && apt-get install -y g++ make pkg-config libssl-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY . .

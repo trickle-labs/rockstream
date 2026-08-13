@@ -184,9 +184,8 @@ inside `frontier.rs` tests, so the rename is contained.
 ### 5.4 Edition / MSRV
 
 `antichain` is `edition = "2024"` / MSRV `1.85`. RockStream is `edition = "2021"`
-/ MSRV `1.88` on toolchain `1.88`. Editions are per-crate, so a 2021 crate can
-depend on a 2024 crate with no issue, and `1.88 > 1.85`. **No toolchain bump
-required.**
+/ MSRV `1.94.1` on toolchain `1.94.1`. Editions are per-crate, so a 2021 crate can
+depend on a 2024 crate with no issue, and `1.94.1 > 1.85`.
 
 ---
 
