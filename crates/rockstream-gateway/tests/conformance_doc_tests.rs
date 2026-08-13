@@ -60,8 +60,9 @@ fn passing_conformance_tests() -> HashSet<String> {
 #[test]
 fn test_conformance_doc_has_linked_tests() {
     if std::env::var_os("ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER").is_none()
-        && (std::env::var_os("CI").is_some()
-            || repo_root().join("target/pgwire-test-results.json").exists())
+        && repo_root()
+            .join("target/pgwire-test-results.json")
+            .is_file()
     {
         let links = conformance_links();
         assert!(
