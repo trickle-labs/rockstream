@@ -1243,9 +1243,24 @@ impl PostgresCdcSource {
                 reason: format!("peek pgoutput changes: {error}"),
             })?;
         for message in messages.into_iter().skip(self.native_seen_messages) {
+            self.native_seen_messages += 1;
             let lsn = PgLsn::parse(message.get::<_, String>(0).as_str())?;
             let payload = message.get::<_, Vec<u8>>(1);
-            self.native_seen_messages += 1;
+            let is_relation = payload.first() == Some(&b'R');
+            if is_relation {
+                decode_native_pgoutput_text_message(
+                    &mut pgoutput.relations,
+                    self.schema.fields().len(),
+                    lsn,
+                    &payload,
+                )?;
+            }
+            if lsn <= after {
+                continue;
+            }
+            if is_relation {
+                continue;
+            }
             match payload.first() {
                 Some(b'B') => {
                     if self.native_transaction.is_some() {
@@ -1439,6 +1454,7 @@ impl SourceConnector for PostgresCdcSource {
             ));
         }
         let allowance = credits_available.min(POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS);
+        let mut records = 0;
         let mut changes = Vec::new();
         while !self.queued.is_empty() {
             let transaction_len = self
@@ -1453,9 +1469,7 @@ impl SourceConnector for PostgresCdcSource {
                 .take(transaction_len)
                 .map(|queued| queued.bytes)
                 .sum::<usize>();
-            if transaction_len > allowance
-                || changes.len().saturating_add(transaction_len) > allowance
-                || transaction_bytes > max_bytes
+            if transaction_len > allowance.saturating_sub(records) || transaction_bytes > max_bytes
             {
                 if changes.is_empty() {
                     return Err(SourceError::PollDeltaFailed {
@@ -1473,6 +1487,7 @@ impl SourceConnector for PostgresCdcSource {
                     changes.push(queued.change);
                 }
             }
+            records += transaction_len;
         }
         if changes.is_empty() {
             return Ok(PollDeltaResult {
