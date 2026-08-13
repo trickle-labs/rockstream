@@ -460,8 +460,13 @@ impl SourceConnector for KafkaSource {
             }
         })?);
         self.last_polled = Some(new_offset.clone());
+        let batches = if records.is_empty() {
+            Vec::new()
+        } else {
+            self.build_batch(&records)?
+        };
         Ok(PollDeltaResult {
-            batches: self.build_batch(&records)?,
+            batches,
             new_offset,
             watermark: self.current_global_watermark(),
         })
