@@ -161,3 +161,39 @@ async fn decommissioned_worker_removed_from_topology_after_grace_period() {
     assert!(catalog.get(WorkerId(1)).is_none());
     handle.shutdown();
 }
+
+#[tokio::test]
+async fn test_worker_drain_progress_monotonic() {
+    let mut state = WorkerLifecycleState::draining(4, 1_000_000);
+    assert_eq!(state.progress_phase(), "draining");
+    assert_eq!(state.shards_remaining(), Some(4));
+    assert!(state.estimated_remaining_ms().is_some());
+
+    // Advance drain with successive shard migrations
+    state.advance_drain_progress(3, Some(30_000_000), Some(150_000));
+    assert_eq!(state.progress_phase(), "draining");
+    assert_eq!(state.shards_remaining(), Some(3));
+    assert_eq!(state.bytes_remaining(), Some(30_000_000));
+    assert_eq!(state.rows_remaining(), Some(150_000));
+    assert!(state.estimated_remaining_ms().unwrap() > 0);
+
+    state.advance_drain_progress(2, Some(20_000_000), Some(100_000));
+    assert_eq!(state.progress_phase(), "draining");
+    assert_eq!(state.shards_remaining(), Some(2));
+    assert_eq!(state.bytes_remaining(), Some(20_000_000));
+    assert_eq!(state.rows_remaining(), Some(100_000));
+
+    state.advance_drain_progress(1, Some(10_000_000), Some(50_000));
+    assert_eq!(state.progress_phase(), "draining");
+    assert_eq!(state.shards_remaining(), Some(1));
+    assert_eq!(state.bytes_remaining(), Some(10_000_000));
+    assert_eq!(state.rows_remaining(), Some(50_000));
+
+    // Terminal completion to decommissioned
+    state.advance_drain_progress(0, Some(0), Some(0));
+    assert_eq!(state.progress_phase(), "decommissioned");
+    assert_eq!(state.shards_remaining(), Some(0));
+    assert_eq!(state.bytes_remaining(), Some(0));
+    assert_eq!(state.rows_remaining(), Some(0));
+    assert_eq!(state.estimated_remaining_ms(), Some(0));
+}

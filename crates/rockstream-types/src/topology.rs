@@ -364,6 +364,18 @@ pub enum WorkerLifecycleState {
         shards_remaining: u32,
         /// Wall-clock time (ms since Unix epoch) when the drain was requested.
         started_at_ms: u64,
+        /// Total bytes across owned shards at drain start.
+        #[serde(default)]
+        total_bytes: Option<u64>,
+        /// Estimated bytes remaining to drain.
+        #[serde(default)]
+        bytes_remaining: Option<u64>,
+        /// Total rows across owned shards at drain start.
+        #[serde(default)]
+        total_rows: Option<u64>,
+        /// Estimated rows remaining to drain.
+        #[serde(default)]
+        rows_remaining: Option<u64>,
     },
     /// All shards have been migrated away; the worker is idle and may exit.
     Decommissioned {
@@ -373,6 +385,18 @@ pub enum WorkerLifecycleState {
 }
 
 impl WorkerLifecycleState {
+    /// Construct a new `Draining` state.
+    pub fn draining(shards_remaining: u32, started_at_ms: u64) -> Self {
+        Self::Draining {
+            shards_remaining,
+            started_at_ms,
+            total_bytes: None,
+            bytes_remaining: None,
+            total_rows: None,
+            rows_remaining: None,
+        }
+    }
+
     /// Returns `true` if the worker is in the `Active` state.
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Active)
@@ -382,6 +406,144 @@ impl WorkerLifecycleState {
     /// (i.e., should not receive new shard assignments).
     pub fn is_draining_or_decommissioned(&self) -> bool {
         !self.is_active()
+    }
+
+    /// Progress phase description.
+    pub fn progress_phase(&self) -> String {
+        match self {
+            Self::Active => "active".to_string(),
+            Self::Draining { .. } => "draining".to_string(),
+            Self::Decommissioned { .. } => "decommissioned".to_string(),
+        }
+    }
+
+    /// Number of shards remaining to migrate.
+    pub fn shards_remaining(&self) -> Option<u32> {
+        match self {
+            Self::Active => None,
+            Self::Draining {
+                shards_remaining, ..
+            } => Some(*shards_remaining),
+            Self::Decommissioned { .. } => Some(0),
+        }
+    }
+
+    /// Bytes remaining to drain.
+    pub fn bytes_remaining(&self) -> Option<u64> {
+        match self {
+            Self::Active => None,
+            Self::Draining {
+                bytes_remaining,
+                shards_remaining,
+                total_bytes,
+                ..
+            } => {
+                if *shards_remaining == 0 {
+                    Some(0)
+                } else {
+                    bytes_remaining.or(*total_bytes)
+                }
+            }
+            Self::Decommissioned { .. } => Some(0),
+        }
+    }
+
+    /// Rows remaining to drain.
+    pub fn rows_remaining(&self) -> Option<u64> {
+        match self {
+            Self::Active => None,
+            Self::Draining {
+                rows_remaining,
+                shards_remaining,
+                total_rows,
+                ..
+            } => {
+                if *shards_remaining == 0 {
+                    Some(0)
+                } else {
+                    rows_remaining.or(*total_rows)
+                }
+            }
+            Self::Decommissioned { .. } => Some(0),
+        }
+    }
+
+    /// Bounded estimate of remaining drain time in milliseconds.
+    pub fn estimated_remaining_ms(&self) -> Option<u64> {
+        match self {
+            Self::Active => None,
+            Self::Decommissioned { .. } => Some(0),
+            Self::Draining {
+                shards_remaining,
+                started_at_ms,
+                total_bytes,
+                bytes_remaining,
+                ..
+            } => {
+                if *shards_remaining == 0 {
+                    return Some(0);
+                }
+                let bytes = bytes_remaining
+                    .or(*total_bytes)
+                    .unwrap_or((*shards_remaining as u64) * 10_000_000);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let elapsed_ms = now.saturating_sub(*started_at_ms).max(1);
+                let total = total_bytes.unwrap_or(bytes);
+                let drained = total.saturating_sub(bytes);
+                if drained > 0 {
+                    let rate = (drained as f64) / (elapsed_ms as f64);
+                    if rate > 0.0 {
+                        let ms = (bytes as f64 / rate) as u64;
+                        return Some(ms.min(600_000));
+                    }
+                }
+                Some(((bytes / (10 * 1024 * 1024)) * 1000).clamp(50, 60_000))
+            }
+        }
+    }
+
+    /// Monotonically advance drain progress.
+    pub fn advance_drain_progress(
+        &mut self,
+        new_shards_remaining: u32,
+        new_bytes_remaining: Option<u64>,
+        new_rows_remaining: Option<u64>,
+    ) {
+        if let Self::Draining {
+            shards_remaining,
+            total_bytes,
+            bytes_remaining,
+            total_rows,
+            rows_remaining,
+            ..
+        } = self
+        {
+            if new_shards_remaining == 0 {
+                *self = Self::Decommissioned {
+                    completed_at_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                };
+            } else {
+                *shards_remaining = (*shards_remaining).min(new_shards_remaining);
+                if let Some(b) = new_bytes_remaining {
+                    *bytes_remaining = Some(bytes_remaining.unwrap_or(b).min(b));
+                    if total_bytes.is_none() {
+                        *total_bytes = Some(b);
+                    }
+                }
+                if let Some(r) = new_rows_remaining {
+                    *rows_remaining = Some(rows_remaining.unwrap_or(r).min(r));
+                    if total_rows.is_none() {
+                        *total_rows = Some(r);
+                    }
+                }
+            }
+        }
     }
 }
 

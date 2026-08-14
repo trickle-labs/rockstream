@@ -10,6 +10,7 @@ use rockstream_gateway::{
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
+use rockstream_types::view_lifecycle::ViewState;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef};
 
 struct NoopViewReader;
@@ -70,6 +71,26 @@ async fn simple_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Opti
             _ => None,
         })
         .collect()
+}
+
+async fn one_view_rows(
+    state: ViewState,
+    lag: rockstream_types::metrics::StageLagBreakdown,
+    view_name: &str,
+) -> Vec<Vec<Option<String>>> {
+    let catalog = CatalogStubs::new();
+    catalog.add_view(CatalogView {
+        name: view_name.to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    catalog.set_view_state(view_name, state);
+    rockstream_types::metrics::set_view_stage_lag(view_name, lag);
+    let (addr, _handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+    simple_rows(&client, &format!("SHOW VIEW STATUS FOR {view_name};")).await
 }
 
 #[tokio::test]
@@ -364,6 +385,13 @@ async fn test_pgwire_show_view_status_decomposed_lag_all_views() {
     assert_eq!(r[12].as_deref(), Some("2")); // spill_lag_ms
     assert_eq!(r[13].as_deref(), Some("1")); // storage_pressure_ms
     assert_eq!(r[14].as_deref(), Some("57")); // total_lag_ms
+    assert_eq!(r[15].as_deref(), Some("spilling"));
+    assert_eq!(r[16].as_deref(), Some("RS-3703"));
+    assert_eq!(r[17].as_deref(), Some("compute_lag"));
+    assert_eq!(r[18].as_deref(), None);
+    assert_eq!(r[19].as_deref(), None);
+    assert_eq!(r[20].as_deref(), None);
+    assert_eq!(r[21].as_deref(), None);
 }
 
 #[tokio::test]
@@ -406,6 +434,13 @@ async fn test_pgwire_show_view_status_decomposed_lag_single_view() {
     assert_eq!(r[12].as_deref(), Some("0"));
     assert_eq!(r[13].as_deref(), Some("0"));
     assert_eq!(r[14].as_deref(), Some("20"));
+    assert_eq!(r[15].as_deref(), Some("sink_blocked"));
+    assert_eq!(r[16].as_deref(), Some("RS-3706"));
+    assert_eq!(r[17].as_deref(), Some("compute_lag"));
+    assert_eq!(r[18].as_deref(), None);
+    assert_eq!(r[19].as_deref(), None);
+    assert_eq!(r[20].as_deref(), None);
+    assert_eq!(r[21].as_deref(), None);
 
     // Negative test: non-existent view returns RS-1001
     let err = client
@@ -414,4 +449,238 @@ async fn test_pgwire_show_view_status_decomposed_lag_single_view() {
         .unwrap_err();
     let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
     assert!(msg.contains("RS-1001"), "expected RS-1001 in error: {msg}");
+}
+
+#[tokio::test]
+async fn test_show_view_status_reason_schema_all_forms() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let catalog = CatalogStubs::new();
+    catalog.add_view(CatalogView {
+        name: "active_users".to_string(),
+        sql: "SELECT 1".to_string(),
+        columns: vec![],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 3,
+        decode_lag_ms: 1,
+        compute_lag_ms: 2,
+        alignment_lag_ms: 0,
+        sink_lag_ms: 0,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 0,
+        total_lag_ms: 6,
+    };
+    rockstream_types::metrics::set_view_stage_lag("active_users", lag);
+    let (addr, _handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+    for sql in [
+        "SHOW VIEW STATUS;",
+        "SHOW VIEW STATUS FOR active_users;",
+        "SHOW VIEW STATUS FOR NAMESPACE public;",
+    ] {
+        let rows = simple_rows(&client, sql).await;
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(rows[0].len(), 22, "{sql}");
+        assert_eq!(rows[0][15].as_deref(), Some("waiting_on_source"), "{sql}");
+        assert_eq!(rows[0][16].as_deref(), Some("RS-3701"), "{sql}");
+        assert_eq!(rows[0][17].as_deref(), Some("source_lag"), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn test_reason_waiting_on_source_pgwire_and_cli() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 7,
+        decode_lag_ms: 0,
+        compute_lag_ms: 0,
+        alignment_lag_ms: 0,
+        sink_lag_ms: 0,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 0,
+        total_lag_ms: 7,
+    };
+    let rows = one_view_rows(ViewState::Running, lag, "reason_source_mv").await;
+    assert_eq!(rows[0][15].as_deref(), Some("waiting_on_source"));
+    assert_eq!(rows[0][16].as_deref(), Some("RS-3701"));
+    assert_eq!(rows[0][17].as_deref(), Some("source_lag"));
+}
+
+#[tokio::test]
+async fn test_reason_quota_admission_rejected_pgwire_and_cli() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 2,
+        decode_lag_ms: 2,
+        compute_lag_ms: 2,
+        alignment_lag_ms: 2,
+        sink_lag_ms: 2,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 0,
+        total_lag_ms: 10,
+    };
+    let rows = one_view_rows(ViewState::OverBudgetRejected, lag, "reason_quota_mv").await;
+    assert_eq!(rows[0][15].as_deref(), Some("quota_admission_rejected"));
+    assert_eq!(rows[0][16].as_deref(), Some("RS-3702"));
+}
+
+#[tokio::test]
+async fn test_reason_spilling_pgwire_and_cli() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 1,
+        decode_lag_ms: 1,
+        compute_lag_ms: 1,
+        alignment_lag_ms: 1,
+        sink_lag_ms: 1,
+        spill_lag_ms: 8,
+        storage_pressure_ms: 0,
+        total_lag_ms: 13,
+    };
+    let rows = one_view_rows(ViewState::Running, lag, "reason_spill_mv").await;
+    assert_eq!(rows[0][15].as_deref(), Some("spilling"));
+    assert_eq!(rows[0][16].as_deref(), Some("RS-3703"));
+    assert_eq!(rows[0][17].as_deref(), Some("spill_lag"));
+}
+
+#[tokio::test]
+async fn test_reason_over_budget_relaxed_pgwire_and_cli() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 1,
+        decode_lag_ms: 1,
+        compute_lag_ms: 9,
+        alignment_lag_ms: 1,
+        sink_lag_ms: 1,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 0,
+        total_lag_ms: 13,
+    };
+    let rows = one_view_rows(ViewState::OverBudgetRelaxed, lag, "reason_over_budget_mv").await;
+    assert_eq!(rows[0][15].as_deref(), Some("over_budget_relaxed"));
+    assert_eq!(rows[0][16].as_deref(), Some("RS-3704"));
+}
+
+#[tokio::test]
+async fn test_reason_checkpoint_alignment_stalled_pgwire_and_cli() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 1,
+        decode_lag_ms: 1,
+        compute_lag_ms: 1,
+        alignment_lag_ms: 9,
+        sink_lag_ms: 0,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 0,
+        total_lag_ms: 12,
+    };
+    let rows = one_view_rows(ViewState::Running, lag, "reason_alignment_mv").await;
+    assert_eq!(rows[0][15].as_deref(), Some("checkpoint_alignment_stalled"));
+    assert_eq!(rows[0][16].as_deref(), Some("RS-3705"));
+    assert_eq!(rows[0][17].as_deref(), Some("alignment_lag"));
+}
+
+#[tokio::test]
+async fn test_reason_sink_blocked_pgwire_and_cli() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 1,
+        decode_lag_ms: 1,
+        compute_lag_ms: 1,
+        alignment_lag_ms: 1,
+        sink_lag_ms: 9,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 0,
+        total_lag_ms: 13,
+    };
+    let rows = one_view_rows(ViewState::Running, lag, "reason_sink_mv").await;
+    assert_eq!(rows[0][15].as_deref(), Some("sink_blocked"));
+    assert_eq!(rows[0][16].as_deref(), Some("RS-3706"));
+    assert_eq!(rows[0][17].as_deref(), Some("sink_lag"));
+}
+
+#[tokio::test]
+async fn test_reason_topology_transition_migration_pgwire_and_cli() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 1,
+        decode_lag_ms: 1,
+        compute_lag_ms: 5,
+        alignment_lag_ms: 1,
+        sink_lag_ms: 1,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 12,
+        total_lag_ms: 21,
+    };
+    let rows = one_view_rows(ViewState::Paused, lag, "reason_migration_mv").await;
+    assert_eq!(
+        rows[0][15].as_deref(),
+        Some("topology_transition_in_progress")
+    );
+    assert_eq!(rows[0][16].as_deref(), Some("RS-3707"));
+    assert_eq!(rows[0][18].as_deref(), Some("shard_migration"));
+    assert_eq!(rows[0][19].as_deref(), Some("12"));
+    assert_eq!(rows[0][20].as_deref(), Some("5"));
+    assert_eq!(rows[0][21].as_deref(), Some("21"));
+}
+
+#[tokio::test]
+async fn test_reason_topology_transition_drain_pgwire_and_cli() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 1,
+        decode_lag_ms: 4,
+        compute_lag_ms: 1,
+        alignment_lag_ms: 1,
+        sink_lag_ms: 6,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 0,
+        total_lag_ms: 13,
+    };
+    let rows = one_view_rows(ViewState::Paused, lag, "reason_drain_mv").await;
+    assert_eq!(
+        rows[0][15].as_deref(),
+        Some("topology_transition_in_progress")
+    );
+    assert_eq!(rows[0][16].as_deref(), Some("RS-3707"));
+    assert_eq!(rows[0][18].as_deref(), Some("worker_drain"));
+    assert_eq!(rows[0][19].as_deref(), Some("6"));
+    assert_eq!(rows[0][20].as_deref(), Some("4"));
+    assert_eq!(rows[0][21].as_deref(), Some("13"));
+}
+
+#[tokio::test]
+async fn test_reason_recovering_pgwire_and_cli() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 1,
+        decode_lag_ms: 2,
+        compute_lag_ms: 9,
+        alignment_lag_ms: 0,
+        sink_lag_ms: 0,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 0,
+        total_lag_ms: 12,
+    };
+    let rows = one_view_rows(
+        ViewState::BackfillingFromEpoch(42),
+        lag,
+        "reason_recovering_mv",
+    )
+    .await;
+    assert_eq!(rows[0][15].as_deref(), Some("recovering"));
+    assert_eq!(rows[0][16].as_deref(), Some("RS-3708"));
+    assert_eq!(rows[0][17].as_deref(), Some("compute_lag"));
 }

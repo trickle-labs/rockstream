@@ -110,6 +110,18 @@ pub struct MigrationRecord {
     pub created_at_ms: u64,
     /// Wall-clock timestamp (ms since Unix epoch) when the record last changed.
     pub updated_at_ms: u64,
+    /// Total bytes estimated/observed for the migration payload.
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+    /// Bytes successfully copied to the recipient shard so far.
+    #[serde(default)]
+    pub copied_bytes: Option<u64>,
+    /// Total logical rows estimated/observed for the migration payload.
+    #[serde(default)]
+    pub total_rows: Option<u64>,
+    /// Rows successfully copied to the recipient shard so far.
+    #[serde(default)]
+    pub copied_rows: Option<u64>,
 }
 
 impl MigrationRecord {
@@ -135,6 +147,116 @@ impl MigrationRecord {
             cutover_epoch: None,
             created_at_ms: now,
             updated_at_ms: now,
+            total_bytes: None,
+            copied_bytes: None,
+            total_rows: None,
+            copied_rows: None,
+        }
+    }
+
+    /// Attach work estimates to this record.
+    pub fn with_work_estimates(
+        mut self,
+        total_bytes: Option<u64>,
+        total_rows: Option<u64>,
+    ) -> Self {
+        self.total_bytes = total_bytes;
+        self.total_rows = total_rows;
+        self
+    }
+
+    /// Record observed progress during copying.
+    pub fn record_progress(&mut self, copied_bytes: u64, copied_rows: u64) {
+        self.copied_bytes = Some(
+            self.copied_bytes
+                .unwrap_or(0)
+                .max(copied_bytes)
+                .min(self.total_bytes.unwrap_or(u64::MAX)),
+        );
+        self.copied_rows = Some(
+            self.copied_rows
+                .unwrap_or(0)
+                .max(copied_rows)
+                .min(self.total_rows.unwrap_or(u64::MAX)),
+        );
+        self.updated_at_ms = now_ms();
+    }
+
+    /// Compute bytes remaining for active work.
+    pub fn bytes_remaining(&self) -> Option<u64> {
+        match self.state {
+            MigrationState::Done => Some(0),
+            MigrationState::DualWriting
+            | MigrationState::CatchingUp
+            | MigrationState::FencingOld
+            | MigrationState::Cutover
+            | MigrationState::Verifying
+            | MigrationState::GcEligible => Some(0),
+            MigrationState::Aborted => None,
+            MigrationState::Planned | MigrationState::Snapshotting => self.total_bytes,
+            MigrationState::Copying => match (self.total_bytes, self.copied_bytes) {
+                (Some(total), Some(copied)) => Some(total.saturating_sub(copied)),
+                (Some(total), None) => Some(total),
+                _ => None,
+            },
+        }
+    }
+
+    /// Compute rows remaining for active work.
+    pub fn rows_remaining(&self) -> Option<u64> {
+        match self.state {
+            MigrationState::Done => Some(0),
+            MigrationState::DualWriting
+            | MigrationState::CatchingUp
+            | MigrationState::FencingOld
+            | MigrationState::Cutover
+            | MigrationState::Verifying
+            | MigrationState::GcEligible => Some(0),
+            MigrationState::Aborted => None,
+            MigrationState::Planned | MigrationState::Snapshotting => self.total_rows,
+            MigrationState::Copying => match (self.total_rows, self.copied_rows) {
+                (Some(total), Some(copied)) => Some(total.saturating_sub(copied)),
+                (Some(total), None) => Some(total),
+                _ => None,
+            },
+        }
+    }
+
+    /// Returns the progress phase string.
+    pub fn progress_phase(&self) -> String {
+        self.state.to_string()
+    }
+
+    /// Compute a bounded estimate of remaining duration in milliseconds.
+    pub fn estimated_remaining_ms(&self) -> Option<u64> {
+        match self.state {
+            MigrationState::Done => Some(0),
+            MigrationState::Aborted => None,
+            MigrationState::DualWriting
+            | MigrationState::CatchingUp
+            | MigrationState::FencingOld
+            | MigrationState::Cutover
+            | MigrationState::Verifying
+            | MigrationState::GcEligible => Some(10),
+            MigrationState::Planned | MigrationState::Snapshotting => self
+                .total_bytes
+                .map(|b| (b / (10 * 1024 * 1024) * 1000).clamp(50, 60_000)),
+            MigrationState::Copying => {
+                let remaining = self.bytes_remaining()?;
+                if remaining == 0 {
+                    return Some(0);
+                }
+                let elapsed_ms = self.updated_at_ms.saturating_sub(self.created_at_ms).max(1);
+                let copied = self.copied_bytes.unwrap_or(0);
+                if copied > 0 {
+                    let rate = (copied as f64) / (elapsed_ms as f64);
+                    if rate > 0.0 {
+                        let ms = (remaining as f64 / rate) as u64;
+                        return Some(ms.min(600_000));
+                    }
+                }
+                Some((remaining / (10 * 1024 * 1024) * 1000).clamp(50, 60_000))
+            }
         }
     }
 

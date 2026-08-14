@@ -19,10 +19,7 @@ fn make_worker() -> WorkerInfo {
         capabilities: WorkerCapabilities::default(),
         registered_at_ms: 1,
         healthy: true,
-        lifecycle: WorkerLifecycleState::Draining {
-            shards_remaining: 2,
-            started_at_ms: 99,
-        },
+        lifecycle: WorkerLifecycleState::draining(2, 99),
     }
 }
 
@@ -185,4 +182,58 @@ async fn draining_state_survives_restart_minio_tc() {
         persistent_b.load_worker(worker.worker_id).await.unwrap(),
         worker
     );
+}
+
+#[tokio::test]
+async fn test_interrupted_drain_progress_survives_restart_lfs_and_minio() {
+    let mut worker = make_worker();
+    worker
+        .lifecycle
+        .advance_drain_progress(2, Some(20_000_000), Some(100_000));
+
+    // 1. LFS
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let persistent_a = TopologyPersistentStore::new(store.clone());
+    persistent_a.save_worker(&worker).await.unwrap();
+
+    let persistent_b = TopologyPersistentStore::new(Arc::new(
+        LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+    ));
+    let mut loaded = persistent_b.load_worker(worker.worker_id).await.unwrap();
+    assert_eq!(loaded.lifecycle.progress_phase(), "draining");
+    assert_eq!(loaded.lifecycle.shards_remaining(), Some(2));
+    assert_eq!(loaded.lifecycle.bytes_remaining(), Some(20_000_000));
+    assert_eq!(loaded.lifecycle.rows_remaining(), Some(100_000));
+
+    // Advance drain after reload
+    loaded
+        .lifecycle
+        .advance_drain_progress(1, Some(10_000_000), Some(50_000));
+    assert_eq!(loaded.lifecycle.shards_remaining(), Some(1));
+    loaded.lifecycle.advance_drain_progress(0, Some(0), Some(0));
+    assert_eq!(loaded.lifecycle.progress_phase(), "decommissioned");
+    assert_eq!(loaded.lifecycle.shards_remaining(), Some(0));
+
+    // 2. MinIO (if docker available)
+    if docker_available() {
+        use testcontainers::runners::AsyncRunner;
+        let container = testcontainers_modules::minio::MinIO::default()
+            .start()
+            .await
+            .unwrap();
+        let port = container.get_host_port_ipv4(9000).await.unwrap();
+        create_minio_bucket(port, MINIO_BUCKET).await;
+
+        let persistent_minio_a = TopologyPersistentStore::new(minio_object_store(port));
+        persistent_minio_a.save_worker(&worker).await.unwrap();
+        let persistent_minio_b = TopologyPersistentStore::new(minio_object_store(port));
+        let loaded_minio = persistent_minio_b
+            .load_worker(worker.worker_id)
+            .await
+            .unwrap();
+        assert_eq!(loaded_minio.lifecycle.progress_phase(), "draining");
+        assert_eq!(loaded_minio.lifecycle.shards_remaining(), Some(2));
+    }
 }

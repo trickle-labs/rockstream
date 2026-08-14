@@ -295,6 +295,22 @@ pub const RS_3607: ErrorCode = ErrorCode::new(3607);
 pub const RS_3608: ErrorCode = ErrorCode::new(3608);
 /// Clone backfill lag exceeded the allowed threshold before flip (v0.39).
 pub const RS_3609: ErrorCode = ErrorCode::new(3609);
+/// View is waiting on upstream source/frontier progress (v0.54.1).
+pub const RS_3701: ErrorCode = ErrorCode::new(3701);
+/// View admission was rejected by quota controls (v0.54.1).
+pub const RS_3702: ErrorCode = ErrorCode::new(3702);
+/// View is spilling and lag is dominated by spill delay (v0.54.1).
+pub const RS_3703: ErrorCode = ErrorCode::new(3703);
+/// View is running in over-budget relaxed mode (v0.54.1).
+pub const RS_3704: ErrorCode = ErrorCode::new(3704);
+/// Checkpoint alignment is stalled on at least one shard/operator (v0.54.1).
+pub const RS_3705: ErrorCode = ErrorCode::new(3705);
+/// Sink commit path is blocked and dominates freshness lag (v0.54.1).
+pub const RS_3706: ErrorCode = ErrorCode::new(3706);
+/// Topology transition (migration or drain) is in progress (v0.54.1).
+pub const RS_3707: ErrorCode = ErrorCode::new(3707);
+/// View is recovering from checkpoint/reassignment work (v0.54.1).
+pub const RS_3708: ErrorCode = ErrorCode::new(3708);
 
 // 3500-3999: Merge laws
 /// Merge-law accumulator wire bytes have the wrong size and cannot be decoded (v0.45.7).
@@ -430,6 +446,14 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2404 => "auth.mtls_no_verified_cert",
         2405 => "auth.tls_config_invalid",
         2406 => "auth.mtls_connection_cap_exceeded",
+        3701 => "view.waiting_on_source",
+        3702 => "view.quota_admission_rejected",
+        3703 => "view.spilling",
+        3704 => "view.over_budget_relaxed",
+        3705 => "view.checkpoint_alignment_stalled",
+        3706 => "view.sink_blocked",
+        3707 => "view.topology_transition_in_progress",
+        3708 => "view.recovering",
         1014 => "workload.has_assigned_views",
         1020 => "operator.not_found",
         1021 => "arrangement.key_decode_failed",
@@ -535,6 +559,14 @@ pub fn description(code: ErrorCode) -> &'static str {
         3607 => "Schema change requires blue/green clone; in-place apply rejected",
         3608 => "A blue/green clone operation is already in progress for this view",
         3609 => "Clone backfill lag exceeded the allowed threshold before flip",
+        3701 => "View is waiting on source/frontier progress",
+        3702 => "View admission rejected by quota controls",
+        3703 => "View lag is dominated by spill delay",
+        3704 => "View is in over-budget relaxed mode",
+        3705 => "View checkpoint alignment is stalled",
+        3706 => "View sink commit path is blocked",
+        3707 => "View topology transition is in progress",
+        3708 => "View is recovering from checkpoint/reassignment work",
         4001 => "Source connection failed",
         4002 => "Sink write failed",
         4003 => "Sink 2PC pre-commit failed; epoch not staged",
@@ -628,6 +660,14 @@ pub fn severity(code: ErrorCode) -> Severity {
         2405 => Severity::Fatal,
         2406 => Severity::Error,
         4017 => Severity::Error,
+        3701 => Severity::Warning,
+        3702 => Severity::Warning,
+        3703 => Severity::Warning,
+        3704 => Severity::Warning,
+        3705 => Severity::Warning,
+        3706 => Severity::Warning,
+        3707 => Severity::Warning,
+        3708 => Severity::Warning,
         _ => Severity::Error,
     }
 }
@@ -711,6 +751,14 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         3607 => "Perform a zero-downtime view replacement using a blue/green deployment strategy.",
         3608 => "Wait for the existing clone backfill to finish before starting a new one.",
         3609 => "Reduce write load or check worker resource usage to allow backfill to catch up before flip.",
+        3701 => "Check source/frontier health and producer lag; verify watermark advancement for the upstream source.",
+        3702 => "Reduce state pressure, free quota in competing workloads, or adjust admission and memory budgets before retrying.",
+        3703 => "Reduce spill pressure by lowering hot-key skew, increasing memory budget, or reducing ingest burst size.",
+        3704 => "Reduce view memory usage or increase workload memory limit so the view can exit relaxed mode.",
+        3705 => "Inspect checkpoint barrier holders and slow shards; resolve stalled operators before retrying.",
+        3706 => "Check sink connectivity/commit latency and transactional backpressure; recover sink health before retrying.",
+        3707 => "Wait for migration/drain to complete, or inspect topology transition progress and blocked shard ownership.",
+        3708 => "Wait for recovery to complete; monitor checkpoint and shard reassignment progress via SHOW VIEW STATUS.",
         4001 => "Verify source connection settings and network connectivity.",
         4002 => "Check sink availability and credentials.",
         4003 => "Retry the epoch; check sink connector health and connectivity.",
@@ -810,6 +858,8 @@ mod tests {
             RS_2403, RS_2404, RS_2405, RS_2406, // v0.51.5-v0.51.26 gateway TLS/mTLS
             RS_2028, // v0.51.12 bounded late-data side-channel
             RS_1020, RS_1021, // v0.53.2 IVM arrangement debugger
+            RS_3701, RS_3702, RS_3703, RS_3704, RS_3705, RS_3706, RS_3707,
+            RS_3708, // v0.54.1 explainability taxonomy
         ];
         for code in codes {
             assert_ne!(
@@ -959,6 +1009,58 @@ mod tests {
         assert!(next_steps(RS_2017).contains("shard_stats"));
         assert!(description(RS_2022).contains("RETURNING"));
         assert!(next_steps(RS_2013).contains("frontier"));
+    }
+
+    #[test]
+    fn degradation_reason_error_codes_registered() {
+        let expected = [
+            (
+                RS_3701,
+                "view.waiting_on_source",
+                "View is waiting on source/frontier progress",
+            ),
+            (
+                RS_3702,
+                "view.quota_admission_rejected",
+                "View admission rejected by quota controls",
+            ),
+            (
+                RS_3703,
+                "view.spilling",
+                "View lag is dominated by spill delay",
+            ),
+            (
+                RS_3704,
+                "view.over_budget_relaxed",
+                "View is in over-budget relaxed mode",
+            ),
+            (
+                RS_3705,
+                "view.checkpoint_alignment_stalled",
+                "View checkpoint alignment is stalled",
+            ),
+            (
+                RS_3706,
+                "view.sink_blocked",
+                "View sink commit path is blocked",
+            ),
+            (
+                RS_3707,
+                "view.topology_transition_in_progress",
+                "View topology transition is in progress",
+            ),
+            (
+                RS_3708,
+                "view.recovering",
+                "View is recovering from checkpoint/reassignment work",
+            ),
+        ];
+        for (code, expected_slug, expected_description) in expected {
+            assert_eq!(slug(code), expected_slug);
+            assert_eq!(description(code), expected_description);
+            assert_eq!(severity(code), Severity::Warning);
+            assert!(!next_steps(code).is_empty());
+        }
     }
 
     #[test]

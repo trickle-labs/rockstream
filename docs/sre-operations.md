@@ -100,3 +100,37 @@ jq '.system_info, .metrics' support-bundle-*.json
 ```
 
 The on-demand `rockstream support bundle` CLI command produces diagnostic artifacts with secret redaction and bounded size (< 10MB default) for operational support and cluster troubleshooting.
+
+---
+
+## Degradation Reasons, Explainability & Remediation Runbook
+
+When a materialized view is degraded or blocked, `SHOW VIEW STATUS` and `rockstream view status` report an enumerated `degradation_reason`, a stable `reason_code`, a deterministic `dominant_contributor`, and optional live progress.
+
+### Enumerated Degradation Reasons & Error Codes
+
+| Reason | Error Code | Description | Remediation |
+|---|---|---|---|
+| `waiting_on_source` | `RS-3701` | Upstream source has stalled or stopped emitting watermarks | Inspect upstream source connectors, message brokers, and network connectivity; verify upstream watermarks are advancing. |
+| `quota_admission_rejected` | `RS-3702` | Admission control rejected incoming work due to workload quota exhaustion | Increase workload memory budget using `ALTER WORKLOAD` or reduce incoming batch sizes and ingest rate. |
+| `spilling` | `RS-3703` | Active disk spilling in progress due to bounded memory pressure | Increase state memory budget (`state_budget_gb`) or scale out cluster workers to distribute arrangement memory. |
+| `over_budget_relaxed` | `RS-3704` | Workload exceeded soft memory budget and is running in relaxed mode | Allocate higher memory headroom or trigger proactive compaction to reclaim tombstone memory. |
+| `checkpoint_alignment_stalled` | `RS-3705` | Checkpoint barrier alignment is stalled waiting for lagging shards | Identify barrier holder shard/operator with `rockstream checkpoint show <id>` and inspect worker CPU/network. |
+| `sink_blocked` | `RS-3706` | Transactional 2PC sink cannot commit batches to external storage | Check downstream sink endpoint health, transaction commit timeouts, and target database locking. |
+| `topology_transition_in_progress` | `RS-3707` | Active shard migration or worker drain is transitioning topology | Monitor live migration/drain progress via `rockstream view status` or `SHOW VIEW STATUS`; await cutover. |
+| `recovering` | `RS-3708` | Materialized view is backfilling or recovering from a checkpoint | Monitor backfill progress and await catch-up to the current stream frontier. |
+
+### Deterministic Dominant Contributor Priority
+
+When multiple lag components contribute simultaneously, the dominant cause is derived deterministically by maximum value. Ties are broken according to the fixed priority ordering:
+
+```
+storage_pressure > source_lag > decode_lag > compute_lag > alignment_lag > sink_lag > spill_lag > healthy
+```
+
+### Live Progress & Durability Semantics
+
+- **Phase**: Reflects current lifecycle sub-state (`planned`, `snapshotting`, `copying`, `dual_writing`, `catching_up`, `fencing_old`, `cutover`, `verifying`, `gc_eligible`, `done`, `draining`, `decommissioned`).
+- **Remaining work**: `bytes_remaining` and `rows_remaining` are non-increasing and monotonically advance toward zero.
+- **Estimates**: `estimated_remaining_ms` is derived only from completed work rate and bounded. On completion, remaining work and estimate report exactly 0.
+

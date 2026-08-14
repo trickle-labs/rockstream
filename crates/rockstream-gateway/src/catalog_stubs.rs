@@ -17,7 +17,7 @@ use rockstream_types::metrics::{
     set_pipeline_state_bytes, set_workload_memory,
 };
 use rockstream_types::state_budget::{StateBudget, WorkloadBudget};
-use rockstream_types::view_lifecycle::ViewState;
+use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 use rockstream_types::workload::WorkloadDef;
 use serde::{Deserialize, Serialize};
 
@@ -1138,51 +1138,31 @@ impl CatalogStubs {
                 let memory_limit_bytes = workload
                     .as_ref()
                     .and_then(|w| w.memory_limit.map(|m| m.bytes.to_string()));
-                let state_str = self
+                let view_state = self
                     .view_states
                     .read()
                     .unwrap()
                     .get(&v.name)
                     .cloned()
-                    .unwrap_or(ViewState::Running)
-                    .to_string();
-                let stage_lag = rockstream_types::metrics::read_view_stage_lag(&v.name);
-                let (src_lag, dec_lag, cmp_lag, aln_lag, snk_lag, spl_lag, stg_lag, tot_lag) =
-                    if let Some(lag) = stage_lag {
-                        (
-                            lag.source_lag_ms.to_string(),
-                            lag.decode_lag_ms.to_string(),
-                            lag.compute_lag_ms.to_string(),
-                            lag.alignment_lag_ms.to_string(),
-                            lag.sink_lag_ms.to_string(),
-                            lag.spill_lag_ms.to_string(),
-                            lag.storage_pressure_ms.to_string(),
-                            lag.total_lag_ms.to_string(),
-                        )
-                    } else if let Some(tot) = rockstream_types::metrics::read_freshness_lag(&v.name)
-                    {
-                        (
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            tot.to_string(),
-                        )
-                    } else {
-                        (
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                            "0".to_string(),
-                        )
-                    };
+                    .unwrap_or(ViewState::Running);
+                let state_str = view_state.to_string();
+                let stage_lag = rockstream_types::metrics::read_view_stage_lag(&v.name)
+                    .or_else(|| {
+                        rockstream_types::metrics::read_freshness_lag(&v.name).map(|tot| {
+                            rockstream_types::metrics::StageLagBreakdown {
+                                source_lag_ms: 0,
+                                decode_lag_ms: 0,
+                                compute_lag_ms: 0,
+                                alignment_lag_ms: 0,
+                                sink_lag_ms: 0,
+                                spill_lag_ms: 0,
+                                storage_pressure_ms: 0,
+                                total_lag_ms: tot,
+                            }
+                        })
+                    })
+                    .unwrap_or_default();
+                let degradation_status = derive_degradation_status(&view_state, Some(stage_lag));
                 vec![
                     Some(v.namespace),
                     Some(v.name),
@@ -1191,14 +1171,27 @@ impl CatalogStubs {
                     freshness_slo_ms,
                     memory_limit_bytes,
                     Some("-".to_string()),
-                    Some(src_lag),
-                    Some(dec_lag),
-                    Some(cmp_lag),
-                    Some(aln_lag),
-                    Some(snk_lag),
-                    Some(spl_lag),
-                    Some(stg_lag),
-                    Some(tot_lag),
+                    Some(stage_lag.source_lag_ms.to_string()),
+                    Some(stage_lag.decode_lag_ms.to_string()),
+                    Some(stage_lag.compute_lag_ms.to_string()),
+                    Some(stage_lag.alignment_lag_ms.to_string()),
+                    Some(stage_lag.sink_lag_ms.to_string()),
+                    Some(stage_lag.spill_lag_ms.to_string()),
+                    Some(stage_lag.storage_pressure_ms.to_string()),
+                    Some(stage_lag.total_lag_ms.to_string()),
+                    Some(degradation_status.degradation_reason.to_string()),
+                    Some(degradation_status.reason_code.clone()),
+                    Some(degradation_status.dominant_contributor.to_string()),
+                    degradation_status.progress_phase,
+                    degradation_status
+                        .bytes_remaining
+                        .map(|value| value.to_string()),
+                    degradation_status
+                        .rows_remaining
+                        .map(|value| value.to_string()),
+                    degradation_status
+                        .estimated_remaining_ms
+                        .map(|value| value.to_string()),
                 ]
             })
             .collect();
@@ -2986,6 +2979,13 @@ pub(crate) fn view_status_columns() -> Vec<String> {
         "spill_lag_ms".to_string(),
         "storage_pressure_ms".to_string(),
         "total_lag_ms".to_string(),
+        "degradation_reason".to_string(),
+        "reason_code".to_string(),
+        "dominant_contributor".to_string(),
+        "progress_phase".to_string(),
+        "bytes_remaining".to_string(),
+        "rows_remaining".to_string(),
+        "estimated_remaining_ms".to_string(),
     ]
 }
 

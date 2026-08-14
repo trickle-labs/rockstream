@@ -3,25 +3,27 @@
 use std::fs;
 
 use rockstream_cli::output::{
-    render_output, ArrangementDebugInfo, CheckpointSummary, ClusterQuotasInfo,
-    ClusterResourceUsageInfo, ClusterStatusInfo, ExplainEstimateInfo, ExplainOpIdInfo,
-    ExplainPlanInfo, OutputFormat, ResourceUsageInfo, SchemaDetail, SchemaEvolutionHistoryInfo,
-    SchemaEvolutionStatusInfo, ShardInfo, SourceDetail, SqlCompileInfo, ViewDetail, ViewStatusInfo,
-    ViewSummary, WorkerStatusInfo, WorkloadDetail, AUDIT_TAIL_MAX_EVENTS,
+    render_output, ArrangementDebugInfo, CheckpointAlignmentInfo, CheckpointSummary,
+    ClusterQuotasInfo, ClusterResourceUsageInfo, ClusterStatusInfo, ExplainEstimateInfo,
+    ExplainOpIdInfo, ExplainPlanInfo, OutputFormat, ResourceUsageInfo, SchemaDetail,
+    SchemaEvolutionHistoryInfo, SchemaEvolutionStatusInfo, ShardAlignmentInfo, ShardInfo,
+    SourceDetail, SqlCompileInfo, ViewDetail, ViewStatusInfo, ViewSummary, WorkerStatusInfo,
+    WorkloadDetail, AUDIT_TAIL_MAX_EVENTS,
 };
 use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
 use rockstream_cli::{
-    run_audit_query, run_audit_tail, run_checkpoint_list, run_cluster_quotas, run_cluster_status,
-    run_cluster_workers_list, run_cluster_workers_status, run_debug_arrangement, run_explain_view,
-    run_resource_cluster, run_resource_usage, run_schema_evolution_history,
-    run_schema_evolution_status, run_schema_list, run_schema_show, run_shard_list, run_source_list,
-    run_source_show, run_sql_compile, run_view_list, run_view_show, run_view_status,
-    run_workload_list, run_workload_show,
+    run_audit_query, run_audit_tail, run_checkpoint_list, run_checkpoint_show, run_cluster_quotas,
+    run_cluster_status, run_cluster_workers_list, run_cluster_workers_status,
+    run_debug_arrangement, run_explain_view, run_resource_cluster, run_resource_usage,
+    run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
+    run_shard_list, run_source_list, run_source_show, run_sql_compile, run_view_list,
+    run_view_show, run_view_status, run_workload_list, run_workload_show,
 };
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::error_code::{
     RS_0004, RS_1001, RS_1005, RS_1012, RS_1020, RS_1021, RS_2006, RS_4009,
 };
+use rockstream_types::view_lifecycle::{DegradationReason, DominantContributor};
 
 // ─── Slice 1: Transport Seam & Substrate Tests ──────────────────────────────
 
@@ -267,6 +269,64 @@ fn test_cli_shard_and_checkpoint_list_golden() {
     assert_eq!(ckpts.len(), 2);
     assert_eq!(ckpts[0].checkpoint_id, 1);
     assert_eq!(ckpts[1].checkpoint_id, 2);
+}
+
+#[test]
+fn test_cli_checkpoint_show_alignment_and_holder() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage_path = temp_dir.path();
+    let checkpoints_dir = storage_path.join("checkpoints");
+    fs::create_dir_all(&checkpoints_dir).unwrap();
+    fs::write(checkpoints_dir.join("42"), b"manifest-42").unwrap();
+
+    let storage = StorageClient::new().with_mock_checkpoint_alignment(CheckpointAlignmentInfo {
+        checkpoint_id: 42,
+        status: "in_progress".to_string(),
+        shards: vec![
+            ShardAlignmentInfo {
+                shard_id: 1,
+                operator_id: "source_0".to_string(),
+                state: "confirmed".to_string(),
+                holder: None,
+                elapsed_ms: 250,
+            },
+            ShardAlignmentInfo {
+                shard_id: 2,
+                operator_id: "source_0".to_string(),
+                state: "holding_barrier".to_string(),
+                holder: Some("shard_2/source_0".to_string()),
+                elapsed_ms: 250,
+            },
+        ],
+        active_holder: Some("shard_2/source_0".to_string()),
+        elapsed_ms: 250,
+    });
+
+    let text = run_checkpoint_show(OutputFormat::Text, &storage, 42, storage_path).unwrap();
+    assert!(text.contains(
+        "Checkpoint 42: status=in_progress, active_holder=shard_2/source_0, elapsed_ms=250"
+    ));
+    assert!(text.contains("shard_2/source_0"));
+
+    let json = run_checkpoint_show(OutputFormat::Json, &storage, 42, storage_path).unwrap();
+    let info: CheckpointAlignmentInfo = serde_json::from_str(&json).unwrap();
+    assert_eq!(info.checkpoint_id, 42);
+    assert_eq!(info.status, "in_progress");
+    assert_eq!(info.active_holder.as_deref(), Some("shard_2/source_0"));
+    assert_eq!(info.shards.len(), 2);
+    assert_eq!(info.shards[0].state, "confirmed");
+    assert_eq!(info.shards[1].state, "holding_barrier");
+    assert_eq!(info.shards[1].holder.as_deref(), Some("shard_2/source_0"));
+}
+
+#[test]
+fn test_cli_checkpoint_show_not_found_fails() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage_path = temp_dir.path();
+    let storage = StorageClient::new();
+    let err = run_checkpoint_show(OutputFormat::Text, &storage, 999, storage_path).unwrap_err();
+    assert_eq!(err.code, RS_0004);
+    assert!(err.message.contains("checkpoint 999 not found"));
 }
 
 #[test]
@@ -671,4 +731,102 @@ fn test_cli_view_status_json_with_lag_breakdown() {
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].view_name, "active_users");
     assert_eq!(statuses[0].stage_lag, Some(lag));
+}
+
+#[test]
+fn test_cli_view_status_explainability_text_exact() {
+    let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+    rockstream_types::metrics::reset_all();
+    let catalog = CatalogClient::with_defaults();
+
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 10,
+        decode_lag_ms: 4,
+        compute_lag_ms: 12,
+        alignment_lag_ms: 3,
+        sink_lag_ms: 8,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 1,
+        total_lag_ms: 38,
+    };
+    rockstream_types::metrics::set_view_stage_lag("active_users", lag);
+
+    let out_text = run_view_status(OutputFormat::Text, &catalog, Some("active_users")).unwrap();
+    let expected = [
+        format!(
+            "{:<15} {:<20} {:<15} {:<15} {:<10} {:<12} {:<45} {:<34} {:<10} {:<18} {:<30} {:<20}",
+            "NAMESPACE",
+            "VIEW",
+            "STATE",
+            "WORKLOAD",
+            "SLO (MS)",
+            "MEM LIMIT",
+            "LAG (MS)",
+            "REASON",
+            "CODE",
+            "DOMINANT",
+            "PROGRESS",
+            "DEPENDS ON"
+        ),
+        "-".repeat(300),
+        format!(
+            "{:<15} {:<20} {:<15} {:<15} {:<10} {:<12} {:<45} {:<34} {:<10} {:<18} {:<30} {:<20}",
+            "public",
+            "active_users",
+            "RUNNING",
+            "analytics",
+            "5000",
+            "536870912",
+            "38 (src:10 dec:4 cmp:12 aln:3 snk:8 spl:0 stg:1)",
+            "sink_blocked",
+            "RS-3706",
+            "compute_lag",
+            "-",
+            "users_source"
+        ),
+    ]
+    .join("\n");
+    assert_eq!(out_text, expected);
+}
+
+#[test]
+fn test_cli_view_status_explainability_json_exact() {
+    let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+    rockstream_types::metrics::reset_all();
+    let catalog = CatalogClient::with_defaults();
+
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 10,
+        decode_lag_ms: 4,
+        compute_lag_ms: 12,
+        alignment_lag_ms: 3,
+        sink_lag_ms: 8,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 1,
+        total_lag_ms: 38,
+    };
+    rockstream_types::metrics::set_view_stage_lag("active_users", lag);
+
+    let out_json = run_view_status(OutputFormat::Json, &catalog, Some("active_users")).unwrap();
+    let statuses: Vec<ViewStatusInfo> = serde_json::from_str(&out_json).unwrap();
+    assert_eq!(
+        statuses,
+        vec![ViewStatusInfo {
+            namespace: "public".to_string(),
+            view_name: "active_users".to_string(),
+            state: "RUNNING".to_string(),
+            workload_name: Some("analytics".to_string()),
+            freshness_slo_ms: Some(5000),
+            memory_limit_bytes: Some(536870912),
+            depends_on: vec!["users_source".to_string()],
+            stage_lag: Some(lag),
+            degradation_reason: DegradationReason::SinkBlocked,
+            reason_code: "RS-3706".to_string(),
+            dominant_contributor: DominantContributor::ComputeLag,
+            progress_phase: None,
+            bytes_remaining: None,
+            rows_remaining: None,
+            estimated_remaining_ms: None,
+        }]
+    );
 }

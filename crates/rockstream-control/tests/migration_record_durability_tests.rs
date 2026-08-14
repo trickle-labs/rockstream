@@ -179,3 +179,57 @@ async fn migration_record_survives_restart_minio_tc() {
     let persistent_b = MigrationPersistentStore::new(minio_object_store(port));
     assert_eq!(persistent_b.load(&state.migration_id).await.unwrap(), state);
 }
+
+#[tokio::test]
+async fn test_interrupted_migration_progress_survives_restart_lfs_and_minio() {
+    let mut record = make_record().with_work_estimates(Some(20_000_000), Some(100_000));
+    record.record_progress(8_000_000, 40_000);
+
+    // 1. LFS
+    let dir = tempfile::tempdir().unwrap();
+    let store_lfs: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let persistent_lfs_a = MigrationPersistentStore::new(store_lfs.clone());
+    persistent_lfs_a.save(&record).await.unwrap();
+
+    let persistent_lfs_b = MigrationPersistentStore::new(Arc::new(
+        LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+    ));
+    let mut loaded = persistent_lfs_b.load(&record.migration_id).await.unwrap();
+    assert_eq!(loaded.progress_phase(), record.progress_phase());
+    assert_eq!(loaded.bytes_remaining(), Some(0)); // dual_writing has 0 bytes remaining
+    assert_eq!(loaded.rows_remaining(), Some(0));
+    assert!(loaded.estimated_remaining_ms().is_some());
+
+    // Advance loaded record after restart
+    loaded.apply_transition(MigrationState::CatchingUp).unwrap();
+    assert_eq!(loaded.progress_phase(), "catching_up");
+    loaded.apply_transition(MigrationState::FencingOld).unwrap();
+    loaded.apply_transition(MigrationState::Cutover).unwrap();
+    loaded.apply_transition(MigrationState::Verifying).unwrap();
+    loaded.apply_transition(MigrationState::GcEligible).unwrap();
+    loaded.apply_transition(MigrationState::Done).unwrap();
+    assert_eq!(loaded.progress_phase(), "done");
+    assert_eq!(loaded.bytes_remaining(), Some(0));
+    assert_eq!(loaded.rows_remaining(), Some(0));
+    assert_eq!(loaded.estimated_remaining_ms(), Some(0));
+
+    // 2. MinIO (if docker available)
+    if docker_available() {
+        use testcontainers::runners::AsyncRunner;
+        let container = testcontainers_modules::minio::MinIO::default()
+            .start()
+            .await
+            .unwrap();
+        let port = container.get_host_port_ipv4(9000).await.unwrap();
+        create_minio_bucket(port, MINIO_BUCKET).await;
+
+        let persistent_minio_a = MigrationPersistentStore::new(minio_object_store(port));
+        persistent_minio_a.save(&record).await.unwrap();
+
+        let persistent_minio_b = MigrationPersistentStore::new(minio_object_store(port));
+        let loaded_minio = persistent_minio_b.load(&record.migration_id).await.unwrap();
+        assert_eq!(loaded_minio.progress_phase(), record.progress_phase());
+        assert_eq!(loaded_minio.bytes_remaining(), Some(0));
+    }
+}

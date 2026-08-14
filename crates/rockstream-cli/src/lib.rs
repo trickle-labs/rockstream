@@ -1157,6 +1157,16 @@ pub fn run_checkpoint_list(
     Ok(output::render_output(&checkpoints, format))
 }
 
+pub fn run_checkpoint_show(
+    format: output::OutputFormat,
+    storage: &transport::StorageClient,
+    checkpoint_id: u64,
+    storage_path: &Path,
+) -> Result<String, CliError> {
+    let alignment = storage.show_checkpoint(storage_path, checkpoint_id)?;
+    Ok(output::render_output(&alignment, format))
+}
+
 pub fn run_resource_usage(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,

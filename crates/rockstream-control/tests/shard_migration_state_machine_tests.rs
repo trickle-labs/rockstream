@@ -337,3 +337,58 @@ async fn cutover_waits_for_all_observers_before_verifying() {
         )
         .unwrap());
 }
+
+#[test]
+fn test_migration_progress_monotonic_all_phases() {
+    let mut record = make_record().with_work_estimates(Some(10_000_000), Some(50_000));
+    assert_eq!(record.progress_phase(), "planned");
+    assert_eq!(record.bytes_remaining(), Some(10_000_000));
+    assert_eq!(record.rows_remaining(), Some(50_000));
+    assert!(record.estimated_remaining_ms().is_some());
+
+    record
+        .apply_transition(MigrationState::Snapshotting)
+        .unwrap();
+    assert_eq!(record.progress_phase(), "snapshotting");
+    assert_eq!(record.bytes_remaining(), Some(10_000_000));
+    assert_eq!(record.rows_remaining(), Some(50_000));
+
+    record.apply_transition(MigrationState::Copying).unwrap();
+    assert_eq!(record.progress_phase(), "copying");
+    assert_eq!(record.bytes_remaining(), Some(10_000_000));
+
+    // Monotonic copy updates
+    record.record_progress(4_000_000, 20_000);
+    assert_eq!(record.bytes_remaining(), Some(6_000_000));
+    assert_eq!(record.rows_remaining(), Some(30_000));
+    assert!(record.estimated_remaining_ms().unwrap() > 0);
+
+    record.record_progress(8_000_000, 40_000);
+    assert_eq!(record.bytes_remaining(), Some(2_000_000));
+    assert_eq!(record.rows_remaining(), Some(10_000));
+
+    record.record_progress(10_000_000, 50_000);
+    assert_eq!(record.bytes_remaining(), Some(0));
+    assert_eq!(record.rows_remaining(), Some(0));
+
+    for next_state in [
+        MigrationState::DualWriting,
+        MigrationState::CatchingUp,
+        MigrationState::FencingOld,
+        MigrationState::Cutover,
+        MigrationState::Verifying,
+        MigrationState::GcEligible,
+    ] {
+        record.apply_transition(next_state).unwrap();
+        assert_eq!(record.progress_phase(), next_state.to_string());
+        assert_eq!(record.bytes_remaining(), Some(0));
+        assert_eq!(record.rows_remaining(), Some(0));
+        assert!(record.estimated_remaining_ms().is_some());
+    }
+
+    record.apply_transition(MigrationState::Done).unwrap();
+    assert_eq!(record.progress_phase(), "done");
+    assert_eq!(record.bytes_remaining(), Some(0));
+    assert_eq!(record.rows_remaining(), Some(0));
+    assert_eq!(record.estimated_remaining_ms(), Some(0));
+}

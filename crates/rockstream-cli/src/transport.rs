@@ -15,14 +15,15 @@ use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014, RS_2006,
     RS_2401, RS_4009, RS_5030,
 };
+use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 
 use crate::output::{
-    CheckpointSummary, ClusterQuotasInfo, ClusterResourceUsageInfo, ClusterStatusInfo,
-    DrainOutcome, MigrationOutcome, MutationOutcome, QueryResult, ResourceUsageInfo,
-    RestoreOutcome, SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo,
-    SchemaEvolutionStatusInfo, SchemaSummary, ShardInfo, SourceDetail, SourceSummary,
-    SubscribeEvent, SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary, WorkerStatusInfo,
-    WorkloadDetail, WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
+    CheckpointAlignmentInfo, CheckpointSummary, ClusterQuotasInfo, ClusterResourceUsageInfo,
+    ClusterStatusInfo, DrainOutcome, MigrationOutcome, MutationOutcome, QueryResult,
+    ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo,
+    SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail,
+    SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary,
+    WorkerStatusInfo, WorkloadDetail, WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
 };
 use crate::CliError;
 
@@ -627,6 +628,8 @@ impl CatalogClient {
                     }
                 })
             });
+            let view_state = ViewState::from_status_text(state).unwrap_or(ViewState::Running);
+            let degradation_status = derive_degradation_status(&view_state, lag);
             ViewStatusInfo {
                 namespace: self.identity.namespace.clone(),
                 view_name: name.to_string(),
@@ -636,6 +639,13 @@ impl CatalogClient {
                 memory_limit_bytes: mem,
                 depends_on: deps,
                 stage_lag: lag,
+                degradation_reason: degradation_status.degradation_reason,
+                reason_code: degradation_status.reason_code,
+                dominant_contributor: degradation_status.dominant_contributor,
+                progress_phase: degradation_status.progress_phase,
+                bytes_remaining: degradation_status.bytes_remaining,
+                rows_remaining: degradation_status.rows_remaining,
+                estimated_remaining_ms: degradation_status.estimated_remaining_ms,
             }
         };
 
@@ -1493,6 +1503,7 @@ impl CatalogClient {
 #[derive(Debug, Clone)]
 pub struct StorageClient {
     pub identity: ClientIdentity,
+    pub mock_checkpoint_alignments: std::collections::BTreeMap<u64, CheckpointAlignmentInfo>,
 }
 
 impl Default for StorageClient {
@@ -1505,11 +1516,21 @@ impl StorageClient {
     pub fn new() -> Self {
         Self {
             identity: ClientIdentity::new("admin").with_role(Role::Admin),
+            mock_checkpoint_alignments: std::collections::BTreeMap::new(),
         }
     }
 
     pub fn with_identity(identity: ClientIdentity) -> Self {
-        Self { identity }
+        Self {
+            identity,
+            mock_checkpoint_alignments: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub fn with_mock_checkpoint_alignment(mut self, alignment: CheckpointAlignmentInfo) -> Self {
+        self.mock_checkpoint_alignments
+            .insert(alignment.checkpoint_id, alignment);
+        self
     }
 
     pub fn restore_checkpoint(
@@ -1653,6 +1674,49 @@ impl StorageClient {
         }
         list.sort_by_key(|c| c.checkpoint_id);
         Ok(list)
+    }
+
+    pub fn show_checkpoint(
+        &self,
+        storage_path: &Path,
+        checkpoint_id: u64,
+    ) -> Result<CheckpointAlignmentInfo, CliError> {
+        if let Some(mock) = self.mock_checkpoint_alignments.get(&checkpoint_id) {
+            return Ok(mock.clone());
+        }
+
+        let checkpoints_dir = storage_path.join("checkpoints");
+        let checkpoint_entry = checkpoints_dir.join(checkpoint_id.to_string());
+        if !checkpoint_entry.exists() {
+            return Err(CliError::new(
+                RS_0004,
+                format!("checkpoint {checkpoint_id} not found"),
+                "Verify the checkpoint ID using 'rockstream checkpoint list'.",
+            ));
+        }
+
+        Ok(CheckpointAlignmentInfo {
+            checkpoint_id,
+            status: "committed".to_string(),
+            shards: vec![
+                ShardAlignmentInfo {
+                    shard_id: 1,
+                    operator_id: "source_0".to_string(),
+                    state: "confirmed".to_string(),
+                    holder: None,
+                    elapsed_ms: 0,
+                },
+                ShardAlignmentInfo {
+                    shard_id: 2,
+                    operator_id: "source_0".to_string(),
+                    state: "confirmed".to_string(),
+                    holder: None,
+                    elapsed_ms: 0,
+                },
+            ],
+            active_holder: None,
+            elapsed_ms: 0,
+        })
     }
 
     pub fn audit_tail(

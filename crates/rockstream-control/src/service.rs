@@ -482,10 +482,7 @@ async fn request_worker_drain(
     }
 
     let started_at_ms = now_ms();
-    let lifecycle = WorkerLifecycleState::Draining {
-        shards_remaining: shards.len() as u32,
-        started_at_ms,
-    };
+    let lifecycle = WorkerLifecycleState::draining(shards.len() as u32, started_at_ms);
     let updated = catalog
         .set_lifecycle(worker_id, lifecycle.clone())
         .expect("worker existence checked above");
@@ -609,18 +606,9 @@ async fn process_drain_queue(
                     completed_at_ms: now_ms(),
                 }
             } else {
-                match worker.lifecycle {
-                    WorkerLifecycleState::Draining { started_at_ms, .. } => {
-                        WorkerLifecycleState::Draining {
-                            shards_remaining: remaining,
-                            started_at_ms,
-                        }
-                    }
-                    _ => WorkerLifecycleState::Draining {
-                        shards_remaining: remaining,
-                        started_at_ms: now_ms(),
-                    },
-                }
+                let mut state = worker.lifecycle.clone();
+                state.advance_drain_progress(remaining, None, None);
+                state
             };
             if let Some(updated) = catalog.set_lifecycle(task.donor_worker_id, next_state.clone()) {
                 persist_worker_if_needed(topology_store, &updated).await;
@@ -914,10 +902,7 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
                         completed_at_ms: now_ms(),
                     }
                 } else {
-                    WorkerLifecycleState::Draining {
-                        shards_remaining,
-                        started_at_ms: now_ms(),
-                    }
+                    WorkerLifecycleState::draining(shards_remaining, now_ms())
                 };
                 if let Some(worker) = catalog.set_lifecycle(worker_id, state) {
                     persist_worker_if_needed(topology_store.as_ref(), &worker).await;

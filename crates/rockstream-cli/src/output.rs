@@ -4,6 +4,7 @@
 //! conforming to stable JSON schemas.
 
 use rockstream_types::audit::AuditEvent;
+use rockstream_types::view_lifecycle::{DegradationReason, DominantContributor};
 use serde::{Deserialize, Serialize};
 
 /// Maximum rows formatted or printed in a single CLI command output buffer.
@@ -146,6 +147,32 @@ pub struct ViewStatusInfo {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub stage_lag: Option<rockstream_types::metrics::StageLagBreakdown>,
+    #[serde(default = "default_degradation_reason")]
+    pub degradation_reason: DegradationReason,
+    #[serde(default = "default_reason_code")]
+    pub reason_code: String,
+    #[serde(default = "default_dominant_contributor")]
+    pub dominant_contributor: DominantContributor,
+    #[serde(default)]
+    pub progress_phase: Option<String>,
+    #[serde(default)]
+    pub bytes_remaining: Option<u64>,
+    #[serde(default)]
+    pub rows_remaining: Option<u64>,
+    #[serde(default)]
+    pub estimated_remaining_ms: Option<u64>,
+}
+
+fn default_degradation_reason() -> DegradationReason {
+    DegradationReason::WaitingOnSource
+}
+
+fn default_reason_code() -> String {
+    "RS-3701".to_string()
+}
+
+fn default_dominant_contributor() -> DominantContributor {
+    DominantContributor::Healthy
 }
 
 impl Formattable for Vec<ViewStatusInfo> {
@@ -155,7 +182,7 @@ impl Formattable for Vec<ViewStatusInfo> {
         }
         let mut lines = Vec::new();
         lines.push(format!(
-            "{:<15} {:<20} {:<15} {:<15} {:<15} {:<15} {:<15} {:<20}",
+            "{:<15} {:<20} {:<15} {:<15} {:<10} {:<12} {:<45} {:<34} {:<10} {:<18} {:<30} {:<20}",
             "NAMESPACE",
             "VIEW",
             "STATE",
@@ -163,9 +190,13 @@ impl Formattable for Vec<ViewStatusInfo> {
             "SLO (MS)",
             "MEM LIMIT",
             "LAG (MS)",
+            "REASON",
+            "CODE",
+            "DOMINANT",
+            "PROGRESS",
             "DEPENDS ON"
         ));
-        lines.push("-".repeat(135));
+        lines.push("-".repeat(300));
         for v in self.iter().take(CLI_OUTPUT_MAX_ROWS) {
             let lag_str = if let Some(ref lag) = v.stage_lag {
                 format!(
@@ -182,8 +213,25 @@ impl Formattable for Vec<ViewStatusInfo> {
             } else {
                 "-".to_string()
             };
+            let progress_str = if let Some(phase) = &v.progress_phase {
+                format!(
+                    "{} (bytes:{} rows:{} eta_ms:{})",
+                    phase,
+                    v.bytes_remaining
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    v.rows_remaining
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    v.estimated_remaining_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                )
+            } else {
+                "-".to_string()
+            };
             lines.push(format!(
-                "{:<15} {:<20} {:<15} {:<15} {:<15} {:<15} {:<15} {:<20}",
+                "{:<15} {:<20} {:<15} {:<15} {:<10} {:<12} {:<45} {:<34} {:<10} {:<18} {:<30} {:<20}",
                 v.namespace,
                 v.view_name,
                 v.state,
@@ -195,6 +243,10 @@ impl Formattable for Vec<ViewStatusInfo> {
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 lag_str,
+                v.degradation_reason.to_string(),
+                v.reason_code.as_str(),
+                v.dominant_contributor.to_string(),
+                progress_str,
                 if v.depends_on.is_empty() {
                     "-".to_string()
                 } else {
@@ -624,6 +676,53 @@ impl Formattable for Vec<CheckpointSummary> {
             lines.push(format!(
                 "{:<15} {:<20} {:<15} {:<10}",
                 c.checkpoint_id, c.created_at_ms, c.shard_count, c.codec
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShardAlignmentInfo {
+    pub shard_id: u64,
+    pub operator_id: String,
+    pub state: String,
+    pub holder: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointAlignmentInfo {
+    pub checkpoint_id: u64,
+    pub status: String,
+    pub shards: Vec<ShardAlignmentInfo>,
+    pub active_holder: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+impl Formattable for CheckpointAlignmentInfo {
+    fn to_text(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "Checkpoint {}: status={}, active_holder={}, elapsed_ms={}",
+            self.checkpoint_id,
+            self.status,
+            self.active_holder.as_deref().unwrap_or("none"),
+            self.elapsed_ms
+        ));
+        lines.push(format!(
+            "{:<10} {:<15} {:<18} {:<25} {:<12}",
+            "SHARD ID", "OPERATOR ID", "STATE", "BARRIER HOLDER", "ELAPSED (MS)"
+        ));
+        lines.push("-".repeat(82));
+        for s in &self.shards {
+            lines.push(format!(
+                "{:<10} {:<15} {:<18} {:<25} {:<12}",
+                s.shard_id,
+                s.operator_id,
+                s.state,
+                s.holder.as_deref().unwrap_or("-"),
+                s.elapsed_ms
             ));
         }
         lines.join("\n")

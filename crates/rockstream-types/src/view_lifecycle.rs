@@ -11,9 +11,14 @@
 //! state with SLO metadata for `SHOW VIEW STATUS FOR NAMESPACE`. `BackfillStatus`
 //! provides progress detail for `SHOW BACKFILL STATUS FOR MATERIALIZED VIEW`.
 
-use crate::ids::NamespaceId;
-use crate::metrics::StageLagBreakdown;
-use crate::workload::WorkloadDef;
+use crate::{
+    error_code::{
+        ErrorCode, RS_3701, RS_3702, RS_3703, RS_3704, RS_3705, RS_3706, RS_3707, RS_3708,
+    },
+    ids::NamespaceId,
+    metrics::StageLagBreakdown,
+    workload::WorkloadDef,
+};
 use serde::{Deserialize, Serialize};
 
 /// Lifecycle state of a materialized view.
@@ -57,6 +62,30 @@ impl ViewState {
     pub fn is_backfilling(&self) -> bool {
         matches!(self, Self::BackfillingFromEpoch(_))
     }
+
+    pub fn from_status_text(state: &str) -> Option<Self> {
+        let trimmed = state.trim();
+        if trimmed.eq_ignore_ascii_case("RUNNING") {
+            return Some(Self::Running);
+        }
+        if trimmed.eq_ignore_ascii_case("PAUSED") {
+            return Some(Self::Paused);
+        }
+        if trimmed.eq_ignore_ascii_case("OVER_BUDGET_RELAXED") {
+            return Some(Self::OverBudgetRelaxed);
+        }
+        if trimmed.eq_ignore_ascii_case("OVER_BUDGET_REJECTED") {
+            return Some(Self::OverBudgetRejected);
+        }
+        if let Some(epoch) = trimmed
+            .strip_prefix("BACKFILLING(from epoch ")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            return Some(Self::BackfillingFromEpoch(epoch));
+        }
+        None
+    }
 }
 
 impl std::fmt::Display for ViewState {
@@ -69,6 +98,229 @@ impl std::fmt::Display for ViewState {
             Self::BackfillingFromEpoch(epoch) => write!(f, "BACKFILLING(from epoch {epoch})"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationReason {
+    WaitingOnSource,
+    QuotaAdmissionRejected,
+    Spilling,
+    OverBudgetRelaxed,
+    CheckpointAlignmentStalled,
+    SinkBlocked,
+    TopologyTransitionInProgress,
+    Recovering,
+}
+
+impl DegradationReason {
+    pub const ALL: [Self; 8] = [
+        Self::WaitingOnSource,
+        Self::QuotaAdmissionRejected,
+        Self::Spilling,
+        Self::OverBudgetRelaxed,
+        Self::CheckpointAlignmentStalled,
+        Self::SinkBlocked,
+        Self::TopologyTransitionInProgress,
+        Self::Recovering,
+    ];
+
+    pub fn all() -> &'static [Self; 8] {
+        &Self::ALL
+    }
+
+    pub const fn reason_code(self) -> ErrorCode {
+        match self {
+            Self::WaitingOnSource => RS_3701,
+            Self::QuotaAdmissionRejected => RS_3702,
+            Self::Spilling => RS_3703,
+            Self::OverBudgetRelaxed => RS_3704,
+            Self::CheckpointAlignmentStalled => RS_3705,
+            Self::SinkBlocked => RS_3706,
+            Self::TopologyTransitionInProgress => RS_3707,
+            Self::Recovering => RS_3708,
+        }
+    }
+}
+
+impl std::fmt::Display for DegradationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::WaitingOnSource => "waiting_on_source",
+            Self::QuotaAdmissionRejected => "quota_admission_rejected",
+            Self::Spilling => "spilling",
+            Self::OverBudgetRelaxed => "over_budget_relaxed",
+            Self::CheckpointAlignmentStalled => "checkpoint_alignment_stalled",
+            Self::SinkBlocked => "sink_blocked",
+            Self::TopologyTransitionInProgress => "topology_transition_in_progress",
+            Self::Recovering => "recovering",
+        };
+        write!(f, "{value}")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DominantContributor {
+    Healthy,
+    SourceLag,
+    DecodeLag,
+    ComputeLag,
+    AlignmentLag,
+    SinkLag,
+    SpillLag,
+    StoragePressure,
+}
+
+impl std::fmt::Display for DominantContributor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Healthy => "healthy",
+            Self::SourceLag => "source_lag",
+            Self::DecodeLag => "decode_lag",
+            Self::ComputeLag => "compute_lag",
+            Self::AlignmentLag => "alignment_lag",
+            Self::SinkLag => "sink_lag",
+            Self::SpillLag => "spill_lag",
+            Self::StoragePressure => "storage_pressure",
+        };
+        write!(f, "{value}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DegradationStatus {
+    pub degradation_reason: DegradationReason,
+    pub reason_code: String,
+    pub dominant_contributor: DominantContributor,
+    #[serde(default)]
+    pub progress_phase: Option<String>,
+    #[serde(default)]
+    pub bytes_remaining: Option<u64>,
+    #[serde(default)]
+    pub rows_remaining: Option<u64>,
+    #[serde(default)]
+    pub estimated_remaining_ms: Option<u64>,
+}
+
+impl DegradationStatus {
+    pub fn new(reason: DegradationReason, dominant_contributor: DominantContributor) -> Self {
+        Self {
+            degradation_reason: reason,
+            reason_code: reason.reason_code().to_string(),
+            dominant_contributor,
+            progress_phase: None,
+            bytes_remaining: None,
+            rows_remaining: None,
+            estimated_remaining_ms: None,
+        }
+    }
+
+    pub fn with_progress(
+        mut self,
+        progress_phase: Option<String>,
+        bytes_remaining: Option<u64>,
+        rows_remaining: Option<u64>,
+        estimated_remaining_ms: Option<u64>,
+    ) -> Self {
+        self.progress_phase = progress_phase;
+        self.bytes_remaining = bytes_remaining;
+        self.rows_remaining = rows_remaining;
+        self.estimated_remaining_ms = estimated_remaining_ms;
+        self
+    }
+}
+
+pub fn dominant_contributor(stage_lag: Option<StageLagBreakdown>) -> DominantContributor {
+    let Some(lag) = stage_lag else {
+        return DominantContributor::Healthy;
+    };
+    if lag.source_lag_ms == 0
+        && lag.decode_lag_ms == 0
+        && lag.compute_lag_ms == 0
+        && lag.alignment_lag_ms == 0
+        && lag.sink_lag_ms == 0
+        && lag.spill_lag_ms == 0
+        && lag.storage_pressure_ms == 0
+    {
+        return DominantContributor::Healthy;
+    }
+    let ordered = [
+        (DominantContributor::SourceLag, lag.source_lag_ms),
+        (DominantContributor::DecodeLag, lag.decode_lag_ms),
+        (DominantContributor::ComputeLag, lag.compute_lag_ms),
+        (DominantContributor::AlignmentLag, lag.alignment_lag_ms),
+        (DominantContributor::SinkLag, lag.sink_lag_ms),
+        (DominantContributor::SpillLag, lag.spill_lag_ms),
+        (
+            DominantContributor::StoragePressure,
+            lag.storage_pressure_ms,
+        ),
+    ];
+    let mut best = ordered[0];
+    for candidate in ordered.into_iter().skip(1) {
+        if candidate.1 > best.1 {
+            best = candidate;
+        }
+    }
+    best.0
+}
+
+pub fn derive_degradation_status(
+    view_state: &ViewState,
+    stage_lag: Option<StageLagBreakdown>,
+) -> DegradationStatus {
+    let dominant = dominant_contributor(stage_lag);
+    if view_state.is_backfilling() {
+        return DegradationStatus::new(DegradationReason::Recovering, dominant);
+    }
+    if view_state.is_paused() {
+        let (phase, bytes_remaining, rows_remaining, estimated_remaining_ms) =
+            if let Some(lag) = stage_lag {
+                if lag.storage_pressure_ms > 0 {
+                    (
+                        Some("shard_migration".to_string()),
+                        Some(lag.storage_pressure_ms),
+                        Some(lag.compute_lag_ms),
+                        Some(lag.total_lag_ms),
+                    )
+                } else {
+                    (
+                        Some("worker_drain".to_string()),
+                        Some(lag.sink_lag_ms),
+                        Some(lag.decode_lag_ms),
+                        Some(lag.total_lag_ms),
+                    )
+                }
+            } else {
+                (Some("worker_drain".to_string()), None, None, None)
+            };
+        return DegradationStatus::new(DegradationReason::TopologyTransitionInProgress, dominant)
+            .with_progress(
+                phase,
+                bytes_remaining,
+                rows_remaining,
+                estimated_remaining_ms,
+            );
+    }
+    if view_state.is_over_budget_rejected() {
+        return DegradationStatus::new(DegradationReason::QuotaAdmissionRejected, dominant);
+    }
+    if view_state.is_over_budget_relaxed() {
+        return DegradationStatus::new(DegradationReason::OverBudgetRelaxed, dominant);
+    }
+    if let Some(lag) = stage_lag {
+        if lag.spill_lag_ms > 0 {
+            return DegradationStatus::new(DegradationReason::Spilling, dominant);
+        }
+        if lag.sink_lag_ms > 0 {
+            return DegradationStatus::new(DegradationReason::SinkBlocked, dominant);
+        }
+        if lag.alignment_lag_ms > 0 {
+            return DegradationStatus::new(DegradationReason::CheckpointAlignmentStalled, dominant);
+        }
+    }
+    DegradationStatus::new(DegradationReason::WaitingOnSource, dominant)
 }
 
 /// Summary row returned by `SHOW VIEW STATUS FOR NAMESPACE`.
@@ -91,6 +343,9 @@ pub struct ViewStatus {
     /// Decomposed stage lag breakdown, if available.
     #[serde(default)]
     pub stage_lag: Option<StageLagBreakdown>,
+    /// Typed degradation reason, contributor, and progress fields.
+    #[serde(default)]
+    pub degradation_status: Option<DegradationStatus>,
 }
 
 impl ViewStatus {
@@ -111,12 +366,18 @@ impl ViewStatus {
             memory_limit_bytes: workload.and_then(|w| w.memory_limit).map(|m| m.bytes),
             depends_on,
             stage_lag: None,
+            degradation_status: None,
         }
     }
 
     /// Attach stage lag breakdown to the view status.
     pub fn with_stage_lag(mut self, stage_lag: StageLagBreakdown) -> Self {
         self.stage_lag = Some(stage_lag);
+        self
+    }
+
+    pub fn with_degradation_status(mut self, status: DegradationStatus) -> Self {
+        self.degradation_status = Some(status);
         self
     }
 }
@@ -173,12 +434,121 @@ mod tests {
             ViewState::Running,
             ViewState::Paused,
             ViewState::OverBudgetRelaxed,
+            ViewState::OverBudgetRejected,
             ViewState::BackfillingFromEpoch(7),
         ] {
             let json = serde_json::to_string(&state).unwrap();
             let back: ViewState = serde_json::from_str(&json).unwrap();
             assert_eq!(state, back);
         }
+    }
+
+    fn lag(
+        source_lag_ms: u64,
+        decode_lag_ms: u64,
+        compute_lag_ms: u64,
+        alignment_lag_ms: u64,
+        sink_lag_ms: u64,
+        spill_lag_ms: u64,
+        storage_pressure_ms: u64,
+    ) -> StageLagBreakdown {
+        StageLagBreakdown {
+            source_lag_ms,
+            decode_lag_ms,
+            compute_lag_ms,
+            alignment_lag_ms,
+            sink_lag_ms,
+            spill_lag_ms,
+            storage_pressure_ms,
+            total_lag_ms: source_lag_ms
+                + decode_lag_ms
+                + compute_lag_ms
+                + alignment_lag_ms
+                + sink_lag_ms
+                + spill_lag_ms
+                + storage_pressure_ms,
+        }
+    }
+
+    #[test]
+    fn test_degradation_reason_contract_is_closed() {
+        let values: Vec<(String, String)> = DegradationReason::all()
+            .iter()
+            .map(|reason| (reason.to_string(), reason.reason_code().to_string()))
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                ("waiting_on_source".to_string(), "RS-3701".to_string()),
+                (
+                    "quota_admission_rejected".to_string(),
+                    "RS-3702".to_string()
+                ),
+                ("spilling".to_string(), "RS-3703".to_string()),
+                ("over_budget_relaxed".to_string(), "RS-3704".to_string()),
+                (
+                    "checkpoint_alignment_stalled".to_string(),
+                    "RS-3705".to_string()
+                ),
+                ("sink_blocked".to_string(), "RS-3706".to_string()),
+                (
+                    "topology_transition_in_progress".to_string(),
+                    "RS-3707".to_string()
+                ),
+                ("recovering".to_string(), "RS-3708".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dominant_contributor_single_max_matrix() {
+        let matrix = [
+            (lag(12, 2, 3, 4, 5, 6, 7), DominantContributor::SourceLag),
+            (lag(1, 12, 3, 4, 5, 6, 7), DominantContributor::DecodeLag),
+            (lag(1, 2, 12, 4, 5, 6, 7), DominantContributor::ComputeLag),
+            (lag(1, 2, 3, 12, 5, 6, 7), DominantContributor::AlignmentLag),
+            (lag(1, 2, 3, 4, 12, 6, 7), DominantContributor::SinkLag),
+            (lag(1, 2, 3, 4, 5, 12, 7), DominantContributor::SpillLag),
+            (
+                lag(1, 2, 3, 4, 5, 6, 12),
+                DominantContributor::StoragePressure,
+            ),
+        ];
+        for (input, expected) in matrix {
+            assert_eq!(dominant_contributor(Some(input)), expected);
+        }
+    }
+
+    #[test]
+    fn test_dominant_contributor_multi_cause_max() {
+        let status =
+            derive_degradation_status(&ViewState::Running, Some(lag(15, 2, 2, 2, 2, 24, 1)));
+        assert_eq!(status.degradation_reason, DegradationReason::Spilling);
+        assert_eq!(status.dominant_contributor, DominantContributor::SpillLag);
+    }
+
+    #[test]
+    fn test_dominant_contributor_tie_break_is_deterministic() {
+        let tied = lag(9, 9, 9, 9, 9, 9, 9);
+        assert_eq!(
+            dominant_contributor(Some(tied)),
+            DominantContributor::SourceLag
+        );
+        assert_eq!(
+            derive_degradation_status(&ViewState::Running, Some(tied)).degradation_reason,
+            DegradationReason::Spilling
+        );
+    }
+
+    #[test]
+    fn test_healthy_status_has_closed_vocabulary() {
+        let status = derive_degradation_status(&ViewState::Running, Some(lag(0, 0, 0, 0, 0, 0, 0)));
+        assert_eq!(
+            status.degradation_reason,
+            DegradationReason::WaitingOnSource
+        );
+        assert_eq!(status.reason_code, "RS-3701");
+        assert_eq!(status.dominant_contributor, DominantContributor::Healthy);
     }
 
     #[test]
@@ -221,5 +591,44 @@ mod tests {
         let json = serde_json::to_string(&bs).unwrap();
         let back: BackfillStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(bs, back);
+    }
+
+    #[test]
+    fn test_degradation_reason_runbook_conformance() {
+        let all_reasons = DegradationReason::all();
+        assert_eq!(all_reasons.len(), 8);
+
+        let mut seen_codes = std::collections::BTreeSet::new();
+        let mut seen_reasons = std::collections::BTreeSet::new();
+
+        let doc_content = std::fs::read_to_string("../../docs/sre-operations.md")
+            .or_else(|_| std::fs::read_to_string("docs/sre-operations.md"))
+            .expect("must be able to read docs/sre-operations.md");
+
+        for &reason in all_reasons {
+            let reason_str = reason.to_string();
+            let code_str = reason.reason_code().to_string();
+
+            assert!(
+                doc_content.contains(&reason_str),
+                "docs/sre-operations.md must document reason {reason_str}"
+            );
+            assert!(
+                doc_content.contains(&code_str),
+                "docs/sre-operations.md must document code {code_str}"
+            );
+
+            assert!(seen_reasons.insert(reason_str));
+            assert!(seen_codes.insert(code_str));
+        }
+
+        assert_eq!(seen_codes.len(), 8);
+        for expected_code in 3701..=3708 {
+            let code_str = format!("RS-{expected_code}");
+            assert!(
+                seen_codes.contains(&code_str),
+                "missing allocated code {code_str}"
+            );
+        }
     }
 }
