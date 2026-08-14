@@ -9,12 +9,15 @@ use clap::{Parser, Subcommand};
 use rockstream_cli::output::OutputFormat;
 use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
 use rockstream_cli::{
-    request_worker_drain, run_audit_query, run_audit_tail, run_checkpoint_list, run_cluster_quotas,
-    run_cluster_status, run_cluster_workers_list, run_cluster_workers_status, run_explain_view,
-    run_resource_cluster, run_resource_usage, run_schema_evolution_history,
-    run_schema_evolution_status, run_schema_list, run_schema_show, run_shard_list, run_source_list,
-    run_source_show, run_sql_compile, run_start, run_view_list, run_view_show, run_view_status,
-    run_workload_list, run_workload_show, StartOptions,
+    run_audit_query, run_audit_tail, run_checkpoint_list, run_checkpoint_restore,
+    run_cluster_quotas, run_cluster_status, run_cluster_workers_drain, run_cluster_workers_list,
+    run_cluster_workers_status, run_explain_view, run_resource_cluster, run_resource_usage,
+    run_schema_create, run_schema_drop, run_schema_evolution_history, run_schema_evolution_status,
+    run_schema_list, run_schema_show, run_shard_list, run_shard_migrate, run_source_drop,
+    run_source_list, run_source_pause, run_source_resume, run_source_show, run_sql_compile,
+    run_start, run_support_bundle, run_view_list, run_view_pause, run_view_query, run_view_resume,
+    run_view_show, run_view_status, run_view_subscribe, run_workload_alter, run_workload_create,
+    run_workload_drop, run_workload_list, run_workload_show, StartOptions,
 };
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
@@ -234,6 +237,11 @@ enum Command {
         #[command(subcommand)]
         command: AuditCommand,
     },
+    /// Diagnostic support commands.
+    Support {
+        #[command(subcommand)]
+        command: SupportCommand,
+    },
     /// Explain the incremental execution plan for a view.
     Explain {
         /// View name to explain.
@@ -263,6 +271,38 @@ enum ViewCommand {
         /// Optional view name filter.
         name: Option<String>,
     },
+    /// Pause an active view.
+    Pause {
+        /// View name.
+        name: String,
+        /// Confirm destructive action without interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Resume a paused view.
+    Resume {
+        /// View name.
+        name: String,
+    },
+    /// Query view results.
+    Query {
+        /// View name.
+        name: String,
+        /// Maximum rows to return.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Stream live view updates.
+    Subscribe {
+        /// View name.
+        name: String,
+        /// Start streaming from a specific epoch.
+        #[arg(long)]
+        from_epoch: Option<u64>,
+        /// Begin subscription with a baseline snapshot.
+        #[arg(long)]
+        snapshot: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -273,6 +313,24 @@ enum SourceCommand {
     Show {
         /// Source name.
         name: String,
+    },
+    /// Pause source ingestion.
+    Pause {
+        /// Source name.
+        name: String,
+    },
+    /// Resume paused source ingestion.
+    Resume {
+        /// Source name.
+        name: String,
+    },
+    /// Drop a source connector.
+    Drop {
+        /// Source name.
+        name: String,
+        /// Confirm destructive action without interactive prompt.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -285,6 +343,22 @@ enum SchemaCommand {
         /// Table or view name.
         name: String,
     },
+    /// Create a new schema table.
+    Create {
+        /// Table name.
+        name: String,
+        /// Column specification (e.g. "id BIGINT, name VARCHAR").
+        #[arg(long)]
+        columns: Option<String>,
+    },
+    /// Drop a schema table or view.
+    Drop {
+        /// Table name.
+        name: String,
+        /// Confirm destructive action without interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -296,18 +370,98 @@ enum WorkloadCommand {
         /// Workload name.
         name: String,
     },
+    /// Create a new workload.
+    Create {
+        /// Workload name.
+        name: String,
+        /// Scheduling priority.
+        #[arg(long)]
+        priority: Option<u32>,
+        /// Freshness SLO in milliseconds.
+        #[arg(long)]
+        freshness_slo_ms: Option<u64>,
+        /// Memory limit in bytes.
+        #[arg(long)]
+        memory_limit: Option<u64>,
+        /// Maximum worker parallelism.
+        #[arg(long)]
+        max_parallelism: Option<usize>,
+    },
+    /// Alter an existing workload.
+    Alter {
+        /// Workload name.
+        name: String,
+        /// Scheduling priority.
+        #[arg(long)]
+        priority: Option<u32>,
+        /// Freshness SLO in milliseconds.
+        #[arg(long)]
+        freshness_slo_ms: Option<u64>,
+        /// Memory limit in bytes.
+        #[arg(long)]
+        memory_limit: Option<u64>,
+        /// Maximum worker parallelism.
+        #[arg(long)]
+        max_parallelism: Option<usize>,
+    },
+    /// Drop a workload.
+    Drop {
+        /// Workload name.
+        name: String,
+        /// Confirm destructive action without interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum ShardCommand {
     /// List all shards and their lease assignments.
     List,
+    /// Migrate a shard to another worker.
+    Migrate {
+        /// Shard ID.
+        shard_id: u64,
+        /// Target worker ID.
+        #[arg(long)]
+        to: u64,
+        /// Confirm destructive action without interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum CheckpointCommand {
     /// List cluster checkpoints.
     List,
+    /// Restore a checkpoint to local storage.
+    Restore {
+        /// Checkpoint ID.
+        checkpoint_id: u64,
+        /// Target directory for restored state.
+        #[arg(long)]
+        storage: Option<std::path::PathBuf>,
+        /// Confirm destructive action without interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SupportCommand {
+    /// Generate on-demand diagnostic support bundle.
+    Bundle {
+        /// Optional view name filter.
+        #[arg(long)]
+        view: Option<String>,
+        /// Optional duration filter (e.g. 1h, 24h).
+        #[arg(long)]
+        since: Option<String>,
+        /// Output file path for the support bundle.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -375,9 +529,12 @@ enum WorkerCommand {
     Drain {
         /// Control-plane worker-facing TCP address.
         #[arg(long)]
-        control: String,
+        control: Option<String>,
         /// Worker id to drain.
         worker_id: u64,
+        /// Confirm destructive action without interactive prompt.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -505,38 +662,94 @@ fn main() -> ExitCode {
         }
         Command::View { command } => {
             let identity = ClientIdentity::default();
-            let catalog = CatalogClient::new(identity);
+            let mut catalog = CatalogClient::new(identity);
             let res = match command {
                 ViewCommand::List => run_view_list(format, &catalog),
                 ViewCommand::Show { name } => run_view_show(format, &catalog, &name),
                 ViewCommand::Status { name } => run_view_status(format, &catalog, name.as_deref()),
+                ViewCommand::Pause { name, yes } => {
+                    run_view_pause(format, &mut catalog, &name, yes)
+                }
+                ViewCommand::Resume { name } => run_view_resume(format, &mut catalog, &name),
+                ViewCommand::Query { name, limit } => {
+                    run_view_query(format, &catalog, &name, limit)
+                }
+                ViewCommand::Subscribe {
+                    name,
+                    from_epoch,
+                    snapshot,
+                } => run_view_subscribe(format, &catalog, &name, from_epoch, snapshot),
             };
             handle_result(res)
         }
         Command::Source { command } => {
             let identity = ClientIdentity::default();
-            let catalog = CatalogClient::new(identity);
+            let mut catalog = CatalogClient::new(identity);
             let res = match command {
                 SourceCommand::List => run_source_list(format, &catalog),
                 SourceCommand::Show { name } => run_source_show(format, &catalog, &name),
+                SourceCommand::Pause { name } => run_source_pause(format, &mut catalog, &name),
+                SourceCommand::Resume { name } => run_source_resume(format, &mut catalog, &name),
+                SourceCommand::Drop { name, yes } => {
+                    run_source_drop(format, &mut catalog, &name, yes)
+                }
             };
             handle_result(res)
         }
         Command::Schema { command } => {
             let identity = ClientIdentity::default();
-            let catalog = CatalogClient::new(identity);
+            let mut catalog = CatalogClient::new(identity);
             let res = match command {
                 SchemaCommand::List => run_schema_list(format, &catalog),
                 SchemaCommand::Show { name } => run_schema_show(format, &catalog, &name),
+                SchemaCommand::Create { name, columns } => {
+                    run_schema_create(format, &mut catalog, &name, columns.as_deref())
+                }
+                SchemaCommand::Drop { name, yes } => {
+                    run_schema_drop(format, &mut catalog, &name, yes)
+                }
             };
             handle_result(res)
         }
         Command::Workload { command } => {
             let identity = ClientIdentity::default();
-            let catalog = CatalogClient::new(identity);
+            let mut catalog = CatalogClient::new(identity);
             let res = match command {
                 WorkloadCommand::List => run_workload_list(format, &catalog),
                 WorkloadCommand::Show { name } => run_workload_show(format, &catalog, &name),
+                WorkloadCommand::Create {
+                    name,
+                    priority,
+                    freshness_slo_ms,
+                    memory_limit,
+                    max_parallelism,
+                } => run_workload_create(
+                    format,
+                    &mut catalog,
+                    &name,
+                    priority,
+                    freshness_slo_ms,
+                    memory_limit,
+                    max_parallelism,
+                ),
+                WorkloadCommand::Alter {
+                    name,
+                    priority,
+                    freshness_slo_ms,
+                    memory_limit,
+                    max_parallelism,
+                } => run_workload_alter(
+                    format,
+                    &mut catalog,
+                    &name,
+                    priority,
+                    freshness_slo_ms,
+                    memory_limit,
+                    max_parallelism,
+                ),
+                WorkloadCommand::Drop { name, yes } => {
+                    run_workload_drop(format, &mut catalog, &name, yes)
+                }
             };
             handle_result(res)
         }
@@ -553,14 +766,25 @@ fn main() -> ExitCode {
                     command: WorkerCommand::Status { worker_id },
                 } => handle_result(run_cluster_workers_status(format, &control, worker_id)),
                 ClusterCommand::Workers {
-                    command: WorkerCommand::Drain { control, worker_id },
-                } => match request_worker_drain(&control, worker_id) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(err) => {
-                        eprintln!("{err}");
-                        ExitCode::FAILURE
-                    }
-                },
+                    command:
+                        WorkerCommand::Drain {
+                            control: ctrl_addr,
+                            worker_id,
+                            yes,
+                        },
+                } => {
+                    let control_client = if let Some(addr) = ctrl_addr {
+                        ControlClient::new(Some(addr), ClientIdentity::default())
+                    } else {
+                        control
+                    };
+                    handle_result(run_cluster_workers_drain(
+                        format,
+                        &control_client,
+                        worker_id,
+                        yes,
+                    ))
+                }
             }
         }
         Command::Shard { command } => {
@@ -568,6 +792,9 @@ fn main() -> ExitCode {
             let control = ControlClient::new(cli.control, identity);
             let res = match command {
                 ShardCommand::List => run_shard_list(format, &control),
+                ShardCommand::Migrate { shard_id, to, yes } => {
+                    run_shard_migrate(format, &control, shard_id, to, yes)
+                }
             };
             handle_result(res)
         }
@@ -578,6 +805,35 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let res = match command {
                 CheckpointCommand::List => run_checkpoint_list(format, &storage, &storage_path),
+                CheckpointCommand::Restore {
+                    checkpoint_id,
+                    storage: dest,
+                    yes,
+                } => run_checkpoint_restore(
+                    format,
+                    &storage,
+                    &storage_path,
+                    checkpoint_id,
+                    dest.as_deref(),
+                    yes,
+                ),
+            };
+            handle_result(res)
+        }
+        Command::Support { command } => {
+            let storage = StorageClient::new();
+            let storage_path = cli
+                .storage_dir
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let res = match command {
+                SupportCommand::Bundle { view, since, out } => run_support_bundle(
+                    format,
+                    &storage,
+                    &storage_path,
+                    view.as_deref(),
+                    since.as_deref(),
+                    out.as_deref(),
+                ),
             };
             handle_result(res)
         }

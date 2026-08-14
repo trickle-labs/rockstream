@@ -13,12 +13,13 @@
 
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
-use rockstream_types::error_code::{ErrorCode, RS_0002, RS_0003, RS_4017};
+use rockstream_types::error_code::{ErrorCode, RS_0002, RS_0003, RS_0005, RS_4017};
 use rockstream_types::topology::{
     ControlMessage, WorkerCapabilities, WorkerLocation, WorkerMessage,
 };
 use serde::Serialize;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1208,6 +1209,249 @@ pub fn run_audit_query(
 ) -> Result<String, CliError> {
     let events = storage.audit_query(storage_path, filter, max)?;
     Ok(output::render_output(&events, format))
+}
+
+// ─── Mutating Command Runners & Confirmation Safeguards ─────────────────────
+
+pub fn prompt_confirmation(prompt: &str, yes_flag: bool) -> Result<(), CliError> {
+    if yes_flag {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::new(
+            RS_0005,
+            "destructive command confirmation required in non-interactive environment",
+            "Pass --yes for script execution or answer y at the prompt.",
+        ));
+    }
+    eprint!("{} [y/N]: ", prompt);
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|e| {
+        CliError::new(
+            RS_0005,
+            format!("failed to read confirmation from stdin: {e}"),
+            "Pass --yes to bypass interactive confirmation.",
+        )
+    })?;
+    let trimmed = line.trim();
+    if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
+        Ok(())
+    } else {
+        Err(CliError::new(
+            RS_0005,
+            "destructive command rejected: confirmation declined",
+            "Pass --yes to confirm execution or enter 'y' when prompted.",
+        ))
+    }
+}
+
+pub fn run_view_pause(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        &format!("Are you sure you want to pause view '{name}'?"),
+        yes,
+    )?;
+    let outcome = catalog.pause_view(name)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_view_resume(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+) -> Result<String, CliError> {
+    let outcome = catalog.resume_view(name)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_view_query(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    name: &str,
+    limit: Option<usize>,
+) -> Result<String, CliError> {
+    let res = catalog.query_view(name, limit)?;
+    Ok(output::render_output(&res, format))
+}
+
+pub fn run_view_subscribe(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    name: &str,
+    from_epoch: Option<u64>,
+    snapshot: bool,
+) -> Result<String, CliError> {
+    let events = catalog.subscribe_view(name, from_epoch, snapshot)?;
+    Ok(output::render_output(&events, format))
+}
+
+pub fn run_source_pause(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+) -> Result<String, CliError> {
+    let outcome = catalog.pause_source(name)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_source_resume(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+) -> Result<String, CliError> {
+    let outcome = catalog.resume_source(name)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_source_drop(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        &format!("Are you sure you want to drop source '{name}'?"),
+        yes,
+    )?;
+    let outcome = catalog.drop_source(name)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_schema_create(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+    columns: Option<&str>,
+) -> Result<String, CliError> {
+    let outcome = catalog.create_schema(name, columns)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_schema_drop(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        &format!("Are you sure you want to drop schema '{name}'?"),
+        yes,
+    )?;
+    let outcome = catalog.drop_schema(name)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_workload_create(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+    priority: Option<u32>,
+    freshness_slo_ms: Option<u64>,
+    memory_limit: Option<u64>,
+    max_parallelism: Option<usize>,
+) -> Result<String, CliError> {
+    let outcome = catalog.create_workload(
+        name,
+        priority,
+        freshness_slo_ms,
+        memory_limit,
+        max_parallelism,
+    )?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_workload_alter(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+    priority: Option<u32>,
+    freshness_slo_ms: Option<u64>,
+    memory_limit: Option<u64>,
+    max_parallelism: Option<usize>,
+) -> Result<String, CliError> {
+    let outcome = catalog.alter_workload(
+        name,
+        priority,
+        freshness_slo_ms,
+        memory_limit,
+        max_parallelism,
+    )?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_workload_drop(
+    format: output::OutputFormat,
+    catalog: &mut transport::CatalogClient,
+    name: &str,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        &format!("Are you sure you want to drop workload '{name}'?"),
+        yes,
+    )?;
+    let outcome = catalog.drop_workload(name)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_cluster_workers_drain(
+    format: output::OutputFormat,
+    control: &transport::ControlClient,
+    worker_id: u64,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        &format!("Are you sure you want to drain worker {worker_id}?"),
+        yes,
+    )?;
+    let outcome = control.drain_worker(worker_id)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_shard_migrate(
+    format: output::OutputFormat,
+    control: &transport::ControlClient,
+    shard_id: u64,
+    to_worker: u64,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        &format!("Are you sure you want to migrate shard {shard_id} to worker {to_worker}?"),
+        yes,
+    )?;
+    let outcome = control.migrate_shard(shard_id, to_worker)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_checkpoint_restore(
+    format: output::OutputFormat,
+    storage: &transport::StorageClient,
+    storage_path: &Path,
+    checkpoint_id: u64,
+    target_dir: Option<&Path>,
+    yes: bool,
+) -> Result<String, CliError> {
+    prompt_confirmation(
+        &format!("Are you sure you want to restore checkpoint {checkpoint_id}?"),
+        yes,
+    )?;
+    let outcome = storage.restore_checkpoint(storage_path, checkpoint_id, target_dir)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_support_bundle(
+    format: output::OutputFormat,
+    storage: &transport::StorageClient,
+    storage_path: &Path,
+    view: Option<&str>,
+    since: Option<&str>,
+    out: Option<&Path>,
+) -> Result<String, CliError> {
+    let outcome = storage.generate_support_bundle(storage_path, view, since, out)?;
+    Ok(output::render_output(&outcome, format))
 }
 
 fn map_column_type(data_type: &str) -> arrow::datatypes::DataType {

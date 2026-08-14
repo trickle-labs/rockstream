@@ -57,38 +57,50 @@ Starts a RockStream node.
 
 ### `rockstream view`
 
-Inspect view metadata, state, and freshness.
+Inspect and control materialized view lifecycle, query contents, and subscribe to change streams.
 
 - `rockstream view list` — List all registered materialized views and their current execution state.
 - `rockstream view show <name>` — Show detailed view metadata, including definition query, assigned workload, and freshness SLO.
 - `rockstream view status [<name>]` — Show view lifecycle and freshness status (optionally filtered by view name).
+- `rockstream view pause <name> [--yes]` — Pause view maintenance and execution.
+- `rockstream view resume <name>` — Resume execution for a paused view.
+- `rockstream view query <name> [--limit <n>]` — Query current view contents with optional row limit.
+- `rockstream view subscribe <name> [--from-epoch <n>] [--snapshot]` — Subscribe to real-time view change stream.
 
 ---
 
 ### `rockstream source`
 
-Inspect ingested streaming sources and connectors.
+Inspect and control streaming ingestion sources and connectors.
 
 - `rockstream source list` — List all configured ingestion sources, connector types, and statuses.
 - `rockstream source show <name>` — Show detailed source configuration, connector options, offsets, and ingest lag.
+- `rockstream source pause <name>` — Pause ingestion on a streaming source connector.
+- `rockstream source resume <name>` — Resume ingestion on a paused streaming source connector.
+- `rockstream source drop <name> [--yes]` — Drop an ingestion source connector.
 
 ---
 
 ### `rockstream schema`
 
-Inspect schemas and entity definitions.
+Inspect schemas and create or drop schema tables.
 
 - `rockstream schema list` — List all tables and views in the active schema.
 - `rockstream schema show <name>` — Show column names, types, and nullability for a table or view.
+- `rockstream schema create <name> [--columns <spec>]` — Create a new table schema with optional column specifications.
+- `rockstream schema drop <name> [--yes]` — Drop a schema table.
 
 ---
 
 ### `rockstream workload`
 
-Inspect workload priorities, memory limits, and view assignments.
+Manage workload definitions, priority scheduling, and resource limits.
 
 - `rockstream workload list` — List all defined workloads, priorities, and assigned view counts.
 - `rockstream workload show <name>` — Show workload detail, memory limits, freshness SLOs, and assigned views.
+- `rockstream workload create <name> [--priority <n>] [--freshness-slo-ms <ms>] [--memory-limit <bytes>] [--max-parallelism <n>]` — Create a new workload definition.
+- `rockstream workload alter <name> [--priority <n>] [--freshness-slo-ms <ms>] [--memory-limit <bytes>] [--max-parallelism <n>]` — Alter workload configuration and resource constraints.
+- `rockstream workload drop <name> [--yes]` — Drop a workload (refused if views are assigned).
 
 ---
 
@@ -100,23 +112,33 @@ Inspect cluster state, quotas, and worker fleet.
 - `rockstream cluster quotas` — Show total memory budgets, used memory, and parallelism limits.
 - `rockstream cluster workers list` — List all registered workers, addresses, availability zones, and health.
 - `rockstream cluster workers status [<worker_id>]` — Show detailed worker status, capacity headroom, and lifecycle state.
-- `rockstream cluster workers drain --control=<addr> <worker_id>` — Signal a worker to drain before shutdown.
+- `rockstream cluster workers drain <worker_id> [--control <addr>] [--yes]` — Signal a worker to drain shard assignments before shutdown.
 
 ---
 
 ### `rockstream shard`
 
-Inspect shard lease ownership and key ranges.
+Inspect shard lease ownership and key ranges, and trigger shard migrations.
 
 - `rockstream shard list` — List all shards, lease tokens, owner workers, and active key ranges.
+- `rockstream shard migrate <shard_id> --to <worker_id> [--yes]` — Migrate a shard lease and state to another worker.
 
 ---
 
 ### `rockstream checkpoint`
 
-Inspect durable cluster checkpoints.
+Inspect and restore durable cluster checkpoints.
 
 - `rockstream checkpoint list` — List all durable checkpoints, creation timestamps, and shard counts.
+- `rockstream checkpoint restore <checkpoint_id> [--storage <dir>] [--yes]` — Restore a committed checkpoint state to storage.
+
+---
+
+### `rockstream support`
+
+Generate on-demand diagnostic support bundles.
+
+- `rockstream support bundle [--view <name>] [--since <duration>] [--out <path>]` — Generate a diagnostic support bundle with secret redaction and bounded size.
 
 ---
 
@@ -178,9 +200,18 @@ Offline SQL compilation and lowering inspection.
 | `RS-0002` | Invalid CLI arguments, unrecognized node role, or missing required flag. | Check `rockstream --help` for expected flags and valid options. |
 | `RS-0003` | Storage or I/O error accessing disk or object storage. | Verify storage path permissions and available disk space. |
 | `RS-0004` | Unreachable control plane. | Verify the `--control` service URL and ensure the control node is active. |
+| `RS-0005` | Destructive command confirmation required. | Pass `--yes` for script execution or answer `y` at the interactive confirmation prompt. |
 | `RS-1001` | Entity not found (view, table, schema, namespace, or worker ID). | Verify the entity name with `rockstream view list` or `rockstream cluster workers list`. |
+| `RS-1004` | Entity already exists. | Use a unique name or inspect existing definitions. |
 | `RS-1005` | Workload not found. | Verify workload name with `rockstream workload list` or create it with `CREATE WORKLOAD`. |
+| `RS-1006` | Workload already exists. | Use distinct name or modify existing workload with `rockstream workload alter`. |
+| `RS-1007` | View already paused. | Inspect view state with `rockstream view status`. |
+| `RS-1008` | View not paused. | Inspect view state with `rockstream view status`. |
 | `RS-1012` | SQL syntax or parsing error. | Check SQL query syntax and column references. |
+| `RS-1014` | Workload drop rejected because views are currently assigned. | Reassign or drop assigned views before dropping the workload. |
 | `RS-1731` | Control node is not the Raft leader. | Re-resolve control plane leadership and route the request to the active leader. |
+| `RS-2006` | Requested subscription epoch is prior to storage retention window. | Subscribe with `--snapshot` or specify a more recent epoch. |
+| `RS-2401` | Permission denied due to insufficient RBAC role. | Request elevated RBAC role (PipelineOwner / Admin) or authenticate under an authorized principal. |
 | `RS-4009` | Ingestion source not found. | Check source name with `rockstream source list`. |
 | `RS-4017` | Removed cold-tier storage configuration was passed. | Remove legacy cold-tier storage flags. |
+| `RS-5030` | In-flight shard migration conflict. | Wait for the active migration to complete before re-initiating shard migration. |

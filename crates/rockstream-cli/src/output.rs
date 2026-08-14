@@ -802,3 +802,191 @@ impl Formattable for SqlCompileInfo {
         self.plan.clone()
     }
 }
+
+// ─── Mutating Command Output Models ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MutationOutcome {
+    pub action: String,
+    pub resource: String,
+    pub status: String,
+    pub message: String,
+}
+
+impl Formattable for MutationOutcome {
+    fn to_text(&self) -> String {
+        format!(
+            "{}: {} [{}] — {}",
+            self.action, self.resource, self.status, self.message
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueryResult {
+    pub view_name: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub total_rows: usize,
+}
+
+impl Formattable for QueryResult {
+    fn to_text(&self) -> String {
+        if self.rows.is_empty() {
+            return format!("No rows returned for view '{}'.", self.view_name);
+        }
+        let col_widths: Vec<usize> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                let col_len = col.len();
+                let max_row_len = self
+                    .rows
+                    .iter()
+                    .map(|r| r.get(i).map(|v| v.to_string().len()).unwrap_or(0))
+                    .max()
+                    .unwrap_or(0);
+                col_len.max(max_row_len).max(10)
+            })
+            .collect();
+
+        let mut lines = Vec::new();
+        let header = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{:<width$}", c, width = col_widths[i]))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let total_w = header.len();
+        lines.push(header);
+        lines.push("-".repeat(total_w.max(40)));
+
+        for row in self.rows.iter().take(CLI_OUTPUT_MAX_ROWS) {
+            let row_str = row
+                .iter()
+                .enumerate()
+                .map(|(i, val)| {
+                    let s = match val {
+                        serde_json::Value::String(st) => st.clone(),
+                        _ => val.to_string(),
+                    };
+                    format!(
+                        "{:<width$}",
+                        s,
+                        width = col_widths.get(i).copied().unwrap_or(10)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(row_str);
+        }
+        lines.push(format!("({} rows)", self.total_rows));
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubscribeEvent {
+    pub epoch: u64,
+    pub view_name: String,
+    pub diff_type: String,
+    pub key: String,
+    pub row: serde_json::Value,
+}
+
+impl Formattable for SubscribeEvent {
+    fn to_text(&self) -> String {
+        format!(
+            "[{}] epoch={} view={} key={} row={}",
+            self.diff_type, self.epoch, self.view_name, self.key, self.row
+        )
+    }
+}
+
+impl Formattable for Vec<SubscribeEvent> {
+    fn to_text(&self) -> String {
+        if self.is_empty() {
+            return "No stream events received.".to_string();
+        }
+        self.iter()
+            .map(|e| e.to_text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DrainOutcome {
+    pub worker_id: u64,
+    pub status: String,
+    pub remaining_shards: usize,
+    pub message: String,
+}
+
+impl Formattable for DrainOutcome {
+    fn to_text(&self) -> String {
+        format!(
+            "Worker {}: status={} remaining_shards={} ({})",
+            self.worker_id, self.status, self.remaining_shards, self.message
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationOutcome {
+    pub shard_id: u64,
+    pub source_worker: u64,
+    pub target_worker: u64,
+    pub status: String,
+    pub duration_ms: u64,
+}
+
+impl Formattable for MigrationOutcome {
+    fn to_text(&self) -> String {
+        format!(
+            "Shard {}: migrated from worker {} to worker {} (status: {}, duration: {}ms)",
+            self.shard_id, self.source_worker, self.target_worker, self.status, self.duration_ms
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    pub checkpoint_id: u64,
+    pub target_dir: String,
+    pub restored_shards: usize,
+    pub status: String,
+}
+
+impl Formattable for RestoreOutcome {
+    fn to_text(&self) -> String {
+        format!(
+            "Checkpoint {}: restored to {} (shards: {}, status: {})",
+            self.checkpoint_id, self.target_dir, self.restored_shards, self.status
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupportBundleInfo {
+    pub bundle_path: String,
+    pub view: Option<String>,
+    pub size_bytes: u64,
+    pub redacted_secrets_count: usize,
+    pub generated_at_ms: u64,
+}
+
+impl Formattable for SupportBundleInfo {
+    fn to_text(&self) -> String {
+        format!(
+            "Support bundle generated at {}\n  view: {}\n  size: {} bytes\n  redacted secrets: {}\n  timestamp: {}",
+            self.bundle_path,
+            self.view.as_deref().unwrap_or("all"),
+            self.size_bytes,
+            self.redacted_secrets_count,
+            self.generated_at_ms
+        )
+    }
+}

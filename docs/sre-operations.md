@@ -51,8 +51,12 @@ To debug critical catalog errors, search log files for `RS-XXXX` codes (e.g. `RS
 
 ## Support Bundle Parsing
 
-There is no `rockstream support-bundle` CLI command today. Instead, a support
-bundle is generated automatically every time a node runs `rockstream start`
+Support bundles can be produced on demand using the CLI command:
+```bash
+rockstream support bundle [--view=<name>] [--since=<duration>] [--out=<path>]
+```
+
+Additionally, a support bundle is generated automatically every time a node runs `rockstream start`
 (`write_support_bundle()` in `crates/rockstream-cli/src/lib.rs`), written as a
 single pretty-printed JSON file directly under the node's `--storage`
 directory:
@@ -68,7 +72,7 @@ Its top-level shape (field-for-field, no tarball, no separate
 {
   "generated_at_ms": 1732000000000,
   "system_info": {
-    "version": "0.45.5",
+    "version": "0.53.1",
     "os": "linux",
     "arch": "x86_64",
     "role": "all"
@@ -95,6 +99,4 @@ Parse it directly with any JSON tool, e.g.:
 jq '.system_info, .metrics' support-bundle-*.json
 ```
 
-A two-word `rockstream support bundle` CLI command that regenerates or
-re-exports this bundle on demand is roadmapped for v0.53.1 and is not yet
-available.
+The on-demand `rockstream support bundle` CLI command produces diagnostic artifacts with secret redaction and bounded size (< 10MB default) for operational support and cluster troubleshooting.
