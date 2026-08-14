@@ -23,6 +23,9 @@ rockstream-storage = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
+rockstream-sql = { workspace = true }
+rockstream-plan = { workspace = true }
+arrow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

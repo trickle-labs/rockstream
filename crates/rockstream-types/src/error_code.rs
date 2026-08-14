@@ -60,6 +60,8 @@ pub const RS_0001: ErrorCode = ErrorCode::new(1);
 pub const RS_0002: ErrorCode = ErrorCode::new(2);
 /// Storage unavailable.
 pub const RS_0003: ErrorCode = ErrorCode::new(3);
+/// Cluster control plane unreachable.
+pub const RS_0004: ErrorCode = ErrorCode::new(4);
 
 // 1xxx: Pipeline / plan
 /// Pipeline not found.
@@ -447,6 +449,7 @@ pub fn slug(code: ErrorCode) -> &'static str {
         4020 => "backfill.live_delta_buffer_full",
         4021 => "backfill.admission_rejected",
         4022 => "backfill.not_published",
+        4 => "control.unreachable",
         _ => "unknown",
     }
 }
@@ -457,6 +460,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         1 => "Internal error",
         2 => "Configuration error",
         3 => "Storage unavailable",
+        4 => "Cluster control plane unreachable",
         1001 => "Pipeline not found",
         1002 => "Incompatible schema change",
         1003 => "Record decode error",
@@ -622,6 +626,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1 => "Report this bug with the support bundle.",
         2 => "Check configuration file and CLI flags.",
         3 => "Verify storage directory permissions and disk space.",
+        4 => "Verify the control service URL and ensure the control node is running and reachable.",
         1001 => "Check pipeline name and ensure it has been created.",
         1002 => "Review schema evolution rules; a new view may be required.",
         1003 => "Inspect the dead-letter queue for malformed records.",
@@ -771,14 +776,14 @@ mod tests {
     #[test]
     fn all_codes_have_descriptions_and_actionable_next_steps() {
         let codes = [
-            RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
-            RS_1007, RS_1008, RS_1030, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005, RS_2006,
-            RS_2007, RS_2008, RS_2014, RS_2015, RS_2016, RS_2017, RS_2018, RS_2021, RS_3003,
-            RS_3009, RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016, RS_3017, RS_3018,
-            RS_3022, RS_3023, RS_3024, RS_3501, RS_4001, RS_4002, RS_5001, RS_5002, RS_5003,
-            RS_5030, RS_5031, RS_5032, RS_5035, RS_5036, RS_1512, RS_1513, RS_3601, RS_3602,
-            RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015, RS_1016,
-            RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
+            RS_0001, RS_0002, RS_0003, RS_0004, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005,
+            RS_1006, RS_1007, RS_1008, RS_1030, RS_2001, RS_2002, RS_2003, RS_2004, RS_2005,
+            RS_2006, RS_2007, RS_2008, RS_2014, RS_2015, RS_2016, RS_2017, RS_2018, RS_2021,
+            RS_3003, RS_3009, RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016, RS_3017,
+            RS_3018, RS_3022, RS_3023, RS_3024, RS_3501, RS_4001, RS_4002, RS_5001, RS_5002,
+            RS_5003, RS_5030, RS_5031, RS_5032, RS_5035, RS_5036, RS_1512, RS_1513, RS_3601,
+            RS_3602, RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001, RS_1015,
+            RS_1016, RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
             RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4008, RS_4009, RS_4010, RS_4011,
             RS_4012, RS_4013, RS_4014, RS_4015, RS_4016, RS_4017, RS_4018, RS_4019, RS_4020,
             RS_4021, RS_4022, RS_3005, RS_1018, RS_2400, RS_2401, RS_2402, // v0.26 auth

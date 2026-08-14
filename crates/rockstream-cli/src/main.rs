@@ -6,7 +6,16 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use rockstream_cli::{request_worker_drain, run_start, StartOptions};
+use rockstream_cli::output::OutputFormat;
+use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
+use rockstream_cli::{
+    request_worker_drain, run_audit_query, run_audit_tail, run_checkpoint_list, run_cluster_quotas,
+    run_cluster_status, run_cluster_workers_list, run_cluster_workers_status, run_explain_view,
+    run_resource_cluster, run_resource_usage, run_schema_evolution_history,
+    run_schema_evolution_status, run_schema_list, run_schema_show, run_shard_list, run_source_list,
+    run_source_show, run_sql_compile, run_start, run_view_list, run_view_show, run_view_status,
+    run_workload_list, run_workload_show, StartOptions,
+};
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 
@@ -15,6 +24,18 @@ use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 #[derive(Debug, Parser)]
 #[command(name = "rockstream", version, about, long_about = None)]
 struct Cli {
+    /// Format output as JSON.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Control service URL.
+    #[arg(long, global = true)]
+    control: Option<String>,
+
+    /// Storage directory for local state and artifacts.
+    #[arg(long, global = true)]
+    storage_dir: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -162,15 +183,178 @@ enum Command {
         #[arg(long)]
         tls_ca_cert_path: Option<std::path::PathBuf>,
     },
-    /// Cluster administration commands.
+    /// View inspection commands.
+    View {
+        #[command(subcommand)]
+        command: ViewCommand,
+    },
+    /// Source inspection commands.
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
+    /// Schema inspection commands.
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+    /// Workload inspection commands.
+    Workload {
+        #[command(subcommand)]
+        command: WorkloadCommand,
+    },
+    /// Cluster administration and inspection commands.
     Cluster {
         #[command(subcommand)]
         command: ClusterCommand,
+    },
+    /// Shard inspection commands.
+    Shard {
+        #[command(subcommand)]
+        command: ShardCommand,
+    },
+    /// Checkpoint inspection commands.
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
+    /// Resource usage inspection commands.
+    Resource {
+        #[command(subcommand)]
+        command: ResourceCommand,
+    },
+    /// Schema evolution inspection commands.
+    #[command(name = "schema-evolution")]
+    SchemaEvolution {
+        #[command(subcommand)]
+        command: SchemaEvolutionCommand,
+    },
+    /// Audit log inspection commands.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+    /// Explain the incremental execution plan for a view.
+    Explain {
+        /// View name to explain.
+        view: String,
+        /// Show static cost and state memory estimates without deploying.
+        #[arg(long)]
+        estimate: bool,
+    },
+    /// Parse, lower, and explain a SQL query without deploying.
+    Sql {
+        /// SQL query to parse and lower.
+        query: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ViewCommand {
+    /// List all views.
+    List,
+    /// Show detailed view metadata.
+    Show {
+        /// View name.
+        name: String,
+    },
+    /// Show view lifecycle and freshness status.
+    Status {
+        /// Optional view name filter.
+        name: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SourceCommand {
+    /// List all sources.
+    List,
+    /// Show source connector detail.
+    Show {
+        /// Source name.
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SchemaCommand {
+    /// List all tables and views in the schema.
+    List,
+    /// Show schema columns for a table or view.
+    Show {
+        /// Table or view name.
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkloadCommand {
+    /// List all workloads.
+    List,
+    /// Show workload definition detail.
+    Show {
+        /// Workload name.
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShardCommand {
+    /// List all shards and their lease assignments.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckpointCommand {
+    /// List cluster checkpoints.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+enum ResourceCommand {
+    /// Show per-view and per-workload resource usage.
+    Usage {
+        /// Optional workload name filter.
+        #[arg(long)]
+        workload: Option<String>,
+    },
+    /// Show aggregate cluster resource usage.
+    Cluster,
+}
+
+#[derive(Debug, Subcommand)]
+enum SchemaEvolutionCommand {
+    /// Show schema evolution status.
+    Status,
+    /// Show schema evolution version history.
+    History,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Tail recent audit log events.
+    Tail {
+        /// Maximum events to return (max 1000).
+        #[arg(long, default_value_t = 100)]
+        max: usize,
+    },
+    /// Query audit log events matching a filter.
+    Query {
+        /// Substring filter for actor, action, or resource.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Maximum events to return (max 1000).
+        #[arg(long, default_value_t = 100)]
+        max: usize,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum ClusterCommand {
+    /// Show cluster status and leadership.
+    Status,
+    /// Show cluster quotas and capacity limits.
+    Quotas,
     /// Worker administration commands.
     Workers {
         #[command(subcommand)]
@@ -180,6 +364,13 @@ enum ClusterCommand {
 
 #[derive(Debug, Subcommand)]
 enum WorkerCommand {
+    /// List all registered workers.
+    List,
+    /// Show detailed worker status.
+    Status {
+        /// Optional worker ID.
+        worker_id: Option<u64>,
+    },
     /// Begin draining a worker.
     Drain {
         /// Control-plane worker-facing TCP address.
@@ -199,6 +390,8 @@ fn main() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
+
+    let format = OutputFormat::from_json_flag(cli.json);
 
     match cli.command {
         Command::Start {
@@ -310,17 +503,135 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Cluster {
-            command:
+        Command::View { command } => {
+            let identity = ClientIdentity::default();
+            let catalog = CatalogClient::new(identity);
+            let res = match command {
+                ViewCommand::List => run_view_list(format, &catalog),
+                ViewCommand::Show { name } => run_view_show(format, &catalog, &name),
+                ViewCommand::Status { name } => run_view_status(format, &catalog, name.as_deref()),
+            };
+            handle_result(res)
+        }
+        Command::Source { command } => {
+            let identity = ClientIdentity::default();
+            let catalog = CatalogClient::new(identity);
+            let res = match command {
+                SourceCommand::List => run_source_list(format, &catalog),
+                SourceCommand::Show { name } => run_source_show(format, &catalog, &name),
+            };
+            handle_result(res)
+        }
+        Command::Schema { command } => {
+            let identity = ClientIdentity::default();
+            let catalog = CatalogClient::new(identity);
+            let res = match command {
+                SchemaCommand::List => run_schema_list(format, &catalog),
+                SchemaCommand::Show { name } => run_schema_show(format, &catalog, &name),
+            };
+            handle_result(res)
+        }
+        Command::Workload { command } => {
+            let identity = ClientIdentity::default();
+            let catalog = CatalogClient::new(identity);
+            let res = match command {
+                WorkloadCommand::List => run_workload_list(format, &catalog),
+                WorkloadCommand::Show { name } => run_workload_show(format, &catalog, &name),
+            };
+            handle_result(res)
+        }
+        Command::Cluster { command } => {
+            let identity = ClientIdentity::default();
+            let control = ControlClient::new(cli.control, identity);
+            match command {
+                ClusterCommand::Status => handle_result(run_cluster_status(format, &control)),
+                ClusterCommand::Quotas => handle_result(run_cluster_quotas(format, &control)),
+                ClusterCommand::Workers {
+                    command: WorkerCommand::List,
+                } => handle_result(run_cluster_workers_list(format, &control)),
+                ClusterCommand::Workers {
+                    command: WorkerCommand::Status { worker_id },
+                } => handle_result(run_cluster_workers_status(format, &control, worker_id)),
                 ClusterCommand::Workers {
                     command: WorkerCommand::Drain { control, worker_id },
+                } => match request_worker_drain(&control, worker_id) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        ExitCode::FAILURE
+                    }
                 },
-        } => match request_worker_drain(&control, worker_id) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
             }
-        },
+        }
+        Command::Shard { command } => {
+            let identity = ClientIdentity::default();
+            let control = ControlClient::new(cli.control, identity);
+            let res = match command {
+                ShardCommand::List => run_shard_list(format, &control),
+            };
+            handle_result(res)
+        }
+        Command::Checkpoint { command } => {
+            let storage = StorageClient::new();
+            let storage_path = cli
+                .storage_dir
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let res = match command {
+                CheckpointCommand::List => run_checkpoint_list(format, &storage, &storage_path),
+            };
+            handle_result(res)
+        }
+        Command::Resource { command } => {
+            let identity = ClientIdentity::default();
+            let catalog = CatalogClient::new(identity);
+            let res = match command {
+                ResourceCommand::Usage { workload } => {
+                    run_resource_usage(format, &catalog, workload.as_deref())
+                }
+                ResourceCommand::Cluster => run_resource_cluster(format, &catalog),
+            };
+            handle_result(res)
+        }
+        Command::SchemaEvolution { command } => {
+            let identity = ClientIdentity::default();
+            let catalog = CatalogClient::new(identity);
+            let res = match command {
+                SchemaEvolutionCommand::Status => run_schema_evolution_status(format, &catalog),
+                SchemaEvolutionCommand::History => run_schema_evolution_history(format, &catalog),
+            };
+            handle_result(res)
+        }
+        Command::Audit { command } => {
+            let storage = StorageClient::new();
+            let storage_path = cli
+                .storage_dir
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let res = match command {
+                AuditCommand::Tail { max } => run_audit_tail(format, &storage, &storage_path, max),
+                AuditCommand::Query { filter, max } => {
+                    run_audit_query(format, &storage, &storage_path, filter.as_deref(), max)
+                }
+            };
+            handle_result(res)
+        }
+        Command::Explain { view, estimate } => {
+            let _identity = ClientIdentity::default();
+            let catalog = CatalogClient::with_defaults();
+            handle_result(run_explain_view(format, &catalog, &view, estimate))
+        }
+        Command::Sql { query } => handle_result(run_sql_compile(format, &query)),
+    }
+}
+
+fn handle_result(res: Result<String, rockstream_cli::CliError>) -> ExitCode {
+    match res {
+        Ok(out) => {
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
     }
 }

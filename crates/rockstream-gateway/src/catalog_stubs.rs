@@ -1111,6 +1111,58 @@ impl CatalogStubs {
         }
     }
 
+    pub fn view_status_response(
+        &self,
+        name_filter: Option<&str>,
+        namespace_filter: Option<&str>,
+    ) -> CatalogResponse {
+        let views = self.list_views();
+        let rows = views
+            .into_iter()
+            .filter(|v| match name_filter {
+                Some(name) => v.name.eq_ignore_ascii_case(name),
+                None => true,
+            })
+            .filter(|v| match namespace_filter {
+                Some(ns) => v.namespace.eq_ignore_ascii_case(ns),
+                None => true,
+            })
+            .map(|v| {
+                let workload = self
+                    .workload_for_view(&v.name)
+                    .and_then(|name| self.get_workload(&name));
+                let workload_name = workload.as_ref().map(|w| w.name.clone());
+                let freshness_slo_ms = workload
+                    .as_ref()
+                    .and_then(|w| w.freshness_slo.map(|s| s.target_ms.to_string()));
+                let memory_limit_bytes = workload
+                    .as_ref()
+                    .and_then(|w| w.memory_limit.map(|m| m.bytes.to_string()));
+                let state_str = self
+                    .view_states
+                    .read()
+                    .unwrap()
+                    .get(&v.name)
+                    .cloned()
+                    .unwrap_or(ViewState::Running)
+                    .to_string();
+                vec![
+                    Some(v.namespace),
+                    Some(v.name),
+                    Some(state_str),
+                    workload_name,
+                    freshness_slo_ms,
+                    memory_limit_bytes,
+                    Some("-".to_string()),
+                ]
+            })
+            .collect();
+        CatalogResponse::Rows {
+            columns: view_status_columns(),
+            rows,
+        }
+    }
+
     /// Return the durable lifecycle summary used by `SHOW BACKFILL STATUS`.
     /// The catalog is the shared read path, so this intentionally has no
     /// gateway-local cache that could expose a stale publication state.
@@ -1400,6 +1452,24 @@ impl CatalogStubs {
                 .trim_matches('"');
             self.get_view(view_name)?;
             return Some(self.backfill_status_response(view_name));
+        }
+        if ql.trim_end_matches(';') == "show view status" {
+            return Some(self.view_status_response(None, None));
+        }
+        if ql.starts_with("show view status for namespace ") {
+            let namespace = q["show view status for namespace ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            return Some(self.view_status_response(None, Some(namespace)));
+        }
+        if ql.starts_with("show view status for ") {
+            let view_name = q["show view status for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            self.get_view(view_name)?;
+            return Some(self.view_status_response(Some(view_name), None));
         }
 
         // S7: SHOW client_encoding / SHOW server_encoding
@@ -2852,6 +2922,18 @@ pub(crate) fn show_sinks_columns() -> Vec<String> {
         .into_iter()
         .map(str::to_string)
         .collect()
+}
+
+pub(crate) fn view_status_columns() -> Vec<String> {
+    vec![
+        "namespace".to_string(),
+        "view_name".to_string(),
+        "state".to_string(),
+        "workload_name".to_string(),
+        "freshness_slo_ms".to_string(),
+        "memory_limit_bytes".to_string(),
+        "depends_on".to_string(),
+    ]
 }
 
 pub(crate) fn show_source_status_columns() -> Vec<String> {

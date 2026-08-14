@@ -4,30 +4,32 @@ RockStream ships as a **single binary** named `rockstream`. Every node role is a
 flag on this one binary — there is no separate server, worker, or gateway
 executable. `main` is always runnable through it.
 
-At **v0.1** the binary runs an **embedded no-op node**: it brings the node up,
-runs a no-op pipeline to completion, writes an audit log and a support bundle,
-and exits cleanly. Real operators, durability, SQL, and the distributed roles
-are added in later versions; this page documents only what exists today.
+All inspection subcommands support human-readable tabular text output by default
+and structured `--json` output for automated tooling.
 
 ## Synopsis
 
 ```bash
 rockstream --help
 rockstream --version
-rockstream start --storage <dir> [--role <role>]
+rockstream [--json] [--control <url>] [--storage-dir <dir>] <command>
 ```
+
+## Global Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--json` | `false` | Format output as structured JSON. |
+| `--control <url>` | — | Control service URL for cluster and shard inspection. |
+| `--storage-dir <dir>` | `.` | Local storage directory for reading checkpoints and audit logs. |
+
+---
 
 ## Commands
 
 ### `rockstream start`
 
-Starts a RockStream node. At v0.1 this runs the embedded no-op node, which:
-
-1. validates the requested role,
-2. creates the storage directory if it does not exist,
-3. writes an audit log recording the node and no-op pipeline lifecycle,
-4. writes a support bundle, and
-5. exits with status `0`.
+Starts a RockStream node.
 
 **Options**
 
@@ -37,54 +39,148 @@ Starts a RockStream node. At v0.1 this runs the embedded no-op node, which:
 | `--role <role>` | no | `all` | Node role. One of `all`, `control`, `worker`, `gateway`, `frontier`. An unrecognised role, or a role requiring `--control` when it is omitted, is rejected with `RS-0002`. |
 | `--control <url>` | no (required for `worker`/`frontier`) | — | Control service URL. Required for the `worker` and `frontier` roles; omitting it is rejected with `RS-0002`. |
 | `--auth <mode>` | no | `off` | Authentication mode. One of `off`, `oidc`, `mtls`. |
+| `--host-id <id>` | no | — | Stable same-host identity advertised during worker registration. |
+| `--availability-zone <az>` | no | — | Availability zone advertised during worker registration. |
 | `--metrics-addr <addr>` | no | — | Metrics HTTP server listen address. |
 | `--listen <addr>` | no | `127.0.0.1:5432` | PostgreSQL wire gateway listen address. Activates the live gateway server for the `gateway` and `all` roles. |
-| `--raft-peers <list>` | no | — | v0.45.2 M7: comma-separated list of the *other* control nodes in this node's Raft group, `id@host:port,id@host:port`. Only meaningful for `--role=control`. When omitted, the control role runs exactly as before v0.45.2 (single embedded node, no Raft leader-only write gating). |
+| `--webhook-listen <addr>` | no | — | Independent HTTP listener for webhook ingestion. |
+| `--raft-peers <list>` | no | — | Comma-separated list of the other control nodes in this node's Raft group, `id@host:port,id@host:port`. Only meaningful for `--role=control`. |
 | `--raft-node-id <id>` | no (required with `--raft-peers`) | — | This node's id within its Raft group. |
 | `--raft-bind <addr>` | no (required with `--raft-peers`) | — | Address this node's Raft peer-RPC listener binds to. |
 | `--raft-bootstrap` | no | `false` | Start an election immediately on boot rather than waiting out a randomized timeout. Exactly one node in a freshly-bootstrapped Raft group should set this. |
-| `--daemon` | no | `false` | v0.45.2 M7 S4: run the `control` role as a real long-lived daemon that blocks on SIGTERM / Ctrl-C, exactly like the `gateway`/`all` roles' live PostgreSQL wire server, instead of the short embedded no-op run. Only meaningful for `--role=control`; required for a real multi-node control-plane cluster. |
-| `--control-bind <addr>` | no | `127.0.0.1:8000` | v0.45.2 M7 S4: overrides the address the control-plane's worker-facing `ControlService` TCP listener binds to. Only meaningful for `--role=control`/`--role=all`. Needed to bind `0.0.0.0:<port>` inside a container so peer control nodes and workers on other hosts can reach it. |
-| `--control-shared-storage <dir>` | no | — | v0.45.2 M7 S4/S5: directory for state that must be *shared* across every control node in this node's Raft group — the Raft term/vote/log and the shard-lease-manager snapshot. Only meaningful for `--role=control` with `--raft-peers`. When omitted, each control node's Raft state lives under its own private `--storage` directory (no cross-process lease continuity). |
+| `--daemon` | no | `false` | Run the `control` role as a real long-lived daemon that blocks on SIGTERM / Ctrl-C. Only meaningful for `--role=control`. |
+| `--control-bind <addr>` | no | `127.0.0.1:8000` | Overrides the address the control-plane's worker-facing `ControlService` TCP listener binds to. |
+| `--control-shared-storage <dir>` | no | — | Directory for state shared across control nodes in this node's Raft group. |
+| `--query-time-shard-dir <dir>` | no | — | Root directory of a non-local shard included in every query-time scatter read. |
 
-**Example**
+---
 
-```bash
-rockstream start --storage ./data
-```
+### `rockstream view`
 
-**Artifacts written under `<storage>`**
+Inspect view metadata, state, and freshness.
 
-- `audit.jsonl` — one JSON object per line, one per control-plane action. v0.1
-  emits `server.started`, `pipeline.created`, `pipeline.started`,
-  `pipeline.stopped`, and `server.stopped`.
-- `support-bundle-<timestamp>.json` — a snapshot bundle containing
-  `system_info` (version, OS, arch, role), a `metrics` snapshot (run duration
-  and audit-event count), and the full `audit_events` list.
+- `rockstream view list` — List all registered materialized views and their current execution state.
+- `rockstream view show <name>` — Show detailed view metadata, including definition query, assigned workload, and freshness SLO.
+- `rockstream view status [<name>]` — Show view lifecycle and freshness status (optionally filtered by view name).
+
+---
+
+### `rockstream source`
+
+Inspect ingested streaming sources and connectors.
+
+- `rockstream source list` — List all configured ingestion sources, connector types, and statuses.
+- `rockstream source show <name>` — Show detailed source configuration, connector options, offsets, and ingest lag.
+
+---
+
+### `rockstream schema`
+
+Inspect schemas and entity definitions.
+
+- `rockstream schema list` — List all tables and views in the active schema.
+- `rockstream schema show <name>` — Show column names, types, and nullability for a table or view.
+
+---
+
+### `rockstream workload`
+
+Inspect workload priorities, memory limits, and view assignments.
+
+- `rockstream workload list` — List all defined workloads, priorities, and assigned view counts.
+- `rockstream workload show <name>` — Show workload detail, memory limits, freshness SLOs, and assigned views.
+
+---
+
+### `rockstream cluster`
+
+Inspect cluster state, quotas, and worker fleet.
+
+- `rockstream cluster status` — Show cluster leadership, active/healthy worker counts, and engine version.
+- `rockstream cluster quotas` — Show total memory budgets, used memory, and parallelism limits.
+- `rockstream cluster workers list` — List all registered workers, addresses, availability zones, and health.
+- `rockstream cluster workers status [<worker_id>]` — Show detailed worker status, capacity headroom, and lifecycle state.
+- `rockstream cluster workers drain --control=<addr> <worker_id>` — Signal a worker to drain before shutdown.
+
+---
+
+### `rockstream shard`
+
+Inspect shard lease ownership and key ranges.
+
+- `rockstream shard list` — List all shards, lease tokens, owner workers, and active key ranges.
+
+---
+
+### `rockstream checkpoint`
+
+Inspect durable cluster checkpoints.
+
+- `rockstream checkpoint list` — List all durable checkpoints, creation timestamps, and shard counts.
+
+---
+
+### `rockstream resource`
+
+Inspect memory, state, and cost across views, workloads, and the cluster.
+
+- `rockstream resource usage [--workload=<name>]` — Show per-view memory, state bytes, and estimated hourly cost (optionally filtered by workload).
+- `rockstream resource cluster` — Show aggregate cluster-wide view counts, workload counts, memory, state bytes, and estimated cost.
+
+---
+
+### `rockstream schema-evolution`
+
+Inspect online schema evolution versions and history.
+
+- `rockstream schema-evolution status` — Show current version, synchronization status, and pending schema alterations.
+- `rockstream schema-evolution history` — Show the historical ledger of schema alterations and applied timestamps.
+
+---
+
+### `rockstream audit`
+
+Inspect security and lifecycle audit log events.
+
+- `rockstream audit tail [--max=<n>]` — Tail recent audit log events (bounded by default, maximum 1000).
+- `rockstream audit query [--filter=<pattern>] [--max=<n>]` — Query audit log events matching a filter substring.
+
+---
+
+### `rockstream explain`
+
+Inspect the compiled incremental operator plan without deploying.
+
+- `rockstream explain <view>` — Print the annotated `PlanNode` operator tree for a registered view.
+- `rockstream explain <view> --estimate` — Print static state memory and epoch throughput estimates for a view.
+
+---
+
+### `rockstream sql`
+
+Offline SQL compilation and lowering inspection.
+
+- `rockstream sql "<query>"` — Parse and lower a raw SQL query into an incremental execution plan without creating or deploying a view.
+
+---
 
 ## Exit codes
 
 | Exit code | Meaning |
 |---|---|
-| `0` | The node ran the no-op pipeline to completion and wrote its artifacts. |
-| non-zero | A failure occurred; the error is printed to stderr with its `RS-XXXX` code and actionable next steps. |
+| `0` | Command completed successfully. |
+| `1` / non-zero | Command failed. An `RS-XXXX` error code and actionable guidance are printed to stderr. |
 
 ## Error codes
 
-Operator-visible failures carry an `RS-XXXX` code (see the registry in
-`crates/rockstream-types/src/error_code.rs`). The `start` command can return:
-
 | Code | Meaning | Next steps |
 |---|---|---|
-| `RS-0002` | Unknown node role passed to `--role`, or a required option (e.g. `--control` for `worker`/`frontier`) was omitted for the requested role. | Pass `--role` with one of: `all`, `control`, `worker`, `gateway`, `frontier`, and supply any options that role requires. |
-| `RS-0003` | Could not create the storage directory or write an artifact. | Check that the parent path exists, is writable, and the disk is not full. |
-| `RS-1731` | `control.not_leader` — a control-plane write (e.g. a shard-lease grant or shard-assignment write) was rejected because this control node is not the current Raft leader. Only relevant when `--raft-peers` is set. | Retry the write against the current Raft leader; callers should re-resolve control-plane leadership and route the request there. |
-
-## Logging
-
-Logs are emitted through `tracing`. Set the verbosity with the standard
-`RUST_LOG` environment variable, e.g. `RUST_LOG=debug`:
-
-```bash
-RUST_LOG=info rockstream start --storage ./data
-```
+| `RS-0002` | Invalid CLI arguments, unrecognized node role, or missing required flag. | Check `rockstream --help` for expected flags and valid options. |
+| `RS-0003` | Storage or I/O error accessing disk or object storage. | Verify storage path permissions and available disk space. |
+| `RS-0004` | Unreachable control plane. | Verify the `--control` service URL and ensure the control node is active. |
+| `RS-1001` | Entity not found (view, table, schema, namespace, or worker ID). | Verify the entity name with `rockstream view list` or `rockstream cluster workers list`. |
+| `RS-1005` | Workload not found. | Verify workload name with `rockstream workload list` or create it with `CREATE WORKLOAD`. |
+| `RS-1012` | SQL syntax or parsing error. | Check SQL query syntax and column references. |
+| `RS-1731` | Control node is not the Raft leader. | Re-resolve control plane leadership and route the request to the active leader. |
+| `RS-4009` | Ingestion source not found. | Check source name with `rockstream source list`. |
+| `RS-4017` | Removed cold-tier storage configuration was passed. | Remove legacy cold-tier storage flags. |

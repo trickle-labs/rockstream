@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod metrics_server;
+pub mod output;
+pub mod transport;
 
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts
@@ -1019,6 +1021,371 @@ pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), CliErro
             }
         }
     })
+}
+
+// ─── Inspection Command Runners ─────────────────────────────────────────────
+
+pub fn run_view_list(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+) -> Result<String, CliError> {
+    let views = catalog.list_views()?;
+    Ok(output::render_output(&views, format))
+}
+
+pub fn run_view_show(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    name: &str,
+) -> Result<String, CliError> {
+    let view = catalog.get_view(name)?;
+    Ok(output::render_output(&view, format))
+}
+
+pub fn run_view_status(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    name: Option<&str>,
+) -> Result<String, CliError> {
+    let statuses = catalog.view_status(name)?;
+    Ok(output::render_output(&statuses, format))
+}
+
+pub fn run_source_list(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+) -> Result<String, CliError> {
+    let sources = catalog.list_sources()?;
+    Ok(output::render_output(&sources, format))
+}
+
+pub fn run_source_show(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    name: &str,
+) -> Result<String, CliError> {
+    let source = catalog.get_source(name)?;
+    Ok(output::render_output(&source, format))
+}
+
+pub fn run_schema_list(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+) -> Result<String, CliError> {
+    let schemas = catalog.list_schemas()?;
+    Ok(output::render_output(&schemas, format))
+}
+
+pub fn run_schema_show(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    name: &str,
+) -> Result<String, CliError> {
+    let schema = catalog.get_schema(name)?;
+    Ok(output::render_output(&schema, format))
+}
+
+pub fn run_workload_list(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+) -> Result<String, CliError> {
+    let workloads = catalog.list_workloads()?;
+    Ok(output::render_output(&workloads, format))
+}
+
+pub fn run_workload_show(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    name: &str,
+) -> Result<String, CliError> {
+    let workload = catalog.get_workload(name)?;
+    Ok(output::render_output(&workload, format))
+}
+
+pub fn run_cluster_status(
+    format: output::OutputFormat,
+    control: &transport::ControlClient,
+) -> Result<String, CliError> {
+    let status = control.cluster_status()?;
+    Ok(output::render_output(&status, format))
+}
+
+pub fn run_cluster_quotas(
+    format: output::OutputFormat,
+    control: &transport::ControlClient,
+) -> Result<String, CliError> {
+    let quotas = control.cluster_quotas()?;
+    Ok(output::render_output(&quotas, format))
+}
+
+pub fn run_cluster_workers_list(
+    format: output::OutputFormat,
+    control: &transport::ControlClient,
+) -> Result<String, CliError> {
+    let workers = control.list_workers()?;
+    Ok(output::render_output(&workers, format))
+}
+
+pub fn run_cluster_workers_status(
+    format: output::OutputFormat,
+    control: &transport::ControlClient,
+    worker_id: Option<u64>,
+) -> Result<String, CliError> {
+    let statuses = control.worker_status(worker_id)?;
+    if worker_id.is_some() && statuses.len() == 1 {
+        Ok(output::render_output(&statuses[0], format))
+    } else {
+        Ok(output::render_output(&statuses, format))
+    }
+}
+
+pub fn run_shard_list(
+    format: output::OutputFormat,
+    control: &transport::ControlClient,
+) -> Result<String, CliError> {
+    let shards = control.list_shards()?;
+    Ok(output::render_output(&shards, format))
+}
+
+pub fn run_checkpoint_list(
+    format: output::OutputFormat,
+    storage: &transport::StorageClient,
+    storage_path: &Path,
+) -> Result<String, CliError> {
+    let checkpoints = storage.list_checkpoints(storage_path)?;
+    Ok(output::render_output(&checkpoints, format))
+}
+
+pub fn run_resource_usage(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    workload: Option<&str>,
+) -> Result<String, CliError> {
+    let usage = catalog.resource_usage(workload)?;
+    Ok(output::render_output(&usage, format))
+}
+
+pub fn run_resource_cluster(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+) -> Result<String, CliError> {
+    let cluster = catalog.resource_cluster()?;
+    Ok(output::render_output(&cluster, format))
+}
+
+pub fn run_schema_evolution_status(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+) -> Result<String, CliError> {
+    let status = catalog.schema_evolution_status()?;
+    Ok(output::render_output(&status, format))
+}
+
+pub fn run_schema_evolution_history(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+) -> Result<String, CliError> {
+    let history = catalog.schema_evolution_history()?;
+    Ok(output::render_output(&history, format))
+}
+
+pub fn run_audit_tail(
+    format: output::OutputFormat,
+    storage: &transport::StorageClient,
+    storage_path: &Path,
+    max: usize,
+) -> Result<String, CliError> {
+    let events = storage.audit_tail(storage_path, max)?;
+    Ok(output::render_output(&events, format))
+}
+
+pub fn run_audit_query(
+    format: output::OutputFormat,
+    storage: &transport::StorageClient,
+    storage_path: &Path,
+    filter: Option<&str>,
+    max: usize,
+) -> Result<String, CliError> {
+    let events = storage.audit_query(storage_path, filter, max)?;
+    Ok(output::render_output(&events, format))
+}
+
+fn map_column_type(data_type: &str) -> arrow::datatypes::DataType {
+    match data_type.to_uppercase().as_str() {
+        "BIGINT" | "INT8" | "INT64" => arrow::datatypes::DataType::Int64,
+        "INT" | "INT4" | "INT32" | "INTEGER" => arrow::datatypes::DataType::Int32,
+        "SMALLINT" | "INT2" | "INT16" => arrow::datatypes::DataType::Int16,
+        "FLOAT" | "FLOAT8" | "DOUBLE" => arrow::datatypes::DataType::Float64,
+        "FLOAT4" | "REAL" => arrow::datatypes::DataType::Float32,
+        "BOOLEAN" | "BOOL" => arrow::datatypes::DataType::Boolean,
+        "TIMESTAMP" => {
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None)
+        }
+        _ => arrow::datatypes::DataType::Utf8,
+    }
+}
+
+pub fn build_sql_frontend_from_catalog(
+    catalog: &transport::CatalogClient,
+) -> Result<rockstream_sql::SqlFrontend, CliError> {
+    let frontend = rockstream_sql::SqlFrontend::new();
+    for schema in catalog.schemas.values() {
+        let fields: Vec<arrow::datatypes::Field> = schema
+            .columns
+            .iter()
+            .map(|c| {
+                arrow::datatypes::Field::new(&c.name, map_column_type(&c.data_type), c.nullable)
+            })
+            .collect();
+        let arrow_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        frontend
+            .register_table(&schema.name, arrow_schema)
+            .map_err(|e| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed registering schema '{}': {e}", schema.name),
+                    "Verify catalog schemas.",
+                )
+            })?;
+    }
+    for source in catalog.sources.values() {
+        if !catalog.schemas.contains_key(&source.table) {
+            let default_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Float64, false),
+                arrow::datatypes::Field::new("hour", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new(
+                    "created_at",
+                    arrow::datatypes::DataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Millisecond,
+                        None,
+                    ),
+                    false,
+                ),
+            ]));
+            let _ = frontend.register_table(&source.table, default_schema);
+        }
+    }
+    if !catalog.schemas.contains_key("orders") {
+        let default_orders_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("hour", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Float64, false),
+        ]));
+        let _ = frontend.register_table("orders", default_orders_schema);
+    }
+    Ok(frontend)
+}
+
+pub fn run_explain_view(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    view_name: &str,
+    estimate: bool,
+) -> Result<String, CliError> {
+    let view = catalog.get_view(view_name)?;
+    let frontend = build_sql_frontend_from_catalog(catalog)?;
+    let view_name_str = view_name.to_string();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
+
+        rt.block_on(async {
+            if estimate {
+                let rows = frontend
+                    .explain_incremental_estimate_for_sql(&view.query, 1000, 10000)
+                    .await
+                    .map_err(|e| {
+                        CliError::new(
+                            rockstream_types::error_code::RS_1012,
+                            format!("failed to compute explain estimate for view '{view_name_str}': {e}"),
+                            "Verify view query syntax and catalog schema dependencies.",
+                        )
+                    })?;
+                let formatted_text = rockstream_sql::format_estimate(&rows);
+                let estimate_infos: Vec<output::EstimateRowInfo> = rows
+                    .into_iter()
+                    .map(|r| output::EstimateRowInfo {
+                        operator_kind: r.operator_kind,
+                        predicted_state_bytes: r.predicted_state_bytes,
+                        epoch_ms: r.epoch_ms,
+                    })
+                    .collect();
+                let info = output::ExplainEstimateInfo {
+                    view_name: view.name,
+                    query: view.query,
+                    estimates: estimate_infos,
+                    formatted_text,
+                };
+                Ok(output::render_output(&info, format))
+            } else {
+                let plan_text = frontend
+                    .explain_incremental_for_sql(
+                        &view.query,
+                        rockstream_types::explain::ExplainLevel::Default,
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| {
+                        CliError::new(
+                            rockstream_types::error_code::RS_1012,
+                            format!("failed to explain view '{view_name_str}': {e}"),
+                            "Verify view query syntax and catalog schema dependencies.",
+                        )
+                    })?;
+                let info = output::ExplainPlanInfo {
+                    view_name: view.name,
+                    query: view.query,
+                    plan: plan_text,
+                };
+                Ok(output::render_output(&info, format))
+            }
+        })
+    })
+    .join()
+    .map_err(|_| CliError::new(RS_0003, "internal thread error", ""))?
+}
+
+pub fn run_sql_compile(format: output::OutputFormat, query: &str) -> Result<String, CliError> {
+    let catalog = transport::CatalogClient::with_defaults();
+    let frontend = build_sql_frontend_from_catalog(&catalog)?;
+    let query_str = query.to_string();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), "")
+            })?;
+
+        rt.block_on(async {
+            let plan_text = frontend
+                .explain_incremental_for_sql(
+                    &query_str,
+                    rockstream_types::explain::ExplainLevel::Default,
+                    &[],
+                )
+                .await
+                .map_err(|e| {
+                    CliError::new(
+                        rockstream_types::error_code::RS_1012,
+                        format!("SQL syntax error: {e}"),
+                        "Check SQL syntax and table/column references.",
+                    )
+                })?;
+            let info = output::SqlCompileInfo {
+                query: query_str,
+                plan: plan_text,
+            };
+            Ok(output::render_output(&info, format))
+        })
+    })
+    .join()
+    .map_err(|_| CliError::new(RS_0003, "internal thread error", ""))?
 }
 
 fn write_support_bundle(

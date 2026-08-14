@@ -153,7 +153,7 @@ async fn run_smoke_suite_in_process(port: u16) {
         .await
         .expect("check4: prepare typed params");
     let _ = client
-        .query(&stmt4, &[&"hello", &42i32, &3.14f64, &true])
+        .query(&stmt4, &[&"hello", &42i32, &1.25f64, &true])
         .await; // result not asserted
 
     // Check 5: transactions + savepoints

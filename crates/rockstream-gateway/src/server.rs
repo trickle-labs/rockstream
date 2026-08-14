@@ -5527,6 +5527,54 @@ impl GatewayHandler {
                 "[RS-2001] sql.invalid_syntax: expected SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>. Next steps: provide a materialized view name.".to_owned(),
             ))))]);
         }
+        if ql.trim_end_matches(';') == "show view status" {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.view_status_response(None, None),
+            ))]);
+        }
+        if ql.starts_with("show view status for namespace ") {
+            let namespace = q["show view status for namespace ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            let views = self.catalog.list_views();
+            let ns_exists = namespace == "public"
+                || views
+                    .iter()
+                    .any(|v| v.namespace.eq_ignore_ascii_case(namespace));
+            if !ns_exists {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-1001] namespace.not_found: namespace '{}' does not exist. Next steps: check namespace name with 'SHOW VIEW STATUS'.",
+                        namespace
+                    ),
+                ))))]);
+            }
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.view_status_response(None, Some(namespace)),
+            ))]);
+        }
+        if ql.starts_with("show view status for ") {
+            let view_name = q["show view status for ".len()..]
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('"');
+            if self.catalog.get_view(view_name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42704".to_owned(),
+                    format!(
+                        "[RS-1001] view.not_found: view '{}' does not exist. Next steps: run CREATE VIEW ... to create it.",
+                        view_name
+                    ),
+                ))))]);
+            }
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.view_status_response(Some(view_name), None),
+            ))]);
+        }
         if ql.trim_end_matches(';') == "show resource usage" {
             return Ok(vec![catalog_resp_to_response(
                 self.catalog.view_resource_usage(&[]),

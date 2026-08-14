@@ -44,3 +44,4 @@ serde_json = { workspace = true }
 tonic = { workspace = true }
 tokio-postgres = { workspace = true }
 futures = { workspace = true }
+rockstream-cli = { workspace = true }
