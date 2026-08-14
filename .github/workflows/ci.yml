@@ -403,6 +403,9 @@ jobs:
   nexmark-regression-gate:
     name: Nexmark regression gate
     runs-on: ubuntu-latest
+    # Raised from 30 after the dependency and Rust-baseline upgrade made
+    # cold compiles of this bench target's dependency tree noticeably
+    # heavier, occasionally exceeding the prior budget.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -424,7 +427,10 @@ jobs:
     # times is ~4 minutes on a warm cache; sized generously above that plus
     # checkout/build overhead so a slow CI runner doesn't flake. Recorded in
     # `.claude/v0.45.4-evidence.md`.
-    timeout-minutes: 45
+    # `.claude/v0.45.4-evidence.md`. Raised from 25 after the dependency and
+    # Rust-baseline upgrade made per-bench-target cold compiles (axum,
+    # hyper, reqwest, arrow/parquet) noticeably heavier.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
