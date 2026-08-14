@@ -212,24 +212,9 @@ async fn drain_completes_zero_downtime_tc() {
             .worker_id,
         WorkerId(1)
     );
-    let binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target/debug/rockstream");
-    let status = std::process::Command::new(binary)
-        .args([
-            "--identity-role",
-            "admin",
-            "cluster",
-            "workers",
-            "drain",
-            "--control",
-            &cluster.control_addr.to_string(),
-            "1",
-            "--yes",
-        ])
-        .status()
+    rockstream_cli::request_worker_drain_async(&cluster.control_addr.to_string(), 1)
+        .await
         .unwrap();
-    assert!(status.success());
     for _ in 0..20 {
         let replies = send(cluster.control_addr, &WorkerMessage::ClusterStatusQuery).await;
         assert!(matches!(

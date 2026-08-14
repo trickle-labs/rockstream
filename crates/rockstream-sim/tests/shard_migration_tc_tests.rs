@@ -197,25 +197,10 @@ async fn wait_for_lease(addr: SocketAddr, worker_id: u64, shard_id: u64) -> Shar
     }
 }
 
-fn exec_drain(control_addr: SocketAddr, worker_id: u64) {
-    let binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target/debug/rockstream");
-    let status = std::process::Command::new(binary)
-        .args([
-            "cluster",
-            "workers",
-            "drain",
-            "--control",
-            &control_addr.to_string(),
-            "--identity-role",
-            "admin",
-            &worker_id.to_string(),
-            "--yes",
-        ])
-        .status()
+async fn exec_drain(control_addr: SocketAddr, worker_id: u64) {
+    rockstream_cli::request_worker_drain_async(&control_addr.to_string(), worker_id)
+        .await
         .unwrap();
-    assert!(status.success(), "drain CLI failed");
 }
 
 #[tokio::test]
@@ -236,7 +221,7 @@ async fn live_migration_zero_loss_tc() {
             .worker_id,
         WorkerId(1)
     );
-    exec_drain(cluster.control_addr, 1);
+    exec_drain(cluster.control_addr, 1).await;
     for _ in 0..10 {
         let _ = send(cluster.control_addr, &WorkerMessage::ClusterStatusQuery).await;
     }
@@ -259,7 +244,7 @@ async fn donor_killed_mid_dual_writing_tc() {
     register_worker(cluster.control_addr, 1).await;
     register_worker(cluster.control_addr, 2).await;
     let _ = request_shard(cluster.control_addr, 1, 21).await;
-    exec_drain(cluster.control_addr, 1);
+    exec_drain(cluster.control_addr, 1).await;
     let status = std::process::Command::new("docker")
         .args(["rm", "-f", &cluster.donor_name])
         .status()
@@ -284,7 +269,7 @@ async fn donor_killed_mid_cutover_tc() {
     register_worker(cluster.control_addr, 1).await;
     register_worker(cluster.control_addr, 2).await;
     let _ = request_shard(cluster.control_addr, 1, 22).await;
-    exec_drain(cluster.control_addr, 1);
+    exec_drain(cluster.control_addr, 1).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     let status = std::process::Command::new("docker")
         .args(["rm", "-f", &cluster.donor_name])

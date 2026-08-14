@@ -917,6 +917,8 @@ The §3.7 mapping rows above are the D-numbered v0.46 deliverable: runtime
 assertions pair M6-S1/M6-S3, the dual-write oracle test pairs M6-S2, the
 durability tests cover the new persistent stores, and the seeded/TC drills are
 the implementation mirror of the model's liveness/coverage claims.
+Dependency baseline upgrades (Rust 1.94.1, lru 0.18, pgwire 0.40, testcontainers 0.27)
+preserve all formal-model invariants and runtime assertion mappings.
 
 ### 4.7 Roadmap Summary
 

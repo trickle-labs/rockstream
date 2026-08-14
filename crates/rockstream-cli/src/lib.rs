@@ -1057,86 +1057,107 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     })
 }
 
-/// Thin v0.46 admin-CLI stub: request a worker drain over the control wire API.
-pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), CliError> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
-    rt.block_on(async move {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::TcpStream;
+/// Request a worker drain over the control wire API asynchronously.
+pub async fn request_worker_drain_async(control: &str, worker_id: u64) -> Result<(), CliError> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
 
-        let mut stream = TcpStream::connect(control).await.map_err(|e| {
+    let mut stream = TcpStream::connect(control).await.map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("failed to connect to control service at {control}: {e}"),
+            "Check that the control node is running and --control points at its worker-facing address.",
+        )
+    })?;
+    let request = serde_json::to_string(&WorkerMessage::RequestDrain {
+        worker_id: rockstream_types::ids::WorkerId(worker_id),
+    })
+    .map_err(|e| CliError::new(RS_0003, format!("failed to encode drain request: {e}"), ""))?
+        + "\n";
+    stream.write_all(request.as_bytes()).await.map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("failed to send drain request: {e}"),
+            "Retry the request after verifying network connectivity to the control node.",
+        )
+    })?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).await.map_err(|e| {
             CliError::new(
                 RS_0003,
-                format!("failed to connect to control service at {control}: {e}"),
-                "Check that the control node is running and --control points at its worker-facing address.",
+                format!("failed reading control response: {e}"),
+                "Retry the request after checking the control-plane logs.",
             )
         })?;
-        let request = serde_json::to_string(&WorkerMessage::RequestDrain {
-            worker_id: rockstream_types::ids::WorkerId(worker_id),
-        })
-        .map_err(|e| CliError::new(RS_0003, format!("failed to encode drain request: {e}"), ""))?
-            + "\n";
-        stream.write_all(request.as_bytes()).await.map_err(|e| {
+        if read == 0 {
+            return Err(CliError::new(
+                RS_0003,
+                "control service closed the drain request without a reply",
+                "Retry against the current control leader and inspect the control-plane audit log.",
+            ));
+        }
+        match serde_json::from_str::<ControlMessage>(line.trim()).map_err(|e| {
             CliError::new(
                 RS_0003,
-                format!("failed to send drain request: {e}"),
-                "Retry the request after verifying network connectivity to the control node.",
+                format!("failed to decode control response: {e}"),
+                "Upgrade the CLI and control plane together so they agree on the wire format.",
             )
-        })?;
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = reader.read_line(&mut line).await.map_err(|e| {
-                CliError::new(
-                    RS_0003,
-                    format!("failed reading control response: {e}"),
-                    "Retry the request after checking the control-plane logs.",
-                )
-            })?;
-            if read == 0 {
-                return Err(CliError::new(
-                    RS_0003,
-                    "control service closed the drain request without a reply",
-                    "Retry against the current control leader and inspect the control-plane audit log.",
-                ));
+        })? {
+            ControlMessage::BeginDrain(_) => continue,
+            ControlMessage::DrainStatus { state, .. } => {
+                println!("{state:?}");
+                return Ok(());
             }
-            match serde_json::from_str::<ControlMessage>(line.trim()).map_err(|e| {
-                CliError::new(
-                    RS_0003,
-                    format!("failed to decode control response: {e}"),
-                    "Upgrade the CLI and control plane together so they agree on the wire format.",
-                )
-            })? {
-                ControlMessage::BeginDrain(_) => continue,
-                ControlMessage::DrainStatus { state, .. } => {
-                    println!("{state:?}");
-                    return Ok(());
-                }
-                ControlMessage::OperationFailed {
-                    code,
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => {
+                return Err(CliError::new(
+                    ErrorCode::new(code.trim_start_matches("RS-").parse().unwrap_or(3)),
                     message,
                     next_steps,
-                } => {
-                    return Err(CliError::new(
-                        ErrorCode::new(code.trim_start_matches("RS-").parse().unwrap_or(3)),
-                        message,
-                        next_steps,
-                    ));
-                }
-                other => {
-                    return Err(CliError::new(
-                        RS_0003,
-                        format!("unexpected control response to drain request: {other:?}"),
-                        "Retry against the current control leader; if the problem persists, inspect the control-plane logs.",
-                    ));
-                }
+                ));
+            }
+            other => {
+                return Err(CliError::new(
+                    RS_0003,
+                    format!("unexpected control response to drain request: {other:?}"),
+                    "Retry against the current control leader; if the problem persists, inspect the control-plane logs.",
+                ));
             }
         }
-    })
+    }
+}
+
+/// Thin v0.46 admin-CLI stub: request a worker drain over the control wire API.
+pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), CliError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), "")
+                    })?;
+                rt.block_on(request_worker_drain_async(control, worker_id))
+            })
+            .join()
+            .unwrap()
+        })
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), "")
+            })?;
+        rt.block_on(request_worker_drain_async(control, worker_id))
+    }
 }
 
 // ─── Inspection Command Runners ─────────────────────────────────────────────
