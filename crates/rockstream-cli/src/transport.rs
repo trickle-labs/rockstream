@@ -607,29 +607,61 @@ impl CatalogClient {
     }
 
     pub fn view_status(&self, name: Option<&str>) -> Result<Vec<ViewStatusInfo>, CliError> {
+        let build_info = |name: &str,
+                          state: &str,
+                          workload: Option<String>,
+                          slo: Option<u64>,
+                          mem: Option<u64>,
+                          deps: Vec<String>| {
+            let lag = rockstream_types::metrics::read_view_stage_lag(name).or_else(|| {
+                rockstream_types::metrics::read_freshness_lag(name).map(|tot| {
+                    rockstream_types::metrics::StageLagBreakdown {
+                        source_lag_ms: 0,
+                        decode_lag_ms: 0,
+                        compute_lag_ms: 0,
+                        alignment_lag_ms: 0,
+                        sink_lag_ms: 0,
+                        spill_lag_ms: 0,
+                        storage_pressure_ms: 0,
+                        total_lag_ms: tot,
+                    }
+                })
+            });
+            ViewStatusInfo {
+                namespace: self.identity.namespace.clone(),
+                view_name: name.to_string(),
+                state: state.to_string(),
+                workload_name: workload,
+                freshness_slo_ms: slo,
+                memory_limit_bytes: mem,
+                depends_on: deps,
+                stage_lag: lag,
+            }
+        };
+
         if let Some(name) = name {
             let v = self.get_view(name)?;
-            Ok(vec![ViewStatusInfo {
-                namespace: self.identity.namespace.clone(),
-                view_name: v.name,
-                state: v.state,
-                workload_name: v.workload,
-                freshness_slo_ms: v.freshness_slo_ms,
-                memory_limit_bytes: v.memory_limit_bytes,
-                depends_on: v.depends_on,
-            }])
+            Ok(vec![build_info(
+                &v.name,
+                &v.state,
+                v.workload,
+                v.freshness_slo_ms,
+                v.memory_limit_bytes,
+                v.depends_on,
+            )])
         } else {
             Ok(self
                 .views
                 .values()
-                .map(|v| ViewStatusInfo {
-                    namespace: self.identity.namespace.clone(),
-                    view_name: v.name.clone(),
-                    state: v.state.clone(),
-                    workload_name: v.workload.clone(),
-                    freshness_slo_ms: v.freshness_slo_ms,
-                    memory_limit_bytes: v.memory_limit_bytes,
-                    depends_on: v.depends_on.clone(),
+                .map(|v| {
+                    build_info(
+                        &v.name,
+                        &v.state,
+                        v.workload.clone(),
+                        v.freshness_slo_ms,
+                        v.memory_limit_bytes,
+                        v.depends_on.clone(),
+                    )
                 })
                 .collect())
         }

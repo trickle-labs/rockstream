@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
@@ -121,6 +121,8 @@ impl From<AlignmentError> for CoordinatorError {
 struct InProgressRound {
     checkpoint_id: CheckpointId,
     started_at: Instant,
+    /// Per-shard barrier arrival timestamps.
+    barrier_arrivals: BTreeMap<ShardId, u64>,
     /// Per-shard confirmations received so far.
     confirmations: BTreeMap<ShardId, PerShardCheckpoint>,
     /// Shards still pending confirmation.
@@ -247,6 +249,12 @@ impl CheckpointCoordinator {
 
         let barrier = CheckpointBarrier::new(checkpoint_id);
 
+        let injected_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        rockstream_types::metrics::set_barrier_injected_at(checkpoint_id.0, injected_at_ms);
+
         // Inject barrier into all source operators before recording in-progress
         // (so any failure in injection doesn't leave a dangling round).
         for &shard_id in &shards {
@@ -256,6 +264,7 @@ impl CheckpointCoordinator {
         guard.in_progress = Some(InProgressRound {
             checkpoint_id,
             started_at: Instant::now(),
+            barrier_arrivals: BTreeMap::new(),
             confirmations: BTreeMap::new(),
             pending: shards,
             credits_held: acquired,
@@ -264,6 +273,41 @@ impl CheckpointCoordinator {
         tracing::info!(checkpoint_id = checkpoint_id.0, "audit: checkpoint.started");
 
         Ok(checkpoint_id)
+    }
+
+    /// Record when a shard receives a checkpoint barrier across exchange channels.
+    ///
+    /// Updates flight time tracking and records metrics into `rockstream-types::metrics`.
+    pub fn record_shard_barrier_received(
+        &self,
+        shard_id: ShardId,
+        checkpoint_id: CheckpointId,
+        arrival_time_ms: u64,
+    ) -> Result<(), CoordinatorError> {
+        let mut guard = self.inner.lock();
+        let round = guard
+            .in_progress
+            .as_mut()
+            .ok_or(CoordinatorError::UnknownShard(shard_id))?;
+
+        if checkpoint_id != round.checkpoint_id {
+            return Err(CoordinatorError::StaleConfirmation {
+                shard_id,
+                expected: round.checkpoint_id,
+                got: checkpoint_id,
+            });
+        }
+        if !round.pending.contains(&shard_id) && !round.confirmations.contains_key(&shard_id) {
+            return Err(CoordinatorError::UnknownShard(shard_id));
+        }
+
+        round.barrier_arrivals.insert(shard_id, arrival_time_ms);
+        rockstream_types::metrics::record_shard_barrier_arrival(
+            checkpoint_id.0,
+            shard_id.0,
+            arrival_time_ms,
+        );
+        Ok(())
     }
 
     /// Record a per-shard checkpoint confirmation.
@@ -336,6 +380,12 @@ impl CheckpointCoordinator {
         }
 
         commit_manifest(&manifest)?;
+
+        let completed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        rockstream_types::metrics::record_checkpoint_completed(checkpoint_id.0, completed_at_ms);
 
         tracing::info!(
             checkpoint_id = checkpoint_id.0,
@@ -616,5 +666,38 @@ mod tests {
         );
         let min_id = committed.iter().map(|c| c.checkpoint_id.0).min().unwrap();
         assert!(min_id >= 3, "expected min_id ≥ 3 but got {min_id}");
+    }
+
+    #[test]
+    fn test_barrier_flight_time_tracking_in_coordinator() {
+        rockstream_types::metrics::reset_all();
+        let coord = CheckpointCoordinator::new(vec![ShardId(0), ShardId(1)]);
+
+        let id = coord.begin_checkpoint(noop_inject).unwrap();
+        assert_eq!(id.0, 1);
+
+        let inj = rockstream_types::metrics::read_barrier_flight_stats().barrier_injected_at_ms;
+
+        // Record shard barrier arrivals
+        coord
+            .record_shard_barrier_received(ShardId(0), id, inj + 15)
+            .unwrap();
+        coord
+            .record_shard_barrier_received(ShardId(1), id, inj + 35)
+            .unwrap();
+
+        // Checkpoint confirmations
+        coord
+            .record_shard_checkpoint(ShardId(0), PerShardCheckpoint::new(id, 100), noop_commit)
+            .unwrap();
+        let manifest = coord
+            .record_shard_checkpoint(ShardId(1), PerShardCheckpoint::new(id, 101), noop_commit)
+            .unwrap();
+        assert!(manifest.is_some());
+
+        let stats = rockstream_types::metrics::read_barrier_flight_stats();
+        assert_eq!(stats.last_checkpoint_id, 1);
+        assert_eq!(stats.barrier_flight_time_ms, 35);
+        assert!(stats.checkpoint_completion_time_ms >= stats.barrier_flight_time_ms);
     }
 }

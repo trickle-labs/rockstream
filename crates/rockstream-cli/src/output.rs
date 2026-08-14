@@ -144,6 +144,8 @@ pub struct ViewStatusInfo {
     pub freshness_slo_ms: Option<u64>,
     pub memory_limit_bytes: Option<u64>,
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub stage_lag: Option<rockstream_types::metrics::StageLagBreakdown>,
 }
 
 impl Formattable for Vec<ViewStatusInfo> {
@@ -153,13 +155,35 @@ impl Formattable for Vec<ViewStatusInfo> {
         }
         let mut lines = Vec::new();
         lines.push(format!(
-            "{:<15} {:<20} {:<15} {:<15} {:<15} {:<15} {:<20}",
-            "NAMESPACE", "VIEW", "STATE", "WORKLOAD", "SLO (MS)", "MEM LIMIT", "DEPENDS ON"
+            "{:<15} {:<20} {:<15} {:<15} {:<15} {:<15} {:<15} {:<20}",
+            "NAMESPACE",
+            "VIEW",
+            "STATE",
+            "WORKLOAD",
+            "SLO (MS)",
+            "MEM LIMIT",
+            "LAG (MS)",
+            "DEPENDS ON"
         ));
-        lines.push("-".repeat(120));
+        lines.push("-".repeat(135));
         for v in self.iter().take(CLI_OUTPUT_MAX_ROWS) {
+            let lag_str = if let Some(ref lag) = v.stage_lag {
+                format!(
+                    "{} (src:{} dec:{} cmp:{} aln:{} snk:{} spl:{} stg:{})",
+                    lag.total_lag_ms,
+                    lag.source_lag_ms,
+                    lag.decode_lag_ms,
+                    lag.compute_lag_ms,
+                    lag.alignment_lag_ms,
+                    lag.sink_lag_ms,
+                    lag.spill_lag_ms,
+                    lag.storage_pressure_ms
+                )
+            } else {
+                "-".to_string()
+            };
             lines.push(format!(
-                "{:<15} {:<20} {:<15} {:<15} {:<15} {:<15} {:<20}",
+                "{:<15} {:<20} {:<15} {:<15} {:<15} {:<15} {:<15} {:<20}",
                 v.namespace,
                 v.view_name,
                 v.state,
@@ -170,6 +194,7 @@ impl Formattable for Vec<ViewStatusInfo> {
                 v.memory_limit_bytes
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| "-".to_string()),
+                lag_str,
                 if v.depends_on.is_empty() {
                     "-".to_string()
                 } else {

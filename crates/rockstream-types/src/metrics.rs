@@ -20,6 +20,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lru::LruCache;
+use serde::{Deserialize, Serialize};
 
 use crate::ids::OperatorId;
 use crate::merge_law::MergeLawId;
@@ -27,6 +28,87 @@ use crate::merge_law::MergeLawId;
 const PIPELINE_STATE_BYTES_CAPACITY: usize = 256;
 pub const OPERATOR_STATS_WINDOW_SECS: u64 = 60;
 pub const OPERATOR_LATENCY_SAMPLES_PER_BUCKET: usize = 16;
+pub const MAX_STAGE_TIMESTAMPS_PER_VIEW: usize = 1024;
+pub const MAX_BARRIER_FLIGHT_SAMPLES: usize = 4096;
+pub const PUBLISHED_SUMMATION_TOLERANCE_MS: u64 = 5;
+
+/// High-resolution timestamp checkpoints for a batch progressing through the pipeline stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StageTimestamps {
+    pub t_source_ms: u64,
+    pub t_ingest_ms: u64,
+    pub t_decode_ms: u64,
+    pub t_compute_ms: u64,
+    pub t_align_ms: u64,
+    pub t_sink_ms: u64,
+    pub spill_delay_ms: u64,
+    pub storage_delay_ms: u64,
+}
+
+impl StageTimestamps {
+    pub fn compute_breakdown(&self) -> StageLagBreakdown {
+        let source_lag_ms = self.t_ingest_ms.saturating_sub(self.t_source_ms);
+        let decode_lag_ms = self.t_decode_ms.saturating_sub(self.t_ingest_ms);
+        let compute_lag_ms = self.t_compute_ms.saturating_sub(self.t_decode_ms);
+        let alignment_lag_ms = self.t_align_ms.saturating_sub(self.t_compute_ms);
+        let sink_lag_ms = self.t_sink_ms.saturating_sub(self.t_align_ms);
+        let spill_lag_ms = self.spill_delay_ms;
+        let storage_pressure_ms = self.storage_delay_ms;
+        let total_lag_ms =
+            self.t_sink_ms.saturating_sub(self.t_source_ms) + spill_lag_ms + storage_pressure_ms;
+
+        StageLagBreakdown {
+            source_lag_ms,
+            decode_lag_ms,
+            compute_lag_ms,
+            alignment_lag_ms,
+            sink_lag_ms,
+            spill_lag_ms,
+            storage_pressure_ms,
+            total_lag_ms,
+        }
+    }
+}
+
+/// Decomposed freshness lag breakdown across all pipeline stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StageLagBreakdown {
+    pub source_lag_ms: u64,
+    pub decode_lag_ms: u64,
+    pub compute_lag_ms: u64,
+    pub alignment_lag_ms: u64,
+    pub sink_lag_ms: u64,
+    pub spill_lag_ms: u64,
+    pub storage_pressure_ms: u64,
+    pub total_lag_ms: u64,
+}
+
+impl StageLagBreakdown {
+    pub fn sum_decomposed(&self) -> u64 {
+        self.source_lag_ms
+            + self.decode_lag_ms
+            + self.compute_lag_ms
+            + self.alignment_lag_ms
+            + self.sink_lag_ms
+            + self.spill_lag_ms
+            + self.storage_pressure_ms
+    }
+
+    pub fn is_within_tolerance(&self, tolerance_ms: u64) -> bool {
+        let sum = self.sum_decomposed();
+        (self.total_lag_ms as i64 - sum as i64).abs() <= tolerance_ms as i64
+    }
+}
+
+/// Barrier flight and checkpoint completion metrics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BarrierFlightStats {
+    pub barrier_injected_at_ms: u64,
+    pub barrier_flight_time_ms: u64,
+    pub checkpoint_completion_time_ms: u64,
+    pub last_checkpoint_id: u64,
+    pub samples_count: u64,
+}
 
 /// Key for a per-law metric bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -217,6 +299,16 @@ struct MetricRegistry {
     webhook_pending_size: AtomicU64,
     mtls_cn_cache_size: AtomicU64,
 
+    // Stage lag & Barrier flight metrics
+    view_stage_lags: HashMap<String, StageLagBreakdown>,
+    stage_timestamps: HashMap<String, Vec<StageTimestamps>>,
+    barrier_flight_samples: Vec<(u64, u64)>,
+    barrier_flight_time_ms: AtomicU64,
+    checkpoint_completion_time_ms: AtomicU64,
+    barrier_flight_injected_at_ms: AtomicU64,
+    barrier_flight_last_checkpoint_id: AtomicU64,
+    barrier_shard_arrivals: HashMap<(u64, u64), u64>,
+
     // Flush duration metrics
     flush_duration_sum_ms: AtomicU64,
     flush_duration_count: AtomicU64,
@@ -298,6 +390,14 @@ impl MetricRegistry {
             exchange_pool_clients_size: AtomicU64::new(0),
             webhook_pending_size: AtomicU64::new(0),
             mtls_cn_cache_size: AtomicU64::new(0),
+            view_stage_lags: HashMap::new(),
+            stage_timestamps: HashMap::new(),
+            barrier_flight_samples: Vec::new(),
+            barrier_flight_time_ms: AtomicU64::new(0),
+            checkpoint_completion_time_ms: AtomicU64::new(0),
+            barrier_flight_injected_at_ms: AtomicU64::new(0),
+            barrier_flight_last_checkpoint_id: AtomicU64::new(0),
+            barrier_shard_arrivals: HashMap::new(),
             flush_duration_sum_ms: AtomicU64::new(0),
             flush_duration_count: AtomicU64::new(0),
             flush_duration_last_ms: AtomicU64::new(0),
@@ -727,6 +827,17 @@ pub fn reset_all() {
         reg.exchange_pool_clients_size.store(0, Ordering::Relaxed);
         reg.webhook_pending_size.store(0, Ordering::Relaxed);
         reg.mtls_cn_cache_size.store(0, Ordering::Relaxed);
+        reg.view_stage_lags.clear();
+        reg.stage_timestamps.clear();
+        reg.barrier_flight_samples.clear();
+        reg.barrier_flight_time_ms.store(0, Ordering::Relaxed);
+        reg.checkpoint_completion_time_ms
+            .store(0, Ordering::Relaxed);
+        reg.barrier_flight_injected_at_ms
+            .store(0, Ordering::Relaxed);
+        reg.barrier_flight_last_checkpoint_id
+            .store(0, Ordering::Relaxed);
+        reg.barrier_shard_arrivals.clear();
         reg.flush_duration_sum_ms.store(0, Ordering::Relaxed);
         reg.flush_duration_count.store(0, Ordering::Relaxed);
         reg.flush_duration_last_ms.store(0, Ordering::Relaxed);
@@ -997,7 +1108,123 @@ pub fn set_freshness_lag(view_name: &str, lag_ms: u64) {
 }
 
 pub fn read_freshness_lag(view_name: &str) -> Option<u64> {
-    with_registry(|reg| reg.freshness_lag_ms.get(view_name).map(Counter::get))
+    with_registry(|reg| {
+        reg.view_stage_lags
+            .get(view_name)
+            .map(|l| l.total_lag_ms)
+            .or_else(|| reg.freshness_lag_ms.get(view_name).map(Counter::get))
+    })
+}
+
+pub fn set_view_stage_lag(view_name: &str, lag: StageLagBreakdown) {
+    with_registry(|reg| {
+        reg.view_stage_lags.insert(view_name.to_string(), lag);
+        let counter = reg
+            .freshness_lag_ms
+            .entry(view_name.to_string())
+            .or_insert_with(Counter::new);
+        counter.value.store(lag.total_lag_ms, Ordering::Relaxed);
+    });
+}
+
+pub fn read_view_stage_lag(view_name: &str) -> Option<StageLagBreakdown> {
+    with_registry(|reg| reg.view_stage_lags.get(view_name).copied())
+}
+
+pub fn record_stage_event(view_name: &str, timestamps: StageTimestamps) {
+    let breakdown = timestamps.compute_breakdown();
+    with_registry(|reg| {
+        let list = reg
+            .stage_timestamps
+            .entry(view_name.to_string())
+            .or_default();
+        if list.len() >= MAX_STAGE_TIMESTAMPS_PER_VIEW {
+            list.remove(0);
+        }
+        list.push(timestamps);
+        reg.view_stage_lags.insert(view_name.to_string(), breakdown);
+        let counter = reg
+            .freshness_lag_ms
+            .entry(view_name.to_string())
+            .or_insert_with(Counter::new);
+        counter
+            .value
+            .store(breakdown.total_lag_ms, Ordering::Relaxed);
+    });
+}
+
+pub fn read_stage_timestamps(view_name: &str) -> Vec<StageTimestamps> {
+    with_registry(|reg| {
+        reg.stage_timestamps
+            .get(view_name)
+            .cloned()
+            .unwrap_or_default()
+    })
+}
+
+pub fn set_barrier_injected_at(checkpoint_id: u64, injected_at_ms: u64) {
+    with_registry(|reg| {
+        reg.barrier_flight_last_checkpoint_id
+            .store(checkpoint_id, Ordering::Relaxed);
+        reg.barrier_flight_injected_at_ms
+            .store(injected_at_ms, Ordering::Relaxed);
+    });
+}
+
+pub fn record_shard_barrier_arrival(checkpoint_id: u64, shard_id: u64, arrival_ms: u64) {
+    with_registry(|reg| {
+        let injected_at = reg.barrier_flight_injected_at_ms.load(Ordering::Relaxed);
+        let flight_time = arrival_ms.saturating_sub(injected_at);
+        reg.barrier_shard_arrivals
+            .insert((checkpoint_id, shard_id), arrival_ms);
+        let current_max = reg.barrier_flight_time_ms.load(Ordering::Relaxed);
+        if flight_time > current_max || current_max == 0 {
+            reg.barrier_flight_time_ms
+                .store(flight_time, Ordering::Relaxed);
+        }
+    });
+}
+
+pub fn record_checkpoint_completed(checkpoint_id: u64, completed_at_ms: u64) {
+    with_registry(|reg| {
+        reg.barrier_flight_last_checkpoint_id
+            .store(checkpoint_id, Ordering::Relaxed);
+        let injected_at = reg.barrier_flight_injected_at_ms.load(Ordering::Relaxed);
+        let flight_time = reg.barrier_flight_time_ms.load(Ordering::Relaxed);
+        let completion_time = completed_at_ms.saturating_sub(injected_at).max(flight_time);
+        reg.checkpoint_completion_time_ms
+            .store(completion_time, Ordering::Relaxed);
+        if reg.barrier_flight_samples.len() >= MAX_BARRIER_FLIGHT_SAMPLES {
+            reg.barrier_flight_samples.remove(0);
+        }
+        reg.barrier_flight_samples
+            .push((flight_time, completion_time));
+    });
+}
+
+pub fn record_barrier_flight_sample(flight_ms: u64, completion_ms: u64) {
+    with_registry(|reg| {
+        reg.barrier_flight_time_ms
+            .store(flight_ms, Ordering::Relaxed);
+        reg.checkpoint_completion_time_ms
+            .store(completion_ms, Ordering::Relaxed);
+        if reg.barrier_flight_samples.len() >= MAX_BARRIER_FLIGHT_SAMPLES {
+            reg.barrier_flight_samples.remove(0);
+        }
+        reg.barrier_flight_samples.push((flight_ms, completion_ms));
+    });
+}
+
+pub fn read_barrier_flight_stats() -> BarrierFlightStats {
+    with_registry(|reg| BarrierFlightStats {
+        barrier_injected_at_ms: reg.barrier_flight_injected_at_ms.load(Ordering::Relaxed),
+        barrier_flight_time_ms: reg.barrier_flight_time_ms.load(Ordering::Relaxed),
+        checkpoint_completion_time_ms: reg.checkpoint_completion_time_ms.load(Ordering::Relaxed),
+        last_checkpoint_id: reg
+            .barrier_flight_last_checkpoint_id
+            .load(Ordering::Relaxed),
+        samples_count: reg.barrier_flight_samples.len() as u64,
+    })
 }
 
 pub fn set_cluster_worker_pressure(snapshot: &crate::topology::ClusterWorkerPressure) {
@@ -1273,6 +1500,10 @@ pub fn record_flush_duration(duration: std::time::Duration) {
         reg.flush_duration_count.fetch_add(1, Ordering::Relaxed);
         reg.flush_duration_last_ms.store(ms, Ordering::Relaxed);
     });
+}
+
+pub fn prometheus_text() -> String {
+    generate_prometheus_metrics()
 }
 
 pub fn generate_prometheus_metrics() -> String {
@@ -1671,6 +1902,101 @@ pub fn generate_prometheus_metrics() -> String {
             "mtls_cn_cache_size {}\n\n",
             reg.mtls_cn_cache_size.load(Ordering::Relaxed)
         ));
+
+        // ─── Stage Lag Decomposed Metrics ─────────────────────────────────────
+        out.push_str("# HELP view_freshness_lag_source_ms Gauge showing source watermark lag in milliseconds.\n");
+        out.push_str("# TYPE view_freshness_lag_source_ms gauge\n");
+        for (view_name, lag) in &reg.view_stage_lags {
+            out.push_str(&format!(
+                "view_freshness_lag_source_ms{{view_name=\"{}\"}} {}\n",
+                view_name, lag.source_lag_ms
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP view_freshness_lag_decode_ms Gauge showing decode and ingest buffer lag in milliseconds.\n");
+        out.push_str("# TYPE view_freshness_lag_decode_ms gauge\n");
+        for (view_name, lag) in &reg.view_stage_lags {
+            out.push_str(&format!(
+                "view_freshness_lag_decode_ms{{view_name=\"{}\"}} {}\n",
+                view_name, lag.decode_lag_ms
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP view_freshness_lag_compute_ms Gauge showing IVM delta compute execution lag in milliseconds.\n");
+        out.push_str("# TYPE view_freshness_lag_compute_ms gauge\n");
+        for (view_name, lag) in &reg.view_stage_lags {
+            out.push_str(&format!(
+                "view_freshness_lag_compute_ms{{view_name=\"{}\"}} {}\n",
+                view_name, lag.compute_lag_ms
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP view_freshness_lag_checkpoint_alignment_ms Gauge showing shard barrier alignment wait lag in milliseconds.\n");
+        out.push_str("# TYPE view_freshness_lag_checkpoint_alignment_ms gauge\n");
+        for (view_name, lag) in &reg.view_stage_lags {
+            out.push_str(&format!(
+                "view_freshness_lag_checkpoint_alignment_ms{{view_name=\"{}\"}} {}\n",
+                view_name, lag.alignment_lag_ms
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP view_freshness_lag_sink_commit_ms Gauge showing transactional sink staging and commit lag in milliseconds.\n");
+        out.push_str("# TYPE view_freshness_lag_sink_commit_ms gauge\n");
+        for (view_name, lag) in &reg.view_stage_lags {
+            out.push_str(&format!(
+                "view_freshness_lag_sink_commit_ms{{view_name=\"{}\"}} {}\n",
+                view_name, lag.sink_lag_ms
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP view_freshness_lag_spill_ms Gauge showing spill activity and storage paging delay in milliseconds.\n");
+        out.push_str("# TYPE view_freshness_lag_spill_ms gauge\n");
+        for (view_name, lag) in &reg.view_stage_lags {
+            out.push_str(&format!(
+                "view_freshness_lag_spill_ms{{view_name=\"{}\"}} {}\n",
+                view_name, lag.spill_lag_ms
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP view_freshness_lag_storage_pressure_ms Gauge showing object-store and compaction backpressure delay in milliseconds.\n");
+        out.push_str("# TYPE view_freshness_lag_storage_pressure_ms gauge\n");
+        for (view_name, lag) in &reg.view_stage_lags {
+            out.push_str(&format!(
+                "view_freshness_lag_storage_pressure_ms{{view_name=\"{}\"}} {}\n",
+                view_name, lag.storage_pressure_ms
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP view_freshness_lag_end_to_end_ms Gauge showing total end-to-end freshness lag in milliseconds.\n");
+        out.push_str("# TYPE view_freshness_lag_end_to_end_ms gauge\n");
+        for (view_name, lag) in &reg.view_stage_lags {
+            out.push_str(&format!(
+                "view_freshness_lag_end_to_end_ms{{view_name=\"{}\"}} {}\n",
+                view_name, lag.total_lag_ms
+            ));
+        }
+        out.push('\n');
+
+        out.push_str("# HELP checkpoint_barrier_flight_time_ms Gauge showing time from barrier injection until all shard operators receive barrier.\n");
+        out.push_str("# TYPE checkpoint_barrier_flight_time_ms gauge\n");
+        out.push_str(&format!(
+            "checkpoint_barrier_flight_time_ms {}\n\n",
+            reg.barrier_flight_time_ms.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP checkpoint_completion_time_ms Gauge showing time from barrier injection until all shard checkpoints commit.\n");
+        out.push_str("# TYPE checkpoint_completion_time_ms gauge\n");
+        out.push_str(&format!(
+            "checkpoint_completion_time_ms {}\n\n",
+            reg.checkpoint_completion_time_ms.load(Ordering::Relaxed)
+        ));
     });
     out
 }
@@ -1992,5 +2318,88 @@ mod tests {
         assert!(metrics.contains("scatter_shards_total 10"));
         assert!(metrics.contains("scatter_shards_pruned_total 9"));
         assert!(metrics.contains("shard_bloom_false_positive_total 1"));
+    }
+
+    #[test]
+    fn test_stage_lag_types_and_invariants() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        let ts = StageTimestamps {
+            t_source_ms: 1000,
+            t_ingest_ms: 1020,
+            t_decode_ms: 1025,
+            t_compute_ms: 1040,
+            t_align_ms: 1045,
+            t_sink_ms: 1060,
+            spill_delay_ms: 5,
+            storage_delay_ms: 2,
+        };
+
+        let breakdown = ts.compute_breakdown();
+        assert_eq!(breakdown.source_lag_ms, 20);
+        assert_eq!(breakdown.decode_lag_ms, 5);
+        assert_eq!(breakdown.compute_lag_ms, 15);
+        assert_eq!(breakdown.alignment_lag_ms, 5);
+        assert_eq!(breakdown.sink_lag_ms, 15);
+        assert_eq!(breakdown.spill_lag_ms, 5);
+        assert_eq!(breakdown.storage_pressure_ms, 2);
+        assert_eq!(breakdown.total_lag_ms, 67); // 60 + 5 + 2
+
+        assert_eq!(breakdown.sum_decomposed(), 67);
+        assert!(breakdown.is_within_tolerance(PUBLISHED_SUMMATION_TOLERANCE_MS));
+
+        record_stage_event("mv_orders", ts);
+        let stored = read_view_stage_lag("mv_orders").expect("stored stage lag");
+        assert_eq!(stored, breakdown);
+        assert_eq!(read_freshness_lag("mv_orders"), Some(67));
+
+        let timestamps = read_stage_timestamps("mv_orders");
+        assert_eq!(timestamps.len(), 1);
+        assert_eq!(timestamps[0], ts);
+    }
+
+    #[test]
+    fn test_metrics_prometheus_stage_lag_and_barrier_flight_units_monotonic() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        let lag = StageLagBreakdown {
+            source_lag_ms: 10,
+            decode_lag_ms: 4,
+            compute_lag_ms: 12,
+            alignment_lag_ms: 3,
+            sink_lag_ms: 8,
+            spill_lag_ms: 2,
+            storage_pressure_ms: 1,
+            total_lag_ms: 40,
+        };
+        set_view_stage_lag("active_users", lag);
+
+        set_barrier_injected_at(42, 5000);
+        record_shard_barrier_arrival(42, 0, 5015);
+        record_shard_barrier_arrival(42, 1, 5025);
+        record_checkpoint_completed(42, 5080);
+
+        let stats = read_barrier_flight_stats();
+        assert_eq!(stats.barrier_injected_at_ms, 5000);
+        assert_eq!(stats.barrier_flight_time_ms, 25);
+        assert_eq!(stats.checkpoint_completion_time_ms, 80);
+        assert_eq!(stats.last_checkpoint_id, 42);
+        assert_eq!(stats.samples_count, 1);
+
+        let metrics = generate_prometheus_metrics();
+        assert!(metrics.contains("view_freshness_lag_source_ms{view_name=\"active_users\"} 10"));
+        assert!(metrics.contains("view_freshness_lag_decode_ms{view_name=\"active_users\"} 4"));
+        assert!(metrics.contains("view_freshness_lag_compute_ms{view_name=\"active_users\"} 12"));
+        assert!(metrics
+            .contains("view_freshness_lag_checkpoint_alignment_ms{view_name=\"active_users\"} 3"));
+        assert!(metrics.contains("view_freshness_lag_sink_commit_ms{view_name=\"active_users\"} 8"));
+        assert!(metrics.contains("view_freshness_lag_spill_ms{view_name=\"active_users\"} 2"));
+        assert!(metrics
+            .contains("view_freshness_lag_storage_pressure_ms{view_name=\"active_users\"} 1"));
+        assert!(metrics.contains("view_freshness_lag_end_to_end_ms{view_name=\"active_users\"} 40"));
+        assert!(metrics.contains("checkpoint_barrier_flight_time_ms 25"));
+        assert!(metrics.contains("checkpoint_completion_time_ms 80"));
     }
 }

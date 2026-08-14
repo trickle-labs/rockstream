@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use rockstream_gateway::{
     catalog_stubs::{CatalogStubs, CatalogView},
     view_reader::{ViewReadStrategy, ViewReader},
@@ -72,6 +74,8 @@ async fn simple_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Opti
 
 #[tokio::test]
 async fn test_pgwire_show_view_status_all_views() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
     let catalog = CatalogStubs::new();
     let wl = WorkloadDef::new("analytics")
         .with_freshness_slo(FreshnessSlo::new(5000))
@@ -307,4 +311,107 @@ async fn test_pgwire_show_view_status_and_resource_usage() {
 
     let cluster_rows = simple_rows(&client, "SHOW CLUSTER RESOURCE USAGE;").await;
     assert_eq!(cluster_rows.len(), 1);
+}
+
+#[tokio::test]
+async fn test_pgwire_show_view_status_decomposed_lag_all_views() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let catalog = CatalogStubs::new();
+    let wl = WorkloadDef::new("realtime")
+        .with_freshness_slo(FreshnessSlo::new(1000))
+        .with_memory_limit(MemoryLimit::new(1048576));
+    catalog.add_workload(wl);
+    catalog.add_view(CatalogView {
+        name: "orders_mv".to_string(),
+        sql: "SELECT * FROM orders".to_string(),
+        columns: vec![],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+    catalog.assign_view_workload("orders_mv", "realtime");
+
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 12,
+        decode_lag_ms: 3,
+        compute_lag_ms: 25,
+        alignment_lag_ms: 4,
+        sink_lag_ms: 10,
+        spill_lag_ms: 2,
+        storage_pressure_ms: 1,
+        total_lag_ms: 57,
+    };
+    rockstream_types::metrics::set_view_stage_lag("orders_mv", lag);
+
+    let (addr, _handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+
+    let rows = simple_rows(&client, "SHOW VIEW STATUS;").await;
+    assert_eq!(rows.len(), 1);
+    let r = &rows[0];
+    assert_eq!(r[0].as_deref(), Some("public"));
+    assert_eq!(r[1].as_deref(), Some("orders_mv"));
+    assert_eq!(r[2].as_deref(), Some("RUNNING"));
+    assert_eq!(r[3].as_deref(), Some("realtime"));
+    assert_eq!(r[4].as_deref(), Some("1000"));
+    assert_eq!(r[5].as_deref(), Some("1048576"));
+    assert_eq!(r[6].as_deref(), Some("-"));
+    assert_eq!(r[7].as_deref(), Some("12")); // source_lag_ms
+    assert_eq!(r[8].as_deref(), Some("3")); // decode_lag_ms
+    assert_eq!(r[9].as_deref(), Some("25")); // compute_lag_ms
+    assert_eq!(r[10].as_deref(), Some("4")); // alignment_lag_ms
+    assert_eq!(r[11].as_deref(), Some("10")); // sink_lag_ms
+    assert_eq!(r[12].as_deref(), Some("2")); // spill_lag_ms
+    assert_eq!(r[13].as_deref(), Some("1")); // storage_pressure_ms
+    assert_eq!(r[14].as_deref(), Some("57")); // total_lag_ms
+}
+
+#[tokio::test]
+async fn test_pgwire_show_view_status_decomposed_lag_single_view() {
+    let _g = TEST_LOCK.lock().await;
+    rockstream_types::metrics::reset_all();
+    let catalog = CatalogStubs::new();
+    catalog.add_view(CatalogView {
+        name: "events_mv".to_string(),
+        sql: "SELECT * FROM events".to_string(),
+        columns: vec![],
+        namespace: "public".to_string(),
+        op_id: None,
+    });
+
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 5,
+        decode_lag_ms: 1,
+        compute_lag_ms: 8,
+        alignment_lag_ms: 2,
+        sink_lag_ms: 4,
+        spill_lag_ms: 0,
+        storage_pressure_ms: 0,
+        total_lag_ms: 20,
+    };
+    rockstream_types::metrics::set_view_stage_lag("events_mv", lag);
+
+    let (addr, _handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+
+    let rows = simple_rows(&client, "SHOW VIEW STATUS FOR events_mv;").await;
+    assert_eq!(rows.len(), 1);
+    let r = &rows[0];
+    assert_eq!(r[1].as_deref(), Some("events_mv"));
+    assert_eq!(r[7].as_deref(), Some("5"));
+    assert_eq!(r[8].as_deref(), Some("1"));
+    assert_eq!(r[9].as_deref(), Some("8"));
+    assert_eq!(r[10].as_deref(), Some("2"));
+    assert_eq!(r[11].as_deref(), Some("4"));
+    assert_eq!(r[12].as_deref(), Some("0"));
+    assert_eq!(r[13].as_deref(), Some("0"));
+    assert_eq!(r[14].as_deref(), Some("20"));
+
+    // Negative test: non-existent view returns RS-1001
+    let err = client
+        .simple_query("SHOW VIEW STATUS FOR nonexistent_view;")
+        .await
+        .unwrap_err();
+    let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
+    assert!(msg.contains("RS-1001"), "expected RS-1001 in error: {msg}");
 }

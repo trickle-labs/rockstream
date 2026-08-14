@@ -61,7 +61,7 @@ Inspect and control materialized view lifecycle, query contents, and subscribe t
 
 - `rockstream view list` — List all registered materialized views and their current execution state.
 - `rockstream view show <name>` — Show detailed view metadata, including definition query, assigned workload, and freshness SLO.
-- `rockstream view status [<name>]` — Show view lifecycle and freshness status (optionally filtered by view name).
+- `rockstream view status [<name>]` — Show view lifecycle, freshness SLO, memory limits, and per-stage lag breakdown (`source_lag_ms`, `decode_lag_ms`, `compute_lag_ms`, `alignment_lag_ms`, `sink_lag_ms`, `spill_lag_ms`, `storage_pressure_ms`, `total_lag_ms`).
 - `rockstream view pause <name> [--yes]` — Pause view maintenance and execution.
 - `rockstream view resume <name>` — Resume execution for a paused view.
 - `rockstream view query <name> [--limit <n>]` — Query current view contents with optional row limit.

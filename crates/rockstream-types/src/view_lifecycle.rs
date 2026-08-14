@@ -12,6 +12,7 @@
 //! provides progress detail for `SHOW BACKFILL STATUS FOR MATERIALIZED VIEW`.
 
 use crate::ids::NamespaceId;
+use crate::metrics::StageLagBreakdown;
 use crate::workload::WorkloadDef;
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +88,9 @@ pub struct ViewStatus {
     pub memory_limit_bytes: Option<u64>,
     /// Names of views and sources this view directly depends on.
     pub depends_on: Vec<String>,
+    /// Decomposed stage lag breakdown, if available.
+    #[serde(default)]
+    pub stage_lag: Option<StageLagBreakdown>,
 }
 
 impl ViewStatus {
@@ -106,7 +110,14 @@ impl ViewStatus {
             freshness_slo_ms: workload.and_then(|w| w.freshness_slo).map(|s| s.target_ms),
             memory_limit_bytes: workload.and_then(|w| w.memory_limit).map(|m| m.bytes),
             depends_on,
+            stage_lag: None,
         }
+    }
+
+    /// Attach stage lag breakdown to the view status.
+    pub fn with_stage_lag(mut self, stage_lag: StageLagBreakdown) -> Self {
+        self.stage_lag = Some(stage_lag);
+        self
     }
 }
 

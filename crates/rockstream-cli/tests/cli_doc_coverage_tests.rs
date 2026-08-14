@@ -115,4 +115,31 @@ fn test_docs_cli_conformance_and_coverage() {
         sre_content.contains("rockstream support bundle"),
         "docs/sre-operations.md must document `rockstream support bundle`"
     );
+
+    // Verify docs/metrics.md documents all stage lag and barrier flight metrics
+    let metrics_doc_path = root.join("docs/metrics.md");
+    let metrics_content = fs::read_to_string(&metrics_doc_path).unwrap_or_else(|_| {
+        panic!(
+            "docs/metrics.md must exist at {}",
+            metrics_doc_path.display()
+        )
+    });
+    let required_metrics = [
+        "view_freshness_lag_source_ms",
+        "view_freshness_lag_decode_ms",
+        "view_freshness_lag_compute_ms",
+        "view_freshness_lag_checkpoint_alignment_ms",
+        "view_freshness_lag_sink_commit_ms",
+        "view_freshness_lag_spill_ms",
+        "view_freshness_lag_storage_pressure_ms",
+        "view_freshness_lag_end_to_end_ms",
+        "checkpoint_barrier_flight_time_ms",
+        "checkpoint_completion_time_ms",
+    ];
+    for m in &required_metrics {
+        assert!(
+            metrics_content.contains(m),
+            "docs/metrics.md must document metric `{m}`"
+        );
+    }
 }

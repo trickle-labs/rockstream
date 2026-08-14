@@ -1146,6 +1146,43 @@ impl CatalogStubs {
                     .cloned()
                     .unwrap_or(ViewState::Running)
                     .to_string();
+                let stage_lag = rockstream_types::metrics::read_view_stage_lag(&v.name);
+                let (src_lag, dec_lag, cmp_lag, aln_lag, snk_lag, spl_lag, stg_lag, tot_lag) =
+                    if let Some(lag) = stage_lag {
+                        (
+                            lag.source_lag_ms.to_string(),
+                            lag.decode_lag_ms.to_string(),
+                            lag.compute_lag_ms.to_string(),
+                            lag.alignment_lag_ms.to_string(),
+                            lag.sink_lag_ms.to_string(),
+                            lag.spill_lag_ms.to_string(),
+                            lag.storage_pressure_ms.to_string(),
+                            lag.total_lag_ms.to_string(),
+                        )
+                    } else if let Some(tot) = rockstream_types::metrics::read_freshness_lag(&v.name)
+                    {
+                        (
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            tot.to_string(),
+                        )
+                    } else {
+                        (
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                            "0".to_string(),
+                        )
+                    };
                 vec![
                     Some(v.namespace),
                     Some(v.name),
@@ -1154,6 +1191,14 @@ impl CatalogStubs {
                     freshness_slo_ms,
                     memory_limit_bytes,
                     Some("-".to_string()),
+                    Some(src_lag),
+                    Some(dec_lag),
+                    Some(cmp_lag),
+                    Some(aln_lag),
+                    Some(snk_lag),
+                    Some(spl_lag),
+                    Some(stg_lag),
+                    Some(tot_lag),
                 ]
             })
             .collect();
@@ -2933,6 +2978,14 @@ pub(crate) fn view_status_columns() -> Vec<String> {
         "freshness_slo_ms".to_string(),
         "memory_limit_bytes".to_string(),
         "depends_on".to_string(),
+        "source_lag_ms".to_string(),
+        "decode_lag_ms".to_string(),
+        "compute_lag_ms".to_string(),
+        "alignment_lag_ms".to_string(),
+        "sink_lag_ms".to_string(),
+        "spill_lag_ms".to_string(),
+        "storage_pressure_ms".to_string(),
+        "total_lag_ms".to_string(),
     ]
 }
 

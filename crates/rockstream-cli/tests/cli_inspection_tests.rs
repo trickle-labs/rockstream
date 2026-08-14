@@ -623,3 +623,52 @@ fn test_cli_sql_compile_syntax_error_rs1012() {
     assert!(err.message.contains("SQL syntax error") || err.message.contains("syntax"));
     assert!(!err.next_steps.is_empty());
 }
+
+#[test]
+fn test_cli_view_status_text_with_lag_breakdown() {
+    let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+    rockstream_types::metrics::reset_all();
+    let catalog = CatalogClient::with_defaults();
+
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 10,
+        decode_lag_ms: 4,
+        compute_lag_ms: 12,
+        alignment_lag_ms: 3,
+        sink_lag_ms: 8,
+        spill_lag_ms: 2,
+        storage_pressure_ms: 1,
+        total_lag_ms: 40,
+    };
+    rockstream_types::metrics::set_view_stage_lag("active_users", lag);
+
+    let out_text = run_view_status(OutputFormat::Text, &catalog, Some("active_users")).unwrap();
+    assert!(out_text.contains("active_users"));
+    assert!(out_text.contains("LAG (MS)"));
+    assert!(out_text.contains("40 (src:10 dec:4 cmp:12 aln:3 snk:8 spl:2 stg:1)"));
+}
+
+#[test]
+fn test_cli_view_status_json_with_lag_breakdown() {
+    let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+    rockstream_types::metrics::reset_all();
+    let catalog = CatalogClient::with_defaults();
+
+    let lag = rockstream_types::metrics::StageLagBreakdown {
+        source_lag_ms: 10,
+        decode_lag_ms: 4,
+        compute_lag_ms: 12,
+        alignment_lag_ms: 3,
+        sink_lag_ms: 8,
+        spill_lag_ms: 2,
+        storage_pressure_ms: 1,
+        total_lag_ms: 40,
+    };
+    rockstream_types::metrics::set_view_stage_lag("active_users", lag);
+
+    let out_json = run_view_status(OutputFormat::Json, &catalog, Some("active_users")).unwrap();
+    let statuses: Vec<ViewStatusInfo> = serde_json::from_str(&out_json).unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].view_name, "active_users");
+    assert_eq!(statuses[0].stage_lag, Some(lag));
+}
