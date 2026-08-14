@@ -283,9 +283,9 @@ impl SessionWindowState {
 pub struct TumbleWindowOp {
     /// Output schema: [window_id: i64, ...input_cols...]
     pub schema: SchemaRef,
-    n_input_cols: usize,
-    time_col: usize,
-    window_size_ms: i64,
+    pub n_input_cols: usize,
+    pub time_col: usize,
+    pub window_size_ms: i64,
     late_data_policy: LateDataPolicy,
     state: Mutex<TumbleWindowState>,
     fill_level: Arc<AtomicUsize>,
@@ -673,10 +673,10 @@ impl Operator for TumbleWindowOp {
 pub struct HopWindowOp {
     /// Output schema: [window_id: i64, ...input_cols...]
     pub schema: SchemaRef,
-    n_input_cols: usize,
-    time_col: usize,
-    window_size_ms: i64,
-    slide_ms: i64,
+    pub n_input_cols: usize,
+    pub time_col: usize,
+    pub window_size_ms: i64,
+    pub slide_ms: i64,
     late_data_policy: LateDataPolicy,
     state: Mutex<HopWindowState>,
     fill_level: Arc<AtomicUsize>,
@@ -916,9 +916,9 @@ impl Operator for HopWindowOp {
 pub struct SessionWindowOp {
     /// Output schema: [session_start: i64, session_end: i64, ...input_cols...]
     pub schema: SchemaRef,
-    n_input_cols: usize,
-    time_col: usize,
-    gap_ms: i64,
+    pub n_input_cols: usize,
+    pub time_col: usize,
+    pub gap_ms: i64,
     late_data_policy: LateDataPolicy,
     state: Mutex<SessionWindowState>,
     fill_level: Arc<AtomicUsize>,

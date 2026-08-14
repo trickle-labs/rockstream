@@ -235,22 +235,22 @@ fn test_cli_all_subcommands_golden_text_and_json_schema() {
 
     // Explain & SQL
     assert!(
-        !run_explain_view(OutputFormat::Text, &catalog, "active_users", false)
+        !run_explain_view(OutputFormat::Text, &catalog, "active_users", false, false)
             .unwrap()
             .is_empty()
     );
     assert!(
-        !run_explain_view(OutputFormat::Json, &catalog, "active_users", false)
+        !run_explain_view(OutputFormat::Json, &catalog, "active_users", false, false)
             .unwrap()
             .is_empty()
     );
     assert!(
-        !run_explain_view(OutputFormat::Text, &catalog, "active_users", true)
+        !run_explain_view(OutputFormat::Text, &catalog, "active_users", true, false)
             .unwrap()
             .is_empty()
     );
     assert!(
-        !run_explain_view(OutputFormat::Json, &catalog, "active_users", true)
+        !run_explain_view(OutputFormat::Json, &catalog, "active_users", true, false)
             .unwrap()
             .is_empty()
     );

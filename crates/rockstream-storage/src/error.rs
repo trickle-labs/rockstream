@@ -40,6 +40,13 @@ pub enum StorageError {
     /// RS-3001: writer was fenced out by a newer writer.
     #[error("RS-3001: shard writer fenced out: lease lost")]
     Fenced,
+
+    /// RS-2006: historical epoch outside checkpoint retention window.
+    #[error("[RS-2006] Requested epoch {requested_epoch} is outside the retention window (minimum epoch: {min_retention_epoch})")]
+    EpochPruned {
+        requested_epoch: u64,
+        min_retention_epoch: u64,
+    },
 }
 
 impl From<slatedb::Error> for StorageError {

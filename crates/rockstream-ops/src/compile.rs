@@ -286,7 +286,7 @@ fn schema_all_int64(schema: &Schema) -> bool {
 /// wrongly compile, because a `Project` between `Aggregate` and `Source`
 /// fell back to `DataType::Int64` for any column whose type couldn't be
 /// statically determined against the (wrongly empty) schema.
-fn find_source_name(node: &PlanNode) -> Option<String> {
+pub(crate) fn find_source_name(node: &PlanNode) -> Option<String> {
     match node {
         PlanNode::Source { name } => Some(name.clone()),
         PlanNode::Filter { input, .. } => find_source_name(input),
@@ -305,18 +305,18 @@ fn find_source_name(node: &PlanNode) -> Option<String> {
 
 /// The result of successfully recognizing an `InnerJoin`/`OuterJoin`-shaped
 /// subtree — see `try_compile_join_shape`.
-struct JoinShape {
+pub(crate) struct JoinShape {
     /// Stateless stages applied to the left source's delta before the join.
-    left_pre: Vec<Stage>,
+    pub(crate) left_pre: Vec<Stage>,
     /// Stateless stages applied to the right source's delta before the join.
-    right_pre: Vec<Stage>,
-    join: JoinKind,
+    pub(crate) right_pre: Vec<Stage>,
+    pub(crate) join: JoinKind,
     /// Stateless stages applied to the join's output, in application order
     /// (closest-to-the-join stage first) — built bottom-up as the recursion
     /// unwinds back up to `ViewSink`.
-    post: Vec<Stage>,
-    left_source: String,
-    right_source: String,
+    pub(crate) post: Vec<Stage>,
+    pub(crate) left_source: String,
+    pub(crate) right_source: String,
     /// Running output column count after `post` (so far) is applied — the
     /// join's own `left_n_cols + right_n_cols` initially, updated by
     /// `Project`/`Aggregate`/`Window` wrapping arms as they change
@@ -451,7 +451,7 @@ fn compile_join_side(
 /// `compile_node` path (which will itself report `UnsupportedPlanNode` for
 /// anything neither path recognizes, with the same error text as before
 /// this slice).
-fn try_compile_join_shape(
+pub(crate) fn try_compile_join_shape(
     node: &PlanNode,
     table_schemas: &HashMap<String, SchemaRef>,
 ) -> Result<Option<JoinShape>, OpError> {
@@ -869,7 +869,7 @@ fn compile_multi_aggregate_lanes(
 
 /// Recursively compile `node` (everything under `ViewSink`) into an ordered
 /// list of `Stage`s, returning `(stages, output_schema)`.
-fn compile_node(
+pub(crate) fn compile_node(
     node: &PlanNode,
     source_schema: &SchemaRef,
 ) -> Result<(Vec<Stage>, SchemaRef), OpError> {

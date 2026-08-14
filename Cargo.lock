@@ -4953,6 +4953,7 @@ dependencies = [
  "object_store 0.12.5",
  "rockstream-control",
  "rockstream-gateway",
+ "rockstream-ops",
  "rockstream-plan",
  "rockstream-runtime",
  "rockstream-sql",

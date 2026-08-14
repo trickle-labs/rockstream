@@ -253,6 +253,50 @@ impl Stage {
         }
     }
 
+    /// OperatorId for this stage, if stateful.
+    pub fn op_id(&self) -> Option<OperatorId> {
+        match self {
+            Stage::Stateless(_) => None,
+            Stage::Aggregate(op) => Some(op.op_id),
+            Stage::MinMax(_, id) => Some(*id),
+            Stage::Distinct(_, id) => Some(*id),
+            Stage::TumbleWindow(_, id) => Some(*id),
+            Stage::HopWindow(_, id) => Some(*id),
+            Stage::SessionWindow(_, id) => Some(*id),
+            Stage::Window(_, id) => Some(*id),
+            Stage::TopK(_, id) => Some(*id),
+            Stage::KeyPack(_, id) => Some(*id),
+            Stage::KeyUnpack(_, id) => Some(*id),
+            Stage::Utf8KeyPack(_, id) => Some(*id),
+            Stage::Utf8KeyUnpack(_, id) => Some(*id),
+            Stage::Utf8ColumnPack(_, _, id) => Some(*id),
+            Stage::Utf8ColumnUnpack(_, _, id) => Some(*id),
+            Stage::MultiAggregate(_) => None,
+        }
+    }
+
+    /// Name of this stage's operator kind.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Stage::Stateless(_) => "Stateless",
+            Stage::Aggregate(_) => "Aggregate",
+            Stage::MinMax(_, _) => "MinMax",
+            Stage::Distinct(_, _) => "Distinct",
+            Stage::TumbleWindow(_, _) => "TumbleWindow",
+            Stage::HopWindow(_, _) => "HopWindow",
+            Stage::SessionWindow(_, _) => "SessionWindow",
+            Stage::Window(_, _) => "Window",
+            Stage::TopK(_, _) => "TopK",
+            Stage::KeyPack(_, _) => "KeyPack",
+            Stage::KeyUnpack(_, _) => "KeyUnpack",
+            Stage::Utf8KeyPack(_, _) => "Utf8KeyPack",
+            Stage::Utf8KeyUnpack(_, _) => "Utf8KeyUnpack",
+            Stage::Utf8ColumnPack(_, _, _) => "Utf8ColumnPack",
+            Stage::Utf8ColumnUnpack(_, _, _) => "Utf8ColumnUnpack",
+            Stage::MultiAggregate(_) => "MultiAggregate",
+        }
+    }
+
     async fn persist(&self, db: &ShardDb) -> Result<(), OpError> {
         match self {
             Stage::Stateless(_) => Ok(()),
@@ -394,6 +438,50 @@ impl GroupKeyPacker {
     /// Number of distinct key tuples interned so far (fill-level metric).
     pub fn entry_count(&self) -> usize {
         self.forward.lock().unwrap().len()
+    }
+
+    /// Number of key columns packed by this instance.
+    pub fn n_key_cols(&self) -> usize {
+        self.n_key_cols
+    }
+
+    /// Reverse-lookup surrogate i64 to original key values.
+    pub fn reverse_lookup(&self, surrogate: i64) -> Option<Vec<i64>> {
+        self.reverse.lock().unwrap().get(&surrogate).cloned()
+    }
+
+    /// Reverse-lookup surrogate i64 to original key array slices.
+    pub fn reverse_slices_lookup(&self, surrogate: i64) -> Option<Vec<ArrayRef>> {
+        self.reverse_slices.lock().unwrap().get(&surrogate).cloned()
+    }
+
+    /// Forward-lookup key values to surrogate i64 if already interned.
+    pub fn forward_lookup_vals(&self, vals: &[i64]) -> Option<i64> {
+        let mut encoded = Vec::with_capacity(vals.len() * 9);
+        for v in vals {
+            encoded.push(1);
+            encoded.extend_from_slice(&v.to_be_bytes());
+        }
+        self.forward.lock().unwrap().get(&encoded).copied()
+    }
+
+    /// Get or assign surrogate i64 for a slice of i64 values.
+    pub fn surrogate_for_vals(&self, vals: &[i64]) -> i64 {
+        let mut encoded = Vec::with_capacity(vals.len() * 9);
+        for v in vals {
+            encoded.push(1);
+            encoded.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut forward = self.forward.lock().unwrap();
+        if let Some(&id) = forward.get(&encoded) {
+            return id;
+        }
+        let mut next_id = self.next_id.lock().unwrap();
+        let id = *next_id;
+        *next_id += 1;
+        forward.insert(encoded, id);
+        self.reverse.lock().unwrap().insert(id, vals.to_vec());
+        id
     }
 
     /// Persist the surrogate-key intern table to `db` (v0.51.4 durability
@@ -745,6 +833,21 @@ impl Utf8KeyPacker {
         id
     }
 
+    /// Reverse-lookup surrogate i64 to original Utf8 key.
+    pub fn reverse_lookup(&self, surrogate: i64) -> Option<String> {
+        self.reverse.lock().unwrap().get(&surrogate).cloned()
+    }
+
+    /// Forward-lookup Utf8 key to surrogate i64 if already interned.
+    pub fn forward_lookup(&self, key: &str) -> Option<i64> {
+        self.forward.lock().unwrap().get(key).copied()
+    }
+
+    /// Get or assign surrogate i64 for a Utf8 key.
+    pub fn surrogate_for_key(&self, key: &str) -> i64 {
+        self.surrogate_for(key)
+    }
+
     /// `(k: Utf8, v: Int64)` rows → `(surrogate_k: Int64, v: Int64)` rows.
     pub fn pack(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
         let key_col = delta
@@ -880,6 +983,21 @@ impl Utf8ColumnPacker {
         forward.insert(key.to_string(), id);
         self.reverse.lock().unwrap().insert(id, key.to_string());
         id
+    }
+
+    /// Reverse-lookup surrogate i64 to original Utf8 value.
+    pub fn reverse_lookup(&self, surrogate: i64) -> Option<String> {
+        self.reverse.lock().unwrap().get(&surrogate).cloned()
+    }
+
+    /// Forward-lookup Utf8 value to surrogate i64 if already interned.
+    pub fn forward_lookup(&self, val: &str) -> Option<i64> {
+        self.forward.lock().unwrap().get(val).copied()
+    }
+
+    /// Get or assign surrogate i64 for a Utf8 value.
+    pub fn surrogate_for_val(&self, val: &str) -> i64 {
+        self.surrogate_for(val)
     }
 
     /// Replace column `col_idx` (must be `Utf8`) with its `Int64` surrogate.

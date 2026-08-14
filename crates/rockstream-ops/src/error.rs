@@ -129,6 +129,18 @@ pub enum OpError {
     /// `compile_plan` encountered a `PlanNode` shape it does not support.
     #[error("[{code}] Plan node not supported by the direct operator compiler: {kind}; next_steps: this query shape requires the DiffCtx/OpNode physical-plan path, not the v0.51.3 fast-path compiler")]
     UnsupportedPlanNode { kind: String, code: ErrorCode },
+
+    /// Operator not found in pipeline (v0.53.2 IVM arrangement debugger).
+    #[error("[{code}] Operator '{op_id}' not found in pipeline; next_steps: run rockstream explain <view> --op-ids to inspect available operator IDs for this view")]
+    OperatorNotFound { op_id: String, code: ErrorCode },
+
+    /// Arrangement key decoding failed or unsupported family (v0.53.2 IVM arrangement debugger).
+    #[error("[{code}] Arrangement key decoding failed for family '{family}': {detail}; next_steps: check arrangement key syntax or verify if the operator family key codec is supported")]
+    ArrangementKeyDecodeFailed {
+        family: String,
+        detail: String,
+        code: ErrorCode,
+    },
 }
 
 impl OpError {
@@ -288,6 +300,26 @@ impl OpError {
         Self::UnsupportedPlanNode {
             kind: kind.into(),
             code: RS_1013,
+        }
+    }
+
+    pub fn operator_not_found(op_id: impl Into<String>) -> Self {
+        use rockstream_types::error_code::RS_1020;
+        Self::OperatorNotFound {
+            op_id: op_id.into(),
+            code: RS_1020,
+        }
+    }
+
+    pub fn arrangement_key_decode_failed(
+        family: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        use rockstream_types::error_code::RS_1021;
+        Self::ArrangementKeyDecodeFailed {
+            family: family.into(),
+            detail: detail.into(),
+            code: RS_1021,
         }
     }
 }

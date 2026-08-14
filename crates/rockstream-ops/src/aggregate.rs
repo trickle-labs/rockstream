@@ -323,7 +323,7 @@ impl AggState {
 /// Uses interior mutability (`Mutex`) so it satisfies `Operator: &self`.
 pub struct AggregateOp {
     state: Mutex<AggState>,
-    op_id: OperatorId,
+    pub op_id: OperatorId,
 }
 
 impl AggregateOp {

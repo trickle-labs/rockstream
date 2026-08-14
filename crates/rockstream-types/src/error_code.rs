@@ -124,6 +124,10 @@ pub const RS_1018: ErrorCode = ErrorCode::new(1018);
 /// into an executable operator pipeline (v0.51.4 Slice 8 — there is no
 /// DataFusion-materializer fallback left to silently serve it from).
 pub const RS_1019: ErrorCode = ErrorCode::new(1019);
+/// Operator not found in pipeline (v0.53.2 IVM arrangement debugger).
+pub const RS_1020: ErrorCode = ErrorCode::new(1020);
+/// Arrangement key decoding failed or unsupported family (v0.53.2 IVM arrangement debugger).
+pub const RS_1021: ErrorCode = ErrorCode::new(1021);
 
 // 17xx: Lease management
 /// Shard is already leased by a different worker; acquire rejected (v0.29).
@@ -427,6 +431,8 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2405 => "auth.tls_config_invalid",
         2406 => "auth.mtls_connection_cap_exceeded",
         1014 => "workload.has_assigned_views",
+        1020 => "operator.not_found",
+        1021 => "arrangement.key_decode_failed",
         9001 => "admission_control.rejected",
         1731 => "control.not_leader",
         4001 => "source.connection_failed",
@@ -486,6 +492,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         1017 => "MIN/MAX multiset retraction underflow: value has no positive weight",
         1018 => "TopK buffer overflow: too many unique rows in a single partition",
         1019 => "View query could not be compiled into an executable operator pipeline",
+        1020 => "Operator not found in pipeline",
+        1021 => "Arrangement key decoding failed or unsupported",
         1512 => "Inner-frontier stall in distributed recursion; per-shard recompute triggered",
         1513 => "Distributed recursion max-iteration cap exceeded without convergence",
         3601 => "Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded",
@@ -653,6 +661,8 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1017 => "Ensure every retraction is matched by a prior insertion; check source event ordering and idempotency.",
         1018 => "Reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add more partition columns.",
         1019 => "Simplify the query to a supported shape (see docs/language-features.md), or reference only base tables — views over other views are not yet compiled.",
+        1020 => "Run rockstream explain <view> --op-ids to inspect available operator IDs for this view.",
+        1021 => "Check arrangement key syntax or verify if the operator family key codec is supported.",
         1512 => "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs.",
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
         1701 => "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead.",
@@ -799,6 +809,7 @@ mod tests {
             RS_1019, // v0.51.4 Slice 8 — CREATE VIEW compile-failure is a real error
             RS_2403, RS_2404, RS_2405, RS_2406, // v0.51.5-v0.51.26 gateway TLS/mTLS
             RS_2028, // v0.51.12 bounded late-data side-channel
+            RS_1020, RS_1021, // v0.53.2 IVM arrangement debugger
         ];
         for code in codes {
             assert_ne!(
@@ -816,6 +827,27 @@ mod tests {
                 "Code {code} has empty next steps"
             );
         }
+    }
+
+    #[test]
+    fn debugger_error_codes_registered() {
+        assert_eq!(RS_1020.value(), 1020);
+        assert_eq!(RS_1021.value(), 1021);
+
+        assert_eq!(slug(RS_1020), "operator.not_found");
+        assert_eq!(slug(RS_1021), "arrangement.key_decode_failed");
+
+        assert_eq!(description(RS_1020), "Operator not found in pipeline");
+        assert_eq!(
+            description(RS_1021),
+            "Arrangement key decoding failed or unsupported"
+        );
+
+        assert_eq!(severity(RS_1020), Severity::Error);
+        assert_eq!(severity(RS_1021), Severity::Error);
+
+        assert!(next_steps(RS_1020).contains("explain <view> --op-ids"));
+        assert!(next_steps(RS_1021).contains("key syntax"));
     }
 
     #[test]

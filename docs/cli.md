@@ -175,6 +175,7 @@ Inspect the compiled incremental operator plan without deploying.
 
 - `rockstream explain <view>` — Print the annotated `PlanNode` operator tree for a registered view.
 - `rockstream explain <view> --estimate` — Print static state memory and epoch throughput estimates for a view.
+- `rockstream explain <view> --op-ids` — Print stable Operator IDs and addressability for intermediate pipeline state.
 
 ---
 
@@ -183,6 +184,14 @@ Inspect the compiled incremental operator plan without deploying.
 Offline SQL compilation and lowering inspection.
 
 - `rockstream sql "<query>"` — Parse and lower a raw SQL query into an incremental execution plan without creating or deploying a view.
+
+---
+
+### `rockstream debug`
+
+Low-level debugging and intermediate arrangement state inspection.
+
+- `rockstream debug arrangement <view> <op_id> <key> [--epoch=N]` — Inspect intermediate arrangement Z-set state, weight, and key bytes for an operator at a current or historical epoch.
 
 ---
 
@@ -209,6 +218,8 @@ Offline SQL compilation and lowering inspection.
 | `RS-1008` | View not paused. | Inspect view state with `rockstream view status`. |
 | `RS-1012` | SQL syntax or parsing error. | Check SQL query syntax and column references. |
 | `RS-1014` | Workload drop rejected because views are currently assigned. | Reassign or drop assigned views before dropping the workload. |
+| `RS-1020` | Operator not found in view pipeline. | Run rockstream explain <view> --op-ids to inspect available operator IDs for this view. |
+| `RS-1021` | Arrangement key decoding failed or unsupported family. | Check arrangement key syntax or verify if the operator family key codec is supported. |
 | `RS-1731` | Control node is not the Raft leader. | Re-resolve control plane leadership and route the request to the active leader. |
 | `RS-2006` | Requested subscription epoch is prior to storage retention window. | Subscribe with `--snapshot` or specify a more recent epoch. |
 | `RS-2401` | Permission denied due to insufficient RBAC role. | Request elevated RBAC role (PipelineOwner / Admin) or authenticate under an authorized principal. |

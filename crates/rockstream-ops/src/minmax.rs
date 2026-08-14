@@ -218,8 +218,8 @@ impl MinMaxState {
 /// Output: two Int64 columns `(k, extremum_v)`.
 pub struct MinMaxOp {
     state: Mutex<MinMaxState>,
-    op_id: OperatorId,
-    kind: MinMaxKind,
+    pub op_id: OperatorId,
+    pub kind: MinMaxKind,
 }
 
 impl MinMaxOp {

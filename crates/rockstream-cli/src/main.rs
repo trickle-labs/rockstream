@@ -11,13 +11,14 @@ use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, St
 use rockstream_cli::{
     run_audit_query, run_audit_tail, run_checkpoint_list, run_checkpoint_restore,
     run_cluster_quotas, run_cluster_status, run_cluster_workers_drain, run_cluster_workers_list,
-    run_cluster_workers_status, run_explain_view, run_resource_cluster, run_resource_usage,
-    run_schema_create, run_schema_drop, run_schema_evolution_history, run_schema_evolution_status,
-    run_schema_list, run_schema_show, run_shard_list, run_shard_migrate, run_source_drop,
-    run_source_list, run_source_pause, run_source_resume, run_source_show, run_sql_compile,
-    run_start, run_support_bundle, run_view_list, run_view_pause, run_view_query, run_view_resume,
-    run_view_show, run_view_status, run_view_subscribe, run_workload_alter, run_workload_create,
-    run_workload_drop, run_workload_list, run_workload_show, StartOptions,
+    run_cluster_workers_status, run_debug_arrangement, run_explain_view, run_resource_cluster,
+    run_resource_usage, run_schema_create, run_schema_drop, run_schema_evolution_history,
+    run_schema_evolution_status, run_schema_list, run_schema_show, run_shard_list,
+    run_shard_migrate, run_source_drop, run_source_list, run_source_pause, run_source_resume,
+    run_source_show, run_sql_compile, run_start, run_support_bundle, run_view_list, run_view_pause,
+    run_view_query, run_view_resume, run_view_show, run_view_status, run_view_subscribe,
+    run_workload_alter, run_workload_create, run_workload_drop, run_workload_list,
+    run_workload_show, StartOptions,
 };
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
@@ -249,11 +250,35 @@ enum Command {
         /// Show static cost and state memory estimates without deploying.
         #[arg(long)]
         estimate: bool,
+        /// Show operator IDs and addressability details for intermediate state.
+        #[arg(long)]
+        op_ids: bool,
     },
     /// Parse, lower, and explain a SQL query without deploying.
     Sql {
         /// SQL query to parse and lower.
         query: String,
+    },
+    /// Low-level debugging and arrangement state inspection.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    /// Inspect intermediate arrangement Z-set state for an operator.
+    Arrangement {
+        /// View name to inspect.
+        view: String,
+        /// Operator ID to inspect.
+        op_id: String,
+        /// Key expression to inspect (e.g. "product_id=42", "category_id=5, region_id=10").
+        key: String,
+        /// Historical epoch to inspect (within retention window).
+        #[arg(long)]
+        epoch: Option<u64>,
     },
 }
 
@@ -870,12 +895,29 @@ fn main() -> ExitCode {
             };
             handle_result(res)
         }
-        Command::Explain { view, estimate } => {
+        Command::Explain {
+            view,
+            estimate,
+            op_ids,
+        } => {
             let _identity = ClientIdentity::default();
             let catalog = CatalogClient::with_defaults();
-            handle_result(run_explain_view(format, &catalog, &view, estimate))
+            handle_result(run_explain_view(format, &catalog, &view, estimate, op_ids))
         }
         Command::Sql { query } => handle_result(run_sql_compile(format, &query)),
+        Command::Debug { command } => {
+            let _identity = ClientIdentity::default();
+            let catalog = CatalogClient::with_defaults();
+            let res = match command {
+                DebugCommand::Arrangement {
+                    view,
+                    op_id,
+                    key,
+                    epoch,
+                } => run_debug_arrangement(format, &catalog, &view, &op_id, &key, epoch),
+            };
+            handle_result(res)
+        }
     }
 }
 

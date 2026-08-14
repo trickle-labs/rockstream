@@ -803,6 +803,54 @@ impl Formattable for SqlCompileInfo {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorKindInfo {
+    pub op_id: String,
+    pub kind: String,
+    pub details: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExplainOpIdInfo {
+    pub view_name: String,
+    pub query: String,
+    pub operators: Vec<OperatorKindInfo>,
+    pub formatted_text: String,
+}
+
+impl Formattable for ExplainOpIdInfo {
+    fn to_text(&self) -> String {
+        self.formatted_text.clone()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArrangementDebugInfo {
+    pub view_name: String,
+    pub op_id: String,
+    pub operator_kind: String,
+    pub details: String,
+    pub shard: String,
+    pub epoch: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_at: Option<String>,
+    pub user_key: String,
+    pub internal_key: String,
+    pub state: serde_json::Value,
+    pub weight: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_delta: Option<String>,
+    pub formatted_text: String,
+}
+
+impl Formattable for ArrangementDebugInfo {
+    fn to_text(&self) -> String {
+        self.formatted_text.clone()
+    }
+}
+
 // ─── Mutating Command Output Models ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -988,5 +1036,53 @@ impl Formattable for SupportBundleInfo {
             self.redacted_secrets_count,
             self.generated_at_ms
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_debugger_output_models_and_error_codes() {
+        let op_info = OperatorKindInfo {
+            op_id: "op-1001".to_string(),
+            kind: "Aggregate".to_string(),
+            details: "SUM(quantity) GROUP BY product_id".to_string(),
+            schema: Some("Int64, Int64".to_string()),
+        };
+        let explain_info = ExplainOpIdInfo {
+            view_name: "orders_mv".to_string(),
+            query: "SELECT product_id, SUM(quantity) FROM orders GROUP BY product_id".to_string(),
+            operators: vec![op_info],
+            formatted_text:
+                "VIEW orders_mv\n  op-1001: Aggregate (SUM(quantity) GROUP BY product_id)"
+                    .to_string(),
+        };
+        let rendered_text = render_output(&explain_info, OutputFormat::Text);
+        assert!(rendered_text.contains("op-1001"));
+        let rendered_json = render_output(&explain_info, OutputFormat::Json);
+        assert!(rendered_json.contains("\"op-1001\""));
+
+        let debug_info = ArrangementDebugInfo {
+            view_name: "orders_mv".to_string(),
+            op_id: "agg_op_3f2a".to_string(),
+            operator_kind: "Aggregate".to_string(),
+            details: "SUM(quantity) GROUP BY product_id".to_string(),
+            shard: "shard-07 (s3://bucket/shards/07/)".to_string(),
+            epoch: 1492,
+            committed_at: Some("2026-05-28T10:14:23Z".to_string()),
+            user_key: "product_id=42".to_string(),
+            internal_key: "0100000000000003f2a...".to_string(),
+            state: serde_json::json!({"sum_quantity": 1840, "row_count": 23}),
+            weight: 1,
+            last_delta: Some("epoch 1489  (+120 quantity, +3 rows)".to_string()),
+            formatted_text: "op_id: agg_op_3f2a\nkey: product_id=42\nweight: +1".to_string(),
+        };
+        let debug_text = render_output(&debug_info, OutputFormat::Text);
+        assert!(debug_text.contains("product_id=42"));
+        let debug_json = render_output(&debug_info, OutputFormat::Json);
+        assert!(debug_json.contains("\"agg_op_3f2a\""));
+        assert!(debug_json.contains("\"weight\": 1"));
     }
 }

@@ -3,22 +3,25 @@
 use std::fs;
 
 use rockstream_cli::output::{
-    render_output, CheckpointSummary, ClusterQuotasInfo, ClusterResourceUsageInfo,
-    ClusterStatusInfo, ExplainEstimateInfo, ExplainPlanInfo, OutputFormat, ResourceUsageInfo,
-    SchemaDetail, SchemaEvolutionHistoryInfo, SchemaEvolutionStatusInfo, ShardInfo, SourceDetail,
-    SqlCompileInfo, ViewDetail, ViewStatusInfo, ViewSummary, WorkerStatusInfo, WorkloadDetail,
-    AUDIT_TAIL_MAX_EVENTS,
+    render_output, ArrangementDebugInfo, CheckpointSummary, ClusterQuotasInfo,
+    ClusterResourceUsageInfo, ClusterStatusInfo, ExplainEstimateInfo, ExplainOpIdInfo,
+    ExplainPlanInfo, OutputFormat, ResourceUsageInfo, SchemaDetail, SchemaEvolutionHistoryInfo,
+    SchemaEvolutionStatusInfo, ShardInfo, SourceDetail, SqlCompileInfo, ViewDetail, ViewStatusInfo,
+    ViewSummary, WorkerStatusInfo, WorkloadDetail, AUDIT_TAIL_MAX_EVENTS,
 };
 use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
 use rockstream_cli::{
     run_audit_query, run_audit_tail, run_checkpoint_list, run_cluster_quotas, run_cluster_status,
-    run_cluster_workers_list, run_cluster_workers_status, run_explain_view, run_resource_cluster,
-    run_resource_usage, run_schema_evolution_history, run_schema_evolution_status, run_schema_list,
-    run_schema_show, run_shard_list, run_source_list, run_source_show, run_sql_compile,
-    run_view_list, run_view_show, run_view_status, run_workload_list, run_workload_show,
+    run_cluster_workers_list, run_cluster_workers_status, run_debug_arrangement, run_explain_view,
+    run_resource_cluster, run_resource_usage, run_schema_evolution_history,
+    run_schema_evolution_status, run_schema_list, run_schema_show, run_shard_list, run_source_list,
+    run_source_show, run_sql_compile, run_view_list, run_view_show, run_view_status,
+    run_workload_list, run_workload_show,
 };
 use rockstream_types::audit::AuditEvent;
-use rockstream_types::error_code::{RS_0004, RS_1001, RS_1005, RS_1012, RS_4009};
+use rockstream_types::error_code::{
+    RS_0004, RS_1001, RS_1005, RS_1012, RS_1020, RS_1021, RS_2006, RS_4009,
+};
 
 // ─── Slice 1: Transport Seam & Substrate Tests ──────────────────────────────
 
@@ -438,23 +441,23 @@ fn test_cli_explain_and_sql_offline_compilation_golden() {
 
     // 1. Explain view text
     let explain_text =
-        run_explain_view(OutputFormat::Text, &catalog, "active_users", false).unwrap();
+        run_explain_view(OutputFormat::Text, &catalog, "active_users", false, false).unwrap();
     assert!(explain_text.contains("Aggregate") || explain_text.contains("Source"));
 
     // 2. Explain view json
     let explain_json =
-        run_explain_view(OutputFormat::Json, &catalog, "active_users", false).unwrap();
+        run_explain_view(OutputFormat::Json, &catalog, "active_users", false, false).unwrap();
     let plan_info: ExplainPlanInfo = serde_json::from_str(&explain_json).unwrap();
     assert_eq!(plan_info.view_name, "active_users");
     assert!(!plan_info.plan.is_empty());
 
     // 3. Explain view estimate text & json
     let estimate_text =
-        run_explain_view(OutputFormat::Text, &catalog, "active_users", true).unwrap();
+        run_explain_view(OutputFormat::Text, &catalog, "active_users", true, false).unwrap();
     assert!(estimate_text.contains("Operator") || estimate_text.contains("state_bytes"));
 
     let estimate_json =
-        run_explain_view(OutputFormat::Json, &catalog, "active_users", true).unwrap();
+        run_explain_view(OutputFormat::Json, &catalog, "active_users", true, false).unwrap();
     let est_info: ExplainEstimateInfo = serde_json::from_str(&estimate_json).unwrap();
     assert_eq!(est_info.view_name, "active_users");
     assert!(!est_info.estimates.is_empty());
@@ -483,8 +486,14 @@ fn test_cli_explain_and_sql_offline_compilation_golden() {
 #[test]
 fn test_cli_explain_view_not_found_rs1001() {
     let catalog = CatalogClient::with_defaults();
-    let err =
-        run_explain_view(OutputFormat::Text, &catalog, "nonexistent_view", false).unwrap_err();
+    let err = run_explain_view(
+        OutputFormat::Text,
+        &catalog,
+        "nonexistent_view",
+        false,
+        false,
+    )
+    .unwrap_err();
     assert_eq!(err.code, RS_1001);
     assert!(err.message.contains("nonexistent_view"));
     assert!(!err.next_steps.is_empty());
@@ -493,9 +502,118 @@ fn test_cli_explain_view_not_found_rs1001() {
 #[test]
 fn test_cli_explain_view_estimate_not_found() {
     let catalog = CatalogClient::with_defaults();
-    let err = run_explain_view(OutputFormat::Text, &catalog, "nonexistent_view", true).unwrap_err();
+    let err = run_explain_view(
+        OutputFormat::Text,
+        &catalog,
+        "nonexistent_view",
+        true,
+        false,
+    )
+    .unwrap_err();
     assert_eq!(err.code, RS_1001);
     assert!(err.message.contains("nonexistent_view"));
+}
+
+#[test]
+fn test_cli_explain_view_op_ids_text_and_json() {
+    let catalog = CatalogClient::with_defaults();
+
+    // 1. Text format
+    let text = run_explain_view(OutputFormat::Text, &catalog, "active_users", false, true).unwrap();
+    assert!(text.contains("VIEW  active_users"));
+    assert!(text.contains("OPERATORS:"));
+    assert!(text.contains("Aggregate") || text.contains("ViewSink"));
+
+    // 2. JSON format
+    let json = run_explain_view(OutputFormat::Json, &catalog, "active_users", false, true).unwrap();
+    let info: ExplainOpIdInfo = serde_json::from_str(&json).unwrap();
+    assert_eq!(info.view_name, "active_users");
+    assert!(!info.operators.is_empty());
+    assert!(info.operators.iter().any(|op| !op.op_id.is_empty()));
+}
+
+#[test]
+fn test_cli_debug_arrangement_command_e2e() {
+    let catalog = CatalogClient::with_defaults();
+
+    // Get an op_id from explain --op-ids
+    let json = run_explain_view(OutputFormat::Json, &catalog, "active_users", false, true).unwrap();
+    let explain: ExplainOpIdInfo = serde_json::from_str(&json).unwrap();
+    let op = explain
+        .operators
+        .iter()
+        .find(|o| o.kind == "Aggregate")
+        .unwrap();
+
+    // 1. Debug arrangement text
+    let text = run_debug_arrangement(
+        OutputFormat::Text,
+        &catalog,
+        "active_users",
+        &op.op_id,
+        "product_id=42",
+        Some(1492),
+    )
+    .unwrap();
+    assert!(text.contains(&op.op_id));
+    assert!(text.contains("shard-07"));
+    assert!(text.contains("product_id=42"));
+    assert!(text.contains("weight:      +1"));
+
+    // 2. Debug arrangement json
+    let json = run_debug_arrangement(
+        OutputFormat::Json,
+        &catalog,
+        "active_users",
+        &op.op_id,
+        "product_id=42",
+        Some(1492),
+    )
+    .unwrap();
+    let debug: ArrangementDebugInfo = serde_json::from_str(&json).unwrap();
+    assert_eq!(debug.view_name, "active_users");
+    assert_eq!(debug.op_id, op.op_id);
+    assert_eq!(debug.epoch, 1492);
+    assert_eq!(debug.weight, 1);
+
+    // 3. Negative test: Unknown op_id -> RS_1020
+    let err_op = run_debug_arrangement(
+        OutputFormat::Text,
+        &catalog,
+        "active_users",
+        "op-999999999999",
+        "product_id=42",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err_op.code, RS_1020);
+    assert!(err_op.message.contains("op-999999999999"));
+    assert!(err_op.next_steps.contains("rockstream explain"));
+
+    // 4. Negative test: Epoch pruned (< 10) -> RS_2006
+    let err_epoch = run_debug_arrangement(
+        OutputFormat::Text,
+        &catalog,
+        "active_users",
+        &op.op_id,
+        "product_id=42",
+        Some(5),
+    )
+    .unwrap_err();
+    assert_eq!(err_epoch.code, RS_2006);
+    assert!(err_epoch.message.contains("outside the retention window"));
+
+    // 5. Negative test: Unparseable key -> RS_1021
+    let err_key = run_debug_arrangement(
+        OutputFormat::Text,
+        &catalog,
+        "active_users",
+        &op.op_id,
+        "invalid, key, format",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err_key.code, RS_1021);
 }
 
 #[test]

@@ -17,6 +17,7 @@
 pub mod aggregate;
 pub mod bench_regression;
 pub mod compile;
+pub mod debugger;
 pub mod distinct;
 pub mod embedded;
 pub mod error;
@@ -55,6 +56,10 @@ pub use aggregate::{
     AggregateOp, BucketedAggregateOp,
 };
 pub use compile::{compile_plan, compile_plan_with_sink_id, CompiledView};
+pub use debugger::{
+    decode_user_key, explain_view_op_ids, format_explain_op_ids, inspect_arrangement_db,
+    inspect_arrangement_reader, ArrangementDebugResult, DecodedArrangementKey, OperatorNodeInfo,
+};
 pub use distinct::{
     load_distinct_state, persist_distinct_state, DistinctOp, DualArrangement, ExceptOp, IntersectOp,
 };

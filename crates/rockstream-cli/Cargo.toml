@@ -24,6 +24,7 @@ object_store = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 rockstream-sql = { workspace = true }
+rockstream-ops = { workspace = true }
 rockstream-plan = { workspace = true }
 arrow = { workspace = true }
 serde = { workspace = true }

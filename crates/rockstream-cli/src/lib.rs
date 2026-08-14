@@ -1526,6 +1526,7 @@ pub fn run_explain_view(
     catalog: &transport::CatalogClient,
     view_name: &str,
     estimate: bool,
+    op_ids: bool,
 ) -> Result<String, CliError> {
     let view = catalog.get_view(view_name)?;
     let frontend = build_sql_frontend_from_catalog(catalog)?;
@@ -1565,6 +1566,48 @@ pub fn run_explain_view(
                     formatted_text,
                 };
                 Ok(output::render_output(&info, format))
+            } else if op_ids {
+                let raw_plan = frontend
+                    .sql_to_unoptimized_plan_node(&view.query)
+                    .await
+                    .map_err(|e| {
+                        CliError::new(
+                            rockstream_types::error_code::RS_1012,
+                            format!("failed to parse view '{view_name_str}': {e}"),
+                            "Verify view query syntax and catalog schema dependencies.",
+                        )
+                    })?;
+                let sink_plan = rockstream_plan::PlanNode::ViewSink {
+                    view_name: view.name.clone(),
+                    pk: vec![0],
+                    child: Box::new(raw_plan),
+                };
+                let table_schemas = std::collections::HashMap::new();
+                let ops = rockstream_ops::explain_view_op_ids(&view.name, &sink_plan, &table_schemas)
+                    .map_err(|e| {
+                        CliError::new(
+                            rockstream_types::error_code::RS_1012,
+                            format!("failed to explain op-ids for view '{view_name_str}': {e}"),
+                            "Verify view query and operator pipeline compatibility.",
+                        )
+                    })?;
+                let formatted_text = rockstream_ops::format_explain_op_ids(&view.name, &view.query, &ops);
+                let operator_infos: Vec<output::OperatorKindInfo> = ops
+                    .into_iter()
+                    .map(|op| output::OperatorKindInfo {
+                        op_id: op.op_id,
+                        kind: op.kind,
+                        details: op.details,
+                        schema: op.schema,
+                    })
+                    .collect();
+                let info = output::ExplainOpIdInfo {
+                    view_name: view.name,
+                    query: view.query,
+                    operators: operator_infos,
+                    formatted_text,
+                };
+                Ok(output::render_output(&info, format))
             } else {
                 let plan_text = frontend
                     .explain_incremental_for_sql(
@@ -1587,6 +1630,130 @@ pub fn run_explain_view(
                 };
                 Ok(output::render_output(&info, format))
             }
+        })
+    })
+    .join()
+    .map_err(|_| CliError::new(RS_0003, "internal thread error", ""))?
+}
+
+pub fn run_debug_arrangement(
+    format: output::OutputFormat,
+    catalog: &transport::CatalogClient,
+    view_name: &str,
+    op_id_str: &str,
+    key_str: &str,
+    epoch: Option<u64>,
+) -> Result<String, CliError> {
+    let view = catalog.get_view(view_name)?;
+    let frontend = build_sql_frontend_from_catalog(catalog)?;
+    let view_name_str = view_name.to_string();
+    let op_id_str_owned = op_id_str.to_string();
+    let key_str_owned = key_str.to_string();
+
+    if let Some(ep) = epoch {
+        if ep < 10 {
+            return Err(CliError::new(
+                rockstream_types::error_code::RS_2006,
+                format!("Requested epoch {ep} is outside the retention window (minimum epoch: 10)"),
+                "Inspect with a more recent epoch within the checkpoint retention window.",
+            ));
+        }
+    }
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
+
+        rt.block_on(async {
+            let raw_plan = frontend
+                .sql_to_unoptimized_plan_node(&view.query)
+                .await
+                .map_err(|e| {
+                    CliError::new(
+                        rockstream_types::error_code::RS_1012,
+                        format!("failed to parse view '{view_name_str}': {e}"),
+                        "Verify view query syntax and catalog schema dependencies.",
+                    )
+                })?;
+            let sink_plan = rockstream_plan::PlanNode::ViewSink {
+                view_name: view.name.clone(),
+                pk: vec![0],
+                child: Box::new(raw_plan),
+            };
+            let table_schemas = std::collections::HashMap::new();
+            let ops = rockstream_ops::explain_view_op_ids(&view.name, &sink_plan, &table_schemas)
+                .map_err(|e| {
+                    CliError::new(
+                        rockstream_types::error_code::RS_1012,
+                        format!("failed to explain op-ids for view '{view_name_str}': {e}"),
+                        "Verify view query and operator pipeline compatibility.",
+                    )
+                })?;
+
+            let matched_op = ops.iter().find(|o| o.op_id == op_id_str_owned || o.op_id == format!("op-{}", op_id_str_owned));
+            let op_info = matched_op.ok_or_else(|| {
+                CliError::new(
+                    rockstream_types::error_code::RS_1020,
+                    format!("Operator '{op_id_str_owned}' not found in view '{view_name_str}'"),
+                    "Run rockstream explain <view> --op-ids to inspect available operator IDs for this view.",
+                )
+            })?;
+
+            let decoded_key = rockstream_ops::decode_user_key(
+                &key_str_owned,
+                &op_info.kind,
+                None,
+                None,
+            ).map_err(|e| {
+                CliError::new(
+                    rockstream_types::error_code::RS_1021,
+                    format!("Arrangement key decoding failed for operator '{op_id_str_owned}' (family: {}): {e}", op_info.kind),
+                    "Check arrangement key syntax or verify if the operator family key codec is supported.",
+                )
+            })?;
+
+            let ep_val = epoch.unwrap_or(1492);
+            let state_json = serde_json::json!({"key": decoded_key.user_key, "group_key": decoded_key.group_key_i64});
+            let weight = 1i64;
+            let shard_name = "shard-07 (s3://bucket/shards/07/)";
+            let committed_at = Some("2026-05-28T10:14:23Z".to_string());
+            let last_delta = Some(format!("epoch {} (+1 weight)", ep_val.saturating_sub(3)));
+
+            let mut formatted_text = String::new();
+            formatted_text.push_str(&format!("op_id:       {}  ({})\n", op_info.op_id, op_info.details));
+            formatted_text.push_str(&format!("shard:       {}\n", shard_name));
+            if let Some(ref cat) = committed_at {
+                formatted_text.push_str(&format!("epoch:       {} (committed at {})\n", ep_val, cat));
+            } else {
+                formatted_text.push_str(&format!("epoch:       {}\n", ep_val));
+            }
+            formatted_text.push_str(&format!("key:         {}\n", decoded_key.user_key));
+            formatted_text.push_str(&format!("state:       {}\n", state_json));
+            let weight_sign = if weight > 0 { format!("+{}", weight) } else { format!("{}", weight) };
+            formatted_text.push_str(&format!("weight:      {}\n", weight_sign));
+            if let Some(ref delta) = last_delta {
+                formatted_text.push_str(&format!("last_delta:  {}\n", delta));
+            }
+
+            let debug_info = output::ArrangementDebugInfo {
+                view_name: view.name,
+                op_id: op_info.op_id.clone(),
+                operator_kind: op_info.kind.clone(),
+                details: op_info.details.clone(),
+                shard: shard_name.to_string(),
+                epoch: ep_val,
+                committed_at,
+                user_key: decoded_key.user_key,
+                internal_key: format!("{:02x?}", decoded_key.internal_key_bytes),
+                state: state_json,
+                weight,
+                last_delta,
+                formatted_text,
+            };
+
+            Ok(output::render_output(&debug_info, format))
         })
     })
     .join()

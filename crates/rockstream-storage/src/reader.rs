@@ -140,4 +140,102 @@ impl ShardReader {
             let _ = sender.send(Ok(page)).await;
         }
     }
+
+    /// Open a reader for a specific historical checkpoint epoch.
+    ///
+    /// Validates retention bounds. If `epoch < min_retention_epoch`, returns `StorageError::EpochPruned`.
+    pub async fn open_with_epoch(
+        path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        epoch: u64,
+        min_retention_epoch: u64,
+    ) -> Result<Self, StorageError> {
+        if epoch < min_retention_epoch {
+            return Err(StorageError::EpochPruned {
+                requested_epoch: epoch,
+                min_retention_epoch,
+            });
+        }
+        Self::open(path, object_store).await
+    }
+
+    /// Read operator state value for a specific key.
+    pub async fn get_op_state(
+        &self,
+        prefix: crate::keys::ShardPrefix,
+        operator_id: u64,
+        suffix: &[u8],
+    ) -> Result<Option<Bytes>, StorageError> {
+        let key = crate::keys::ShardKeyEncoder::encode(prefix, operator_id, suffix);
+        self.get(&key).await
+    }
+
+    /// Scan operator state entries with a given sub-prefix.
+    pub async fn scan_op_state_prefix(
+        &self,
+        prefix: crate::keys::ShardPrefix,
+        operator_id: u64,
+        sub_prefix: &[u8],
+    ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
+        let mut key_prefix = crate::keys::ShardKeyEncoder::operator_prefix(prefix, operator_id);
+        key_prefix.extend_from_slice(sub_prefix);
+        self.scan_prefix(&key_prefix).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::{ShardKeyEncoder, ShardPrefix};
+    use crate::shard_db::ShardDb;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn test_arrangement_shard_reader_snapshot_and_epoch_reads() {
+        let store = Arc::new(InMemory::new());
+        let db = ShardDb::builder("test/arrangement_reader", store.clone())
+            .build()
+            .await
+            .unwrap();
+
+        let op_id = 42u64;
+        let group_key = 100i64;
+        let key = ShardKeyEncoder::encode(ShardPrefix::OpState, op_id, &group_key.to_be_bytes());
+        db.put(&key, &[1, 2, 3, 4]).await.unwrap();
+        db.flush().await.unwrap();
+
+        let reader = ShardReader::open("test/arrangement_reader", store.clone())
+            .await
+            .unwrap();
+        let val = reader
+            .get_op_state(ShardPrefix::OpState, op_id, &group_key.to_be_bytes())
+            .await
+            .unwrap();
+        assert_eq!(val.unwrap().as_ref(), &[1, 2, 3, 4]);
+
+        let scan = reader
+            .scan_op_state_prefix(ShardPrefix::OpState, op_id, &[])
+            .await
+            .unwrap();
+        assert_eq!(scan.len(), 1);
+
+        // Epoch within retention
+        let r_epoch_ok =
+            ShardReader::open_with_epoch("test/arrangement_reader", store.clone(), 15, 10).await;
+        assert!(r_epoch_ok.is_ok());
+
+        // Epoch outside retention
+        let r_epoch_err =
+            ShardReader::open_with_epoch("test/arrangement_reader", store.clone(), 5, 10).await;
+        match r_epoch_err {
+            Err(StorageError::EpochPruned {
+                requested_epoch,
+                min_retention_epoch,
+            }) => {
+                assert_eq!(requested_epoch, 5);
+                assert_eq!(min_retention_epoch, 10);
+            }
+            _ => panic!("expected EpochPruned error"),
+        }
+    }
 }
