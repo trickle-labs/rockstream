@@ -198,9 +198,13 @@ async fn wait_for_lease(addr: SocketAddr, worker_id: u64, shard_id: u64) -> Shar
 }
 
 async fn exec_drain(control_addr: SocketAddr, worker_id: u64) {
-    rockstream_cli::request_worker_drain_async(&control_addr.to_string(), worker_id)
-        .await
-        .unwrap();
+    let _ = send(
+        control_addr,
+        &WorkerMessage::RequestDrain {
+            worker_id: WorkerId(worker_id),
+        },
+    )
+    .await;
 }
 
 #[tokio::test]

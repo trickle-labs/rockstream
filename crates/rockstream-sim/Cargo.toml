@@ -22,7 +22,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-rockstream-cli = { workspace = true }
 rockstream-test-support.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 rockstream-oracle = { path = "../rockstream-oracle" }

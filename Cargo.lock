@@ -5307,7 +5307,6 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "reqwest",
- "rockstream-cli",
  "rockstream-connectors",
  "rockstream-control",
  "rockstream-docgen",

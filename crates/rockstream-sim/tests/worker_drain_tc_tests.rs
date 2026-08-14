@@ -212,9 +212,13 @@ async fn drain_completes_zero_downtime_tc() {
             .worker_id,
         WorkerId(1)
     );
-    rockstream_cli::request_worker_drain_async(&cluster.control_addr.to_string(), 1)
-        .await
-        .unwrap();
+    let _ = send(
+        cluster.control_addr,
+        &WorkerMessage::RequestDrain {
+            worker_id: WorkerId(1),
+        },
+    )
+    .await;
     for _ in 0..20 {
         let replies = send(cluster.control_addr, &WorkerMessage::ClusterStatusQuery).await;
         assert!(matches!(
