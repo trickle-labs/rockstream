@@ -1292,9 +1292,6 @@ impl PostgresCdcSource {
                 }
                 _ => {}
             }
-            if lsn <= after {
-                continue;
-            }
             if let Some(change) = decode_native_pgoutput_text_message(
                 &mut pgoutput.relations,
                 self.schema.fields().len(),
