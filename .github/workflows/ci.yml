@@ -51,6 +51,8 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::uninlined_format_args
+      - name: build TestContainers image
+        run: docker build -t rockstream-tc-test:latest .
       - name: cargo test
         env:
           ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER: "1"
@@ -227,6 +229,8 @@ jobs:
         run: docker build -t rockstream-tc-test:latest .
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: build TestContainers image
+        run: docker build -t rockstream-tc-test:latest .
       - name: cargo llvm-cov (workspace lcov)
         env:
           CARGO_BUILD_JOBS: "2"
