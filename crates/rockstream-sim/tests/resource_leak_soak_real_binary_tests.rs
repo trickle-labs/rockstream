@@ -486,8 +486,17 @@ async fn run_soak(inject_teardown_leak: bool, use_minio: bool) {
     let mut elapsed_secs = 0;
     let mut completed_cycles = 0_i64;
     loop {
-        if let Some(sampler) = sampler.as_mut() {
-            sampler.sample(elapsed_secs).unwrap();
+        if let Some(process_sampler) = sampler.as_mut() {
+            match process_sampler.sample(elapsed_secs) {
+                Ok(()) => {}
+                Err(rockstream_sim::ResourceGateError::ProcessRead { source, .. })
+                    if source.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    sampler = None;
+                    container_samples.push(sample_container_resources(&name, elapsed_secs));
+                }
+                Err(error) => panic!("real binary resource sample failed: {error}"),
+            }
         } else {
             container_samples.push(sample_container_resources(&name, elapsed_secs));
         }
@@ -580,18 +589,24 @@ async fn run_soak(inject_teardown_leak: bool, use_minio: bool) {
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_lfs_churn_is_flat() {
-    let _lock = SOAK_SERIALIZATION_LOCK.lock().unwrap();
+    let _lock = SOAK_SERIALIZATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     run_soak(false, false).await;
 }
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_minio_churn_is_flat() {
-    let _lock = SOAK_SERIALIZATION_LOCK.lock().unwrap();
+    let _lock = SOAK_SERIALIZATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     run_soak(false, true).await;
 }
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_injected_teardown_deregistration_leak_fails_gate() {
-    let _lock = SOAK_SERIALIZATION_LOCK.lock().unwrap();
+    let _lock = SOAK_SERIALIZATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     run_soak(true, false).await;
 }
