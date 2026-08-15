@@ -545,6 +545,7 @@ mod tests {
 
     #[test]
     fn begin_checkpoint_returns_first_id() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0, 1]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
         assert_eq!(id, CheckpointId(1));
@@ -552,6 +553,7 @@ mod tests {
 
     #[test]
     fn checkpoint_id_exhaustion_returns_rs3604_without_wrapping() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coordinator = make_coordinator(&[1]);
         coordinator.inner.lock().next_checkpoint_id = CheckpointId(u64::MAX);
         assert_eq!(
@@ -571,6 +573,7 @@ mod tests {
             delta in 0u8..=1,
             shard_count in 1usize..=3,
         ) {
+            let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
             let coordinator = make_coordinator(&(0..shard_count as u64).collect::<Vec<_>>());
             let initial_id = CheckpointId(u64::MAX - u64::from(delta));
             coordinator.inner.lock().next_checkpoint_id = initial_id;
@@ -593,6 +596,7 @@ mod tests {
 
     #[test]
     fn begin_checkpoint_acquires_one_credit_per_shard() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0, 1]);
         coord.begin_checkpoint(noop_inject).unwrap();
         assert_eq!(coord.credits_used(), 2);
@@ -600,6 +604,7 @@ mod tests {
 
     #[test]
     fn begin_checkpoint_injects_barrier_for_each_shard() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
@@ -616,6 +621,7 @@ mod tests {
 
     #[test]
     fn record_all_shards_completes_checkpoint() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0, 1]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
 
@@ -638,6 +644,7 @@ mod tests {
 
     #[test]
     fn credits_released_after_completion() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0, 1]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
         assert_eq!(coord.credits_used(), 2);
@@ -655,6 +662,7 @@ mod tests {
 
     #[test]
     fn latest_committed_is_set_after_completion() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
         coord
@@ -669,6 +677,7 @@ mod tests {
     /// buffer never exceeds `max_credits`; exhaustion returns RS-3601, not panic.
     #[test]
     fn test_checkpoint_alignment_bounded_lfs() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         // Set max_credits to exactly the number of shards so one round fully
         // exhausts the buffer.
         let shards: Vec<ShardId> = (0..4).map(ShardId).collect();
@@ -714,6 +723,7 @@ mod tests {
 
     #[test]
     fn stale_confirmation_returns_error() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = make_coordinator(&[0]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
 
@@ -735,6 +745,7 @@ mod tests {
 
     #[test]
     fn gc_removes_old_checkpoints_beyond_retention() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = CheckpointCoordinator::with_config(vec![ShardId(0)], 64, 2);
 
         for i in 1..=5u64 {
@@ -792,6 +803,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_show_names_barrier_holder() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = CheckpointCoordinator::new(vec![ShardId(0), ShardId(1)]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
 
@@ -822,6 +834,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_show_clears_completed_holder() {
+        let _lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
         let coord = CheckpointCoordinator::new(vec![ShardId(0), ShardId(1)]);
         let id = coord.begin_checkpoint(noop_inject).unwrap();
 

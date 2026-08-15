@@ -215,6 +215,7 @@ async fn drain_completes_zero_downtime_tc() {
             "--control",
             &cluster.control_addr.to_string(),
             "1",
+            "--yes",
         ])
         .status()
         .unwrap();

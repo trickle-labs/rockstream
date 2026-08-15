@@ -25,11 +25,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
-use rockstream_types::error_code::{RS_3604, RS_3610, RS_3611, RS_3612};
+use rockstream_types::error_code::{RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612};
+use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
 use rockstream_types::ids::{ShardId, WorkerId};
 use rockstream_types::lease::ShardRevokeReason;
 use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
@@ -149,12 +150,23 @@ pub struct ControlServiceHandle {
     pub addr: SocketAddr,
     /// Shutdown sender; drop or send to stop the service.
     shutdown_tx: broadcast::Sender<()>,
+    /// TLS certificate reloader (if internal mTLS is enabled).
+    pub reloader: Option<Arc<crate::tls::TlsCertificateReloader>>,
 }
 
 impl ControlServiceHandle {
     /// Signal the service to shut down.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
+    }
+
+    /// Reload the server certificate, private key, and/or CA certificate without restarting.
+    pub fn reload_tls(&self, new_config: InternalTlsConfig) -> Result<(), String> {
+        if let Some(ref r) = self.reloader {
+            r.reload(new_config)
+        } else {
+            Err("RS-2410: internal TLS is not enabled on this control service".to_string())
+        }
     }
 }
 
@@ -190,6 +202,8 @@ pub struct ControlService {
     drain_state: Arc<AsyncMutex<DrainState>>,
     /// Automatically process queued drain migrations in the background.
     auto_drain: bool,
+    /// Optional internal TLS configuration for control plane mTLS.
+    internal_tls: Option<InternalTlsConfig>,
 }
 
 impl ControlService {
@@ -206,6 +220,7 @@ impl ControlService {
             migration_store: None,
             drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
             auto_drain: false,
+            internal_tls: None,
         }
     }
 
@@ -262,6 +277,12 @@ impl ControlService {
         self
     }
 
+    /// Attach an [`InternalTlsConfig`] for internal mTLS mutual authentication.
+    pub fn with_internal_tls(mut self, config: InternalTlsConfig) -> Self {
+        self.internal_tls = Some(config);
+        self
+    }
+
     /// Start the service on `bind_addr`.
     ///
     /// Returns a [`ControlServiceHandle`] which can be used to query the
@@ -297,6 +318,25 @@ impl ControlService {
             auto_drain: self.auto_drain,
         };
 
+        let reloader = if let Some(tls_cfg) = &self.internal_tls {
+            if tls_cfg.is_enabled() {
+                match crate::tls::TlsCertificateReloader::new(tls_cfg.clone()) {
+                    Ok(r) => Some(Arc::new(r)),
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("RS-2405: failed to initialize internal TLS: {e}"),
+                        ));
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let reloader_for_handle = reloader.clone();
+
         tokio::spawn(async move {
             let mut shutdown_rx = shutdown_tx2.subscribe();
             loop {
@@ -307,9 +347,10 @@ impl ControlService {
                                 tracing::debug!(%peer, "control: new connection");
                                 let conn_ctx = ctx.clone();
                                 let mut sd = shutdown_tx2.subscribe();
+                                let acceptor = reloader.as_ref().map(|r| r.current_acceptor());
                                 tokio::spawn(async move {
                                     tokio::select! {
-                                        _ = handle_connection(stream, peer, conn_ctx) => {}
+                                        _ = accept_and_handle(stream, peer, conn_ctx, acceptor) => {}
                                         _ = sd.recv() => {}
                                     }
                                 });
@@ -327,7 +368,11 @@ impl ControlService {
             }
         });
 
-        Ok(ControlServiceHandle { addr, shutdown_tx })
+        Ok(ControlServiceHandle {
+            addr,
+            shutdown_tx,
+            reloader: reloader_for_handle,
+        })
     }
 
     /// Collect live operator statistics for a pipeline.
@@ -638,8 +683,91 @@ async fn cleanup_decommissioned_workers(
     }
 }
 
-/// Handle a single worker connection.
+/// Accept a connection and perform TLS handshake if configured.
+async fn accept_and_handle(
+    stream: TcpStream,
+    peer: SocketAddr,
+    ctx: ConnectionContext,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+) {
+    if let Some(tls_acceptor) = acceptor {
+        match tls_acceptor.accept(stream).await {
+            Ok(tls_stream) => {
+                let identity = match crate::tls::extract_peer_identity(&tls_stream) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        tracing::warn!(%peer, error = %e, "control: mTLS identity extraction failed");
+                        if let Some(aud) = &ctx.audit {
+                            let event = AuditEvent::now(
+                                "control",
+                                "security.internal_mtls_denied",
+                                format!("peer={peer}"),
+                            )
+                            .with_detail(format!(
+                                "identity extraction failed: {e}, error_code=RS-2411"
+                            ));
+                            let _ = aud.append(&event);
+                        }
+                        return;
+                    }
+                };
+                if let Some(ref id) = identity {
+                    if id.role == NodeRole::Cli {
+                        if let Some(aud) = &ctx.audit {
+                            let event = AuditEvent::now(
+                                id.to_cn(),
+                                "cli.authenticated",
+                                format!("peer={peer}"),
+                            );
+                            let _ = aud.append(&event);
+                        }
+                    }
+                }
+                let (reader, writer) = tokio::io::split(tls_stream);
+                handle_connection_stream(reader, writer, peer, ctx, identity).await;
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                let code = if err_str.contains("NoCertificate") || err_str.contains("missing") {
+                    RS_2410
+                } else {
+                    RS_2411
+                };
+                tracing::warn!(%peer, error = %e, %code, "control: mTLS handshake rejected");
+                if let Some(aud) = &ctx.audit {
+                    let event = AuditEvent::now(
+                        "control",
+                        "security.internal_mtls_denied",
+                        format!("peer={peer}"),
+                    )
+                    .with_detail(format!("TLS handshake failed: {e}, error_code={code}"));
+                    let _ = aud.append(&event);
+                }
+            }
+        }
+    } else {
+        let (reader, writer) = stream.into_split();
+        handle_connection_stream(reader, writer, peer, ctx, None).await;
+    }
+}
+
+/// Handle a single worker connection over plaintext.
+#[allow(dead_code)]
 async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionContext) {
+    accept_and_handle(stream, peer, ctx, None).await;
+}
+
+/// Handle a single worker connection over an arbitrary stream.
+async fn handle_connection_stream<R, W>(
+    reader: R,
+    mut writer: W,
+    peer: SocketAddr,
+    ctx: ConnectionContext,
+    peer_identity: Option<NodeIdentity>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let ConnectionContext {
         catalog,
         shard_manager,
@@ -653,7 +781,6 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
         drain_state,
         auto_drain,
     } = ctx;
-    let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut connected_worker_id: Option<rockstream_types::ids::WorkerId> = None;
 
@@ -671,6 +798,44 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
 
         match msg {
             WorkerMessage::Register(reg) => {
+                if let Some(id) = &peer_identity {
+                    if id.role != NodeRole::Worker
+                        || (!id.matches_worker_id(reg.worker_id.0)
+                            && !id.matches_worker_str(&reg.address))
+                    {
+                        tracing::warn!(
+                            %peer,
+                            cert_identity = %id.to_cn(),
+                            registered_id = %reg.worker_id,
+                            "control: worker mTLS identity mismatch rejected"
+                        );
+                        if let Some(aud) = &audit {
+                            let event = AuditEvent::now(
+                                "control",
+                                "security.internal_mtls_denied",
+                                format!("worker_id={}, peer={peer}", reg.worker_id),
+                            )
+                            .with_detail(format!(
+                                "node identity mismatch: cert={}, requested_worker_id={}, error_code=RS-2412",
+                                id.to_cn(),
+                                reg.worker_id
+                            ));
+                            let _ = aud.append(&event);
+                        }
+                        let reply = ControlMessage::OperationFailed {
+                            code: RS_2412.to_string(),
+                            message: format!(
+                                "certificate identity {} does not match requested worker_id {}",
+                                id.to_cn(),
+                                reg.worker_id
+                            ),
+                            next_steps: rockstream_types::error_code::next_steps(RS_2412)
+                                .to_string(),
+                        };
+                        send_message(&mut writer, &reply).await;
+                        return;
+                    }
+                }
                 let worker_id = catalog.register(&reg);
                 connected_worker_id = Some(worker_id);
                 tracing::info!(
@@ -1069,7 +1234,7 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
     tracing::debug!(%peer, "control: connection closed");
 }
 
-async fn send_message(writer: &mut tokio::net::tcp::OwnedWriteHalf, msg: &ControlMessage) {
+async fn send_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &ControlMessage) {
     match serde_json::to_string(msg) {
         Ok(mut line) => {
             line.push('\n');

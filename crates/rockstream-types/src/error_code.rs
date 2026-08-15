@@ -236,6 +236,19 @@ pub const RS_2405: ErrorCode = ErrorCode::new(2405);
 /// next_steps: "Reduce concurrent connections or raise MAX_CONNECTIONS. The gateway rejected the handshake to avoid silently dropping the peer identity."
 pub const RS_2406: ErrorCode = ErrorCode::new(2406);
 
+/// Internal mTLS connection rejected: client certificate required (v0.55, `auth.internal_mtls_required`).
+/// next_steps: "Configure internal TLS client certificates (--internal-tls-cert-path, --internal-tls-key-path, --internal-tls-ca-cert-path) so the node can authenticate with the cluster."
+pub const RS_2410: ErrorCode = ErrorCode::new(2410);
+/// Internal mTLS client certificate invalid, expired, or signed by an untrusted CA (v0.55, `auth.internal_mtls_invalid_cert`).
+/// next_steps: "Verify the internal TLS client certificate is valid, not expired, and signed by the trusted cluster CA root certificate."
+pub const RS_2411: ErrorCode = ErrorCode::new(2411);
+/// Presented client certificate node identity does not match registration payload (v0.55, `auth.internal_mtls_node_identity_mismatch`).
+/// next_steps: "Ensure the node ID and role presented in the internal TLS certificate Common Name / SAN match the node registration parameters."
+pub const RS_2412: ErrorCode = ErrorCode::new(2412);
+/// Internal mTLS certificate rotation or reload failed (v0.55, `auth.internal_mtls_rotation_failed`).
+/// next_steps: "Verify the new certificate and private key files exist, have matching keys, and are signed by a trusted CA."
+pub const RS_2413: ErrorCode = ErrorCode::new(2413);
+
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
 /// Durable shuffle rate-limit retry budget exhausted (v0.45.7, split from RS-3010).
@@ -446,6 +459,10 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2404 => "auth.mtls_no_verified_cert",
         2405 => "auth.tls_config_invalid",
         2406 => "auth.mtls_connection_cap_exceeded",
+        2410 => "auth.internal_mtls_required",
+        2411 => "auth.internal_mtls_invalid_cert",
+        2412 => "auth.internal_mtls_node_identity_mismatch",
+        2413 => "auth.internal_mtls_rotation_failed",
         3701 => "view.waiting_on_source",
         3702 => "view.quota_admission_rejected",
         3703 => "view.spilling",
@@ -621,6 +638,10 @@ pub fn description(code: ErrorCode) -> &'static str {
         2404 => "mTLS connection has no verified client certificate CN for its peer address",
         2405 => "Gateway TLS certificate/key/CA material failed to load or parse",
         2406 => "mTLS handshake rejected: connection identity map is at capacity",
+        2410 => "Internal mTLS connection rejected: client certificate required",
+        2411 => "Internal mTLS client certificate invalid, expired, or signed by an untrusted CA",
+        2412 => "Presented client certificate node identity does not match registration payload",
+        2413 => "Internal mTLS certificate rotation or reload failed",
         _ => "Unknown error",
     }
 }
@@ -659,6 +680,10 @@ pub fn severity(code: ErrorCode) -> Severity {
         2404 => Severity::Fatal,
         2405 => Severity::Fatal,
         2406 => Severity::Error,
+        2410 => Severity::Fatal,
+        2411 => Severity::Fatal,
+        2412 => Severity::Fatal,
+        2413 => Severity::Error,
         4017 => Severity::Error,
         3701 => Severity::Warning,
         3702 => Severity::Warning,
@@ -803,6 +828,10 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2404 => "Connect with a client certificate signed by the configured CA over sslmode=verify-full; a bare TCP or TLS connection without a client cert cannot use --auth=mtls.",
         2405 => "Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process.",
         2406 => "Reduce concurrent connections or raise MAX_CONNECTIONS. The gateway rejected the handshake to avoid silently dropping the peer identity.",
+        2410 => "Configure internal TLS client certificates (--internal-tls-cert-path, --internal-tls-key-path, --internal-tls-ca-cert-path) so the node can authenticate with the cluster.",
+        2411 => "Verify the internal TLS client certificate is valid, not expired, and signed by the trusted cluster CA root certificate.",
+        2412 => "Ensure the node ID and role presented in the internal TLS certificate Common Name / SAN match the node registration parameters.",
+        2413 => "Verify the new certificate and private key files exist, have matching keys, and are signed by a trusted CA before triggering certificate rotation.",
         _ => "See documentation for this error code.",
     }
 }
@@ -1073,5 +1102,28 @@ mod tests {
         );
         assert_eq!(severity(RS_0005), Severity::Error);
         assert!(next_steps(RS_0005).contains("--yes"));
+    }
+
+    #[test]
+    fn internal_mtls_error_codes_registered() {
+        assert_eq!(RS_2410.value(), 2410);
+        assert_eq!(RS_2411.value(), 2411);
+        assert_eq!(RS_2412.value(), 2412);
+        assert_eq!(RS_2413.value(), 2413);
+
+        assert_eq!(slug(RS_2410), "auth.internal_mtls_required");
+        assert_eq!(slug(RS_2411), "auth.internal_mtls_invalid_cert");
+        assert_eq!(slug(RS_2412), "auth.internal_mtls_node_identity_mismatch");
+        assert_eq!(slug(RS_2413), "auth.internal_mtls_rotation_failed");
+
+        assert_eq!(severity(RS_2410), Severity::Fatal);
+        assert_eq!(severity(RS_2411), Severity::Fatal);
+        assert_eq!(severity(RS_2412), Severity::Fatal);
+        assert_eq!(severity(RS_2413), Severity::Error);
+
+        assert!(next_steps(RS_2410).contains("internal-tls"));
+        assert!(next_steps(RS_2411).contains("cluster CA"));
+        assert!(next_steps(RS_2412).contains("Common Name"));
+        assert!(next_steps(RS_2413).contains("rotation"));
     }
 }

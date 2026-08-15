@@ -11,8 +11,10 @@ pub use rockstream_ops::scheduler::CreditScheduler;
 pub use rockstream_ops::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
 
 pub mod client;
+pub mod tls;
 pub use client::{
-    start_worker_client, start_worker_client_with_metadata, ShardState, WorkerClientHandle,
+    start_worker_client, start_worker_client_with_metadata, start_worker_client_with_tls,
+    start_worker_client_with_tls_and_metadata, ShardState, WorkerClientHandle,
 };
 
 pub mod exchange;

@@ -17,6 +17,7 @@ pub mod error_code;
 pub mod exchange;
 pub mod explain;
 pub mod frontier;
+pub mod identity;
 pub mod ids;
 pub mod laws;
 pub mod lease;

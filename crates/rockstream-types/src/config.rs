@@ -256,6 +256,8 @@ pub struct RockstreamConfig {
     pub pricing: Option<PricingConfig>,
     #[serde(default)]
     pub gateway: GatewayConfig,
+    #[serde(default)]
+    pub internal_tls: crate::identity::InternalTlsConfig,
 }
 
 const fn default_recursion_max_iterations() -> usize {
@@ -298,6 +300,7 @@ impl Default for RockstreamConfig {
             storage: StorageConfig::default(),
             pricing: None,
             gateway: GatewayConfig::default(),
+            internal_tls: crate::identity::InternalTlsConfig::default(),
         }
     }
 }
@@ -405,5 +408,38 @@ compute_spot_mix = 0.75
         );
         assert_eq!(cfg.storage.tiering.cold_sst_age_threshold, Some(3600));
         assert!(cfg.pricing.is_some());
+    }
+
+    #[test]
+    fn config_internal_tls_defaults_roundtrip() {
+        let cfg = RockstreamConfig::default();
+        assert_eq!(
+            cfg.internal_tls,
+            crate::identity::InternalTlsConfig::default()
+        );
+        assert_eq!(cfg.internal_tls.cert_path, None);
+        assert_eq!(cfg.internal_tls.key_path, None);
+        assert_eq!(cfg.internal_tls.ca_cert_path, None);
+        let roundtrip = RockstreamConfig::load_from_str(&cfg.to_string().unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.internal_tls,
+            crate::identity::InternalTlsConfig::default()
+        );
+    }
+
+    #[test]
+    fn config_internal_tls_paths_roundtrip() {
+        let mut cfg = RockstreamConfig::default();
+        cfg.internal_tls.cert_path = Some(std::path::PathBuf::from(
+            "/etc/rockstream/tls/internal-cert.pem",
+        ));
+        cfg.internal_tls.key_path = Some(std::path::PathBuf::from(
+            "/etc/rockstream/tls/internal-key.pem",
+        ));
+        cfg.internal_tls.ca_cert_path = Some(std::path::PathBuf::from(
+            "/etc/rockstream/tls/cluster-ca.pem",
+        ));
+        let roundtrip = RockstreamConfig::load_from_str(&cfg.to_string().unwrap()).unwrap();
+        assert_eq!(roundtrip.internal_tls, cfg.internal_tls);
     }
 }

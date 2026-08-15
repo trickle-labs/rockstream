@@ -35,6 +35,10 @@ lz4_flex = { workspace = true }
 zstd = { workspace = true }
 rand = { workspace = true }
 rockstream-sim = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"

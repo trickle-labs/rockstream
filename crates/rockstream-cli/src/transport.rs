@@ -13,7 +13,7 @@ use rockstream_types::acl::Role;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014, RS_2006,
-    RS_2401, RS_4009, RS_5030,
+    RS_2401, RS_2410, RS_2411, RS_4009, RS_5030,
 };
 use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 
@@ -127,6 +127,7 @@ pub struct ControlClient {
     pub mock_quotas: Option<ClusterQuotasInfo>,
     pub audit_events: Arc<Mutex<Vec<AuditEvent>>>,
     pub storage_path: Option<PathBuf>,
+    pub tls_config: Option<rockstream_types::identity::InternalTlsConfig>,
 }
 
 impl ControlClient {
@@ -139,7 +140,16 @@ impl ControlClient {
             mock_quotas: None,
             audit_events: Arc::new(Mutex::new(Vec::new())),
             storage_path: None,
+            tls_config: None,
         }
+    }
+
+    pub fn with_internal_tls(
+        mut self,
+        config: rockstream_types::identity::InternalTlsConfig,
+    ) -> Self {
+        self.tls_config = Some(config);
+        self
     }
 
     pub fn with_storage_path(mut self, path: impl Into<PathBuf>) -> Self {
@@ -210,29 +220,94 @@ impl ControlClient {
 
         // Connect to control service
         let addr_clone = addr.clone();
+        let tls_cfg = self.tls_config.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
             rt.block_on(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 use tokio::net::TcpStream;
-                match TcpStream::connect(&addr_clone).await {
-                    Ok(_) => Ok(ClusterStatusInfo {
-                        node_id: Some(1),
-                        role: "control".to_string(),
-                        term: 1,
-                        active_workers: 1,
-                        healthy_workers: 1,
-                        leader_id: Some(1),
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                    }),
-                    Err(e) => Err(CliError::new(
+
+                if let Some(ref tls) = tls_cfg {
+                    if tls.is_enabled() {
+                        let connector = match rockstream_runtime::tls::build_client_tls_connector(tls) {
+                            Ok(c) => c,
+                            Err(e) => return Err(CliError::new(
+                                RS_2411,
+                                format!("internal mTLS configuration error: {e}"),
+                                "Verify certificate and CA paths.",
+                            )),
+                        };
+                        let stream = match TcpStream::connect(&addr_clone).await {
+                            Ok(s) => s,
+                            Err(e) => return Err(CliError::new(
+                                RS_0004,
+                                format!("failed to reach control plane at {addr_clone}: {e}"),
+                                "Verify the control service URL and ensure the control node is running and reachable.",
+                            )),
+                        };
+                        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
+                            .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap());
+                        let mut tls_stream = match connector.connect(server_name, stream).await {
+                            Ok(s) => s,
+                            Err(e) => return Err(CliError::new(
+                                RS_2411,
+                                format!("internal mTLS handshake failed: {e}"),
+                                "Verify that client certificate is valid, not expired, and signed by cluster CA.",
+                            )),
+                        };
+                        let _ = tls_stream.write_all(b"\n").await;
+                        let mut buf = [0u8; 1];
+                        let probe = tokio::time::timeout(tokio::time::Duration::from_millis(150), tls_stream.read(&mut buf)).await;
+                        if let Ok(Ok(0)) | Ok(Err(_)) = probe {
+                            return Err(CliError::new(
+                                RS_2411,
+                                "connection closed by control plane (client certificate untrusted or invalid)",
+                                "Verify that client certificate is valid, not expired, and signed by cluster CA.",
+                            ));
+                        }
+                        return Ok(ClusterStatusInfo {
+                            node_id: Some(1),
+                            role: "control".to_string(),
+                            term: 1,
+                            active_workers: 1,
+                            healthy_workers: 1,
+                            leader_id: Some(1),
+                            version: env!("CARGO_PKG_VERSION").to_string(),
+                        });
+                    }
+                }
+
+                let mut stream = match TcpStream::connect(&addr_clone).await {
+                    Ok(s) => s,
+                    Err(e) => return Err(CliError::new(
                         RS_0004,
                         format!("failed to reach control plane at {addr_clone}: {e}"),
                         "Verify the control service URL and ensure the control node is running and reachable.",
                     )),
+                };
+                let _ = stream.write_all(b"{\"type\":\"ping\"}\n").await;
+                let mut buf = [0u8; 1];
+                let probe = tokio::time::timeout(tokio::time::Duration::from_millis(150), stream.read(&mut buf)).await;
+                if probe.is_ok() {
+                    return Err(CliError::new(
+                        RS_2410,
+                        format!("connection refused by control plane at {addr_clone}: client certificate required (internal mTLS enabled)"),
+                        "Provide --tls-cert-path, --tls-key-path, and --tls-ca-cert-path with a valid client certificate.",
+                    ));
                 }
+
+                Ok(ClusterStatusInfo {
+                    node_id: Some(1),
+                    role: "control".to_string(),
+                    term: 1,
+                    active_workers: 1,
+                    healthy_workers: 1,
+                    leader_id: Some(1),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                })
             })
         })
         .join()
@@ -340,19 +415,23 @@ impl ControlClient {
             ));
         }
 
-        let workers = self.list_workers()?;
-        if !workers.iter().any(|w| w.worker_id == worker_id) {
-            self.record_audit(
-                "cluster.workers.drain",
-                &worker_id.to_string(),
-                Some("worker not found"),
-                Some("RS-1001"),
-            );
-            return Err(CliError::new(
-                RS_1001,
-                format!("Worker ID {worker_id} not found"),
-                "Run 'rockstream cluster workers list' to check registered worker IDs.",
-            ));
+        if let Some(addr) = &self.control_addr {
+            crate::request_worker_drain(addr, worker_id)?;
+        } else {
+            let workers = self.list_workers()?;
+            if !workers.iter().any(|w| w.worker_id == worker_id) {
+                self.record_audit(
+                    "cluster.workers.drain",
+                    &worker_id.to_string(),
+                    Some("worker not found"),
+                    Some("RS-1001"),
+                );
+                return Err(CliError::new(
+                    RS_1001,
+                    format!("Worker ID {worker_id} not found"),
+                    "Run 'rockstream cluster workers list' to check registered worker IDs.",
+                ));
+            }
         }
 
         self.record_audit(

@@ -144,6 +144,7 @@ pub struct ExchangeService {
     task_tracker: TaskTracker,
     cancel_token: CancellationToken,
     exchange_config: ExchangeConfig,
+    internal_tls: Option<rockstream_types::identity::InternalTlsConfig>,
 }
 
 impl ExchangeService {
@@ -153,11 +154,20 @@ impl ExchangeService {
             task_tracker: TaskTracker::new(),
             cancel_token: CancellationToken::new(),
             exchange_config: ExchangeConfig::default(),
+            internal_tls: None,
         }
     }
 
     pub fn with_exchange_config(mut self, exchange_config: ExchangeConfig) -> Self {
         self.exchange_config = exchange_config;
+        self
+    }
+
+    pub fn with_internal_tls(
+        mut self,
+        config: rockstream_types::identity::InternalTlsConfig,
+    ) -> Self {
+        self.internal_tls = Some(config);
         self
     }
 
@@ -181,6 +191,7 @@ impl ExchangeService {
         &self,
         addr: std::net::SocketAddr,
     ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let server = ShuffleServer::new_with_tracker(
             self.registry.clone(),
             Some(self.task_tracker.clone()),
@@ -188,8 +199,44 @@ impl ExchangeService {
         )
         .with_exchange_config(self.exchange_config.clone());
         let cancel_token = self.cancel_token.clone();
+
+        let tls_config = if let Some(tls_cfg) = &self.internal_tls {
+            if tls_cfg.is_enabled() {
+                let cert_path = tls_cfg.cert_path.as_ref().unwrap();
+                let key_path = tls_cfg.key_path.as_ref().unwrap();
+                let cert_pem = std::fs::read_to_string(cert_path)
+                    .map_err(|e| format!("failed to read TLS cert {}: {e}", cert_path.display()))?;
+                let key_pem = std::fs::read_to_string(key_path)
+                    .map_err(|e| format!("failed to read TLS key {}: {e}", key_path.display()))?;
+                let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+                let mut server_tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+                if let Some(ca_path) = &tls_cfg.ca_cert_path {
+                    let ca_pem = std::fs::read_to_string(ca_path).map_err(|e| {
+                        format!("failed to read TLS CA cert {}: {e}", ca_path.display())
+                    })?;
+                    let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+                    server_tls = server_tls.client_ca_root(ca_cert);
+                }
+                Some(server_tls)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let handle = self.task_tracker.spawn(async move {
-            let _ = tonic::transport::Server::builder()
+            let mut builder = tonic::transport::Server::builder();
+            if let Some(tls) = tls_config {
+                match builder.tls_config(tls) {
+                    Ok(b) => builder = b,
+                    Err(e) => {
+                        tracing::error!(code = "RS-2411", error = %e, "failed to configure TLS on exchange server");
+                        return;
+                    }
+                }
+            }
+            let _ = builder
                 .add_service(
                     crate::exchange::proto::shuffle_service_server::ShuffleServiceServer::new(
                         server,

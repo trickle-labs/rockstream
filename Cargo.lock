@@ -4958,12 +4958,15 @@ dependencies = [
  "rockstream-runtime",
  "rockstream-sql",
  "rockstream-storage",
+ "rockstream-test-support",
  "rockstream-types",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -5014,6 +5017,7 @@ dependencies = [
  "proptest",
  "rand 0.8.6",
  "reqwest",
+ "rockstream-cli",
  "rockstream-ops",
  "rockstream-plan",
  "rockstream-runtime",
@@ -5021,6 +5025,8 @@ dependencies = [
  "rockstream-storage",
  "rockstream-test-support",
  "rockstream-types",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5030,8 +5036,10 @@ dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
+ "x509-parser",
  "zstd",
 ]
 
@@ -5219,6 +5227,8 @@ dependencies = [
  "rockstream-storage",
  "rockstream-test-support",
  "rockstream-types",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5227,10 +5237,12 @@ dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tonic 0.12.3",
  "tonic-build",
  "tracing",
+ "x509-parser",
  "zstd",
 ]
 
@@ -5336,6 +5348,12 @@ dependencies = [
 [[package]]
 name = "rockstream-test-support"
 version = "0.42.0"
+dependencies = [
+ "rcgen",
+ "rockstream-types",
+ "rustls-pemfile",
+ "tempfile",
+]
 
 [[package]]
 name = "rockstream-types"
@@ -5353,6 +5371,7 @@ dependencies = [
  "serde_json",
  "toml",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
@@ -6502,8 +6521,11 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.13.5",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",

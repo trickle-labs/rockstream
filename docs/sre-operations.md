@@ -39,6 +39,7 @@ SREs should establish the following alert rules on Prometheus:
 - **State Budget Warning**: `workload_memory_bytes / memory_limit > 0.80` (RS-5018).
 - **State Budget Critical**: `workload_memory_bytes / memory_limit > 0.95` (RS-5019).
 - **Frontier Stalled**: `rate(merge_law_applied_total[1m]) == 0` for running pipelines.
+- **mTLS Handshake Refusal Spikes**: `increase(audit_events_total{action="security.internal_mtls_denied"}[5m]) > 5` (RS-2410 / RS-2411).
 
 ---
 

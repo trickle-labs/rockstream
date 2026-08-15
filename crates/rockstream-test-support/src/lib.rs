@@ -1,3 +1,5 @@
+pub mod pki;
+
 pub fn docker_available() -> bool {
     docker_available_when(
         std::process::Command::new("docker")

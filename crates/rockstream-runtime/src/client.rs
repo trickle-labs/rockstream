@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use serde_json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
+use rockstream_types::identity::InternalTlsConfig;
 use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
 use rockstream_types::lease::ShardLease;
 use rockstream_types::topology::{
@@ -144,9 +145,103 @@ pub async fn start_worker_client_with_metadata(
     location: WorkerLocation,
     capabilities: WorkerCapabilities,
 ) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
-    let stream = TcpStream::connect(control_url).await?;
-    let (reader, mut writer) = stream.into_split();
+    start_worker_client_with_tls_and_metadata(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        location,
+        capabilities,
+        InternalTlsConfig::default(),
+    )
+    .await
+}
 
+/// Connect to the control plane over mTLS and start the worker client daemon loop.
+pub async fn start_worker_client_with_tls(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    tls_config: InternalTlsConfig,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    start_worker_client_with_tls_and_metadata(
+        proposed_worker_id,
+        control_url,
+        storage_dir,
+        WorkerLocation::default(),
+        WorkerCapabilities::default(),
+        tls_config,
+    )
+    .await
+}
+
+/// Connect to the control plane over mTLS with explicit locality/capability metadata.
+pub async fn start_worker_client_with_tls_and_metadata(
+    proposed_worker_id: u64,
+    control_url: &str,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    tls_config: InternalTlsConfig,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)> {
+    let clean_url = control_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let stream = TcpStream::connect(clean_url).await?;
+
+    if tls_config.is_enabled() {
+        let connector = crate::tls::build_client_tls_connector(&tls_config).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("RS-2405: TLS client error: {e}"),
+            )
+        })?;
+        let host = clean_url.split(':').next().unwrap_or("localhost");
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.to_string()).unwrap_or_else(|_| {
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
+            });
+        let tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("RS-2411: TLS handshake error: {e}"),
+            )
+        })?;
+        let (reader, writer) = tokio::io::split(tls_stream);
+        run_worker_client(
+            proposed_worker_id,
+            storage_dir,
+            location,
+            capabilities,
+            reader,
+            writer,
+        )
+        .await
+    } else {
+        let (reader, writer) = stream.into_split();
+        run_worker_client(
+            proposed_worker_id,
+            storage_dir,
+            location,
+            capabilities,
+            reader,
+            writer,
+        )
+        .await
+    }
+}
+
+async fn run_worker_client<R, W>(
+    proposed_worker_id: u64,
+    storage_dir: &Path,
+    location: WorkerLocation,
+    capabilities: WorkerCapabilities,
+    reader: R,
+    mut writer: W,
+) -> io::Result<(WorkerClientHandle, tokio::task::JoinHandle<()>)>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let worker_id = Arc::new(RwLock::new(None));
     let active_shards = Arc::new(RwLock::new(HashMap::new()));
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));

@@ -31,6 +31,10 @@ futures = { workspace = true }
 slatedb = { workspace = true }
 zstd = { workspace = true }
 rockstream-sim = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
 rockstream-test-support.workspace = true
@@ -46,4 +50,5 @@ sha2 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 rockstream-ops = { workspace = true }
 rockstream-runtime = { workspace = true }
+rockstream-cli = { workspace = true }
 serde_json = { workspace = true }

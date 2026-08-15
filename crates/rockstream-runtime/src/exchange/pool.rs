@@ -19,6 +19,7 @@ pub struct ShuffleClientPool {
     shm_clients: Arc<RwLock<HashMap<WorkerId, SharedMemoryClient>>>,
     config: ExchangeConfig,
     consecutive_failures: Arc<RwLock<HashMap<WorkerId, u32>>>,
+    internal_tls: Option<rockstream_types::identity::InternalTlsConfig>,
 }
 
 impl Default for ShuffleClientPool {
@@ -38,11 +39,20 @@ impl ShuffleClientPool {
             shm_clients: Arc::new(RwLock::new(HashMap::new())),
             config: ExchangeConfig::default(),
             consecutive_failures: Arc::new(RwLock::new(HashMap::new())),
+            internal_tls: None,
         }
     }
 
     pub fn with_config(mut self, config: ExchangeConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    pub fn with_internal_tls(
+        mut self,
+        config: rockstream_types::identity::InternalTlsConfig,
+    ) -> Self {
+        self.internal_tls = Some(config);
         self
     }
 
@@ -151,8 +161,22 @@ impl ShuffleClientPool {
                 .ok_or_else(|| format!("RS-5002: no registered address for worker {:?}. Next steps: verify cluster topology registration.", worker_id))?
         };
 
+        let use_tls = self
+            .internal_tls
+            .as_ref()
+            .map(|t| t.is_enabled())
+            .unwrap_or(false);
+        if use_tls {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
         let url = if addr.starts_with("http://") || addr.starts_with("https://") {
-            addr
+            if use_tls && addr.starts_with("http://") {
+                addr.replacen("http://", "https://", 1)
+            } else {
+                addr
+            }
+        } else if use_tls {
+            format!("https://{}", addr)
         } else {
             format!("http://{}", addr)
         };
@@ -161,7 +185,7 @@ impl ShuffleClientPool {
         let max_attempts = self.config.max_retries.max(1);
 
         for attempt in 1..=max_attempts {
-            let endpoint = match Channel::from_shared(url.clone()) {
+            let mut endpoint = match Channel::from_shared(url.clone()) {
                 Ok(ep) => ep.connect_timeout(std::time::Duration::from_millis(
                     self.config.connect_timeout_ms,
                 )),
@@ -170,6 +194,45 @@ impl ShuffleClientPool {
                     return Err(format!("RS-5002: invalid gRPC URL for worker {:?}: {:?}. Next steps: check address configuration.", worker_id, e));
                 }
             };
+
+            if let Some(tls_cfg) = &self.internal_tls {
+                if tls_cfg.is_enabled() {
+                    let cert_path = tls_cfg.cert_path.as_ref().unwrap();
+                    let key_path = tls_cfg.key_path.as_ref().unwrap();
+                    let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
+                        format!(
+                            "RS-2405: failed to read TLS cert {}: {e}",
+                            cert_path.display()
+                        )
+                    })?;
+                    let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
+                        format!(
+                            "RS-2405: failed to read TLS key {}: {e}",
+                            key_path.display()
+                        )
+                    })?;
+                    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+
+                    let mut client_tls = tonic::transport::ClientTlsConfig::new()
+                        .identity(identity)
+                        .domain_name("localhost");
+
+                    if let Some(ca_path) = &tls_cfg.ca_cert_path {
+                        let ca_pem = std::fs::read_to_string(ca_path).map_err(|e| {
+                            format!(
+                                "RS-2405: failed to read TLS CA cert {}: {e}",
+                                ca_path.display()
+                            )
+                        })?;
+                        let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+                        client_tls = client_tls.ca_certificate(ca_cert);
+                    }
+
+                    endpoint = endpoint.tls_config(client_tls).map_err(|e| {
+                        format!("RS-2405: failed to configure TLS on endpoint: {e}")
+                    })?;
+                }
+            }
 
             match endpoint.connect().await {
                 Ok(channel) => {

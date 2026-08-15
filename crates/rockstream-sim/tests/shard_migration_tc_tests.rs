@@ -209,6 +209,7 @@ fn exec_drain(control_addr: SocketAddr, worker_id: u64) {
             "--control",
             &control_addr.to_string(),
             &worker_id.to_string(),
+            "--yes",
         ])
         .status()
         .unwrap();

@@ -40,6 +40,30 @@ struct Cli {
     #[arg(long, global = true)]
     storage_dir: Option<std::path::PathBuf>,
 
+    /// Path to the PEM-encoded CA certificate used to validate peer certificates for mTLS.
+    #[arg(long = "tls-ca-cert-path", global = true)]
+    tls_ca_cert_path: Option<std::path::PathBuf>,
+
+    /// Path to the PEM-encoded client/server certificate presented during TLS handshake.
+    #[arg(long = "tls-cert-path", global = true)]
+    tls_cert_path: Option<std::path::PathBuf>,
+
+    /// Path to the PEM-encoded private key matching `--tls-cert-path`.
+    #[arg(long = "tls-key-path", global = true)]
+    tls_key_path: Option<std::path::PathBuf>,
+
+    /// Path to the PEM-encoded certificate chain for internal cluster mTLS.
+    #[arg(long = "internal-tls-cert-path", global = true)]
+    internal_tls_cert_path: Option<std::path::PathBuf>,
+
+    /// Path to the PEM-encoded private key for internal cluster mTLS.
+    #[arg(long = "internal-tls-key-path", global = true)]
+    internal_tls_key_path: Option<std::path::PathBuf>,
+
+    /// Path to the PEM-encoded CA certificate for internal cluster mTLS.
+    #[arg(long = "internal-tls-ca-cert-path", global = true)]
+    internal_tls_ca_cert_path: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -172,20 +196,6 @@ enum Command {
         same_host_shm_segments_per_peer: Option<usize>,
         #[arg(long)]
         max_exchange_compression_states: Option<usize>,
-
-        /// v0.51.5: path to the PEM-encoded server certificate (chain) for
-        /// gateway-facing TLS termination. Requires `--tls-key-path`.
-        #[arg(long)]
-        tls_cert_path: Option<std::path::PathBuf>,
-        /// v0.51.5: path to the PEM-encoded private key matching
-        /// `--tls-cert-path`.
-        #[arg(long)]
-        tls_key_path: Option<std::path::PathBuf>,
-        /// v0.51.5: path to the PEM-encoded CA certificate used to validate
-        /// client certificates for `--auth=mtls`. Required whenever
-        /// `--auth=mtls` is set.
-        #[arg(long)]
-        tls_ca_cert_path: Option<std::path::PathBuf>,
     },
     /// View inspection commands.
     View {
@@ -606,9 +616,6 @@ fn main() -> ExitCode {
             same_host_shm_segment_bytes,
             same_host_shm_segments_per_peer,
             max_exchange_compression_states,
-            tls_cert_path,
-            tls_key_path,
-            tls_ca_cert_path,
         } => {
             let mut config = RockstreamConfig::default();
             if let Some(value) = exchange_direct_threshold_bytes {
@@ -632,14 +639,23 @@ fn main() -> ExitCode {
             if let Some(value) = max_exchange_compression_states {
                 config.exchange.max_exchange_compression_states = value;
             }
-            if let Some(value) = tls_cert_path {
-                config.gateway.tls_cert_path = Some(value);
+            if let Some(ref value) = cli.tls_cert_path {
+                config.gateway.tls_cert_path = Some(value.clone());
             }
-            if let Some(value) = tls_key_path {
-                config.gateway.tls_key_path = Some(value);
+            if let Some(ref value) = cli.tls_key_path {
+                config.gateway.tls_key_path = Some(value.clone());
             }
-            if let Some(value) = tls_ca_cert_path {
-                config.gateway.tls_ca_cert_path = Some(value);
+            if let Some(ref value) = cli.tls_ca_cert_path {
+                config.gateway.tls_ca_cert_path = Some(value.clone());
+            }
+            if let Some(ref value) = cli.internal_tls_cert_path {
+                config.internal_tls.cert_path = Some(value.clone());
+            }
+            if let Some(ref value) = cli.internal_tls_key_path {
+                config.internal_tls.key_path = Some(value.clone());
+            }
+            if let Some(ref value) = cli.internal_tls_ca_cert_path {
+                config.internal_tls.ca_cert_path = Some(value.clone());
             }
             config.gateway.webhook_listen_addr = webhook_listen;
             let opts = StartOptions {
@@ -783,9 +799,8 @@ fn main() -> ExitCode {
             };
             handle_result(res)
         }
-        Command::Cluster { command } => {
-            let identity = ClientIdentity::default();
-            let control = ControlClient::new(cli.control, identity);
+        Command::Cluster { ref command } => {
+            let control = make_control_client(&cli, None);
             match command {
                 ClusterCommand::Status => handle_result(run_cluster_status(format, &control)),
                 ClusterCommand::Quotas => handle_result(run_cluster_quotas(format, &control)),
@@ -794,7 +809,7 @@ fn main() -> ExitCode {
                 } => handle_result(run_cluster_workers_list(format, &control)),
                 ClusterCommand::Workers {
                     command: WorkerCommand::Status { worker_id },
-                } => handle_result(run_cluster_workers_status(format, &control, worker_id)),
+                } => handle_result(run_cluster_workers_status(format, &control, *worker_id)),
                 ClusterCommand::Workers {
                     command:
                         WorkerCommand::Drain {
@@ -804,26 +819,25 @@ fn main() -> ExitCode {
                         },
                 } => {
                     let control_client = if let Some(addr) = ctrl_addr {
-                        ControlClient::new(Some(addr), ClientIdentity::default())
+                        make_control_client(&cli, Some(addr.clone()))
                     } else {
                         control
                     };
                     handle_result(run_cluster_workers_drain(
                         format,
                         &control_client,
-                        worker_id,
-                        yes,
+                        *worker_id,
+                        *yes,
                     ))
                 }
             }
         }
-        Command::Shard { command } => {
-            let identity = ClientIdentity::default();
-            let control = ControlClient::new(cli.control, identity);
+        Command::Shard { ref command } => {
+            let control = make_control_client(&cli, None);
             let res = match command {
                 ShardCommand::List => run_shard_list(format, &control),
                 ShardCommand::Migrate { shard_id, to, yes } => {
-                    run_shard_migrate(format, &control, shard_id, to, yes)
+                    run_shard_migrate(format, &control, *shard_id, *to, *yes)
                 }
             };
             handle_result(res)
@@ -927,6 +941,43 @@ fn main() -> ExitCode {
             handle_result(res)
         }
     }
+}
+
+fn make_control_client(cli: &Cli, override_addr: Option<String>) -> ControlClient {
+    let mut identity = ClientIdentity::default();
+    if let Some(ref p) = cli.tls_cert_path {
+        identity = identity.with_cert(p.clone());
+    }
+    let control_addr = override_addr.or_else(|| cli.control.clone());
+    let mut client = ControlClient::new(control_addr, identity);
+    if cli.tls_cert_path.is_some()
+        || cli.tls_key_path.is_some()
+        || cli.tls_ca_cert_path.is_some()
+        || cli.internal_tls_cert_path.is_some()
+        || cli.internal_tls_key_path.is_some()
+        || cli.internal_tls_ca_cert_path.is_some()
+    {
+        let cert_path = cli
+            .internal_tls_cert_path
+            .clone()
+            .or_else(|| cli.tls_cert_path.clone());
+        let key_path = cli
+            .internal_tls_key_path
+            .clone()
+            .or_else(|| cli.tls_key_path.clone());
+        let ca_cert_path = cli
+            .internal_tls_ca_cert_path
+            .clone()
+            .or_else(|| cli.tls_ca_cert_path.clone());
+        client = client.with_internal_tls(rockstream_types::identity::InternalTlsConfig {
+            cert_path,
+            key_path,
+            ca_cert_path,
+            client_auth_required: true,
+            reload_enabled: false,
+        });
+    }
+    client
 }
 
 fn handle_result(res: Result<String, rockstream_cli::CliError>) -> ExitCode {

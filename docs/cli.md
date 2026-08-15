@@ -22,6 +22,12 @@ rockstream [--json] [--control <url>] [--storage-dir <dir>] <command>
 | `--json` | `false` | Format output as structured JSON. |
 | `--control <url>` | — | Control service URL for cluster and shard inspection. |
 | `--storage-dir <dir>` | `.` | Local storage directory for reading checkpoints and audit logs. |
+| `--tls-ca-cert-path <path>` | — | Path to CA root certificate bundle for internal mTLS. |
+| `--tls-cert-path <path>` | — | Path to client/node X.509 certificate for internal mTLS. |
+| `--tls-key-path <path>` | — | Path to client/node private key for internal mTLS. |
+| `--internal-tls-ca-cert-path <path>` | — | Alias for `--tls-ca-cert-path`. |
+| `--internal-tls-cert-path <path>` | — | Alias for `--tls-cert-path`. |
+| `--internal-tls-key-path <path>` | — | Alias for `--tls-key-path`. |
 
 ---
 

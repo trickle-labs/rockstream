@@ -1,200 +1,236 @@
-//! mTLS scaffolding for RockStream control ↔ worker channels.
-//!
-//! This module provides the `TlsConfig` type that holds paths to TLS
-//! certificate material. The `load()` method validates that all referenced
-//! files are readable and contain well-formed PEM data.
-//!
-//! Actual TLS handshake integration (via `tokio-rustls` or equivalent) is
-//! wired in when a TLS-enabled transport is added in a later version. For
-//! v0.28, the scaffolding ensures the configuration is type-safe, validates
-//! at startup, and the CLI surface is stable.
+//! TLS Helpers for Control Service mTLS Handshake (v0.55).
 
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+use std::sync::Arc;
 
-/// Configuration for mutual TLS on a RockStream channel.
-///
-/// All fields are paths to PEM-encoded files.
-#[derive(Debug, Clone, Default)]
-pub struct TlsConfig {
-    /// Path to the node's certificate (PEM).
-    pub cert_path: Option<PathBuf>,
-    /// Path to the node's private key (PEM).
-    pub key_path: Option<PathBuf>,
-    /// Path to the CA certificate used to verify peer certificates (PEM).
-    pub ca_cert_path: Option<PathBuf>,
-}
+use rockstream_types::identity::{InternalTlsConfig, NodeIdentity};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
+use tokio_rustls::TlsAcceptor;
 
-/// Loaded, in-memory TLS material after `TlsConfig::load()` succeeds.
-#[derive(Debug, Clone)]
-pub struct LoadedTls {
-    /// PEM-encoded certificate bytes.
-    pub cert_pem: Vec<u8>,
-    /// PEM-encoded private key bytes.
-    pub key_pem: Vec<u8>,
-    /// PEM-encoded CA certificate bytes.
-    pub ca_cert_pem: Vec<u8>,
-}
+/// Alias for `InternalTlsConfig` for backward compatibility.
+pub type TlsConfig = InternalTlsConfig;
 
-/// Error returned when TLS configuration loading fails.
-#[derive(Debug, thiserror::Error)]
-pub enum TlsError {
-    #[error("missing required TLS field: {field}")]
-    MissingField { field: &'static str },
-    #[error("failed to read TLS file {path:?}: {source}")]
-    ReadError { path: PathBuf, source: io::Error },
-    #[error("TLS file {path:?} does not contain valid PEM data")]
-    InvalidPem { path: PathBuf },
-}
+/// Build a `TlsAcceptor` configured for internal mutual TLS (mTLS).
+pub fn build_server_tls_acceptor(config: &InternalTlsConfig) -> Result<TlsAcceptor, String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert_path = config
+        .cert_path
+        .as_ref()
+        .ok_or_else(|| "RS-2410: cert_path is required for internal TLS".to_string())?;
+    let key_path = config
+        .key_path
+        .as_ref()
+        .ok_or_else(|| "RS-2410: key_path is required for internal TLS".to_string())?;
 
-impl TlsConfig {
-    /// Create a new `TlsConfig` with the given paths.
-    pub fn new(
-        cert_path: impl Into<PathBuf>,
-        key_path: impl Into<PathBuf>,
-        ca_cert_path: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
-            cert_path: Some(cert_path.into()),
-            key_path: Some(key_path.into()),
-            ca_cert_path: Some(ca_cert_path.into()),
+    let certs = load_certs(cert_path)?;
+    let key = load_key(key_path)?;
+
+    let mut roots = RootCertStore::empty();
+    if let Some(ca_path) = &config.ca_cert_path {
+        let ca_certs = load_certs(ca_path)?;
+        for ca in ca_certs {
+            roots
+                .add(ca)
+                .map_err(|e| format!("RS-2411: failed to add CA root certificate: {e}"))?;
         }
+    } else if config.client_auth_required {
+        return Err(
+            "RS-2410: ca_cert_path is required when client_auth_required is true".to_string(),
+        );
     }
 
-    /// Returns `true` if TLS has been configured (all three paths are set).
-    pub fn is_configured(&self) -> bool {
-        self.cert_path.is_some() && self.key_path.is_some() && self.ca_cert_path.is_some()
+    let verifier = if config.client_auth_required {
+        WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| format!("RS-2411: failed to build client cert verifier: {e}"))?
+    } else {
+        WebPkiClientVerifier::builder(Arc::new(roots))
+            .allow_unauthenticated()
+            .build()
+            .map_err(|e| format!("RS-2411: failed to build client cert verifier: {e}"))?
+    };
+
+    let server_config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("RS-2411: failed to build TLS server config: {e}"))?;
+
+    Ok(TlsAcceptor::from(Arc::new(server_config)))
+}
+
+use std::path::PathBuf;
+use std::sync::RwLock;
+
+/// Dynamic reloadable TLS acceptor supporting in-flight certificate swapping and dual-generation CA trust.
+pub struct TlsCertificateReloader {
+    config: RwLock<InternalTlsConfig>,
+    acceptor: RwLock<TlsAcceptor>,
+    extra_ca_roots: RwLock<Vec<PathBuf>>,
+}
+
+impl std::fmt::Debug for TlsCertificateReloader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsCertificateReloader")
+            .field("config", &self.config)
+            .field("extra_ca_roots", &self.extra_ca_roots)
+            .finish_non_exhaustive()
     }
+}
 
-    /// Load and validate the TLS material from disk.
-    ///
-    /// Reads each PEM file and checks that it starts with a valid `-----BEGIN`
-    /// marker. Does **not** parse the certificate structure; full cryptographic
-    /// validation happens when the TLS handshake is performed.
-    pub fn load(&self) -> Result<LoadedTls, TlsError> {
-        let cert_path = self
-            .cert_path
-            .as_ref()
-            .ok_or(TlsError::MissingField { field: "cert_path" })?;
-        let key_path = self
-            .key_path
-            .as_ref()
-            .ok_or(TlsError::MissingField { field: "key_path" })?;
-        let ca_cert_path = self.ca_cert_path.as_ref().ok_or(TlsError::MissingField {
-            field: "ca_cert_path",
-        })?;
-
-        let cert_pem = read_pem(cert_path)?;
-        let key_pem = read_pem(key_path)?;
-        let ca_cert_pem = read_pem(ca_cert_path)?;
-
-        Ok(LoadedTls {
-            cert_pem,
-            key_pem,
-            ca_cert_pem,
+impl TlsCertificateReloader {
+    /// Create a new `TlsCertificateReloader` with initial configuration.
+    pub fn new(initial_config: InternalTlsConfig) -> Result<Self, String> {
+        let acceptor = build_server_tls_acceptor(&initial_config)?;
+        Ok(Self {
+            config: RwLock::new(initial_config),
+            acceptor: RwLock::new(acceptor),
+            extra_ca_roots: RwLock::new(Vec::new()),
         })
     }
+
+    /// Get a clone of the current `TlsAcceptor`.
+    pub fn current_acceptor(&self) -> TlsAcceptor {
+        self.acceptor.read().unwrap().clone()
+    }
+
+    /// Add an additional CA root certificate path to support dual-generation rollover.
+    pub fn add_trusted_ca(&self, ca_path: impl Into<PathBuf>) -> Result<(), String> {
+        let ca_path = ca_path.into();
+        if !ca_path.exists() {
+            return Err(format!(
+                "RS-2411: CA certificate path does not exist: {}",
+                ca_path.display()
+            ));
+        }
+        self.extra_ca_roots.write().unwrap().push(ca_path);
+        let cfg = self.config.read().unwrap().clone();
+        self.rebuild_acceptor(&cfg)
+    }
+
+    /// Reload the server certificate, private key, and/or CA certificate in-place.
+    pub fn reload(&self, new_config: InternalTlsConfig) -> Result<(), String> {
+        self.rebuild_acceptor(&new_config)?;
+        *self.config.write().unwrap() = new_config;
+        Ok(())
+    }
+
+    fn rebuild_acceptor(&self, config: &InternalTlsConfig) -> Result<(), String> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert_path = config
+            .cert_path
+            .as_ref()
+            .ok_or_else(|| "RS-2410: cert_path is required for internal TLS".to_string())?;
+        let key_path = config
+            .key_path
+            .as_ref()
+            .ok_or_else(|| "RS-2410: key_path is required for internal TLS".to_string())?;
+
+        let certs = load_certs(cert_path)?;
+        let key = load_key(key_path)?;
+
+        let mut roots = RootCertStore::empty();
+        if let Some(ca_path) = &config.ca_cert_path {
+            let ca_certs = load_certs(ca_path)?;
+            for ca in ca_certs {
+                roots
+                    .add(ca)
+                    .map_err(|e| format!("RS-2411: failed to add CA root certificate: {e}"))?;
+            }
+        } else if config.client_auth_required {
+            return Err(
+                "RS-2410: ca_cert_path is required when client_auth_required is true".to_string(),
+            );
+        }
+
+        let extra_roots = self.extra_ca_roots.read().unwrap();
+        for extra_ca in extra_roots.iter() {
+            if extra_ca.exists() {
+                if let Ok(ca_certs) = load_certs(extra_ca) {
+                    for ca in ca_certs {
+                        let _ = roots.add(ca);
+                    }
+                }
+            }
+        }
+
+        let verifier = if config.client_auth_required {
+            WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| format!("RS-2411: failed to build client cert verifier: {e}"))?
+        } else {
+            WebPkiClientVerifier::builder(Arc::new(roots))
+                .allow_unauthenticated()
+                .build()
+                .map_err(|e| format!("RS-2411: failed to build client cert verifier: {e}"))?
+        };
+
+        let server_config = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("RS-2411: failed to build TLS server config: {e}"))?;
+
+        let new_acceptor = TlsAcceptor::from(Arc::new(server_config));
+        *self.acceptor.write().unwrap() = new_acceptor;
+        Ok(())
+    }
 }
 
-fn read_pem(path: &Path) -> Result<Vec<u8>, TlsError> {
-    let bytes = fs::read(path).map_err(|source| TlsError::ReadError {
-        path: path.to_owned(),
-        source,
-    })?;
-    if !bytes.starts_with(b"-----BEGIN") {
-        return Err(TlsError::InvalidPem {
-            path: path.to_owned(),
-        });
-    }
-    Ok(bytes)
+/// Extract and parse `NodeIdentity` from the peer certificates of a TLS stream.
+pub fn extract_peer_identity(
+    tls_stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> Result<NodeIdentity, String> {
+    let (_, session) = tls_stream.get_ref();
+    let certs = session
+        .peer_certificates()
+        .ok_or_else(|| "RS-2410: no peer certificate presented during TLS handshake".to_string())?;
+    let leaf_cert = certs
+        .first()
+        .ok_or_else(|| "RS-2411: peer certificate chain is empty".to_string())?;
+    NodeIdentity::from_certificate_der(leaf_cert.as_ref())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    fn write_pem(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> PathBuf {
-        let path = dir.path().join(name);
-        let mut f = fs::File::create(&path).unwrap();
-        f.write_all(contents).unwrap();
-        path
+pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("RS-2411: failed to open cert file {}: {e}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            format!(
+                "RS-2411: failed to parse certs from {}: {e}",
+                path.display()
+            )
+        })?;
+    if certs.is_empty() {
+        return Err(format!(
+            "RS-2411: no certificates found in {}",
+            path.display()
+        ));
     }
+    Ok(certs)
+}
 
-    #[test]
-    fn tls_config_not_configured_by_default() {
-        let cfg = TlsConfig::default();
-        assert!(!cfg.is_configured());
+pub fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("RS-2411: failed to open key file {}: {e}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    loop {
+        match rustls_pemfile::read_one(&mut reader)
+            .map_err(|e| format!("RS-2411: failed to read key from {}: {e}", path.display()))?
+        {
+            Some(rustls_pemfile::Item::Pkcs1Key(k)) => return Ok(PrivateKeyDer::Pkcs1(k)),
+            Some(rustls_pemfile::Item::Pkcs8Key(k)) => return Ok(PrivateKeyDer::Pkcs8(k)),
+            Some(rustls_pemfile::Item::Sec1Key(k)) => return Ok(PrivateKeyDer::Sec1(k)),
+            None => break,
+            _ => continue,
+        }
     }
-
-    #[test]
-    fn tls_config_configured_when_all_paths_set() {
-        let cfg = TlsConfig::new("cert.pem", "key.pem", "ca.pem");
-        assert!(cfg.is_configured());
-    }
-
-    #[test]
-    fn load_succeeds_with_valid_pem_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let cert = write_pem(
-            &dir,
-            "cert.pem",
-            b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
-        );
-        let key = write_pem(
-            &dir,
-            "key.pem",
-            b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
-        );
-        let ca = write_pem(
-            &dir,
-            "ca.pem",
-            b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
-        );
-
-        let cfg = TlsConfig::new(&cert, &key, &ca);
-        let loaded = cfg.load().unwrap();
-        assert!(loaded.cert_pem.starts_with(b"-----BEGIN"));
-        assert!(loaded.key_pem.starts_with(b"-----BEGIN"));
-        assert!(loaded.ca_cert_pem.starts_with(b"-----BEGIN"));
-    }
-
-    #[test]
-    fn load_fails_with_invalid_pem() {
-        let dir = tempfile::tempdir().unwrap();
-        let cert = write_pem(&dir, "cert.pem", b"NOT A PEM FILE");
-        let key = write_pem(
-            &dir,
-            "key.pem",
-            b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
-        );
-        let ca = write_pem(
-            &dir,
-            "ca.pem",
-            b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
-        );
-
-        let cfg = TlsConfig::new(&cert, &key, &ca);
-        let result = cfg.load();
-        assert!(matches!(result, Err(TlsError::InvalidPem { .. })));
-    }
-
-    #[test]
-    fn load_fails_when_file_missing() {
-        let cfg = TlsConfig::new(
-            "/nonexistent/cert.pem",
-            "/nonexistent/key.pem",
-            "/nonexistent/ca.pem",
-        );
-        let result = cfg.load();
-        assert!(matches!(result, Err(TlsError::ReadError { .. })));
-    }
-
-    #[test]
-    fn load_fails_with_missing_field() {
-        let cfg = TlsConfig::default();
-        let result = cfg.load();
-        assert!(matches!(result, Err(TlsError::MissingField { .. })));
-    }
+    Err(format!(
+        "RS-2411: no valid private key found in {}",
+        path.display()
+    ))
 }
