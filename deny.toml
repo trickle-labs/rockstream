@@ -8,6 +8,7 @@ ignore = [
     "RUSTSEC-2025-0134", # rustls-pemfile - unmaintained (testcontainers transitive dep via bollard)
     "RUSTSEC-2026-0194", # quick-xml - pinned by object_store 0.12.x transitive constraint
     "RUSTSEC-2026-0195", # quick-xml - pinned by object_store 0.12.x transitive constraint
+    "RUSTSEC-2026-0235", # rkyv - inactive optional rust_decimal feature in the lockfile
 ]
 
 [licenses]

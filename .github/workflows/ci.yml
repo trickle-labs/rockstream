@@ -44,6 +44,16 @@ jobs:
           cargo test -p rockstream-gateway --test conformance_doc_tests test_conformance_doc_has_linked_tests -- --exact
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
+      - name: install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+      - name: cargo audit
+        run: cargo audit $(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' deny.toml | tr -d '"' | sed 's/^/--ignore /')
+      - name: threat-model link check
+        run: bash scripts/check-threat-model-links.sh
+      - name: threat-model checker self-test
+        run: bash scripts/check-threat-model-links.test.sh
+      - name: dependency-audit checker self-test
+        run: bash scripts/check-dependency-audit.test.sh
       - name: error-code enforcement
         run: bash scripts/check-error-codes.sh
       - name: error-code checker self-test

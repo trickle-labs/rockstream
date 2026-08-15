@@ -15,6 +15,8 @@ use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014, RS_2006,
     RS_2401, RS_2410, RS_2411, RS_4009, RS_5030,
 };
+use rockstream_types::mutation_policy::cli_mutation_policy;
+pub use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
 use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 
 use crate::output::{
@@ -38,6 +40,13 @@ fn append_audit_file(storage_path: &Path, event: &AuditEvent) {
             let _ = writeln!(file, "{}", line);
         }
     }
+}
+
+fn required_role(operation: &str) -> Role {
+    cli_mutation_policy(operation)
+        .expect("every CLI mutation must have an authorization policy")
+        .minimum_role
+        .clone()
 }
 
 /// Client identity representation for authenticating requests.
@@ -397,7 +406,7 @@ impl ControlClient {
     }
 
     pub fn drain_worker(&self, worker_id: u64) -> Result<DrainOutcome, CliError> {
-        if self.identity.role < Role::Admin {
+        if self.identity.role < required_role("cluster workers drain") {
             self.record_audit(
                 "cluster.workers.drain",
                 &worker_id.to_string(),
@@ -454,7 +463,7 @@ impl ControlClient {
         shard_id: u64,
         target_worker: u64,
     ) -> Result<MigrationOutcome, CliError> {
-        if self.identity.role < Role::Admin {
+        if self.identity.role < required_role("shard migrate") {
             self.record_audit(
                 "shard.migrate",
                 &shard_id.to_string(),
@@ -901,7 +910,7 @@ impl CatalogClient {
     }
 
     pub fn pause_view(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::PipelineOwner {
+        if self.identity.role < required_role("view pause") {
             self.record_audit(
                 "view.pause",
                 name,
@@ -955,7 +964,7 @@ impl CatalogClient {
     }
 
     pub fn resume_view(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::PipelineOwner {
+        if self.identity.role < required_role("view resume") {
             self.record_audit(
                 "view.resume",
                 name,
@@ -1138,7 +1147,7 @@ impl CatalogClient {
     }
 
     pub fn pause_source(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::PipelineOwner {
+        if self.identity.role < required_role("source pause") {
             self.record_audit(
                 "source.pause",
                 name,
@@ -1183,7 +1192,7 @@ impl CatalogClient {
     }
 
     pub fn resume_source(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::PipelineOwner {
+        if self.identity.role < required_role("source resume") {
             self.record_audit(
                 "source.resume",
                 name,
@@ -1228,7 +1237,7 @@ impl CatalogClient {
     }
 
     pub fn drop_source(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::Admin {
+        if self.identity.role < required_role("source drop") {
             self.record_audit(
                 "source.drop",
                 name,
@@ -1275,7 +1284,7 @@ impl CatalogClient {
         name: &str,
         columns_spec: Option<&str>,
     ) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::PipelineOwner {
+        if self.identity.role < required_role("schema create") {
             self.record_audit(
                 "schema.create",
                 name,
@@ -1346,7 +1355,7 @@ impl CatalogClient {
     }
 
     pub fn drop_schema(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::Admin {
+        if self.identity.role < required_role("schema drop") {
             self.record_audit(
                 "schema.drop",
                 name,
@@ -1396,7 +1405,7 @@ impl CatalogClient {
         memory_limit: Option<u64>,
         max_parallelism: Option<usize>,
     ) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::Admin {
+        if self.identity.role < required_role("workload create") {
             self.record_audit(
                 "workload.create",
                 name,
@@ -1458,7 +1467,7 @@ impl CatalogClient {
         memory_limit: Option<u64>,
         max_parallelism: Option<usize>,
     ) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::Admin {
+        if self.identity.role < required_role("workload alter") {
             self.record_audit(
                 "workload.alter",
                 name,
@@ -1516,7 +1525,7 @@ impl CatalogClient {
     }
 
     pub fn drop_workload(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
-        if self.identity.role < Role::Admin {
+        if self.identity.role < required_role("workload drop") {
             self.record_audit(
                 "workload.drop",
                 name,
@@ -1618,7 +1627,7 @@ impl StorageClient {
         checkpoint_id: u64,
         target_dir: Option<&Path>,
     ) -> Result<RestoreOutcome, CliError> {
-        if self.identity.role < Role::Admin {
+        if self.identity.role < required_role("checkpoint restore") {
             let event = AuditEvent::now(
                 self.identity.user.clone(),
                 "checkpoint.restore",
@@ -1670,7 +1679,7 @@ impl StorageClient {
         _since: Option<&str>,
         out: Option<&Path>,
     ) -> Result<SupportBundleInfo, CliError> {
-        if self.identity.role < Role::Admin {
+        if self.identity.role < required_role("support bundle") {
             let event = AuditEvent::now(
                 self.identity.user.clone(),
                 "support.bundle",

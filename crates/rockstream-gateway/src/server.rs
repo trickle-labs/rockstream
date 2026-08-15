@@ -73,6 +73,7 @@ use rockstream_types::config::ScatterPruningConfig;
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
 use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId};
+use rockstream_types::mutation_policy::pgwire_mutation_policy;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
 use crate::auth::{
@@ -1722,6 +1723,110 @@ pub struct GatewayHandler {
 impl GatewayHandler {
     fn bind_server(&self, handler: &Arc<Self>) {
         *self.self_ref.lock() = Arc::downgrade(handler);
+    }
+
+    fn mutation_resource(query: &str, operation: &str) -> String {
+        let words: Vec<&str> = query
+            .trim()
+            .trim_end_matches(';')
+            .split_whitespace()
+            .collect();
+        let after = |keyword: &str| {
+            words
+                .iter()
+                .position(|word| word.eq_ignore_ascii_case(keyword))
+                .and_then(|index| words.get(index + 1).copied())
+        };
+        let token = |value: &str| {
+            value
+                .trim_matches(|c: char| c == '"' || c == '\'')
+                .trim_end_matches(';')
+                .to_ascii_lowercase()
+        };
+        match operation {
+            "CREATE VIEW" | "REFRESH MATERIALIZED VIEW" => after("view"),
+            "CREATE TABLE" => after("table").and_then(|name| {
+                if name.eq_ignore_ascii_case("if") {
+                    words
+                        .iter()
+                        .position(|word| word.eq_ignore_ascii_case("exists"))
+                        .and_then(|index| words.get(index + 1).copied())
+                } else {
+                    Some(name)
+                }
+            }),
+            "CREATE SINK" => after("sink"),
+            "CREATE SOURCE"
+            | "DROP SOURCE"
+            | "ALTER SOURCE"
+            | "ALTER SOURCE PAUSE"
+            | "ALTER SOURCE RESUME" => after("source"),
+            "CREATE SECRET" | "ALTER SECRET" | "DROP SECRET" => after("secret"),
+            "CREATE INDEX" | "DROP INDEX" | "REBUILD INDEX" | "MARK INDEX" => after("index"),
+            "CREATE WORKLOAD" | "ALTER WORKLOAD" | "DROP WORKLOAD" => after("workload"),
+            "INSERT" => after("into"),
+            "UPDATE" => words.get(1).copied(),
+            "DELETE" => after("from"),
+            "COPY FROM STDIN" => words.get(1).copied(),
+            "CREATE NAMESPACE" => after("namespace"),
+            _ => None,
+        }
+        .map(token)
+        .unwrap_or_else(|| "<unknown>".to_string())
+    }
+
+    fn authorize_mutation(
+        &self,
+        query: &str,
+        conn_id: Option<&str>,
+    ) -> Option<Vec<Response<'static>>> {
+        let spec = pgwire_mutation_policy(query)?;
+        let id = conn_id?;
+        let (principal, namespace) = self
+            .sessions
+            .get(id)
+            .map(|session| (session.principal.clone(), session.current_namespace.clone()))
+            .unwrap_or((Principal::System, "public".to_string()));
+        if principal.is_system() {
+            return None;
+        }
+
+        let resource = Self::mutation_resource(query, spec.operation);
+        if self
+            .acl_store
+            .check(
+                principal.identity(),
+                &namespace,
+                Some(&resource),
+                spec.minimum_role.clone(),
+            )
+            .is_ok()
+        {
+            return None;
+        }
+
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(
+                &rockstream_types::audit::AuditEvent::now(
+                    principal.actor(),
+                    spec.audit_action,
+                    &resource,
+                )
+                .with_detail("unauthorized role")
+                .with_error_code("RS-2401"),
+            );
+        }
+
+        Some(vec![promote_response(Response::Error(Box::new(
+            ErrorInfo::new(
+                "ERROR".to_string(),
+                "42501".to_string(),
+                format!(
+                    "[RS-2401] auth.permission_denied: principal '{}' lacks required role '{:?}' on {}. next_steps: Request an ACL grant for the required role, then retry.",
+                    principal.identity(), spec.minimum_role, resource
+                ),
+            ),
+        )))])
     }
 
     /// Fill-level snapshot of every per-connection state map (v0.51.6
@@ -4457,6 +4562,9 @@ impl GatewayHandler {
         // COPY IN: enter COPY IN mode, store CopyState, return CopyInResponse.
         let ql = query.trim().to_lowercase();
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
+            if let Some(response) = self.authorize_mutation(query, Some(conn_id)) {
+                return Ok(response);
+            }
             return self.handle_copy_from_stdin(query, conn_id);
         }
 
@@ -4756,6 +4864,10 @@ impl GatewayHandler {
     ) -> PgWireResult<Vec<Response<'static>>> {
         let q = query.trim();
         let ql = q.to_lowercase();
+
+        if let Some(response) = self.authorize_mutation(q, conn_id) {
+            return Ok(response);
+        }
 
         // ── Aborted-transaction guard ────────────────────────────────────────────
         // Any command inside a failed block is bounced with SQLSTATE 25P02, except
@@ -9601,6 +9713,9 @@ impl GatewayHandler {
         query: &str,
         conn_id: &str,
     ) -> PgWireResult<Vec<Response<'static>>> {
+        if let Some(response) = self.authorize_mutation(query, Some(conn_id)) {
+            return Ok(response);
+        }
         self.handle_copy_from_stdin(query, conn_id)
     }
 
@@ -10728,6 +10843,12 @@ impl ExtendedQueryHandler for GatewayHandler {
 
         // COPY IN via extended query protocol (e.g. tokio_postgres.copy_in()).
         if ql.starts_with("copy ") && ql.contains(" from stdin") {
+            if let Some(response) = self.authorize_mutation(query, Some(&conn_id)) {
+                return Ok(response
+                    .into_iter()
+                    .next()
+                    .unwrap_or(Response::Execution(Tag::new("OK"))));
+            }
             let responses = self.handle_copy_from_stdin(query, &conn_id)?;
             return Ok(responses
                 .into_iter()

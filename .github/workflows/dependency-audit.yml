@@ -1,6 +1,6 @@
 name: Dependency Audit
 
-# Runs `cargo deny check` against main on a fixed schedule, independent of any
+# Runs `cargo deny check` and `cargo audit` against main on a fixed schedule, independent of any
 # push/pull_request activity. Introduced in v0.45.3 to close the gap called
 # out in DEPENDENCY_POLICY.md: the PR-triggered `cargo deny` step in ci.yml
 # only runs when a PR touches the repo, so a newly-published advisory against
@@ -24,3 +24,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
+      - name: install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+      - name: cargo audit
+        run: cargo audit $(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' deny.toml | tr -d '"' | sed 's/^/--ignore /')
+      - name: dependency-audit checker self-test
+        run: bash scripts/check-dependency-audit.test.sh

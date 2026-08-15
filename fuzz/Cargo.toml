@@ -18,6 +18,7 @@ rockstream-types = { workspace = true }
 arrow = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+serde_json = { workspace = true }
 
 [[bin]]
 name = "fuzz_sql_parser"
@@ -34,5 +35,29 @@ doc = false
 [[bin]]
 name = "fuzz_postgres_cdc"
 path = "fuzz_targets/fuzz_postgres_cdc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_control_worker_decoder"
+path = "fuzz_targets/fuzz_control_worker_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_raft_rpc_decoder"
+path = "fuzz_targets/fuzz_raft_rpc_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_kafka_payload_decoder"
+path = "fuzz_targets/fuzz_kafka_payload_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_oidc_jwt_decoder"
+path = "fuzz_targets/fuzz_oidc_jwt_decoder.rs"
 test = false
 doc = false

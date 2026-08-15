@@ -20,6 +20,7 @@ use rockstream_cli::{
     run_view_subscribe, run_workload_alter, run_workload_create, run_workload_drop,
     run_workload_list, run_workload_show, StartOptions,
 };
+use rockstream_types::acl::Role;
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::topology::{WorkerCapabilities, WorkerLocation};
 
@@ -39,6 +40,14 @@ struct Cli {
     /// Storage directory for local state and artifacts.
     #[arg(long, global = true)]
     storage_dir: Option<std::path::PathBuf>,
+
+    /// Principal presented to control-plane and catalog mutations.
+    #[arg(long, global = true, default_value = "rockstream")]
+    identity_user: String,
+
+    /// RBAC role presented to control-plane and catalog mutations.
+    #[arg(long, global = true, value_parser = ["viewer", "pipeline-owner", "admin"], default_value = "viewer")]
+    identity_role: String,
 
     /// Path to the PEM-encoded CA certificate used to validate peer certificates for mTLS.
     #[arg(long = "tls-ca-cert-path", global = true)]
@@ -587,6 +596,7 @@ fn main() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
+    let identity = cli_identity(&cli);
 
     let format = OutputFormat::from_json_flag(cli.json);
 
@@ -707,7 +717,7 @@ fn main() -> ExitCode {
             }
         }
         Command::View { command } => {
-            let identity = ClientIdentity::default();
+            let identity = identity.clone();
             let mut catalog = CatalogClient::new(identity);
             let res = match command {
                 ViewCommand::List => run_view_list(format, &catalog),
@@ -729,7 +739,7 @@ fn main() -> ExitCode {
             handle_result(res)
         }
         Command::Source { command } => {
-            let identity = ClientIdentity::default();
+            let identity = identity.clone();
             let mut catalog = CatalogClient::new(identity);
             let res = match command {
                 SourceCommand::List => run_source_list(format, &catalog),
@@ -743,7 +753,7 @@ fn main() -> ExitCode {
             handle_result(res)
         }
         Command::Schema { command } => {
-            let identity = ClientIdentity::default();
+            let identity = identity.clone();
             let mut catalog = CatalogClient::new(identity);
             let res = match command {
                 SchemaCommand::List => run_schema_list(format, &catalog),
@@ -758,7 +768,7 @@ fn main() -> ExitCode {
             handle_result(res)
         }
         Command::Workload { command } => {
-            let identity = ClientIdentity::default();
+            let identity = identity.clone();
             let mut catalog = CatalogClient::new(identity);
             let res = match command {
                 WorkloadCommand::List => run_workload_list(format, &catalog),
@@ -843,7 +853,7 @@ fn main() -> ExitCode {
             handle_result(res)
         }
         Command::Checkpoint { command } => {
-            let storage = StorageClient::new();
+            let storage = StorageClient::with_identity(identity.clone());
             let storage_path = cli
                 .storage_dir
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -868,7 +878,7 @@ fn main() -> ExitCode {
             handle_result(res)
         }
         Command::Support { command } => {
-            let storage = StorageClient::new();
+            let storage = StorageClient::with_identity(identity.clone());
             let storage_path = cli
                 .storage_dir
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -885,7 +895,7 @@ fn main() -> ExitCode {
             handle_result(res)
         }
         Command::Resource { command } => {
-            let identity = ClientIdentity::default();
+            let identity = identity.clone();
             let catalog = CatalogClient::new(identity);
             let res = match command {
                 ResourceCommand::Usage { workload } => {
@@ -896,7 +906,7 @@ fn main() -> ExitCode {
             handle_result(res)
         }
         Command::SchemaEvolution { command } => {
-            let identity = ClientIdentity::default();
+            let identity = identity.clone();
             let catalog = CatalogClient::new(identity);
             let res = match command {
                 SchemaEvolutionCommand::Status => run_schema_evolution_status(format, &catalog),
@@ -905,7 +915,7 @@ fn main() -> ExitCode {
             handle_result(res)
         }
         Command::Audit { command } => {
-            let storage = StorageClient::new();
+            let storage = StorageClient::with_identity(identity.clone());
             let storage_path = cli
                 .storage_dir
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -922,13 +932,11 @@ fn main() -> ExitCode {
             estimate,
             op_ids,
         } => {
-            let _identity = ClientIdentity::default();
             let catalog = CatalogClient::with_defaults();
             handle_result(run_explain_view(format, &catalog, &view, estimate, op_ids))
         }
         Command::Sql { query } => handle_result(run_sql_compile(format, &query)),
         Command::Debug { command } => {
-            let _identity = ClientIdentity::default();
             let catalog = CatalogClient::with_defaults();
             let res = match command {
                 DebugCommand::Arrangement {
@@ -944,7 +952,7 @@ fn main() -> ExitCode {
 }
 
 fn make_control_client(cli: &Cli, override_addr: Option<String>) -> ControlClient {
-    let mut identity = ClientIdentity::default();
+    let mut identity = cli_identity(cli);
     if let Some(ref p) = cli.tls_cert_path {
         identity = identity.with_cert(p.clone());
     }
@@ -978,6 +986,19 @@ fn make_control_client(cli: &Cli, override_addr: Option<String>) -> ControlClien
         });
     }
     client
+}
+
+fn cli_identity(cli: &Cli) -> ClientIdentity {
+    let role = match cli.identity_role.as_str() {
+        "admin" => Role::Admin,
+        "pipeline-owner" => Role::PipelineOwner,
+        _ => Role::Viewer,
+    };
+    let mut identity = ClientIdentity::new(cli.identity_user.clone()).with_role(role);
+    if let Some(cert_path) = &cli.tls_cert_path {
+        identity = identity.with_cert(cert_path.clone());
+    }
+    identity
 }
 
 fn handle_result(res: Result<String, rockstream_cli::CliError>) -> ExitCode {

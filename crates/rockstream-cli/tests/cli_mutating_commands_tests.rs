@@ -20,6 +20,7 @@ use rockstream_types::acl::Role;
 use rockstream_types::error_code::{
     RS_1001, RS_1004, RS_1007, RS_1008, RS_1014, RS_2401, RS_4009, RS_5030,
 };
+use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
 
 #[test]
 fn test_cli_mutating_subcommands_e2e_live_cluster() {
@@ -263,78 +264,123 @@ fn test_cli_unauthorized_identity_refused_and_audited_exhaustive() {
         ControlClient::new(None, viewer_identity.clone()).with_storage_path(&storage_path);
     let storage = StorageClient::with_identity(viewer_identity);
 
-    // Define table of all mutating operations requiring elevated role
-    enum MutatingOp {
-        ViewPause,
-        ViewResume,
-        SourcePause,
-        SourceResume,
-        SourceDrop,
-        SchemaCreate,
-        SchemaDrop,
-        WorkloadCreate,
-        WorkloadAlter,
-        WorkloadDrop,
-        WorkerDrain,
-        ShardMigrate,
-        CheckpointRestore,
-        SupportBundle,
-    }
+    let resource_for = |operation: &str| match operation {
+        "view pause" | "view resume" => "active_users",
+        "source pause" | "source resume" | "source drop" => "users_source",
+        "schema create" => "tbl",
+        "schema drop" => "users",
+        "workload create" => "wl",
+        "workload alter" | "workload drop" => "analytics",
+        "cluster workers drain" => "1",
+        "shard migrate" => "1",
+        "checkpoint restore" => "1",
+        "support bundle" => "all",
+        operation => panic!("unknown CLI mutation policy operation: {operation}"),
+    };
 
-    let mutating_ops = [
-        MutatingOp::ViewPause,
-        MutatingOp::ViewResume,
-        MutatingOp::SourcePause,
-        MutatingOp::SourceResume,
-        MutatingOp::SourceDrop,
-        MutatingOp::SchemaCreate,
-        MutatingOp::SchemaDrop,
-        MutatingOp::WorkloadCreate,
-        MutatingOp::WorkloadAlter,
-        MutatingOp::WorkloadDrop,
-        MutatingOp::WorkerDrain,
-        MutatingOp::ShardMigrate,
-        MutatingOp::CheckpointRestore,
-        MutatingOp::SupportBundle,
-    ];
-
-    for op in &mutating_ops {
-        let err = match op {
-            MutatingOp::ViewPause => catalog.pause_view("active_users").unwrap_err(),
-            MutatingOp::ViewResume => catalog.resume_view("active_users").unwrap_err(),
-            MutatingOp::SourcePause => catalog.pause_source("users_source").unwrap_err(),
-            MutatingOp::SourceResume => catalog.resume_source("users_source").unwrap_err(),
-            MutatingOp::SourceDrop => catalog.drop_source("users_source").unwrap_err(),
-            MutatingOp::SchemaCreate => catalog.create_schema("tbl", None).unwrap_err(),
-            MutatingOp::SchemaDrop => catalog.drop_schema("users").unwrap_err(),
-            MutatingOp::WorkloadCreate => catalog
+    let mut result_vector = Vec::new();
+    for spec in CLI_MUTATION_POLICY {
+        let err = match spec.operation {
+            "view pause" => catalog.pause_view("active_users").unwrap_err(),
+            "view resume" => catalog.resume_view("active_users").unwrap_err(),
+            "source pause" => catalog.pause_source("users_source").unwrap_err(),
+            "source resume" => catalog.resume_source("users_source").unwrap_err(),
+            "source drop" => catalog.drop_source("users_source").unwrap_err(),
+            "schema create" => catalog.create_schema("tbl", None).unwrap_err(),
+            "schema drop" => catalog.drop_schema("users").unwrap_err(),
+            "workload create" => catalog
                 .create_workload("wl", None, None, None, None)
                 .unwrap_err(),
-            MutatingOp::WorkloadAlter => catalog
+            "workload alter" => catalog
                 .alter_workload("analytics", None, None, None, None)
                 .unwrap_err(),
-            MutatingOp::WorkloadDrop => catalog.drop_workload("analytics").unwrap_err(),
-            MutatingOp::WorkerDrain => control.drain_worker(1).unwrap_err(),
-            MutatingOp::ShardMigrate => control.migrate_shard(1, 2).unwrap_err(),
-            MutatingOp::CheckpointRestore => storage
+            "workload drop" => catalog.drop_workload("analytics").unwrap_err(),
+            "cluster workers drain" => control.drain_worker(1).unwrap_err(),
+            "shard migrate" => control.migrate_shard(1, 2).unwrap_err(),
+            "checkpoint restore" => storage
                 .restore_checkpoint(&storage_path, 1, None)
                 .unwrap_err(),
-            MutatingOp::SupportBundle => storage
+            "support bundle" => storage
                 .generate_support_bundle(&storage_path, None, None, None)
                 .unwrap_err(),
+            operation => panic!("unknown CLI mutation policy operation: {operation}"),
         };
-
+        assert_eq!(err.code, RS_2401);
         assert_eq!(
-            err.code, RS_2401,
-            "Mutating operation must be refused with RS-2401 for Viewer role"
+            err.message,
+            format!(
+                "permission denied: principal 'unauth_viewer' lacks required role {:?}",
+                spec.minimum_role
+            )
         );
+        assert_eq!(
+            err.next_steps,
+            format!(
+                "Request elevated RBAC role ({}) or run under an authorized principal.",
+                match &spec.minimum_role {
+                    Role::PipelineOwner => "PipelineOwner / Admin",
+                    Role::Admin => "Admin",
+                    Role::Viewer => "Viewer / Admin",
+                }
+            )
+        );
+        result_vector.push((
+            spec.operation,
+            err.code,
+            err.message,
+            err.next_steps,
+            resource_for(spec.operation),
+        ));
     }
 
-    // Verify audit log has exactly one refusal entry per attempted mutation
+    let expected_results = CLI_MUTATION_POLICY
+        .iter()
+        .map(|spec| {
+            (
+                spec.operation,
+                RS_2401,
+                format!(
+                    "permission denied: principal 'unauth_viewer' lacks required role {:?}",
+                    spec.minimum_role
+                ),
+                format!(
+                    "Request elevated RBAC role ({}) or run under an authorized principal.",
+                    match &spec.minimum_role {
+                        Role::PipelineOwner => "PipelineOwner / Admin",
+                        Role::Admin => "Admin",
+                        Role::Viewer => "Viewer / Admin",
+                    }
+                ),
+                resource_for(spec.operation),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(result_vector, expected_results);
+
     let events = StorageClient::new().audit_tail(&storage_path, 100).unwrap();
-    assert_eq!(events.len(), mutating_ops.len());
-    for e in &events {
-        assert_eq!(e.actor, "unauth_viewer");
-        assert_eq!(e.error_code.as_deref(), Some("RS-2401"));
-    }
+    let actual_audit = events
+        .iter()
+        .map(|event| {
+            (
+                event.actor.as_str(),
+                event.action.as_str(),
+                event.resource.as_str(),
+                event.detail.as_deref(),
+                event.error_code.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected_audit = CLI_MUTATION_POLICY
+        .iter()
+        .map(|spec| {
+            (
+                "unauth_viewer",
+                spec.audit_action,
+                resource_for(spec.operation),
+                Some("unauthorized role"),
+                Some("RS-2401"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual_audit, expected_audit);
 }

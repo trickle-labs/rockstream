@@ -18,7 +18,7 @@ and structured `--json` output for automated tooling.
 ```bash
 rockstream --help
 rockstream --version
-rockstream [--json] [--control <url>] [--storage-dir <dir>] <command>
+rockstream [--json] [--control <url>] [--storage-dir <dir>] [--identity-user <name>] [--identity-role <role>] <command>
 ```
 
 ## Global Options
@@ -28,6 +28,8 @@ rockstream [--json] [--control <url>] [--storage-dir <dir>] <command>
 | `--json` | `false` | Format output as structured JSON. |
 | `--control <url>` | — | Control service URL for cluster and shard inspection. |
 | `--storage-dir <dir>` | `.` | Local storage directory for reading checkpoints and audit logs. |
+| `--identity-user <name>` | `rockstream` | Principal presented to control-plane and catalog mutations. |
+| `--identity-role <role>` | `viewer` | RBAC role presented to mutations: `viewer`, `pipeline-owner`, or `admin`. |
 | `--tls-ca-cert-path <path>` | — | Path to CA root certificate bundle for internal mTLS. |
 | `--tls-cert-path <path>` | — | Path to client/node X.509 certificate for internal mTLS. |
 | `--tls-key-path <path>` | — | Path to client/node private key for internal mTLS. |

@@ -43,6 +43,14 @@ const fn default_weight() -> i64 {
     1
 }
 
+/// Decode one Kafka source payload using the same decoder as the live source.
+pub fn decode_kafka_payload(
+    payload: &[u8],
+) -> Result<(i64, Vec<serde_json::Value>, i64), serde_json::Error> {
+    let body: KafkaPayload = serde_json::from_slice(payload)?;
+    Ok((body.timestamp, body.values, body.weight))
+}
+
 /// Kafka source using a real `rdkafka::consumer::StreamConsumer`.
 pub struct KafkaSource {
     _connector_id: ConnectorId,
@@ -306,7 +314,7 @@ impl KafkaSource {
                     .to_string(),
             })?;
         let offset = u64::try_from(message.offset()).unwrap_or(0);
-        let body: KafkaPayload = match serde_json::from_slice(payload) {
+        let (timestamp, values, weight) = match decode_kafka_payload(payload) {
             Ok(body) => body,
             Err(error) => {
                 rockstream_types::dlq::quarantine_record(
@@ -322,9 +330,9 @@ impl KafkaSource {
         Ok(Some(KafkaRecord {
             offset,
             partition: message.partition(),
-            timestamp: body.timestamp,
-            values: body.values,
-            weight: body.weight,
+            timestamp,
+            values,
+            weight,
             bytes: payload.len(),
         }))
     }

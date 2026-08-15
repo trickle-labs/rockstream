@@ -24,6 +24,7 @@ pub mod lease;
 pub mod merge_law;
 pub mod metrics;
 pub mod migration;
+pub mod mutation_policy;
 pub mod raft;
 pub mod rendezvous;
 pub mod schema_evolution;
