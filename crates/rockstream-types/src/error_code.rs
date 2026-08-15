@@ -249,6 +249,28 @@ pub const RS_2412: ErrorCode = ErrorCode::new(2412);
 /// next_steps: "Verify the new certificate and private key files exist, have matching keys, and are signed by a trusted CA."
 pub const RS_2413: ErrorCode = ErrorCode::new(2413);
 
+/// Secret not found in secret catalog (v0.55.1, `secret.not_found`).
+/// next_steps: "Verify the secret name or run CREATE SECRET to define it."
+pub const RS_2420: ErrorCode = ErrorCode::new(2420);
+/// Secret already exists in catalog (v0.55.1, `secret.already_exists`).
+/// next_steps: "Choose a distinct secret name or run ALTER SECRET to modify the existing secret."
+pub const RS_2421: ErrorCode = ErrorCode::new(2421);
+/// Secret encryption or envelope DEK wrap/unwrap failed (v0.55.1, `secret.encryption_failed`).
+/// next_steps: "Check KEK provider configuration and key access permissions."
+pub const RS_2422: ErrorCode = ErrorCode::new(2422);
+/// Secret token is invalid, expired, or failed node-identity verification (v0.55.1, `secret.token_invalid`).
+/// next_steps: "Request a fresh secret token using valid mTLS node credentials."
+pub const RS_2423: ErrorCode = ErrorCode::new(2423);
+/// Secret DDL syntax or configuration is invalid (v0.55.1, `secret.ddl_invalid`).
+/// next_steps: "Check CREATE/ALTER SECRET syntax and required options (e.g. TYPE)."
+pub const RS_2424: ErrorCode = ErrorCode::new(2424);
+/// Secret or KEK rotation failed (v0.55.1, `secret.rotation_failed`).
+/// next_steps: "Verify the target KEK provider is reachable and active connectors are responsive."
+pub const RS_2425: ErrorCode = ErrorCode::new(2425);
+/// Secret drop rejected because it is in active use by a source or sink (v0.55.1, `secret.in_use_by_source_or_sink`).
+/// next_steps: "Drop or alter referencing sources and sinks before dropping the secret."
+pub const RS_2426: ErrorCode = ErrorCode::new(2426);
+
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
 /// Durable shuffle rate-limit retry budget exhausted (v0.45.7, split from RS-3010).
@@ -463,6 +485,13 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2411 => "auth.internal_mtls_invalid_cert",
         2412 => "auth.internal_mtls_node_identity_mismatch",
         2413 => "auth.internal_mtls_rotation_failed",
+        2420 => "secret.not_found",
+        2421 => "secret.already_exists",
+        2422 => "secret.encryption_failed",
+        2423 => "secret.token_invalid",
+        2424 => "secret.ddl_invalid",
+        2425 => "secret.rotation_failed",
+        2426 => "secret.in_use_by_source_or_sink",
         3701 => "view.waiting_on_source",
         3702 => "view.quota_admission_rejected",
         3703 => "view.spilling",
@@ -642,6 +671,13 @@ pub fn description(code: ErrorCode) -> &'static str {
         2411 => "Internal mTLS client certificate invalid, expired, or signed by an untrusted CA",
         2412 => "Presented client certificate node identity does not match registration payload",
         2413 => "Internal mTLS certificate rotation or reload failed",
+        2420 => "Secret not found in secret catalog",
+        2421 => "Secret already exists in catalog",
+        2422 => "Secret encryption or envelope DEK wrap/unwrap failed",
+        2423 => "Secret token is invalid, expired, or failed node-identity verification",
+        2424 => "Secret DDL syntax or configuration is invalid",
+        2425 => "Secret or KEK rotation failed",
+        2426 => "Secret drop rejected because it is in active use by a source or sink",
         _ => "Unknown error",
     }
 }
@@ -684,6 +720,13 @@ pub fn severity(code: ErrorCode) -> Severity {
         2411 => Severity::Fatal,
         2412 => Severity::Fatal,
         2413 => Severity::Error,
+        2420 => Severity::Error,
+        2421 => Severity::Error,
+        2422 => Severity::Fatal,
+        2423 => Severity::Error,
+        2424 => Severity::Error,
+        2425 => Severity::Fatal,
+        2426 => Severity::Error,
         4017 => Severity::Error,
         3701 => Severity::Warning,
         3702 => Severity::Warning,
@@ -832,6 +875,13 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2411 => "Verify the internal TLS client certificate is valid, not expired, and signed by the trusted cluster CA root certificate.",
         2412 => "Ensure the node ID and role presented in the internal TLS certificate Common Name / SAN match the node registration parameters.",
         2413 => "Verify the new certificate and private key files exist, have matching keys, and are signed by a trusted CA before triggering certificate rotation.",
+        2420 => "Verify the secret name or run CREATE SECRET to define it.",
+        2421 => "Choose a distinct secret name or run ALTER SECRET to modify the existing secret.",
+        2422 => "Check KEK provider configuration and key access permissions.",
+        2423 => "Request a fresh secret token using valid mTLS node credentials.",
+        2424 => "Check CREATE/ALTER SECRET syntax and required options (e.g. TYPE).",
+        2425 => "Verify the target KEK provider is reachable and active connectors are responsive.",
+        2426 => "Drop or alter referencing sources and sinks before dropping the secret.",
         _ => "See documentation for this error code.",
     }
 }
@@ -1125,5 +1175,31 @@ mod tests {
         assert!(next_steps(RS_2411).contains("cluster CA"));
         assert!(next_steps(RS_2412).contains("Common Name"));
         assert!(next_steps(RS_2413).contains("rotation"));
+    }
+
+    #[test]
+    fn secrets_error_codes_registered() {
+        let codes = [
+            (RS_2420, 2420, "secret.not_found", Severity::Error),
+            (RS_2421, 2421, "secret.already_exists", Severity::Error),
+            (RS_2422, 2422, "secret.encryption_failed", Severity::Fatal),
+            (RS_2423, 2423, "secret.token_invalid", Severity::Error),
+            (RS_2424, 2424, "secret.ddl_invalid", Severity::Error),
+            (RS_2425, 2425, "secret.rotation_failed", Severity::Fatal),
+            (
+                RS_2426,
+                2426,
+                "secret.in_use_by_source_or_sink",
+                Severity::Error,
+            ),
+        ];
+
+        for (code, val, expected_slug, expected_sev) in codes {
+            assert_eq!(code.value(), val);
+            assert_eq!(slug(code), expected_slug);
+            assert_eq!(severity(code), expected_sev);
+            assert!(!description(code).is_empty());
+            assert!(!next_steps(code).is_empty());
+        }
     }
 }

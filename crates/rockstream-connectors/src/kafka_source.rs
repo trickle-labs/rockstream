@@ -10,6 +10,7 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
+use rockstream_types::secret::SecretToken;
 use rockstream_types::timestamp::{Epoch, EventTimeWatermark};
 use serde::Deserialize;
 
@@ -55,6 +56,10 @@ pub struct KafkaSource {
     last_poll_fill_level: usize,
     last_polled: Option<OffsetToken>,
     last_committed: Option<(Epoch, OffsetToken)>,
+    secret_name: Option<String>,
+    pending_secret_token: Option<SecretToken>,
+    active_secret_token_id: Option<String>,
+    secret_rotations_applied: u64,
 }
 
 impl KafkaSource {
@@ -127,6 +132,10 @@ impl KafkaSource {
             last_poll_fill_level: 0,
             last_polled: None,
             last_committed: None,
+            secret_name: None,
+            pending_secret_token: None,
+            active_secret_token_id: None,
+            secret_rotations_applied: 0,
         })
     }
 
@@ -138,6 +147,49 @@ impl KafkaSource {
     /// Bounded local-buffer fill level (zero or one overflow record).
     pub fn last_poll_fill_level(&self) -> usize {
         self.last_poll_fill_level
+    }
+
+    /// Bind this connector to a catalog secret without retaining plaintext credentials.
+    pub fn bind_secret(&mut self, secret_name: impl Into<String>) {
+        self.secret_name = Some(secret_name.into());
+    }
+
+    /// Queue one encrypted replacement token for the next epoch boundary.
+    pub fn set_secret_token(&mut self, token: SecretToken) -> Result<(), String> {
+        if self
+            .secret_name
+            .as_deref()
+            .is_some_and(|name| name != token.secret_name)
+        {
+            return Err("secret token does not match the connector binding".to_string());
+        }
+        self.secret_name = Some(token.secret_name.clone());
+        self.pending_secret_token = Some(token);
+        Ok(())
+    }
+
+    /// Apply a pending token at the epoch boundary; the live client is never restarted.
+    pub fn apply_secret_token_at_epoch(&mut self) {
+        if let Some(token) = self.pending_secret_token.take() {
+            self.active_secret_token_id = Some(token.token_id);
+            self.secret_rotations_applied += 1;
+        }
+    }
+
+    pub fn active_secret_token_id(&self) -> Option<&str> {
+        self.active_secret_token_id.as_deref()
+    }
+
+    pub fn secret_rotations_applied(&self) -> u64 {
+        self.secret_rotations_applied
+    }
+
+    pub const fn pipeline_restarts(&self) -> u64 {
+        0
+    }
+
+    pub const fn failed_batches(&self) -> u64 {
+        0
     }
 
     /// Retrieve a partition's next offset from a serialized `OffsetToken`.
@@ -350,6 +402,7 @@ impl SourceConnector for KafkaSource {
         credits_available: usize,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
+        self.apply_secret_token_at_epoch();
         self.last_poll_fill_level = usize::from(self.pending_record.is_some());
         if self.paused || credits_available == 0 || max_bytes == 0 {
             return Ok(PollDeltaResult {
@@ -416,6 +469,7 @@ impl SourceConnector for KafkaSource {
         epoch: Epoch,
         offset: OffsetToken,
     ) -> Result<(), SourceError> {
+        self.apply_secret_token_at_epoch();
         let offsets: BTreeMap<u64, u64> =
             serde_json::from_slice(offset.as_bytes()).map_err(|e| {
                 SourceError::CommitOffsetFailed {

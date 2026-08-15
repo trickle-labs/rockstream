@@ -293,6 +293,12 @@ pub enum ControlMessage {
         /// Actionable operator guidance.
         next_steps: String,
     },
+    /// Short-lived secret token encrypted for this worker identity.
+    SecretTokenIssued { token: crate::secret::SecretToken },
+    /// A secret changed and workers should request a fresh token at an epoch boundary.
+    SecretRotated {
+        rotation: crate::secret::SecretRotation,
+    },
     /// Published by the control plane after all workers have reported their
     /// pressure samples; consumers (HPA adapters) read this gauge (v0.47).
     ClusterPressureGauge(ClusterWorkerPressure),
@@ -766,6 +772,8 @@ pub enum WorkerMessage {
         /// migrate away its current shard set.
         worker_id: WorkerId,
     },
+    /// Request a short-lived token for a catalog secret.
+    ResolveSecretToken { secret_name: String },
 }
 
 #[cfg(test)]

@@ -5007,7 +5007,10 @@ dependencies = [
 name = "rockstream-control"
 version = "0.42.0"
 dependencies = [
+ "async-trait",
+ "base64",
  "bytes",
+ "chrono",
  "criterion",
  "futures",
  "hex",
@@ -5017,6 +5020,7 @@ dependencies = [
  "proptest",
  "rand 0.8.6",
  "reqwest",
+ "ring",
  "rockstream-cli",
  "rockstream-ops",
  "rockstream-plan",
@@ -5039,6 +5043,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tracing",
+ "uuid",
  "x509-parser",
  "zstd",
 ]
@@ -5220,6 +5225,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rand 0.8.6",
  "reqwest",
+ "ring",
  "rockstream-cli",
  "rockstream-control",
  "rockstream-ops",
@@ -5369,6 +5375,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "toml",
  "tracing",
  "x509-parser",

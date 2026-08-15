@@ -29,6 +29,7 @@ use rdkafka::{
 
 use rockstream_sim::buggify;
 use rockstream_types::ids::ConnectorId;
+use rockstream_types::secret::SecretToken;
 use rockstream_types::sink::{RecoveryAction, SinkIdempotencyProfile, SinkState};
 use rockstream_types::timestamp::Epoch;
 
@@ -66,6 +67,10 @@ pub struct KafkaSink {
     /// by default (production/no simulation).
     kafka_tx_timeout_probability: f64,
     broker: Option<KafkaBroker>,
+    secret_name: Option<String>,
+    pending_secret_token: Option<SecretToken>,
+    active_secret_token_id: Option<String>,
+    secret_rotations_applied: u64,
 }
 
 impl KafkaSink {
@@ -105,6 +110,10 @@ impl KafkaSink {
                 bootstrap: bootstrap.to_owned(),
                 topic: topic.to_owned(),
             }),
+            secret_name: None,
+            pending_secret_token: None,
+            active_secret_token_id: None,
+            secret_rotations_applied: 0,
         })
     }
 
@@ -119,7 +128,52 @@ impl KafkaSink {
             cluster_committed: 0,
             kafka_tx_timeout_probability: 0.0,
             broker: None,
+            secret_name: None,
+            pending_secret_token: None,
+            active_secret_token_id: None,
+            secret_rotations_applied: 0,
         }
+    }
+
+    pub fn bind_secret(&mut self, secret_name: impl Into<String>) {
+        self.secret_name = Some(secret_name.into());
+    }
+
+    /// Queue one encrypted replacement token for the next epoch boundary.
+    pub fn set_secret_token(&mut self, token: SecretToken) -> Result<(), String> {
+        if self
+            .secret_name
+            .as_deref()
+            .is_some_and(|name| name != token.secret_name)
+        {
+            return Err("secret token does not match the connector binding".to_string());
+        }
+        self.secret_name = Some(token.secret_name.clone());
+        self.pending_secret_token = Some(token);
+        Ok(())
+    }
+
+    pub fn apply_secret_token_at_epoch(&mut self) {
+        if let Some(token) = self.pending_secret_token.take() {
+            self.active_secret_token_id = Some(token.token_id);
+            self.secret_rotations_applied += 1;
+        }
+    }
+
+    pub fn active_secret_token_id(&self) -> Option<&str> {
+        self.active_secret_token_id.as_deref()
+    }
+
+    pub fn secret_rotations_applied(&self) -> u64 {
+        self.secret_rotations_applied
+    }
+
+    pub const fn pipeline_restarts(&self) -> u64 {
+        0
+    }
+
+    pub const fn failed_batches(&self) -> u64 {
+        0
     }
 
     /// Update the known `cluster_committed` horizon (called by the epoch-commit loop
@@ -218,6 +272,7 @@ impl SinkConnector for KafkaSink {
     }
 
     async fn pre_commit(&mut self, epoch: Epoch, row_count: usize) -> Result<SinkState, SinkError> {
+        self.apply_secret_token_at_epoch();
         if self.backpressure_active() {
             return Err(SinkError::PreCommitFailed {
                 epoch,
@@ -258,6 +313,7 @@ impl SinkConnector for KafkaSink {
     }
 
     async fn commit(&mut self, epoch: Epoch, state: &SinkState) -> Result<(), SinkError> {
+        self.apply_secret_token_at_epoch();
         // M3-S3: must not commit before cluster checkpoint.
         assert_epoch_committed_only_after_cluster_checkpoint(
             self.connector_id,
@@ -564,6 +620,10 @@ mod tests {
             cluster_committed: 100,
             kafka_tx_timeout_probability: 0.0,
             broker: None,
+            secret_name: None,
+            pending_secret_token: None,
+            active_secret_token_id: None,
+            secret_rotations_applied: 0,
         };
         sink.pre_commit(1, 10).await.unwrap();
         sink.pre_commit(2, 10).await.unwrap();

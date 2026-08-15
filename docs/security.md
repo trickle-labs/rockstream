@@ -1,5 +1,16 @@
 # RockStream Security Architecture & Internal mTLS (v0.55)
 
+## Secrets and envelope encryption (v0.55.1)
+
+`CREATE SECRET`, `ALTER SECRET`, `DROP SECRET`, and `SHOW SECRETS` store only
+AES-256-GCM envelopes under `catalog/secrets/`. The control plane uses
+`RS_SECRET_KEK` by default; AWS KMS-compatible provider wiring is available
+for deployments that supply a KMS ARN. `SHOW SECRETS` returns metadata only.
+
+Workers receive short-lived tokens over authenticated mTLS. Decrypted payloads
+remain in the worker process memory and are refreshed at the next epoch after
+an `ALTER SECRET`; they are never written to worker storage.
+
 This document describes the security model, mutual TLS (mTLS) transport encryption, identity verification, and dynamic certificate rotation in RockStream.
 
 ---

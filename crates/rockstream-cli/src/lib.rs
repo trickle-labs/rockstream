@@ -1828,7 +1828,14 @@ fn write_support_bundle(
             uptime_ms: generated_at_ms.saturating_sub(started_ms),
             audit_events_emitted: events.len(),
         },
-        audit_events: events.to_vec(),
+        audit_events: events
+            .iter()
+            .cloned()
+            .map(|mut event| {
+                event.detail = None;
+                event
+            })
+            .collect(),
     };
 
     let bundle_path = storage.join(format!("support-bundle-{generated_at_ms}.json"));

@@ -11,10 +11,14 @@ pub use rockstream_ops::scheduler::CreditScheduler;
 pub use rockstream_ops::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
 
 pub mod client;
+pub mod secrets;
 pub mod tls;
 pub use client::{
     start_worker_client, start_worker_client_with_metadata, start_worker_client_with_tls,
     start_worker_client_with_tls_and_metadata, ShardState, WorkerClientHandle,
+};
+pub use secrets::{
+    ResolvedSecret, SecretManagerError, WorkerSecretManager, MAX_WORKER_SECRET_TOKENS,
 };
 
 pub mod exchange;

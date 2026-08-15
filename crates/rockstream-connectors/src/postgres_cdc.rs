@@ -17,6 +17,7 @@ use arrow::record_batch::RecordBatch;
 use rockstream_types::arrow_batch::append_weight_column;
 use rockstream_types::connector::PartitionFilter;
 use rockstream_types::ids::ConnectorId;
+use rockstream_types::secret::SecretToken;
 use rockstream_types::timestamp::Epoch;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::{Client, NoTls};
@@ -244,6 +245,10 @@ pub struct PostgresCdcSource {
     native_transaction: Option<(u32, Vec<PgOutputTextChange>, usize)>,
     native_seen_messages: usize,
     native_xid: Option<u32>,
+    secret_name: Option<String>,
+    pending_secret_token: Option<SecretToken>,
+    active_secret_token_id: Option<String>,
+    secret_rotations_applied: u64,
 }
 
 /// Connection details for a native pgoutput source. Credentials are resolved
@@ -310,7 +315,52 @@ impl PostgresCdcSource {
             native_transaction: None,
             native_seen_messages: 0,
             native_xid: None,
+            secret_name: None,
+            pending_secret_token: None,
+            active_secret_token_id: None,
+            secret_rotations_applied: 0,
         }
+    }
+
+    pub fn bind_secret(&mut self, secret_name: impl Into<String>) {
+        self.secret_name = Some(secret_name.into());
+    }
+
+    /// Queue one encrypted replacement token for the next epoch boundary.
+    pub fn set_secret_token(&mut self, token: SecretToken) -> Result<(), String> {
+        if self
+            .secret_name
+            .as_deref()
+            .is_some_and(|name| name != token.secret_name)
+        {
+            return Err("secret token does not match the connector binding".to_string());
+        }
+        self.secret_name = Some(token.secret_name.clone());
+        self.pending_secret_token = Some(token);
+        Ok(())
+    }
+
+    pub fn apply_secret_token_at_epoch(&mut self) {
+        if let Some(token) = self.pending_secret_token.take() {
+            self.active_secret_token_id = Some(token.token_id);
+            self.secret_rotations_applied += 1;
+        }
+    }
+
+    pub fn active_secret_token_id(&self) -> Option<&str> {
+        self.active_secret_token_id.as_deref()
+    }
+
+    pub fn secret_rotations_applied(&self) -> u64 {
+        self.secret_rotations_applied
+    }
+
+    pub const fn pipeline_restarts(&self) -> u64 {
+        0
+    }
+
+    pub const fn failed_batches(&self) -> u64 {
+        0
     }
 
     /// Connect to PostgreSQL's native pgoutput logical-decoding stream.
@@ -1362,6 +1412,7 @@ impl SourceConnector for PostgresCdcSource {
         credits_available: usize,
         _partition_filter: Option<PartitionFilter>,
     ) -> Result<PollDeltaResult, SourceError> {
+        self.apply_secret_token_at_epoch();
         if self.pgoutput.is_none() && self.pgoutput_config.is_some() {
             self.open_pgoutput(false).await?;
         }
@@ -1460,6 +1511,7 @@ impl SourceConnector for PostgresCdcSource {
         epoch: Epoch,
         offset: OffsetToken,
     ) -> Result<(), SourceError> {
+        self.apply_secret_token_at_epoch();
         let lsn = PgLsn::from_offset_token(&offset)?;
         if self.pgoutput.is_none() && self.pgoutput_config.is_some() {
             return Err(SourceError::CommitOffsetFailed {

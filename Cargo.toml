@@ -84,6 +84,7 @@ uuid = { version = "1", features = ["v4"] }
 rust_decimal = "1"
 postgres-types = { version = "0.2", features = ["with-uuid-1", "with-serde_json-1", "array-impls"] }
 rdkafka = "0.36"
+ring = { version = "0.17", default-features = false, features = ["std"] }
 
 
 # Workspace crate references

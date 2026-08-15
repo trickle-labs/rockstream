@@ -1,5 +1,11 @@
 # Connector guarantees
 
+## Secret rotation
+
+Kafka sources/sinks and PostgreSQL CDC sources can bind to `secret = '<name>'`.
+An altered secret queues one encrypted replacement token and applies it at the
+next epoch boundary, preserving the connector process and committed batches.
+
 RockStream supports exactly three external connector boundaries: PostgreSQL
 CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,
 not a connector. The guarantees below are the contract for the retained

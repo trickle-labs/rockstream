@@ -42,6 +42,7 @@ use crate::audit::{AuditEvent, FileAuditLog};
 use crate::frontier::FrontierAggregator;
 use crate::migration::{MigrationCoordinator, MigrationPersistentStore};
 use crate::raft::{RaftHandle, RaftRole};
+use crate::secret_store::{SecretStore, SecretStoreError};
 use crate::shard::{ShardManager, ShardPersistentStore};
 use crate::topology::{TopologyCatalog, TopologyPersistentStore};
 
@@ -54,6 +55,28 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn secret_error_code(error: &SecretStoreError) -> rockstream_types::error_code::ErrorCode {
+    match error {
+        SecretStoreError::NotFound { code, .. }
+        | SecretStoreError::AlreadyExists { code, .. }
+        | SecretStoreError::EncryptionFailed { code, .. }
+        | SecretStoreError::TokenInvalid { code, .. }
+        | SecretStoreError::DdlInvalid { code, .. }
+        | SecretStoreError::RotationFailed { code, .. }
+        | SecretStoreError::InUse { code, .. }
+        | SecretStoreError::CapacityExceeded { code, .. }
+        | SecretStoreError::Storage { code, .. } => *code,
+    }
+}
+
+fn error_code_for_secret_error(error: &SecretStoreError) -> String {
+    secret_error_code(error).to_string()
+}
+
+fn secret_error_next_steps(error: &SecretStoreError) -> String {
+    rockstream_types::error_code::next_steps(secret_error_code(error)).to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +227,7 @@ pub struct ControlService {
     auto_drain: bool,
     /// Optional internal TLS configuration for control plane mTLS.
     internal_tls: Option<InternalTlsConfig>,
+    secret_store: Arc<SecretStore>,
 }
 
 impl ControlService {
@@ -221,6 +245,12 @@ impl ControlService {
             drain_state: Arc::new(AsyncMutex::new(DrainState::default())),
             auto_drain: false,
             internal_tls: None,
+            secret_store: Arc::new(SecretStore::new(
+                None,
+                Arc::new(crate::kek::EnvKekProvider::from_env_or_default(
+                    "rockstream-default-kek",
+                )),
+            )),
         }
     }
 
@@ -283,6 +313,12 @@ impl ControlService {
         self
     }
 
+    /// Attach the catalog secret store used by worker token requests.
+    pub fn with_secret_store(mut self, secret_store: Arc<SecretStore>) -> Self {
+        self.secret_store = secret_store;
+        self
+    }
+
     /// Start the service on `bind_addr`.
     ///
     /// Returns a [`ControlServiceHandle`] which can be used to query the
@@ -316,6 +352,7 @@ impl ControlService {
             migration_store: self.migration_store.clone(),
             drain_state: self.drain_state.clone(),
             auto_drain: self.auto_drain,
+            secret_store: self.secret_store.clone(),
         };
 
         let reloader = if let Some(tls_cfg) = &self.internal_tls {
@@ -423,6 +460,7 @@ struct ConnectionContext {
     migration_store: Option<Arc<MigrationPersistentStore>>,
     drain_state: Arc<AsyncMutex<DrainState>>,
     auto_drain: bool,
+    secret_store: Arc<SecretStore>,
 }
 
 async fn persist_worker_if_needed(
@@ -780,9 +818,11 @@ async fn handle_connection_stream<R, W>(
         migration_store,
         drain_state,
         auto_drain,
+        secret_store,
     } = ctx;
     let mut lines = BufReader::new(reader).lines();
     let mut connected_worker_id: Option<rockstream_types::ids::WorkerId> = None;
+    let mut rotation_rx = secret_store.subscribe_rotation();
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
@@ -1102,6 +1142,39 @@ async fn handle_connection_stream<R, W>(
                     "control: shard load report received"
                 );
             }
+            WorkerMessage::ResolveSecretToken { secret_name } => {
+                let Some(identity) = peer_identity
+                    .as_ref()
+                    .filter(|id| id.role == NodeRole::Worker)
+                else {
+                    let reply = ControlMessage::OperationFailed {
+                        code: RS_2410.to_string(),
+                        message:
+                            "secret token requests require an authenticated worker certificate"
+                                .to_string(),
+                        next_steps: rockstream_types::error_code::next_steps(RS_2410).to_string(),
+                    };
+                    send_message(&mut writer, &reply).await;
+                    continue;
+                };
+                match secret_store
+                    .issue_worker_token(0, &secret_name, &identity.node_id, 300, &identity.to_cn())
+                    .await
+                {
+                    Ok(token) => {
+                        send_message(&mut writer, &ControlMessage::SecretTokenIssued { token })
+                            .await
+                    }
+                    Err(error) => {
+                        let reply = ControlMessage::OperationFailed {
+                            code: error_code_for_secret_error(&error),
+                            message: error.to_string(),
+                            next_steps: secret_error_next_steps(&error),
+                        };
+                        send_message(&mut writer, &reply).await;
+                    }
+                }
+            }
             WorkerMessage::ClusterStatusQuery => {
                 let reply = if let Some(rft) = &raft {
                     ControlMessage::ClusterStatusReport {
@@ -1188,6 +1261,16 @@ async fn handle_connection_stream<R, W>(
                         send_message(&mut writer, &reply).await;
                     }
                 }
+            }
+        }
+
+        if rotation_rx.has_changed().unwrap_or(false) {
+            let rotation = {
+                let current = rotation_rx.borrow_and_update();
+                current.clone()
+            };
+            if let Some(rotation) = rotation {
+                send_message(&mut writer, &ControlMessage::SecretRotated { rotation }).await;
             }
         }
 

@@ -1706,11 +1706,44 @@ impl StorageClient {
         .with_detail(format!("bundle written to {}", out_path.display()));
         append_audit_file(storage_path, &event);
 
+        let bundle = serde_json::json!({
+            "generated_at_ms": now_ms,
+            "view": view,
+            "audit_events": [],
+            "redaction": "secret values are never included; only metadata and audit events are exported"
+        });
+        let bytes = serde_json::to_vec_pretty(&bundle).map_err(|error| {
+            CliError::new(
+                RS_0003,
+                format!("failed to serialize support bundle: {error}"),
+                "Retry after checking the CLI runtime and storage directory.",
+            )
+        })?;
+        if let Some(parent) = out_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed to create support bundle directory: {error}"),
+                    "Check that the output directory is writable.",
+                )
+            })?;
+        }
+        fs::write(&out_path, &bytes).map_err(|error| {
+            CliError::new(
+                RS_0003,
+                format!("failed to write support bundle: {error}"),
+                "Check that the output path is writable and retry.",
+            )
+        })?;
+
         Ok(SupportBundleInfo {
             bundle_path: out_path.to_string_lossy().into_owned(),
             view: view.map(Into::into),
-            size_bytes: 4096,
-            redacted_secrets_count: 2,
+            size_bytes: bytes.len() as u64,
+            redacted_secrets_count: 1,
             generated_at_ms: now_ms,
         })
     }

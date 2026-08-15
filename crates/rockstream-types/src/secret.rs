@@ -1,10 +1,137 @@
-//! Secrets management types and helpers for RockStream (v0.49).
+//! Secrets management types for RockStream (v0.55.1).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// A stored secret representation.
+/// Secret type discriminator.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretType {
+    SaslPlain,
+    PostgresPassword,
+    BearerToken,
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl SecretType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::SaslPlain => "sasl_plain",
+            Self::PostgresPassword => "postgres_password",
+            Self::BearerToken => "bearer_token",
+            Self::Custom(s) => s.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for SecretType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl From<&str> for SecretType {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "sasl_plain" | "sasl_plaintext" => Self::SaslPlain,
+            "postgres_password" | "postgres" => Self::PostgresPassword,
+            "bearer_token" | "bearer" => Self::BearerToken,
+            other => Self::Custom(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for SecretType {
+    fn from(s: String) -> Self {
+        Self::from(s.as_str())
+    }
+}
+
+/// Metadata associated with a stored secret.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretMetadata {
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub version: u64,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+}
+
+impl Default for SecretMetadata {
+    fn default() -> Self {
+        Self {
+            created_at: 0,
+            updated_at: 0,
+            version: 1,
+            source_refs: Vec::new(),
+        }
+    }
+}
+
+/// Plaintext in-memory representation of a secret.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Secret {
+    pub name: String,
+    pub secret_type: SecretType,
+    pub payload: HashMap<String, String>,
+    pub metadata: SecretMetadata,
+}
+
+/// Envelope-encrypted stored representation of a secret.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncryptedSecret {
+    pub name: String,
+    pub secret_type: SecretType,
+    pub kek_provider: String,
+    pub wrapped_dek: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub metadata: SecretMetadata,
+}
+
+/// Short-lived secret token issued to a worker node identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretToken {
+    pub token_id: String,
+    pub secret_name: String,
+    pub secret_type: SecretType,
+    pub worker_identity: String,
+    pub encrypted_payload: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
+impl SecretToken {
+    /// Stable key derivation shared by the control plane and worker process.
+    pub fn worker_key(identity: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"rockstream-worker-secret-token-key-v1");
+        hasher.update(identity.as_bytes());
+        let digest = hasher.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&digest);
+        key
+    }
+
+    pub fn is_expired(&self, current_time_secs: u64) -> bool {
+        current_time_secs >= self.expires_at
+    }
+}
+
+/// Notification emitted after a secret payload changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretRotation {
+    pub secret_name: String,
+    pub version: u64,
+}
+
+/// A stored secret representation (legacy compatibility helper).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretEntry {
     pub name: String,
@@ -138,6 +265,41 @@ pub fn get_global_secrets() -> Arc<SecretsRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_secret_types_and_models() {
+        let meta = SecretMetadata {
+            created_at: 100,
+            updated_at: 200,
+            version: 2,
+            source_refs: vec!["src_kafka".to_string()],
+        };
+        let mut payload = HashMap::new();
+        payload.insert("username".to_string(), "alice".to_string());
+        payload.insert("password".to_string(), "secret123".to_string());
+
+        let secret = Secret {
+            name: "kafka_auth".to_string(),
+            secret_type: SecretType::SaslPlain,
+            payload,
+            metadata: meta.clone(),
+        };
+        assert_eq!(secret.secret_type.as_str(), "sasl_plain");
+
+        let token = SecretToken {
+            token_id: "tok-1".to_string(),
+            secret_name: "kafka_auth".to_string(),
+            secret_type: SecretType::SaslPlain,
+            worker_identity: "worker-1".to_string(),
+            encrypted_payload: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+            issued_at: 100,
+            expires_at: 200,
+        };
+        assert!(!token.is_expired(150));
+        assert!(token.is_expired(200));
+        assert!(token.is_expired(250));
+    }
 
     #[test]
     fn test_secret_registration_and_masking() {

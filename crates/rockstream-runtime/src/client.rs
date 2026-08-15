@@ -24,6 +24,7 @@ use rockstream_types::topology::{
     WorkerMessage, WorkerRegistration,
 };
 
+use crate::secrets::WorkerSecretManager;
 use rockstream_storage::ShardDb;
 
 /// Tracks a shard lease and its local active database instance.
@@ -41,6 +42,7 @@ pub struct WorkerClientHandle {
     msg_tx: mpsc::Sender<WorkerMessage>,
     fence_waiters:
         Arc<parking_lot::Mutex<HashMap<ShardId, Vec<tokio::sync::oneshot::Sender<bool>>>>>,
+    secret_manager: Arc<WorkerSecretManager>,
 }
 
 impl WorkerClientHandle {
@@ -69,6 +71,32 @@ impl WorkerClientHandle {
     /// Latest topology snapshot advertised by the control plane.
     pub fn topology_snapshot(&self) -> Vec<WorkerInfo> {
         self.topology_workers.read().values().cloned().collect()
+    }
+
+    /// Request a fresh short-lived token over the authenticated control channel.
+    pub async fn request_secret_token(
+        &self,
+        secret_name: impl Into<String>,
+    ) -> Result<(), io::Error> {
+        self.msg_tx
+            .send(WorkerMessage::ResolveSecretToken {
+                secret_name: secret_name.into(),
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "Client channel closed"))
+    }
+
+    /// Read a decrypted credential from memory. No storage path is consulted.
+    pub fn secret(
+        &self,
+        secret_name: &str,
+        now_secs: u64,
+    ) -> Option<crate::secrets::ResolvedSecret> {
+        self.secret_manager.get(secret_name, now_secs)
+    }
+
+    pub fn secret_manager(&self) -> Arc<WorkerSecretManager> {
+        self.secret_manager.clone()
     }
 
     /// Send a request to acquire a shard lease.
@@ -247,6 +275,9 @@ where
     let topology_workers = Arc::new(RwLock::new(HashMap::new()));
     let (msg_tx, mut msg_rx) = mpsc::channel::<WorkerMessage>(32);
     let fence_waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let secret_manager = Arc::new(WorkerSecretManager::new(format!(
+        "worker-{proposed_worker_id}"
+    )));
 
     let handle = WorkerClientHandle {
         worker_id: worker_id.clone(),
@@ -254,12 +285,14 @@ where
         topology_workers: topology_workers.clone(),
         msg_tx: msg_tx.clone(),
         fence_waiters: fence_waiters.clone(),
+        secret_manager: secret_manager.clone(),
     };
 
     let worker_id_clone = worker_id.clone();
     let active_shards_clone = active_shards.clone();
     let fence_waiters_clone = fence_waiters.clone();
     let storage_dir = storage_dir.to_path_buf();
+    let secret_manager_clone = secret_manager.clone();
 
     let join_handle = tokio::spawn(async move {
         // 1. Send Registration message.
@@ -464,6 +497,29 @@ where
                                 e
                             );
                         }
+                    }
+                }
+                ControlMessage::SecretTokenIssued { token } => {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if let Err(error) = secret_manager_clone.resolve_token(&token, now_secs) {
+                        tracing::error!(
+                            code = %rockstream_types::error_code::RS_2423,
+                            error = %error,
+                            "worker secret token rejected"
+                        );
+                    }
+                }
+                ControlMessage::SecretRotated { rotation } => {
+                    if let Err(error) = msg_tx
+                        .send(WorkerMessage::ResolveSecretToken {
+                            secret_name: rotation.secret_name,
+                        })
+                        .await
+                    {
+                        tracing::warn!(code = %rockstream_types::error_code::RS_0001, error = %error, "secret rotation refresh request could not be queued");
                     }
                 }
                 ControlMessage::Shutdown => {

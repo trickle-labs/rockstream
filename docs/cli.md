@@ -1,5 +1,11 @@
 # RockStream CLI Reference
 
+## Secret handling
+
+Support bundles contain sanitized metadata and audit events only. Secret
+payloads are envelope-encrypted in the catalog and are not included in CLI
+output, `SHOW SECRETS`, errors, or generated support bundles.
+
 RockStream ships as a **single binary** named `rockstream`. Every node role is a
 flag on this one binary — there is no separate server, worker, or gateway
 executable. `main` is always runnable through it.

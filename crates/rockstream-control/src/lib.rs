@@ -21,11 +21,13 @@ pub mod checkpoint;
 pub mod checkpoint_store;
 pub mod config_deriver;
 pub mod frontier;
+pub mod kek;
 pub mod migration;
 pub mod namespace;
 pub mod placement;
 pub mod raft;
 pub mod scheduler;
+pub mod secret_store;
 pub mod service;
 pub mod shard;
 pub mod shard_stats;
@@ -38,6 +40,7 @@ pub use acl::{AclError, AclStore};
 pub use checkpoint::{CheckpointCoordinator, CoordinatorError, DEFAULT_ALIGNMENT_MAX_CREDITS};
 pub use checkpoint_store::CheckpointManifestStore;
 pub use frontier::{AggregatorError, FrontierAggregator};
+pub use kek::{AwsKmsKekProvider, EnvKekProvider, KekError, KekProvider};
 pub use migration::{
     BucketMapVersionTracker, MigrationConsumerFrontierTracker, MigrationCoordinator,
     MigrationError, MigrationFillLevel, MigrationPersistentStore, MigrationShard, PhaseClocks,
@@ -45,6 +48,7 @@ pub use migration::{
 pub use namespace::NamespaceCatalog;
 pub use placement::PlacementAlgorithm;
 pub use scheduler::{ShardAssignment, ShardScheduler};
+pub use secret_store::{SecretListing, SecretStore, SecretStoreError};
 pub use service::{ControlService, ControlServiceHandle};
 pub use shard::{LeaseError, ShardManager, ShardManagerSnapshot, ShardPersistentStore};
 pub use shard_stats::ShardStatsPersistentStore;

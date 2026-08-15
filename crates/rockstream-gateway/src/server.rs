@@ -1716,6 +1716,7 @@ pub struct GatewayHandler {
     /// ponytail: shard-wide serialization is the correctness ceiling; split
     /// by dependency component only after measured contention.
     shard_commit_lock: Arc<tokio::sync::Mutex<()>>,
+    pub secret_store: Arc<rockstream_control::SecretStore>,
 }
 
 impl GatewayHandler {
@@ -1740,6 +1741,10 @@ impl GatewayHandler {
     }
 
     pub fn new(catalog: Arc<CatalogStubs>, view_reader: Arc<dyn ViewReader>) -> Self {
+        let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env_or_default(
+            "rockstream-default-kek",
+        ));
+        let secret_store = Arc::new(rockstream_control::SecretStore::new(None, kek_provider));
         GatewayHandler {
             catalog: catalog.clone(),
             view_reader,
@@ -1771,6 +1776,7 @@ impl GatewayHandler {
             pgoutput_coordinators: Arc::new(DashMap::new()),
             pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            secret_store,
         }
     }
 
@@ -1779,6 +1785,10 @@ impl GatewayHandler {
         view_reader: Arc<dyn ViewReader>,
         shard_db: Arc<rockstream_storage::ShardDb>,
     ) -> Self {
+        let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env_or_default(
+            "rockstream-default-kek",
+        ));
+        let secret_store = Arc::new(rockstream_control::SecretStore::new(None, kek_provider));
         GatewayHandler {
             catalog: catalog.clone(),
             view_reader,
@@ -1810,7 +1820,13 @@ impl GatewayHandler {
             pgoutput_coordinators: Arc::new(DashMap::new()),
             pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            secret_store,
         }
+    }
+
+    pub fn with_secret_store(mut self, secret_store: Arc<rockstream_control::SecretStore>) -> Self {
+        self.secret_store = secret_store;
+        self
     }
 
     /// Inject the complete pinned shard-reader topology used by query-time
@@ -2655,7 +2671,7 @@ impl GatewayHandler {
             .or_else(|| source.options.get("group_id"))
             .cloned()
             .unwrap_or_else(|| format!("rockstream-{connector_id}"));
-        let runtime = KafkaSource::connect(
+        let mut runtime = KafkaSource::connect(
             connector_id,
             catalog_columns_to_schema(&table.columns),
             bootstrap,
@@ -2663,6 +2679,9 @@ impl GatewayHandler {
             &group_id,
         )
         .map_err(source_backfill_error)?;
+        if let Some(secret_name) = source.options.get("secret") {
+            runtime.bind_secret(secret_name.clone());
+        }
         Ok((table, connector_id, runtime))
     }
 
@@ -2691,29 +2710,43 @@ impl GatewayHandler {
                 }
             })
         };
-        let credential_ref = option("credential_ref")?;
-        let password = if let Some(variable) = credential_ref.strip_prefix("env://") {
-            Some(
-                std::env::var(variable).map_err(|_| GatewayError::QueryTimeExecutionFailed {
-                    detail: format!(
+        let secret_name = source.options.get("secret").cloned();
+        let (password, secret_name) = if let Some(secret_name) = secret_name {
+            let secret = self
+                .secret_store
+                .get_secret(0, &secret_name)
+                .await
+                .map_err(|error| GatewayError::QueryTimeExecutionFailed {
+                    detail: error.to_string(),
+                })?;
+            let password = secret.payload.get("password").cloned();
+            (password, Some(secret_name))
+        } else {
+            let credential_ref = option("credential_ref")?;
+            let password = if let Some(variable) = credential_ref.strip_prefix("env://") {
+                Some(std::env::var(variable).map_err(|_| {
+                    GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
                     "PostgreSQL CDC source '{}' cannot resolve credential_ref '{credential_ref}'",
                     source.name
                 ),
-                })?,
-            )
-        } else if credential_ref == "none://trusted" {
-            None
-        } else {
-            return Err(GatewayError::QueryTimeExecutionFailed {
-                detail: format!(
-                    "PostgreSQL CDC source '{}' requires credential_ref env://<PASSWORD_ENV> or none://trusted",
-                    source.name
-                ),
-            });
+                    }
+                })?)
+            } else if credential_ref == "none://trusted" {
+                None
+            } else {
+                return Err(GatewayError::QueryTimeExecutionFailed {
+                    detail: format!(
+                        "PostgreSQL CDC source '{}' requires credential_ref env://<PASSWORD_ENV> or none://trusted",
+                        source.name
+                    ),
+                });
+            };
+            (password, None)
         };
         let identity = pgoutput_source_identity(source)?;
         let connector_id = identity.connector_id();
-        let runtime = PostgresCdcSource::configured_pgoutput(
+        let mut runtime = PostgresCdcSource::configured_pgoutput(
             connector_id,
             catalog_columns_to_schema(&table.columns),
             PgOutputConfig {
@@ -2732,6 +2765,9 @@ impl GatewayHandler {
             },
         )
         .map_err(source_backfill_error)?;
+        if let Some(secret_name) = secret_name {
+            runtime.bind_secret(secret_name);
+        }
         Ok((table, connector_id, runtime))
     }
 
@@ -4676,10 +4712,21 @@ impl GatewayHandler {
 
         // CREATE SOURCE / ALTER SOURCE / DROP SOURCE — v0.51.9 pgwire DDL wiring
         if ql.starts_with("create source ") {
-            return Some(self.handle_create_source(q));
+            return Some(self.handle_create_source(q).await);
         }
         if ql.starts_with("alter source ") || ql.starts_with("drop source ") {
             return Some(self.handle_alter_source(q));
+        }
+
+        // CREATE SECRET / ALTER SECRET / DROP SECRET — v0.55.1 pgwire DDL wiring
+        if ql.starts_with("create secret ") {
+            return Some(self.handle_create_secret(q).await);
+        }
+        if ql.starts_with("alter secret ") {
+            return Some(self.handle_alter_secret(q).await);
+        }
+        if ql.starts_with("drop secret ") {
+            return Some(self.handle_drop_secret(q).await);
         }
 
         // CREATE INDEX / DROP INDEX / REBUILD INDEX / MARK INDEX READY — v0.32 pgwire DDL wiring
@@ -5476,6 +5523,9 @@ impl GatewayHandler {
             return Ok(vec![promote_response(catalog_resp_to_response(
                 self.catalog.sinks_response(),
             ))]);
+        }
+        if ql.trim_end_matches(';') == "show secrets" || ql.trim_end_matches(';') == "show secret" {
+            return Ok(vec![promote_response(self.handle_show_secrets().await)]);
         }
         if ql.trim_end_matches(';') == "show source status" {
             return Ok(vec![promote_response(catalog_resp_to_response(
@@ -7216,6 +7266,19 @@ impl GatewayHandler {
             ))]);
         }
 
+        let secret_name = parsed.secret.clone();
+        if let Some(secret_name) = secret_name.as_deref() {
+            if !secret_name.is_empty() {
+                let ns = 0u128;
+                if !self.secret_store.has_secret(ns, secret_name) {
+                    return Ok(vec![create_sink_error_response(
+                        "[RS-2420] secret.not_found: referenced secret does not exist. Next steps: verify the secret name or run CREATE SECRET to define it."
+                            .to_string(),
+                    )]);
+                }
+            }
+        }
+
         let entry = CatalogSinkEntry {
             name: parsed.name.clone(),
             view: parsed.view.clone(),
@@ -7231,7 +7294,21 @@ impl GatewayHandler {
             state: "OK".to_string(),
         };
 
-        let _ = self.catalog.add_sink(entry);
+        if !self.catalog.add_sink(entry) {
+            return Ok(vec![create_sink_error_response(format!(
+                "[RS-4010] sink.already_exists: sink '{}' already exists for a different view. Next steps: choose a distinct sink name.",
+                parsed.name
+            ))]);
+        }
+        if let Some(secret_name) = secret_name.as_deref() {
+            if let Err(error) = self
+                .secret_store
+                .add_reference(0u128, secret_name, &parsed.name)
+            {
+                self.catalog.remove_sink(&parsed.name);
+                return Ok(vec![create_sink_error_response(error.to_string())]);
+            }
+        }
 
         if let Some(log) = &self.audit_log {
             let _ = log.append(&rockstream_types::audit::AuditEvent::now(
@@ -7246,7 +7323,7 @@ impl GatewayHandler {
         )])
     }
 
-    fn handle_create_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+    async fn handle_create_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_create_source_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![create_source_error_response(message)]),
@@ -7257,6 +7334,27 @@ impl GatewayHandler {
                 "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
+        }
+
+        let secret_ref = parsed.options.get("secret").cloned();
+        if let Some(secret_name) = secret_ref.as_deref() {
+            if !secret_name.is_empty() {
+                let ns = 0u128;
+                let secret_exists = match self.secret_store.contains_secret(ns, secret_name).await {
+                    Ok(exists) => exists,
+                    Err(_) => {
+                        return Ok(vec![create_source_error_response(
+                            "[RS-0003] secret.storage_unavailable: unable to check the secret catalog. Next steps: verify catalog storage health and retry."
+                                .to_string(),
+                        )])
+                    }
+                };
+                if !secret_exists {
+                    return Ok(vec![create_source_error_response(format!(
+                        "[RS-2420] secret.not_found: secret '{secret_name}' does not exist. Next steps: verify the secret name or run CREATE SECRET to define it."
+                    ))]);
+                }
+            }
         }
 
         let entry = CatalogSourceEntry {
@@ -7306,6 +7404,15 @@ impl GatewayHandler {
                 parsed.name
             ))]);
         }
+        if let Some(secret_name) = secret_ref.as_deref() {
+            if let Err(error) = self
+                .secret_store
+                .add_reference(0u128, secret_name, &parsed.name)
+            {
+                self.catalog.remove_source(&parsed.name);
+                return Ok(vec![create_source_error_response(error.to_string())]);
+            }
+        }
         if let Some(log) = &self.audit_log {
             let _ = log.append(&rockstream_types::audit::AuditEvent::now(
                 "system",
@@ -7317,6 +7424,113 @@ impl GatewayHandler {
         Ok(vec![Response::Execution(
             Tag::new("CREATE SOURCE").with_rows(0),
         )])
+    }
+
+    async fn handle_create_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let parsed = match parse_create_secret_ddl(q) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(vec![secret_error_response(message)]),
+        };
+
+        let ns = 0u128;
+        if let Err(err) = self
+            .secret_store
+            .create_secret(
+                ns,
+                &parsed.name,
+                parsed.secret_type,
+                parsed.payload,
+                "pgwire",
+            )
+            .await
+        {
+            return Ok(vec![secret_error_response(err.to_string())]);
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("CREATE SECRET").with_rows(0),
+        )])
+    }
+
+    async fn handle_alter_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let parsed = match parse_alter_secret_ddl(q) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(vec![secret_error_response(message)]),
+        };
+
+        let ns = 0u128;
+        if let Err(err) = self
+            .secret_store
+            .alter_secret(ns, &parsed.name, parsed.payload, "pgwire")
+            .await
+        {
+            return Ok(vec![secret_error_response(err.to_string())]);
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("ALTER SECRET").with_rows(0),
+        )])
+    }
+
+    async fn handle_drop_secret<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let parsed = match parse_drop_secret_ddl(q) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(vec![secret_error_response(message)]),
+        };
+
+        let ns = 0u128;
+        if let Err(err) = self
+            .secret_store
+            .drop_secret(ns, &parsed.name, "pgwire")
+            .await
+        {
+            if parsed.if_exists
+                && matches!(err, rockstream_control::SecretStoreError::NotFound { .. })
+            {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SECRET").with_rows(0),
+                )]);
+            }
+            return Ok(vec![secret_error_response(err.to_string())]);
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("DROP SECRET").with_rows(0),
+        )])
+    }
+
+    async fn handle_show_secrets<'a>(&'a self) -> Response<'a> {
+        let ns = 0u128;
+        let listings = match self.secret_store.list_secrets(ns).await {
+            Ok(listings) => listings,
+            Err(_) => {
+                return secret_error_response(
+                    "[RS-0003] secret.storage_unavailable: unable to read the secret catalog. Next steps: verify catalog storage health and retry."
+                        .to_string(),
+                )
+            }
+        };
+        let rows: Vec<Vec<Option<String>>> = listings
+            .into_iter()
+            .map(|s| {
+                vec![
+                    Some(s.name),
+                    Some(s.secret_type.to_string()),
+                    Some(s.created_at.to_string()),
+                    Some(s.updated_at.to_string()),
+                ]
+            })
+            .collect();
+
+        catalog_resp_to_response(CatalogResponse::Rows {
+            columns: vec![
+                "name".to_string(),
+                "type".to_string(),
+                "created_at".to_string(),
+                "updated_at".to_string(),
+            ],
+            rows,
+        })
     }
 
     fn handle_alter_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
@@ -7398,6 +7612,13 @@ impl GatewayHandler {
                         .flatten()
                         .map(|identity| identity.connector_id())
                 });
+                if let Some(source_entry) = source.as_ref() {
+                    let secret_name_opt = source_entry.options.get("secret");
+                    if let Some(secret_name) = secret_name_opt {
+                        self.secret_store
+                            .remove_reference(0u128, secret_name, &parsed.name);
+                    }
+                }
                 self.catalog.remove_source(&parsed.name);
                 if let (Some(connector_id), Some(shard_db), Ok(runtime)) = (
                     pgoutput_id.filter(|connector_id| {
@@ -10917,6 +11138,14 @@ impl GatewayServer {
         self
     }
 
+    /// Attach a custom `SecretStore` to the server.
+    pub fn with_secret_store(mut self, secret_store: Arc<rockstream_control::SecretStore>) -> Self {
+        if let Some(h) = Arc::get_mut(&mut self.handler) {
+            h.secret_store = secret_store;
+        }
+        self
+    }
+
     /// Create a new gateway server listening on `addr`.
     pub fn new(addr: std::net::SocketAddr, view_reader: Arc<dyn ViewReader>) -> Self {
         let catalog = Arc::new(CatalogStubs::new());
@@ -13482,6 +13711,7 @@ struct ParsedCreateSink {
     format_version: Option<u64>,
     partition_by: Vec<String>,
     catalog: String,
+    secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13614,6 +13844,15 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         }
         None => "filesystem".to_string(),
     };
+    let secret = match option_map.get("secret") {
+        Some(CreateSinkOptionValue::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Err(format!(
+                "[RS-4007] CREATE SINK option secret must be a string. Next steps: {CREATE_SINK_NEXT_STEPS}"
+            ))
+        }
+        None => None,
+    };
 
     Ok(ParsedCreateSink {
         name,
@@ -13626,6 +13865,7 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         format_version,
         partition_by,
         catalog,
+        secret,
     })
 }
 
@@ -13752,6 +13992,240 @@ fn parse_sql_single_quoted_string(input: &str) -> Result<(String, usize), String
     Err(format!(
         "[RS-4007] unterminated string literal. Next steps: {CREATE_SINK_NEXT_STEPS}"
     ))
+}
+
+const CREATE_SECRET_NEXT_STEPS: &str =
+    "syntax: CREATE SECRET <name> (TYPE = '<type>', [KEY = 'VAL', ...]); options must include TYPE";
+const ALTER_SECRET_NEXT_STEPS: &str = "syntax: ALTER SECRET <name> SET (KEY = 'VAL', ...)";
+const DROP_SECRET_NEXT_STEPS: &str = "syntax: DROP SECRET [IF EXISTS] <name>";
+
+fn secret_error_response(message: String) -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "42601".to_owned(),
+        message,
+    )))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedCreateSecret {
+    name: String,
+    secret_type: rockstream_types::secret::SecretType,
+    payload: std::collections::HashMap<String, String>,
+}
+
+fn parse_key_value_options(
+    options_str: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut map = std::collections::HashMap::new();
+    let pairs = split_top_level_comma_list(options_str).map_err(|_| {
+        format!(
+            "[RS-2424] secret.ddl_invalid: malformed secret option list. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        )
+    })?;
+    for pair in pairs {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            return Err(format!(
+                "[RS-2424] secret.ddl_invalid: secret options cannot be empty. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+            ));
+        }
+        let eq = find_top_level_equals(pair).ok_or_else(|| {
+            format!(
+                "[RS-2424] secret.ddl_invalid: each secret option must use KEY = 'VALUE' syntax. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+            )
+        })?;
+        let key = pair[..eq].trim().trim_matches('"').to_lowercase();
+        let raw_value = pair[eq + 1..].trim();
+        if key.is_empty() || raw_value.is_empty() {
+            return Err(format!(
+                "[RS-2424] secret.ddl_invalid: secret option keys and values cannot be empty. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+            ));
+        }
+        let value = if raw_value.starts_with('\'') {
+            let (value, consumed) = parse_sql_single_quoted_string(raw_value).map_err(|_| {
+                format!(
+                    "[RS-2424] secret.ddl_invalid: malformed secret string literal. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+                )
+            })?;
+            if !raw_value[consumed..].trim().is_empty() {
+                return Err(format!(
+                    "[RS-2424] secret.ddl_invalid: malformed secret string literal. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+                ));
+            }
+            value
+        } else {
+            raw_value.trim_matches('"').to_string()
+        };
+        map.insert(key, value);
+    }
+    Ok(map)
+}
+
+fn parse_create_secret_ddl(q: &str) -> Result<ParsedCreateSecret, String> {
+    let trimmed = q.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("create secret ") {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: CREATE SECRET statement must start with CREATE SECRET. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let after_create = trimmed["CREATE SECRET".len()..].trim();
+    let paren_pos = after_create.find('(').ok_or_else(|| {
+        format!(
+            "[RS-2424] secret.ddl_invalid: CREATE SECRET requires option list in parentheses. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        )
+    })?;
+
+    let name = after_create[..paren_pos]
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    if name.is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: CREATE SECRET requires a secret name. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let close_paren = after_create.rfind(')').ok_or_else(|| {
+        format!(
+            "[RS-2424] secret.ddl_invalid: unterminated parentheses in CREATE SECRET. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        )
+    })?;
+
+    let options_str = &after_create[paren_pos + 1..close_paren];
+    let mut options = parse_key_value_options(options_str)?;
+
+    let type_str = options.remove("type").ok_or_else(|| {
+        format!(
+            "[RS-2424] secret.ddl_invalid: CREATE SECRET requires TYPE option. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        )
+    })?;
+
+    if type_str.trim().is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: TYPE option cannot be empty. Next steps: {CREATE_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let secret_type = rockstream_types::secret::SecretType::from(type_str.as_str());
+
+    Ok(ParsedCreateSecret {
+        name,
+        secret_type,
+        payload: options,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ParsedAlterSecret {
+    name: String,
+    payload: std::collections::HashMap<String, String>,
+}
+
+fn parse_alter_secret_ddl(q: &str) -> Result<ParsedAlterSecret, String> {
+    let trimmed = q.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("alter secret ") {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: ALTER SECRET statement must start with ALTER SECRET. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let after_alter = trimmed["ALTER SECRET".len()..].trim();
+    let lower_after = after_alter.to_lowercase();
+
+    let (name, options_str) = if let Some(set_pos) = lower_after.find(" set ") {
+        let name = after_alter[..set_pos]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        let after_set = after_alter[set_pos + " set ".len()..].trim();
+        let open_paren = after_set.find('(').ok_or_else(|| {
+            format!(
+                "[RS-2424] secret.ddl_invalid: ALTER SECRET SET requires option list in parentheses. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+            )
+        })?;
+        let close_paren = after_set.rfind(')').ok_or_else(|| {
+            format!(
+                "[RS-2424] secret.ddl_invalid: unterminated parentheses in ALTER SECRET. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+            )
+        })?;
+        (name, &after_set[open_paren + 1..close_paren])
+    } else if let Some(paren_pos) = after_alter.find('(') {
+        let name = after_alter[..paren_pos]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        let close_paren = after_alter.rfind(')').ok_or_else(|| {
+            format!(
+                "[RS-2424] secret.ddl_invalid: unterminated parentheses in ALTER SECRET. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+            )
+        })?;
+        (name, &after_alter[paren_pos + 1..close_paren])
+    } else {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: ALTER SECRET requires SET clause with options. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+        ));
+    };
+
+    if name.is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: ALTER SECRET requires a secret name. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let options = parse_key_value_options(options_str)?;
+    if options.is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: ALTER SECRET SET cannot have empty options. Next steps: {ALTER_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    Ok(ParsedAlterSecret {
+        name,
+        payload: options,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ParsedDropSecret {
+    name: String,
+    if_exists: bool,
+}
+
+fn parse_drop_secret_ddl(q: &str) -> Result<ParsedDropSecret, String> {
+    let trimmed = q.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("drop secret ") {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: DROP SECRET statement must start with DROP SECRET. Next steps: {DROP_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    let after_drop = trimmed["DROP SECRET".len()..].trim();
+    let (if_exists, name_part) = if after_drop.to_lowercase().starts_with("if exists ") {
+        (true, after_drop["IF EXISTS ".len()..].trim())
+    } else {
+        (false, after_drop)
+    };
+
+    let name = name_part
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return Err(format!(
+            "[RS-2424] secret.ddl_invalid: DROP SECRET requires a secret name. Next steps: {DROP_SECRET_NEXT_STEPS}"
+        ));
+    }
+
+    Ok(ParsedDropSecret { name, if_exists })
 }
 
 const CREATE_SOURCE_NEXT_STEPS: &str =
@@ -13887,16 +14361,18 @@ fn validate_typed_source_options(
     if source_type != "postgres_cdc" && source_type != "http_webhook" {
         return Ok(());
     }
-    for key in ["password", "token", "secret", "api_key", "authorization"] {
+    for key in ["password", "token", "api_key", "authorization"] {
         if options.contains_key(key) {
             return Err(format!(
-                "[RS-4008] CREATE SOURCE option '{key}' contains an inline credential; use credential_ref instead. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+                "[RS-4008] CREATE SOURCE option '{key}' contains an inline credential; use secret or credential_ref instead. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
             ));
         }
     }
-    if options.get("credential_ref").is_none_or(String::is_empty) {
+    let has_cred_ref = options.get("credential_ref").is_some_and(|s| !s.is_empty())
+        || options.get("secret").is_some_and(|s| !s.is_empty());
+    if !has_cred_ref {
         return Err(format!(
-            "[RS-4008] CREATE SOURCE type '{source_type}' requires a non-empty credential_ref. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
+            "[RS-4008] CREATE SOURCE type '{source_type}' requires a non-empty secret or credential_ref. Next steps: {CREATE_SOURCE_NEXT_STEPS}"
         ));
     }
     if source_type == "postgres_cdc" {

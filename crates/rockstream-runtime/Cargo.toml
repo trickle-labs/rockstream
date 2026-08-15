@@ -39,6 +39,7 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 x509-parser = { workspace = true }
+ring = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"

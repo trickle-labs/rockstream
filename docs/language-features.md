@@ -1,5 +1,17 @@
 # RockStream Language Features
 
+## Secret DDL
+
+```sql
+CREATE SECRET kafka_auth (TYPE = 'sasl_plain', username = 'user', password = 'value');
+ALTER SECRET kafka_auth SET (username = 'next-user', password = 'next-value');
+SHOW SECRETS;
+DROP SECRET kafka_auth;
+```
+
+Sources and sinks may use `secret = '<name>'`; inline credential values are
+rejected and secret references are validated before catalog registration.
+
 This inventory collects the SQL, DML, and DDL surface that appears across the current README, ROADMAP, concepts guide, connector guide, index-tuning guide, and the `rockstream-sql`/`rockstream-gateway` frontend crates.
 
 Status legend:
