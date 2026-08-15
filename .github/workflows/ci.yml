@@ -434,7 +434,7 @@ jobs:
     # `.claude/v0.45.4-evidence.md`. Raised from 25 after the dependency and
     # Rust-baseline upgrade made per-bench-target cold compiles (axum,
     # hyper, reqwest, arrow/parquet) noticeably heavier.
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

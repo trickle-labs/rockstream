@@ -64,7 +64,7 @@ async fn spawn_smoke_gateway() -> (u16, String, tokio::task::JoinHandle<()>) {
         .insert(create_role_entry("alice", "pencil"))
         .expect("insert alice");
 
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     let server =
         GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
 
