@@ -1512,10 +1512,8 @@ pub fn read_stage_timestamps(view_name: &str) -> Vec<StageTimestamps> {
     })
 }
 
-pub fn set_barrier_injected_at(checkpoint_id: u64, injected_at_ms: u64) {
+pub fn set_barrier_injected_at(_checkpoint_id: u64, injected_at_ms: u64) {
     with_registry(|reg| {
-        reg.barrier_flight_last_checkpoint_id
-            .store(checkpoint_id, Ordering::Relaxed);
         reg.barrier_flight_injected_at_ms
             .store(injected_at_ms, Ordering::Relaxed);
     });
