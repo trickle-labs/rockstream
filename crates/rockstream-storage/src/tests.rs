@@ -202,7 +202,18 @@ async fn scan_empty_prefix_returns_all() {
     db.put(b"c", b"3").await.unwrap();
 
     let results = db.scan_prefix(b"").await.unwrap();
-    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results,
+        vec![
+            (
+                Bytes::from(ShardKeyEncoder::format_version_key()),
+                Bytes::from_static(&[1]),
+            ),
+            (Bytes::from_static(b"a"), Bytes::from_static(b"1")),
+            (Bytes::from_static(b"b"), Bytes::from_static(b"2")),
+            (Bytes::from_static(b"c"), Bytes::from_static(b"3")),
+        ]
+    );
     db.close().await.unwrap();
 }
 

@@ -37,7 +37,7 @@
 //! 5.  **`proof_2pc_crash_after_pre_commit_triggers_recovery`** — `recover()`
 //!     returns `true` in `PreCommitted` state; the subsequent commit is idempotent.
 //!
-//! 6.  **`proof_wire_version_skew_rejects_incompatible_newer`** — `RS-5003`:
+//! 6.  **`proof_wire_version_skew_rejects_incompatible_newer`** — `RS-5021`:
 //!     a v1-only node rejects a message from a v2 sender.
 //!
 //! 7.  **`proof_wire_version_skew_accepts_compatible`** — A v2 node with v1 compat
@@ -233,11 +233,11 @@ fn proof_wire_version_skew_rejects_incompatible_newer() {
     // Local node supports only v1.
     let local = SupportedVersionRange::v1_only();
 
-    // Remote sends v2 — not supported; must be rejected (RS-5003).
+    // Remote sends v2 — not supported; must be rejected (RS-5021).
     let result = negotiate_version(local, ProtocolVersion::V2);
     assert!(
         matches!(result, NegotiationResult::Incompatible { .. }),
-        "v1-only node must reject v2 remote (RS-5003): {result:?}"
+        "v1-only node must reject v2 remote (RS-5021): {result:?}"
     );
 
     if let NegotiationResult::Incompatible {

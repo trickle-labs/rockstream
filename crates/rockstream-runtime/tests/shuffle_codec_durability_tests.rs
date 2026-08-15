@@ -54,6 +54,9 @@ fn worker_info(worker_id: u64, address: &str, host_id: &str, az: &str) -> Worker
             shuffle_codec_v1: true,
             checkpoint_manifest_codec_v1: true,
         },
+        protocol_range: rockstream_types::compatibility::SupportedVersionRange::default(),
+        storage_format_range: rockstream_types::compatibility::SupportedStorageFormatRange::default(
+        ),
         registered_at_ms: 1,
         healthy: true,
         lifecycle: WorkerLifecycleState::Active,

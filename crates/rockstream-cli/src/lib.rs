@@ -13,7 +13,9 @@
 
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
-use rockstream_types::error_code::{ErrorCode, RS_0002, RS_0003, RS_0005, RS_4017};
+use rockstream_types::error_code::{
+    next_steps, ErrorCode, RS_0002, RS_0003, RS_0005, RS_4017, RS_5001,
+};
 use rockstream_types::topology::{
     ControlMessage, WorkerCapabilities, WorkerLocation, WorkerMessage,
 };
@@ -1434,6 +1436,70 @@ pub fn run_shard_migrate(
     )?;
     let outcome = control.migrate_shard(shard_id, to_worker)?;
     Ok(output::render_output(&outcome, format))
+}
+
+/// Run the offline storage-format migration without a control-plane connection.
+pub fn run_format_migrate(
+    format: output::OutputFormat,
+    from: u8,
+    to: u8,
+    storage: &str,
+) -> Result<String, CliError> {
+    let result = std::thread::Builder::new()
+        .name("rockstream-format-migrate".to_string())
+        .spawn({
+            let storage = storage.to_string();
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime
+                    .block_on(
+                        rockstream_storage::format_migration::migrate_storage_format(
+                            &storage,
+                            from.into(),
+                            to.into(),
+                        ),
+                    )
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .map_err(|error| CliError::new(RS_0002, error.to_string(), next_steps(RS_0002)))?
+        .join()
+        .map_err(|_| {
+            CliError::new(
+                RS_0002,
+                "format migration worker panicked",
+                next_steps(RS_0002),
+            )
+        })?
+        .map_err(|error| {
+            let code = if error.to_string().starts_with("RS-5001") {
+                RS_5001
+            } else {
+                RS_0002
+            };
+            CliError::new(code, error.to_string(), next_steps(code))
+        })?;
+    let json = serde_json::json!({
+        "from": from,
+        "to": to,
+        "shards": result,
+    });
+    Ok(match format {
+        output::OutputFormat::Json => serde_json::to_string_pretty(&json).unwrap(),
+        output::OutputFormat::Text => {
+            let mut lines = vec![format!("format migration {from} -> {to}")];
+            for shard in result {
+                lines.push(format!(
+                    "{}: objects_migrated={} already_complete={}",
+                    shard.path, shard.objects_migrated, shard.already_complete
+                ));
+            }
+            lines.join("\n")
+        }
+    })
 }
 
 pub fn run_checkpoint_restore(

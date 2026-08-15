@@ -890,14 +890,16 @@ async fn handle_connection_stream<R, W>(
                     let event =
                         AuditEvent::now("control", "worker.registered", worker_id.to_string())
                             .with_detail(format!(
-                                "address={}, host_id={}, availability_zone={}, headroom={}, same_host_arrow_shm_v1={}, shuffle_codec_v1={}, checkpoint_manifest_codec_v1={}",
+                                "address={}, host_id={}, availability_zone={}, headroom={}, same_host_arrow_shm_v1={}, shuffle_codec_v1={}, checkpoint_manifest_codec_v1={}, protocol_range={:?}, storage_format_range={:?}",
                                 reg.address,
                                 reg.location.host_id,
                                 reg.location.availability_zone,
                                 reg.capacity_headroom,
                                 reg.capabilities.same_host_arrow_shm_v1,
                                 reg.capabilities.shuffle_codec_v1,
-                                reg.capabilities.checkpoint_manifest_codec_v1
+                                reg.capabilities.checkpoint_manifest_codec_v1,
+                                reg.protocol_range,
+                                reg.storage_format_range
                             ));
                     let _ = aud.append(&event);
                 }
@@ -990,6 +992,49 @@ async fn handle_connection_stream<R, W>(
                         ),
                         next_steps: "Wait for the drain to complete or target an active worker instead."
                             .to_string(),
+                    };
+                    send_message(&mut writer, &reply).await;
+                    continue;
+                }
+                let requested_worker = catalog.get(worker_id).expect("worker was checked above");
+                let healthy_workers = catalog.healthy_workers();
+                if !rockstream_types::topology::assignment_compatible(
+                    &healthy_workers,
+                    requested_worker.protocol_range.max,
+                    requested_worker.storage_format_range.max,
+                ) {
+                    tracing::warn!(
+                        %worker_id,
+                        %shard_id,
+                        protocol = %requested_worker.protocol_range.max,
+                        storage_format = %requested_worker.storage_format_range.max,
+                        "control: assignment withheld by compatibility floor"
+                    );
+                    if let Some(aud) = &audit {
+                        let event = AuditEvent::now(
+                            "control",
+                            "assignment.compatibility_withheld",
+                            shard_id.to_string(),
+                        )
+                        .with_detail(format!(
+                            "worker={}, protocol={}, storage_format={}",
+                            worker_id,
+                            requested_worker.protocol_range.max,
+                            requested_worker.storage_format_range.max
+                        ));
+                        let _ = aud.append(&event);
+                    }
+                    let reply = ControlMessage::OperationFailed {
+                        code: rockstream_types::error_code::RS_5021.to_string(),
+                        message: format!(
+                            "assignment withheld: worker {worker_id} requires protocol {} and storage format {}, but the affected workers do not meet that compatibility floor",
+                            requested_worker.protocol_range.max,
+                            requested_worker.storage_format_range.max
+                        ),
+                        next_steps: rockstream_types::error_code::next_steps(
+                            rockstream_types::error_code::RS_5021,
+                        )
+                        .to_string(),
                     };
                     send_message(&mut writer, &reply).await;
                     continue;

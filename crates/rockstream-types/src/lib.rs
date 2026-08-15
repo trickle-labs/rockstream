@@ -9,6 +9,7 @@ pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
 pub mod checkpoint;
+pub mod compatibility;
 pub mod config;
 pub mod connector;
 pub mod cost;
@@ -35,6 +36,10 @@ pub mod tiering;
 pub mod topology;
 pub mod view_lifecycle;
 pub mod workload;
+
+pub use compatibility::{
+    ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
+};
 
 /// Timestamp types.
 pub mod timestamp {

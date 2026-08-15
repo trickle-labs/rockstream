@@ -29,7 +29,12 @@ async fn test_worker_shuffle_grpc_mtls_valid_cert_admitted() {
     let mut client = pool.get_client(WorkerId(1)).await.unwrap();
     let req_stream =
         futures::stream::iter(Vec::<rockstream_runtime::exchange::proto::ShuffleFrame>::new());
-    let res = client.shuffle_stream(req_stream).await;
+    let mut request = tonic::Request::new(req_stream);
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    let res = client.shuffle_stream(request).await;
     assert!(
         res.is_ok(),
         "mTLS RPC stream should succeed with valid certificates: {:?}",
@@ -61,7 +66,12 @@ async fn test_worker_shuffle_grpc_mtls_unauthenticated_rejected() {
     let mut client = pool.get_client(WorkerId(1)).await.unwrap();
     let req_stream =
         futures::stream::iter(Vec::<rockstream_runtime::exchange::proto::ShuffleFrame>::new());
-    let res = client.shuffle_stream(req_stream).await;
+    let mut request = tonic::Request::new(req_stream);
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    let res = client.shuffle_stream(request).await;
     assert!(
         res.is_err(),
         "Unauthenticated plaintext connection should be rejected"
@@ -92,7 +102,12 @@ async fn test_worker_shuffle_grpc_mtls_untrusted_rejected() {
     let mut client = pool.get_client(WorkerId(1)).await.unwrap();
     let req_stream =
         futures::stream::iter(Vec::<rockstream_runtime::exchange::proto::ShuffleFrame>::new());
-    let res = client.shuffle_stream(req_stream).await;
+    let mut request = tonic::Request::new(req_stream);
+    request.metadata_mut().insert(
+        "protocol_version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    let res = client.shuffle_stream(request).await;
     assert!(
         res.is_err(),
         "Untrusted certificate should be rejected during TLS handshake"

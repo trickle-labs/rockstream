@@ -1,6 +1,7 @@
 use crate::exchange::proto::shuffle_service_client::ShuffleServiceClient;
 use crate::exchange::shared_memory::SharedMemoryClient;
 use parking_lot::RwLock;
+use rockstream_types::compatibility::ProtocolVersion;
 use rockstream_types::config::ExchangeConfig;
 use rockstream_types::ids::WorkerId;
 use rockstream_types::topology::WorkerInfo;
@@ -89,6 +90,19 @@ impl ShuffleClientPool {
 
     pub fn peer_info(&self, worker_id: WorkerId) -> Option<WorkerInfo> {
         self.peer_infos.read().get(&worker_id).cloned()
+    }
+
+    /// Select the highest protocol both workers advertise.
+    pub fn protocol_version_for_peer(&self, worker_id: WorkerId) -> ProtocolVersion {
+        let local = self.local_worker_info();
+        let peer = self.peer_info(worker_id);
+        match (local, peer) {
+            (Some(local), Some(peer)) => local
+                .protocol_range
+                .highest_common(peer.protocol_range)
+                .unwrap_or(ProtocolVersion::V1),
+            _ => ProtocolVersion::V1,
+        }
     }
 
     pub fn is_circuit_broken(&self, worker_id: WorkerId) -> bool {

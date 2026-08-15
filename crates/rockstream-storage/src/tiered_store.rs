@@ -418,6 +418,64 @@ pub fn build_runtime_object_store(
     )))
 }
 
+/// Build the bounded object-store view used by the offline format migrator.
+pub fn build_migration_object_store(storage_url: &str) -> Result<Arc<dyn ObjectStore>, String> {
+    let (scheme, rest) = storage_url
+        .split_once("://")
+        .map_or(("file", storage_url), |parts| parts);
+    if scheme == "file" {
+        let path = rest;
+        let local_path = LocalPath::new(path);
+        std::fs::create_dir_all(local_path)
+            .map_err(|error| format!("failed to create {}: {error}", local_path.display()))?;
+        return Ok(Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(local_path)
+                .map_err(|error| format!("failed to open {}: {error}", local_path.display()))?,
+        ));
+    }
+    if scheme != "s3" {
+        return Err(format!(
+            "RS-0002: unsupported migration storage scheme `{scheme}`; use a local path or s3://bucket/prefix"
+        ));
+    }
+    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    if bucket.is_empty() {
+        return Err("RS-0002: migration storage URL is missing its S3 bucket".to_string());
+    }
+    let endpoint = std::env::var("ROCKSTREAM_OBJECT_STORE_ENDPOINT").map_err(|_| {
+        "RS-0002: ROCKSTREAM_OBJECT_STORE_ENDPOINT is required for s3 migration storage".to_string()
+    })?;
+    let access_key = std::env::var("ROCKSTREAM_OBJECT_STORE_ACCESS_KEY").map_err(|_| {
+        "RS-0002: ROCKSTREAM_OBJECT_STORE_ACCESS_KEY is required for s3 migration storage"
+            .to_string()
+    })?;
+    let secret_key = std::env::var("ROCKSTREAM_OBJECT_STORE_SECRET_KEY").map_err(|_| {
+        "RS-0002: ROCKSTREAM_OBJECT_STORE_SECRET_KEY is required for s3 migration storage"
+            .to_string()
+    })?;
+    let region =
+        std::env::var("ROCKSTREAM_OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let store = AmazonS3Builder::new()
+        .with_endpoint(endpoint.clone())
+        .with_bucket_name(bucket)
+        .with_region(region)
+        .with_access_key_id(access_key)
+        .with_secret_access_key(secret_key)
+        .with_allow_http(endpoint.starts_with("http://"))
+        .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+        .build()
+        .map_err(|error| format!("RS-0002: failed to build migration object store: {error}"))?;
+    let store: Arc<dyn ObjectStore> = Arc::new(store);
+    Ok(if prefix.is_empty() {
+        store
+    } else {
+        Arc::new(object_store::prefix::PrefixStore::new(
+            store,
+            prefix.trim_matches('/'),
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

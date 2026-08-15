@@ -93,6 +93,9 @@ mod tests {
             capacity_headroom: CapacityHeadroom::new(headroom),
             location: WorkerLocation::new(format!("host-{id}"), az),
             capabilities: WorkerCapabilities::default(),
+            protocol_range: rockstream_types::compatibility::SupportedVersionRange::default(),
+            storage_format_range:
+                rockstream_types::compatibility::SupportedStorageFormatRange::default(),
             registered_at_ms: 0,
             healthy: true,
             lifecycle: WorkerLifecycleState::Active,

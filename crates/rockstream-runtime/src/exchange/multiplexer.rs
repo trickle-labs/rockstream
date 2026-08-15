@@ -3,6 +3,7 @@ use tokio_util::task::TaskTracker;
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -14,6 +15,7 @@ use rockstream_types::exchange::{
     ExchangeAnn, ExchangePath, ExchangeTransport, ShuffleCompression,
 };
 use tokio::sync::mpsc;
+use tonic::{metadata::MetadataValue, Request};
 
 use crate::exchange::pool::ShuffleClientPool;
 use crate::exchange::proto::ShuffleFrame;
@@ -337,7 +339,16 @@ impl WorkerStreamMultiplexer {
                 Ok(mut client) => {
                     let (tx, rx) = mpsc::channel::<ShuffleFrame>(64);
                     let request_stream = RxStream { rx };
-                    match client.shuffle_stream(request_stream).await {
+                    let protocol_version =
+                        self.client_pool.protocol_version_for_peer(target_worker);
+                    let mut request = Request::new(request_stream);
+                    request.metadata_mut().insert(
+                        "protocol_version",
+                        MetadataValue::from_str(&protocol_version.0.to_string()).map_err(
+                            |error| format!("RS-5021: invalid protocol metadata: {error}"),
+                        )?,
+                    );
+                    match client.shuffle_stream(request).await {
                         Ok(response) => {
                             let mut response_stream = response.into_inner();
                             let flow_controller = self.flow_controller.clone();

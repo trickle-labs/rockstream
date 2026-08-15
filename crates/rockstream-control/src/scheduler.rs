@@ -34,6 +34,8 @@ use crate::placement::PlacementAlgorithm;
 use crate::raft::RaftHandle;
 use crate::shard::{LeaseError, ShardManager};
 use crate::topology::TopologyCatalog;
+use rockstream_types::compatibility::{ProtocolVersion, StorageFormatVersion};
+use rockstream_types::topology::assignment_compatible;
 
 /// Assignment result from [`ShardScheduler::assign_initial_shards`] or
 /// [`ShardScheduler::on_worker_dead`].
@@ -106,6 +108,15 @@ impl ShardScheduler {
         Ok(())
     }
 
+    /// Shared compatibility gate for shard and pipeline assignment.
+    pub fn compatible_for_assignment(
+        &self,
+        protocol: ProtocolVersion,
+        storage_format: StorageFormatVersion,
+    ) -> bool {
+        assignment_compatible(&self.catalog.healthy_workers(), protocol, storage_format)
+    }
+
     /// Assign an initial set of shards to healthy workers.
     ///
     /// Each shard is assigned to the healthy worker with the highest
@@ -129,17 +140,39 @@ impl ShardScheduler {
         }
 
         let mut assignments = Vec::with_capacity(shard_ids.len());
+        let compatible_workers: Vec<_> = workers
+            .iter()
+            .filter(|worker| {
+                assignment_compatible(
+                    &workers,
+                    worker.protocol_range.max,
+                    worker.storage_format_range.max,
+                )
+            })
+            .cloned()
+            .collect();
         for &shard_id in shard_ids {
             // Skip shards already held by a healthy worker.
             if let Some(existing) = self.manager.get(shard_id) {
                 let holder_healthy = workers.iter().any(|w| w.worker_id == existing.worker_id);
-                if holder_healthy {
+                let holder_compatible = self
+                    .catalog
+                    .get(existing.worker_id)
+                    .map(|worker| {
+                        assignment_compatible(
+                            &workers,
+                            worker.protocol_range.max,
+                            worker.storage_format_range.max,
+                        )
+                    })
+                    .unwrap_or(false);
+                if holder_healthy && holder_compatible {
                     continue;
                 }
             }
 
             // Pick best worker and force-acquire (evicts any stale holder).
-            if let Some(winner) = PlacementAlgorithm::choose(&workers) {
+            if let Some(winner) = PlacementAlgorithm::choose(&compatible_workers) {
                 let (lease, evicted) = self.manager.force_acquire(shard_id, winner.worker_id);
                 assignments.push(ShardAssignment { lease, evicted });
             }
@@ -181,10 +214,22 @@ impl ShardScheduler {
         }
 
         let mut assignments = Vec::with_capacity(freed.len());
+        let compatible_workers: Vec<_> = workers
+            .iter()
+            .filter(|worker| {
+                assignment_compatible(
+                    &workers,
+                    worker.protocol_range.max,
+                    worker.storage_format_range.max,
+                )
+            })
+            .cloned()
+            .collect();
         for shard_id in freed {
-            if let Some(winner) =
-                PlacementAlgorithm::choose_with_preference(&workers, preferred_az.as_deref())
-            {
+            if let Some(winner) = PlacementAlgorithm::choose_with_preference(
+                &compatible_workers,
+                preferred_az.as_deref(),
+            ) {
                 // acquire() should always succeed here because we just released
                 // the shard; no other worker holds it.
                 match self.manager.acquire(shard_id, winner.worker_id) {
@@ -223,6 +268,7 @@ impl ShardScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rockstream_types::compatibility::{SupportedStorageFormatRange, SupportedVersionRange};
     use rockstream_types::ids::{ShardId, WorkerId};
     use rockstream_types::topology::{CapacityHeadroom, NodeRole, WorkerRegistration};
 
@@ -259,6 +305,27 @@ mod tests {
         for a in &assignments {
             assert_eq!(a.worker_id(), WorkerId(1));
         }
+    }
+
+    #[test]
+    fn mixed_versions_choose_a_compatible_worker() {
+        let sched = make_scheduler();
+        register(&sched, 1, 0.3);
+        let v2_worker = WorkerRegistration::new(
+            WorkerId(2),
+            NodeRole::Worker,
+            "127.0.0.1:8002",
+            CapacityHeadroom::new(0.9),
+        )
+        .with_compatibility(
+            SupportedVersionRange::v1_through_v2(),
+            SupportedStorageFormatRange::v1_through_v2(),
+        );
+        sched.catalog.register(&v2_worker);
+
+        let assignments = sched.assign_initial_shards(&[ShardId(1)]).unwrap();
+
+        assert_eq!(assignments[0].worker_id(), WorkerId(1));
     }
 
     #[test]

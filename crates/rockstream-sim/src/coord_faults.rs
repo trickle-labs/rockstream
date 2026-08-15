@@ -104,6 +104,16 @@ pub fn register_coord_faults(model: &mut FaultModel) {
                        without PoisonError, lock acquisition stalls, or degraded service.",
         category: FaultCategory::Logic,
     });
+    model.register(FaultEntry {
+        id: "upgrade.before_assignment_compatibility_check",
+        description: "Rolling upgrade pauses immediately before the compatibility floor check; no incompatible assignment may be committed.",
+        category: FaultCategory::Timing,
+    });
+    model.register(FaultEntry {
+        id: "upgrade.after_worker_restart_before_reassign",
+        description: "Rolling upgrade pauses after a worker restart and before reassignment; committed epochs must remain gap-free.",
+        category: FaultCategory::Timing,
+    });
 }
 
 /// Fault-model entries registered by `register_coord_faults`.
@@ -124,6 +134,8 @@ pub const COORD_FAULT_IDS: &[&str] = &[
     "exchange.shm_segment_unavailable",
     "exchange.domain_rebuild_during_drain",
     "lock_poisoning.holder_panic",
+    "upgrade.before_assignment_compatibility_check",
+    "upgrade.after_worker_restart_before_reassign",
 ];
 
 #[cfg(test)]

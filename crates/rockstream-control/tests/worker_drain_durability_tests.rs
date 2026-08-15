@@ -17,6 +17,9 @@ fn make_worker() -> WorkerInfo {
         capacity_headroom: CapacityHeadroom::FULL,
         location: WorkerLocation::default(),
         capabilities: WorkerCapabilities::default(),
+        protocol_range: rockstream_types::compatibility::SupportedVersionRange::default(),
+        storage_format_range: rockstream_types::compatibility::SupportedStorageFormatRange::default(
+        ),
         registered_at_ms: 1,
         healthy: true,
         lifecycle: WorkerLifecycleState::draining(2, 99),

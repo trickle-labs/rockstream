@@ -13,6 +13,7 @@
 //! scan-and-delete or compaction-filter patterns.
 
 pub mod error;
+pub mod format_migration;
 pub mod keys;
 pub mod merge_registry;
 pub mod reader;
@@ -24,7 +25,7 @@ pub mod wal_cache;
 pub use error::StorageError;
 pub use keys::{
     minmax_sort_key, minmax_sort_key_decode, CatalogKeyEncoder, JoinSide, ShardKeyEncoder,
-    ShardPrefix, DISTINCT_DISCRIMINATOR, MINMAX_DISCRIMINATOR,
+    ShardPrefix, DISTINCT_DISCRIMINATOR, FORMAT_VERSION_DISCRIMINATOR, MINMAX_DISCRIMINATOR,
 };
 pub use merge_registry::{MergeOperatorRegistry, SumCountMergeOperator};
 pub use reader::ShardReader;
@@ -33,8 +34,8 @@ pub use shard_db::{
     PartialAggSpec, ShardDb, WriteBatch,
 };
 pub use tiered_store::{
-    build_runtime_object_store, build_s3_backend_from_config, s3_express_build_config,
-    tier_aged_ssts, TieredObjectStore, MAX_TIERING_SCAN_OBJECTS,
+    build_migration_object_store, build_runtime_object_store, build_s3_backend_from_config,
+    s3_express_build_config, tier_aged_ssts, TieredObjectStore, MAX_TIERING_SCAN_OBJECTS,
 };
 pub use wal_cache::WalListingCache;
 

@@ -14,6 +14,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::exchange::proto::{shuffle_service_server::ShuffleService, ShuffleAck, ShuffleFrame};
 use crate::exchange::serialization::deserialize_zset;
 use rockstream_ops::zset::ArrowZSet;
+use rockstream_types::compatibility::{ProtocolVersion, SupportedVersionRange};
 use rockstream_types::config::ExchangeConfig;
 
 /// Holds the input channel and Schema metadata for a local exchange target.
@@ -145,6 +146,7 @@ pub struct ExchangeService {
     cancel_token: CancellationToken,
     exchange_config: ExchangeConfig,
     internal_tls: Option<rockstream_types::identity::InternalTlsConfig>,
+    protocol_range: SupportedVersionRange,
 }
 
 impl ExchangeService {
@@ -155,6 +157,7 @@ impl ExchangeService {
             cancel_token: CancellationToken::new(),
             exchange_config: ExchangeConfig::default(),
             internal_tls: None,
+            protocol_range: SupportedVersionRange::v1_through_v2(),
         }
     }
 
@@ -168,6 +171,11 @@ impl ExchangeService {
         config: rockstream_types::identity::InternalTlsConfig,
     ) -> Self {
         self.internal_tls = Some(config);
+        self
+    }
+
+    pub fn with_supported_protocol_range(mut self, protocol_range: SupportedVersionRange) -> Self {
+        self.protocol_range = protocol_range;
         self
     }
 
@@ -197,7 +205,8 @@ impl ExchangeService {
             Some(self.task_tracker.clone()),
             Some(self.cancel_token.clone()),
         )
-        .with_exchange_config(self.exchange_config.clone());
+        .with_exchange_config(self.exchange_config.clone())
+        .with_supported_protocol_range(self.protocol_range);
         let cancel_token = self.cancel_token.clone();
 
         let tls_config = if let Some(tls_cfg) = &self.internal_tls {
@@ -264,6 +273,7 @@ pub struct ShuffleServer {
     task_tracker: Option<TaskTracker>,
     cancel_token: Option<CancellationToken>,
     exchange_config: ExchangeConfig,
+    protocol_range: SupportedVersionRange,
 }
 
 impl ShuffleServer {
@@ -273,6 +283,7 @@ impl ShuffleServer {
             task_tracker: None,
             cancel_token: None,
             exchange_config: ExchangeConfig::default(),
+            protocol_range: SupportedVersionRange::v1_through_v2(),
         }
     }
 
@@ -286,12 +297,56 @@ impl ShuffleServer {
             task_tracker,
             cancel_token,
             exchange_config: ExchangeConfig::default(),
+            protocol_range: SupportedVersionRange::v1_through_v2(),
         }
     }
 
     pub fn with_exchange_config(mut self, exchange_config: ExchangeConfig) -> Self {
         self.exchange_config = exchange_config;
         self
+    }
+
+    pub fn with_supported_protocol_range(mut self, protocol_range: SupportedVersionRange) -> Self {
+        self.protocol_range = protocol_range;
+        self
+    }
+
+    /// Validate a request's protocol metadata before its frame stream is read.
+    #[allow(clippy::result_large_err)]
+    pub fn validate_protocol_version(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<ProtocolVersion, Status> {
+        let raw_protocol_version = metadata
+            .get("protocol_version")
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "RS-5021: missing protocol_version metadata; send an overlapping peer protocol range",
+                )
+            })?
+            .to_str()
+            .map_err(|_| {
+                Status::failed_precondition(
+                    "RS-5021: invalid protocol_version metadata; send an integer protocol version",
+                )
+            })?;
+        let protocol_version = raw_protocol_version
+            .strip_prefix('v')
+            .unwrap_or(raw_protocol_version)
+            .parse::<u32>()
+            .map(ProtocolVersion)
+            .map_err(|_| {
+                Status::failed_precondition(
+                    "RS-5021: invalid protocol_version metadata; send an integer protocol version",
+                )
+            })?;
+        if !self.protocol_range.contains(protocol_version) {
+            return Err(Status::failed_precondition(format!(
+                "RS-5021: protocol version {protocol_version} is outside receiver range {}..={}; use an overlapping peer protocol range",
+                self.protocol_range.min, self.protocol_range.max
+            )));
+        }
+        Ok(protocol_version)
     }
 
     pub fn exchange_config(&self) -> &ExchangeConfig {
@@ -307,6 +362,7 @@ impl ShuffleService for ShuffleServer {
         &self,
         request: Request<Streaming<ShuffleFrame>>,
     ) -> Result<Response<Self::ShuffleStreamStream>, Status> {
+        self.validate_protocol_version(request.metadata())?;
         let mut stream = request.into_inner();
         let registry = self.registry.clone();
 
@@ -486,6 +542,9 @@ mod tests {
                 shuffle_codec_v1: shuffle_codec,
                 checkpoint_manifest_codec_v1: true,
             },
+            protocol_range: rockstream_types::compatibility::SupportedVersionRange::default(),
+            storage_format_range:
+                rockstream_types::compatibility::SupportedStorageFormatRange::default(),
             registered_at_ms: 1,
             healthy: true,
             lifecycle: WorkerLifecycleState::Active,
@@ -677,12 +736,13 @@ mod tests {
         eprintln!("Direct frame sent to local channel");
 
         let request_stream = RxStream { rx: frame_rx };
+        let mut request = tonic::Request::new(request_stream);
+        request.metadata_mut().insert(
+            "protocol_version",
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
         eprintln!("Calling shuffle_stream direct");
-        let mut response = client
-            .shuffle_stream(request_stream)
-            .await
-            .unwrap()
-            .into_inner();
+        let mut response = client.shuffle_stream(request).await.unwrap().into_inner();
         eprintln!("shuffle_stream direct response stream received");
 
         eprintln!("Waiting for Ack");

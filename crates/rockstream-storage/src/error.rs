@@ -33,6 +33,28 @@ pub enum StorageError {
     )]
     UnknownMergeLaw { law_id: u16, law_version: u16 },
 
+    /// RS-5001: the stored format is outside the binary's inclusive range.
+    #[error(
+        "RS-5001: incompatible storage format stored={stored}, supported={min}..={max}; run rockstream migrate --from=N --to=M --storage=<url>"
+    )]
+    IncompatibleFormat { stored: u8, min: u8, max: u8 },
+
+    /// RS-5001: the fixed storage-format marker is not one byte.
+    #[error(
+        "RS-5001: malformed storage format marker length={length}, supported={min}..={max}; run rockstream migrate --from=N --to=M --storage=<url>"
+    )]
+    MalformedFormatMarker { length: usize, min: u8, max: u8 },
+
+    /// Test/operation hook used to prove resumability without retaining a key list.
+    #[error("format migration interrupted after {processed} objects")]
+    MigrationInterrupted { processed: usize },
+
+    /// A live writer attempted to use a shard while offline migration was pending.
+    #[error(
+        "RS-5001: offline format migration is in progress; stop shard writers and rerun the migration"
+    )]
+    MigrationInProgress,
+
     /// RS-5003: stored operand fails validation for the merge law.
     #[error("RS-5003: operand corruption for law {law_name} ({law_id}): invalid bytes")]
     OperandCorruption { law_id: u16, law_name: String },

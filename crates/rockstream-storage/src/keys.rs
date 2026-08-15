@@ -54,6 +54,9 @@ pub const TW_DISCRIMINATOR: [u8; 2] = [0x54, 0x57];
 /// Watermark state discriminator bytes (v0.12 — IVM-8): ASCII 'W', 'M'.
 pub const WM_DISCRIMINATOR: [u8; 2] = [0x57, 0x4D];
 
+/// Fixed shard metadata discriminator for the one-byte storage format marker.
+pub const FORMAT_VERSION_DISCRIMINATOR: [u8; 2] = [0x46, 0x56]; // "FV"
+
 /// Top-K buffer discriminator bytes (v0.12 — IVM-9): ASCII 'T', 'K'.
 pub const TK_DISCRIMINATOR: [u8; 2] = [0x54, 0x4B];
 
@@ -222,6 +225,11 @@ impl ShardKeyEncoder {
     /// The frontier key for a shard.
     pub fn frontier_key() -> Vec<u8> {
         Self::meta_key(b"frontier")
+    }
+
+    /// The fixed key holding the shard's one-byte storage format version.
+    pub fn format_version_key() -> Vec<u8> {
+        Self::meta_key(&FORMAT_VERSION_DISCRIMINATOR)
     }
 
     // ─── MIN/MAX arrangement keys (IVM-3) ────────────────────────────────────

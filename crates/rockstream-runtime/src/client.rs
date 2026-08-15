@@ -303,7 +303,11 @@ where
             CapacityHeadroom::FULL,
         )
         .with_location(location.clone())
-        .with_capabilities(capabilities);
+        .with_capabilities(capabilities)
+        .with_compatibility(
+            rockstream_types::compatibility::SupportedVersionRange::v1_through_v2(),
+            rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(),
+        );
         let reg_msg = WorkerMessage::Register(reg);
         let reg_line = serde_json::to_string(&reg_msg).unwrap() + "\n";
         if let Err(e) = writer.write_all(reg_line.as_bytes()).await {
@@ -416,7 +420,10 @@ where
                     };
 
                     // Attempt to open the ShardDb
-                    let mut builder = ShardDb::builder("db", store);
+                    let mut builder = ShardDb::builder("db", store).with_supported_format_range(
+                        rockstream_types::compatibility::SupportedStorageFormatRange::v1_through_v2(
+                        ),
+                    );
                     if let Ok(metric_shard_id) = u16::try_from(lease.shard_id.0) {
                         builder = builder
                             .with_metrics_identity(metric_shard_id, lease.worker_id.to_string());
@@ -431,14 +438,41 @@ where
                                 },
                             );
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                code = %rockstream_types::error_code::RS_0003,
-                                "Failed to open ShardDb for {:?}: {:?}",
+                        Err(e) => match &e {
+                            rockstream_storage::StorageError::IncompatibleFormat {
+                                stored,
+                                min,
+                                max,
+                            } => tracing::error!(
+                                code = %rockstream_types::error_code::RS_5001,
+                                stored,
+                                min,
+                                max,
+                                "Failed to open ShardDb for {:?}: {}",
                                 lease.shard_id,
                                 e
-                            );
-                        }
+                            ),
+                            rockstream_storage::StorageError::MalformedFormatMarker {
+                                length,
+                                min,
+                                max,
+                            } => tracing::error!(
+                                code = %rockstream_types::error_code::RS_5001,
+                                stored = "malformed",
+                                marker_length = length,
+                                min,
+                                max,
+                                "Failed to open ShardDb for {:?}: {}",
+                                lease.shard_id,
+                                e
+                            ),
+                            _ => tracing::error!(
+                                code = %rockstream_types::error_code::RS_0003,
+                                "Failed to open ShardDb for {:?}: {}",
+                                lease.shard_id,
+                                e
+                            ),
+                        },
                     }
                 }
                 ControlMessage::ShardRevoked { shard_id, reason } => {

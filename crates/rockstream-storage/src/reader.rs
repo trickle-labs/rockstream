@@ -6,11 +6,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::ObjectStore;
+use rockstream_types::compatibility::SupportedStorageFormatRange;
 use slatedb::config::DbReaderOptions;
 use slatedb::DbReader;
 use tokio::sync::mpsc;
 
 use crate::error::StorageError;
+use crate::format_migration::{format_v2_key, format_v2_prefix, logical_key_from_format_v2};
+use crate::keys::ShardKeyEncoder;
 
 /// A read-only view of a shard database from a checkpoint.
 ///
@@ -19,6 +22,8 @@ use crate::error::StorageError;
 pub struct ShardReader {
     reader: DbReader,
     path: String,
+    format_version: u8,
+    migration_pending: bool,
 }
 
 impl ShardReader {
@@ -27,11 +32,12 @@ impl ShardReader {
         path: impl Into<String>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self, StorageError> {
-        let path = path.into();
-        let reader = DbReader::builder(path.clone(), object_store)
-            .build()
-            .await?;
-        Ok(Self { reader, path })
+        Self::open_with_supported_format_range(
+            path,
+            object_store,
+            SupportedStorageFormatRange::v1_through_v2(),
+        )
+        .await
     }
 
     /// Open a reader with custom options.
@@ -40,12 +46,80 @@ impl ShardReader {
         object_store: Arc<dyn ObjectStore>,
         options: DbReaderOptions,
     ) -> Result<Self, StorageError> {
+        Self::open_with_options_and_supported_format_range(
+            path,
+            object_store,
+            options,
+            SupportedStorageFormatRange::v1_through_v2(),
+        )
+        .await
+    }
+
+    /// Open a reader while enforcing an inclusive storage-format range.
+    pub async fn open_with_supported_format_range(
+        path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        supported_format_range: SupportedStorageFormatRange,
+    ) -> Result<Self, StorageError> {
+        let path = path.into();
+        let reader = DbReader::builder(path.clone(), object_store)
+            .build()
+            .await?;
+        Self::from_reader(path, reader, supported_format_range).await
+    }
+
+    async fn open_with_options_and_supported_format_range(
+        path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        options: DbReaderOptions,
+        supported_format_range: SupportedStorageFormatRange,
+    ) -> Result<Self, StorageError> {
         let path = path.into();
         let reader = DbReader::builder(path.clone(), object_store)
             .with_options(options)
             .build()
             .await?;
-        Ok(Self { reader, path })
+        Self::from_reader(path, reader, supported_format_range).await
+    }
+
+    async fn from_reader(
+        path: String,
+        reader: DbReader,
+        supported_format_range: SupportedStorageFormatRange,
+    ) -> Result<Self, StorageError> {
+        let format_version = match reader.get(ShardKeyEncoder::format_version_key()).await? {
+            None => 1,
+            Some(bytes) if bytes.len() == 1 => bytes[0],
+            Some(bytes) => {
+                return Err(StorageError::MalformedFormatMarker {
+                    length: bytes.len(),
+                    min: supported_format_range.min.0,
+                    max: supported_format_range.max.0,
+                });
+            }
+        };
+        let stored = rockstream_types::compatibility::StorageFormatVersion(format_version);
+        if !supported_format_range.contains(stored) {
+            return Err(StorageError::IncompatibleFormat {
+                stored: format_version,
+                min: supported_format_range.min.0,
+                max: supported_format_range.max.0,
+            });
+        }
+        let migration_pending = format_version == 1
+            && reader
+                .get(&crate::format_migration::migration_progress_key(
+                    rockstream_types::compatibility::StorageFormatVersion::V1,
+                    rockstream_types::compatibility::StorageFormatVersion::V2,
+                ))
+                .await?
+                .is_some();
+        Ok(Self {
+            reader,
+            path,
+            format_version,
+            migration_pending,
+        })
     }
 
     /// Return the storage path this snapshot reader was opened against.
@@ -53,9 +127,26 @@ impl ShardReader {
         &self.path
     }
 
+    /// Return the persisted storage format version.
+    pub fn format_version(&self) -> u8 {
+        self.format_version
+    }
+
     /// Get the value for a key from the snapshot.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
-        Ok(self.reader.get(key).await?)
+        if self.migration_pending && key.first().copied() != Some(0x06) {
+            return Ok(self
+                .reader
+                .get(&format_v2_key(key))
+                .await?
+                .or(self.reader.get(key).await?));
+        }
+        let physical_key = if self.format_version == 2 && key.first().copied() != Some(0x06) {
+            format_v2_key(key)
+        } else {
+            key.to_vec()
+        };
+        Ok(self.reader.get(physical_key).await?)
     }
 
     /// Look up an idempotency key epoch.
@@ -76,10 +167,57 @@ impl ShardReader {
 
     /// Scan all key-value pairs with the given prefix from the snapshot.
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
+        if self.format_version == 2 && prefix.first().copied() != Some(0x06) {
+            return self.scan_physical_prefix(prefix, true).await;
+        }
+        if self.migration_pending && prefix.first().copied() != Some(0x06) {
+            return self.scan_pending_prefix(prefix).await;
+        }
+        self.scan_physical_prefix(prefix, false).await
+    }
+
+    async fn scan_pending_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
         let mut results = Vec::new();
-        let mut iter = self.reader.scan_prefix(prefix).await?;
+        let mut old_iter = self.reader.scan_prefix(prefix).await?;
+        while let Some(entry) = old_iter.next().await? {
+            if self.reader.get(format_v2_key(&entry.key)).await?.is_none() {
+                results.push((entry.key, entry.value));
+            }
+        }
+        let mut new_iter = self.reader.scan_prefix(format_v2_prefix(prefix)).await?;
+        while let Some(entry) = new_iter.next().await? {
+            let key = logical_key_from_format_v2(&entry.key)
+                .ok_or_else(|| StorageError::Unsupported("invalid v2 storage key".to_string()))?;
+            results.push((Bytes::copy_from_slice(key), entry.value));
+        }
+        results.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(results)
+    }
+
+    async fn scan_physical_prefix(
+        &self,
+        prefix: &[u8],
+        strip_v2_prefix: bool,
+    ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
+        let mut results = Vec::new();
+        let physical_prefix = if strip_v2_prefix {
+            format_v2_prefix(prefix)
+        } else {
+            prefix.to_vec()
+        };
+        let mut iter = self.reader.scan_prefix(physical_prefix).await?;
         while let Some(entry) = iter.next().await? {
-            results.push((entry.key, entry.value));
+            let key = if strip_v2_prefix {
+                Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(|| {
+                    StorageError::Unsupported("invalid v2 storage key".to_string())
+                })?)
+            } else {
+                entry.key
+            };
+            results.push((key, entry.value));
         }
         Ok(results)
     }
@@ -98,9 +236,15 @@ impl ShardReader {
         sender: mpsc::Sender<Result<Vec<(Bytes, Bytes)>, StorageError>>,
     ) {
         let sender = sender;
+        let use_v2 = self.format_version == 2 && prefix.first().copied() != Some(0x06);
+        let physical_prefix = if use_v2 {
+            format_v2_prefix(prefix)
+        } else {
+            prefix.to_vec()
+        };
         let mut page = Vec::with_capacity(max_rows);
         let mut page_bytes = 0usize;
-        let mut iter = match self.reader.scan_prefix(prefix).await {
+        let mut iter = match self.reader.scan_prefix(physical_prefix).await {
             Ok(iter) => iter,
             Err(error) => {
                 let _ = sender.send(Err(error.into())).await;
@@ -116,7 +260,22 @@ impl ShardReader {
                     return;
                 }
             };
-            let entry_bytes = entry.key.len() + entry.value.len();
+            let key = if use_v2 {
+                match logical_key_from_format_v2(&entry.key) {
+                    Some(key) => Bytes::copy_from_slice(key),
+                    None => {
+                        let _ = sender
+                            .send(Err(StorageError::Unsupported(
+                                "invalid v2 storage key".to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            } else {
+                entry.key
+            };
+            let entry_bytes = key.len() + entry.value.len();
             if entry_bytes > max_bytes {
                 let _ = sender
                     .send(Err(StorageError::Unsupported(format!(
@@ -134,7 +293,7 @@ impl ShardReader {
                 page_bytes = 0;
             }
             page_bytes = page_bytes.saturating_add(entry_bytes);
-            page.push((entry.key, entry.value));
+            page.push((key, entry.value));
         }
         if !page.is_empty() {
             let _ = sender.send(Ok(page)).await;

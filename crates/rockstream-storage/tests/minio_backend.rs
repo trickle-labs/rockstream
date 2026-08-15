@@ -39,6 +39,7 @@ use object_store::{
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
 use rockstream_storage::{
+    format_migration::migrate_shard_format,
     keys::{CatalogKeyEncoder, CatalogType, ShardKeyEncoder, ShardPrefix},
     merge_registry::MergeOperatorRegistry,
     tier_aged_ssts, ShardDb, StorageError, TieredObjectStore, WriteBatch,
@@ -754,4 +755,41 @@ async fn minio_aged_sst_moves_to_cold_bucket_with_storage_class() {
         .unwrap();
     assert_eq!(bytes.as_ref(), b"payload");
     assert!(cold_recorder.saw_storage_class("STANDARD_IA"));
+}
+
+#[tokio::test]
+async fn migrates_populated_v1_shards_to_v2_bit_identically_tc() {
+    let port = match get_shared_minio().await {
+        Some(port) => port,
+        None => return,
+    };
+    let path = format!(
+        "format-migration/{}",
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let store = minio_object_store(port);
+    let db = ShardDb::builder(path.clone(), store.clone())
+        .with_settings(fast_settings())
+        .build()
+        .await
+        .unwrap();
+    for (suffix, value) in [(b"a".as_slice(), b"one".as_slice()), (b"b", b"two")] {
+        let key = ShardKeyEncoder::encode(ShardPrefix::OpState, 56, suffix);
+        db.put(&key, value).await.unwrap();
+    }
+    db.flush().await.unwrap();
+    let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, 56);
+    let before = db.scan_prefix(&prefix).await.unwrap();
+    db.close().await.unwrap();
+
+    let report = migrate_shard_format(path.clone(), store.clone(), 1u8, 2u8)
+        .await
+        .unwrap();
+    assert_eq!(report.objects_migrated, 2);
+    let reopened = ShardDb::builder(path, store).build().await.unwrap();
+    assert_eq!(reopened.format_version(), 2);
+    assert_eq!(reopened.scan_prefix(&prefix).await.unwrap(), before);
 }

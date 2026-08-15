@@ -213,6 +213,9 @@ mod tests {
                 shuffle_codec_v1: true,
                 checkpoint_manifest_codec_v1: true,
             },
+            protocol_range: rockstream_types::compatibility::SupportedVersionRange::default(),
+            storage_format_range:
+                rockstream_types::compatibility::SupportedStorageFormatRange::default(),
             registered_at_ms: 1,
             healthy: true,
             lifecycle: rockstream_types::topology::WorkerLifecycleState::Active,

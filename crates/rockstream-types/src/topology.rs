@@ -6,6 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::compatibility::{
+    ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
+};
 use crate::ids::{ShardId, WorkerId};
 use crate::lease::{ShardLease, ShardRevokeReason};
 
@@ -138,6 +141,12 @@ pub struct WorkerRegistration {
     /// Worker feature/capability advertisement.
     #[serde(default)]
     pub capabilities: WorkerCapabilities,
+    /// Inclusive gRPC protocol range accepted by this worker.
+    #[serde(default)]
+    pub protocol_range: SupportedVersionRange,
+    /// Inclusive shard storage-format range accepted by this worker.
+    #[serde(default)]
+    pub storage_format_range: SupportedStorageFormatRange,
     /// Wall-clock timestamp (ms since Unix epoch) when the registration was
     /// sent.
     pub registered_at_ms: u64,
@@ -162,6 +171,8 @@ impl WorkerRegistration {
             capacity_headroom,
             location: WorkerLocation::default(),
             capabilities: WorkerCapabilities::default(),
+            protocol_range: SupportedVersionRange::default(),
+            storage_format_range: SupportedStorageFormatRange::default(),
             registered_at_ms,
         }
     }
@@ -173,6 +184,16 @@ impl WorkerRegistration {
 
     pub fn with_capabilities(mut self, capabilities: WorkerCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_compatibility(
+        mut self,
+        protocol_range: SupportedVersionRange,
+        storage_format_range: SupportedStorageFormatRange,
+    ) -> Self {
+        self.protocol_range = protocol_range;
+        self.storage_format_range = storage_format_range;
         self
     }
 }
@@ -194,6 +215,12 @@ pub struct WorkerInfo {
     /// Worker feature/capability advertisement.
     #[serde(default)]
     pub capabilities: WorkerCapabilities,
+    /// Inclusive gRPC protocol range accepted by this worker.
+    #[serde(default)]
+    pub protocol_range: SupportedVersionRange,
+    /// Inclusive shard storage-format range accepted by this worker.
+    #[serde(default)]
+    pub storage_format_range: SupportedStorageFormatRange,
     /// When this worker registered (ms since Unix epoch).
     pub registered_at_ms: u64,
     /// Whether the worker is currently considered healthy.
@@ -213,6 +240,8 @@ impl WorkerInfo {
             capacity_headroom: reg.capacity_headroom,
             location: reg.location.clone(),
             capabilities: reg.capabilities,
+            protocol_range: reg.protocol_range,
+            storage_format_range: reg.storage_format_range,
             registered_at_ms: reg.registered_at_ms,
             healthy: true,
             lifecycle: WorkerLifecycleState::Active,
@@ -223,6 +252,19 @@ impl WorkerInfo {
     pub fn update_capacity(&mut self, headroom: CapacityHeadroom) {
         self.capacity_headroom = headroom;
     }
+}
+
+/// Whether every worker can run the requested protocol and storage format.
+pub fn assignment_compatible(
+    workers: &[WorkerInfo],
+    protocol: ProtocolVersion,
+    storage_format: StorageFormatVersion,
+) -> bool {
+    !workers.is_empty()
+        && workers.iter().all(|worker| {
+            worker.protocol_range.contains(protocol)
+                && worker.storage_format_range.contains(storage_format)
+        })
 }
 
 /// A control-plane message sent from the control service to a worker.

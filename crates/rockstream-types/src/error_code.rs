@@ -406,8 +406,10 @@ pub const RS_3005: ErrorCode = ErrorCode::new(3005);
 pub const RS_5001: ErrorCode = ErrorCode::new(5001);
 /// Unknown merge law referenced in arrangement header.
 pub const RS_5002: ErrorCode = ErrorCode::new(5002);
-/// Wire protocol version not supported; rolling upgrade version skew (v0.36, DESIGN.md §5.5).
+/// Legacy validation failures retained outside the wire-version gate.
 pub const RS_5003: ErrorCode = ErrorCode::new(5003);
+/// Wire protocol version not supported during a rolling upgrade.
+pub const RS_5021: ErrorCode = ErrorCode::new(5021);
 /// Illegal shard-migration state transition rejected (v0.46).
 pub const RS_5030: ErrorCode = ErrorCode::new(5030);
 /// Shard-migration verify scan window exceeded its configured bound (v0.46).
@@ -638,7 +640,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         3005 => "Self-fencing configuration invalid: self_fence_after constraint violated",
         5001 => "Incompatible storage format",
         5002 => "Unknown merge law in arrangement header",
-        5003 => "Wire protocol version not supported; rolling upgrade version skew",
+        5003 => "Legacy validation failure",
+        5021 => "Wire protocol version not supported; rolling upgrade version skew",
         5030 => "Illegal shard-migration state transition rejected",
         5031 => "Shard-migration verify scan window exceeded its configured bound",
         5032 => "Shard-migration bucket-map version or watcher acknowledgement mismatch",
@@ -702,6 +705,7 @@ pub fn severity(code: ErrorCode) -> Severity {
         3501 => Severity::Error,
         5001 => Severity::Fatal,
         5002 => Severity::Fatal,
+        5021 => Severity::Fatal,
         5030 => Severity::Error,
         5031 => Severity::Error,
         5032 => Severity::Error,
@@ -850,9 +854,10 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         4021 => "Wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES before retrying.",
         4022 => "Run SHOW BACKFILL STATUS and retry after the materialized view reaches RUNNING, or create it first.",
         3005 => "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget.",
-        5001 => "Run the storage migration tool before upgrading.",
+        5001 => "Run rockstream migrate --from=N --to=M --storage=<url> before upgrading the binary.",
         5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
-        5003 => "Ensure N+1 binary is backward compatible with N; check rolling upgrade procedure in DESIGN.md §5.5.",
+        5003 => "Inspect the failing component and its version-specific validation guidance.",
+        5021 => "Use a peer with an overlapping protocol range, or finish the rolling upgrade before retrying.",
         5030 => "Drive the migration through the documented next state only, or resume from the persisted record instead of forcing a skipped state.",
         5031 => "Reduce verify_sample_rate, split the migration into fewer buckets, or increase the configured verify scan bound if memory headroom allows.",
         5032 => "Wait for every reader, exchange receiver, and gateway to observe the new bucket_map_version, then retry the migration step under the current version.",
@@ -908,6 +913,18 @@ mod tests {
         assert_eq!(description(RS_0001), "Internal error");
         assert_eq!(description(RS_1002), "Incompatible schema change");
         assert_eq!(description(RS_5001), "Incompatible storage format");
+        assert_eq!(
+            description(RS_5021),
+            "Wire protocol version not supported; rolling upgrade version skew"
+        );
+        assert_eq!(
+            next_steps(RS_5001),
+            "Run rockstream migrate --from=N --to=M --storage=<url> before upgrading the binary."
+        );
+        assert_eq!(
+            next_steps(RS_5021),
+            "Use a peer with an overlapping protocol range, or finish the rolling upgrade before retrying."
+        );
     }
 
     #[test]
@@ -923,9 +940,9 @@ mod tests {
             RS_2005, RS_2006, RS_2007, RS_2008, RS_2014, RS_2015, RS_2016, RS_2017, RS_2018,
             RS_2021, RS_3003, RS_3009, RS_3011, RS_3012, RS_3013, RS_3014, RS_3015, RS_3016,
             RS_3017, RS_3018, RS_3022, RS_3023, RS_3024, RS_3501, RS_4001, RS_4002, RS_5001,
-            RS_5002, RS_5003, RS_5030, RS_5031, RS_5032, RS_5035, RS_5036, RS_1512, RS_1513,
-            RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019, RS_6001,
-            RS_1015, RS_1016, RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
+            RS_5002, RS_5003, RS_5021, RS_5030, RS_5031, RS_5032, RS_5035, RS_5036, RS_1512,
+            RS_1513, RS_3601, RS_3602, RS_3603, RS_1701, RS_1702, RS_1703, RS_5018, RS_5019,
+            RS_6001, RS_1015, RS_1016, RS_1017, RS_1012, RS_1013, RS_1014, RS_8001, // v0.21
             RS_4003, RS_4004, RS_4005, RS_4006, RS_4007, RS_4008, RS_4009, RS_4010, RS_4011,
             RS_4012, RS_4013, RS_4014, RS_4015, RS_4016, RS_4017, RS_4018, RS_4019, RS_4020,
             RS_4021, RS_4022, RS_3005, RS_1018, RS_2400, RS_2401, RS_2402, // v0.26 auth

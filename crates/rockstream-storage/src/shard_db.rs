@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::ObjectStore;
+use rockstream_types::compatibility::SupportedStorageFormatRange;
 use rockstream_types::frontier::ShardFrontierReport;
 use rockstream_types::ids::ShardId;
 use rockstream_types::merge_law::{ArrangementHeader, MergeLawId};
@@ -39,6 +40,9 @@ pub fn is_allow_law_operand_fallback() -> bool {
 }
 
 use crate::error::StorageError;
+use crate::format_migration::{
+    format_v2_key, format_v2_prefix, logical_key_from_format_v2, migration_progress_key,
+};
 use crate::keys::ShardKeyEncoder;
 use crate::merge_registry::SumCountMergeOperator;
 
@@ -82,6 +86,8 @@ pub struct ShardDb {
     path: String,
     object_store: Arc<dyn ObjectStore>,
     last_epoch: Arc<std::sync::atomic::AtomicU64>,
+    format_version: u8,
+    migration_pending: bool,
 }
 
 /// Builder for creating a `ShardDb`.
@@ -91,6 +97,7 @@ pub struct ShardDbBuilder {
     settings: Settings,
     metrics_shard_id: Option<u16>,
     worker_id: Option<String>,
+    supported_format_range: SupportedStorageFormatRange,
 }
 
 /// Specification for a partial aggregation query.
@@ -114,6 +121,7 @@ impl ShardDbBuilder {
             settings: Settings::default(),
             metrics_shard_id: None,
             worker_id: None,
+            supported_format_range: SupportedStorageFormatRange::v1_through_v2(),
         }
     }
 
@@ -127,6 +135,15 @@ impl ShardDbBuilder {
     pub fn with_metrics_identity(mut self, shard_id: u16, worker_id: impl Into<String>) -> Self {
         self.metrics_shard_id = Some(shard_id);
         self.worker_id = Some(worker_id.into());
+        self
+    }
+
+    /// Set the inclusive storage-format range accepted by this binary.
+    pub fn with_supported_format_range(
+        mut self,
+        supported_format_range: SupportedStorageFormatRange,
+    ) -> Self {
+        self.supported_format_range = supported_format_range;
         self
     }
 
@@ -145,6 +162,52 @@ impl ShardDbBuilder {
             );
         }
         let db = builder.build().await?;
+        let range = self.supported_format_range;
+        let format_key = ShardKeyEncoder::format_version_key();
+        let format_version = match db.get(&format_key).await? {
+            None => {
+                if !range.contains(rockstream_types::compatibility::StorageFormatVersion::V1) {
+                    return Err(StorageError::IncompatibleFormat {
+                        stored: rockstream_types::compatibility::StorageFormatVersion::V1.0,
+                        min: range.min.0,
+                        max: range.max.0,
+                    });
+                }
+                db.put(
+                    &format_key,
+                    [rockstream_types::compatibility::StorageFormatVersion::V1.0],
+                )
+                .await?;
+                db.flush().await?;
+                rockstream_types::compatibility::StorageFormatVersion::V1.0
+            }
+            Some(bytes) if bytes.len() == 1 => {
+                let stored = rockstream_types::compatibility::StorageFormatVersion(bytes[0]);
+                if !range.contains(stored) {
+                    return Err(StorageError::IncompatibleFormat {
+                        stored: stored.0,
+                        min: range.min.0,
+                        max: range.max.0,
+                    });
+                }
+                stored.0
+            }
+            Some(bytes) => {
+                return Err(StorageError::MalformedFormatMarker {
+                    length: bytes.len(),
+                    min: range.min.0,
+                    max: range.max.0,
+                });
+            }
+        };
+        let migration_pending = format_version == 1
+            && db
+                .get(&migration_progress_key(
+                    rockstream_types::compatibility::StorageFormatVersion::V1,
+                    rockstream_types::compatibility::StorageFormatVersion::V2,
+                ))
+                .await?
+                .is_some();
         let frontier_key = ShardKeyEncoder::frontier_key();
         let initial_epoch = if let Some(bytes) = db.get(&frontier_key).await? {
             if bytes.len() == 8 {
@@ -160,6 +223,8 @@ impl ShardDbBuilder {
             path: self.path,
             object_store: self.object_store,
             last_epoch: Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch)),
+            format_version,
+            migration_pending,
         })
     }
 }
@@ -173,6 +238,82 @@ impl ShardDb {
     /// Get the underlying object store.
     pub fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.object_store.clone()
+    }
+
+    /// Return the persisted storage format version.
+    pub fn format_version(&self) -> u8 {
+        self.format_version
+    }
+
+    pub(crate) fn raw_db(&self) -> &Db {
+        &self.db
+    }
+
+    fn physical_key(&self, key: &[u8]) -> Vec<u8> {
+        if self.format_version == 2 && key.first().copied() != Some(0x06) {
+            format_v2_key(key)
+        } else {
+            key.to_vec()
+        }
+    }
+
+    async fn scan_physical_prefix(
+        &self,
+        prefix: &[u8],
+        strip_v2_prefix: bool,
+    ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
+        let mut results = Vec::new();
+        let physical_prefix = if strip_v2_prefix {
+            format_v2_prefix(prefix)
+        } else {
+            prefix.to_vec()
+        };
+        let mut iter = self.db.scan_prefix(&physical_prefix).await?;
+        while let Some(entry) = iter.next().await? {
+            let key = if strip_v2_prefix {
+                Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(|| {
+                    StorageError::Unsupported("invalid v2 storage key".to_string())
+                })?)
+            } else {
+                entry.key
+            };
+            results.push((key, entry.value));
+        }
+        Ok(results)
+    }
+
+    async fn scan_physical_prefix_bounded(
+        &self,
+        prefix: &[u8],
+        strip_v2_prefix: bool,
+        max_bytes: usize,
+    ) -> Result<(Vec<(Bytes, Bytes)>, bool), StorageError> {
+        let mut results = Vec::new();
+        let mut total_bytes = 0usize;
+        let physical_prefix = if strip_v2_prefix {
+            format_v2_prefix(prefix)
+        } else {
+            prefix.to_vec()
+        };
+        let mut iter = self.db.scan_prefix(physical_prefix).await?;
+        while let Some(entry) = iter.next().await? {
+            let key = if strip_v2_prefix {
+                Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(|| {
+                    StorageError::Unsupported("invalid v2 storage key".to_string())
+                })?)
+            } else {
+                entry.key
+            };
+            total_bytes += key.len() + entry.value.len();
+            if total_bytes > max_bytes && !results.is_empty() {
+                return Ok((results, true));
+            }
+            results.push((key, entry.value));
+            if total_bytes > max_bytes {
+                return Ok((results, true));
+            }
+        }
+        Ok((results, false))
     }
 
     /// Access the last epoch atomic (for epoch allocation in direct-write commits).
@@ -204,7 +345,14 @@ impl ShardDb {
 
     /// Get the value for a key, if it exists.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
-        let val = self.db.get(key).await?;
+        let val = if self.migration_pending && key.first().copied() != Some(0x06) {
+            self.db
+                .get(&format_v2_key(key))
+                .await?
+                .or(self.db.get(key).await?)
+        } else {
+            self.db.get(self.physical_key(key)).await?
+        };
         if key == ShardKeyEncoder::frontier_key() {
             if let Some(ref bytes) = val {
                 if bytes.len() == 8 {
@@ -223,6 +371,9 @@ impl ShardDb {
 
     /// Put a key-value pair.
     pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        if self.migration_pending {
+            return Err(StorageError::MigrationInProgress);
+        }
         if key == ShardKeyEncoder::frontier_key() && value.len() == 8 {
             let new_epoch = u64::from_be_bytes(value[..8].try_into().unwrap());
             let old_epoch = self.last_epoch.load(Ordering::SeqCst);
@@ -232,13 +383,16 @@ impl ShardDb {
             );
             self.last_epoch.store(new_epoch, Ordering::SeqCst);
         }
-        self.db.put(key, value).await?;
+        self.db.put(self.physical_key(key), value).await?;
         Ok(())
     }
 
     /// Delete a key.
     pub async fn delete(&self, key: &[u8]) -> Result<(), StorageError> {
-        self.db.delete(key).await?;
+        if self.migration_pending {
+            return Err(StorageError::MigrationInProgress);
+        }
+        self.db.delete(self.physical_key(key)).await?;
         Ok(())
     }
 
@@ -246,7 +400,10 @@ impl ShardDb {
     ///
     /// The value must be tagged with a `MergeTag` prefix byte.
     pub async fn merge(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
-        self.db.merge(key, value).await?;
+        if self.migration_pending {
+            return Err(StorageError::MigrationInProgress);
+        }
+        self.db.merge(self.physical_key(key), value).await?;
         Ok(())
     }
 
@@ -264,6 +421,9 @@ impl ShardDb {
     /// unobservable, not merely untested. No redundant runtime `assert!` is
     /// needed (same escape hatch used for M2-S1/S2's meet-correctness).
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        if self.migration_pending {
+            return Err(StorageError::MigrationInProgress);
+        }
         let frontier_key = ShardKeyEncoder::frontier_key();
         for op in &batch.ops {
             if let BatchOp::Put { key, value } = op {
@@ -281,9 +441,9 @@ impl ShardDb {
         let mut inner = slatedb::WriteBatch::new();
         for op in batch.ops {
             match op {
-                BatchOp::Put { key, value } => inner.put(&key, &value),
-                BatchOp::Delete { key } => inner.delete(&key),
-                BatchOp::Merge { key, value } => inner.merge(&key, &value),
+                BatchOp::Put { key, value } => inner.put(self.physical_key(&key), &value),
+                BatchOp::Delete { key } => inner.delete(self.physical_key(&key)),
+                BatchOp::Merge { key, value } => inner.merge(self.physical_key(&key), &value),
             }
         }
         self.db.write(inner).await?;
@@ -297,12 +457,74 @@ impl ShardDb {
     /// **Warning:** This materializes the entire result into memory. For large
     /// arrangements, prefer `scan_prefix_bounded` with an explicit byte budget.
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
-        let mut results = Vec::new();
-        let mut iter = self.db.scan_prefix(prefix).await?;
-        while let Some(entry) = iter.next().await? {
-            results.push((entry.key, entry.value));
+        if self.format_version == 2 && prefix.first().copied() != Some(0x06) {
+            return self.scan_physical_prefix(prefix, true).await;
         }
+        if self.migration_pending && prefix.first().copied() != Some(0x06) {
+            return self.scan_pending_prefix(prefix).await;
+        }
+        self.scan_physical_prefix(prefix, false).await
+    }
+
+    async fn scan_pending_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
+        let mut results = Vec::new();
+        let mut old_iter = self.db.scan_prefix(prefix).await?;
+        while let Some(entry) = old_iter.next().await? {
+            if self.db.get(format_v2_key(&entry.key)).await?.is_none() {
+                results.push((entry.key, entry.value));
+            }
+        }
+        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix)).await?;
+        while let Some(entry) = new_iter.next().await? {
+            let key = logical_key_from_format_v2(&entry.key)
+                .ok_or_else(|| StorageError::Unsupported("invalid v2 storage key".to_string()))?;
+            results.push((Bytes::copy_from_slice(key), entry.value));
+        }
+        results.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(results)
+    }
+
+    async fn scan_pending_prefix_bounded(
+        &self,
+        prefix: &[u8],
+        max_bytes: usize,
+    ) -> Result<(Vec<(Bytes, Bytes)>, bool), StorageError> {
+        let mut results = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut old_iter = self.db.scan_prefix(prefix).await?;
+        while let Some(entry) = old_iter.next().await? {
+            if self.db.get(format_v2_key(&entry.key)).await?.is_some() {
+                continue;
+            }
+            total_bytes += entry.key.len() + entry.value.len();
+            if total_bytes > max_bytes && !results.is_empty() {
+                return Ok((results, true));
+            }
+            results.push((entry.key, entry.value));
+            if total_bytes > max_bytes {
+                return Ok((results, true));
+            }
+        }
+        let mut new_iter = self.db.scan_prefix(format_v2_prefix(prefix)).await?;
+        while let Some(entry) = new_iter.next().await? {
+            let key =
+                Bytes::copy_from_slice(logical_key_from_format_v2(&entry.key).ok_or_else(
+                    || StorageError::Unsupported("invalid v2 storage key".to_string()),
+                )?);
+            total_bytes += key.len() + entry.value.len();
+            if total_bytes > max_bytes && !results.is_empty() {
+                return Ok((results, true));
+            }
+            results.push((key, entry.value));
+            if total_bytes > max_bytes {
+                return Ok((results, true));
+            }
+        }
+        results.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok((results, false))
     }
 
     /// Execute a partial aggregation query against this shard's view output.
@@ -388,9 +610,17 @@ impl ShardDb {
         prefix: &[u8],
         max_bytes: usize,
     ) -> Result<(Vec<(Bytes, Bytes)>, bool), StorageError> {
+        if self.format_version == 2 && prefix.first().copied() != Some(0x06) {
+            return self
+                .scan_physical_prefix_bounded(prefix, true, max_bytes)
+                .await;
+        }
+        if self.migration_pending && prefix.first().copied() != Some(0x06) {
+            return self.scan_pending_prefix_bounded(prefix, max_bytes).await;
+        }
         let mut results = Vec::new();
-        let mut total_bytes: usize = 0;
         let mut iter = self.db.scan_prefix(prefix).await?;
+        let mut total_bytes: usize = 0;
         while let Some(entry) = iter.next().await? {
             total_bytes += entry.key.len() + entry.value.len();
             if total_bytes > max_bytes && !results.is_empty() {
@@ -604,7 +834,7 @@ impl ShardDb {
         &self,
         key: &[u8],
     ) -> Result<Option<ArrangementHeader>, StorageError> {
-        let raw = self.db.get(key).await?;
+        let raw = self.get(key).await?;
         match raw {
             None => Ok(None),
             Some(bytes) if bytes.len() < ArrangementHeader::WIRE_SIZE => Ok(None),
@@ -636,7 +866,7 @@ impl ShardDb {
         key: &[u8],
         law: &dyn rockstream_types::merge_law::LawBundle,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        let raw = self.db.get(key).await?;
+        let raw = self.get(key).await?;
         match raw {
             None => Ok(None),
             Some(bytes) => {
@@ -872,14 +1102,23 @@ mod frontier_reporter_tests {
         let shard_id = ShardId(99);
         db.commit_epoch(shard_id, 5).await.unwrap();
 
-        // Only the frontier key should be set; scanning the shard_meta prefix
-        // should yield exactly one entry.
+        // The format marker is initialized at open; commit_epoch adds only the
+        // frontier key to the shard metadata namespace.
         let prefix = ShardKeyEncoder::namespace_prefix(crate::keys::ShardPrefix::ShardMeta);
         let entries = db.scan_prefix(&prefix).await.unwrap();
-        assert!(
-            entries.len() == 1,
-            "commit_epoch must write exactly the frontier key, got {} entries",
-            entries.len()
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    Bytes::from(ShardKeyEncoder::format_version_key()),
+                    Bytes::from_static(&[1]),
+                ),
+                (
+                    Bytes::from(ShardKeyEncoder::frontier_key()),
+                    Bytes::from(5u64.to_be_bytes().to_vec()),
+                ),
+            ],
+            "commit_epoch must add only the frontier key"
         );
     }
 
