@@ -118,7 +118,7 @@ async fn test_pipeline_stall_localization_pgwire() {
     // op 2 at epoch 80 is holding back commit
     assert_eq!(
         op2_row.get(5).and_then(|o| o.as_deref()),
-        Some("t"),
+        Some("true"),
         "is_holding_back_commit should be true for op 2"
     );
 }
@@ -177,7 +177,7 @@ async fn test_pipeline_slow_source_localization_pgwire() {
 
     assert_eq!(
         op1_row.get(4).and_then(|o| o.as_deref()),
-        Some("t"),
+        Some("true"),
         "is_slowest_input should be true for source op 1"
     );
 }
