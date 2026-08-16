@@ -2,6 +2,8 @@
 
 **Keep your reports and dashboards up-to-date automatically as your workload grows — and query them with the database tools you already know.**
 
+> RockStream ingests changing data, continuously maintains a documented SQL subset as durable materialized views, and serves globally committed results to PostgreSQL-compatible clients while surviving ordinary distributed-system failures without losing or silently corrupting committed state.
+
 ---
 
 ## The Problem

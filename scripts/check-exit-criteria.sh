@@ -8,10 +8,54 @@
 # items (i.e. no '- [ ]' lines remain).
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
+ROOT="${1:-$(git rev-parse --show-toplevel)}"
 ROADMAP="$ROOT/NEW_ROADMAP.md"
 SIGNOFFS_DIR="$ROOT/sign-offs"
 ERRORS=0
+ADMISSION_ERRORS=0
+
+# A future row that explicitly proposes new product surface must carry a
+# completed §8 admission block. The block format is:
+#   ### Admission: vX.Y
+#   ## Product fit
+#   - [x] ...
+#   ## Semantic fit
+#   - [x] ...
+#   ## Operational fit
+#   - [x] ...
+#   ## Scope cost
+#   - [x] ...
+#   ## Proof
+#   - [x] ...
+#
+# Existing rows are intentionally not inferred as candidates from broad words
+# such as "feature" or "surface"; only an explicit Tier C/admission marker or
+# a new SQL/connector/catalog/protocol/policy/product-surface title opts in.
+while IFS= read -r row; do
+  version="$(printf '%s\n' "$row" | sed -nE 's/^\| (v[0-9]+\.[0-9]+(\.[0-9]+)?) \|.*/\1/p')"
+  [ -n "$version" ] || continue
+  title="$(printf '%s\n' "$row" | sed -nE 's/^\| v[0-9]+\.[0-9]+(\.[0-9]+)? \| ([^|]+) \|.*/\2/p')"
+  lower_title="$(printf '%s\n' "$title" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$lower_title" != *"admission required"* &&
+    ! "$lower_title" =~ (^|[^[:alnum:]])tier[[:space:]-]+c([^[:alnum:]]|$) &&
+    ! "$lower_title" =~ (^|[^[:alnum:]])new[[:space:]-]+(sql|connector|catalog|protocol|policy|governance|transaction|product[[:space:]-]+surface)([^[:alnum:]]|$) ]]; then
+    continue
+  fi
+
+  admission="$(awk -v version="$version" '
+    $0 ~ "^### Admission:[[:space:]]*" version "[[:space:]]*$" { found=1; next }
+    found && /^### / { exit }
+    found { print }
+  ' "$ROADMAP")"
+  if [ -z "${admission//[[:space:]]/}" ] ||
+    ! printf '%s\n' "$admission" | grep -qiE 'product fit|semantic fit|operational fit|scope cost|proof' ||
+    ! printf '%s\n' "$admission" | grep -qE '\[[xX]\]' ||
+    printf '%s\n' "$admission" | grep -q -e '\[ \]' -e 'TODO' -e 'TBD'; then
+    echo "ADMISSION: $version is a new product-surface row without a completed §8 checklist."
+    ERRORS=$((ERRORS + 1))
+    ADMISSION_ERRORS=$((ADMISSION_ERRORS + 1))
+  fi
+done < <(grep -E '^\| v[0-9]+\.[0-9]+(\.[0-9]+)? \|' "$ROADMAP" || true)
 
 # Extract versions marked Done from roadmap version table rows.
 # A Done row carries the explicit marker "✅ Done", e.g.:
@@ -57,7 +101,11 @@ done
 
 if [ "$ERRORS" -gt 0 ]; then
   echo ""
-  echo "$ERRORS sign-off problem(s) found."
+  if [ "$ADMISSION_ERRORS" -gt 0 ]; then
+    echo "$ERRORS exit-criteria problem(s) found."
+  else
+    echo "$ERRORS sign-off problem(s) found."
+  fi
   echo "A version cannot be marked Done without a complete sign-offs/vX.Y.md file."
   echo "Use 'make approve VERSION=X.Y' to create the template."
   exit 1

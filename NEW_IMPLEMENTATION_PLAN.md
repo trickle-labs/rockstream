@@ -23,6 +23,8 @@ strict dependency order with a named test gate at every step.
 >   public contract and strategic scope (what stays core vs. maintained-only)
 >   that governs which future phases get admitted to this plan.
 
+> RockStream ingests changing data, continuously maintains a documented SQL subset as durable materialized views, and serves globally committed results to PostgreSQL-compatible clients while surviving ordinary distributed-system failures without losing or silently corrupting committed state.
+
 ---
 
 ## Guiding Principles for This Plan

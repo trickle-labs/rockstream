@@ -5,6 +5,8 @@ system inspired by DBSP and differential dataflow theory
 — built on a mesh of SlateDB instances backed by
 object storage.
 
+> RockStream ingests changing data, continuously maintains a documented SQL subset as durable materialized views, and serves globally committed results to PostgreSQL-compatible clients while surviving ordinary distributed-system failures without losing or silently corrupting committed state.
+
 > **Status**: Design v3.28. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit

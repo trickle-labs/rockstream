@@ -520,6 +520,13 @@ No new product-surface milestone should enter the roadmap without answering the 
 
 If these answers are weak, the feature should stay out of the strategic roadmap even if it sounds useful.
 
+For machine enforcement, a roadmap table row that proposes new SQL, connector,
+catalog, protocol, policy, governance, transaction, or product-surface breadth
+must be followed by `### Admission: <version>` containing completed
+`Product fit`, `Semantic fit`, `Operational fit`, `Scope cost`, and `Proof`
+checklists. `scripts/check-exit-criteria.sh` rejects a marked row when that
+block is missing, incomplete, or contains unchecked items.
+
 ---
 
 ## 9. Concrete repository and planning changes

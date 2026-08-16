@@ -1,0 +1,474 @@
+[contract]
+version = "v0.57"
+roadmap = "NEW_ROADMAP.md"
+promise = "RockStream ingests changing data, continuously maintains a documented SQL subset as durable materialized views, and serves globally committed results to PostgreSQL-compatible clients while surviving ordinary distributed-system failures without losing or silently corrupting committed state."
+
+[[dispatch]]
+id = "query_async_entry"
+path = "crates/rockstream-gateway/src/server.rs"
+symbol = "dispatch_async_with_conn"
+surface = "pgwire query entry"
+
+[[dispatch]]
+id = "query_sync_entry"
+path = "crates/rockstream-gateway/src/server.rs"
+symbol = "dispatch_sync"
+surface = "synchronous/catalog dispatch"
+
+[[dispatch]]
+id = "catalog_query"
+path = "crates/rockstream-gateway/src/catalog_stubs.rs"
+symbol = "handle_query"
+surface = "delegated catalog dispatch"
+
+[[dispatch]]
+id = "sql_lowering"
+path = "crates/rockstream-sql/src/frontend.rs"
+symbol = "sql_to_plan_node"
+surface = "DataFusion parse and PlanNode lowering"
+
+[[dispatch]]
+id = "view_dispatch"
+path = "crates/rockstream-gateway/src/server.rs"
+symbol = "handle_create_view"
+surface = "materialized-view dispatch"
+
+[[dispatch]]
+id = "plan_compilation"
+path = "crates/rockstream-ops/src/compile.rs"
+symbol = "compile_node"
+surface = "operator compilation"
+
+[[dispatch]]
+id = "response_encoding"
+path = "crates/rockstream-gateway/src/server.rs"
+symbol = "DataRowEncoder"
+surface = "PostgreSQL response encoding"
+
+[[dispatch]]
+id = "postgres_cdc_runtime"
+path = "crates/rockstream-connectors/src/postgres_cdc.rs"
+symbol = "PostgresCdcSource"
+surface = "PostgreSQL CDC source"
+
+[[dispatch]]
+id = "kafka_source_runtime"
+path = "crates/rockstream-connectors/src/lib.rs"
+symbol = "KafkaSource"
+surface = "Kafka source"
+
+[[dispatch]]
+id = "kafka_sink_runtime"
+path = "crates/rockstream-connectors/src/kafka_sink.rs"
+symbol = "KafkaSink"
+surface = "Kafka sink"
+
+[[capability]]
+id = "language.query-read"
+kind = "language"
+name = "Query and read surface"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "response_encoding"]
+proof = "crates/rockstream-gateway/tests/gateway_dml_tests.rs::test_create_view_and_select"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.scalar-expressions"
+kind = "language"
+name = "Scalar expressions"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering"]
+proof = "crates/rockstream-sql/tests/tpch_plans.rs::tpch_q6_filter_aggregate_no_join"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.aggregates"
+kind = "language"
+name = "Aggregation and algebraic maintenance"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-gateway/tests/serving_path_aggregate_matrix_tests.rs::test_basic_int_sum_group_by"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.relational-operators"
+kind = "language"
+name = "Relational operators"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-sql/tests/tpch_plans.rs::tpch_q3_two_join_aggregate"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.analytics-time"
+kind = "language"
+name = "Analytics and time"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
+proof = "crates/rockstream-sql/tests/sql_engine_e2e.rs::sql_engine_window_row_number_over_view"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.view-on-view-dag"
+kind = "language"
+name = "View-on-view DAGs"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "view_dispatch", "plan_compilation"]
+proof = "crates/rockstream-sql/tests/lfs_catalog.rs::test_5_level_view_chain_convergence"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.historical-streaming-reads"
+kind = "language"
+name = "Historical and streaming reads"
+tier = "Core"
+reachability = "SUBSCRIBE over pgwire"
+dispatch = ["query_async_entry", "response_encoding"]
+proof = "crates/rockstream-gateway/tests/gateway_proof_tests.rs::proof_subscribe_snapshot_then_deltas_lfs"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.session-freshness"
+kind = "language"
+name = "Session and freshness controls"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "query_sync_entry", "response_encoding"]
+proof = "crates/rockstream-gateway/tests/gateway_proof_tests.rs::write_fence_token_can_be_used_by_another_session_via_after_fence"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.dml"
+kind = "language"
+name = "DML"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation", "response_encoding"]
+proof = "crates/rockstream-gateway/tests/gateway_dml_tests.rs::test_update_accumulates_in_write_buffer"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.transaction-semantics"
+kind = "language"
+name = "Transaction semantics"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "query_sync_entry", "response_encoding"]
+proof = "crates/rockstream-gateway/tests/gateway_proof_tests.rs::explicit_idempotency_key_dedupes_multi_statement_transaction_replay"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.views"
+kind = "language"
+name = "Views"
+tier = "Core"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "view_dispatch", "plan_compilation", "response_encoding"]
+proof = "crates/rockstream-gateway/tests/gateway_dml_tests.rs::test_refresh_materialized_view_roundtrip"
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.multitenancy-quotas"
+kind = "language"
+name = "Multi-tenancy and quotas"
+tier = "Maintain"
+reachability = "SQL over pgwire"
+dispatch = ["query_sync_entry", "catalog_query", "response_encoding"]
+proof = ""
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.resource-visibility"
+kind = "language"
+name = "Resource visibility"
+tier = "Maintain"
+reachability = "SQL over pgwire"
+dispatch = ["query_sync_entry", "catalog_query", "response_encoding"]
+proof = ""
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.removed-connectors"
+kind = "language"
+name = "Removed connector rejection"
+tier = "Maintain"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "response_encoding"]
+proof = ""
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.indexes"
+kind = "language"
+name = "Secondary indexes"
+tier = "Maintain"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "plan_compilation", "response_encoding"]
+proof = ""
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.query-diagnostics"
+kind = "language"
+name = "Query diagnostics"
+tier = "Maintain"
+reachability = "SQL over pgwire"
+dispatch = ["query_async_entry", "sql_lowering", "response_encoding"]
+proof = ""
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.system-catalog"
+kind = "language"
+name = "System catalog SQL"
+tier = "Maintain"
+reachability = "SQL over pgwire"
+dispatch = ["query_sync_entry", "catalog_query", "response_encoding"]
+proof = ""
+documentation = "docs/language-features.md#implemented-today"
+
+[[capability]]
+id = "language.hop-session-windows"
+kind = "language"
+name = "HOP and SESSION windows"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.custom-algebra"
+kind = "language"
+name = "Custom merge laws and user-visible CRDT columns"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.recursive-cte"
+kind = "language"
+name = "Recursive CTEs"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.secret-ddl"
+kind = "language"
+name = "Secret DDL and schema defaults"
+tier = "Maintain"
+reachability = "Secret DDL over pgwire"
+dispatch = ["query_async_entry", "query_sync_entry", "response_encoding"]
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.optimizer-hints"
+kind = "language"
+name = "Optimizer hint comments"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.view-replacement"
+kind = "language"
+name = "View replacement workflow"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.lifecycle-visibility"
+kind = "language"
+name = "View and backfill lifecycle visibility"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.source-lifecycle"
+kind = "language"
+name = "Source lifecycle DDL"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.dead-letter-queue"
+kind = "language"
+name = "Dead-letter queue operations"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.connector-schema-contracts"
+kind = "language"
+name = "Connector schema contracts"
+tier = "Maintain"
+reachability = "Rust connector API"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.write-classification"
+kind = "language"
+name = "Write classification"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.schema-evolution-introspection"
+kind = "language"
+name = "Schema evolution introspection"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.ddl-coordination"
+kind = "language"
+name = "DDL coordination"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.lateral"
+kind = "language"
+name = "LATERAL subqueries and functions"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.optimistic-transactions"
+kind = "language"
+name = "Optimistic transactions"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.broader-production-sql"
+kind = "language"
+name = "Broader production SQL surface"
+tier = "Experimental"
+reachability = "Roadmap contract only"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.connector-expansion"
+kind = "language"
+name = "Connector expansion"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.view-retention"
+kind = "language"
+name = "View retention and historical knobs"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#documented-planned-surface"
+
+[[capability]]
+id = "language.limit-order-by"
+kind = "language"
+name = "LIMIT and ORDER BY"
+tier = "Experimental"
+reachability = "Frontend rejects the construct"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#current-frontend-gaps"
+
+[[capability]]
+id = "language.explain-index"
+kind = "language"
+name = "Standalone EXPLAIN INDEX"
+tier = "Experimental"
+reachability = "Not SQL-reachable"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#current-frontend-gaps"
+
+[[capability]]
+id = "language.uncommon-expressions"
+kind = "language"
+name = "Uncommon expressions and operators"
+tier = "Experimental"
+reachability = "Frontend partial coverage"
+dispatch = []
+proof = ""
+documentation = "docs/language-features.md#current-frontend-gaps"
+
+[[capability]]
+id = "connector.postgres-cdc"
+kind = "connector"
+name = "PostgreSQL CDC source"
+tier = "Core"
+reachability = "Connector runtime"
+dispatch = ["postgres_cdc_runtime"]
+proof = "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs::postgres_cdc_snapshot_stream_fence_has_exact_transcript"
+documentation = "docs/connectors.md#postgresql-cdc"
+
+[[capability]]
+id = "connector.kafka-source"
+kind = "connector"
+name = "Kafka source"
+tier = "Core"
+reachability = "Connector runtime"
+dispatch = ["kafka_source_runtime"]
+proof = "crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs::kafka_source_mid_epoch_rebalance_recovers_exact_transcript"
+documentation = "docs/connectors.md#kafka-source"
+
+[[capability]]
+id = "sink.kafka"
+kind = "sink"
+name = "Kafka sink"
+tier = "Core"
+reachability = "Connector runtime"
+dispatch = ["kafka_sink_runtime"]
+proof = "crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_crash_before_commit_has_no_visible_payload_and_recovers_exactly"
+documentation = "docs/connectors.md#kafka-sink"

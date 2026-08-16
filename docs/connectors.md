@@ -11,6 +11,23 @@ CDC, Kafka source, and Kafka sink. `object_store` is internal durable state,
 not a connector. The guarantees below are the contract for the retained
 connectors.
 
+## Strategic contract
+
+The retained connector and sink surface is Core: it is release-gated, named in
+the generated [`capability matrix`](capability-matrix.md), and covered by the
+existing exact-transcript proof suites.
+
+| Capability | Tier | Guarantee reference | Named proof |
+| --- | --- | --- | --- |
+| PostgreSQL CDC source | **Core** | [PostgreSQL CDC](#postgresql-cdc) | [`postgres_cdc_snapshot_stream_fence_has_exact_transcript`](../crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs) |
+| Kafka source | **Core** | [Kafka source](#kafka-source) | [`kafka_source_mid_epoch_rebalance_recovers_exact_transcript`](../crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs) |
+| Kafka sink | **Core** | [Kafka sink](#kafka-sink) | [`kafka_sink_crash_before_commit_has_no_visible_payload_and_recovers_exactly`](../crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs) |
+
+These are the only external connector boundaries. Removed Iceberg, Delta,
+object-store, S3, and HTTP webhook surfaces fail closed with `RS-4017`; their
+permanent replacements are documented in
+[`docs/connector-migration.md`](connector-migration.md).
+
 ## PostgreSQL CDC
 
 | Axis | Guarantee |

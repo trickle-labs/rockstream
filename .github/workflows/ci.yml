@@ -80,6 +80,12 @@ jobs:
         run: bash scripts/check-connector-admission.test.sh
       - name: exit criteria sign-offs
         run: bash scripts/check-exit-criteria.sh
+      - name: exit criteria checker self-test
+        run: bash scripts/check-exit-criteria.test.sh
+      - name: capability contract gate
+        run: bash scripts/check-capability-contract.sh
+      - name: capability contract checker self-test
+        run: bash scripts/check-capability-contract.test.sh
       - name: operator-state-bytes check
         run: bash scripts/check-operator-state-bytes.sh
       - name: operator-state-bytes checker self-test
