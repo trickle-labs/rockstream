@@ -722,16 +722,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bcder"
-version = "0.7.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b593e5aeaf7992d388c08a9831c921cd703718064b3e50ba8e6d666d6cf86ca7"
-dependencies = [
- "bytes",
- "smallvec",
-]
-
-[[package]]
 name = "bigdecimal"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3609,12 +3599,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
-name = "md5"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
-
-[[package]]
 name = "mea"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4169,47 +4153,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg_interval"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c386dd54fce258fc04e668126ae68589a0d92e03a90ea67881d1300f70fd6170"
-dependencies = [
- "bytes",
- "chrono",
- "postgres-types",
-]
-
-[[package]]
 name = "pgwire"
-version = "0.40.7"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8265901ede50d0879fe401c6fe282e7e4ff83ae10a48c1f8e4f89b92f7d5f604"
+checksum = "c84e671791f3a354f265e55e400be8bb4b6262c1ec04fac4289e710ccf22ab43"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
- "base64 0.23.1",
  "bytes",
  "chrono",
  "derive-new",
  "futures",
  "hex",
  "lazy-regex",
- "md5 0.8.1",
- "pg_interval",
+ "md5",
  "postgres-types",
- "rand 0.10.1",
+ "rand 0.8.6",
  "rust_decimal",
- "rustls-pki-types",
- "ryu",
- "serde",
- "serde_json",
- "smol_str",
- "stringprep",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tokio-util",
- "x509-certificate",
 ]
 
 [[package]]
@@ -5212,7 +5176,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "lru",
- "md5 0.7.0",
+ "md5",
  "object_store 0.12.5",
  "parking_lot",
  "pgwire",
@@ -5941,15 +5905,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "signature"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
-dependencies = [
- "rand_core 0.6.4",
-]
-
-[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6059,16 +6014,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "smol_str"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
-dependencies = [
- "borsh",
- "serde_core",
-]
 
 [[package]]
 name = "snap"
@@ -7778,25 +7723,6 @@ dependencies = [
  "der",
  "spki",
  "tls_codec",
-]
-
-[[package]]
-name = "x509-certificate"
-version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca9eb9a0c822c67129d5b8fcc2806c6bc4f50496b420825069a440669bcfbf7f"
-dependencies = [
- "bcder",
- "bytes",
- "chrono",
- "der",
- "hex",
- "pem",
- "ring",
- "signature",
- "spki",
- "thiserror 2.0.18",
- "zeroize",
 ]
 
 [[package]]

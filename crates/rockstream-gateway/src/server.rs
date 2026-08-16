@@ -12946,29 +12946,6 @@ fn sha256_16(data: &[u8]) -> [u8; 16] {
     out
 }
 
-fn catalog_field_type(col_name: &str) -> Type {
-    let col = col_name.to_lowercase();
-    if col.starts_with("is_")
-        || col.starts_with("has_")
-        || col.starts_with("relis")
-        || col.starts_with("relhas")
-        || col.starts_with("attis")
-        || col.starts_with("attnotnull")
-        || col.starts_with("indis")
-        || col.starts_with("typis")
-        || col.starts_with("prois")
-        || col.starts_with("conis")
-        || col == "exists"
-        || col == "condeferred"
-        || col == "convalidated"
-        || col == "typbyval"
-    {
-        Type::BOOL
-    } else {
-        Type::TEXT
-    }
-}
-
 /// Convert a `CatalogResponse` to a pgwire `Response`.
 fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
     match resp {
@@ -12976,37 +12953,16 @@ fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
         CatalogResponse::Rows { columns, rows } => {
             let fields: Vec<FieldInfo> = columns
                 .iter()
-                .map(|c| {
-                    FieldInfo::new(
-                        c.clone(),
-                        None,
-                        None,
-                        catalog_field_type(c),
-                        FieldFormat::Text,
-                    )
-                })
+                .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
                 .collect();
             let schema = Arc::new(fields);
             let schema_ref = schema.clone();
             let stream = stream::iter(rows).map(move |row: Vec<Option<String>>| {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
-                for (i, field) in row.iter().enumerate() {
-                    let ty = schema_ref
-                        .get(i)
-                        .map(|f| f.datatype())
-                        .unwrap_or(&Type::TEXT);
-                    if ty == &Type::BOOL {
-                        let bool_val = field
-                            .as_deref()
-                            .map(|v| matches!(v, "t" | "true" | "TRUE" | "1"));
-                        encoder
-                            .encode_field(&bool_val)
-                            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                    } else {
-                        encoder
-                            .encode_field(&field.as_deref())
-                            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                    }
+                for field in &row {
+                    encoder
+                        .encode_field(&field.as_deref())
+                        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
                 }
                 encoder.finish()
             });
@@ -15393,15 +15349,7 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
     {
         return columns
             .iter()
-            .map(|c| {
-                FieldInfo::new(
-                    c.clone(),
-                    None,
-                    None,
-                    catalog_field_type(c),
-                    FieldFormat::Text,
-                )
-            })
+            .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
             .collect();
     }
     if let Some(view_name) = extract_view_name_from_select(q) {
