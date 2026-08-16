@@ -69,6 +69,11 @@ pub const CLI_MUTATION_POLICY: &[MutationSpec] = &[
         audit_action: "shard.migrate",
     },
     MutationSpec {
+        operation: "checkpoint export",
+        minimum_role: Role::Admin,
+        audit_action: "checkpoint.export",
+    },
+    MutationSpec {
         operation: "checkpoint restore",
         minimum_role: Role::Admin,
         audit_action: "checkpoint.restore",
@@ -283,7 +288,7 @@ mod tests {
 
     #[test]
     fn policy_covers_cli_matrix_and_wire_variants() {
-        assert_eq!(CLI_MUTATION_POLICY.len(), 14);
+        assert_eq!(CLI_MUTATION_POLICY.len(), 15);
         assert_eq!(
             pgwire_mutation_policy("ALTER SOURCE foo PAUSE")
                 .unwrap()

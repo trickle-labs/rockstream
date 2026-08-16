@@ -52,6 +52,16 @@ pub fn register_coord_faults(model: &mut FaultModel) {
         category: FaultCategory::Io,
     });
     model.register(FaultEntry {
+        id: "dr.export.after_m3_selection",
+        description: "Checkpoint export is interrupted after selecting the durable M3 manifest; retry must not select a different epoch.",
+        category: FaultCategory::Timing,
+    });
+    model.register(FaultEntry {
+        id: "dr.export.before_terminal_marker",
+        description: "Checkpoint export is interrupted before publishing its terminal marker; retry must validate the same generation inventory.",
+        category: FaultCategory::Io,
+    });
+    model.register(FaultEntry {
         id: "skew.control_loop_delay",
         description: "Adaptive skew-splitting control loop pauses between observing the skew \
                        breach and emitting the split action; the loop must still converge once \
@@ -126,6 +136,8 @@ pub const COORD_FAULT_IDS: &[&str] = &[
     "epoch.frontier_write_delay",
     "task.output_channel_closed",
     "object_store.rate_limit",
+    "dr.export.after_m3_selection",
+    "dr.export.before_terminal_marker",
     "skew.control_loop_delay",
     "split.kill_donor_mid_copy",
     "merge.concurrent_split_race",

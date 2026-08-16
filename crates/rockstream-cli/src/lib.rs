@@ -1505,16 +1505,26 @@ pub fn run_format_migrate(
 pub fn run_checkpoint_restore(
     format: output::OutputFormat,
     storage: &transport::StorageClient,
-    storage_path: &Path,
-    checkpoint_id: u64,
-    target_dir: Option<&Path>,
+    audit_path: &Path,
+    source: &str,
+    target: &str,
     yes: bool,
 ) -> Result<String, CliError> {
     prompt_confirmation(
-        &format!("Are you sure you want to restore checkpoint {checkpoint_id}?"),
+        &format!("Are you sure you want to restore {source} into fresh storage {target}?"),
         yes,
     )?;
-    let outcome = storage.restore_checkpoint(storage_path, checkpoint_id, target_dir)?;
+    let outcome = storage.restore_checkpoint(audit_path, source, target)?;
+    Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_checkpoint_export(
+    format: output::OutputFormat,
+    storage: &transport::StorageClient,
+    storage_path: &Path,
+    destination: &str,
+) -> Result<String, CliError> {
+    let outcome = storage.export_checkpoint(storage_path, destination)?;
     Ok(output::render_output(&outcome, format))
 }
 

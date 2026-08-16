@@ -208,6 +208,8 @@ fn exec_drain(control_addr: SocketAddr, worker_id: u64) {
             "drain",
             "--control",
             &control_addr.to_string(),
+            "--identity-role",
+            "admin",
             &worker_id.to_string(),
             "--yes",
         ])

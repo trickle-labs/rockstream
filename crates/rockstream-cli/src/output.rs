@@ -1127,7 +1127,10 @@ impl Formattable for MigrationOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RestoreOutcome {
     pub checkpoint_id: u64,
-    pub target_dir: String,
+    pub source: String,
+    pub target: String,
+    pub object_count: u64,
+    pub byte_count: u64,
     pub restored_shards: usize,
     pub status: String,
 }
@@ -1135,8 +1138,38 @@ pub struct RestoreOutcome {
 impl Formattable for RestoreOutcome {
     fn to_text(&self) -> String {
         format!(
-            "Checkpoint {}: restored to {} (shards: {}, status: {})",
-            self.checkpoint_id, self.target_dir, self.restored_shards, self.status
+            "Checkpoint {}: restored from {} to {} (objects: {}, bytes: {}, shards: {}, status: {})",
+            self.checkpoint_id,
+            self.source,
+            self.target,
+            self.object_count,
+            self.byte_count,
+            self.restored_shards,
+            self.status
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointExportOutcome {
+    pub checkpoint_id: u64,
+    pub source: String,
+    pub destination: String,
+    pub object_count: u64,
+    pub byte_count: u64,
+    pub status: String,
+}
+
+impl Formattable for CheckpointExportOutcome {
+    fn to_text(&self) -> String {
+        format!(
+            "Checkpoint {}: exported from {} to {} (objects: {}, bytes: {}, status: {})",
+            self.checkpoint_id,
+            self.source,
+            self.destination,
+            self.object_count,
+            self.byte_count,
+            self.status
         )
     }
 }

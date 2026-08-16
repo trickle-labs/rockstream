@@ -41,15 +41,30 @@ async fn sim_control_plane_leases() {
         .unwrap();
 
     // Wait for registration
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while catalog.len() != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("workers did not register within 5 seconds");
     assert_eq!(catalog.len(), 2);
 
     // 5. Worker 1 requests lease for shard 10
     client1.request_shard(ShardId(10)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let leases = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let leases = client1.leases();
+            if !leases.is_empty() {
+                break leases;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker 1 did not receive a lease within 5 seconds");
 
     // Verify lease is granted to worker 1
-    let leases = client1.leases();
     assert_eq!(leases.len(), 1);
     assert_eq!(leases[0].shard_id, ShardId(10));
     assert_eq!(leases[0].worker_id, WorkerId(1));
@@ -63,7 +78,13 @@ async fn sim_control_plane_leases() {
     }
 
     // Give time for the control plane to detect worker disconnect, clean up, and allow worker 2 to request it.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !manager.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker 1 lease was not released within 5 seconds");
 
     // Lease should be released
     assert!(
@@ -73,10 +94,19 @@ async fn sim_control_plane_leases() {
 
     // 7. Worker 2 requests lease for shard 10
     client2.request_shard(ShardId(10)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let leases2 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let leases = client2.leases();
+            if !leases.is_empty() {
+                break leases;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker 2 did not receive a lease within 5 seconds");
 
     // Verify lease is now held by worker 2
-    let leases2 = client2.leases();
     assert_eq!(leases2.len(), 1);
     assert_eq!(leases2[0].shard_id, ShardId(10));
     assert_eq!(leases2[0].worker_id, WorkerId(2));

@@ -8,6 +8,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 // Re-export the canonical AuditEvent type.
 pub use rockstream_types::audit::AuditEvent;
@@ -15,6 +16,7 @@ pub use rockstream_types::audit::AuditEvent;
 /// A file-backed audit log that writes JSONL.
 pub struct FileAuditLog {
     path: PathBuf,
+    write_lock: Mutex<()>,
 }
 
 impl FileAuditLog {
@@ -24,11 +26,18 @@ impl FileAuditLog {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            write_lock: Mutex::new(()),
+        })
     }
 
     /// Append an audit event.
     pub fn append(&self, event: &AuditEvent) -> io::Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("audit log lock poisoned"))?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)

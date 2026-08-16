@@ -260,9 +260,14 @@ impl RecoveryDriver {
         }
 
         // Open the shard reader (pinned to checkpoint snapshot).
-        let reader = ShardReader::open(shard_path.into(), object_store)
-            .await
-            .map_err(|e| RecoveryError::StorageError(e.to_string()))?;
+        let shard_path = shard_path.into();
+        let reader = match psc.snapshot_id.as_deref() {
+            Some(snapshot_id) => {
+                ShardReader::open_with_snapshot_id(shard_path, object_store, snapshot_id).await
+            }
+            None => ShardReader::open(shard_path, object_store).await,
+        }
+        .map_err(|e| RecoveryError::StorageError(e.to_string()))?;
 
         let elapsed = started.elapsed();
 

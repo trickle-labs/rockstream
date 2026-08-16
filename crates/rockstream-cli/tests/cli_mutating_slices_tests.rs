@@ -19,10 +19,28 @@ use rockstream_cli::{
     run_workload_alter, run_workload_create, run_workload_drop,
 };
 use rockstream_types::acl::Role;
+use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
 use rockstream_types::error_code::{
     RS_0005, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014, RS_2006, RS_2401,
     RS_4009, RS_5030,
 };
+
+fn checkpoint_fixture(root: &std::path::Path, checkpoint_id: u64) -> (String, String, u64) {
+    let checkpoint_dir = root.join("control/checkpoints");
+    std::fs::create_dir_all(&checkpoint_dir).unwrap();
+    let bytes = serde_json::to_vec(&ClusterCheckpoint::new(CheckpointId(checkpoint_id))).unwrap();
+    std::fs::write(checkpoint_dir.join(checkpoint_id.to_string()), &bytes).unwrap();
+    let export = root.join(format!("export-{checkpoint_id}"));
+    let target = root.join(format!("target-{checkpoint_id}"));
+    StorageClient::new()
+        .export_checkpoint(root, export.to_str().unwrap())
+        .unwrap();
+    (
+        export.to_string_lossy().into_owned(),
+        target.to_string_lossy().into_owned(),
+        bytes.len() as u64,
+    )
+}
 
 // ─── Slice 1: Confirmation Safeguards & Flags ──────────────────────────────
 
@@ -840,28 +858,32 @@ fn test_cli_migrate_audit_event_logged() {
 fn test_cli_checkpoint_restore_lfs_and_minio() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = StorageClient::new();
-    let target = tmp.path().join("restore_dest");
+    let (source, target, checkpoint_bytes) = checkpoint_fixture(tmp.path(), 1001);
 
     // 1. Restore with --yes
     let restore_out = run_checkpoint_restore(
         OutputFormat::Text,
         &storage,
         tmp.path(),
-        1001,
-        Some(&target),
+        &source,
+        &target,
         true,
     )
     .unwrap();
-    assert!(restore_out.contains("Checkpoint 1001: restored to"));
-    assert!(restore_out.contains("SUCCESS"));
+    assert_eq!(
+        restore_out,
+        format!(
+            "Checkpoint 1001: restored from {source} to {target} (objects: 1, bytes: {checkpoint_bytes}, shards: 0, status: SUCCESS)"
+        )
+    );
 
     // 2. Unconfirmed restore refuses with RS-0005
     let unconf_res = run_checkpoint_restore(
         OutputFormat::Text,
         &storage,
         tmp.path(),
-        1001,
-        Some(&target),
+        &source,
+        &target,
         false,
     );
     assert_eq!(unconf_res.unwrap_err().code, RS_0005);
@@ -874,7 +896,7 @@ fn test_cli_restore_viewer_denied_rs2401() {
     let tmp = tempfile::tempdir().unwrap();
     assert_eq!(
         storage
-            .restore_checkpoint(tmp.path(), 1001, None)
+            .restore_checkpoint(tmp.path(), "source", "target")
             .unwrap_err()
             .code,
         RS_2401
@@ -885,14 +907,24 @@ fn test_cli_restore_viewer_denied_rs2401() {
 fn test_cli_restore_admin_authorized() {
     let storage = StorageClient::new();
     let tmp = tempfile::tempdir().unwrap();
-    assert!(storage.restore_checkpoint(tmp.path(), 1001, None).is_ok());
+    let (source, target, _) = checkpoint_fixture(tmp.path(), 1001);
+    assert!(storage
+        .restore_checkpoint(tmp.path(), &source, &target)
+        .is_ok());
 }
 
 #[test]
 fn test_cli_restore_unconfirmed_refusal() {
     let storage = StorageClient::new();
     let tmp = tempfile::tempdir().unwrap();
-    let res = run_checkpoint_restore(OutputFormat::Text, &storage, tmp.path(), 1001, None, false);
+    let res = run_checkpoint_restore(
+        OutputFormat::Text,
+        &storage,
+        tmp.path(),
+        "source",
+        "target",
+        false,
+    );
     assert_eq!(res.unwrap_err().code, RS_0005);
 }
 
@@ -900,8 +932,13 @@ fn test_cli_restore_unconfirmed_refusal() {
 fn test_cli_restore_reissue_safe() {
     let storage = StorageClient::new();
     let tmp = tempfile::tempdir().unwrap();
-    let res1 = storage.restore_checkpoint(tmp.path(), 1001, None).unwrap();
-    let res2 = storage.restore_checkpoint(tmp.path(), 1001, None).unwrap();
+    let (source, target, _) = checkpoint_fixture(tmp.path(), 1001);
+    let res1 = storage
+        .restore_checkpoint(tmp.path(), &source, &target)
+        .unwrap();
+    let res2 = storage
+        .restore_checkpoint(tmp.path(), &source, &target)
+        .unwrap();
     assert_eq!(res1.checkpoint_id, res2.checkpoint_id);
     assert_eq!(res1.status, res2.status);
 }
@@ -910,7 +947,10 @@ fn test_cli_restore_reissue_safe() {
 fn test_cli_restore_audit_event_logged() {
     let storage = StorageClient::new();
     let tmp = tempfile::tempdir().unwrap();
-    storage.restore_checkpoint(tmp.path(), 1001, None).unwrap();
+    let (source, target, _) = checkpoint_fixture(tmp.path(), 1001);
+    storage
+        .restore_checkpoint(tmp.path(), &source, &target)
+        .unwrap();
     let events = storage.audit_tail(tmp.path(), 10).unwrap();
     assert!(events
         .iter()

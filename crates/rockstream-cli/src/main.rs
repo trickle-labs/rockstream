@@ -9,16 +9,17 @@ use clap::{Parser, Subcommand};
 use rockstream_cli::output::OutputFormat;
 use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
 use rockstream_cli::{
-    run_audit_query, run_audit_tail, run_checkpoint_list, run_checkpoint_restore,
-    run_checkpoint_show, run_cluster_quotas, run_cluster_status, run_cluster_workers_drain,
-    run_cluster_workers_list, run_cluster_workers_status, run_debug_arrangement, run_explain_view,
-    run_format_migrate, run_resource_cluster, run_resource_usage, run_schema_create,
-    run_schema_drop, run_schema_evolution_history, run_schema_evolution_status, run_schema_list,
-    run_schema_show, run_shard_list, run_shard_migrate, run_source_drop, run_source_list,
-    run_source_pause, run_source_resume, run_source_show, run_sql_compile, run_start,
-    run_support_bundle, run_view_list, run_view_pause, run_view_query, run_view_resume,
-    run_view_show, run_view_status, run_view_subscribe, run_workload_alter, run_workload_create,
-    run_workload_drop, run_workload_list, run_workload_show, StartOptions,
+    run_audit_query, run_audit_tail, run_checkpoint_export, run_checkpoint_list,
+    run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
+    run_cluster_workers_drain, run_cluster_workers_list, run_cluster_workers_status,
+    run_debug_arrangement, run_explain_view, run_format_migrate, run_resource_cluster,
+    run_resource_usage, run_schema_create, run_schema_drop, run_schema_evolution_history,
+    run_schema_evolution_status, run_schema_list, run_schema_show, run_shard_list,
+    run_shard_migrate, run_source_drop, run_source_list, run_source_pause, run_source_resume,
+    run_source_show, run_sql_compile, run_start, run_support_bundle, run_view_list, run_view_pause,
+    run_view_query, run_view_resume, run_view_show, run_view_status, run_view_subscribe,
+    run_workload_alter, run_workload_create, run_workload_drop, run_workload_list,
+    run_workload_show, StartOptions,
 };
 use rockstream_types::acl::Role;
 use rockstream_types::config::RockstreamConfig;
@@ -496,13 +497,20 @@ enum CheckpointCommand {
         /// Checkpoint ID.
         checkpoint_id: u64,
     },
-    /// Restore a checkpoint to local storage.
-    Restore {
-        /// Checkpoint ID.
-        checkpoint_id: u64,
-        /// Target directory for restored state.
+    /// Export the latest committed checkpoint to separate object storage.
+    Export {
+        /// Destination object-store URL.
         #[arg(long)]
-        storage: Option<std::path::PathBuf>,
+        destination: String,
+    },
+    /// Restore a committed export into fresh storage.
+    Restore {
+        /// Export object-store URL.
+        #[arg(long)]
+        source: String,
+        /// Fresh target object-store URL.
+        #[arg(long)]
+        storage: String,
         /// Confirm destructive action without interactive prompt.
         #[arg(long)]
         yes: bool,
@@ -877,18 +885,14 @@ fn main() -> ExitCode {
                 CheckpointCommand::Show { checkpoint_id } => {
                     run_checkpoint_show(format, &storage, checkpoint_id, &storage_path)
                 }
+                CheckpointCommand::Export { destination } => {
+                    run_checkpoint_export(format, &storage, &storage_path, &destination)
+                }
                 CheckpointCommand::Restore {
-                    checkpoint_id,
-                    storage: dest,
+                    source,
+                    storage: target,
                     yes,
-                } => run_checkpoint_restore(
-                    format,
-                    &storage,
-                    &storage_path,
-                    checkpoint_id,
-                    dest.as_deref(),
-                    yes,
-                ),
+                } => run_checkpoint_restore(format, &storage, &storage_path, &source, &target, yes),
             };
             handle_result(res)
         }

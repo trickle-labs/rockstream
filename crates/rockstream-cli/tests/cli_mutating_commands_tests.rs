@@ -11,16 +11,25 @@
 use rockstream_cli::output::OutputFormat;
 use rockstream_cli::transport::{CatalogClient, ClientIdentity, ControlClient, StorageClient};
 use rockstream_cli::{
-    run_checkpoint_restore, run_cluster_workers_drain, run_schema_create, run_schema_drop,
-    run_shard_migrate, run_source_drop, run_source_pause, run_source_resume, run_support_bundle,
-    run_view_pause, run_view_query, run_view_resume, run_view_subscribe, run_workload_alter,
-    run_workload_create, run_workload_drop,
+    run_checkpoint_export, run_checkpoint_restore, run_cluster_workers_drain, run_schema_create,
+    run_schema_drop, run_shard_migrate, run_source_drop, run_source_pause, run_source_resume,
+    run_support_bundle, run_view_pause, run_view_query, run_view_resume, run_view_subscribe,
+    run_workload_alter, run_workload_create, run_workload_drop,
 };
 use rockstream_types::acl::Role;
+use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
 use rockstream_types::error_code::{
     RS_1001, RS_1004, RS_1007, RS_1008, RS_1014, RS_2401, RS_4009, RS_5030,
 };
 use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
+
+fn seed_checkpoint(path: &std::path::Path, checkpoint_id: u64) -> u64 {
+    let dir = path.join("control/checkpoints");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = serde_json::to_vec(&ClusterCheckpoint::new(CheckpointId(checkpoint_id))).unwrap();
+    std::fs::write(dir.join(checkpoint_id.to_string()), &bytes).unwrap();
+    bytes.len() as u64
+}
 
 #[test]
 fn test_cli_mutating_subcommands_e2e_live_cluster() {
@@ -32,6 +41,10 @@ fn test_cli_mutating_subcommands_e2e_live_cluster() {
     catalog.identity = admin_identity.clone();
     let control = ControlClient::new(None, admin_identity.clone()).with_storage_path(&storage_path);
     let storage = StorageClient::with_identity(admin_identity);
+    let dr_source = storage_path.join("dr-source");
+    let checkpoint_bytes = seed_checkpoint(&dr_source, 100);
+    let export_path = storage_path.join("export");
+    let target_path = storage_path.join("target");
 
     // 1. view pause
     let out = run_view_pause(OutputFormat::Text, &mut catalog, "active_users", true).unwrap();
@@ -115,9 +128,31 @@ fn test_cli_mutating_subcommands_e2e_live_cluster() {
     assert!(out.contains("COMPLETED"));
 
     // 15. checkpoint restore
-    let out = run_checkpoint_restore(OutputFormat::Text, &storage, &storage_path, 100, None, true)
-        .unwrap();
-    assert!(out.contains("restored to"));
+    run_checkpoint_export(
+        OutputFormat::Text,
+        &storage,
+        &dr_source,
+        export_path.to_str().unwrap(),
+    )
+    .unwrap();
+    let out = run_checkpoint_restore(
+        OutputFormat::Text,
+        &storage,
+        &storage_path,
+        export_path.to_str().unwrap(),
+        target_path.to_str().unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "Checkpoint 100: restored from {} to {} (objects: 1, bytes: {}, shards: 0, status: SUCCESS)",
+            export_path.display(),
+            target_path.display(),
+            checkpoint_bytes
+        )
+    );
 
     // 16. support bundle
     let out = run_support_bundle(
@@ -142,6 +177,12 @@ fn test_cli_mutating_commands_emit_exact_audit_event() {
     catalog.identity = admin_identity.clone();
     let control = ControlClient::new(None, admin_identity.clone()).with_storage_path(&storage_path);
     let storage = StorageClient::with_identity(admin_identity);
+    seed_checkpoint(&storage_path, 200);
+    let export_path = storage_path.join("export");
+    let target_path = storage_path.join("target");
+    storage
+        .export_checkpoint(&storage_path, export_path.to_str().unwrap())
+        .unwrap();
 
     // Initial audit log is empty
     let events = storage.audit_tail(&storage_path, 100).unwrap();
@@ -152,7 +193,11 @@ fn test_cli_mutating_commands_emit_exact_audit_event() {
     catalog.resume_view("active_users").unwrap();
     control.drain_worker(1).unwrap();
     storage
-        .restore_checkpoint(&storage_path, 200, None)
+        .restore_checkpoint(
+            &storage_path,
+            export_path.to_str().unwrap(),
+            target_path.to_str().unwrap(),
+        )
         .unwrap();
 
     let events = storage.audit_tail(&storage_path, 100).unwrap();
@@ -273,7 +318,8 @@ fn test_cli_unauthorized_identity_refused_and_audited_exhaustive() {
         "workload alter" | "workload drop" => "analytics",
         "cluster workers drain" => "1",
         "shard migrate" => "1",
-        "checkpoint restore" => "1",
+        "checkpoint export" => "destination",
+        "checkpoint restore" => "source",
         "support bundle" => "all",
         operation => panic!("unknown CLI mutation policy operation: {operation}"),
     };
@@ -297,8 +343,11 @@ fn test_cli_unauthorized_identity_refused_and_audited_exhaustive() {
             "workload drop" => catalog.drop_workload("analytics").unwrap_err(),
             "cluster workers drain" => control.drain_worker(1).unwrap_err(),
             "shard migrate" => control.migrate_shard(1, 2).unwrap_err(),
+            "checkpoint export" => storage
+                .export_checkpoint(&storage_path, "destination")
+                .unwrap_err(),
             "checkpoint restore" => storage
-                .restore_checkpoint(&storage_path, 1, None)
+                .restore_checkpoint(&storage_path, "source", "target")
                 .unwrap_err(),
             "support bundle" => storage
                 .generate_support_bundle(&storage_path, None, None, None)

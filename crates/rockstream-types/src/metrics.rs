@@ -309,6 +309,13 @@ struct MetricRegistry {
     barrier_flight_last_checkpoint_id: AtomicU64,
     barrier_shard_arrivals: HashMap<(u64, u64), u64>,
 
+    // Checkpoint export bounds and copy progress.
+    checkpoint_export_objects_in_flight: AtomicU64,
+    checkpoint_export_object_buffer_fill_level: AtomicU64,
+    checkpoint_export_scan_window_fill_level: AtomicU64,
+    checkpoint_export_copied: AtomicU64,
+    checkpoint_export_total: AtomicU64,
+
     // Flush duration metrics
     flush_duration_sum_ms: AtomicU64,
     flush_duration_count: AtomicU64,
@@ -398,6 +405,11 @@ impl MetricRegistry {
             barrier_flight_injected_at_ms: AtomicU64::new(0),
             barrier_flight_last_checkpoint_id: AtomicU64::new(0),
             barrier_shard_arrivals: HashMap::new(),
+            checkpoint_export_objects_in_flight: AtomicU64::new(0),
+            checkpoint_export_object_buffer_fill_level: AtomicU64::new(0),
+            checkpoint_export_scan_window_fill_level: AtomicU64::new(0),
+            checkpoint_export_copied: AtomicU64::new(0),
+            checkpoint_export_total: AtomicU64::new(0),
             flush_duration_sum_ms: AtomicU64::new(0),
             flush_duration_count: AtomicU64::new(0),
             flush_duration_last_ms: AtomicU64::new(0),
@@ -830,6 +842,14 @@ pub fn reset_all() {
         reg.view_stage_lags.clear();
         reg.stage_timestamps.clear();
         reg.barrier_flight_samples.clear();
+        reg.checkpoint_export_objects_in_flight
+            .store(0, Ordering::Relaxed);
+        reg.checkpoint_export_object_buffer_fill_level
+            .store(0, Ordering::Relaxed);
+        reg.checkpoint_export_scan_window_fill_level
+            .store(0, Ordering::Relaxed);
+        reg.checkpoint_export_copied.store(0, Ordering::Relaxed);
+        reg.checkpoint_export_total.store(0, Ordering::Relaxed);
         reg.barrier_flight_time_ms.store(0, Ordering::Relaxed);
         reg.checkpoint_completion_time_ms
             .store(0, Ordering::Relaxed);
@@ -1224,6 +1244,65 @@ pub fn read_barrier_flight_stats() -> BarrierFlightStats {
             .barrier_flight_last_checkpoint_id
             .load(Ordering::Relaxed),
         samples_count: reg.barrier_flight_samples.len() as u64,
+    })
+}
+
+pub fn set_checkpoint_export_objects_in_flight(value: u64) {
+    with_registry(|reg| {
+        reg.checkpoint_export_objects_in_flight
+            .store(value, Ordering::Relaxed);
+    });
+}
+
+pub fn read_checkpoint_export_objects_in_flight() -> u64 {
+    with_registry(|reg| {
+        reg.checkpoint_export_objects_in_flight
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn set_checkpoint_export_object_buffer_fill_level(value: u64) {
+    with_registry(|reg| {
+        reg.checkpoint_export_object_buffer_fill_level
+            .store(value, Ordering::Relaxed);
+    });
+}
+
+pub fn read_checkpoint_export_object_buffer_fill_level() -> u64 {
+    with_registry(|reg| {
+        reg.checkpoint_export_object_buffer_fill_level
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn set_checkpoint_export_scan_window_fill_level(value: u64) {
+    with_registry(|reg| {
+        reg.checkpoint_export_scan_window_fill_level
+            .store(value, Ordering::Relaxed);
+    });
+}
+
+pub fn read_checkpoint_export_scan_window_fill_level() -> u64 {
+    with_registry(|reg| {
+        reg.checkpoint_export_scan_window_fill_level
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn set_checkpoint_export_copy_progress(copied: u64, total: u64) {
+    with_registry(|reg| {
+        reg.checkpoint_export_copied
+            .store(copied, Ordering::Relaxed);
+        reg.checkpoint_export_total.store(total, Ordering::Relaxed);
+    });
+}
+
+pub fn read_checkpoint_export_copy_progress() -> (u64, u64) {
+    with_registry(|reg| {
+        (
+            reg.checkpoint_export_copied.load(Ordering::Relaxed),
+            reg.checkpoint_export_total.load(Ordering::Relaxed),
+        )
     })
 }
 
@@ -1901,6 +1980,43 @@ pub fn generate_prometheus_metrics() -> String {
         out.push_str(&format!(
             "mtls_cn_cache_size {}\n\n",
             reg.mtls_cn_cache_size.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP checkpoint_export_objects_in_flight Gauge showing checkpoint export copies in flight.\n");
+        out.push_str("# TYPE checkpoint_export_objects_in_flight gauge\n");
+        out.push_str(&format!(
+            "checkpoint_export_objects_in_flight {}\n\n",
+            reg.checkpoint_export_objects_in_flight
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP checkpoint_export_object_buffer_fill_level Gauge showing bytes held by the bounded checkpoint export object buffer.\n");
+        out.push_str("# TYPE checkpoint_export_object_buffer_fill_level gauge\n");
+        out.push_str(&format!(
+            "checkpoint_export_object_buffer_fill_level {}\n\n",
+            reg.checkpoint_export_object_buffer_fill_level
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP checkpoint_export_scan_window_fill_level Gauge showing the current bounded checkpoint export scan window fill.\n");
+        out.push_str("# TYPE checkpoint_export_scan_window_fill_level gauge\n");
+        out.push_str(&format!(
+            "checkpoint_export_scan_window_fill_level {}\n\n",
+            reg.checkpoint_export_scan_window_fill_level
+                .load(Ordering::Relaxed)
+        ));
+
+        let copied = reg.checkpoint_export_copied.load(Ordering::Relaxed);
+        let total = reg.checkpoint_export_total.load(Ordering::Relaxed);
+        let progress = if total == 0 {
+            0.0
+        } else {
+            copied as f64 / total as f64
+        };
+        out.push_str("# HELP checkpoint_export_copy_progress Gauge showing checkpoint export copy progress as copied/total.\n");
+        out.push_str("# TYPE checkpoint_export_copy_progress gauge\n");
+        out.push_str(&format!(
+            "checkpoint_export_copy_progress{{copied=\"{copied}\",total=\"{total}\"}} {progress:.6}\n\n"
         ));
 
         // ─── Stage Lag Decomposed Metrics ─────────────────────────────────────

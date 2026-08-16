@@ -440,7 +440,8 @@ impl MigrationCoordinator {
             checkpoint_coordinator
                 .record_shard_checkpoint(
                     donor.shard_id,
-                    PerShardCheckpoint::new(checkpoint_id, handle.shard_checkpoint_id),
+                    PerShardCheckpoint::new(checkpoint_id, handle.shard_checkpoint_id)
+                        .with_snapshot_id(handle.snapshot_id.clone()),
                     |_| Ok(()),
                 )
                 .map_err(checkpoint_error)?;

@@ -73,6 +73,11 @@ pub struct PerShardCheckpoint {
     pub checkpoint_id: CheckpointId,
     /// The underlying SlateDB checkpoint ID for this shard at this barrier.
     pub shard_checkpoint_id: u64,
+    /// The SlateDB checkpoint UUID, when available. This is the durable
+    /// checkpoint handle needed to reopen the exact manifest rather than the
+    /// mutable latest reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 
 impl PerShardCheckpoint {
@@ -81,7 +86,13 @@ impl PerShardCheckpoint {
         Self {
             checkpoint_id,
             shard_checkpoint_id,
+            snapshot_id: None,
         }
+    }
+
+    pub fn with_snapshot_id(mut self, snapshot_id: impl Into<String>) -> Self {
+        self.snapshot_id = Some(snapshot_id.into());
+        self
     }
 }
 

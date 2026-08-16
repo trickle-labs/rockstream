@@ -24,6 +24,10 @@ All lag metrics are measured in **milliseconds (`ms`)**, are strictly non-negati
 | `checkpoint_barrier_flight_time_ms` | Gauge | ms | Elapsed time from coordinator barrier injection until all shard operators receive the barrier. |
 | `checkpoint_completion_time_ms` | Gauge | ms | Total elapsed time from barrier injection until all shard SlateDB checkpoints confirm and the manifest commits. |
 | `checkpoint_alignment_buffer_credits_used` | Gauge | count | Number of in-flight alignment credits currently held by the checkpoint coordinator. |
+| `checkpoint_export_objects_in_flight` | Gauge | count | Active checkpoint export or restore copy permits; hard maximum is 1. |
+| `checkpoint_export_object_buffer_fill_level` | Gauge | bytes | Bytes held by the bounded single-object copy buffer. |
+| `checkpoint_export_scan_window_fill_level` | Gauge | objects | Object names held by the bounded export scan window; hard maximum is 1024. |
+| `checkpoint_export_copy_progress` | Gauge | ratio | Completed checkpoint export objects divided by the committed inventory total. |
  
 ## Merge Law & Storage Metrics
  

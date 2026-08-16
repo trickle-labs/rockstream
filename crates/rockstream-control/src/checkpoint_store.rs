@@ -60,15 +60,30 @@ impl CheckpointManifestStore {
     }
 
     pub async fn load_manifest(&self, checkpoint_id: CheckpointId) -> Option<ClusterCheckpoint> {
+        self.load_manifest_checked(checkpoint_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn load_manifest_checked(
+        &self,
+        checkpoint_id: CheckpointId,
+    ) -> Result<Option<ClusterCheckpoint>, String> {
         let bytes = self
             .store
             .get(&self.manifest_path(checkpoint_id))
             .await
-            .ok()?
+            .map_err(|error| format!("load checkpoint manifest {}: {error}", checkpoint_id.0))?
             .bytes()
             .await
-            .ok()?;
-        decode_manifest(&bytes).ok()
+            .map_err(|error| format!("read checkpoint manifest {}: {error}", checkpoint_id.0))?;
+        decode_manifest(&bytes).map(Some).map_err(|error| {
+            format!(
+                "checkpoint manifest {} is malformed: {error}",
+                checkpoint_id.0
+            )
+        })
     }
 
     pub async fn load_latest_manifest(&self) -> Result<Option<ClusterCheckpoint>, String> {
@@ -76,7 +91,7 @@ impl CheckpointManifestStore {
         let Some(checkpoint_id) = ids.into_iter().max() else {
             return Ok(None);
         };
-        Ok(self.load_manifest(checkpoint_id).await)
+        self.load_manifest_checked(checkpoint_id).await
     }
 
     pub async fn gc_old_manifests(
@@ -236,6 +251,26 @@ mod tests {
             manifests.load_manifest(CheckpointId(7)).await,
             Some(manifest)
         );
+    }
+
+    #[tokio::test]
+    async fn latest_manifest_does_not_fall_back_after_corruption() {
+        let store = Arc::new(InMemory::new());
+        let manifests = CheckpointManifestStore::new(store.clone());
+        manifests
+            .save_manifest(&manifest(), false, None)
+            .await
+            .unwrap();
+        store
+            .put(
+                &Path::from("control/checkpoints/8"),
+                bytes::Bytes::from_static(b"truncated").into(),
+            )
+            .await
+            .unwrap();
+
+        let error = manifests.load_latest_manifest().await.unwrap_err();
+        assert!(error.contains("checkpoint manifest 8 is malformed"));
     }
 
     #[test]

@@ -40,6 +40,28 @@ impl ShardReader {
         .await
     }
 
+    /// Open the exact durable SlateDB checkpoint named by its UUID.
+    ///
+    /// A normal `open` follows the latest mutable manifest. Recovery and DR
+    /// must use this path whenever the checkpoint handle carries a UUID.
+    pub async fn open_with_snapshot_id(
+        path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        snapshot_id: &str,
+    ) -> Result<Self, StorageError> {
+        let path = path.into();
+        let checkpoint_id = uuid::Uuid::parse_str(snapshot_id).map_err(|error| {
+            StorageError::Unsupported(format!(
+                "invalid SlateDB snapshot id `{snapshot_id}`: {error}"
+            ))
+        })?;
+        let reader = slatedb::DbReader::builder(path.clone(), object_store)
+            .with_checkpoint_id(checkpoint_id)
+            .build()
+            .await?;
+        Self::from_reader(path, reader, SupportedStorageFormatRange::v1_through_v2()).await
+    }
+
     /// Open a reader with custom options.
     pub async fn open_with_options(
         path: impl Into<String>,
@@ -396,5 +418,27 @@ mod tests {
             }
             _ => panic!("expected EpochPruned error"),
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_id_selects_the_named_durable_checkpoint() {
+        let store = Arc::new(InMemory::new());
+        let db = ShardDb::builder("test/exact_checkpoint", store.clone())
+            .build()
+            .await
+            .unwrap();
+
+        db.put(b"k", b"old").await.unwrap();
+        db.flush().await.unwrap();
+        let first = db.create_checkpoint().await.unwrap();
+        db.put(b"k", b"new").await.unwrap();
+        db.flush().await.unwrap();
+        let _second = db.create_checkpoint().await.unwrap();
+
+        let reader =
+            ShardReader::open_with_snapshot_id("test/exact_checkpoint", store, &first.snapshot_id)
+                .await
+                .unwrap();
+        assert_eq!(reader.get(b"k").await.unwrap().unwrap().as_ref(), b"old");
     }
 }

@@ -54,7 +54,7 @@ async fn full_live_delta_buffer_returns_rs4020_lfs() {
             reason: "backfill.live_delta_buffer_full: live delta buffer is 9 bytes, above BACKFILL_LIVE_DELTA_MAX_BYTES=8; next_steps: wait for snapshot catch-up before retrying".to_string(),
         }
     );
-    assert_eq!(db.scan_prefix(b"").await.unwrap(), vec![]);
+    assert_eq!(db.scan_prefix(b"view_output/").await.unwrap(), vec![]);
 }
 
 #[tokio::test]

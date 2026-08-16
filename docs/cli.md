@@ -141,10 +141,15 @@ Inspect shard lease ownership and key ranges, and trigger shard migrations.
 
 ### `rockstream checkpoint`
 
-Inspect and restore durable cluster checkpoints.
+Inspect, export, and restore durable cluster checkpoints.
 
 - `rockstream checkpoint list` — List all durable checkpoints, creation timestamps, and shard counts.
-- `rockstream checkpoint restore <checkpoint_id> [--storage <dir>] [--yes]` — Restore a committed checkpoint state to storage.
+- `rockstream checkpoint export --destination <file://...|s3://...>` — Export the latest M3-committed checkpoint and its immutable object inventory.
+- `rockstream checkpoint restore --source <file://...|s3://...> --storage <file://...|s3://...> --yes` — Verify a committed export and restore it into fresh storage. The target bootstrap pointer is published last.
+
+Both commands require the Admin role and emit `checkpoint.export` or
+`checkpoint.restore` audit events. Integrity, truncation, mixed-generation,
+and partial-restore failures return `RS-5035` with recovery steps.
 
 ---
 

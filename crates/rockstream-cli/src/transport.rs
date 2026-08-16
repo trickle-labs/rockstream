@@ -13,19 +13,20 @@ use rockstream_types::acl::Role;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014, RS_2006,
-    RS_2401, RS_2410, RS_2411, RS_4009, RS_5030,
+    RS_2401, RS_2410, RS_2411, RS_4009, RS_5030, RS_5035,
 };
 use rockstream_types::mutation_policy::cli_mutation_policy;
 pub use rockstream_types::mutation_policy::CLI_MUTATION_POLICY;
 use rockstream_types::view_lifecycle::{derive_degradation_status, ViewState};
 
 use crate::output::{
-    CheckpointAlignmentInfo, CheckpointSummary, ClusterQuotasInfo, ClusterResourceUsageInfo,
-    ClusterStatusInfo, DrainOutcome, MigrationOutcome, MutationOutcome, QueryResult,
-    ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail, SchemaEvolutionHistoryInfo,
-    SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo, ShardInfo, SourceDetail,
-    SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail, ViewStatusInfo, ViewSummary,
-    WorkerStatusInfo, WorkloadDetail, WorkloadSummary, AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
+    CheckpointAlignmentInfo, CheckpointExportOutcome, CheckpointSummary, ClusterQuotasInfo,
+    ClusterResourceUsageInfo, ClusterStatusInfo, DrainOutcome, MigrationOutcome, MutationOutcome,
+    QueryResult, ResourceUsageInfo, RestoreOutcome, SchemaColumn, SchemaDetail,
+    SchemaEvolutionHistoryInfo, SchemaEvolutionStatusInfo, SchemaSummary, ShardAlignmentInfo,
+    ShardInfo, SourceDetail, SourceSummary, SubscribeEvent, SupportBundleInfo, ViewDetail,
+    ViewStatusInfo, ViewSummary, WorkerStatusInfo, WorkloadDetail, WorkloadSummary,
+    AUDIT_TAIL_MAX_EVENTS, CLI_OUTPUT_MAX_ROWS,
 };
 use crate::CliError;
 
@@ -47,6 +48,17 @@ fn required_role(operation: &str) -> Role {
         .expect("every CLI mutation must have an authorization policy")
         .minimum_role
         .clone()
+}
+
+fn checkpoint_dr_error(error: String) -> CliError {
+    CliError::new(
+        RS_5035,
+        error
+            .strip_prefix("RS-5035: ")
+            .unwrap_or(&error)
+            .to_string(),
+        "Verify the committed export, object-store access, and target freshness, then retry.",
+    )
 }
 
 /// Client identity representation for authenticating requests.
@@ -1621,20 +1633,16 @@ impl StorageClient {
         self
     }
 
-    pub fn restore_checkpoint(
+    pub fn export_checkpoint(
         &self,
         storage_path: &Path,
-        checkpoint_id: u64,
-        target_dir: Option<&Path>,
-    ) -> Result<RestoreOutcome, CliError> {
-        if self.identity.role < required_role("checkpoint restore") {
-            let event = AuditEvent::now(
-                self.identity.user.clone(),
-                "checkpoint.restore",
-                checkpoint_id.to_string(),
-            )
-            .with_detail("unauthorized role")
-            .with_error_code("RS-2401");
+        destination: &str,
+    ) -> Result<CheckpointExportOutcome, CliError> {
+        if self.identity.role < required_role("checkpoint export") {
+            let event =
+                AuditEvent::now(self.identity.user.clone(), "checkpoint.export", destination)
+                    .with_detail("unauthorized role")
+                    .with_error_code("RS-2401");
             append_audit_file(storage_path, &event);
             return Err(CliError::new(
                 RS_2401,
@@ -1647,28 +1655,174 @@ impl StorageClient {
             ));
         }
 
-        let dest = target_dir
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| {
-                storage_path
-                    .join(format!("restored_{checkpoint_id}"))
-                    .to_string_lossy()
-                    .into_owned()
-            });
+        let source = storage_path.to_string_lossy().into_owned();
+        let destination = destination.to_string();
+        let source_for_task = source.clone();
+        let destination_for_task = destination.clone();
+        let result = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(async move {
+                let source_store =
+                    rockstream_storage::build_migration_object_store(&source_for_task)?;
+                let destination_store =
+                    rockstream_storage::build_migration_object_store(&destination_for_task)?;
+                let manifests =
+                    rockstream_control::CheckpointManifestStore::new(source_store.clone());
+                let checkpoint = manifests
+                    .load_latest_manifest()
+                    .await?
+                    .ok_or_else(|| "no committed checkpoint manifest exists".to_string())?;
+                let generation = format!("checkpoint-{}", checkpoint.checkpoint_id.0);
+                rockstream_control::CheckpointExportService::new()
+                    .export_latest_prefix(
+                        source_store,
+                        destination_store,
+                        &manifests,
+                        generation,
+                        &object_store::path::Path::from(""),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .join()
+        .map_err(|_| {
+            CliError::new(
+                RS_5035,
+                "checkpoint export worker panicked",
+                "Retry the export.",
+            )
+        })?
+        .map_err(checkpoint_dr_error);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let event = AuditEvent::now(
+                    self.identity.user.clone(),
+                    "checkpoint.export",
+                    destination.clone(),
+                )
+                .with_detail("export failed")
+                .with_error_code(error.code.to_string());
+                append_audit_file(storage_path, &event);
+                return Err(error);
+            }
+        };
+
+        let event = AuditEvent::now(
+            self.identity.user.clone(),
+            "checkpoint.export",
+            result.checkpoint_id.to_string(),
+        )
+        .with_detail(format!(
+            "source={source} destination={destination} objects={} bytes={} status={}",
+            result.object_count, result.byte_count, result.status
+        ));
+        append_audit_file(storage_path, &event);
+
+        Ok(CheckpointExportOutcome {
+            checkpoint_id: result.checkpoint_id,
+            source,
+            destination,
+            object_count: result.object_count,
+            byte_count: result.byte_count,
+            status: result.status,
+        })
+    }
+
+    pub fn restore_checkpoint(
+        &self,
+        audit_path: &Path,
+        source: &str,
+        target: &str,
+    ) -> Result<RestoreOutcome, CliError> {
+        if self.identity.role < required_role("checkpoint restore") {
+            let event = AuditEvent::now(self.identity.user.clone(), "checkpoint.restore", source)
+                .with_detail("unauthorized role")
+                .with_error_code("RS-2401");
+            append_audit_file(audit_path, &event);
+            return Err(CliError::new(
+                RS_2401,
+                format!(
+                    "permission denied: principal '{}' lacks required role {:?}",
+                    self.identity.user,
+                    Role::Admin
+                ),
+                "Request elevated RBAC role (Admin) or run under an authorized principal.",
+            ));
+        }
+
+        let source = source.to_string();
+        let target = target.to_string();
+        let source_for_task = source.clone();
+        let target_for_task = target.clone();
+        let result = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(async move {
+                let source_store =
+                    rockstream_storage::build_migration_object_store(&source_for_task)?;
+                let target_store =
+                    rockstream_storage::build_migration_object_store(&target_for_task)?;
+                let service = rockstream_control::CheckpointExportService::new();
+                let generation = service
+                    .latest_committed_generation(source_store.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                service
+                    .restore_generation(source_store, target_store, &generation)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .join()
+        .map_err(|_| {
+            CliError::new(
+                RS_5035,
+                "checkpoint restore worker panicked",
+                "Retry the restore.",
+            )
+        })?
+        .map_err(checkpoint_dr_error);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let event = AuditEvent::now(
+                    self.identity.user.clone(),
+                    "checkpoint.restore",
+                    source.clone(),
+                )
+                .with_detail(format!("target={target} restore failed"))
+                .with_error_code(error.code.to_string());
+                append_audit_file(audit_path, &event);
+                return Err(error);
+            }
+        };
 
         let event = AuditEvent::now(
             self.identity.user.clone(),
             "checkpoint.restore",
-            checkpoint_id.to_string(),
+            result.checkpoint_id.to_string(),
         )
-        .with_detail(format!("restored to {dest}"));
-        append_audit_file(storage_path, &event);
+        .with_detail(format!(
+            "source={source} target={target} objects={} bytes={} status={}",
+            result.object_count, result.byte_count, result.status
+        ));
+        append_audit_file(audit_path, &event);
 
         Ok(RestoreOutcome {
-            checkpoint_id,
-            target_dir: dest,
-            restored_shards: 2,
-            status: "SUCCESS".to_string(),
+            checkpoint_id: result.checkpoint_id,
+            source,
+            target,
+            object_count: result.object_count,
+            byte_count: result.byte_count,
+            restored_shards: result.restored_shards,
+            status: result.status,
         })
     }
 

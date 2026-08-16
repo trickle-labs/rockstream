@@ -797,6 +797,7 @@ impl ShardDb {
             .await?;
         Ok(CheckpointHandle {
             shard_checkpoint_id: result.manifest_id,
+            snapshot_id: result.id.to_string(),
         })
     }
 
@@ -945,10 +946,12 @@ impl ShardDb {
 /// time the checkpoint was created. It is reported to the
 /// `CheckpointCoordinator` as part of a `PerShardCheckpoint` and later used by
 /// the `RecoveryDriver` to open a `ShardReader` pinned to this exact snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointHandle {
     /// The SlateDB manifest ID for this checkpoint.
     pub shard_checkpoint_id: u64,
+    /// The UUID used by SlateDB to reopen this exact checkpoint.
+    pub snapshot_id: String,
 }
 
 /// A single operation within a `WriteBatch`.
