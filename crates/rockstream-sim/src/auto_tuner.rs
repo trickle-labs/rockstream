@@ -5,6 +5,8 @@
 
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::AutotunerConfig;
+use rockstream_types::metrics::{read_storage_pressure_signals, StoragePressureSignals};
+use rockstream_types::view_lifecycle::dominant_storage_contributor_for_signals;
 use rockstream_types::workload::WorkloadDef;
 
 use crate::buggify;
@@ -130,16 +132,48 @@ impl AutoTuner {
         (new_min, new_max)
     }
 
-    /// Adjust parallelism based on observed P95 epoch latency.
+    /// Adjust parallelism based on observed P95 epoch latency and storage pressure signals.
     ///
     /// Hysteresis: must see P95 above threshold for `hysteresis_scale_up_windows`
     /// consecutive calls before scaling up, and below for `hysteresis_scale_down_windows`
     /// before scaling down.
     /// Bounded: `min_parallelism ≤ result ≤ max_parallelism`.
+    /// Under storage pressure (Step 3), scale-up is strictly vetoed/refused.
     pub fn adjust_parallelism(&mut self, epoch_ms_p95: u64) -> usize {
+        self.adjust_parallelism_with_signals(epoch_ms_p95, None)
+    }
+
+    pub fn adjust_parallelism_with_signals(
+        &mut self,
+        epoch_ms_p95: u64,
+        signals: Option<&StoragePressureSignals>,
+    ) -> usize {
+        let global_signals = read_storage_pressure_signals();
+        let sigs = signals.unwrap_or(&global_signals);
+        let pressured = sigs.is_pressured();
+
         if epoch_ms_p95 > PARALLELISM_P95_SCALE_UP_MS {
-            self.up_window_count =
-                (self.up_window_count + 1).min(self.config.hysteresis_scale_up_windows);
+            if pressured {
+                // Step 3: Veto scale up when storage pressure is detected
+                self.up_window_count = 0;
+                let dominant = dominant_storage_contributor_for_signals(sigs)
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "storage_pressure".to_string());
+                self.audit_sink.push(
+                    AuditEvent::now(
+                        "auto_tuner",
+                        "parallelism.scale_up_refused_storage_pressure",
+                        "auto_tuner",
+                    )
+                    .with_detail(format!(
+                        "parallelism={} dominant_cause={}",
+                        self.current_parallelism, dominant
+                    )),
+                );
+            } else {
+                self.up_window_count =
+                    (self.up_window_count + 1).min(self.config.hysteresis_scale_up_windows);
+            }
             self.down_window_count = 0;
         } else if epoch_ms_p95 < PARALLELISM_P95_SCALE_DOWN_MS {
             self.down_window_count =
@@ -155,7 +189,7 @@ impl AutoTuner {
             return self.current_parallelism;
         }
 
-        if self.up_window_count >= self.config.hysteresis_scale_up_windows {
+        if !pressured && self.up_window_count >= self.config.hysteresis_scale_up_windows {
             let new_p = (self.current_parallelism + 1).min(self.config.max_parallelism);
             if new_p != self.current_parallelism {
                 self.current_parallelism = new_p;
@@ -183,9 +217,10 @@ impl AutoTuner {
         self.current_parallelism
     }
 
-    /// Adjust source poll-bytes throttle based on frontier lag.
+    /// Adjust source poll-bytes throttle based on frontier lag and storage pressure signals.
     ///
     /// Trigger: `frontier_lag_ms > freshness_target_ms * 1.5` for > 20 epochs → reduce by 50 %.
+    /// Under storage pressure (Step 2), source throttle is reduced to alleviate backpressure.
     /// Floor: `MIN_THROTTLE_BYTES` (64); ceiling: `MAX_THROTTLE_BYTES` (64 MiB).
     /// Never returns 0 (deadlock-prevention invariant).
     pub fn adjust_source_throttle(
@@ -194,6 +229,46 @@ impl AutoTuner {
         freshness_target_ms: u64,
         current_max_poll_bytes: u64,
     ) -> u64 {
+        self.adjust_source_throttle_with_signals(
+            frontier_lag_ms,
+            freshness_target_ms,
+            current_max_poll_bytes,
+            None,
+        )
+    }
+
+    pub fn adjust_source_throttle_with_signals(
+        &mut self,
+        frontier_lag_ms: u64,
+        freshness_target_ms: u64,
+        current_max_poll_bytes: u64,
+        signals: Option<&StoragePressureSignals>,
+    ) -> u64 {
+        let global_signals = read_storage_pressure_signals();
+        let sigs = signals.unwrap_or(&global_signals);
+        let pressured = sigs.is_pressured();
+
+        if pressured {
+            // Step 2: Storage pressure immediately enforces source throttle reduction (down to 50% or floor)
+            let dominant = dominant_storage_contributor_for_signals(sigs)
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "storage_pressure".to_string());
+            let reduced = (current_max_poll_bytes / 2).max(MIN_THROTTLE_BYTES);
+            self.audit_sink.push(
+                AuditEvent::now(
+                    "auto_tuner",
+                    "source_throttle.reduced_storage_pressure",
+                    "auto_tuner",
+                )
+                .with_detail(format!(
+                    "new_throttle={} dominant_cause={}",
+                    reduced, dominant
+                )),
+            );
+            debug_assert!(reduced > 0, "throttle must never be 0");
+            return reduced;
+        }
+
         let lag_threshold = freshness_target_ms + freshness_target_ms / 2;
 
         if frontier_lag_ms > lag_threshold {
@@ -372,5 +447,54 @@ mod tests {
             "parallelism trace must stay at or below 4: {trace:?}"
         );
         assert_eq!(tuner.current_parallelism, 4);
+    }
+
+    #[test]
+    fn storage_pressure_vetoes_parallelism_scale_up() {
+        let config = AutotunerConfig {
+            hysteresis_scale_up_windows: 2,
+            ..Default::default()
+        };
+        let mut tuner = AutoTuner::new(config);
+        let signals = StoragePressureSignals {
+            l0_backlog: 12,
+            ..Default::default()
+        };
+
+        // Even with high latency, storage pressure must veto scale-up.
+        for _ in 0..10 {
+            let p = tuner.adjust_parallelism_with_signals(1000, Some(&signals));
+            assert_eq!(p, tuner.config.default_parallelism);
+        }
+
+        assert!(tuner.audit_sink.iter().any(|e| {
+            e.action == "parallelism.scale_up_refused_storage_pressure"
+                && e.detail
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("storage_pressure_l0_backlog")
+        }));
+    }
+
+    #[test]
+    fn storage_pressure_reduces_source_throttle() {
+        let mut tuner = AutoTuner::new(AutotunerConfig::default());
+        let signals = StoragePressureSignals {
+            pending_compaction_bytes: 128 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let current_throttle = 1024u64;
+        let new_throttle =
+            tuner.adjust_source_throttle_with_signals(100, 1000, current_throttle, Some(&signals));
+        assert_eq!(new_throttle, 512);
+
+        assert!(tuner.audit_sink.iter().any(|e| {
+            e.action == "source_throttle.reduced_storage_pressure"
+                && e.detail
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("storage_pressure_pending_compaction_bytes")
+        }));
     }
 }

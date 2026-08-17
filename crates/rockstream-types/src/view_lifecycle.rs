@@ -16,7 +16,14 @@ use crate::{
         ErrorCode, RS_3701, RS_3702, RS_3703, RS_3704, RS_3705, RS_3706, RS_3707, RS_3708,
     },
     ids::NamespaceId,
-    metrics::StageLagBreakdown,
+    metrics::{
+        read_storage_pressure_signals, StageLagBreakdown, StoragePressureSignals,
+        STORAGE_PRESSURE_FLUSH_LATENCY_MS_THRESHOLD, STORAGE_PRESSURE_L0_BACKLOG_THRESHOLD,
+        STORAGE_PRESSURE_OBJECT_STORE_FAILURE_RATE_THRESHOLD,
+        STORAGE_PRESSURE_OBJECT_STORE_LATENCY_MS_THRESHOLD,
+        STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_THRESHOLD,
+        STORAGE_PRESSURE_WRITE_AMPLIFICATION_THRESHOLD,
+    },
     workload::WorkloadDef,
 };
 use serde::{Deserialize, Serialize};
@@ -38,27 +45,22 @@ pub enum ViewState {
 }
 
 impl ViewState {
-    /// Returns true if the view is running (not paused, not backfilling).
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running)
     }
 
-    /// Returns true if the view is paused.
     pub fn is_paused(&self) -> bool {
         matches!(self, Self::Paused)
     }
 
-    /// Returns true if the view is running in over-budget relaxed mode.
     pub fn is_over_budget_relaxed(&self) -> bool {
         matches!(self, Self::OverBudgetRelaxed)
     }
 
-    /// Returns true if the view is in over-budget rejected state.
     pub fn is_over_budget_rejected(&self) -> bool {
         matches!(self, Self::OverBudgetRejected)
     }
 
-    /// Returns true if the view is backfilling.
     pub fn is_backfilling(&self) -> bool {
         matches!(self, Self::BackfillingFromEpoch(_))
     }
@@ -141,6 +143,10 @@ impl DegradationReason {
             Self::Recovering => RS_3708,
         }
     }
+
+    pub fn error_code(&self) -> ErrorCode {
+        self.reason_code()
+    }
 }
 
 impl std::fmt::Display for DegradationReason {
@@ -170,6 +176,12 @@ pub enum DominantContributor {
     SinkLag,
     SpillLag,
     StoragePressure,
+    StoragePressureL0Backlog,
+    StoragePressurePendingCompaction,
+    StoragePressureFlushLatency,
+    StoragePressureWriteAmplification,
+    StoragePressureObjectStoreLatency,
+    StoragePressureObjectStoreFailures,
 }
 
 impl std::fmt::Display for DominantContributor {
@@ -183,6 +195,12 @@ impl std::fmt::Display for DominantContributor {
             Self::SinkLag => "sink_lag",
             Self::SpillLag => "spill_lag",
             Self::StoragePressure => "storage_pressure",
+            Self::StoragePressureL0Backlog => "storage_pressure_l0_backlog",
+            Self::StoragePressurePendingCompaction => "storage_pressure_pending_compaction_bytes",
+            Self::StoragePressureFlushLatency => "storage_pressure_flush_latency",
+            Self::StoragePressureWriteAmplification => "storage_pressure_write_amplification",
+            Self::StoragePressureObjectStoreLatency => "storage_pressure_object_store_latency",
+            Self::StoragePressureObjectStoreFailures => "storage_pressure_object_store_failures",
         };
         write!(f, "{value}")
     }
@@ -231,8 +249,77 @@ impl DegradationStatus {
     }
 }
 
+pub fn dominant_storage_contributor_for_signals(
+    signals: &StoragePressureSignals,
+) -> Option<DominantContributor> {
+    let l0_ratio = signals.l0_backlog as f64 / STORAGE_PRESSURE_L0_BACKLOG_THRESHOLD as f64;
+    let pending_ratio = signals.pending_compaction_bytes as f64
+        / STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_THRESHOLD as f64;
+    let flush_ratio =
+        signals.flush_latency_ms as f64 / STORAGE_PRESSURE_FLUSH_LATENCY_MS_THRESHOLD as f64;
+    let write_amp_ratio =
+        signals.write_amplification / STORAGE_PRESSURE_WRITE_AMPLIFICATION_THRESHOLD;
+    let obj_lat_ratio = signals.object_store_latency_ms as f64
+        / STORAGE_PRESSURE_OBJECT_STORE_LATENCY_MS_THRESHOLD as f64;
+    let obj_fail_ratio =
+        signals.object_store_failure_rate / STORAGE_PRESSURE_OBJECT_STORE_FAILURE_RATE_THRESHOLD;
+
+    let candidates = [
+        (DominantContributor::StoragePressureL0Backlog, l0_ratio),
+        (
+            DominantContributor::StoragePressurePendingCompaction,
+            pending_ratio,
+        ),
+        (
+            DominantContributor::StoragePressureFlushLatency,
+            flush_ratio,
+        ),
+        (
+            DominantContributor::StoragePressureWriteAmplification,
+            write_amp_ratio,
+        ),
+        (
+            DominantContributor::StoragePressureObjectStoreLatency,
+            obj_lat_ratio,
+        ),
+        (
+            DominantContributor::StoragePressureObjectStoreFailures,
+            obj_fail_ratio,
+        ),
+    ];
+
+    let mut best = candidates[0];
+    for candidate in &candidates[1..] {
+        if candidate.1 > best.1 {
+            best = *candidate;
+        }
+    }
+
+    if best.1 > 1.0 {
+        Some(best.0)
+    } else {
+        None
+    }
+}
+
 pub fn dominant_contributor(stage_lag: Option<StageLagBreakdown>) -> DominantContributor {
+    dominant_contributor_with_signals(stage_lag, None)
+}
+
+pub fn dominant_contributor_with_signals(
+    stage_lag: Option<StageLagBreakdown>,
+    signals: Option<StoragePressureSignals>,
+) -> DominantContributor {
+    let signals = signals.unwrap_or_else(read_storage_pressure_signals);
+    let storage_dominant = dominant_storage_contributor_for_signals(&signals);
+    let storage_variant = storage_dominant.unwrap_or(DominantContributor::StoragePressure);
+
     let Some(lag) = stage_lag else {
+        if signals.is_pressured() {
+            if let Some(sd) = storage_dominant {
+                return sd;
+            }
+        }
         return DominantContributor::Healthy;
     };
     if lag.source_lag_ms == 0
@@ -243,6 +330,11 @@ pub fn dominant_contributor(stage_lag: Option<StageLagBreakdown>) -> DominantCon
         && lag.spill_lag_ms == 0
         && lag.storage_pressure_ms == 0
     {
+        if signals.is_pressured() {
+            if let Some(sd) = storage_dominant {
+                return sd;
+            }
+        }
         return DominantContributor::Healthy;
     }
     let ordered = [
@@ -252,10 +344,7 @@ pub fn dominant_contributor(stage_lag: Option<StageLagBreakdown>) -> DominantCon
         (DominantContributor::AlignmentLag, lag.alignment_lag_ms),
         (DominantContributor::SinkLag, lag.sink_lag_ms),
         (DominantContributor::SpillLag, lag.spill_lag_ms),
-        (
-            DominantContributor::StoragePressure,
-            lag.storage_pressure_ms,
-        ),
+        (storage_variant, lag.storage_pressure_ms),
     ];
     let mut best = ordered[0];
     for candidate in ordered.into_iter().skip(1) {
@@ -270,7 +359,15 @@ pub fn derive_degradation_status(
     view_state: &ViewState,
     stage_lag: Option<StageLagBreakdown>,
 ) -> DegradationStatus {
-    let dominant = dominant_contributor(stage_lag);
+    derive_degradation_status_with_signals(view_state, stage_lag, None)
+}
+
+pub fn derive_degradation_status_with_signals(
+    view_state: &ViewState,
+    stage_lag: Option<StageLagBreakdown>,
+    signals: Option<StoragePressureSignals>,
+) -> DegradationStatus {
+    let dominant = dominant_contributor_with_signals(stage_lag, signals);
     if view_state.is_backfilling() {
         return DegradationStatus::new(DegradationReason::Recovering, dominant);
     }
@@ -628,6 +725,72 @@ mod tests {
             assert!(
                 seen_codes.contains(&code_str),
                 "missing allocated code {code_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_storage_pressure_dominant_contributors() {
+        let cases = [
+            (
+                StoragePressureSignals {
+                    l0_backlog: 15,
+                    ..Default::default()
+                },
+                DominantContributor::StoragePressureL0Backlog,
+                "storage_pressure_l0_backlog",
+            ),
+            (
+                StoragePressureSignals {
+                    pending_compaction_bytes: 128 * 1024 * 1024,
+                    ..Default::default()
+                },
+                DominantContributor::StoragePressurePendingCompaction,
+                "storage_pressure_pending_compaction_bytes",
+            ),
+            (
+                StoragePressureSignals {
+                    flush_latency_ms: 800,
+                    ..Default::default()
+                },
+                DominantContributor::StoragePressureFlushLatency,
+                "storage_pressure_flush_latency",
+            ),
+            (
+                StoragePressureSignals {
+                    write_amplification: 25.0,
+                    ..Default::default()
+                },
+                DominantContributor::StoragePressureWriteAmplification,
+                "storage_pressure_write_amplification",
+            ),
+            (
+                StoragePressureSignals {
+                    object_store_latency_ms: 2000,
+                    ..Default::default()
+                },
+                DominantContributor::StoragePressureObjectStoreLatency,
+                "storage_pressure_object_store_latency",
+            ),
+            (
+                StoragePressureSignals {
+                    object_store_failure_rate: 0.10,
+                    ..Default::default()
+                },
+                DominantContributor::StoragePressureObjectStoreFailures,
+                "storage_pressure_object_store_failures",
+            ),
+        ];
+
+        for (signals, expected_dominant, expected_str) in cases {
+            assert_eq!(
+                dominant_storage_contributor_for_signals(&signals),
+                Some(expected_dominant)
+            );
+            assert_eq!(expected_dominant.to_string(), expected_str);
+            assert_eq!(
+                dominant_contributor_with_signals(None, Some(signals)),
+                expected_dominant
             );
         }
     }

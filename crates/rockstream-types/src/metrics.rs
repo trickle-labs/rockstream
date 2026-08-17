@@ -32,6 +32,35 @@ pub const MAX_STAGE_TIMESTAMPS_PER_VIEW: usize = 1024;
 pub const MAX_BARRIER_FLIGHT_SAMPLES: usize = 4096;
 pub const PUBLISHED_SUMMATION_TOLERANCE_MS: u64 = 5;
 
+pub const STORAGE_PRESSURE_L0_BACKLOG_THRESHOLD: u64 = 8;
+pub const STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_THRESHOLD: u64 = 64 * 1024 * 1024; // 64 MiB
+pub const STORAGE_PRESSURE_FLUSH_LATENCY_MS_THRESHOLD: u64 = 500;
+pub const STORAGE_PRESSURE_WRITE_AMPLIFICATION_THRESHOLD: f64 = 15.0;
+pub const STORAGE_PRESSURE_OBJECT_STORE_LATENCY_MS_THRESHOLD: u64 = 1000;
+pub const STORAGE_PRESSURE_OBJECT_STORE_FAILURE_RATE_THRESHOLD: f64 = 0.05;
+
+/// Separately attributable storage pressure admission signals.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct StoragePressureSignals {
+    pub l0_backlog: u64,
+    pub pending_compaction_bytes: u64,
+    pub flush_latency_ms: u64,
+    pub write_amplification: f64,
+    pub object_store_latency_ms: u64,
+    pub object_store_failure_rate: f64,
+}
+
+impl StoragePressureSignals {
+    pub fn is_pressured(&self) -> bool {
+        self.l0_backlog > STORAGE_PRESSURE_L0_BACKLOG_THRESHOLD
+            || self.pending_compaction_bytes > STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_THRESHOLD
+            || self.flush_latency_ms > STORAGE_PRESSURE_FLUSH_LATENCY_MS_THRESHOLD
+            || self.write_amplification > STORAGE_PRESSURE_WRITE_AMPLIFICATION_THRESHOLD
+            || self.object_store_latency_ms > STORAGE_PRESSURE_OBJECT_STORE_LATENCY_MS_THRESHOLD
+            || self.object_store_failure_rate > STORAGE_PRESSURE_OBJECT_STORE_FAILURE_RATE_THRESHOLD
+    }
+}
+
 /// High-resolution timestamp checkpoints for a batch progressing through the pipeline stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StageTimestamps {
@@ -324,6 +353,14 @@ struct MetricRegistry {
     ops_spill_faults_total: AtomicU64,
     operator_runtime: HashMap<OperatorId, OperatorRuntimeWindow>,
     operator_frontiers: HashMap<(String, OperatorId, u32), OperatorFrontierEntry>,
+
+    // Storage pressure admission signals
+    storage_pressure_l0_backlog: AtomicU64,
+    storage_pressure_pending_compaction_bytes: AtomicU64,
+    storage_pressure_flush_latency_ms: AtomicU64,
+    storage_pressure_write_amplification_bits: AtomicU64,
+    storage_pressure_object_store_latency_ms: AtomicU64,
+    storage_pressure_object_store_failure_rate_bits: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +454,12 @@ impl MetricRegistry {
             ops_spill_faults_total: AtomicU64::new(0),
             operator_runtime: HashMap::new(),
             operator_frontiers: HashMap::new(),
+            storage_pressure_l0_backlog: AtomicU64::new(0),
+            storage_pressure_pending_compaction_bytes: AtomicU64::new(0),
+            storage_pressure_flush_latency_ms: AtomicU64::new(0),
+            storage_pressure_write_amplification_bits: AtomicU64::new(0.0f64.to_bits()),
+            storage_pressure_object_store_latency_ms: AtomicU64::new(0),
+            storage_pressure_object_store_failure_rate_bits: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 }
@@ -864,6 +907,17 @@ pub fn reset_all() {
         reg.ops_spilled_bytes.store(0, Ordering::Relaxed);
         reg.ops_spill_faults_total.store(0, Ordering::Relaxed);
         reg.operator_runtime.clear();
+        reg.storage_pressure_l0_backlog.store(0, Ordering::Relaxed);
+        reg.storage_pressure_pending_compaction_bytes
+            .store(0, Ordering::Relaxed);
+        reg.storage_pressure_flush_latency_ms
+            .store(0, Ordering::Relaxed);
+        reg.storage_pressure_write_amplification_bits
+            .store(0.0f64.to_bits(), Ordering::Relaxed);
+        reg.storage_pressure_object_store_latency_ms
+            .store(0, Ordering::Relaxed);
+        reg.storage_pressure_object_store_failure_rate_bits
+            .store(0.0f64.to_bits(), Ordering::Relaxed);
     });
 }
 
@@ -1581,6 +1635,135 @@ pub fn record_flush_duration(duration: std::time::Duration) {
     });
 }
 
+// ─── Storage Pressure Admission Signals ──────────────────────────────────────
+
+pub fn set_storage_pressure_signals(signals: &StoragePressureSignals) {
+    with_registry(|reg| {
+        reg.storage_pressure_l0_backlog
+            .store(signals.l0_backlog, Ordering::Relaxed);
+        reg.storage_pressure_pending_compaction_bytes
+            .store(signals.pending_compaction_bytes, Ordering::Relaxed);
+        reg.storage_pressure_flush_latency_ms
+            .store(signals.flush_latency_ms, Ordering::Relaxed);
+        reg.storage_pressure_write_amplification_bits
+            .store(signals.write_amplification.to_bits(), Ordering::Relaxed);
+        reg.storage_pressure_object_store_latency_ms
+            .store(signals.object_store_latency_ms, Ordering::Relaxed);
+        reg.storage_pressure_object_store_failure_rate_bits.store(
+            signals.object_store_failure_rate.to_bits(),
+            Ordering::Relaxed,
+        );
+    });
+}
+
+pub fn read_storage_pressure_signals() -> StoragePressureSignals {
+    with_registry(|reg| StoragePressureSignals {
+        l0_backlog: reg.storage_pressure_l0_backlog.load(Ordering::Relaxed),
+        pending_compaction_bytes: reg
+            .storage_pressure_pending_compaction_bytes
+            .load(Ordering::Relaxed),
+        flush_latency_ms: reg
+            .storage_pressure_flush_latency_ms
+            .load(Ordering::Relaxed),
+        write_amplification: f64::from_bits(
+            reg.storage_pressure_write_amplification_bits
+                .load(Ordering::Relaxed),
+        ),
+        object_store_latency_ms: reg
+            .storage_pressure_object_store_latency_ms
+            .load(Ordering::Relaxed),
+        object_store_failure_rate: f64::from_bits(
+            reg.storage_pressure_object_store_failure_rate_bits
+                .load(Ordering::Relaxed),
+        ),
+    })
+}
+
+pub fn set_storage_pressure_l0_backlog(val: u64) {
+    with_registry(|reg| {
+        reg.storage_pressure_l0_backlog
+            .store(val, Ordering::Relaxed);
+    });
+}
+
+pub fn read_storage_pressure_l0_backlog() -> u64 {
+    with_registry(|reg| reg.storage_pressure_l0_backlog.load(Ordering::Relaxed))
+}
+
+pub fn set_storage_pressure_pending_compaction_bytes(val: u64) {
+    with_registry(|reg| {
+        reg.storage_pressure_pending_compaction_bytes
+            .store(val, Ordering::Relaxed);
+    });
+}
+
+pub fn read_storage_pressure_pending_compaction_bytes() -> u64 {
+    with_registry(|reg| {
+        reg.storage_pressure_pending_compaction_bytes
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn set_storage_pressure_flush_latency_ms(val: u64) {
+    with_registry(|reg| {
+        reg.storage_pressure_flush_latency_ms
+            .store(val, Ordering::Relaxed);
+    });
+}
+
+pub fn read_storage_pressure_flush_latency_ms() -> u64 {
+    with_registry(|reg| {
+        reg.storage_pressure_flush_latency_ms
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn set_storage_pressure_write_amplification(val: f64) {
+    with_registry(|reg| {
+        reg.storage_pressure_write_amplification_bits
+            .store(val.to_bits(), Ordering::Relaxed);
+    });
+}
+
+pub fn read_storage_pressure_write_amplification() -> f64 {
+    with_registry(|reg| {
+        f64::from_bits(
+            reg.storage_pressure_write_amplification_bits
+                .load(Ordering::Relaxed),
+        )
+    })
+}
+
+pub fn set_storage_pressure_object_store_latency_ms(val: u64) {
+    with_registry(|reg| {
+        reg.storage_pressure_object_store_latency_ms
+            .store(val, Ordering::Relaxed);
+    });
+}
+
+pub fn read_storage_pressure_object_store_latency_ms() -> u64 {
+    with_registry(|reg| {
+        reg.storage_pressure_object_store_latency_ms
+            .load(Ordering::Relaxed)
+    })
+}
+
+pub fn set_storage_pressure_object_store_failure_rate(val: f64) {
+    with_registry(|reg| {
+        reg.storage_pressure_object_store_failure_rate_bits
+            .store(val.to_bits(), Ordering::Relaxed);
+    });
+}
+
+pub fn read_storage_pressure_object_store_failure_rate() -> f64 {
+    with_registry(|reg| {
+        f64::from_bits(
+            reg.storage_pressure_object_store_failure_rate_bits
+                .load(Ordering::Relaxed),
+        )
+    })
+}
+
 pub fn prometheus_text() -> String {
     generate_prometheus_metrics()
 }
@@ -2113,6 +2296,59 @@ pub fn generate_prometheus_metrics() -> String {
             "checkpoint_completion_time_ms {}\n\n",
             reg.checkpoint_completion_time_ms.load(Ordering::Relaxed)
         ));
+
+        out.push_str(
+            "# HELP storage_pressure_l0_backlog Gauge showing current L0 file backlog count.\n",
+        );
+        out.push_str("# TYPE storage_pressure_l0_backlog gauge\n");
+        out.push_str(&format!(
+            "storage_pressure_l0_backlog {}\n\n",
+            reg.storage_pressure_l0_backlog.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP storage_pressure_pending_compaction_bytes Gauge showing estimated pending compaction bytes.\n");
+        out.push_str("# TYPE storage_pressure_pending_compaction_bytes gauge\n");
+        out.push_str(&format!(
+            "storage_pressure_pending_compaction_bytes {}\n\n",
+            reg.storage_pressure_pending_compaction_bytes
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP storage_pressure_flush_latency_ms Gauge showing P95 memtable flush latency in milliseconds.\n");
+        out.push_str("# TYPE storage_pressure_flush_latency_ms gauge\n");
+        out.push_str(&format!(
+            "storage_pressure_flush_latency_ms {}\n\n",
+            reg.storage_pressure_flush_latency_ms
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP storage_pressure_write_amplification Gauge showing write amplification ratio.\n");
+        out.push_str("# TYPE storage_pressure_write_amplification gauge\n");
+        out.push_str(&format!(
+            "storage_pressure_write_amplification {}\n\n",
+            f64::from_bits(
+                reg.storage_pressure_write_amplification_bits
+                    .load(Ordering::Relaxed)
+            )
+        ));
+
+        out.push_str("# HELP storage_pressure_object_store_latency_ms Gauge showing P99 object store latency in milliseconds.\n");
+        out.push_str("# TYPE storage_pressure_object_store_latency_ms gauge\n");
+        out.push_str(&format!(
+            "storage_pressure_object_store_latency_ms {}\n\n",
+            reg.storage_pressure_object_store_latency_ms
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP storage_pressure_object_store_failure_rate Gauge showing object store request failure rate.\n");
+        out.push_str("# TYPE storage_pressure_object_store_failure_rate gauge\n");
+        out.push_str(&format!(
+            "storage_pressure_object_store_failure_rate {}\n\n",
+            f64::from_bits(
+                reg.storage_pressure_object_store_failure_rate_bits
+                    .load(Ordering::Relaxed)
+            )
+        ));
     });
     out
 }
@@ -2517,5 +2753,38 @@ mod tests {
         assert!(metrics.contains("view_freshness_lag_end_to_end_ms{view_name=\"active_users\"} 40"));
         assert!(metrics.contains("checkpoint_barrier_flight_time_ms 25"));
         assert!(metrics.contains("checkpoint_completion_time_ms 80"));
+    }
+
+    #[test]
+    fn test_storage_pressure_signals_and_prometheus_export() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        let sigs = StoragePressureSignals {
+            l0_backlog: 12,
+            pending_compaction_bytes: 100 * 1024 * 1024,
+            flush_latency_ms: 600,
+            write_amplification: 18.5,
+            object_store_latency_ms: 1200,
+            object_store_failure_rate: 0.08,
+        };
+        assert!(sigs.is_pressured());
+
+        set_storage_pressure_signals(&sigs);
+        let read = read_storage_pressure_signals();
+        assert_eq!(read.l0_backlog, 12);
+        assert_eq!(read.pending_compaction_bytes, 100 * 1024 * 1024);
+        assert_eq!(read.flush_latency_ms, 600);
+        assert!((read.write_amplification - 18.5).abs() < 1e-6);
+        assert_eq!(read.object_store_latency_ms, 1200);
+        assert!((read.object_store_failure_rate - 0.08).abs() < 1e-6);
+
+        let metrics = generate_prometheus_metrics();
+        assert!(metrics.contains("storage_pressure_l0_backlog 12"));
+        assert!(metrics.contains("storage_pressure_pending_compaction_bytes 104857600"));
+        assert!(metrics.contains("storage_pressure_flush_latency_ms 600"));
+        assert!(metrics.contains("storage_pressure_write_amplification 18.5"));
+        assert!(metrics.contains("storage_pressure_object_store_latency_ms 1200"));
+        assert!(metrics.contains("storage_pressure_object_store_failure_rate 0.08"));
     }
 }
