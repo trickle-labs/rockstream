@@ -276,6 +276,17 @@ pub fn build_initial_corpus() -> SeedCorpus {
         scenario: "recovery_slo.full_outage.one_tb_state",
     });
 
+    // FailureMatrix/v1 — all 11 production failure modes (v0.58).
+    for cell in crate::failure_matrix::FAILURE_MATRIX_CELLS {
+        for &seed in cell.permanent_seeds {
+            corpus.add_law_seed(LawSeed {
+                law_id: cell.id.as_str(),
+                seed,
+                scenario: cell.scenario,
+            });
+        }
+    }
+
     // Regression seeds (boundary values; corpus non-empty per v0.36 exit criterion).
     corpus.add_regression_seed(RegressionSeed {
         seed: 0x0000_0000_0000_0000,

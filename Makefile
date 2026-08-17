@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e e2e-lfs e2e-nextest approve clean error-codes exit-criteria coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
+.PHONY: build test clippy fmt check e2e e2e-lfs e2e-nextest approve clean error-codes exit-criteria failure-matrix coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
 
 # Build the workspace
 build:
@@ -17,7 +17,7 @@ fmt:
 	cargo fmt --all --check
 
 # Run all checks (what CI does)
-check: fmt clippy test error-codes exit-criteria verify path-coupling
+check: fmt clippy test error-codes exit-criteria verify path-coupling failure-matrix
 
 # Run formal verification specs
 verify:
@@ -52,6 +52,11 @@ error-codes:
 # Enforce that every version marked Done has a complete sign-off.
 exit-criteria:
 	bash scripts/check-exit-criteria.sh
+
+# Enforce failure matrix completeness, non-vacuous recovery assertions, test links, and seed references.
+failure-matrix:
+	bash scripts/check-failure-matrix.sh
+	bash scripts/check-failure-matrix.test.sh
 
 # Generate an lcov coverage report for the workspace (requires cargo-llvm-cov).
 coverage:

@@ -20,6 +20,7 @@ pub mod chaos;
 pub mod clock;
 pub mod compaction;
 pub mod coord_faults;
+pub mod failure_matrix;
 pub mod fault_model;
 pub mod law_faults;
 pub mod liveness;
@@ -55,6 +56,10 @@ pub use compaction::{
     apply_tombstone_gc, simulate_donor_cleanup, simulate_split_migration, SimEntry,
 };
 pub use coord_faults::{register_coord_faults, COORD_FAULT_IDS};
+pub use failure_matrix::{
+    all_cells, find_by_id_str, get_failure_mode, validate_registry, FailureMatrixCell,
+    FailureModeId, FAILURE_MATRIX_CELLS,
+};
 pub use fault_model::{FaultEntry, FaultModel};
 pub use law_faults::{register_law_faults, LAW_FAULT_IDS};
 pub use liveness::{DegradedState, LivenessChecker, LivenessStatus};
