@@ -56,7 +56,6 @@ pub struct KafkaSource {
     _connector_id: ConnectorId,
     schema: SchemaRef,
     consumer: StreamConsumer,
-    runtime: Option<tokio::runtime::Runtime>,
     topic: String,
     paused: bool,
     watermarks: BTreeMap<i32, i64>,
@@ -132,7 +131,6 @@ impl KafkaSource {
             _connector_id: connector_id,
             schema,
             consumer,
-            runtime,
             topic: topic.to_owned(),
             paused: false,
             watermarks: BTreeMap::new(),
@@ -283,58 +281,55 @@ impl KafkaSource {
         Ok(())
     }
 
-    fn next_record(&mut self) -> Result<Option<KafkaRecord>, SourceError> {
+    async fn next_record(&mut self) -> Result<Option<KafkaRecord>, SourceError> {
         if let Some(record) = self.pending_record.take() {
             return Ok(Some(record));
         }
-        let receive =
-            async { tokio::time::timeout(Duration::from_millis(25), self.consumer.recv()).await };
-        let message = match if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(receive))
-        } else {
-            self.runtime
-                .as_ref()
-                .expect("runtime exists outside Tokio")
-                .block_on(receive)
-        } {
-            Ok(Ok(message)) => message,
-            Ok(Err(error)) => {
-                return Err(SourceError::PollDeltaFailed {
-                    reason: format!(
+        loop {
+            let message = match tokio::time::timeout(
+                Duration::from_millis(25),
+                self.consumer.recv(),
+            )
+            .await
+            {
+                Ok(Ok(message)) => message,
+                Ok(Err(error)) => {
+                    let reason = format!(
                         "Kafka poll failed: {error}. Next steps: retry after verifying broker connectivity"
-                    ),
-                });
-            }
-            Err(_) => return Ok(None),
-        };
-        let payload = message
-            .payload()
-            .ok_or_else(|| SourceError::PollDeltaFailed {
-                reason: "Kafka record has no payload. Next steps: publish JSON source records"
-                    .to_string(),
-            })?;
-        let offset = u64::try_from(message.offset()).unwrap_or(0);
-        let (timestamp, values, weight) = match decode_kafka_payload(payload) {
-            Ok(body) => body,
-            Err(error) => {
-                rockstream_types::dlq::quarantine_record(
-                    &self.topic,
-                    offset,
-                    "RS-1003",
-                    &format!("Kafka record payload is not valid JSON shape: {error}"),
-                    payload,
-                );
-                return self.next_record();
-            }
-        };
-        Ok(Some(KafkaRecord {
-            offset,
-            partition: message.partition(),
-            timestamp,
-            values,
-            weight,
-            bytes: payload.len(),
-        }))
+                    );
+                    return Err(SourceError::PollDeltaFailed { reason });
+                }
+                Err(_) => return Ok(None),
+            };
+            let payload = message
+                .payload()
+                .ok_or_else(|| SourceError::PollDeltaFailed {
+                    reason: "Kafka record has no payload. Next steps: publish JSON source records"
+                        .to_string(),
+                })?;
+            let offset = u64::try_from(message.offset()).unwrap_or(0);
+            let (timestamp, values, weight) = match decode_kafka_payload(payload) {
+                Ok(body) => body,
+                Err(error) => {
+                    rockstream_types::dlq::quarantine_record(
+                        &self.topic,
+                        offset,
+                        "RS-1003",
+                        &format!("Kafka record payload is not valid JSON shape: {error}"),
+                        payload,
+                    );
+                    continue;
+                }
+            };
+            return Ok(Some(KafkaRecord {
+                offset,
+                partition: message.partition(),
+                timestamp,
+                values,
+                weight,
+                bytes: payload.len(),
+            }));
+        }
     }
 
     fn build_batch(&self, records: &[KafkaRecord]) -> Result<Vec<RecordBatch>, SourceError> {
@@ -435,7 +430,7 @@ impl SourceConnector for KafkaSource {
         let mut records = Vec::with_capacity(record_limit);
         let mut bytes = 0;
         while records.len() < record_limit {
-            let Some(record) = self.next_record()? else {
+            let Some(record) = self.next_record().await? else {
                 break;
             };
             if record.bytes > max_bytes && records.is_empty() {

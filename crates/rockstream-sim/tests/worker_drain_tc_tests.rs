@@ -187,7 +187,15 @@ async fn drain_completes_zero_downtime_tc() {
         );
         return;
     }
-    let cluster = TcCluster::boot("drain").await;
+    let run_id = format!(
+        "drain-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let cluster = TcCluster::boot(&run_id).await;
     for worker_id in [1u64, 2u64] {
         let reg = WorkerRegistration::new(
             WorkerId(worker_id),
@@ -209,6 +217,8 @@ async fn drain_completes_zero_downtime_tc() {
         .join("target/debug/rockstream");
     let status = std::process::Command::new(binary)
         .args([
+            "--identity-role",
+            "admin",
             "cluster",
             "workers",
             "drain",

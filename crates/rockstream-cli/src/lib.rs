@@ -797,6 +797,12 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             // second `gateway-shard/` directory); standalone `--role
             // gateway` opens its own shard, since there's no worker sharing
             // this process with it.
+            #[cfg(unix)]
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .unwrap_or_else(|_| panic!("failed to install SIGTERM handler"));
+
             let gateway_result = if let Some((shard_db, store)) = shared_gateway_shard.take() {
                 start_gateway_with_shard(opts, shard_db, store, "db").await
             } else {
@@ -818,12 +824,6 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     // Block until Ctrl-C (SIGINT) or SIGTERM.
                     #[cfg(unix)]
                     {
-                        use tokio::signal::unix::{signal, SignalKind};
-                        let mut sigterm =
-                            signal(SignalKind::terminate()).unwrap_or_else(|_| {
-                                // Fallback: if SIGTERM handler fails, just wait for Ctrl-C.
-                                panic!("failed to install SIGTERM handler")
-                            });
                         tokio::select! {
                             _ = tokio::signal::ctrl_c() => {}
                             _ = sigterm.recv() => {}
