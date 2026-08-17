@@ -58,14 +58,26 @@ def main():
     violations = 0
 
     for row in table_rows:
-        # Table columns: | ID | Scenario | Category | Fault Injection | Asserted Recovery Outcome | Owning Version | Deterministic Test | Permanent Seeds |
+        # Table columns: | ID | Scenario | Category | Fault Injection | Asserted Recovery Outcome | Owning Version | Deterministic Test | Permanent Seeds | Real-Backend Counterpart Test | Budget | Absolute SLO Target | Status / Reasoned Exemption |
         cols = [c.strip() for c in row.split("|")[1:-1]]
         if len(cols) < 8:
-            print(f"VIOLATION: Malformed table row (expected 8 columns, found {len(cols)}): {row}", file=sys.stderr)
+            print(f"VIOLATION: Malformed table row (expected at least 8 columns, found {len(cols)}): {row}", file=sys.stderr)
             violations += 1
             continue
 
-        raw_id, scenario, category, fault_inj, outcome, owning_ver, test_link, seeds = cols[:8]
+        raw_id = cols[0]
+        scenario = cols[1]
+        category = cols[2]
+        fault_inj = cols[3]
+        outcome = cols[4]
+        owning_ver = cols[5]
+        test_link = cols[6]
+        seeds = cols[7]
+        real_backend_test = cols[8] if len(cols) > 8 else ""
+        budget = cols[9] if len(cols) > 9 else ""
+        slo_target = cols[10] if len(cols) > 10 else ""
+        exemption = cols[11] if len(cols) > 11 else ""
+
         fm_id = raw_id.replace("`", "").strip()
 
         if not fm_id.startswith("FM-"):
@@ -79,6 +91,10 @@ def main():
             "owning_ver": owning_ver,
             "test_link": test_link.replace("`", "").strip(),
             "seeds": seeds.replace("`", "").strip(),
+            "real_backend_test": real_backend_test.replace("`", "").strip(),
+            "budget": budget.replace("`", "").strip(),
+            "slo_target": slo_target.replace("`", "").strip(),
+            "exemption": exemption.replace("`", "").strip(),
         }
 
     # 1. Check all required modes are present
@@ -107,7 +123,7 @@ def main():
                     violations += 1
                     break
 
-        # 4. Check test resolution
+        # 4. Check deterministic test resolution
         test_link = cell["test_link"]
         if not test_link or test_link == "---":
             print(f"VIOLATION: {req_mode} has missing deterministic test link", file=sys.stderr)
@@ -134,6 +150,50 @@ def main():
         if not seeds_text or seeds_text == "---" or not re.search(r"0x[0-9a-fA-F_]+", seeds_text):
             print(f"VIOLATION: {req_mode} missing permanent seed corpus reference (found '{seeds_text}')", file=sys.stderr)
             violations += 1
+
+        # 6. Check real-backend counterpart test resolution or reasoned exemption
+        real_backend = cell["real_backend_test"]
+        exemption = cell["exemption"]
+        has_real_test = bool(real_backend and real_backend != "---")
+        has_exemption = bool(exemption and ("Reasoned Exemption" in exemption or "exemption" in exemption.lower()))
+
+        if not has_real_test and not has_exemption:
+            print(f"VIOLATION: {req_mode} has neither a real backend test counterpart nor a reasoned exemption", file=sys.stderr)
+            violations += 1
+
+        if has_real_test:
+            if "::" in real_backend:
+                rb_file_rel, rb_symbol = real_backend.split("::", 1)
+            else:
+                rb_file_rel, rb_symbol = real_backend, ""
+            rb_file_path = os.path.join(root, rb_file_rel)
+            if not os.path.isfile(rb_file_path):
+                print(f"VIOLATION: {req_mode} real backend test file missing: {rb_file_rel}", file=sys.stderr)
+                violations += 1
+            elif rb_symbol:
+                with open(rb_file_path, "r", encoding="utf-8") as rbf:
+                    rb_file_text = rbf.read()
+                if rb_symbol not in rb_file_text:
+                    print(f"VIOLATION: {req_mode} real backend test symbol '{rb_symbol}' missing in {rb_file_rel}", file=sys.stderr)
+                    violations += 1
+
+        # 7. Check time budget
+        budget_str = cell["budget"].rstrip("s").strip()
+        if not budget_str or not budget_str.isdigit() or int(budget_str) <= 0:
+            print(f"VIOLATION: {req_mode} has invalid or missing time budget: '{cell['budget']}'", file=sys.stderr)
+            violations += 1
+
+        # 8. Check absolute SLO target
+        slo_text = cell["slo_target"].lower()
+        if not slo_text or slo_text == "---":
+            print(f"VIOLATION: {req_mode} has empty absolute SLO target", file=sys.stderr)
+            violations += 1
+        else:
+            for pat in VACUOUS_PATTERNS:
+                if re.search(pat, slo_text):
+                    print(f"VIOLATION: {req_mode} has vacuous absolute SLO target: '{cell['slo_target']}' (matches '{pat}')", file=sys.stderr)
+                    violations += 1
+                    break
 
     if violations > 0:
         print(f"\nFailed with {violations} violation(s).", file=sys.stderr)

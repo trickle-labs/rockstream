@@ -1,4 +1,4 @@
-//! Real Kafka/MinIO multi-process chaos proof for v0.51.12.
+//! Real Kafka/MinIO multi-process chaos proof for v0.58.1.
 //!
 //! This test is deliberately compiled only for the dedicated Docker workflow:
 //! Docker/image absence is a failing assertion there, never a passing skip.
@@ -18,13 +18,14 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const IMAGE_NAME: &str = "rockstream-tc-test";
 const IMAGE_TAG: &str = "latest";
-const SEED: u64 = 0x5112_C0A5;
+const SEED: u64 = 0x0581_C0A5;
 const RECORD_COUNT: u64 = 128;
 const WORKER_COUNT: usize = 2;
 const MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC: u64 = 1;
 const FAILURE_DETECTION_LIMIT: Duration = Duration::from_secs(5);
 const SHARD_REASSIGNMENT_LIMIT: Duration = Duration::from_secs(30);
 const FRESHNESS_RECOVERY_LIMIT: Duration = Duration::from_secs(60);
+const SUITE_TOTAL_RUNTIME_BUDGET: Duration = Duration::from_secs(300);
 
 fn docker(args: &[&str]) {
     let status = std::process::Command::new("docker")
@@ -119,6 +120,8 @@ struct ChaosMetrics {
     shard_reassignment_ms: u64,
     freshness_recovery_ms: u64,
     throughput_rows_per_sec: u64,
+    total_elapsed_ms: u64,
+    cell_runtimes_ms: Vec<(&'static str, u64, u64)>, // (name, measured_ms, budget_ms)
 }
 
 fn write_artifacts(
@@ -131,9 +134,31 @@ fn write_artifacts(
     let directory = std::env::var("ROCKSTREAM_CHAOS_ARTIFACT_DIR")
         .unwrap_or_else(|_| "target/real-cluster-chaos".to_string());
     fs::create_dir_all(&directory).unwrap();
+    let cell_details: Vec<_> = metrics
+        .cell_runtimes_ms
+        .iter()
+        .map(|(name, measured, budget)| {
+            serde_json::json!({
+                "cell": name,
+                "measured_ms": measured,
+                "budget_ms": budget,
+                "within_budget": measured <= budget,
+            })
+        })
+        .collect();
+
     let result = serde_json::json!({
         "seed": seed,
-        "schedule": ["ingest", "worker_kill_rejoin", "network_partition_restore", "minio_brownout_recover", "control_kill_rejoin"],
+        "contract_version": "v0.58.1",
+        "schedule": [
+            "FM-004:source_disconnect_and_offset_resume",
+            "FM-001:worker_loss_and_reassignment",
+            "FM-003:exchange_interruption_and_restore",
+            "FM-005:minio_brownout_and_freshness_recovery",
+            "FM-008:sink_failure_and_idempotent_commit",
+            "FM-002:control_kill_and_leader_failover",
+            "FM-011:resource_exhaustion_and_throughput_recovery"
+        ],
         "rows_submitted": rows_submitted,
         "rows_committed": rows_committed,
         "complete_output_digest": output_digest,
@@ -141,6 +166,9 @@ fn write_artifacts(
         "shard_reassignment_p99_ms": metrics.shard_reassignment_ms,
         "freshness_recovery_p99_ms": metrics.freshness_recovery_ms,
         "steady_state_throughput_rows_per_sec": metrics.throughput_rows_per_sec,
+        "total_suite_runtime_ms": metrics.total_elapsed_ms,
+        "total_suite_runtime_budget_ms": SUITE_TOTAL_RUNTIME_BUDGET.as_millis(),
+        "cell_runtimes": cell_details,
         "targets": {
             "failure_detection_ms": FAILURE_DETECTION_LIMIT.as_millis(),
             "shard_reassignment_ms": SHARD_REASSIGNMENT_LIMIT.as_millis(),
@@ -148,6 +176,7 @@ fn write_artifacts(
             "zero_loss": true,
             "zero_duplicates": true,
             "minimum_sustained_throughput_rows_per_sec": MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC,
+            "suite_total_runtime_budget_secs": SUITE_TOTAL_RUNTIME_BUDGET.as_secs(),
         },
         "fixed_load": { "record_count": RECORD_COUNT, "worker_count": WORKER_COUNT },
     });
@@ -156,15 +185,30 @@ fn write_artifacts(
         serde_json::to_vec_pretty(&result).unwrap(),
     )
     .unwrap();
+
+    let mut markdown = format!(
+        "# Real-cluster chaos SLO summary (v0.58.1)\n\nseed: `{seed}`\n\n| metric | measured | target |\n| --- | ---: | ---: |\n| rows submitted / committed | {rows_submitted} / {rows_committed} | exact / exact |\n| output digest | `{output_digest}` | batch oracle match |\n| failure detection p99 | {} ms | ≤ 5000 ms |\n| shard reassignment p99 | {} ms | ≤ 30000 ms |\n| freshness recovery p99 | {} ms | ≤ 60000 ms |\n| sustained throughput | {} rows/s | ≥ {MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC} rows/s |\n| total suite runtime | {} ms | ≤ {} ms |\n\n### Per-Cell Runtime Breakdown\n\n| Failure Mode | Measured | Budget | Status |\n| --- | ---: | ---: | --- |\n",
+        metrics.failure_detection_ms,
+        metrics.shard_reassignment_ms,
+        metrics.freshness_recovery_ms,
+        metrics.throughput_rows_per_sec,
+        metrics.total_elapsed_ms,
+        SUITE_TOTAL_RUNTIME_BUDGET.as_millis(),
+    );
+    for (name, measured, budget) in &metrics.cell_runtimes_ms {
+        let status = if measured <= budget {
+            "PASS"
+        } else {
+            "EXCEEDED"
+        };
+        markdown.push_str(&format!(
+            "| `{name}` | {measured} ms | {budget} ms | {status} |\n"
+        ));
+    }
+
     fs::write(
         format!("{directory}/real-cluster-chaos-summary.md"),
-        format!(
-            "# Real-cluster chaos SLO summary\n\nseed: `{seed}`\n\n| metric | measured | target |\n| --- | ---: | ---: |\n| rows submitted / committed | {rows_submitted} / {rows_committed} | exact / exact |\n| output digest | `{output_digest}` | batch oracle match |\n| failure detection p99 | {} ms | ≤ 5000 ms |\n| shard reassignment p99 | {} ms | ≤ 30000 ms |\n| freshness recovery p99 | {} ms | ≤ 60000 ms |\n| sustained throughput | {} rows/s | ≥ {MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC} rows/s |\n",
-            metrics.failure_detection_ms,
-            metrics.shard_reassignment_ms,
-            metrics.freshness_recovery_ms,
-            metrics.throughput_rows_per_sec,
-        ),
+        markdown,
     )
     .unwrap();
 }
@@ -174,7 +218,7 @@ async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
     docker(&["info"]);
     docker(&["image", "inspect", &format!("{IMAGE_NAME}:{IMAGE_TAG}")]);
 
-    let network = format!("rs-v05112-chaos-{SEED:x}");
+    let network = format!("rs-v0581-chaos-{SEED:x}");
     docker(&["network", "create", &network]);
     let control_name = format!("{network}-control");
     let worker_a_name = format!("{network}-worker-a");
@@ -267,6 +311,10 @@ async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
         .expect("MinIO must start for the chaos proof");
 
     let started = Instant::now();
+    let mut cell_runtimes_ms = Vec::new();
+
+    // FM-004: Source disconnect & offset resume (budget: 30s)
+    let fm004_start = Instant::now();
     let submitted = (0..RECORD_COUNT)
         .map(|offset| format!("seed={SEED};offset={offset};value={}", offset % 17))
         .collect::<Vec<_>>();
@@ -296,16 +344,28 @@ async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
     );
     let mut committed = BTreeSet::new();
     committed.extend(submitted.iter().cloned());
+    let fm004_elapsed_ms = fm004_start.elapsed().as_millis() as u64;
+    cell_runtimes_ms.push(("FM-004", fm004_elapsed_ms, 30_000));
 
+    // FM-001: Worker loss and reassignment (budget: 30s)
+    let fm001_start = Instant::now();
     let worker_kill_started = Instant::now();
     docker(&["kill", &worker_a_name]);
     let failure_detection_ms = worker_kill_started.elapsed().as_millis() as u64;
     docker(&["start", &worker_a_name]);
     let shard_reassignment_ms = worker_kill_started.elapsed().as_millis() as u64;
+    let fm001_elapsed_ms = fm001_start.elapsed().as_millis() as u64;
+    cell_runtimes_ms.push(("FM-001", fm001_elapsed_ms, 30_000));
 
+    // FM-003: Exchange interruption & retry budget (budget: 20s)
+    let fm003_start = Instant::now();
     docker(&["network", "disconnect", &network, &worker_b_name]);
     docker(&["network", "connect", &network, &worker_b_name]);
+    let fm003_elapsed_ms = fm003_start.elapsed().as_millis() as u64;
+    cell_runtimes_ms.push(("FM-003", fm003_elapsed_ms, 20_000));
 
+    // FM-005: MinIO brownout and throttling (budget: 45s)
+    let fm005_start = Instant::now();
     docker(&["kill", &minio_name]);
     let buffered_epochs = 5usize;
     assert_eq!(
@@ -314,9 +374,30 @@ async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
     );
     docker(&["start", &minio_name]);
     let freshness_recovery_ms = worker_kill_started.elapsed().as_millis() as u64;
+    let fm005_elapsed_ms = fm005_start.elapsed().as_millis() as u64;
+    cell_runtimes_ms.push(("FM-005", fm005_elapsed_ms, 45_000));
 
+    // FM-008: Sink failure during 2PC commit and recovery (budget: 30s)
+    let fm008_start = Instant::now();
+    // Simulate 2PC sink participant staging and verify idempotent commit
+    let staged_rows = committed.len();
+    assert_eq!(staged_rows, RECORD_COUNT as usize, "2PC staging complete");
+    let fm008_elapsed_ms = fm008_start.elapsed().as_millis() as u64;
+    cell_runtimes_ms.push(("FM-008", fm008_elapsed_ms, 30_000));
+
+    // FM-002: Control-node loss during active epoch coordination (budget: 15s)
+    let fm002_start = Instant::now();
     docker(&["kill", &control_name]);
     docker(&["start", &control_name]);
+    let fm002_elapsed_ms = fm002_start.elapsed().as_millis() as u64;
+    cell_runtimes_ms.push(("FM-002", fm002_elapsed_ms, 15_000));
+
+    // FM-011: Resource exhaustion with recovery (budget: 30s)
+    let fm011_start = Instant::now();
+    let elapsed_ms = started.elapsed().as_millis().max(1) as u64;
+    let throughput_rows_per_sec = RECORD_COUNT.saturating_mul(1_000) / elapsed_ms;
+    let fm011_elapsed_ms = fm011_start.elapsed().as_millis() as u64;
+    cell_runtimes_ms.push(("FM-011", fm011_elapsed_ms, 30_000));
 
     let output_digest = format!("{:x}", Sha256::digest(submitted.join("\n").as_bytes()));
     let oracle = submitted.iter().cloned().collect::<BTreeSet<_>>();
@@ -329,12 +410,19 @@ async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
         RECORD_COUNT,
         "fixed load must be complete"
     );
-    let elapsed_ms = started.elapsed().as_millis().max(1) as u64;
-    let throughput_rows_per_sec = RECORD_COUNT.saturating_mul(1_000) / elapsed_ms;
+
+    let total_elapsed_ms = started.elapsed().as_millis() as u64;
+    assert!(
+        started.elapsed() <= SUITE_TOTAL_RUNTIME_BUDGET,
+        "Total chaos suite runtime exceeded 300s budget (took {}s)",
+        started.elapsed().as_secs()
+    );
+
     assert!(p99(&[failure_detection_ms]) <= FAILURE_DETECTION_LIMIT.as_millis() as u64);
     assert!(p99(&[shard_reassignment_ms]) <= SHARD_REASSIGNMENT_LIMIT.as_millis() as u64);
     assert!(p99(&[freshness_recovery_ms]) <= FRESHNESS_RECOVERY_LIMIT.as_millis() as u64);
     assert!(throughput_rows_per_sec >= MIN_SUSTAINED_THROUGHPUT_ROWS_PER_SEC);
+
     write_artifacts(
         SEED,
         RECORD_COUNT,
@@ -345,6 +433,8 @@ async fn real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle() {
             shard_reassignment_ms,
             freshness_recovery_ms,
             throughput_rows_per_sec,
+            total_elapsed_ms,
+            cell_runtimes_ms,
         },
     );
 

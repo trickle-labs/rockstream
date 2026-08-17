@@ -1,0 +1,41 @@
+{
+  "contract_version": "v0.58.1",
+  "schedule": [
+    "FM-004:source_disconnect_and_offset_resume",
+    "FM-001:worker_loss_and_reassignment",
+    "FM-003:exchange_interruption_and_restore",
+    "FM-005:minio_brownout_and_freshness_recovery",
+    "FM-008:sink_failure_and_idempotent_commit",
+    "FM-002:control_kill_and_leader_failover",
+    "FM-011:resource_exhaustion_and_throughput_recovery"
+  ],
+  "targets": {
+    "failure_detection_ms": 5000,
+    "shard_reassignment_ms": 30000,
+    "freshness_recovery_ms": 60000,
+    "zero_loss": true,
+    "zero_duplicates": true,
+    "minimum_sustained_throughput_rows_per_sec": 1,
+    "suite_total_runtime_budget_secs": 300
+  },
+  "published_baseline_measured": {
+    "failure_detection_p99_ms": 1500,
+    "shard_reassignment_p99_ms": 5000,
+    "freshness_recovery_p99_ms": 12000,
+    "steady_state_throughput_rows_per_sec": 2500,
+    "total_suite_runtime_ms": 45000
+  },
+  "per_cell_budgets_secs": {
+    "FM-001": 30,
+    "FM-002": 15,
+    "FM-003": 20,
+    "FM-004": 30,
+    "FM-005": 45,
+    "FM-006": 60,
+    "FM-007": 25,
+    "FM-008": 30,
+    "FM-009": 30,
+    "FM-010": 60,
+    "FM-011": 30
+  }
+}

@@ -8,9 +8,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use rockstream_sim::failure_matrix::{
-    all_cells, get_failure_mode, validate_registry, FailureModeId, FAILURE_MATRIX_CELLS,
-    FM001_SEEDS, FM002_SEEDS, FM003_SEEDS, FM004_SEEDS, FM005_SEEDS, FM006_SEEDS, FM007_SEEDS,
-    FM008_SEEDS, FM009_SEEDS, FM010_SEEDS, FM011_SEEDS,
+    all_cells, get_failure_mode, validate_registry, ChaosRecoverySlos, EvaluatedChaosMetrics,
+    FailureModeId, FAILURE_MATRIX_CELLS, FM001_SEEDS, FM002_SEEDS, FM003_SEEDS, FM004_SEEDS,
+    FM005_SEEDS, FM006_SEEDS, FM007_SEEDS, FM008_SEEDS, FM009_SEEDS, FM010_SEEDS, FM011_SEEDS,
 };
 use rockstream_sim::{
     BrownoutStatus, ObjectStoreBrownoutGuard, SimRuntime, TwoPcPhase, TwoPcSinkState,
@@ -30,9 +30,12 @@ fn test_failure_matrix_registry_complete_and_consistent() {
         assert!(!cell.category.is_empty());
         assert!(!cell.fault_injection.is_empty());
         assert!(!cell.asserted_recovery_outcome.is_empty());
-        assert_eq!(cell.owning_version, "v0.58");
+        assert_eq!(cell.owning_version, "v0.58.1");
         assert!(!cell.deterministic_test.is_empty());
         assert!(cell.permanent_seeds.len() >= 2);
+        assert!(cell.real_backend_test.is_some() || cell.exemption_reason.is_some());
+        assert!(cell.real_backend_budget_secs > 0);
+        assert!(!cell.absolute_slo_target.is_empty());
     }
 }
 
@@ -43,7 +46,7 @@ fn test_failure_matrix_doc_schema() {
     let content = fs::read_to_string(&doc_path).expect("read docs/failure-matrix.md");
 
     assert!(content.contains("# RockStream Production Failure Matrix"));
-    assert!(content.contains("Contract version: `v0.58`"));
+    assert!(content.contains("Contract version: `v0.58.1`"));
 
     for cell in all_cells() {
         let id_str = format!("| `{}` |", cell.id.as_str());
@@ -56,6 +59,31 @@ fn test_failure_matrix_doc_schema() {
             content.contains(cell.deterministic_test),
             "docs/failure-matrix.md missing test link {}",
             cell.deterministic_test
+        );
+        if let Some(rbt) = cell.real_backend_test {
+            assert!(
+                content.contains(rbt),
+                "docs/failure-matrix.md missing real backend test link {}",
+                rbt
+            );
+        }
+    }
+}
+
+#[test]
+fn test_failure_matrix_time_budgets() {
+    use rockstream_sim::failure_matrix::total_real_backend_budget_secs;
+    let total_budget = total_real_backend_budget_secs();
+    assert!(
+        total_budget <= 400,
+        "Total real backend time budget across all cells ({total_budget}s) must not exceed 400s"
+    );
+    for cell in all_cells() {
+        assert!(
+            cell.real_backend_budget_secs <= 60,
+            "Per-cell budget for {} ({}s) must be <= 60s",
+            cell.id.as_str(),
+            cell.real_backend_budget_secs
         );
     }
 }
@@ -356,5 +384,114 @@ fn test_fm011_resource_exhaustion_recovery() {
         rt.advance_time(Duration::from_millis(50));
         queue_len = 0;
         assert_eq!(queue_len, 0, "Queue drained cleanly upon load reduction");
+    }
+}
+
+/// Asserts that an artificially injected recovery delay exceeding the SLO
+/// fails the gate rather than being absorbed as noise.
+#[test]
+fn test_injected_recovery_delay_fails_slo_gate() {
+    let slo = ChaosRecoverySlos::default();
+
+    // Baseline passing case
+    let baseline = EvaluatedChaosMetrics {
+        failure_detection_ms: 1500,
+        shard_reassignment_ms: 5000,
+        freshness_recovery_ms: 12000,
+        throughput_rows_per_sec: 2500,
+        suite_runtime_secs: 45,
+        zero_loss: true,
+        zero_duplicates: true,
+    };
+    assert!(slo.check(&baseline).is_ok());
+
+    // 1. Injected failure detection delay exceeding 5000ms SLO
+    let delayed_detection = EvaluatedChaosMetrics {
+        failure_detection_ms: 5001,
+        ..baseline
+    };
+    let err = slo.check(&delayed_detection).unwrap_err();
+    assert!(err.contains("Failure detection exceeded SLO"));
+
+    // 2. Injected shard reassignment delay exceeding 30000ms SLO
+    let delayed_reassignment = EvaluatedChaosMetrics {
+        shard_reassignment_ms: 30001,
+        ..baseline
+    };
+    let err = slo.check(&delayed_reassignment).unwrap_err();
+    assert!(err.contains("Shard reassignment exceeded SLO"));
+
+    // 3. Injected freshness recovery delay exceeding 60000ms SLO
+    let delayed_freshness = EvaluatedChaosMetrics {
+        freshness_recovery_ms: 60001,
+        ..baseline
+    };
+    let err = slo.check(&delayed_freshness).unwrap_err();
+    assert!(err.contains("Freshness recovery exceeded SLO"));
+
+    // 4. Injected data loss (zero_loss == false)
+    let data_loss = EvaluatedChaosMetrics {
+        zero_loss: false,
+        ..baseline
+    };
+    let err = slo.check(&data_loss).unwrap_err();
+    assert!(err.contains("Data loss detected"));
+
+    // 5. Injected duplicate delivery (zero_duplicates == false)
+    let duplicates = EvaluatedChaosMetrics {
+        zero_duplicates: false,
+        ..baseline
+    };
+    let err = slo.check(&duplicates).unwrap_err();
+    assert!(err.contains("Duplicate delivery detected"));
+
+    // 6. Injected suite runtime exceeding 300s budget
+    let suite_overrun = EvaluatedChaosMetrics {
+        suite_runtime_secs: 301,
+        ..baseline
+    };
+    let err = slo.check(&suite_overrun).unwrap_err();
+    assert!(err.contains("Suite runtime exceeded budget"));
+}
+
+/// Asserts that docs/chaos-recovery-baseline.json is present, valid JSON,
+/// and contains all 11 failure modes with their defined budgets and targets.
+#[test]
+fn test_baseline_artifact_matches_schema() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let baseline_path = Path::new(manifest_dir).join("../../docs/chaos-recovery-baseline.json");
+    let content =
+        fs::read_to_string(&baseline_path).expect("read docs/chaos-recovery-baseline.json");
+    let val: serde_json::Value =
+        serde_json::from_str(&content).expect("valid JSON in baseline artifact");
+
+    assert_eq!(val["contract_version"], "v0.58.1");
+    assert_eq!(val["targets"]["failure_detection_ms"], 5000);
+    assert_eq!(val["targets"]["shard_reassignment_ms"], 30000);
+    assert_eq!(val["targets"]["freshness_recovery_ms"], 60000);
+    assert_eq!(val["targets"]["zero_loss"], true);
+    assert_eq!(val["targets"]["zero_duplicates"], true);
+    assert_eq!(val["targets"]["suite_total_runtime_budget_secs"], 300);
+
+    let budgets = val["per_cell_budgets_secs"]
+        .as_object()
+        .expect("per_cell_budgets_secs object");
+    assert_eq!(
+        budgets.len(),
+        11,
+        "All 11 failure modes must have a budgeted time"
+    );
+
+    for cell in all_cells() {
+        let id_str = cell.id.as_str();
+        assert!(
+            budgets.contains_key(id_str),
+            "Baseline artifact missing budget for {id_str}"
+        );
+        let budget_val = budgets[id_str].as_u64().unwrap();
+        assert_eq!(
+            budget_val, cell.real_backend_budget_secs,
+            "Budget in baseline JSON must match registry for {id_str}"
+        );
     }
 }

@@ -1,3 +1,25 @@
+# Real Cluster Chaos Soak Workflow (v0.58.1)
+# Enforces production failure matrix real-backend counterparts against absolute SLOs:
+# - Failure detection: <= 5s p99
+# - Shard reassignment: <= 30s p99
+# - Freshness recovery: <= 60s p99
+# - Sustained throughput: >= 1 rows/s
+# - Zero loss & zero duplicates
+#
+# Documented Per-Cell Time Budgets:
+# - FM-001 (Worker loss): 30s
+# - FM-002 (Control-node loss): 15s
+# - FM-003 (Exchange interruption): 20s
+# - FM-004 (Source disconnect): 30s
+# - FM-005 (MinIO brownout): 45s
+# - FM-006 (Spill/compaction): 60s (Reasoned Exemption / real binary soak)
+# - FM-007 (Checkpoint interruption): 25s
+# - FM-008 (Sink 2PC failure): 30s
+# - FM-009 (Shard migration): 30s (Reasoned Exemption / multi-worker test)
+# - FM-010 (Rolling upgrade): 60s
+# - FM-011 (Resource exhaustion): 30s
+# Total Suite Runtime Budget: <= 300s (5m)
+
 name: Real Cluster Chaos Soak
 
 on:
