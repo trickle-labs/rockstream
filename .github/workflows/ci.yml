@@ -58,6 +58,8 @@ jobs:
       - name: cargo test
         env:
           ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER: "1"
+          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "60"
+          ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS: "10"
         run: |
           cargo test --workspace --exclude rockstream-connectors
           cargo test -p rockstream-connectors --lib --tests -- --test-threads=1
@@ -240,6 +242,8 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
           ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER: "1"
+          ROCKSTREAM_RESOURCE_SOAK_DURATION_SECS: "60"
+          ROCKSTREAM_RESOURCE_SOAK_SAMPLE_INTERVAL_SECS: "10"
         run: |
           cargo llvm-cov --workspace --lib --tests --no-report
           cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests
