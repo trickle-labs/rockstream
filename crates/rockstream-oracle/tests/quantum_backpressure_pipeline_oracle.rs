@@ -324,7 +324,7 @@ async fn quantum_coupled_exchange_rechunking_incremental_equals_batch() {
     let aggregate = AggregateOp::new(OperatorId(2));
 
     let mut rng = StdRng::seed_from_u64(0xA11CE);
-    let mut live = BTreeMap::new();
+    let mut live: BTreeMap<i64, i64> = BTreeMap::new();
     let mut net_input: BTreeMap<(i64, i64), i64> = BTreeMap::new();
     let mut incremental_agg: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
     let mut seq = 0u64;
@@ -438,7 +438,7 @@ async fn durable_fallback_after_fast_path_failure_incremental_equals_batch() {
     let aggregate = AggregateOp::new(OperatorId(2));
 
     let mut rng = StdRng::seed_from_u64(0xFEED5);
-    let mut live = BTreeMap::new();
+    let mut live: BTreeMap<i64, i64> = BTreeMap::new();
     let mut net_input: BTreeMap<(i64, i64), i64> = BTreeMap::new();
     let mut incremental_agg: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
     let mut sent_epochs: Vec<u64> = Vec::new();
