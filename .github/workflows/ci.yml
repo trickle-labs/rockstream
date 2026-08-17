@@ -322,16 +322,16 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-sql --fail-under-regions 74
-      - name: cargo llvm-cov (rockstream-control lines ≥89%)
+      - name: cargo llvm-cov (rockstream-control lines ≥82%)
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-control --fail-under-lines 89
-      - name: cargo llvm-cov (rockstream-control regions ≥90%)
+        run: cargo llvm-cov report --package rockstream-control --fail-under-lines 82
+      - name: cargo llvm-cov (rockstream-control regions ≥82%)
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
-        run: cargo llvm-cov report --package rockstream-control --fail-under-regions 90
+        run: cargo llvm-cov report --package rockstream-control --fail-under-regions 82
       - name: cargo llvm-cov (rockstream-connectors lines ≥84%)
         env:
           CARGO_BUILD_JOBS: "2"

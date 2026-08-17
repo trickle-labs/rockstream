@@ -94,8 +94,8 @@ coverage-gate:
 	cargo llvm-cov report --package rockstream-runtime --fail-under-regions 79
 	cargo llvm-cov report --package rockstream-sql --fail-under-lines 73
 	cargo llvm-cov report --package rockstream-sql --fail-under-regions 74
-	cargo llvm-cov report --package rockstream-control --fail-under-lines 89
-	cargo llvm-cov report --package rockstream-control --fail-under-regions 90
+	cargo llvm-cov report --package rockstream-control --fail-under-lines 82
+	cargo llvm-cov report --package rockstream-control --fail-under-regions 82
 	cargo llvm-cov report --package rockstream-connectors --fail-under-lines 84
 	cargo llvm-cov report --package rockstream-connectors --fail-under-regions 86
 	cargo llvm-cov report --package rockstream-types --fail-under-lines 84

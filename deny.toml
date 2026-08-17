@@ -23,6 +23,7 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
+    "NCSA",
     # Permissive licenses from DataFusion/Arrow transitive deps:
     "CC0-1.0",     # tiny-keccak (const-random-macro via ahash)
     "bzip2-1.0.6", # libbz2-rs-sys (bzip2 compression codec)
