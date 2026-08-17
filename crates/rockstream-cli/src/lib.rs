@@ -490,13 +490,15 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     })?;
 
     let audit_path = opts.storage.join("audit.jsonl");
-    let audit_log = rockstream_control::audit::FileAuditLog::open(&audit_path).map_err(|e| {
-        CliError::new(
-            RS_0003,
-            format!("could not open audit log: {e}"),
-            "Check storage directory permissions.",
-        )
-    })?;
+    let audit_log = Arc::new(
+        rockstream_control::audit::FileAuditLog::open(&audit_path).map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("could not open audit log: {e}"),
+                "Check storage directory permissions.",
+            )
+        })?,
+    );
 
     // Log baseline startup events
     let _ = audit_log.append(
@@ -564,9 +566,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             let manager = rockstream_control::ShardManager::new();
             let service = rockstream_control::ControlService::new(catalog)
                 .with_shard_manager(manager)
-                .with_audit(Arc::new(
-                    rockstream_control::audit::FileAuditLog::open(&audit_path).unwrap(),
-                ));
+                .with_audit(audit_log.clone());
             let handle = service.start("127.0.0.1:0").await.unwrap();
             control_url = Some(handle.addr.to_string());
             control_handle = Some(handle);
@@ -577,9 +577,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             let mut service = rockstream_control::ControlService::new(catalog)
                 .with_shard_manager(manager.clone())
                 .with_frontier(frontier)
-                .with_audit(Arc::new(
-                    rockstream_control::audit::FileAuditLog::open(&audit_path).unwrap(),
-                ));
+                .with_audit(audit_log.clone());
 
             // v0.45.2 M7 S4/S5: state that must be visible to whichever
             // control node in the group is currently elected leader (the

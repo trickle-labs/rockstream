@@ -96,6 +96,10 @@ use crate::pgoutput_coordinator::{
 };
 use crate::role_catalog::RoleCatalog;
 use crate::session::{FreshnessToken, ScramAuthState, SessionNotice, SessionState};
+use crate::subscribe_handler::{
+    deliver_snapshot, start_from_epoch, SubscribeError, SubscribeRegistry, SubscriberHandle,
+};
+use crate::subscribe_parser::{parse_subscribe, SubscribeStart};
 use crate::view_reader::{ViewReadStrategy, ViewReader};
 use crate::write_buffer::{DmlOp, WriteBuffer};
 use crate::GatewayError;
@@ -1691,6 +1695,8 @@ pub struct GatewayHandler {
     pub notify_registry: Arc<NotifyRegistry>,
     /// Transactional NOTIFYs buffered until COMMIT. Bound: MAX_OUTBOX_PER_CONNECTION.
     pending_notifies: Arc<DashMap<String, Vec<(String, String)>>>,
+    /// Shared historical/streaming subscription change logs.
+    subscribe_registry: Arc<SubscribeRegistry>,
     /// CREATE TABLE-side metadata needed for server-assigned INSERT values.
     table_insert_metadata: Arc<DashMap<String, Arc<TableInsertMetadata>>>,
     /// Wall-clock publish timestamp of the most recently advanced shard frontier.
@@ -1845,6 +1851,11 @@ impl GatewayHandler {
         }
     }
 
+    /// Shared registry used by `SUBSCRIBE` and commit change publication.
+    pub fn subscribe_registry(&self) -> &Arc<SubscribeRegistry> {
+        &self.subscribe_registry
+    }
+
     pub fn new(catalog: Arc<CatalogStubs>, view_reader: Arc<dyn ViewReader>) -> Self {
         let kek_provider = Arc::new(rockstream_control::EnvKekProvider::from_env_or_default(
             "rockstream-default-kek",
@@ -1872,6 +1883,7 @@ impl GatewayHandler {
             cancellation_registry: Arc::new(DashMap::new()),
             notify_registry: Arc::new(NotifyRegistry::new()),
             pending_notifies: Arc::new(DashMap::new()),
+            subscribe_registry: Arc::new(SubscribeRegistry::new()),
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
@@ -1916,6 +1928,7 @@ impl GatewayHandler {
             cancellation_registry: Arc::new(DashMap::new()),
             notify_registry: Arc::new(NotifyRegistry::new()),
             pending_notifies: Arc::new(DashMap::new()),
+            subscribe_registry: Arc::new(SubscribeRegistry::new()),
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
@@ -4856,6 +4869,186 @@ impl GatewayHandler {
         None
     }
 
+    async fn handle_subscribe(&self, query: &str) -> PgWireResult<Vec<Response<'static>>> {
+        let request = match parse_subscribe(query) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(vec![promote_response(Response::Error(Box::new(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        format!(
+                            "[RS-2005] history.subscribe_invalid: {error}. next_steps: Use SUBSCRIBE <view> [AS OF NOW WITH SNAPSHOT | AS OF EPOCH <n>]."
+                        ),
+                    ),
+                )))]);
+            }
+        };
+
+        let catalog_columns = self
+            .catalog
+            .get_view(&request.view_name)
+            .map(|view| view.columns)
+            .or_else(|| {
+                self.catalog
+                    .get_table(&request.view_name)
+                    .map(|table| table.columns)
+            })
+            .unwrap_or_default();
+        if catalog_columns.is_empty()
+            && self
+                .subscribe_registry
+                .latest_epoch(&request.view_name)
+                .is_none()
+        {
+            return Ok(vec![promote_response(Response::Error(Box::new(
+                ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42P01".to_owned(),
+                    format!(
+                        "[RS-2005] history.subscribe_invalid: subscription target '{}' does not exist. next_steps: Create the view or table before subscribing.",
+                        request.view_name
+                    ),
+                ),
+            )))]);
+        }
+
+        let col_names = request.projection.clone().unwrap_or_else(|| {
+            catalog_columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()
+        });
+        let start_epoch = match &request.start {
+            SubscribeStart::NowWithSnapshot => self
+                .shard_db
+                .as_ref()
+                .map(|db| db.last_epoch().load(Ordering::SeqCst))
+                .or_else(|| self.subscribe_registry.latest_epoch(&request.view_name))
+                .unwrap_or(0),
+            SubscribeStart::Epoch(epoch) => *epoch,
+        };
+        let mut pending = std::collections::VecDeque::new();
+        let handle = match &request.start {
+            SubscribeStart::NowWithSnapshot => {
+                let snapshot = self
+                    .view_reader
+                    .read_view(&request.view_name, None, ViewReadStrategy::HotOnly)
+                    .await
+                    .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+                let snapshot = snapshot
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, row)| (Bytes::from(index.to_string()), Bytes::from(row)))
+                    .collect();
+                let column_refs: Vec<&str> = col_names.iter().map(String::as_str).collect();
+                pending.extend(deliver_snapshot(
+                    snapshot,
+                    start_epoch,
+                    &request,
+                    &column_refs,
+                ));
+                SubscriberHandle::new(
+                    request.view_name.clone(),
+                    start_epoch,
+                    request.clone(),
+                    col_names.clone(),
+                )
+            }
+            SubscribeStart::Epoch(epoch) => {
+                let mut handle = match start_from_epoch(
+                    &self.subscribe_registry,
+                    &request,
+                    *epoch,
+                    col_names.clone(),
+                ) {
+                    Ok(handle) => handle,
+                    Err(error) => return Ok(vec![subscribe_error_response(error)]),
+                };
+                match handle.poll(&self.subscribe_registry) {
+                    Ok(rows) => pending.extend(rows),
+                    Err(error) => return Ok(vec![subscribe_error_response(error)]),
+                }
+                handle
+            }
+        };
+
+        let mut fields: Vec<FieldInfo> = col_names
+            .iter()
+            .map(|name| FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text))
+            .collect();
+        fields.push(FieldInfo::new(
+            "mz_timestamp".to_owned(),
+            None,
+            None,
+            Type::INT8,
+            FieldFormat::Text,
+        ));
+        fields.push(FieldInfo::new(
+            "mz_diff".to_owned(),
+            None,
+            None,
+            Type::INT2,
+            FieldFormat::Text,
+        ));
+        let schema = Arc::new(fields);
+        let stream_schema = schema.clone();
+        let registry = self.subscribe_registry.clone();
+        let data_stream = Box::pin(stream::unfold(
+            (registry, handle, pending, stream_schema, false),
+            |(registry, mut handle, mut pending, schema, failed)| async move {
+                if failed {
+                    return None;
+                }
+                loop {
+                    if let Some(row) = pending.pop_front() {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        for value in String::from_utf8_lossy(&row.encoded_row).split('\t') {
+                            if let Err(error) = encoder.encode_field(&Some(value)) {
+                                return Some((
+                                    Err(error),
+                                    (registry, handle, pending, schema, true),
+                                ));
+                            }
+                        }
+                        let timestamp = row.mz_timestamp.to_string();
+                        if let Err(error) = encoder.encode_field(&Some(timestamp.as_str())) {
+                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                        }
+                        let diff = row.mz_diff.to_string();
+                        if let Err(error) = encoder.encode_field(&Some(diff.as_str())) {
+                            return Some((Err(error), (registry, handle, pending, schema, true)));
+                        }
+                        let encoded = match encoder.finish() {
+                            Ok(encoded) => encoded,
+                            Err(error) => {
+                                return Some((
+                                    Err(error),
+                                    (registry, handle, pending, schema, true),
+                                ));
+                            }
+                        };
+                        return Some((Ok(encoded), (registry, handle, pending, schema, false)));
+                    }
+                    match handle.poll(&registry) {
+                        Ok(rows) if !rows.is_empty() => pending.extend(rows),
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                        Err(error) => {
+                            return Some((
+                                Err(PgWireError::ApiError(Box::new(error))),
+                                (registry, handle, pending, schema, true),
+                            ));
+                        }
+                    }
+                }
+            },
+        ));
+        Ok(vec![promote_response(Response::Query(QueryResponse::new(
+            schema,
+            data_stream,
+        )))])
+    }
+
     /// Dispatch with an optional connection ID for write buffer routing.
     pub async fn dispatch_async_with_conn(
         &self,
@@ -4867,6 +5060,10 @@ impl GatewayHandler {
 
         if let Some(response) = self.authorize_mutation(q, conn_id) {
             return Ok(response);
+        }
+
+        if ql == "subscribe" || ql.starts_with("subscribe ") {
+            return self.handle_subscribe(q).await;
         }
 
         // ── Aborted-transaction guard ────────────────────────────────────────────
@@ -8456,6 +8653,54 @@ impl GatewayHandler {
         self.frontier_published_at_ms
             .store(current_time_ms(), Ordering::SeqCst);
 
+        for op in &ops {
+            let (table, row_key, mz_diff, encoded_row) = match op {
+                DmlOp::Insert {
+                    table,
+                    row_key,
+                    values_tsv,
+                    ..
+                } => (table.clone(), row_key.clone(), 1, values_tsv.clone()),
+                DmlOp::Delete {
+                    table,
+                    row_key,
+                    returning_tsv,
+                } => (
+                    table.clone(),
+                    row_key.clone(),
+                    -1,
+                    returning_tsv.clone().unwrap_or_default(),
+                ),
+                DmlOp::Update {
+                    table,
+                    old_row_key,
+                    old_tsv,
+                    new_row_key,
+                    new_tsv,
+                } => {
+                    self.subscribe_registry.push(
+                        table,
+                        crate::change_log::ChangeEntry {
+                            epoch,
+                            row_key: Bytes::from(old_row_key.clone()),
+                            mz_diff: -1,
+                            encoded_row: Bytes::from(old_tsv.clone()),
+                        },
+                    );
+                    (table.clone(), new_row_key.clone(), 1, new_tsv.clone())
+                }
+            };
+            self.subscribe_registry.push(
+                &table,
+                crate::change_log::ChangeEntry {
+                    epoch,
+                    row_key: Bytes::from(row_key),
+                    mz_diff,
+                    encoded_row: Bytes::from(encoded_row),
+                },
+            );
+        }
+
         // ── Last hop: materialise dependent views ─────────────────────────────
         // Collect the unique tables touched by this commit, then re-evaluate
         // every view that transitively depends on them.  This converts the
@@ -11903,6 +12148,14 @@ fn promote_response(r: Response<'_>) -> Response<'static> {
     // This is the standard pattern in pgwire examples that need to escape the
     // `'a` lifetime from `do_query`.
     unsafe { std::mem::transmute(r) }
+}
+
+fn subscribe_error_response(error: SubscribeError) -> Response<'static> {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "22000".to_owned(),
+        error.to_string(),
+    )))
 }
 
 fn parse_duration_literal(raw: &str) -> Option<Duration> {

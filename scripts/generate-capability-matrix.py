@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the v0.57 capability matrix from capabilities.toml."""
+"""Generate the v0.57.1 capability matrix from capabilities.toml."""
 
 from __future__ import annotations
 
@@ -13,6 +13,13 @@ from pathlib import Path
 TIERS = {"Core", "Maintain", "Experimental"}
 KINDS = {"language", "connector", "sink"}
 PROOF_RE = re.compile(r"^(?P<path>[^:]+)::(?P<test>[A-Za-z_][A-Za-z0-9_]*)$")
+BEHAVIORS = (
+    "incremental",
+    "backfill",
+    "checkpoint_recovery",
+    "state_growth",
+    "failure",
+)
 
 
 def fail(message: str) -> None:
@@ -32,13 +39,13 @@ def validate(
     contract = data.get("contract")
     if not isinstance(contract, dict):
         fail("capabilities.toml must define [contract]")
-    if contract.get("version") != "v0.57":
-        fail("capabilities.toml contract.version must be v0.57")
+    if contract.get("version") != "v0.57.1":
+        fail("capabilities.toml contract.version must be v0.57.1")
     roadmap = contract.get("roadmap")
     if not isinstance(roadmap, str):
         fail("contract.roadmap must be a path")
     roadmap_text = check_file(root, roadmap, "roadmap")
-    roadmap_rows = re.findall(r"^\| v0\.57 \|.*$", roadmap_text, re.MULTILINE)
+    roadmap_rows = re.findall(r"^\| v0\.57\.1 \|.*$", roadmap_text, re.MULTILINE)
     if len(roadmap_rows) != 1:
         fail("NEW_ROADMAP.md has no v0.57 version row")
     roadmap_fingerprint = hashlib.sha256(
@@ -124,6 +131,42 @@ def markdown_proof(proof: str) -> str:
     return f"`{proof}`" if proof else "—"
 
 
+def semantic_rows(capability: dict) -> list[dict]:
+    rows = capability.get("behavior", [])
+    return rows if isinstance(rows, list) else []
+
+
+def render_semantics(capabilities: list[dict]) -> list[str]:
+    lines = [
+        "<!-- BEGIN GENERATED CORE SEMANTICS -->",
+        "## Core semantic ledger",
+        "",
+        "This block is generated from the five-behavior ledger in "
+        "`capabilities.toml`.",
+        "",
+        "| Capability | Behavior | Statement | Proof | Paired proof | Bound | Metric | Bound outcome |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for capability in sorted(
+        (
+            item
+            for item in capabilities
+            if item["kind"] == "language" and item["tier"] == "Core"
+        ),
+        key=lambda item: item["id"],
+    ):
+        for row in semantic_rows(capability):
+            lines.append(
+                f"| `{capability['id']}` | `{row['behavior']}` | "
+                f"{row['statement']} | {markdown_proof(row['proof'])} | "
+                f"{markdown_proof(row.get('paired_proof', ''))} | "
+                f"{row.get('bound', '—')} | {row.get('metric', '—')} | "
+                f"{row.get('on_bound', '—')} |"
+            )
+    lines.extend(["", "<!-- END GENERATED CORE SEMANTICS -->"])
+    return lines
+
+
 def generate(root: Path, source: Path, output: Path) -> None:
     with source.open("rb") as stream:
         data = tomllib.load(stream)
@@ -186,6 +229,7 @@ def generate(root: Path, source: Path, output: Path) -> None:
             f"| {evidence['surface']} |"
         )
 
+    lines.extend(["", *render_semantics(capabilities)])
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -204,7 +248,13 @@ def main() -> int:
     except (OSError, tomllib.TOMLDecodeError, ValueError) as error:
         print(f"capability matrix generation failed: {error}", file=sys.stderr)
         return 1
-    print(f"Generated {output.relative_to(root)} from {source.relative_to(root)}")
+    try:
+        output_name = output.relative_to(root)
+        source_name = source.relative_to(root)
+    except ValueError:
+        output_name = output
+        source_name = source
+    print(f"Generated {output_name} from {source_name}")
     return 0
 
 

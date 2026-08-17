@@ -1,7 +1,28 @@
 [contract]
-version = "v0.57"
+version = "v0.57.1"
 roadmap = "NEW_ROADMAP.md"
 promise = "RockStream ingests changing data, continuously maintains a documented SQL subset as durable materialized views, and serves globally committed results to PostgreSQL-compatible clients while surviving ordinary distributed-system failures without losing or silently corrupting committed state."
+
+[[contract.tier_decision]]
+capability = "language.aggregates"
+old_tier = "Core"
+new_tier = "Experimental"
+reason = "The exact aggregate type matrix exposes unsupported floating-point and text-key combinations, so the broad aggregate claim is demoted rather than documented aspirationally."
+evidence = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_aggregate_text_f64_sum"
+
+[[contract.tier_decision]]
+capability = "language.relational-operators"
+old_tier = "Core"
+new_tier = "Experimental"
+reason = "The join matrix proves integer and text keys but rejects floating-point keys and text semi/anti joins with RS-1019, so the broad relational claim is demoted."
+evidence = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_inner_f64"
+
+[[contract.tier_decision]]
+capability = "language.analytics-time"
+old_tier = "Core"
+new_tier = "Experimental"
+reason = "The window matrix proves supported rank and navigation paths but the timestamp-key cells remain unsupported, so the broad analytics-time claim is demoted."
+evidence = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_row_number_timestamp"
 
 [[dispatch]]
 id = "query_async_entry"
@@ -72,6 +93,13 @@ reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_dml_tests.rs::test_create_view_and_select"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "A committed row delta is reflected in the same SELECT transcript as the corresponding source change.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_query_read_incremental" },
+  { behavior = "backfill", statement = "A snapshot read returns every committed source row before subsequent deltas are observed.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_query_read_backfill" },
+  { behavior = "checkpoint_recovery", statement = "Reopening the local durable shard restores the committed read transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_query_read_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "Read results are materialized per query and do not retain an unbounded process buffer.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_query_read_state_growth", bound = "one query result set", metric = "query_result_rows", on_bound = "the query fails with its RS-coded resource error" },
+  { behavior = "failure", statement = "Invalid read input returns an actionable RS-coded error instead of an empty success.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_query_read_failure" },
+]
 
 [[capability]]
 id = "language.scalar-expressions"
@@ -82,12 +110,19 @@ reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering"]
 proof = "crates/rockstream-sql/tests/tpch_plans.rs::tpch_q6_filter_aggregate_no_join"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "Scalar expressions are recomputed for each changed input row and preserve the exact projected transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_scalar_incremental" },
+  { behavior = "backfill", statement = "Backfill evaluates the scalar expression over the complete snapshot before deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_scalar_backfill" },
+  { behavior = "checkpoint_recovery", statement = "A reopened shard preserves the scalar result of committed rows.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_scalar_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "Scalar evaluation retains no input-sized queue between queries.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_scalar_state_growth", bound = "one query result set", metric = "query_result_rows", on_bound = "the query fails with its RS-coded resource error" },
+  { behavior = "failure", statement = "Unsupported scalar input returns an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_scalar_failure" },
+]
 
 [[capability]]
 id = "language.aggregates"
 kind = "language"
 name = "Aggregation and algebraic maintenance"
-tier = "Core"
+tier = "Experimental"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
 proof = "crates/rockstream-gateway/tests/serving_path_aggregate_matrix_tests.rs::test_basic_int_sum_group_by"
@@ -97,21 +132,35 @@ documentation = "docs/language-features.md#implemented-today"
 id = "language.relational-operators"
 kind = "language"
 name = "Relational operators"
-tier = "Core"
+tier = "Experimental"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
 proof = "crates/rockstream-sql/tests/tpch_plans.rs::tpch_q3_two_join_aggregate"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "Join deltas update the relational result without changing unaffected rows.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_incremental_equals_batch_matrix" },
+  { behavior = "backfill", statement = "Join backfill builds the complete snapshot result before later input deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_backfill_matrix" },
+  { behavior = "checkpoint_recovery", statement = "A reopened join shard restores the committed relational transcript in both local and object-store backends.", proof = "crates/rockstream-gateway/tests/live_exec_join_durability_lfs_tests.rs::compiled_join_state_persists_across_restart_lfs", paired_proof = "crates/rockstream-gateway/tests/core_operator_durability_minio_tests.rs::compiled_join_state_persists_across_restart_minio" },
+  { behavior = "state_growth", statement = "Join arrangements use the configured state budget and expose fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_state_growth", bound = "configured arrangement state budget", metric = "arrangement_state_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "Invalid join input returns an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_join_failure" },
+]
 
 [[capability]]
 id = "language.analytics-time"
 kind = "language"
 name = "Analytics and time"
-tier = "Core"
+tier = "Experimental"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "plan_compilation"]
 proof = "crates/rockstream-sql/tests/sql_engine_e2e.rs::sql_engine_window_row_number_over_view"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "Window deltas update only the affected partition and preserve the exact ordered transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_incremental_equals_batch_matrix" },
+  { behavior = "backfill", statement = "Window backfill orders the complete snapshot before applying later changes.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_backfill_matrix" },
+  { behavior = "checkpoint_recovery", statement = "A reopened window shard restores the committed ordered transcript in both local and object-store backends.", proof = "crates/rockstream-gateway/tests/live_exec_tumble_window_durability_lfs_tests.rs::compiled_tumble_window_state_persists_across_restart_lfs", paired_proof = "crates/rockstream-gateway/tests/core_operator_durability_minio_tests.rs::compiled_tumble_window_state_persists_across_restart_minio" },
+  { behavior = "state_growth", statement = "Window state is bounded by the configured partition budget and exposes fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_state_growth", bound = "configured window partition budget", metric = "window_state_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "Unsupported window input returns an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_window_failure" },
+]
 
 [[capability]]
 id = "language.view-on-view-dag"
@@ -122,6 +171,13 @@ reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "view_dispatch", "plan_compilation"]
 proof = "crates/rockstream-sql/tests/lfs_catalog.rs::test_5_level_view_chain_convergence"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "View-on-view deltas propagate through the dependency DAG once and preserve the downstream transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_view_dag_incremental" },
+  { behavior = "backfill", statement = "DAG backfill materializes dependencies in topological order before downstream deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_view_dag_backfill" },
+  { behavior = "checkpoint_recovery", statement = "A reopened DAG restores committed upstream and downstream view state.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_view_dag_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "DAG compilation and dependency state are bounded by the configured view budget.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_view_dag_state_growth", bound = "configured view dependency budget", metric = "view_dependency_fill_ratio", on_bound = "the view operation is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "A cycle or invalid dependency returns an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_view_dag_failure" },
+]
 
 [[capability]]
 id = "language.historical-streaming-reads"
@@ -130,8 +186,15 @@ name = "Historical and streaming reads"
 tier = "Core"
 reachability = "SUBSCRIBE over pgwire"
 dispatch = ["query_async_entry", "response_encoding"]
-proof = "crates/rockstream-gateway/tests/gateway_proof_tests.rs::proof_subscribe_snapshot_then_deltas_lfs"
+proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_pgwire_dispatch"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "SUBSCRIBE emits the snapshot followed by each committed delta in order.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_incremental", paired_proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_pgwire_dispatch" },
+  { behavior = "backfill", statement = "A historical subscription starts from the requested committed snapshot before streaming deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_backfill" },
+  { behavior = "checkpoint_recovery", statement = "Reconnecting a subscription resumes from durable committed state without duplicate rows.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "Subscription output uses a bounded delivery window and reports fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_state_growth", bound = "configured subscription delivery window", metric = "subscription_buffer_fill_ratio", on_bound = "delivery applies backpressure or returns its RS-coded resource error" },
+  { behavior = "failure", statement = "An invalid subscription target returns an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_failure" },
+]
 
 [[capability]]
 id = "language.session-freshness"
@@ -142,6 +205,13 @@ reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "query_sync_entry", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_proof_tests.rs::write_fence_token_can_be_used_by_another_session_via_after_fence"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "Freshness controls make committed writes visible according to the session fence.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_freshness_incremental" },
+  { behavior = "backfill", statement = "A session fence observes the complete committed snapshot at the requested frontier.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_freshness_backfill" },
+  { behavior = "checkpoint_recovery", statement = "Freshness tokens remain valid after reopening the durable session state.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_freshness_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "Session freshness retains only bounded fence metadata and reports its fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_freshness_state_growth", bound = "configured fence-token budget", metric = "fence_token_fill_ratio", on_bound = "new fence creation returns its RS-coded resource error" },
+  { behavior = "failure", statement = "An invalid freshness setting returns an actionable RS-coded error.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_freshness_failure" },
+]
 
 [[capability]]
 id = "language.dml"
@@ -152,6 +222,13 @@ reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "plan_compilation", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_dml_tests.rs::test_update_accumulates_in_write_buffer"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "INSERT, UPDATE, and DELETE deltas change the materialized result exactly once.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_dml_incremental" },
+  { behavior = "backfill", statement = "DML backfill starts from the committed table snapshot before applying mutations.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_dml_backfill" },
+  { behavior = "checkpoint_recovery", statement = "Reopening the durable shard restores all committed DML effects.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_dml_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "The write buffer is bounded, exposes fill level, and cannot accumulate indefinitely.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_dml_state_growth", bound = "configured write-buffer budget", metric = "write_buffer_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "Invalid DML returns an actionable RS-coded error and preserves the prior committed result.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_dml_failure" },
+]
 
 [[capability]]
 id = "language.transaction-semantics"
@@ -162,6 +239,13 @@ reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "query_sync_entry", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_proof_tests.rs::explicit_idempotency_key_dedupes_multi_statement_transaction_replay"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "A committed transaction applies its complete statement set atomically to the result transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_transaction_incremental" },
+  { behavior = "backfill", statement = "Transaction backfill observes only the committed snapshot and excludes uncommitted statements.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_transaction_backfill" },
+  { behavior = "checkpoint_recovery", statement = "A committed transaction remains durable and replay-safe after restart.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_transaction_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "Transaction statements are bounded by the configured write-buffer budget and expose fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_transaction_state_growth", bound = "configured transaction write-buffer budget", metric = "transaction_buffer_fill_ratio", on_bound = "the transaction is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "A failed or replayed transaction returns an actionable RS-coded error or exact no-op.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_transaction_failure" },
+]
 
 [[capability]]
 id = "language.views"
@@ -172,6 +256,13 @@ reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "view_dispatch", "plan_compilation", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_dml_tests.rs::test_refresh_materialized_view_roundtrip"
 documentation = "docs/language-features.md#implemented-today"
+behavior = [
+  { behavior = "incremental", statement = "View maintenance publishes each source delta to the materialized view transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_views_incremental" },
+  { behavior = "backfill", statement = "View creation backfills from the committed source snapshot before later deltas.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_views_backfill" },
+  { behavior = "checkpoint_recovery", statement = "A reopened materialized view restores its committed output.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_views_checkpoint_recovery" },
+  { behavior = "state_growth", statement = "View maintenance is bounded by the configured arrangement budget and exposes fill level.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_views_state_growth", bound = "configured view arrangement budget", metric = "view_state_fill_ratio", on_bound = "the write is rejected with its RS-coded resource error" },
+  { behavior = "failure", statement = "Invalid view definitions return an actionable RS-coded error and do not publish partial state.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_views_failure" },
+]
 
 [[capability]]
 id = "language.multitenancy-quotas"

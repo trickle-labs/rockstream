@@ -5,9 +5,10 @@ set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
 CHECKER="$ROOT/scripts/check-capability-contract.sh"
-TMP_ROOT="$(mktemp -d)"
-OUT="$(mktemp)"
-trap 'rm -rf "$TMP_ROOT"; rm -f "$OUT"' EXIT
+TMP_ROOT="$ROOT/.capability-contract-test.$$"
+mkdir "$TMP_ROOT"
+OUT="$TMP_ROOT/output"
+trap 'rm -rf "$TMP_ROOT"' EXIT
 
 fail() {
   echo "FAIL: $1" >&2
@@ -24,13 +25,14 @@ cp "$ROOT/scripts/generate-capability-matrix.py" "$TMP_ROOT/scripts/"
 
 run_bad() {
   local label="$1"
+  local expected="${2:-VIOLATION:}"
   if bash "$CHECKER" "$TMP_ROOT" >"$OUT" 2>&1; then
     cat "$OUT"
     fail "$label mutation was accepted"
   fi
-  grep -q "VIOLATION:" "$OUT" || {
+  grep -q "$expected" "$OUT" || {
     cat "$OUT"
-    fail "$label mutation did not report a violation"
+    fail "$label mutation did not report the expected violation"
   }
 }
 
@@ -46,6 +48,22 @@ python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml");
 run_bad "unresolvable proof target"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); p.write_text(s.replace("behavior = \"incremental\"", "behavior = \"removed_behavior\"", 1))'
+run_bad "missing Core semantic behavior" "missing Core semantic behavior incremental"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); p.write_text(s.replace("core_query_read_incremental", "", 1))'
+run_bad "missing Core semantic proof" "has an invalid proof target"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/docs/language-features.md"); s=p.read_text(); p.write_text(s.replace("A committed row delta", "A drifted row delta", 1))'
+run_bad "generated Core semantics drift" "generated Core semantics blocks are not byte-identical"
+cp "$ROOT/docs/language-features.md" "$TMP_ROOT/docs/language-features.md"
+
+python3 -c 'from pathlib import Path; import re; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); p.write_text(re.sub(r"^reason = .*$", "reason = \"\"", s, count=1, flags=re.M))'
+run_bad "missing tier decision reason" "tier decision is missing reason"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
 python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); p.write_text(s.replace("dispatch = [\"query_async_entry\", \"sql_lowering\", \"response_encoding\"]", "dispatch = []", 1))'
 run_bad "Core entry without dispatch evidence"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
@@ -58,7 +76,7 @@ printf '\nmutation\n' >> "$TMP_ROOT/docs/capability-matrix.md"
 run_bad "generated matrix drift"
 cp "$ROOT/docs/capability-matrix.md" "$TMP_ROOT/docs/capability-matrix.md"
 
-python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/NEW_ROADMAP.md"); s=p.read_text(); p.write_text(s.replace("| v0.57 |", "| v0.570 |", 1))'
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/NEW_ROADMAP.md"); s=p.read_text(); p.write_text(s.replace("| v0.57.1 | Core Operator Semantics", "| v0.570 | Core Operator Semantics", 1))'
 run_bad "roadmap drift"
 cp "$ROOT/NEW_ROADMAP.md" "$TMP_ROOT/NEW_ROADMAP.md"
 

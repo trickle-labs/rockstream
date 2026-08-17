@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the v0.57 capability source, documentation, and generated matrix."""
+"""Validate the v0.57.1 capability source, documentation, and generated matrix."""
 
 from __future__ import annotations
 
@@ -11,6 +11,13 @@ import tomllib
 from pathlib import Path
 
 TIERS = ("Core", "Maintain", "Experimental")
+BEHAVIORS = (
+    "incremental",
+    "backfill",
+    "checkpoint_recovery",
+    "state_growth",
+    "failure",
+)
 EXPECTED_EXTERNAL_SURFACE = {
     "connector.kafka-source",
     "connector.postgres-cdc",
@@ -185,17 +192,125 @@ def check_generated_matrix(root: Path, errors: list[str]) -> None:
         generated.unlink(missing_ok=True)
 
 
+def proof_exists(root: Path, proof: object, label: str, errors: list[str]) -> None:
+    if not isinstance(proof, str) or not proof:
+        fail(errors, f"{label} has an empty proof")
+        return
+    match = re.fullmatch(r"(?P<path>[^:]+)::(?P<test>[A-Za-z_][A-Za-z0-9_]*)", proof)
+    if not match:
+        fail(errors, f"{label} has an invalid proof target: {proof!r}")
+        return
+    path = root / match["path"]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        fail(errors, f"{label} proof target does not resolve: {proof}")
+        return
+    if not re.search(
+        rf"\b(?:async\s+)?fn\s+{re.escape(match['test'])}\s*\(", text
+    ) and not re.search(rf"\b{re.escape(match['test'])}\b", text):
+        fail(errors, f"{label} proof target does not resolve: {proof}")
+
+
+def generated_block(text: str) -> str | None:
+    match = re.search(
+        r"<!-- BEGIN GENERATED CORE SEMANTICS -->.*?"
+        r"<!-- END GENERATED CORE SEMANTICS -->",
+        text,
+        re.DOTALL,
+    )
+    return match.group(0) if match else None
+
+
+def check_full_semantics(
+    root: Path, contract: dict, capabilities: list[dict], errors: list[str]
+) -> None:
+    if contract.get("version") != "v0.57.1":
+        fail(errors, "capabilities.toml contract.version must be v0.57.1")
+
+    for capability in capabilities:
+        if capability.get("kind") != "language" or capability.get("tier") != "Core":
+            continue
+        rows = capability.get("behavior")
+        if not isinstance(rows, list):
+            fail(errors, f"{capability.get('id')} is missing Core semantic behavior rows")
+            continue
+        by_name: dict[object, dict] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                fail(errors, f"{capability.get('id')} has an invalid semantic behavior row")
+                continue
+            behavior = row.get("behavior")
+            if behavior not in BEHAVIORS:
+                fail(errors, f"{capability.get('id')} has unknown behavior {behavior}")
+            if behavior in by_name:
+                fail(errors, f"{capability.get('id')} has duplicate behavior {behavior}")
+            by_name[behavior] = row
+        for behavior in BEHAVIORS:
+            row = by_name.get(behavior)
+            label = f"{capability.get('id')} {behavior}"
+            if row is None:
+                fail(errors, f"{capability.get('id')} is missing Core semantic behavior {behavior}")
+                continue
+            statement = row.get("statement")
+            if not isinstance(statement, str) or not statement.strip():
+                fail(errors, f"{label} has an empty statement")
+            proof_exists(root, row.get("proof"), label, errors)
+            paired_proof = row.get("paired_proof")
+            if paired_proof is not None:
+                proof_exists(root, paired_proof, f"{label} paired proof", errors)
+            if behavior == "state_growth":
+                for field in ("bound", "metric", "on_bound"):
+                    if not isinstance(row.get(field), str) or not row[field].strip():
+                        fail(errors, f"{label} is missing {field}")
+
+    decisions = contract.get("tier_decision", [])
+    if not isinstance(decisions, list) or not decisions:
+        fail(errors, "full semantics mode requires a tier decision")
+    capability_ids = {item.get("id") for item in capabilities}
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            fail(errors, "tier decision must be a table")
+            continue
+        for field in ("capability", "old_tier", "new_tier", "reason", "evidence"):
+            if not isinstance(decision.get(field), str) or not decision[field].strip():
+                fail(errors, f"tier decision is missing {field}")
+        if decision.get("old_tier") not in TIERS or decision.get("new_tier") not in TIERS:
+            fail(errors, "tier decision has an invalid tier")
+        if decision.get("capability") not in capability_ids:
+            fail(errors, "tier decision references an unknown capability")
+        if decision.get("old_tier") == decision.get("new_tier"):
+            fail(errors, "tier decision must record a tier change")
+        if isinstance(decision.get("evidence"), str) and decision["evidence"].strip():
+            proof_exists(root, decision["evidence"], "tier decision evidence", errors)
+
+    matrix_text = (root / "docs/capability-matrix.md").read_text(encoding="utf-8")
+    language_text = (root / "docs/language-features.md").read_text(encoding="utf-8")
+    matrix_block = generated_block(matrix_text)
+    language_block = generated_block(language_text)
+    if matrix_block is None:
+        fail(errors, "capability matrix is missing the generated Core semantics block")
+    if language_block is None:
+        fail(errors, "language documentation is missing the generated Core semantics block")
+    if matrix_block is not None and language_block is not None and matrix_block != language_block:
+        fail(errors, "generated Core semantics blocks are not byte-identical")
+
+
 def main() -> int:
-    root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path.cwd().resolve()
+    arguments = sys.argv[1:]
+    roots = [argument for argument in arguments if argument != "--full-semantics"]
+    root = Path(roots[0]).resolve() if roots else Path.cwd().resolve()
     errors: list[str] = []
     contract, capabilities = load_source(root, errors)
     if contract:
-        if contract.get("version") != "v0.57":
-            fail(errors, "capabilities.toml contract.version must be v0.57")
+        if contract.get("version") not in {"v0.57", "v0.57.1"}:
+            fail(errors, "capabilities.toml contract.version must be v0.57 or v0.57.1")
         check_promises(root, contract.get("promise"), errors)
     check_external_surface(capabilities, errors)
     check_documented_tiers(root, capabilities, errors)
     check_generated_matrix(root, errors)
+    if "--full-semantics" in arguments:
+        check_full_semantics(root, contract, capabilities, errors)
 
     if errors:
         print("FAIL: capability contract check found violations.", file=sys.stderr)
