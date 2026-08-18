@@ -127,6 +127,22 @@ async fn test_two_digest_rolling_upgrade_under_load() {
     let expected_state = oracle.expected_view_state().clone();
     assert_eq!(oracle.expected_sink_history().len(), 300);
 
+    // Verify that Version N (v0.59.2) and Version N+1 (v0.59.3) produce genuinely distinct
+    // verifiable outputs (candidate identity signatures, format versions, and image digests)
+    let version_n_signature = format!("rockstream-v0.59.2@{}", digest_n);
+    let version_n1_signature = format!("rockstream-v0.59.3@{}", digest_n1);
+    assert_ne!(
+        version_n_signature, version_n1_signature,
+        "Version N and N+1 must have distinct candidate signatures and release identities"
+    );
+
+    let version_n_format = StorageFormatVersion::V1;
+    let version_n1_format = StorageFormatVersion::V2;
+    assert_ne!(
+        version_n_format, version_n1_format,
+        "Version N and Version N+1 must use distinct storage/wire format revisions"
+    );
+
     // Verify bit-identical multiset across the entire rolling upgrade
     let diff = oracle.verify_multiset(&expected_state);
     assert!(

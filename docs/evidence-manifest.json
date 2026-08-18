@@ -1,10 +1,10 @@
 {
   "candidate": {
-    "semantic_version": "0.59.1",
-    "commit_sha": "74aab091306b37db98299aac87279358b4989bd3",
-    "build_timestamp_rfc3339": "2026-08-18T13:34:24.999571+00:00",
+    "semantic_version": "0.59.3",
+    "commit_sha": "f8572e216634d36e4b0fbebb4bdba1d48db35f0c",
+    "build_timestamp_rfc3339": "2026-08-18T21:06:00.754740+00:00",
     "compiler_version": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)",
-    "lockfile_digest": "516585f8a30238b41a868692c56ee1f0889c2d5d532d120a8e02927bde2ba338",
+    "lockfile_digest": "e8e5c43ea0d26c00579fd667500f4ef5448db34397cd68026893278a6a93f2ad",
     "enabled_features": []
   },
   "workflow_run": {
@@ -19,12 +19,21 @@
     }
   },
   "artifacts": {
-    "Cargo.toml": "075a0e63fed37896da46e2ea9b1199567838d169dbcc39812127edeaefff4f62",
-    "Cargo.lock": "516585f8a30238b41a868692c56ee1f0889c2d5d532d120a8e02927bde2ba338",
-    "capabilities.toml": "3b23f77c761f753e508c0aa7531279e8c4fd18f33a9605235357f735e6ab2d2c",
+    "Cargo.toml": "bcacb67ed05e048928ec5766df08bcf8640737aa575cd85fe7b489aea6e15a44",
+    "Cargo.lock": "e8e5c43ea0d26c00579fd667500f4ef5448db34397cd68026893278a6a93f2ad",
+    "capabilities.toml": "0369878ba0f898bc5455e35ac5ee7ba505289fe9cda1fdb1d8b1a6bfdc7bf744",
     "docs/chaos-recovery-baseline.json": "38c27e0d31ab550a89698d36956b3f5ee71a73bbdd8ef87afcf4df1ec3d27e03",
     "docs/release-governance.md": "479e3ee6258d83b3a4aa4c23b14213f53201c190d08c322d96d4e5a8d2e338b8",
-    "sign-offs/v0.59.md": "e82d39bd5cb54846b0b645e80f79cc86a1c0b9f29167ba76d2066f7d9c26dced"
+    "sign-offs/v0.59.md": "e82d39bd5cb54846b0b645e80f79cc86a1c0b9f29167ba76d2066f7d9c26dced",
+    "docs/security-report.md": "fd306c24d3d9dec9d60eb93927c90086bb99369881fb4c17b294d7be95fb5bea",
+    "docs/security-assessment.json": "d59627e5f942c0da676329e08a302d4e3895a8a93352a7cc2eec334f4f26abba",
+    "docs/provenance.slsa.json": "046763401b7390c4528f83e76afc442bff5fbbd9a222a0cc90371bc092d73769",
+    "docs/sbom.spdx.json": "86e364f5a2650ccc5d880bfff47a2bd8dba96e501d49826a57f0ed1ed73164f2",
+    "docs/sbom.cyclonedx.json": "023db9b535e371c0c634a1379ea6524865f28182b84e64ab66139fc4481945cc",
+    "docs/vulnerability-results.json": "03d5a9519804f06381ff2ccaf124ab214df2966b55936ceee364cce931dafc11",
+    "docs/reproducible-builds.md": "94f4dec4e89c6c28f5d4ccd6c2816fee4b878d7e03bfaceb0c606b7da0763e50",
+    "docs/known-limitations.md": "b0bb04246784835d587b0447efe4eb1feb110427cc86b4cbdd91f81428ebf207",
+    "docs/release-notes-v1.0.md": "c89c05fb3b03ceca9cedd5bfd39064a4a442b169bc1469cf8edb57319fa06695"
   },
   "workloads": {
     "workload_recovery_slo": "9715e08979b0f5a8056b9e0d03f96e3990a1862f036ad6d2c19837e08327f05f",

@@ -81,7 +81,7 @@ def generate_manifest(root: Path, out_path: Path) -> dict:
     rustc_ver = get_rustc_version()
 
     candidate = {
-        "semantic_version": "0.59.1",
+        "semantic_version": "0.59.3",
         "commit_sha": commit_sha,
         "build_timestamp_rfc3339": datetime.now(timezone.utc).isoformat(),
         "compiler_version": rustc_ver,
@@ -110,6 +110,15 @@ def generate_manifest(root: Path, out_path: Path) -> dict:
         "docs/chaos-recovery-baseline.json",
         "docs/release-governance.md",
         "sign-offs/v0.59.md",
+        "docs/security-report.md",
+        "docs/security-assessment.json",
+        "docs/provenance.slsa.json",
+        "docs/sbom.spdx.json",
+        "docs/sbom.cyclonedx.json",
+        "docs/vulnerability-results.json",
+        "docs/reproducible-builds.md",
+        "docs/known-limitations.md",
+        "docs/release-notes-v1.0.md",
     ]
     artifacts = {}
     for rel_path in tracked_files:

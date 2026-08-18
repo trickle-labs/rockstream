@@ -10,7 +10,7 @@ use tempfile::tempdir;
 
 fn create_valid_manifest() -> EvidenceManifest {
     let candidate = CandidateIdentity {
-        semantic_version: "0.59.1".to_string(),
+        semantic_version: "0.59.3".to_string(),
         commit_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
         build_timestamp_rfc3339: "2026-08-18T12:00:00Z".to_string(),
         compiler_version: "rustc 1.88.0".to_string(),

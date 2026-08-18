@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "version": "0.59.3",
+  "assessor": {
+    "name": "RockStream Security Architecture & Assessment Group",
+    "type": "Internal Security Readiness Review / Assessor Group"
+  },
+  "scope": [
+    "rockstream-core",
+    "rockstream-storage",
+    "rockstream-ops",
+    "rockstream-control",
+    "rockstream-gateway",
+    "rockstream-sim",
+    "rockstream-cli"
+  ],
+  "audit_dates": {
+    "start": "2026-08-10",
+    "end": "2026-08-18"
+  },
+  "exclusions": [
+    "experimental third-party connectors quarantined in v0.52.3"
+  ],
+  "findings": {
+    "open_p0": 0,
+    "open_p1": 0,
+    "total_remediated": 8,
+    "status": "Closed"
+  },
+  "report_sha256": "fd306c24d3d9dec9d60eb93927c90086bb99369881fb4c17b294d7be95fb5bea"
+}

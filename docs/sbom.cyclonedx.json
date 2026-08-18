@@ -1,0 +1,39 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-08-18T00:00:00Z",
+    "component": {
+      "name": "rockstream",
+      "version": "0.59.3",
+      "type": "application"
+    }
+  },
+  "components": [
+    {
+      "name": "rockstream-core",
+      "version": "0.59.3",
+      "type": "library",
+      "purl": "pkg:cargo/rockstream-core@0.59.3"
+    },
+    {
+      "name": "rockstream-storage",
+      "version": "0.59.3",
+      "type": "library",
+      "purl": "pkg:cargo/rockstream-storage@0.59.3"
+    },
+    {
+      "name": "rockstream-gateway",
+      "version": "0.59.3",
+      "type": "library",
+      "purl": "pkg:cargo/rockstream-gateway@0.59.3"
+    },
+    {
+      "name": "slatedb",
+      "version": "0.4.0",
+      "type": "library",
+      "purl": "pkg:cargo/slatedb@0.4.0"
+    }
+  ]
+}

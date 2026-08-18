@@ -76,9 +76,10 @@ printf '\nmutation\n' >> "$TMP_ROOT/docs/capability-matrix.md"
 run_bad "generated matrix drift"
 cp "$ROOT/docs/capability-matrix.md" "$TMP_ROOT/docs/capability-matrix.md"
 
-python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/NEW_ROADMAP.md"); s=p.read_text(); p.write_text(s.replace("| v0.57.1 | Core Operator Semantics", "| v0.570 | Core Operator Semantics", 1))'
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/NEW_ROADMAP.md"); s=p.read_text(); p.write_text(s.replace("| v0.59.3 |", "| v0.590 |", 1))'
 run_bad "roadmap drift"
 cp "$ROOT/NEW_ROADMAP.md" "$TMP_ROOT/NEW_ROADMAP.md"
+
 
 python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/README.md"); s=p.read_text(); p.write_text(s.replace("RockStream ingests changing data", "RockStream mutates changing data", 1))'
 run_bad "promise drift"

@@ -117,7 +117,7 @@ python3 -c '
 import sys
 p = sys.argv[1]
 with open(p, "r") as f: c = f.read()
-with open(p, "w") as f: f.write(c.replace("version = \"0.59.1\"", "version = \"0.59.0\""))
+with open(p, "w") as f: f.write(c.replace("version = \"0.59.3\"", "version = \"0.59.0\""))
 ' "$TMP_DIR/Cargo.toml"
 if bash "$TMP_DIR/scripts/check-release-candidate-gate.sh" "$TMP_DIR" >"$TMP_DIR/out.log" 2>&1; then
   fail "candidate version mismatch was accepted"

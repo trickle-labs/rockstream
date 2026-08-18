@@ -13,6 +13,9 @@ an `ALTER SECRET`; they are never written to worker storage.
 
 This document describes the security model, mutual TLS (mTLS) transport encryption, identity verification, and dynamic certificate rotation in RockStream.
 
+For full assessor findings, verification records, and machine-readable audit metadata, see [Security Report](file:///Users/grove/projects/rockstream/docs/security-report.md) and [Security Assessment Metadata](file:///Users/grove/projects/rockstream/docs/security-assessment.json).
+
+
 ---
 
 ## Overview

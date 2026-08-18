@@ -1,0 +1,55 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "rockstream-0.59.3",
+  "documentNamespace": "https://rockstream.dev/spdx/0.59.3",
+  "creationInfo": {
+    "creators": [
+      "Organization: RockStream Project"
+    ],
+    "created": "2026-08-18T00:00:00Z"
+  },
+  "packages": [
+    {
+      "name": "rockstream",
+      "SPDXID": "SPDXRef-Package-rockstream",
+      "versionInfo": "0.59.3",
+      "downloadLocation": "https://github.com/trickle-labs/rockstream",
+      "licenseConcluded": "Apache-2.0",
+      "filesAnalyzed": false
+    },
+    {
+      "name": "rockstream-core",
+      "SPDXID": "SPDXRef-Package-rockstream-core",
+      "versionInfo": "0.59.3",
+      "downloadLocation": "https://github.com/trickle-labs/rockstream",
+      "licenseConcluded": "Apache-2.0",
+      "filesAnalyzed": false
+    },
+    {
+      "name": "rockstream-gateway",
+      "SPDXID": "SPDXRef-Package-rockstream-gateway",
+      "versionInfo": "0.59.3",
+      "downloadLocation": "https://github.com/trickle-labs/rockstream",
+      "licenseConcluded": "Apache-2.0",
+      "filesAnalyzed": false
+    },
+    {
+      "name": "slatedb",
+      "SPDXID": "SPDXRef-Package-slatedb",
+      "versionInfo": "0.4.0",
+      "downloadLocation": "https://crates.io/crates/slatedb",
+      "licenseConcluded": "Apache-2.0",
+      "filesAnalyzed": false
+    },
+    {
+      "name": "tokio",
+      "SPDXID": "SPDXRef-Package-tokio",
+      "versionInfo": "1.37.0",
+      "downloadLocation": "https://crates.io/crates/tokio",
+      "licenseConcluded": "MIT",
+      "filesAnalyzed": false
+    }
+  ]
+}
