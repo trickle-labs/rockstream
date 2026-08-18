@@ -3291,7 +3291,13 @@ impl GatewayHandler {
                     view_name.to_string(),
                     Arc::clone(shard_db),
                 ),
-                _ => unreachable!("source type was checked above"),
+                source_type => {
+                    return Err(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!(
+                            "unsupported source type '{source_type}' for worker spawning on materialized view '{view_name}'"
+                        ),
+                    });
+                }
             }
         }
         Ok(())
@@ -4812,6 +4818,7 @@ impl GatewayHandler {
         if ql.starts_with("create view ")
             || ql.starts_with("create materialized view ")
             || ql.starts_with("create or replace view ")
+            || ql.starts_with("create or replace materialized view ")
         {
             return Some(self.handle_create_view(q).await);
         }
@@ -12687,11 +12694,18 @@ fn analyze_select_query(catalog: &CatalogStubs, q: &str) -> Option<AnalyzedSelec
     );
 
     let mut seen = HashSet::new();
-    let referenced_tables = raw_relations
+    let referenced_tables: Vec<String> = raw_relations
         .into_iter()
         .filter_map(|raw_name| resolve_catalog_relation_name(catalog, &raw_name))
         .filter(|name| seen.insert(name.clone()))
         .collect();
+
+    if top_level_relation.is_none() {
+        top_level_relation = referenced_tables.first().cloned();
+    }
+    if top_level_relation_full.is_none() {
+        top_level_relation_full = top_level_relation.clone();
+    }
 
     Some(AnalyzedSelectQuery {
         top_level_relation,

@@ -862,7 +862,7 @@ mod tests {
                 4 => value.publication.push('x'),
                 5 => value.auth_principal.push('x'),
                 6 => value.credential_ref.push('x'),
-                _ => unreachable!(),
+                _ => {}
             }
             changed.push(value.connector_id());
         }
