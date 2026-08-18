@@ -13,7 +13,7 @@ use rockstream_cli::{
     run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
     run_cluster_workers_drain, run_cluster_workers_list, run_cluster_workers_status,
     run_debug_arrangement, run_explain_view, run_format_migrate, run_manifest_validate,
-    run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
+    run_qualify, run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
     run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
     run_shard_list, run_shard_migrate, run_source_drop, run_source_list, run_source_pause,
     run_source_resume, run_source_show, run_sql_compile, run_start, run_support_bundle,
@@ -306,6 +306,18 @@ enum Command {
     Manifest {
         #[command(subcommand)]
         command: ManifestCommand,
+    },
+    /// Run release qualification suite or check prerequisites.
+    Qualify {
+        /// Check execution environment prerequisites (Docker, ports, resources) fail-closed.
+        #[arg(long)]
+        check_prerequisites: bool,
+        /// Qualification test suite to execute (e.g. "e2e", "recovery", "lifecycle", "all").
+        #[arg(long)]
+        suite: Option<String>,
+        /// Output file path for raw metrics and qualification summary.
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
     },
 }
 
@@ -1004,6 +1016,16 @@ fn main() -> ExitCode {
                 handle_result(run_manifest_validate(format, &path, base_dir.as_deref()))
             }
         },
+        Command::Qualify {
+            check_prerequisites,
+            suite,
+            output,
+        } => handle_result(run_qualify(
+            format,
+            check_prerequisites,
+            suite.as_deref(),
+            output.as_deref(),
+        )),
     }
 }
 

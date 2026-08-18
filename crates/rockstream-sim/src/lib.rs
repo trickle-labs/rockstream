@@ -28,6 +28,7 @@ pub mod network;
 pub mod nexmark;
 pub mod object_store;
 pub mod paired_assert;
+pub mod qualification;
 pub mod recovery_soak;
 pub mod resource_leak_soak;
 pub mod runtime;
@@ -66,6 +67,13 @@ pub use liveness::{DegradedState, LivenessChecker, LivenessStatus};
 pub use network::{SimNetwork, SimNetworkHandle};
 pub use object_store::{SimObjectStore, SimObjectStoreHandle};
 pub use paired_assert::paired_assert;
+pub use qualification::{
+    check_prerequisites, CdcTransaction, ClusterHealth, FaultInjector, FaultType, InjectedFault,
+    MultisetDiff, MutationOp, NodeHandle, NodeRole, NodeStatus, OracleAuditor, PrerequisiteKind,
+    PrerequisiteReport, PrerequisiteViolation, QualificationCluster, QualificationClusterConfig,
+    QualificationWorkloadGenerator, RecoveryObservation, RecoveryObservationType, RecoveryObserver,
+    RecoveryTimingsReport, WorkloadRecord, REQUIRED_CONTAINER_IMAGES, REQUIRED_PORTS,
+};
 pub use recovery_soak::{
     run_brownout_recovery_scenario, run_partition_recovery_scenario, KafkaLagTimings,
     KafkaRecoverySoakResult, RecoverySoakConfig,

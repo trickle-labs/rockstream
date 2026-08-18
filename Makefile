@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e e2e-lfs e2e-nextest approve clean error-codes exit-criteria failure-matrix coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
+.PHONY: build test clippy fmt check e2e e2e-lfs e2e-nextest qualify approve clean error-codes exit-criteria failure-matrix coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
 
 # Build the workspace
 build:
@@ -198,6 +198,10 @@ e2e-nextest:
 		cargo test -p rockstream-storage --test lfs_backend --test minio_backend -- --test-threads=4 2>&1 ; \
 	fi
 	@echo "=== e2e-nextest PASSED ==="
+
+# Automated End-to-End Release Qualification suite
+qualify:
+	@bash scripts/run-release-qualification.sh
 
 # Bump the workspace version, commit, tag, and push.
 # Usage: make release VERSION=0.5.0

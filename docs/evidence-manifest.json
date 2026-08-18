@@ -1,10 +1,10 @@
 {
   "candidate": {
     "semantic_version": "0.59.1",
-    "commit_sha": "e174991554b069f9c90ddea360ba89fb46816be6",
-    "build_timestamp_rfc3339": "2026-08-18T12:05:21.614905+00:00",
+    "commit_sha": "74aab091306b37db98299aac87279358b4989bd3",
+    "build_timestamp_rfc3339": "2026-08-18T13:34:24.999571+00:00",
     "compiler_version": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)",
-    "lockfile_digest": "d9b2c662571c57ca92e43af26b31b06c5994e8592fd1d1b0f266c36db0cb9d57",
+    "lockfile_digest": "516585f8a30238b41a868692c56ee1f0889c2d5d532d120a8e02927bde2ba338",
     "enabled_features": []
   },
   "workflow_run": {
@@ -20,7 +20,7 @@
   },
   "artifacts": {
     "Cargo.toml": "075a0e63fed37896da46e2ea9b1199567838d169dbcc39812127edeaefff4f62",
-    "Cargo.lock": "d9b2c662571c57ca92e43af26b31b06c5994e8592fd1d1b0f266c36db0cb9d57",
+    "Cargo.lock": "516585f8a30238b41a868692c56ee1f0889c2d5d532d120a8e02927bde2ba338",
     "capabilities.toml": "3b23f77c761f753e508c0aa7531279e8c4fd18f33a9605235357f735e6ab2d2c",
     "docs/chaos-recovery-baseline.json": "38c27e0d31ab550a89698d36956b3f5ee71a73bbdd8ef87afcf4df1ec3d27e03",
     "docs/release-governance.md": "479e3ee6258d83b3a4aa4c23b14213f53201c190d08c322d96d4e5a8d2e338b8",

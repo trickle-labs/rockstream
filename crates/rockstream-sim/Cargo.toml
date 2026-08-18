@@ -18,6 +18,8 @@ async-trait = "0.1"
 bytes = "1"
 rand = { version = "0.8", features = ["small_rng"] }
 parking_lot = "0.12"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 rockstream-test-support.workspace = true
