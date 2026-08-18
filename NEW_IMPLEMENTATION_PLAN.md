@@ -95,7 +95,7 @@ must satisfy the relevant rungs before it exits.
 | **Deterministic simulation** | The distributed system is correct under reordering, partial failure, and crash-replay — reproducibly. | `rockstream-sim`: `SimRuntime` (seeded RNG, single-threaded), `buggify!()` fault injection, paired assertions at durable/network boundaries. |
 | **Integration** | Real processes, real network, real object store. | `testcontainers` (MinIO/Postgres/Kafka); multi-host where stated. |
 | **Chaos** | Survives arbitrary single-node faults end-to-end. | Process kills, network partitions, object-store throttling. |
-| **Soak** | No drift, leak, or unbounded cost over long runs. | 24h–7d continuous workloads with reference comparison. |
+| **Extended soak (optional)** | Adds confidence about drift, leaks, and cost over long runs when capacity permits. | Re-run the automated qualification workload for hours or days with reference comparison; never substitutes for or blocks the bounded release suite. |
 | **Benchmark** | Performance is measured and does not regress. | `criterion`; CI fails on >10% regression. |
 
 **Rules that hold for every phase:**
@@ -161,7 +161,7 @@ phase.
 | 12 | IVM | Complex analytics & compute tuning | Recursive CTEs correct against oracle; +30% DAG throughput |
 | 12.5 | Both | Standard wire compatibility & the real incremental serving path | A vanilla autocommitting psql/ORM connection round-trips data with zero private ritual; ad hoc WHERE/JOIN/GROUP BY execute correctly; the gateway and runtime unify into one data plane serving views incrementally, not via full-table batch recompute |
 | 13 | Both | Ingestion failure containment | Malformed records durably quarantined without stalling the source or breaking exactly-once |
-| 14 | Both | Production readiness & v1.0 finalization | Operable, secure, upgradeable, recoverable; v1 contract enforced by CI; 2-week chaos; zero P0/P1; `v1.0.0` tagged |
+| 14 | Both | Production readiness & v1.0 finalization | Operable, secure, upgradeable, recoverable; v1 contract enforced by CI; exact candidate artifacts pass the bounded no-skip qualification suite; zero P0/P1; `v1.0.0` tagged |
 
 **Note on Phase numbering (2026-07-19 fix)**: this table's Elastic Scaling
 row was previously numbered "11" (with every later row shifted +1 to 12–15)
@@ -992,7 +992,8 @@ durable, bounded, replayable connector quarantine.
 ## Phase 14 — Production Readiness & v1.0 Finalization
 
 **Goal**: Make the already-shipped system operable, secure, upgradeable, and
-recoverable; write the v1 contract down; prove it; tag v1.0.0.
+recoverable; write the v1 contract down; prove it against immutable candidate
+artifacts; hold `v1.0.0` until that qualification is complete.
 
 > **Rebaselined 2026-08-11.** `SERIALIZABLE LOCAL` and per-row version
 > validation for non-CRDT exact-key writes are **deferred by decision**: they
@@ -1026,9 +1027,28 @@ recoverable; write the v1 contract down; prove it; tag v1.0.0.
   commit and in recovery, migration interruption, rolling upgrade, resource
   exhaustion), each cell with a deterministic scenario, a real-backend
   counterpart, and an asserted recovery outcome.
-- **v1.0 RC1 chaos soak**: activate all features from Phase 0 through 13
-  simultaneously; run a 2-week comprehensive chaos, performance, and scaling
-  soak under maximum cluster pressure within a single cloud region.
+- **Evidence integrity and candidate identity**: bind package, binary, image,
+  support-bundle, build-info, manifest, documentation, and tag identity to one
+  source SHA and immutable artifact digests. Evidence records the workflow,
+  environment, workload, raw metrics, regenerated summaries, and exact
+  pass/fail/skip counts; checked-in targets cannot masquerade as measurements.
+- **Automated v1 qualification suite**: run separate control nodes, workers,
+  gateway, Kafka, MinIO, fault injection, workload generator, and independent
+  correctness auditor. Exercise real Kafka and PostgreSQL CDC ingestion, public
+  pgwire/CLI setup, maintained views, Kafka sink output, actual recovery events,
+  a two-image mixed-version rolling upgrade, and restore into a fresh cluster.
+  Compare complete output and frontiers with an external batch oracle and
+  regenerate recovery, performance, and resource claims from raw observations.
+  Pull-request shards stay short and deterministic; the complete bounded suite
+  runs against the candidate and fails if a required backend or scenario skips.
+- **Reproducible release and contract reconciliation**: produce signed binaries
+  and images, checksums, SBOM, vulnerability results, provenance, release docs,
+  and a verifiable security-review artifact. Generate public support and
+  compatibility tables from `capabilities.toml`, and finish dependency upgrades
+  without weakening coverage or performance gates.
+- **Optional extended qualification**: when resources permit, run the same
+  harness for hours or days. This is supplemental evidence, not an RC or release
+  prerequisite.
 
 **Exit criteria**:
 - An operator can diagnose a stale or wrong view, drain, upgrade, recover, and
@@ -1037,11 +1057,18 @@ recoverable; write the v1 contract down; prove it; tag v1.0.0.
   linked passing proof test; CI fails if the capability matrix drifts from the
   roadmap.
 - Every failure-matrix cell has a passing scenario with an asserted recovery
-  outcome; none enters the RC gate uncovered.
-- No P0 or P1 bugs discovered during the 2-week continuous automated chaos
-  cycle, and each of the seven v1 release gates (correctness, recovery, bounded
-  resources, operability, upgradeability, security, performance stability) is
-  signed off against a named artifact. Tag release `v1.0.0`.
+  outcome; none enters the RC gate uncovered or skipped.
+- One protected source SHA and its exact signed artifacts pass the complete
+  bounded qualification suite with zero failed or skipped mandatory scenarios.
+  Correctness comes from full external-oracle comparisons; recovery timing from
+  observed RockStream state transitions; upgradeability from distinct N/N+1
+  image digests; disaster recovery from destruction and fresh-cluster restore;
+  and performance/resource results from regenerable raw measurements.
+- Each of the seven v1 release gates (correctness, recovery, bounded resources,
+  operability, upgradeability, security, performance stability) is signed off
+  against the evidence manifest, with zero open P0/P1 defects. Then tag release
+  `v1.0.0`; optional extended soaks may add confidence but cannot block or
+  replace this decision.
 
 ---
 

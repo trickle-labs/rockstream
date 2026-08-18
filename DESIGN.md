@@ -4996,15 +4996,17 @@ The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
 adaptive per-operator parallelism**.
 
-**GA vs. Data Lake GA scope.** At v1.0 (v0.59 RC1), the cold-tier
-Iceberg/Delta sink (v0.44) and DuckDB/Spark/Trino table discovery via
-registered external catalogs ship before the RC1 gate. The Iceberg REST
-Catalog server (§13.7) and the DuckLake catalog server (§13.8) remain
-post-1.0. The v1.0 positioning rests on: object-storage-native IVM, full SQL,
-adaptive parallelism, Postgres wire access, direct DML writes, secondary
-indexes, and the connector and cold-tier ecosystem. Marketing materials must
-not claim the Iceberg REST Catalog or DuckLake server as shipping capabilities
-until they are released.
+**GA vs. Data Lake GA scope.** The planned v1.0 follows v0.59.1–v0.59.3
+qualification, not the completed v0.59 engineering gate. Cold-tier Iceberg and
+Delta sinks, external catalog registration, the Iceberg REST Catalog server
+(§13.7), and the DuckLake catalog server (§13.8) are not shipping v1
+capabilities; downstream lakehouse delivery uses the supported Kafka sink and
+an external format-owning writer. The v1.0 positioning rests on
+object-storage-native IVM, the documented `Core` SQL subset, adaptive
+parallelism, PostgreSQL wire access, direct DML writes, secondary indexes, and
+the PostgreSQL CDC/Kafka connector boundary. Marketing materials must be
+generated from or reconciled with `capabilities.toml` and must not claim a
+removed or deferred data-lake surface.
 
 ### 15.1 Explicitly Deferred: Data Quality / Expectations
 

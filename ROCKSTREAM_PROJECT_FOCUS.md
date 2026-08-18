@@ -368,9 +368,12 @@ Why: necessary to operate the existing distributed system safely.
 
 Why: necessary to make object-storage-backed disposable compute a credible production promise.
 
-#### Simulator maturity and final production soaks
+#### Automated release qualification and optional production soaks
 
-**Recommendation:** Keep, but tie the work to concrete IVM/recovery failure modes rather than generic platform expansion.
+**Recommendation:** Make the bounded, no-skip automated qualification suite the
+release gate and tie every scenario to a concrete IVM/recovery claim. Longer
+production soaks may reuse the same harness when resources permit, but remain
+optional supplemental evidence.
 
 #### v1.0 release verification
 
@@ -592,6 +595,9 @@ For public-facing features, track:
 | Rolling upgrade proof & disaster recovery | Planned | v0.56–v0.56.1 | Core | Yes |
 | The v1 public contract & compatibility freeze | Planned | v0.57–v0.57.1 | Core | Yes |
 | Production failure-matrix proof | Planned | v0.58–v0.58.3 | Core | Yes |
+| Evidence integrity & honest release state | Planned | v0.59.1 | Core | Yes |
+| True automated end-to-end release qualification | Planned | v0.59.2 | Core | Yes |
+| Security provenance, reproducible releases & contract reconciliation | Planned | v0.59.3 | Core | Yes |
 | Inline expectations, lineage diagnostics & governance policy language | Deferred by decision | — | Candidate | No; readmission requires a design partner needing policy in the engine |
 | Isolation & validation hooks (broader transactional semantics) | Deferred by decision | — | Candidate | No; readmission requires a workload that cannot use PostgreSQL/Kafka as source of truth |
 | New connector family (beyond PostgreSQL CDC / Kafka) | Not applicable | — | Candidate | No without admission, machine-enforced from v0.52.5 |
@@ -662,9 +668,15 @@ Prove rolling upgrade and restore into a fresh cluster from independently stored
 
 Exit when the procedures are executable runbooks backed by automated tests and a real drill.
 
-### Stage 5 — Final IVM production validation
+### Stage 5 — Evidence integrity and automated v1 qualification
 
-Run long-duration chaos, scale, object-store-pressure, spill, and connector-failure workloads against the v1 core contract.
+First bind the candidate's source SHA, artifact digests, environment, workload,
+raw results, and generated summaries in an immutable evidence manifest. Then run
+a bounded, repeatable, no-skip multi-process suite against those exact artifacts:
+real Kafka and PostgreSQL CDC paths, public pgwire/CLI setup, independent batch
+oracle and sink auditor, observed worker/control/source/storage recovery, two
+distinct versions under rolling upgrade, fresh-cluster restore, and measured
+resource and performance envelopes.
 
 The release gate should prioritize:
 
@@ -676,7 +688,10 @@ The release gate should prioritize:
 - Security.
 - Performance stability of core IVM workloads.
 
-Only after those gates are satisfied should broader feature expansion become a default roadmap activity again.
+Only after those gates are satisfied should `v1.0.0` or broader feature
+expansion become a default roadmap activity. Extended chaos, scale,
+object-store-pressure, spill, and connector-failure soaks may run when resources
+permit, but are optional and cannot replace or block the automated gate.
 
 ---
 

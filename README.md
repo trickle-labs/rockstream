@@ -215,17 +215,16 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 
 ## Status
 
-This project is under active, evidence-driven implementation — every roadmap
-version ships only once its tests, benchmarks, and (for coordination
-protocols) FizzBee models prove the new capability works. The current
-released version is **v0.42** ("Wire Protocol End-User Complete" — see
-[sign-offs/v0.42.md](sign-offs/v0.42.md)): the single-shard IVM engine, the
-distributed frontier/fault-tolerance protocols, and the PostgreSQL wire
-gateway (auth, transactions/savepoints, LISTEN/NOTIFY, and a certified
-driver-compatibility matrix) are all done and proven. Work is proceeding
-through the supported Kafka-based export path toward the v1.0
-release candidate at v0.59. Four documents describe the system in
-progressively more detail:
+This project is under active, evidence-driven implementation. The current
+engineering milestone is **v0.59.0 technical preview**: implementation and its
+short CI gate are complete, but v1 release qualification is still in progress
+and no `v1.0.0` release is claimed. The workspace and binary still report
+`0.42.0`; unifying package, binary, image, manifest, documentation, and tag
+identity is explicit v0.59.1 work rather than something this README hides. The
+v0.59.1–v0.59.3 sequence makes evidence immutable, replaces nominal release
+proofs with a bounded no-skip end-to-end suite, and finishes reproducible
+release, security-provenance, and contract work before a signed RC. Five
+documents describe the system in progressively more detail:
 
 | Document | Audience | What it covers |
 |---|---|---|
@@ -264,7 +263,9 @@ evidence behind every completed version.
 | Public Demo Ready | v0.51.6 | A vanilla, autocommitting psql/ORM/BI-tool connection round-trips data with zero private ritual; ad hoc queries honor WHERE/JOIN/GROUP BY; the gateway serves views through the real incremental engine on one unified data plane instead of a disconnected batch recompute; the wire is TLS-terminated for a standard client |
 | Operationally Complete | v0.56.1 | Full operator CLI + arrangement debugger, explainable freshness lag, internal mTLS, secrets management, an independent security review, and a proven rolling-upgrade/disaster-recovery path |
 | v1 Contract Published | v0.57.1 | Every capability carries a strategic tier (Core/Maintain/Experimental), every Core operator's incremental/backfill/recovery/state-growth/failure semantics are documented, and CI fails if the published capability matrix drifts from the roadmap |
-| 1.0 Release | v0.59 | All v0.1–v0.58 features integrated; the seven v1 release gates each signed off against a named artifact; 2-week continuous chaos cycle passes with zero P0/P1 bugs; `v1.0.0` tagged |
+| v0.59 Engineering Complete ✅ Done | v0.59 | All v0.1–v0.58.3 implementation work and the short CI gate completed; release qualification remains open |
+| v1 Release Qualification | v0.59.1–v0.59.3 | Immutable candidate identity and evidence; real no-skip multi-process correctness/recovery/upgrade/restore/performance suite; reproducible signed releases, security provenance, and generated public contracts |
+| 1.0 Release | after v0.59.3 | Exact signed candidate artifacts pass every bounded automated gate with zero open P0/P1 defects; optional extended soaks may add confidence but do not block release; `v1.0.0` tagged |
 
 ### Phase Summary
 
@@ -288,7 +289,7 @@ evidence behind every completed version.
 | 15 | Complex analytics and compute tuning: recursive CTEs, lateral joins, hopping/session windows, hot-path optimizations |
 | 15.5 | Standard wire compatibility and the real incremental serving path: standard autocommit/idempotency/immediate-view-population semantics, query-time WHERE/JOIN/GROUP BY execution, gateway+runtime unified into one incrementally-served data plane, TLS termination, binary wire format, bounded session state |
 | 16 | Ingestion failure containment: a durable, bounded, inspectable, replayable connector quarantine |
-| 17 | Production readiness and 1.0 finalization: the operator CLI + arrangement debugger, freshness explainability, mTLS/secrets/security review, rolling-upgrade + disaster-recovery proof, the written v1 contract, the production failure matrix, the v1.0 release candidate |
+| 17 | Production readiness and 1.0 finalization: the operator CLI + arrangement debugger, freshness explainability, mTLS/secrets/security review, rolling-upgrade + disaster-recovery proof, the written v1 contract, the production failure matrix, evidence integrity, the automated end-to-end qualification suite, reproducible releases, and the signed v1.0 release candidate |
 
 ## Crate Architecture
 
