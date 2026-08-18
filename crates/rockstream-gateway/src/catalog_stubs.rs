@@ -1609,6 +1609,9 @@ impl CatalogStubs {
             return Some(self.pg_attribute(&requested_cols));
         }
         if ql.contains("pg_type") {
+            if ql.contains("typname") && ql.contains("'hstore'") {
+                return Some(CatalogResponse::rows(requested_cols, Vec::new()));
+            }
             return Some(self.pg_type(&requested_cols));
         }
         if ql.contains("pg_class") {

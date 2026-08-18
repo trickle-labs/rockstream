@@ -15323,6 +15323,28 @@ fn describe_returning_fields(
             FieldInfo::new(col.clone(), None, None, Type::TEXT, FieldFormat::Text)
         })
         .collect()
+}
+
+fn catalog_column_type(column: &str) -> Type {
+    match column.to_ascii_lowercase().as_str() {
+        "is_partition"
+        | "has_subclass"
+        | "has_row_level_security"
+        | "is_deferrable"
+        | "is_deferred"
+        | "relhasindex"
+        | "indisprimary"
+        | "indisunique"
+        | "indisvalid"
+        | "attnotnull"
+        | "atthasdef" => Type::BOOL,
+        "oid" | "table_oid" | "relid" | "attrelid" | "atttypid" | "relnamespace" | "relowner" => {
+            Type::INT4
+        }
+        "constraint_type" => Type::CHAR,
+        _ => Type::TEXT,
+    }
+}
 
 /// Build FieldInfo list for a query (for DESCRIBE).
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
