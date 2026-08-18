@@ -232,30 +232,42 @@ impl Drop for ContainerCleanup {
     }
 }
 
-async fn read_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+async fn read_frame(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     let mut kind = [0_u8; 1];
-    stream.read_exact(&mut kind).await.unwrap();
+    stream.read_exact(&mut kind).await?;
     let mut length = [0_u8; 4];
-    stream.read_exact(&mut length).await.unwrap();
+    stream.read_exact(&mut length).await?;
     let body_length = u32::from_be_bytes(length) as usize - 4;
     let mut body = vec![0_u8; body_length];
-    stream.read_exact(&mut body).await.unwrap();
-    (kind[0], body)
+    stream.read_exact(&mut body).await?;
+    Ok((kind[0], body))
 }
 
 async fn startup(port: u16) -> TcpStream {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let mut body = Vec::from(196_608_u32.to_be_bytes());
-    body.extend_from_slice(b"user\0soak\0database\0soak\0\0");
-    let mut message = Vec::from(((body.len() + 4) as u32).to_be_bytes());
-    message.extend_from_slice(&body);
-    stream.write_all(&message).await.unwrap();
-    loop {
-        let (kind, _) = read_frame(&mut stream).await;
-        if kind == b'Z' {
-            return stream;
+    for _ in 0..20 {
+        let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        };
+        let mut body = Vec::from(196_608_u32.to_be_bytes());
+        body.extend_from_slice(b"user\0soak\0database\0soak\0\0");
+        let mut message = Vec::from(((body.len() + 4) as u32).to_be_bytes());
+        message.extend_from_slice(&body);
+        if stream.write_all(&message).await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
         }
+        loop {
+            let Ok((kind, _)) = read_frame(&mut stream).await else {
+                break;
+            };
+            if kind == b'Z' {
+                return stream;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    panic!("gateway did not complete pgwire startup on port {port}");
 }
 
 async fn command_tag(port: u16, sql: &str) -> String {
@@ -272,7 +284,7 @@ async fn command_tag_on_stream(stream: &mut TcpStream, sql: &str) -> String {
     stream.write_all(&message).await.unwrap();
     let mut tag = None;
     loop {
-        let (kind, body) = read_frame(stream).await;
+        let (kind, body) = read_frame(stream).await.unwrap();
         if kind == b'C' {
             tag = Some(String::from_utf8(body[..body.len() - 1].to_vec()).unwrap());
         }
