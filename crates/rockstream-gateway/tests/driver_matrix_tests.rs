@@ -801,7 +801,9 @@ async fn test_prisma_smoke() {
         vec![
             "sh",
             "-c",
-            &format!("cd /app && DATABASE_URL='{db_url}' npx prisma db pull --force"),
+            &format!(
+                "cd /app && for attempt in 1 2 3 4 5; do DATABASE_URL='{db_url}' npx prisma db pull --force && exit 0; sleep 1; done; exit 1"
+            ),
         ],
         "prisma db pull",
     )
