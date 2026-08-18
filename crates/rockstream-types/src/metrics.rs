@@ -1771,6 +1771,20 @@ pub fn prometheus_text() -> String {
 pub fn generate_prometheus_metrics() -> String {
     let mut out = String::new();
     with_registry(|reg| {
+        // 0. rockstream_build_info
+        let id = crate::candidate_identity::CandidateIdentity::current();
+        out.push_str("# HELP rockstream_build_info Immutable candidate identity build metadata.\n");
+        out.push_str("# TYPE rockstream_build_info gauge\n");
+        out.push_str(&format!(
+            "rockstream_build_info{{version=\"{}\",commit_sha=\"{}\",build_timestamp=\"{}\",compiler_version=\"{}\",lockfile_digest=\"{}\",features=\"{}\"}} 1\n\n",
+            id.semantic_version,
+            id.commit_sha,
+            id.build_timestamp_rfc3339,
+            id.compiler_version,
+            id.lockfile_digest,
+            id.enabled_features.join(",")
+        ));
+
         // 1. merge_law_applied_total
         out.push_str("# HELP merge_law_applied_total Counter tracking the number of times a merge law is evaluated on a state merge.\n");
         out.push_str("# TYPE merge_law_applied_total counter\n");

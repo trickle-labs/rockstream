@@ -333,7 +333,7 @@ impl PostgresCdcSource {
             .as_deref()
             .is_some_and(|name| name != token.secret_name)
         {
-            return Err("secret token does not match the connector binding".to_string());
+            return Err("RS-5003: secret token does not match the connector binding".to_string());
         }
         self.secret_name = Some(token.secret_name.clone());
         self.pending_secret_token = Some(token);

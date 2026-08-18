@@ -1,0 +1,19 @@
+# Code Ownership Rules for RockStream
+
+# Release workflows and prompts
+/.github/workflows/ @rockstream-maintainers
+/.github/prompts/ @rockstream-maintainers
+
+# Formal verification specifications and plans
+/formal/ @rockstream-formal-methods
+/FIZZBEE_TEST_PLAN.md @rockstream-formal-methods
+
+# Security policies, threat model, and review commission
+/SECURITY.md @rockstream-security
+/SECURITY_REVIEW_COMMISSION.md @rockstream-security
+/docs/threat-model.md @rockstream-security
+
+# Capability contracts, language features, and roadmap
+/capabilities.toml @rockstream-maintainers
+/docs/language-features.md @rockstream-maintainers
+/NEW_ROADMAP.md @rockstream-maintainers

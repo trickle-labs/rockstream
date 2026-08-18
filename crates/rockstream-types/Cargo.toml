@@ -19,7 +19,9 @@ hex = { workspace = true }
 parking_lot = { workspace = true }
 x509-parser = { workspace = true }
 sha2 = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"

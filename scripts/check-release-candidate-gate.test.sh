@@ -107,4 +107,121 @@ fi
 grep -q "VIOLATION: Gate 7:" "$TMP_DIR/out.log" || fail "Gate 7 low throughput violation was not reported"
 rm -rf "$TMP_DIR"
 
+# 8. Mutation: candidate version mismatch in Cargo.toml / manifest
+TMP_DIR="$(mktemp -d)"
+python3 -c '
+import shutil, sys
+shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, ignore=shutil.ignore_patterns("target", ".git"), dirs_exist_ok=True)
+' "$ROOT" "$TMP_DIR"
+python3 -c '
+import sys
+p = sys.argv[1]
+with open(p, "r") as f: c = f.read()
+with open(p, "w") as f: f.write(c.replace("version = \"0.59.1\"", "version = \"0.59.0\""))
+' "$TMP_DIR/Cargo.toml"
+if bash "$TMP_DIR/scripts/check-release-candidate-gate.sh" "$TMP_DIR" >"$TMP_DIR/out.log" 2>&1; then
+  fail "candidate version mismatch was accepted"
+fi
+grep -q "VIOLATION: Candidate Identity:" "$TMP_DIR/out.log" || fail "Candidate Identity violation was not reported"
+rm -rf "$TMP_DIR"
+
+# 9. Mutation: artifact digest mismatch in evidence manifest
+TMP_DIR="$(mktemp -d)"
+python3 -c '
+import shutil, sys
+shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, ignore=shutil.ignore_patterns("target", ".git"), dirs_exist_ok=True)
+' "$ROOT" "$TMP_DIR"
+python3 -c '
+import json, sys
+p = sys.argv[1]
+with open(p, "r") as f: d = json.load(f)
+for k in d["artifacts"]:
+    d["artifacts"][k] = "0" * 64
+with open(p, "w") as f: json.dump(d, f, indent=2)
+' "$TMP_DIR/docs/evidence-manifest.json"
+if bash "$TMP_DIR/scripts/check-release-candidate-gate.sh" "$TMP_DIR" >"$TMP_DIR/out.log" 2>&1; then
+  fail "tampered artifact digest in evidence manifest was accepted"
+fi
+grep -q "VIOLATION: Evidence Manifest: artifact" "$TMP_DIR/out.log" || fail "Evidence manifest digest mismatch was not reported"
+rm -rf "$TMP_DIR"
+
+# 10. Mutation: skipped mandatory tests in evidence manifest
+TMP_DIR="$(mktemp -d)"
+python3 -c '
+import shutil, sys
+shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, ignore=shutil.ignore_patterns("target", ".git"), dirs_exist_ok=True)
+' "$ROOT" "$TMP_DIR"
+python3 -c '
+import json, sys
+p = sys.argv[1]
+with open(p, "r") as f: d = json.load(f)
+d["test_results"]["candidate_identity_tests"]["mandatory_skipped"] = 1
+with open(p, "w") as f: json.dump(d, f, indent=2)
+' "$TMP_DIR/docs/evidence-manifest.json"
+if bash "$TMP_DIR/scripts/check-release-candidate-gate.sh" "$TMP_DIR" >"$TMP_DIR/out.log" 2>&1; then
+  fail "skipped mandatory tests in evidence manifest was accepted"
+fi
+grep -q "skipped mandatory tests" "$TMP_DIR/out.log" || fail "Skipped mandatory tests violation was not reported"
+rm -rf "$TMP_DIR"
+
+# 11. Mutation: missing raw observation data for summary metrics
+TMP_DIR="$(mktemp -d)"
+python3 -c '
+import shutil, sys
+shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, ignore=shutil.ignore_patterns("target", ".git"), dirs_exist_ok=True)
+' "$ROOT" "$TMP_DIR"
+python3 -c '
+import json, sys
+p = sys.argv[1]
+with open(p, "r") as f: d = json.load(f)
+d["raw_metrics"].clear()
+with open(p, "w") as f: json.dump(d, f, indent=2)
+' "$TMP_DIR/docs/evidence-manifest.json"
+if bash "$TMP_DIR/scripts/check-release-candidate-gate.sh" "$TMP_DIR" >"$TMP_DIR/out.log" 2>&1; then
+  fail "missing raw data in evidence manifest was accepted"
+fi
+grep -q "missing raw observation data" "$TMP_DIR/out.log" || fail "Missing raw data violation was not reported"
+rm -rf "$TMP_DIR"
+
+# 12. Mutation: summary metrics mathematical regeneration mismatch
+TMP_DIR="$(mktemp -d)"
+python3 -c '
+import shutil, sys
+shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, ignore=shutil.ignore_patterns("target", ".git"), dirs_exist_ok=True)
+' "$ROOT" "$TMP_DIR"
+python3 -c '
+import json, sys
+p = sys.argv[1]
+with open(p, "r") as f: d = json.load(f)
+d["summary_metrics"]["failure_detection_ms"]["p99"] = 999.0
+with open(p, "w") as f: json.dump(d, f, indent=2)
+' "$TMP_DIR/docs/evidence-manifest.json"
+if bash "$TMP_DIR/scripts/check-release-candidate-gate.sh" "$TMP_DIR" >"$TMP_DIR/out.log" 2>&1; then
+  fail "mathematical summary regeneration mismatch was accepted"
+fi
+grep -q "mismatch: expected" "$TMP_DIR/out.log" || fail "Summary regeneration mismatch violation was not reported"
+rm -rf "$TMP_DIR"
+
+# 13. Mutation: target threshold used directly as measured result
+TMP_DIR="$(mktemp -d)"
+python3 -c '
+import shutil, sys
+shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, ignore=shutil.ignore_patterns("target", ".git"), dirs_exist_ok=True)
+' "$ROOT" "$TMP_DIR"
+python3 -c '
+import json, sys
+p = sys.argv[1]
+with open(p, "r") as f: d = json.load(f)
+d["raw_metrics"]["failure_detection_ms"] = [5000.0]
+d["summary_metrics"]["failure_detection_ms"] = {
+    "p50": 5000.0, "p95": 5000.0, "p99": 5000.0, "mean": 5000.0, "min": 5000.0, "max": 5000.0, "sample_count": 1
+}
+with open(p, "w") as f: json.dump(d, f, indent=2)
+' "$TMP_DIR/docs/evidence-manifest.json"
+if bash "$TMP_DIR/scripts/check-release-candidate-gate.sh" "$TMP_DIR" >"$TMP_DIR/out.log" 2>&1; then
+  fail "target threshold used as measured result was accepted"
+fi
+grep -q "target threshold cannot satisfy measured result" "$TMP_DIR/out.log" || fail "Target cannot satisfy measured result was not reported"
+rm -rf "$TMP_DIR"
+
 echo "OK: check-release-candidate-gate self-test passed."

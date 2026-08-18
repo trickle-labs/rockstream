@@ -1871,6 +1871,7 @@ impl StorageClient {
 
         let bundle = serde_json::json!({
             "generated_at_ms": now_ms,
+            "candidate_identity": rockstream_types::candidate_identity::CandidateIdentity::current(),
             "view": view,
             "audit_events": [],
             "redaction": "secret values are never included; only metadata and audit events are exported"

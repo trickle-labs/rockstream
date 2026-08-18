@@ -4946,7 +4946,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-cli"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "arrow",
  "clap",
@@ -4974,7 +4974,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-connectors"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5005,7 +5005,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-control"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -5050,7 +5050,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-diff"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "rockstream-plan",
  "rockstream-types",
@@ -5060,7 +5060,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-fuzz"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5075,7 +5075,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-gateway"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5132,7 +5132,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-ops"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5166,7 +5166,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-oracle"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5199,7 +5199,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-plan"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "rockstream-types",
  "serde",
@@ -5208,7 +5208,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-runtime"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -5255,7 +5255,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sim"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5291,7 +5291,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sql"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5324,7 +5324,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-storage"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5355,7 +5355,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-test-support"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "rcgen",
  "rockstream-types",
@@ -5365,7 +5365,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-types"
-version = "0.42.0"
+version = "0.59.1"
 dependencies = [
  "antichain",
  "arrow",
@@ -5378,6 +5378,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "toml",
  "tracing",
  "x509-parser",

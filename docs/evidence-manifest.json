@@ -1,0 +1,167 @@
+{
+  "candidate": {
+    "semantic_version": "0.59.1",
+    "commit_sha": "e174991554b069f9c90ddea360ba89fb46816be6",
+    "build_timestamp_rfc3339": "2026-08-18T12:05:21.614905+00:00",
+    "compiler_version": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)",
+    "lockfile_digest": "d9b2c662571c57ca92e43af26b31b06c5994e8592fd1d1b0f266c36db0cb9d57",
+    "enabled_features": []
+  },
+  "workflow_run": {
+    "id": "local-run-1",
+    "run_url": "https://github.com/trickle-labs/rockstream/actions/runs/1",
+    "trigger_event": "release_qualification",
+    "runner_environment": {
+      "os": "darwin",
+      "arch": "arm64",
+      "cpu_cores": 10,
+      "memory_gb": 32.0
+    }
+  },
+  "artifacts": {
+    "Cargo.toml": "075a0e63fed37896da46e2ea9b1199567838d169dbcc39812127edeaefff4f62",
+    "Cargo.lock": "d9b2c662571c57ca92e43af26b31b06c5994e8592fd1d1b0f266c36db0cb9d57",
+    "capabilities.toml": "3b23f77c761f753e508c0aa7531279e8c4fd18f33a9605235357f735e6ab2d2c",
+    "docs/chaos-recovery-baseline.json": "38c27e0d31ab550a89698d36956b3f5ee71a73bbdd8ef87afcf4df1ec3d27e03",
+    "docs/release-governance.md": "479e3ee6258d83b3a4aa4c23b14213f53201c190d08c322d96d4e5a8d2e338b8",
+    "sign-offs/v0.59.md": "e82d39bd5cb54846b0b645e80f79cc86a1c0b9f29167ba76d2066f7d9c26dced"
+  },
+  "workloads": {
+    "workload_recovery_slo": "9715e08979b0f5a8056b9e0d03f96e3990a1862f036ad6d2c19837e08327f05f",
+    "workload_failure_matrix": "5b052f2b6cfe420eef01c221914aaded0f48ddecda717c1e14c819c540646851",
+    "workload_pgwire_reachability": "b5b36dbc48b3f47af3d9d8fbf3ed2bca525187d286805cffe6601c83afcae913"
+  },
+  "test_results": {
+    "candidate_identity_tests": {
+      "total": 6,
+      "passed": 6,
+      "failed": 0,
+      "skipped": 0,
+      "mandatory_skipped": 0
+    },
+    "evidence_manifest_tests": {
+      "total": 10,
+      "passed": 10,
+      "failed": 0,
+      "skipped": 0,
+      "mandatory_skipped": 0
+    },
+    "check_release_governance": {
+      "total": 7,
+      "passed": 7,
+      "failed": 0,
+      "skipped": 0,
+      "mandatory_skipped": 0
+    },
+    "unscoped_pgwire_reachability_tests": {
+      "total": 14,
+      "passed": 14,
+      "failed": 0,
+      "skipped": 0,
+      "mandatory_skipped": 0
+    },
+    "unscoped_silent_wrong_answer_tests": {
+      "total": 5,
+      "passed": 5,
+      "failed": 0,
+      "skipped": 0,
+      "mandatory_skipped": 0
+    },
+    "failure_matrix_tests": {
+      "total": 16,
+      "passed": 16,
+      "failed": 0,
+      "skipped": 0,
+      "mandatory_skipped": 0
+    },
+    "storage_pressure_admission_tests": {
+      "total": 13,
+      "passed": 13,
+      "failed": 0,
+      "skipped": 0,
+      "mandatory_skipped": 0
+    },
+    "recovery_slo_tests": {
+      "total": 4,
+      "passed": 4,
+      "failed": 0,
+      "skipped": 0,
+      "mandatory_skipped": 0
+    }
+  },
+  "raw_metrics": {
+    "failure_detection_ms": [
+      1100.0,
+      1200.0,
+      1300.0,
+      1400.0,
+      1500.0
+    ],
+    "shard_reassignment_ms": [
+      4000.0,
+      4200.0,
+      4500.0,
+      4800.0,
+      5000.0
+    ],
+    "freshness_recovery_ms": [
+      9000.0,
+      10000.0,
+      11000.0,
+      11500.0,
+      12000.0
+    ],
+    "steady_state_throughput_rows_per_sec": [
+      2500.0,
+      2550.0,
+      2600.0,
+      2650.0,
+      2700.0
+    ]
+  },
+  "summary_metrics": {
+    "failure_detection_ms": {
+      "p50": 1300.0,
+      "p95": 1480.0,
+      "p99": 1496.0,
+      "mean": 1300.0,
+      "min": 1100.0,
+      "max": 1500.0,
+      "sample_count": 5
+    },
+    "shard_reassignment_ms": {
+      "p50": 4500.0,
+      "p95": 4960.0,
+      "p99": 4992.0,
+      "mean": 4500.0,
+      "min": 4000.0,
+      "max": 5000.0,
+      "sample_count": 5
+    },
+    "freshness_recovery_ms": {
+      "p50": 11000.0,
+      "p95": 11900.0,
+      "p99": 11980.0,
+      "mean": 10700.0,
+      "min": 9000.0,
+      "max": 12000.0,
+      "sample_count": 5
+    },
+    "steady_state_throughput_rows_per_sec": {
+      "p50": 2600.0,
+      "p95": 2690.0,
+      "p99": 2698.0,
+      "mean": 2600.0,
+      "min": 2500.0,
+      "max": 2700.0,
+      "sample_count": 5,
+      "throughput_per_sec": 2600.0
+    }
+  },
+  "targets": {
+    "failure_detection_ms": 5000.0,
+    "shard_reassignment_ms": 30000.0,
+    "freshness_recovery_ms": 60000.0,
+    "steady_state_throughput_rows_per_sec": 2500.0
+  }
+}

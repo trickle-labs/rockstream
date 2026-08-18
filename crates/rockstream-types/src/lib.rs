@@ -8,6 +8,7 @@ pub mod acl;
 pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
+pub mod candidate_identity;
 pub mod checkpoint;
 pub mod compatibility;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod connector;
 pub mod cost;
 pub mod dlq;
 pub mod error_code;
+pub mod evidence_manifest;
 pub mod exchange;
 pub mod explain;
 pub mod frontier;
@@ -37,8 +39,13 @@ pub mod topology;
 pub mod view_lifecycle;
 pub mod workload;
 
+pub use candidate_identity::CandidateIdentity;
 pub use compatibility::{
     ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
+};
+pub use evidence_manifest::{
+    EvidenceIntegrityError, EvidenceManifest, RunnerEnvironment, SummaryMetric, TestSuiteResult,
+    WorkflowRunInfo,
 };
 
 /// Timestamp types.

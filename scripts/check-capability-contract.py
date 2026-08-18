@@ -225,8 +225,8 @@ def generated_block(text: str) -> str | None:
 def check_full_semantics(
     root: Path, contract: dict, capabilities: list[dict], errors: list[str]
 ) -> None:
-    if contract.get("version") != "v0.57.1":
-        fail(errors, "capabilities.toml contract.version must be v0.57.1")
+    if contract.get("version") not in {"v0.57.1", "v0.59.1"}:
+        fail(errors, "capabilities.toml contract.version must be v0.57.1 or v0.59.1")
 
     for capability in capabilities:
         if capability.get("kind") != "language" or capability.get("tier") != "Core":
@@ -303,8 +303,8 @@ def main() -> int:
     errors: list[str] = []
     contract, capabilities = load_source(root, errors)
     if contract:
-        if contract.get("version") not in {"v0.57", "v0.57.1"}:
-            fail(errors, "capabilities.toml contract.version must be v0.57 or v0.57.1")
+        if contract.get("version") not in {"v0.57", "v0.57.1", "v0.59.1"}:
+            fail(errors, "capabilities.toml contract.version must be v0.57, v0.57.1 or v0.59.1")
         check_promises(root, contract.get("promise"), errors)
     check_external_surface(capabilities, errors)
     check_documented_tiers(root, capabilities, errors)

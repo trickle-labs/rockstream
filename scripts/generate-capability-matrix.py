@@ -39,15 +39,18 @@ def validate(
     contract = data.get("contract")
     if not isinstance(contract, dict):
         fail("capabilities.toml must define [contract]")
-    if contract.get("version") != "v0.57.1":
-        fail("capabilities.toml contract.version must be v0.57.1")
+    version = contract.get("version")
+    if version not in {"v0.57.1", "v0.59.1"}:
+        fail("capabilities.toml contract.version must be v0.57.1 or v0.59.1")
     roadmap = contract.get("roadmap")
     if not isinstance(roadmap, str):
         fail("contract.roadmap must be a path")
     roadmap_text = check_file(root, roadmap, "roadmap")
-    roadmap_rows = re.findall(r"^\| v0\.57\.1 \|.*$", roadmap_text, re.MULTILINE)
+    roadmap_rows = re.findall(rf"^\| {re.escape(str(version))} \|.*$", roadmap_text, re.MULTILINE)
+    if not roadmap_rows:
+        roadmap_rows = re.findall(r"^\| v0\.57\.1 \|.*$", roadmap_text, re.MULTILINE)
     if len(roadmap_rows) != 1:
-        fail("NEW_ROADMAP.md has no v0.57 version row")
+        fail(f"NEW_ROADMAP.md has no {version} version row")
     roadmap_fingerprint = hashlib.sha256(
         roadmap_rows[0].encode("utf-8")
     ).hexdigest()

@@ -352,7 +352,7 @@ pub fn total_real_backend_budget_secs() -> u64 {
 pub fn validate_registry() -> Result<(), String> {
     if FAILURE_MATRIX_CELLS.len() != 11 {
         return Err(format!(
-            "Expected 11 failure matrix cells, found {}",
+            "RS-0001: Expected 11 failure matrix cells, found {}",
             FAILURE_MATRIX_CELLS.len()
         ));
     }
@@ -360,14 +360,14 @@ pub fn validate_registry() -> Result<(), String> {
     for (idx, cell) in FAILURE_MATRIX_CELLS.iter().enumerate() {
         if cell.id as usize != idx {
             return Err(format!(
-                "Cell {} is out of index order (expected {:?})",
+                "RS-0001: Cell {} is out of index order (expected {:?})",
                 cell.id.as_str(),
                 FailureModeId::all()[idx]
             ));
         }
         if cell.permanent_seeds.is_empty() {
             return Err(format!(
-                "Cell {} has no permanent seeds assigned",
+                "RS-0001: Cell {} has no permanent seeds assigned",
                 cell.id.as_str()
             ));
         }
@@ -378,20 +378,20 @@ pub fn validate_registry() -> Result<(), String> {
             || outcome.contains("runs fine")
         {
             return Err(format!(
-                "Cell {} contains a vacuous recovery assertion: '{}'",
+                "RS-0001: Cell {} contains a vacuous recovery assertion: '{}'",
                 cell.id.as_str(),
                 cell.asserted_recovery_outcome
             ));
         }
         if cell.real_backend_test.is_none() && cell.exemption_reason.is_none() {
             return Err(format!(
-                "Cell {} has neither a real backend test link nor a reasoned exemption",
+                "RS-0001: Cell {} has neither a real backend test link nor a reasoned exemption",
                 cell.id.as_str()
             ));
         }
         if cell.real_backend_budget_secs == 0 {
             return Err(format!(
-                "Cell {} has an invalid time budget (0s)",
+                "RS-0001: Cell {} has an invalid time budget (0s)",
                 cell.id.as_str()
             ));
         }
@@ -403,7 +403,7 @@ pub fn validate_registry() -> Result<(), String> {
             || slo.contains("runs fine")
         {
             return Err(format!(
-                "Cell {} contains a vacuous or empty absolute SLO target: '{}'",
+                "RS-0001: Cell {} contains a vacuous or empty absolute SLO target: '{}'",
                 cell.id.as_str(),
                 cell.absolute_slo_target
             ));
@@ -451,40 +451,41 @@ impl ChaosRecoverySlos {
     /// Validate measured metrics against the absolute SLO limits.
     pub fn check(&self, metrics: &EvaluatedChaosMetrics) -> Result<(), String> {
         if !metrics.zero_loss {
-            return Err("Data loss detected: zero_loss assertion failed".to_string());
+            return Err("RS-3001: Data loss detected: zero_loss assertion failed".to_string());
         }
         if !metrics.zero_duplicates {
             return Err(
-                "Duplicate delivery detected: zero_duplicates assertion failed".to_string(),
+                "RS-3001: Duplicate delivery detected: zero_duplicates assertion failed"
+                    .to_string(),
             );
         }
         if metrics.failure_detection_ms > self.max_failure_detection_ms {
             return Err(format!(
-                "Failure detection exceeded SLO: {} ms > {} ms limit",
+                "RS-3001: Failure detection exceeded SLO: {} ms > {} ms limit",
                 metrics.failure_detection_ms, self.max_failure_detection_ms
             ));
         }
         if metrics.shard_reassignment_ms > self.max_shard_reassignment_ms {
             return Err(format!(
-                "Shard reassignment exceeded SLO: {} ms > {} ms limit",
+                "RS-3001: Shard reassignment exceeded SLO: {} ms > {} ms limit",
                 metrics.shard_reassignment_ms, self.max_shard_reassignment_ms
             ));
         }
         if metrics.freshness_recovery_ms > self.max_freshness_recovery_ms {
             return Err(format!(
-                "Freshness recovery exceeded SLO: {} ms > {} ms limit",
+                "RS-3001: Freshness recovery exceeded SLO: {} ms > {} ms limit",
                 metrics.freshness_recovery_ms, self.max_freshness_recovery_ms
             ));
         }
         if metrics.throughput_rows_per_sec < self.min_sustained_throughput_rows_per_sec {
             return Err(format!(
-                "Sustained throughput below SLO: {} rows/s < {} rows/s minimum",
+                "RS-3001: Sustained throughput below SLO: {} rows/s < {} rows/s minimum",
                 metrics.throughput_rows_per_sec, self.min_sustained_throughput_rows_per_sec
             ));
         }
         if metrics.suite_runtime_secs > self.max_suite_runtime_secs {
             return Err(format!(
-                "Suite runtime exceeded budget: {} s > {} s limit",
+                "RS-3001: Suite runtime exceeded budget: {} s > {} s limit",
                 metrics.suite_runtime_secs, self.max_suite_runtime_secs
             ));
         }

@@ -11,10 +11,11 @@
 //! All user/operator-visible failures carry an `RS-XXXX` error code with
 //! actionable `next_steps` text (see [`CliError`]).
 
+use crate::output::OutputFormat;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
 use rockstream_types::error_code::{
-    next_steps, ErrorCode, RS_0002, RS_0003, RS_0005, RS_4017, RS_5001,
+    next_steps, ErrorCode, RS_0001, RS_0002, RS_0003, RS_0005, RS_4017, RS_5001,
 };
 use rockstream_types::topology::{
     ControlMessage, WorkerCapabilities, WorkerLocation, WorkerMessage,
@@ -188,6 +189,7 @@ struct MetricsSnapshot {
 #[derive(Debug, Clone, Serialize)]
 struct SupportBundle {
     generated_at_ms: u64,
+    candidate_identity: rockstream_types::candidate_identity::CandidateIdentity,
     system_info: SystemInfo,
     metrics: MetricsSnapshot,
     audit_events: Vec<AuditEvent>,
@@ -1892,6 +1894,7 @@ fn write_support_bundle(
     let generated_at_ms = now_ms();
     let bundle = SupportBundle {
         generated_at_ms,
+        candidate_identity: rockstream_types::candidate_identity::CandidateIdentity::current(),
         system_info: SystemInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             os: std::env::consts::OS.to_string(),
@@ -1931,6 +1934,74 @@ fn write_support_bundle(
         )
     })?;
     Ok(bundle_path)
+}
+
+/// Validate an evidence manifest file.
+pub fn run_manifest_validate(
+    format: OutputFormat,
+    manifest_path: &Path,
+    base_dir: Option<&Path>,
+) -> Result<String, CliError> {
+    if !manifest_path.is_file() {
+        return Err(CliError::new(
+            RS_0003,
+            format!("Manifest file not found: {}", manifest_path.display()),
+            "Provide a valid path to an evidence-manifest.json file.",
+        ));
+    }
+    let content = fs::read_to_string(manifest_path).map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("Failed to read manifest file: {e}"),
+            "Ensure the manifest file is readable.",
+        )
+    })?;
+    let manifest = rockstream_types::evidence_manifest::EvidenceManifest::from_json(&content)
+        .map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("Invalid evidence manifest JSON: {e}"),
+                "Ensure the manifest conforms to the EvidenceManifest schema.",
+            )
+        })?;
+
+    manifest.validate().map_err(|e| {
+        CliError::new(
+            RS_0001,
+            format!("Evidence manifest validation failed: {e}"),
+            "Investigate and rectify the evidence discrepancy or missing raw metrics.",
+        )
+    })?;
+
+    if let Some(dir) = base_dir {
+        manifest.verify_files_on_disk(dir).map_err(|e| {
+            CliError::new(
+                RS_0001,
+                format!("Artifact file verification failed: {e}"),
+                "Ensure all artifacts exist on disk and match the declared SHA-256 digests.",
+            )
+        })?;
+    }
+
+    match format {
+        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+            "status": "VALID",
+            "candidate_version": manifest.candidate.semantic_version,
+            "candidate_sha": manifest.candidate.commit_sha,
+            "artifacts_count": manifest.artifacts.len(),
+            "test_suites_count": manifest.test_results.len(),
+            "summary_metrics_count": manifest.summary_metrics.len(),
+        }))
+        .map_err(|e| CliError::new(RS_0001, format!("JSON serialization error: {e}"), "Internal error")),
+        OutputFormat::Text => Ok(format!(
+            "OK: Evidence manifest is valid.\n  Version: {}\n  Commit SHA: {}\n  Artifacts: {}\n  Test suites: {}\n  Summary metrics: {}",
+            manifest.candidate.semantic_version,
+            manifest.candidate.commit_sha,
+            manifest.artifacts.len(),
+            manifest.test_results.len(),
+            manifest.summary_metrics.len(),
+        )),
+    }
 }
 
 #[cfg(test)]

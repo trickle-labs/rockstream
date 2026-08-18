@@ -12,14 +12,14 @@ use rockstream_cli::{
     run_audit_query, run_audit_tail, run_checkpoint_export, run_checkpoint_list,
     run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
     run_cluster_workers_drain, run_cluster_workers_list, run_cluster_workers_status,
-    run_debug_arrangement, run_explain_view, run_format_migrate, run_resource_cluster,
-    run_resource_usage, run_schema_create, run_schema_drop, run_schema_evolution_history,
-    run_schema_evolution_status, run_schema_list, run_schema_show, run_shard_list,
-    run_shard_migrate, run_source_drop, run_source_list, run_source_pause, run_source_resume,
-    run_source_show, run_sql_compile, run_start, run_support_bundle, run_view_list, run_view_pause,
-    run_view_query, run_view_resume, run_view_show, run_view_status, run_view_subscribe,
-    run_workload_alter, run_workload_create, run_workload_drop, run_workload_list,
-    run_workload_show, StartOptions,
+    run_debug_arrangement, run_explain_view, run_format_migrate, run_manifest_validate,
+    run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
+    run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
+    run_shard_list, run_shard_migrate, run_source_drop, run_source_list, run_source_pause,
+    run_source_resume, run_source_show, run_sql_compile, run_start, run_support_bundle,
+    run_view_list, run_view_pause, run_view_query, run_view_resume, run_view_show, run_view_status,
+    run_view_subscribe, run_workload_alter, run_workload_create, run_workload_drop,
+    run_workload_list, run_workload_show, StartOptions,
 };
 use rockstream_types::acl::Role;
 use rockstream_types::config::RockstreamConfig;
@@ -295,6 +295,29 @@ enum Command {
     Debug {
         #[command(subcommand)]
         command: DebugCommand,
+    },
+    /// Print candidate identity and version information.
+    Version {
+        /// Format version information as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evidence manifest verification and inspection.
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ManifestCommand {
+    /// Validate an evidence-manifest.json file.
+    Validate {
+        /// Path to the evidence-manifest.json file.
+        path: std::path::PathBuf,
+        /// Optional base directory containing referenced artifact files.
+        #[arg(long)]
+        base_dir: Option<std::path::PathBuf>,
     },
 }
 
@@ -967,6 +990,20 @@ fn main() -> ExitCode {
             };
             handle_result(res)
         }
+        Command::Version { json } => {
+            let id = rockstream_types::candidate_identity::CandidateIdentity::current();
+            if cli.json || json {
+                println!("{}", id.to_json().unwrap_or_default());
+            } else {
+                println!("{}", id.display_text());
+            }
+            ExitCode::SUCCESS
+        }
+        Command::Manifest { command } => match command {
+            ManifestCommand::Validate { path, base_dir } => {
+                handle_result(run_manifest_validate(format, &path, base_dir.as_deref()))
+            }
+        },
     }
 }
 

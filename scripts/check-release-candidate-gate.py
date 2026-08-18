@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-check-release-candidate-gate.py — Automated verification of all 4 Entry Criteria
-and 7 Release Candidate (RC1) Gates for Rockstream v1.0 / v0.59.
+check-release-candidate-gate.py — Automated verification of Entry Criteria,
+Candidate Identity, Release Governance, Evidence Manifest Integrity, and
+all Release Candidate Gates for Rockstream.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -15,6 +17,24 @@ from pathlib import Path
 
 def fail(violations: list[str], msg: str) -> None:
     violations.append(f"VIOLATION: {msg}")
+
+def compute_sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def compute_percentile(sorted_samples: list[float], p: float) -> float:
+    if not sorted_samples:
+        return 0.0
+    if len(sorted_samples) == 1:
+        return sorted_samples[0]
+    rank = p * (len(sorted_samples) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(sorted_samples) - 1)
+    weight = rank - lower
+    return sorted_samples[lower] * (1.0 - weight) + sorted_samples[upper] * weight
 
 def check_entry_criteria(root: Path, violations: list[str]) -> None:
     """Validate the 4 Entry Criteria."""
@@ -69,6 +89,131 @@ def check_entry_criteria(root: Path, violations: list[str]) -> None:
         )
         if res.returncode != 0:
             fail(violations, f"Entry Criterion 4: check-exit-criteria.sh failed:\n{res.stderr or res.stdout}")
+
+def check_candidate_identity(root: Path, violations: list[str]) -> None:
+    """Validate candidate identity consistency across Cargo.toml, Dockerfile, capabilities.toml."""
+    cargo_toml = root / "Cargo.toml"
+    if not cargo_toml.is_file():
+        fail(violations, "Candidate Identity: Cargo.toml missing")
+    else:
+        text = cargo_toml.read_text(encoding="utf-8")
+        if 'version = "0.59.1"' not in text:
+            fail(violations, "Candidate Identity: workspace Cargo.toml version is not 0.59.1")
+
+    capabilities_toml = root / "capabilities.toml"
+    if not capabilities_toml.is_file():
+        fail(violations, "Candidate Identity: capabilities.toml missing")
+    else:
+        text = capabilities_toml.read_text(encoding="utf-8")
+        if 'version = "v0.59.1"' not in text:
+            fail(violations, "Candidate Identity: capabilities.toml version is not v0.59.1")
+
+    dockerfile = root / "Dockerfile"
+    if not dockerfile.is_file():
+        fail(violations, "Candidate Identity: Dockerfile missing")
+    else:
+        text = dockerfile.read_text(encoding="utf-8")
+        if 'org.opencontainers.image.version="0.59.1"' not in text:
+            fail(violations, "Candidate Identity: Dockerfile missing version label 0.59.1")
+
+def check_release_governance(root: Path, violations: list[str]) -> None:
+    """Validate release governance and CODEOWNERS enforcement."""
+    gov_script = root / "scripts" / "check-release-governance.sh"
+    if not gov_script.is_file():
+        fail(violations, "Governance: scripts/check-release-governance.sh missing")
+    else:
+        res = subprocess.run(
+            ["bash", str(gov_script), str(root)],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            fail(violations, f"Governance: check-release-governance.sh failed:\n{res.stderr or res.stdout}")
+
+def check_evidence_manifest(root: Path, violations: list[str]) -> None:
+    """Validate machine-readable evidence manifest integrity."""
+    manifest_path = root / "docs" / "evidence-manifest.json"
+    if not manifest_path.is_file():
+        manifest_path = root / "evidence-manifest.json"
+    if not manifest_path.is_file():
+        fail(violations, "Evidence Manifest: docs/evidence-manifest.json missing")
+        return
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        fail(violations, f"Evidence Manifest: malformed JSON: {err}")
+        return
+
+    candidate = manifest.get("candidate", {})
+    if not candidate.get("commit_sha") or len(candidate.get("commit_sha", "")) < 8:
+        fail(violations, "Evidence Manifest: candidate commit_sha missing or invalid")
+    if candidate.get("semantic_version") != "0.59.1":
+        fail(violations, f"Evidence Manifest: candidate version {candidate.get('semantic_version')} != 0.59.1")
+    if len(candidate.get("lockfile_digest", "")) != 64:
+        fail(violations, "Evidence Manifest: candidate lockfile_digest is not a 64-character SHA-256")
+
+    artifacts = manifest.get("artifacts", {})
+    if not artifacts:
+        fail(violations, "Evidence Manifest: artifacts map is empty")
+    for rel_path, expected_digest in artifacts.items():
+        if len(expected_digest) != 64:
+            fail(violations, f"Evidence Manifest: invalid artifact digest for {rel_path}")
+        full_path = root / rel_path
+        if full_path.is_file():
+            actual_digest = compute_sha256(full_path)
+            if actual_digest.lower() != expected_digest.lower():
+                fail(violations, f"Evidence Manifest: artifact {rel_path} digest mismatch (expected {expected_digest}, actual {actual_digest})")
+
+    test_results = manifest.get("test_results", {})
+    for suite, res in test_results.items():
+        if res.get("mandatory_skipped", 0) > 0:
+            fail(violations, f"Evidence Manifest: test suite '{suite}' has {res.get('mandatory_skipped')} skipped mandatory tests (must be 0)")
+        if res.get("failed", 0) > 0:
+            fail(violations, f"Evidence Manifest: test suite '{suite}' has {res.get('failed')} failed tests")
+
+    raw_metrics = manifest.get("raw_metrics", {})
+    summary_metrics = manifest.get("summary_metrics", {})
+    targets = manifest.get("targets", {})
+
+    if not summary_metrics:
+        fail(violations, "Evidence Manifest: summary_metrics map is empty")
+
+    for metric_name, summary in summary_metrics.items():
+        raw_samples = raw_metrics.get(metric_name)
+        if raw_samples is None or len(raw_samples) == 0:
+            fail(violations, f"Evidence Manifest: missing raw observation data for summary metric '{metric_name}'")
+            continue
+
+        sorted_samples = sorted(raw_samples)
+        count = len(sorted_samples)
+        expected_p50 = compute_percentile(sorted_samples, 0.50)
+        expected_p95 = compute_percentile(sorted_samples, 0.95)
+        expected_p99 = compute_percentile(sorted_samples, 0.99)
+        expected_mean = sum(sorted_samples) / count
+        expected_min = sorted_samples[0]
+        expected_max = sorted_samples[-1]
+
+        eps = 1e-3
+        if abs(summary.get("p50", 0.0) - expected_p50) > eps:
+            fail(violations, f"Evidence Manifest: '{metric_name}.p50' mismatch: expected {expected_p50}, actual {summary.get('p50')}")
+        if abs(summary.get("p95", 0.0) - expected_p95) > eps:
+            fail(violations, f"Evidence Manifest: '{metric_name}.p95' mismatch: expected {expected_p95}, actual {summary.get('p95')}")
+        if abs(summary.get("p99", 0.0) - expected_p99) > eps:
+            fail(violations, f"Evidence Manifest: '{metric_name}.p99' mismatch: expected {expected_p99}, actual {summary.get('p99')}")
+        if abs(summary.get("mean", 0.0) - expected_mean) > eps:
+            fail(violations, f"Evidence Manifest: '{metric_name}.mean' mismatch: expected {expected_mean}, actual {summary.get('mean')}")
+        if abs(summary.get("min", 0.0) - expected_min) > eps:
+            fail(violations, f"Evidence Manifest: '{metric_name}.min' mismatch: expected {expected_min}, actual {summary.get('min')}")
+        if abs(summary.get("max", 0.0) - expected_max) > eps:
+            fail(violations, f"Evidence Manifest: '{metric_name}.max' mismatch: expected {expected_max}, actual {summary.get('max')}")
+        if summary.get("sample_count") != count:
+            fail(violations, f"Evidence Manifest: '{metric_name}.sample_count' mismatch: expected {count}, actual {summary.get('sample_count')}")
+
+        if metric_name in targets:
+            target_val = float(targets[metric_name])
+            if count == 1 and abs(sorted_samples[0] - target_val) < eps and target_val > 0:
+                fail(violations, f"Evidence Manifest: target threshold cannot satisfy measured result for '{metric_name}'")
 
 def check_gate_1_correctness(root: Path, violations: list[str]) -> None:
     """Gate 1: Correctness (Silent-Wrong-Answer & Reachability)."""
@@ -280,6 +425,15 @@ def main() -> None:
     print("Checking Entry Criteria (4 checks)...")
     check_entry_criteria(root, violations)
 
+    print("Checking Candidate Identity Conformance...")
+    check_candidate_identity(root, violations)
+
+    print("Checking Release Governance & CODEOWNERS...")
+    check_release_governance(root, violations)
+
+    print("Checking Evidence Manifest Integrity...")
+    check_evidence_manifest(root, violations)
+
     print("Checking Gate 1: Correctness...")
     check_gate_1_correctness(root, violations)
 
@@ -307,7 +461,7 @@ def main() -> None:
             print(f"  {v}", file=sys.stderr)
         sys.exit(1)
 
-    print("\nOK: All 4 Entry Criteria and 7 Release Candidate Gates passed successfully.")
+    print("\nOK: All Entry Criteria, Identity, Governance, Manifest, and RC Gates passed successfully.")
 
 if __name__ == "__main__":
     main()
