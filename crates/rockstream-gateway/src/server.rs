@@ -12953,7 +12953,15 @@ fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
         CatalogResponse::Rows { columns, rows } => {
             let fields: Vec<FieldInfo> = columns
                 .iter()
-                .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+                .map(|c| {
+                    FieldInfo::new(
+                        c.clone(),
+                        None,
+                        None,
+                        catalog_column_type(c),
+                        FieldFormat::Text,
+                    )
+                })
                 .collect();
             let schema = Arc::new(fields);
             let schema_ref = schema.clone();
@@ -15315,7 +15323,6 @@ fn describe_returning_fields(
             FieldInfo::new(col.clone(), None, None, Type::TEXT, FieldFormat::Text)
         })
         .collect()
-}
 
 /// Build FieldInfo list for a query (for DESCRIBE).
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
@@ -15349,7 +15356,15 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
     {
         return columns
             .iter()
-            .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+            .map(|c| {
+                FieldInfo::new(
+                    c.clone(),
+                    None,
+                    None,
+                    catalog_column_type(c),
+                    FieldFormat::Text,
+                )
+            })
             .collect();
     }
     if let Some(view_name) = extract_view_name_from_select(q) {
