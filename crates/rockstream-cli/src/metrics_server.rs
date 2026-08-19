@@ -97,8 +97,8 @@ mod tests {
     async fn metrics_endpoint_returns_200_with_prometheus_body() {
         let _metrics_lock = METRICS_SERVER_TEST_LOCK.lock().await;
         let handle = start_metrics_server("127.0.0.1:0").await.unwrap();
-        let resp = request(handle.local_addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
         let body = rockstream_types::metrics::generate_prometheus_metrics();
+        let resp = request(handle.local_addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
         assert_eq!(
             resp,
             format!(
