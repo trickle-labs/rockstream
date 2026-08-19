@@ -777,7 +777,7 @@ async fn test_prisma_smoke() {
         vec![
             "sh",
             "-c",
-            "mkdir -p /app && cd /app && npm init -y && npm install -q prisma @prisma/client pg",
+            "mkdir -p /app && cd /app && npm init -y && npm install -q prisma@6.16.2 @prisma/client@6.16.2 pg",
         ],
         "npm install prisma",
     )
