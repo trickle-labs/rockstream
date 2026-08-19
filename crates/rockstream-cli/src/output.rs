@@ -14,7 +14,8 @@ pub const CLI_OUTPUT_MAX_ROWS: usize = 1000;
 pub const AUDIT_TAIL_MAX_EVENTS: usize = 1000;
 
 /// Output format mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     #[default]
     Text,
@@ -29,6 +30,10 @@ impl OutputFormat {
             Self::Text
         }
     }
+
+    pub fn is_json(&self) -> bool {
+        matches!(self, Self::Json)
+    }
 }
 
 pub trait Formattable {
@@ -40,6 +45,49 @@ pub fn render_output<T: Serialize + Formattable>(data: &T, format: OutputFormat)
         OutputFormat::Json => serde_json::to_string_pretty(data)
             .unwrap_or_else(|e| format!("{{\"error\": \"json serialization failed: {}\"}}", e)),
         OutputFormat::Text => data.to_text(),
+    }
+}
+
+pub fn render_json_lines<T: Serialize>(items: &[T]) -> String {
+    items
+        .iter()
+        .map(|item| serde_json::to_string(item).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Structured CLI error envelope emitted to stderr in JSON output mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CliErrorEnvelope {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub next_steps: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation_url: Option<String>,
+}
+
+impl CliErrorEnvelope {
+    pub fn from_cli_error(err: &crate::CliError) -> Self {
+        let doc_url = format!("https://rockstream.dev/docs/errors#{}", err.code);
+        Self {
+            code: err.code.to_string(),
+            message: err.message.clone(),
+            retryable: false,
+            next_steps: err.next_steps.clone(),
+            documentation_url: Some(doc_url),
+        }
+    }
+}
+
+/// Render an error according to the output format (plain text or structured JSON).
+pub fn render_error(err: &crate::CliError, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Json => {
+            let env = CliErrorEnvelope::from_cli_error(err);
+            serde_json::to_string_pretty(&env).unwrap_or_else(|_| err.to_string())
+        }
+        OutputFormat::Text => err.to_string(),
     }
 }
 
@@ -1193,6 +1241,20 @@ impl Formattable for SupportBundleInfo {
             self.redacted_secrets_count,
             self.generated_at_ms
         )
+    }
+}
+
+// ─── Configuration Output Models ────────────────────────────────────────────
+
+impl Formattable for rockstream_types::config_validation::ConfigValidationReport {
+    fn to_text(&self) -> String {
+        self.to_text()
+    }
+}
+
+impl Formattable for rockstream_types::config_resolver::ResolvedConfig {
+    fn to_text(&self) -> String {
+        self.to_toml_text(false)
     }
 }
 

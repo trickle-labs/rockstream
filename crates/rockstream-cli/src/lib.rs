@@ -27,9 +27,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub mod cli_args;
+pub mod demo;
+pub mod doctor;
 pub mod metrics_server;
 pub mod output;
 pub mod transport;
+
+pub use cli_args::{Cli, Command, ConfigCommand, ShellType};
+pub use demo::{run_demo, DemoOptions, DemoOutcome, DemoStep};
+pub use doctor::{
+    run_doctor, run_doctor_checks, DiagnosticCheckResult, DiagnosticStatus, DoctorOptions,
+    DoctorReport,
+};
 
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts
@@ -2065,6 +2075,143 @@ pub fn run_qualify(
                 suite_name
             )),
         }
+    }
+}
+
+/// Generate dynamic shell completions for the `rockstream` CLI.
+pub fn run_completions(shell: ShellType) -> Result<String, CliError> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let mut buf = Vec::new();
+    match shell {
+        ShellType::Bash => {
+            clap_complete::generate(
+                clap_complete::shells::Bash,
+                &mut cmd,
+                "rockstream",
+                &mut buf,
+            );
+        }
+        ShellType::Zsh => {
+            clap_complete::generate(clap_complete::shells::Zsh, &mut cmd, "rockstream", &mut buf);
+        }
+        ShellType::Fish => {
+            clap_complete::generate(
+                clap_complete::shells::Fish,
+                &mut cmd,
+                "rockstream",
+                &mut buf,
+            );
+        }
+    }
+    String::from_utf8(buf).map_err(|e| {
+        CliError::new(
+            RS_0001,
+            format!("failed to generate completions: {e}"),
+            "Report this bug with support bundle.",
+        )
+    })
+}
+
+/// Validate RockStream configuration files for syntax, unknown/deprecated keys, and semantic bounds.
+pub fn run_config_validate(
+    format: output::OutputFormat,
+    file: Option<&Path>,
+    _strict: bool,
+    check_files: bool,
+) -> Result<String, CliError> {
+    let resolved_path = file
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("ROCKSTREAM_CONFIG").map(PathBuf::from))
+        .or_else(|| {
+            let default_path = PathBuf::from("rockstream.toml");
+            if default_path.exists() {
+                Some(default_path)
+            } else {
+                None
+            }
+        });
+
+    let (contents, filename) = if let Some(path) = resolved_path {
+        if !path.exists() {
+            return Err(CliError::new(
+                RS_0002,
+                format!("configuration file not found: {}", path.display()),
+                "Verify the --file path or ensure rockstream.toml exists in the current directory.",
+            ));
+        }
+        let text = fs::read_to_string(&path).map_err(|e| {
+            CliError::new(
+                RS_0003,
+                format!("failed to read config file {}: {e}", path.display()),
+                "Check file permissions and readability.",
+            )
+        })?;
+        (text, path.to_string_lossy().to_string())
+    } else {
+        let default_config = RockstreamConfig::default();
+        let text = default_config.to_string().map_err(|e| {
+            CliError::new(
+                RS_0001,
+                format!("failed to serialize default config: {e}"),
+                "Report this bug with support bundle.",
+            )
+        })?;
+        (text, "defaults".to_string())
+    };
+
+    let report = rockstream_types::config_validation::validate_config_str(&contents, check_files);
+    let rendered = output::render_output(&report, format);
+
+    if !report.valid {
+        let first_err = report.diagnostics.iter().find(|d| {
+            d.severity == rockstream_types::config_validation::ConfigDiagnosticSeverity::Error
+        });
+        let code = first_err
+            .map(|d| {
+                if d.code == "RS-4017" {
+                    RS_4017
+                } else {
+                    RS_0002
+                }
+            })
+            .unwrap_or(RS_0002);
+
+        return Err(CliError::new(
+            code,
+            format!("configuration validation failed for {filename}"),
+            rendered,
+        ));
+    }
+
+    Ok(rendered)
+}
+
+/// Print the effective configuration resolved from defaults, config file, environment, and CLI flags.
+pub fn run_config_print_effective(
+    format: output::OutputFormat,
+    file: Option<&Path>,
+    show_origins: bool,
+    overrides: &rockstream_types::config_resolver::CliConfigOverrides,
+) -> Result<String, CliError> {
+    let resolved = rockstream_types::config_resolver::ConfigResolver::resolve(file, overrides)
+        .map_err(|e| {
+            CliError::new(
+                RS_0002,
+                format!("failed to resolve effective configuration: {e}"),
+                "Check configuration files, environment variables, and CLI flags.",
+            )
+        })?;
+
+    match format {
+        output::OutputFormat::Json => serde_json::to_string_pretty(&resolved).map_err(|e| {
+            CliError::new(
+                RS_0001,
+                format!("failed to serialize resolved config to JSON: {e}"),
+                "Report this bug.",
+            )
+        }),
+        output::OutputFormat::Text => Ok(resolved.to_toml_text(show_origins)),
     }
 }
 

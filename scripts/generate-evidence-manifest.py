@@ -74,14 +74,24 @@ def get_rustc_version() -> str:
     except Exception:
         return "rustc 1.88.0"
 
+def get_workspace_version(root: Path) -> str:
+    cargo_toml = root / "Cargo.toml"
+    if cargo_toml.is_file():
+        for line in cargo_toml.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("version = "):
+                return line.split("=")[1].strip().strip('"')
+    return "0.59.4"
+
 def generate_manifest(root: Path, out_path: Path) -> dict:
     lockfile_path = root / "Cargo.lock"
     lockfile_digest = compute_sha256(lockfile_path) if lockfile_path.is_file() else "0" * 64
     commit_sha = get_git_sha(root)
     rustc_ver = get_rustc_version()
+    version = get_workspace_version(root)
 
     candidate = {
-        "semantic_version": "0.59.3",
+        "semantic_version": version,
         "commit_sha": commit_sha,
         "build_timestamp_rfc3339": datetime.now(timezone.utc).isoformat(),
         "compiler_version": rustc_ver,

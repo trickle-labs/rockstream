@@ -40,14 +40,20 @@ def validate(
     if not isinstance(contract, dict):
         fail("capabilities.toml must define [contract]")
     version = contract.get("version")
-    if version not in {"v0.57.1", "v0.59.1", "v0.59.3"}:
-        fail("capabilities.toml contract.version must be v0.57.1, v0.59.1, or v0.59.3")
+    if version not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4"}:
+        fail("capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, or v0.59.4")
 
     roadmap = contract.get("roadmap")
     if not isinstance(roadmap, str):
         fail("contract.roadmap must be a path")
     roadmap_text = check_file(root, roadmap, "roadmap")
-    roadmap_rows = re.findall(rf"^\| {re.escape(str(version))} \|.*$", roadmap_text, re.MULTILINE)
+    roadmap_rows = [
+        row
+        for row in re.findall(
+            rf"^\| {re.escape(str(version))} \|.*$", roadmap_text, re.MULTILINE
+        )
+        if len(row.split("|")) >= 6
+    ]
     if len(roadmap_rows) != 1:
         fail(f"NEW_ROADMAP.md has no {version} version row")
 

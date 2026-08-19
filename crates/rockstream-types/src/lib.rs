@@ -12,6 +12,8 @@ pub mod candidate_identity;
 pub mod checkpoint;
 pub mod compatibility;
 pub mod config;
+pub mod config_resolver;
+pub mod config_validation;
 pub mod connector;
 pub mod cost;
 pub mod dlq;

@@ -97,24 +97,24 @@ def check_candidate_identity(root: Path, violations: list[str]) -> None:
         fail(violations, "Candidate Identity: Cargo.toml missing")
     else:
         text = cargo_toml.read_text(encoding="utf-8")
-        if 'version = "0.59.3"' not in text:
-            fail(violations, "Candidate Identity: workspace Cargo.toml version is not 0.59.3")
+        if 'version = "0.59.4"' not in text:
+            fail(violations, "Candidate Identity: workspace Cargo.toml version is not 0.59.4")
 
     capabilities_toml = root / "capabilities.toml"
     if not capabilities_toml.is_file():
         fail(violations, "Candidate Identity: capabilities.toml missing")
     else:
         text = capabilities_toml.read_text(encoding="utf-8")
-        if 'version = "v0.59.3"' not in text:
-            fail(violations, "Candidate Identity: capabilities.toml version is not v0.59.3")
+        if 'version = "v0.59.4"' not in text:
+            fail(violations, "Candidate Identity: capabilities.toml version is not v0.59.4")
 
     dockerfile = root / "Dockerfile"
     if not dockerfile.is_file():
         fail(violations, "Candidate Identity: Dockerfile missing")
     else:
         text = dockerfile.read_text(encoding="utf-8")
-        if 'org.opencontainers.image.version="0.59.3"' not in text:
-            fail(violations, "Candidate Identity: Dockerfile missing version label 0.59.3")
+        if 'org.opencontainers.image.version="0.59.4"' not in text:
+            fail(violations, "Candidate Identity: Dockerfile missing version label 0.59.4")
 
 def check_release_governance(root: Path, violations: list[str]) -> None:
     """Validate release governance and CODEOWNERS enforcement."""
@@ -148,8 +148,8 @@ def check_evidence_manifest(root: Path, violations: list[str]) -> None:
     candidate = manifest.get("candidate", {})
     if not candidate.get("commit_sha") or len(candidate.get("commit_sha", "")) < 8:
         fail(violations, "Evidence Manifest: candidate commit_sha missing or invalid")
-    if candidate.get("semantic_version") != "0.59.3":
-        fail(violations, f"Evidence Manifest: candidate version {candidate.get('semantic_version')} != 0.59.3")
+    if candidate.get("semantic_version") != "0.59.4":
+        fail(violations, f"Evidence Manifest: candidate version {candidate.get('semantic_version')} != 0.59.4")
     if len(candidate.get("lockfile_digest", "")) != 64:
         fail(violations, "Evidence Manifest: candidate lockfile_digest is not a 64-character SHA-256")
 

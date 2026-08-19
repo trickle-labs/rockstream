@@ -22,7 +22,7 @@ members = [
 overflow-checks = true
 
 [workspace.package]
-version = "0.59.3"
+version = "0.59.4"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -39,6 +39,7 @@ prost = "0.13"
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 criterion = { version = "0.5", features = ["html_reports"] }
 datafusion = "53"
 object_store = { version = "0.12", features = ["aws"] }

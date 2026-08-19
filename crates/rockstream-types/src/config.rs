@@ -6,6 +6,7 @@ use crate::cost::PricingConfig;
 use crate::tiering::StorageTieringConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct AutotunerConfig {
     pub enabled: bool,
     pub hysteresis_scale_up_windows: usize,
@@ -35,6 +36,7 @@ impl Default for AutotunerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct SkewSplitConfig {
     pub enabled: bool,
     pub hot_key_factor: f64,
@@ -52,6 +54,7 @@ impl Default for SkewSplitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ScatterPruningConfig {
     pub shard_bloom_budget_bytes: usize,
     pub shard_stats_max_age_checkpoints: u64,
@@ -271,6 +274,15 @@ impl RockstreamConfig {
 
     pub fn to_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
+    }
+
+    pub fn validate(&self, check_files: bool) -> crate::config_validation::ConfigValidationReport {
+        let mut diagnostics = Vec::new();
+        crate::config_validation::validate_semantic_bounds(self, check_files, &mut diagnostics);
+        let valid = diagnostics
+            .iter()
+            .all(|d| d.severity != crate::config_validation::ConfigDiagnosticSeverity::Error);
+        crate::config_validation::ConfigValidationReport { valid, diagnostics }
     }
 }
 

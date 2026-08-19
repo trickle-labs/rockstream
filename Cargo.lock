@@ -1078,6 +1078,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4946,10 +4955,11 @@ dependencies = [
 
 [[package]]
 name = "rockstream-cli"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "arrow",
  "clap",
+ "clap_complete",
  "object_store 0.12.5",
  "rockstream-control",
  "rockstream-gateway",
@@ -4970,11 +4980,12 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
 name = "rockstream-connectors"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5005,7 +5016,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-control"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -5050,7 +5061,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-diff"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "rockstream-plan",
  "rockstream-types",
@@ -5060,7 +5071,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-fuzz"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5075,7 +5086,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-gateway"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5132,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-ops"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5166,7 +5177,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-oracle"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5199,7 +5210,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-plan"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "rockstream-types",
  "serde",
@@ -5208,7 +5219,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-runtime"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -5255,7 +5266,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sim"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5292,7 +5303,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sql"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5325,7 +5336,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-storage"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5356,7 +5367,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-test-support"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "rcgen",
  "rockstream-types",
@@ -5366,7 +5377,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-types"
-version = "0.59.3"
+version = "0.59.4"
 dependencies = [
  "antichain",
  "arrow",

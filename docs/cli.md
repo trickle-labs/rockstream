@@ -25,7 +25,8 @@ rockstream [--json] [--control <url>] [--storage-dir <dir>] [--identity-user <na
 
 | Option | Default | Description |
 |---|---|---|
-| `--json` | `false` | Format output as structured JSON. |
+| `--output <format>` | `text` | Output format: `text` or `json`. |
+| `--json` | `false` | Backwards-compatible alias for `--output json`. |
 | `--control <url>` | — | Control service URL for cluster and shard inspection. |
 | `--storage-dir <dir>` | `.` | Local storage directory for reading checkpoints and audit logs. |
 | `--identity-user <name>` | `rockstream` | Principal presented to control-plane and catalog mutations. |
@@ -211,6 +212,39 @@ Offline SQL compilation and lowering inspection.
 Low-level debugging and intermediate arrangement state inspection.
 
 - `rockstream debug arrangement <view> <op_id> <key> [--epoch=N]` — Inspect intermediate arrangement Z-set state, weight, and key bytes for an operator at a current or historical epoch.
+
+---
+
+### `rockstream demo`
+
+Runs an embedded zero-external-dependency demonstration scenario proving PostgreSQL DDL, DML, and incremental materialized view maintenance over pgwire.
+
+- `rockstream demo [--scenario <orders>] [--storage <dir>] [--listen <addr>] [--keep] [--step-delay-ms <ms>]`
+
+---
+
+### `rockstream doctor`
+
+Runs non-destructive bounded diagnostic checks probing binary candidate identity, configuration validity, system host limits, storage accessibility, control plane connectivity, and gateway reachability.
+
+- `rockstream doctor [--config <path>] [--storage <path-or-url>] [--control <url>] [--gateway <host:port>] [--deep] [--include-docker] [--timeout <secs>]`
+
+---
+
+### `rockstream config`
+
+Configuration inspection and validation commands.
+
+- `rockstream config validate [--file <path>] [--strict] [--check-files]` — Validate syntax, unknown keys, and semantic parameter bounds.
+- `rockstream config print-effective [--file <path>] [--show-origins]` — Print resolved configuration from defaults, config file, environment, and CLI flags with origin annotations.
+
+---
+
+### `rockstream completions`
+
+Generates shell completion scripts directly to stdout.
+
+- `rockstream completions <bash|zsh|fish>`
 
 ---
 
