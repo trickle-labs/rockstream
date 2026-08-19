@@ -15,10 +15,15 @@ It is deliberately narrow. The only goals are the **cloud-native IVM engine**
 and the **PostgreSQL wire access layer**. Everything outside those two pillars
 is out of scope (see the plan's *Out of Scope* section).
 
-Each version below is sized at about **6 person-weeks** of implementation
-effort. That can mean one person for six weeks, two people for three weeks, or
-any other mix. The version number is a planning unit, not a release-quality
-promise: a version is done only when its proof is done.
+Each version below is initially sized at about **6 person-weeks** of
+implementation effort. That can mean one person for six weeks, two people for
+three weeks, or any other mix. During implementation planning, any mandatory
+slice estimated above two person-weeks, requiring an independently reviewable
+durable format, or carrying its own formal model becomes a numbered sub-version.
+The total program estimate is regenerated from the resulting slice estimates;
+the parent estimate is not retained merely to preserve the original count. The
+version number is a planning unit, not a release-quality promise: a version is
+done only when its proof is done.
 
 Version sign-offs are strictly ordered. Each version builds on the one before
 it, and no version may be marked done until its predecessor's proof is
@@ -26,10 +31,12 @@ complete. Implementation work on an independent stream may begin once its
 declared prerequisites are complete; the final qualification and sign-off
 sequence remains ordered.
 
-The pre-v1 product program from v0.59.4 through v0.59.24 contains 21 planning
-units, or approximately 126 person-weeks at the roadmap sizing rule. That is a
-program estimate, not a calendar promise: the dependency graph below identifies
-work that can proceed in parallel without weakening the ordered sign-offs.
+The pre-v1 product program from v0.59.4 through v0.59.24 currently contains 21
+planning units and an initial estimate of approximately 126 person-weeks. That
+number is not a binding staffing estimate: the split rule above requires the
+program total to be regenerated after mandatory slices are estimated. The
+dependency graph below identifies work that can proceed in parallel without
+weakening the ordered sign-offs.
 
 ```
 CLI/config -> delta state -> shared arrangements -> factorized IVM
@@ -89,8 +96,10 @@ applies even when implementation starts in parallel.
    `rockstream` binary; `main` remains runnable through it at every version.
 6. **Thin vertical slices.** Each version leaves a human able to do something
    real, or leaves the project with stronger proof that a hard thing is safe.
-7. **Split before rushing.** If a version cannot fit in ~6 person-weeks, split
-   it. The roadmap is allowed to grow.
+7. **Split before rushing.** Any mandatory slice estimated above two
+   person-weeks, requiring an independently reviewable durable format, or
+   carrying its own formal model becomes a numbered sub-version. Regenerate the
+   overall estimate from those slices; the roadmap is allowed to grow.
 8. **Maintainer sustainability is part of done.** The project keeps a test
    taxonomy and standard commands, contributor guidance for adding SQL,
    operators, errors, catalogs, configuration, and scenarios, ADRs for binding
@@ -278,7 +287,9 @@ These names orient readers; they are not calendar commitments.
 
 ## Version Roadmap
 
-Each row is about 6 person-weeks. The **Proof** column is the binding part:
+Each row is initially sized at about 6 person-weeks. The split rule and
+regenerated slice estimate are binding; the **Proof** column is the binding
+delivery requirement:
 without that proof, the version is not done. The **Backends** column names the
 required test backends beyond plain unit tests (LFS = SlateDB local-filesystem
 backend; MinIO = SlateDB S3 backend via TestContainers; TC = TestContainers
@@ -1638,11 +1649,15 @@ v0.59.10–v0.59.23. v0.59.24 remains a pure, blocking qualification gate over
 the finished product and may not introduce engine architecture.
 
 The order is binding for two reasons. First, v0.59.5 establishes real,
-independently identified workers and captures an honest v0.59.5 S1
-pre-optimization 1/2/4/8-worker baseline of unchanged v0.59.4 engine behavior,
-then every architecture version republishes the same workload and raw profile so its throughput,
-latency, memory, logical-write, and physical-write effects are attributable
-rather than guessed. Second, observability and capacity calibration must
+independently identified workers and captures two baselines: B0 is the exact
+v0.59.4 artifact under the existing one-worker topology, while B1 is the
+v0.59.5 S1 artifact with the new worker substrate at 1/2/4/8 workers. The B0
+one-worker result is compared with B1 at one worker; any regression is
+quantified and explained, and a regression above 10% requires remediation or
+explicit approval. S2-S4 and v0.59.6-v0.59.9 compare against B1. Every
+architecture version republishes the same workload and raw profile so its
+throughput, latency, memory, logical-write, and physical-write effects are
+attributable rather than guessed. Second, observability and capacity calibration must
 describe the architecture that will ship: arrangement sharing, factorization,
 delta persistence, commit grouping, and skew routing all change what should be
 measured and how state is sized. The large architectural choices freeze after
@@ -1665,15 +1680,17 @@ duration, repetition count, variance and confidence interval, the open-loop
 offered-load schedule, load-generator and sink-consumer headroom, Kafka and
 MinIO utilization, input and checkpoint backlog slopes, compaction-debt slope,
 completed checkpoint and compaction cycles, and cost per million accepted
-changes. The harness must prove that its generator, Kafka, MinIO, PostgreSQL,
-gateway client, oracle, and sink consumer can each sustain materially more than
-the candidate's measured rate. Sustainable throughput means the maximum
+changes. The harness must prove that the load generator, Kafka, MinIO,
+PostgreSQL, gateway client, oracle, and sink consumer each independently sustain
+at least 1.25x the candidate's maximum accepted rate at the same payload shape;
+otherwise the measured saturation point of that component is an explicit upper
+bound on candidate capacity. Sustainable throughput means the maximum
 offered rate at which the workload's p99 freshness SLO holds, input and
 checkpoint backlog slopes are non-positive, memory and queues remain bounded,
 and the declared minimum checkpoint and compaction cycle counts complete.
 
-To preserve the approximately six-person-week sizing rule, v0.59.5 and v0.59.9
-have mandatory internal sign-off slices:
+To make the estimate auditable, v0.59.5 and v0.59.9 have mandatory internal
+sign-off slices, and the split rule above applies to each one:
 
 - **v0.59.5 S1:** real-worker topology, external harness, and honest baseline;
    **S2:** `OperatorEpochResult`/`StateMutation` plus aggregate and distinct;
@@ -1687,6 +1704,41 @@ have mandatory internal sign-off slices:
 
 A version is complete only after every mandatory slice passes its own proof;
 optional work cannot delay or substitute for a mandatory slice.
+
+**Qualification identity contract.** Every release artifact carries three
+distinct identities. `CandidateIdentity` contains the product semantic version,
+candidate id, source SHA, binary/image digests, toolchain, lockfile digest, and
+enabled features. RC artifacts use product semantic version `1.0.0` and a
+separate candidate id such as `rc.1`; `rockstream --version`,
+`rockstream_version()`, image labels, support bundles, compatibility checks, and
+telemetry report both fields rather than embedding a prerelease semantic version
+in the product version. `QualificationProfile` contains hardware, topology,
+configuration, workload, fault policy, and thresholds. `QualificationRun`
+contains the workflow/run id, timestamps, and raw evidence digests. A source,
+dependency, toolchain, lockfile, enabled-feature, or artifact change creates the
+next candidate/RC. A replacement host or a change to hardware, topology,
+configuration, workload, fault policy, or thresholds creates a new profile
+revision and run for the same candidate unless the candidate identity itself
+changed. A failed host therefore does not manufacture a new release candidate;
+the replacement profile and run remain comparable to the original candidate.
+The final `v1.0.0` tag is a signed promotion alias to the same qualified
+artifacts, with `candidate_id=rc.1` retained in the manifest and release
+metadata.
+
+This identity contract supersedes older shorthand in the v0.59.1, v0.59.5,
+v0.59.10, and v0.59.24 table summaries: B0/B1 are both required, product
+semantic version and candidate id remain separate, and profile or run changes
+do not create a new RC unless the candidate identity changes.
+
+The v0.59.23 threshold manifest records provenance for every absolute floor and
+ceiling as one of: a design-partner requirement, a published reference-profile
+objective, or a measured baseline plus a stated safety margin. A threshold may
+not be selected merely because it is slightly below an already observed result.
+
+**Active formal-model correction.** The continuous-verification requirement for
+v0.23-v0.59.24 is all active base models: M1-M4 and M6-M7, plus every admitted
+v0.59.x protocol variant. M5 was retired by v0.52.4 and is not a release
+prerequisite.
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
@@ -1817,7 +1869,7 @@ the design is verified before the implementation exists.
 | v0.59.7 | Record that compile/deploy-time classic-versus-factorized selection adds no distributed lifecycle protocol | Existing M1/M2 models plus external-oracle equivalence; a dedicated cutover model is required if live replacement is later admitted | Classic and factorized execution remain equivalent at committed frontiers; no dual active production graph or switch generation exists in v1 | Oracle equivalence passes; path-coupling rejects any later live-cutover implementation without its dedicated model and crash-phase invariants |
 | v0.59.8 | Extend M6 for bounded chunk copy, migration epochs, dual routing, frontier cutover, and delayed reclamation | `formal/m6_shard_migration.fizz` micro-migration variant | Existing M6 single-authority/no-loss invariants hold for every chunk and routing epoch; heat metadata survives reassignment | Extended M6 green before micro-migration ships; kill/restart at every copy/dual-route/cutover boundary replays as permanent regression cases |
 | v0.59.9 | Extend M1 for logical visibility epochs versus physical commit groups; model checkpoint-mode transition only if unaligned fallback is admitted | `formal/m1_epoch_commit.fizz`; checkpoint transition variant when S5 admission evidence requires it | Commit grouping cannot expose a partial logical epoch or acknowledge non-durable state; aligned/unaligned transition cannot lose or duplicate in-flight data | Extended M1 green for the mandatory core; any admitted unaligned fallback is blocked on its checkpoint-transition model and paired runtime assertions |
-| v0.23–v0.59.24 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all M1–M7 | A coordination-protocol change without a model touch fails CI; the automated qualification suite re-runs the relaxed-bounds sweep against the candidate SHA |
+| v0.23–v0.59.24 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all active base models: M1-M4, M6-M7, plus every admitted v0.59.x protocol variant | A coordination-protocol change without a model touch fails CI; the automated qualification suite re-runs the relaxed-bounds sweep against the candidate SHA |
 
 Every row above maps each FizzBee invariant to a paired runtime `assert!` per
 [FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.7. **Correction (2026-07-11
