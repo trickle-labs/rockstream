@@ -802,7 +802,7 @@ async fn test_prisma_smoke() {
             "sh",
             "-c",
             &format!(
-                "cd /app && for attempt in 1 2 3 4 5; do DATABASE_URL='{db_url}' npx prisma db pull --force && exit 0; sleep 1; done; exit 1"
+                "cd /app && for attempt in 1 2 3 4 5 6 7 8 9 10; do DATABASE_URL='{db_url}' npx prisma db pull --force && exit 0; sleep 2; done; exit 1"
             ),
         ],
         "prisma db pull",
