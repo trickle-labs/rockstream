@@ -151,6 +151,7 @@ fn test_worker_semantic_rules() {
 [worker]
 segment_cache_bytes = 0
 max_rows_per_quantum = 0
+execution_threads = 0
 "#;
     let report = validate_config_str(toml_bad_worker, false);
     assert!(!report.valid);
@@ -162,6 +163,10 @@ max_rows_per_quantum = 0
         .diagnostics
         .iter()
         .any(|d| d.path == "worker.max_rows_per_quantum"));
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|d| d.path == "worker.execution_threads"));
 }
 
 #[test]

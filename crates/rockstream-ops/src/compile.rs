@@ -805,21 +805,33 @@ pub(crate) fn try_compile_join_shape(
         },
         // v0.51.4 gap-fix: `Aggregate` directly over a join (e.g. Nexmark
         // q4's `SELECT a.category, AVG(b.price) FROM auction a JOIN bid b
-        // ON ... WHERE ... GROUP BY a.category`) — only the single group-by
-        // column / single aggregate expression shape is supported here
-        // (mirrors `compile_node`'s simplest `Aggregate` case); composite
-        // keys or multiple aggregates over a join are not yet wired.
+        // ON ... WHERE ... GROUP BY a.category`) — composite group keys are
+        // not yet wired, but multiple aggregates reuse the same multi-lane
+        // stage as the single-input compiler below.
         PlanNode::Aggregate {
             input,
             group_by,
             aggregates,
         } => match try_compile_join_shape(input, table_schemas)? {
             Some(mut shape) => {
-                if group_by.len() != 1 || aggregates.len() != 1 {
+                if group_by.len() != 1 || aggregates.is_empty() {
                     return Err(OpError::unsupported_plan_node(
-                        "Aggregate over a join only supports a single group-by column \
-                         and a single aggregate expression",
+                        "Aggregate over a join requires a single group-by column \
+                         and at least one aggregate expression",
                     ));
+                }
+                if aggregates.len() > 1 {
+                    shape.factorized_spec = None;
+                    let input_schema = int64_schema(shape.post_n_cols);
+                    let (post, output_schema) = compile_multi_aggregate_lanes(
+                        std::mem::take(&mut shape.post),
+                        group_by,
+                        aggregates,
+                        &input_schema,
+                    )?;
+                    shape.post = post;
+                    shape.post_n_cols = output_schema.fields().len();
+                    return Ok(Some(shape));
                 }
                 let agg = &aggregates[0];
                 if !agg.distinct
@@ -1917,5 +1929,89 @@ mod tests {
             1,
             "right delta should join with the already-staged left row"
         );
+    }
+
+    #[tokio::test]
+    async fn executes_multiple_aggregates_over_inner_join() {
+        use rockstream_plan::{AggregateExpr, AggregateFunc, JoinSemantics};
+
+        let (_dir, db) = make_db().await;
+        let plan = PlanNode::ViewSink {
+            view_name: "join_totals".to_string(),
+            pk: vec![0],
+            child: Box::new(PlanNode::Aggregate {
+                input: Box::new(PlanNode::InnerJoin {
+                    left: Box::new(PlanNode::Source {
+                        name: "source".to_string(),
+                    }),
+                    right: Box::new(PlanNode::Source {
+                        name: "dimension".to_string(),
+                    }),
+                    left_keys: vec![0],
+                    right_keys: vec![0],
+                    left_arr_id: OperatorId(2001),
+                    right_arr_id: OperatorId(2002),
+                    semantics: JoinSemantics::default(),
+                }),
+                group_by: vec![Expr::Column(3)],
+                aggregates: vec![
+                    AggregateExpr {
+                        func: AggregateFunc::Count,
+                        input: Expr::Column(1),
+                        distinct: false,
+                    },
+                    AggregateExpr {
+                        func: AggregateFunc::Sum,
+                        input: Expr::Column(1),
+                        distinct: false,
+                    },
+                ],
+            }),
+        };
+        let schemas = HashMap::from([
+            ("source".to_string(), int64_schema(2)),
+            ("dimension".to_string(), int64_schema(2)),
+        ]);
+        let join = compile_plan(&plan, db, &schemas).unwrap().join.unwrap();
+
+        let left_only = join
+            .pipeline
+            .process(
+                ArrowZSet::from_ab_rows(&[(1, 100)], 1),
+                ArrowZSet::empty(int64_schema(2)),
+            )
+            .unwrap();
+        assert_eq!(left_only.num_rows(), 0);
+
+        let output = join
+            .pipeline
+            .process(
+                ArrowZSet::empty(int64_schema(2)),
+                ArrowZSet::from_ab_rows(&[(1, 7)], 1),
+            )
+            .unwrap();
+        assert_eq!(output.num_rows(), 1);
+        assert_eq!(
+            output.data.schema().as_ref(),
+            &Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("agg0", DataType::Int64, false),
+                Field::new("agg1", DataType::Int64, false),
+            ])
+        );
+        assert_eq!(
+            output
+                .data
+                .columns()
+                .iter()
+                .map(|column| column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0))
+                .collect::<Vec<_>>(),
+            vec![7, 1, 100]
+        );
+        assert_eq!(output.weights, vec![1]);
     }
 }

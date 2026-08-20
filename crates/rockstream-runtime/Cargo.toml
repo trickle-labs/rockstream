@@ -15,6 +15,7 @@ harness = false
 
 [dependencies]
 rockstream-ops = { workspace = true }
+rockstream-plan = { workspace = true }
 rockstream-types = { workspace = true }
 rockstream-storage = { workspace = true }
 tokio = { workspace = true }

@@ -179,6 +179,7 @@ impl ComplexDagBench {
         .with_worker_config(WorkerConfig {
             segment_cache_bytes: 0,
             max_rows_per_quantum: COMPLEX_DAG_ROWS,
+            ..WorkerConfig::default()
         });
 
         Self {

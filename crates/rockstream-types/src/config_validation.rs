@@ -170,7 +170,11 @@ const KNOWN_SCATTER_PRUNING_KEYS: &[&str] = &[
     "shard_stats_max_age_checkpoints",
 ];
 
-const KNOWN_WORKER_KEYS: &[&str] = &["segment_cache_bytes", "max_rows_per_quantum"];
+const KNOWN_WORKER_KEYS: &[&str] = &[
+    "segment_cache_bytes",
+    "max_rows_per_quantum",
+    "execution_threads",
+];
 
 const KNOWN_CONNECTOR_KEYS: &[&str] = &["dlq_warn_threshold", "dlq_retention_days"];
 
@@ -535,6 +539,17 @@ pub fn validate_semantic_bounds(
             code: "RS-0002".to_string(),
             message: "worker.max_rows_per_quantum must be greater than 0".to_string(),
             suggestion: Some("Set max_rows_per_quantum > 0 (default 8192 or 1000)".to_string()),
+            line: None,
+            column: None,
+        });
+    }
+    if config.worker.execution_threads == 0 {
+        diagnostics.push(ConfigDiagnostic {
+            path: "worker.execution_threads".to_string(),
+            severity: ConfigDiagnosticSeverity::Error,
+            code: "RS-0002".to_string(),
+            message: "worker.execution_threads must be greater than 0".to_string(),
+            suggestion: Some("Set execution_threads >= 1 (default 1)".to_string()),
             line: None,
             column: None,
         });

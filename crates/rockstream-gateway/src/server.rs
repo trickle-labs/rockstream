@@ -68,11 +68,16 @@ use rockstream_connectors::{
 };
 use rockstream_ops::sink::{column_values_to_tsv_bytes, materialize_view_state};
 use rockstream_ops::ArrowZSet;
+use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_sql::SqlFrontend;
 use rockstream_types::config::ScatterPruningConfig;
+use rockstream_types::data_plane::{
+    DeploymentColumn, DeploymentRequest, DeploymentSchema, RuntimeRow, SourceDeltaRequest,
+    WorkloadSnapshot, DEPLOYMENT_DESCRIPTOR_VERSION,
+};
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
-use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId};
+use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId, WorkloadId};
 use rockstream_types::mutation_policy::pgwire_mutation_policy;
 use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
 
@@ -866,6 +871,7 @@ pub static QUERY_TIME_SCATTER_PEAK_BYTES_IN_FLIGHT: AtomicUsize = AtomicUsize::n
 pub static QUERY_TIME_SCATTER_PEAK_BATCHES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static QUERY_TIME_SCATTER_BATCH_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(QUERY_TIME_SCATTER_MAX_CONCURRENT_SHARD_BATCHES);
+static NEXT_DISTRIBUTED_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn query_time_scatter_fill_levels() -> QueryTimeScatterFillLevels {
     QueryTimeScatterFillLevels {
@@ -1710,6 +1716,8 @@ pub struct GatewayHandler {
     /// outright (`RS-1019`) when compilation fails — there is no
     /// materializer fallback left (v0.51.4 Slice 8).
     compiled_views: Arc<DashMap<String, Arc<rockstream_ops::CompiledView>>>,
+    distributed_data_plane: Option<DataPlaneClient>,
+    distributed_storage_root: Option<String>,
     backfill_admission: Arc<crate::admission::BackfillAdmissionController>,
     /// Bound only by `GatewayServer`; source tasks upgrade it per poll and
     /// exit when the server releases its handler.
@@ -1887,6 +1895,8 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            distributed_data_plane: None,
+            distributed_storage_root: None,
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
@@ -1932,6 +1942,8 @@ impl GatewayHandler {
             table_insert_metadata: Arc::new(DashMap::new()),
             frontier_published_at_ms: Arc::new(AtomicU64::new(current_time_ms())),
             compiled_views: Arc::new(DashMap::new()),
+            distributed_data_plane: None,
+            distributed_storage_root: None,
             backfill_admission: Arc::new(crate::admission::BackfillAdmissionController::default()),
             self_ref: Arc::new(Mutex::new(Weak::new())),
             source_workers: Arc::new(DashMap::new()),
@@ -2338,7 +2350,9 @@ impl GatewayHandler {
 
         let candidates = reachable
             .iter()
-            .filter(|name| self.compiled_views.contains_key(*name))
+            .filter(|name| {
+                self.distributed_data_plane.is_some() || self.compiled_views.contains_key(*name)
+            })
             .cloned()
             .collect::<HashSet<_>>();
         let mut indegree = BTreeMap::new();
@@ -6921,7 +6935,56 @@ impl GatewayHandler {
         // committed writes immediately after the post-COMMIT flush.  The
         // ShardReader (DbReader) polls for a new manifest every 1 s and would
         // return stale results until the next poll fires.
-        let raw_rows: Vec<Vec<u8>> = if let Some(shard_db) = &self.shard_db {
+        let distributed_data_plane = self
+            .distributed_data_plane
+            .as_ref()
+            .filter(|_| self.catalog.get_view(view_name).is_some());
+        let raw_rows: Vec<Vec<u8>> = if let Some(distributed_data_plane) = distributed_data_plane {
+            let snapshot = distributed_data_plane
+                .read_workload(WorkloadId(stable_name_id("workload", view_name)))
+                .await
+                .map_err(|error| {
+                    PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("read distributed view {view_name}: {error}"),
+                    }))
+                })?;
+            let mut rows = merge_workload_snapshot(&snapshot)
+                .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+            if !order_by.is_empty() {
+                let col_idx: std::collections::HashMap<String, usize> = schema_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (f.name().to_lowercase(), i))
+                    .collect();
+                rows.sort_by(|a, b| {
+                    let a_fields: Vec<&str> =
+                        std::str::from_utf8(a).unwrap_or("").split('\t').collect();
+                    let b_fields: Vec<&str> =
+                        std::str::from_utf8(b).unwrap_or("").split('\t').collect();
+                    for (col, desc) in &order_by {
+                        let Some(&idx) = col_idx.get(col.as_str()) else {
+                            continue;
+                        };
+                        let av = a_fields.get(idx).copied().unwrap_or("");
+                        let bv = b_fields.get(idx).copied().unwrap_or("");
+                        let ord = if let (Ok(an), Ok(bn)) = (av.parse::<i64>(), bv.parse::<i64>()) {
+                            an.cmp(&bn)
+                        } else {
+                            av.cmp(bv)
+                        };
+                        let ord = if *desc { ord.reverse() } else { ord };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            if let Some(n) = limit {
+                rows.truncate(n);
+            }
+            rows
+        } else if let Some(shard_db) = &self.shard_db {
             let mut rows: Vec<Vec<u8>> = if let Some(view) = self.catalog.get_view(view_name) {
                 if view.op_id.is_some() {
                     self.read_compiled_view_rows(view_name, &view, shard_db)
@@ -7100,7 +7163,94 @@ impl GatewayHandler {
             // registers the view unconditionally — its data is served from
             // elsewhere via `ViewReader` (multi-shard scatter-read), not
             // this process's own compiled pipeline.
-            let compiled_op_id: Option<u64> = if let Some(shard_db) = self.shard_db.clone() {
+            let compiled_op_id: Option<u64> = if let Some(data_plane) = &self.distributed_data_plane
+            {
+                let inlined_sql =
+                    inline_view_dependencies(&select_sql, &self.catalog, MAX_VIEW_INLINE_DEPTH);
+                let compile_deps = extract_sql_refs(&inlined_sql);
+                if !compile_deps
+                    .iter()
+                    .all(|dep| self.catalog.get_table(dep).is_some())
+                {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        format!(
+                            "[RS-1019] view.compile_failed: distributed view '{view_name}' must depend only on base tables"
+                        ),
+                    )))]);
+                }
+                let frontend = self
+                    .build_explain_frontend()
+                    .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+                let plan = rockstream_plan::PlanNode::ViewSink {
+                    view_name: view_name.clone(),
+                    pk: full_row_pk(initial_columns.len()),
+                    child: Box::new(
+                        frontend
+                            .sql_to_plan_node(&inlined_sql)
+                            .await
+                            .map_err(|error| PgWireError::ApiError(Box::new(error)))?,
+                    ),
+                };
+                let Some((routing_columns, merge_key_columns)) = deployment_routing(&plan) else {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        format!(
+                            "[RS-1019] view.compile_failed: distributed view '{view_name}' must be an aggregate or aggregate over an equi-join"
+                        ),
+                    )))]);
+                };
+                let sink_operator_id = OperatorId(stable_name_id("distributed-sink", &view_name));
+                let request = DeploymentRequest {
+                    version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                    workload_id: WorkloadId(stable_name_id("workload", &view_name)),
+                    plan_json: serde_json::to_string(&plan).map_err(|error| {
+                        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("serialize distributed plan {view_name}: {error}"),
+                        }))
+                    })?,
+                    schemas: compile_deps
+                        .iter()
+                        .filter_map(|relation| {
+                            self.catalog
+                                .get_table(relation)
+                                .map(|table| DeploymentSchema {
+                                    relation: relation.clone(),
+                                    columns: table
+                                        .columns
+                                        .iter()
+                                        .map(|column| DeploymentColumn {
+                                            name: column.name.clone(),
+                                            data_type: column.data_type.clone(),
+                                        })
+                                        .collect(),
+                                })
+                        })
+                        .collect(),
+                    frontier: 0,
+                    storage_root: self.distributed_storage_root.clone().ok_or_else(|| {
+                        PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                            detail: "distributed storage root is not configured".to_string(),
+                        }))
+                    })?,
+                    sink_operator_id,
+                    output_columns: initial_columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                    primary_key: full_row_pk(initial_columns.len()),
+                    merge_key_columns,
+                    routing_columns,
+                };
+                data_plane.deploy(request).await.map_err(|error| {
+                    PgWireError::ApiError(Box::new(GatewayError::QueryTimeExecutionFailed {
+                        detail: format!("deploy distributed view {view_name}: {error}"),
+                    }))
+                })?;
+                Some(sink_operator_id.0)
+            } else if let Some(shard_db) = self.shard_db.clone() {
                 // v0.51.4 Slice 8: a view-of-view (any dep that's itself a
                 // view, not a base table) is inlined as a subquery before
                 // compilation — the *catalog*'s own dependency graph
@@ -7244,7 +7394,7 @@ impl GatewayHandler {
             } else {
                 Vec::new()
             };
-            let mut backfill_ready = !is_materialized;
+            let mut backfill_ready = !is_materialized || self.distributed_data_plane.is_some();
             if let Some(shard_db) = &self.shard_db {
                 if !bound_sources.is_empty() {
                     let result = self
@@ -8721,16 +8871,57 @@ impl GatewayHandler {
                     DmlOp::Delete { table, .. } => table.clone(),
                 })
                 .collect();
-            for view_name in self.reachable_compiled_views(&changed_tables) {
-                if let Err(error) = self
-                    .recompute_compiled_view(&view_name, &ops, shard_db)
-                    .await
-                {
-                    tracing::warn!(
-                        view = %view_name,
-                        error = %error,
-                        "compiled view refresh failed after commit"
-                    );
+            if let Some(data_plane) = &self.distributed_data_plane {
+                for view_name in self.reachable_compiled_views(&changed_tables) {
+                    for source in self.catalog.get_view_deps(&view_name) {
+                        if !changed_tables
+                            .iter()
+                            .any(|table| table.eq_ignore_ascii_case(&source))
+                        {
+                            continue;
+                        }
+                        let rows = runtime_rows_for_table(&source, &ops);
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        let request_id = format!(
+                            "{}-{epoch}-{}",
+                            std::process::id(),
+                            NEXT_DISTRIBUTED_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+                        );
+                        data_plane
+                            .submit_delta(SourceDeltaRequest {
+                                version: DEPLOYMENT_DESCRIPTOR_VERSION,
+                                request_id,
+                                workload_id: WorkloadId(stable_name_id("workload", &view_name)),
+                                epoch,
+                                source,
+                                rows,
+                            })
+                            .await
+                            .map_err(|error| {
+                                PgWireError::ApiError(Box::new(
+                                    GatewayError::QueryTimeExecutionFailed {
+                                        detail: format!(
+                                            "distributed view refresh {view_name}: {error}"
+                                        ),
+                                    },
+                                ))
+                            })?;
+                    }
+                }
+            } else {
+                for view_name in self.reachable_compiled_views(&changed_tables) {
+                    if let Err(error) = self
+                        .recompute_compiled_view(&view_name, &ops, shard_db)
+                        .await
+                    {
+                        tracing::warn!(
+                            view = %view_name,
+                            error = %error,
+                            "compiled view refresh failed after commit"
+                        );
+                    }
                 }
             }
             // Flush the WAL so that materialised view output is immediately
@@ -11511,6 +11702,18 @@ impl GatewayServer {
         self
     }
 
+    pub fn with_distributed_data_plane(
+        mut self,
+        client: DataPlaneClient,
+        storage_root: impl Into<String>,
+    ) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.distributed_data_plane = Some(client);
+            handler.distributed_storage_root = Some(storage_root.into());
+        }
+        self
+    }
+
     /// Attach a custom `SecretStore` to the server.
     pub fn with_secret_store(mut self, secret_store: Arc<rockstream_control::SecretStore>) -> Self {
         if let Some(h) = Arc::get_mut(&mut self.handler) {
@@ -12879,6 +13082,214 @@ fn query_time_relation_schema(catalog: &CatalogStubs, relation_name: &str) -> Sc
 
 fn full_row_pk(column_count: usize) -> Vec<usize> {
     (0..column_count).collect()
+}
+
+fn stable_name_id(namespace: &str, name: &str) -> u64 {
+    namespace
+        .bytes()
+        .chain([0])
+        .chain(name.bytes())
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+fn source_routing_column(
+    plan: &rockstream_plan::PlanNode,
+    output_column: usize,
+) -> Option<(String, usize)> {
+    use rockstream_plan::{Expr, PlanNode};
+    match plan {
+        PlanNode::Source { name } => Some((name.clone(), output_column)),
+        PlanNode::Filter { input, .. } | PlanNode::Map { input, .. } => {
+            source_routing_column(input, output_column)
+        }
+        PlanNode::Project { input, columns } => {
+            let Expr::Column(input_column) = columns.get(output_column)? else {
+                return None;
+            };
+            source_routing_column(input, *input_column)
+        }
+        PlanNode::ViewSink { child, .. } => source_routing_column(child, output_column),
+        _ => None,
+    }
+}
+
+fn join_routing_columns(plan: &rockstream_plan::PlanNode) -> Option<BTreeMap<String, usize>> {
+    use rockstream_plan::PlanNode;
+    match plan {
+        PlanNode::InnerJoin {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            ..
+        } => {
+            let left = source_routing_column(left, *left_keys.first()?)?;
+            let right = source_routing_column(right, *right_keys.first()?)?;
+            Some(BTreeMap::from([left, right]))
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Map { input, .. }
+        | PlanNode::Aggregate { input, .. } => join_routing_columns(input),
+        PlanNode::ViewSink { child, .. } => join_routing_columns(child),
+        _ => None,
+    }
+}
+
+fn aggregate_routing(
+    plan: &rockstream_plan::PlanNode,
+) -> Option<(BTreeMap<String, usize>, Vec<usize>)> {
+    use rockstream_plan::{Expr, PlanNode};
+    match plan {
+        PlanNode::Aggregate {
+            input, group_by, ..
+        } => {
+            let Expr::Column(column) = group_by.first()? else {
+                return None;
+            };
+            let (source, column) = source_routing_column(input, *column)?;
+            Some((
+                BTreeMap::from([(source, column)]),
+                (0..group_by.len()).collect(),
+            ))
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Map { input, .. } => aggregate_routing(input),
+        PlanNode::ViewSink { child, .. } => aggregate_routing(child),
+        _ => None,
+    }
+}
+
+fn aggregate_merge_keys(plan: &rockstream_plan::PlanNode) -> Option<Vec<usize>> {
+    use rockstream_plan::PlanNode;
+    match plan {
+        PlanNode::Aggregate { group_by, .. } => Some((0..group_by.len()).collect()),
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Map { input, .. } => aggregate_merge_keys(input),
+        PlanNode::ViewSink { child, .. } => aggregate_merge_keys(child),
+        _ => None,
+    }
+}
+
+fn deployment_routing(
+    plan: &rockstream_plan::PlanNode,
+) -> Option<(BTreeMap<String, usize>, Vec<usize>)> {
+    if let Some(routing) = join_routing_columns(plan) {
+        Some((routing, aggregate_merge_keys(plan)?))
+    } else {
+        aggregate_routing(plan)
+    }
+}
+
+fn runtime_rows_for_table(table: &str, ops: &[DmlOp]) -> Vec<RuntimeRow> {
+    let mut rows = Vec::new();
+    for op in ops {
+        match op {
+            DmlOp::Insert {
+                table: op_table,
+                values_tsv,
+                ..
+            } if op_table.eq_ignore_ascii_case(table) => rows.push(RuntimeRow {
+                values_tsv: values_tsv.clone(),
+                weight: 1,
+            }),
+            DmlOp::Update {
+                table: op_table,
+                old_tsv,
+                new_tsv,
+                ..
+            } if op_table.eq_ignore_ascii_case(table) => {
+                rows.push(RuntimeRow {
+                    values_tsv: old_tsv.clone(),
+                    weight: -1,
+                });
+                rows.push(RuntimeRow {
+                    values_tsv: new_tsv.clone(),
+                    weight: 1,
+                });
+            }
+            DmlOp::Delete {
+                table: op_table,
+                returning_tsv: Some(values_tsv),
+                ..
+            } if op_table.eq_ignore_ascii_case(table) => rows.push(RuntimeRow {
+                values_tsv: values_tsv.clone(),
+                weight: -1,
+            }),
+            _ => {}
+        }
+    }
+    rows
+}
+
+fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, GatewayError> {
+    let mut shard_rows = Vec::new();
+    for shard in &snapshot.shards {
+        let mut state = BTreeMap::<String, i64>::new();
+        for delta in &shard.deltas {
+            for row in &delta.rows {
+                *state.entry(row.values_tsv.clone()).or_default() += row.weight;
+            }
+        }
+        shard_rows.extend(
+            state
+                .into_iter()
+                .filter_map(|(row, weight)| (weight > 0).then_some(row)),
+        );
+    }
+
+    let merge_keys = &snapshot.deployment.merge_key_columns;
+    if merge_keys.is_empty() {
+        return Ok(shard_rows.into_iter().map(|row| row.into_bytes()).collect());
+    }
+
+    let mut merged = BTreeMap::<String, Vec<String>>::new();
+    for row in shard_rows {
+        let fields = row.split('\t').map(str::to_string).collect::<Vec<_>>();
+        let key = merge_keys
+            .iter()
+            .filter_map(|column| fields.get(*column))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        match merged.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(fields);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                for (column, value) in fields.iter().enumerate() {
+                    if merge_keys.contains(&column) {
+                        continue;
+                    }
+                    let current = entry.get()[column].parse::<i64>().map_err(|error| {
+                        GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("distributed merge column {column}: {error}"),
+                        }
+                    })?;
+                    let incoming = value.parse::<i64>().map_err(|error| {
+                        GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("distributed merge column {column}: {error}"),
+                        }
+                    })?;
+                    entry.get_mut()[column] = current
+                        .checked_add(incoming)
+                        .ok_or_else(|| GatewayError::QueryTimeExecutionFailed {
+                            detail: format!("distributed merge overflow in column {column}"),
+                        })?
+                        .to_string();
+                }
+            }
+        }
+    }
+
+    Ok(merged
+        .into_values()
+        .map(|fields| fields.join("\t").into_bytes())
+        .collect())
 }
 
 /// v0.51.4 Slice 0: build a signed-weight `ArrowZSet` from the commit's own

@@ -9,6 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use parking_lot::RwLock;
 use serde_json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -16,8 +19,12 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
+use rockstream_types::data_plane::{
+    DeploymentDescriptor, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow,
+    DEPLOYMENT_DESCRIPTOR_VERSION,
+};
 use rockstream_types::identity::InternalTlsConfig;
-use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
+use rockstream_types::ids::{LeaseToken, ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardLease;
 use rockstream_types::topology::{
     CapacityHeadroom, ControlMessage, NodeRole, WorkerCapabilities, WorkerInfo, WorkerLocation,
@@ -26,6 +33,314 @@ use rockstream_types::topology::{
 
 use crate::secrets::WorkerSecretManager;
 use rockstream_storage::ShardDb;
+
+struct WorkerDeployment {
+    descriptor: DeploymentDescriptor,
+    schemas: HashMap<String, SchemaRef>,
+    db: Arc<ShardDb>,
+    compiled: rockstream_ops::compile::CompiledView,
+}
+
+type WorkerDeployments = Arc<RwLock<HashMap<(WorkloadId, ShardId), Arc<WorkerDeployment>>>>;
+
+fn deployment_schema(descriptor: &DeploymentDescriptor) -> io::Result<HashMap<String, SchemaRef>> {
+    descriptor
+        .schemas
+        .iter()
+        .map(|schema| {
+            let fields = schema
+                .columns
+                .iter()
+                .map(|column| {
+                    let data_type = match column.data_type.to_ascii_lowercase().as_str() {
+                        "i64" | "int64" | "bigint" => DataType::Int64,
+                        "f64" | "float64" | "double" => DataType::Float64,
+                        "bool" | "boolean" => DataType::Boolean,
+                        "string" | "utf8" | "text" => DataType::Utf8,
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("unsupported deployment type {other}"),
+                            ))
+                        }
+                    };
+                    Ok(Field::new(&column.name, data_type, true))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok((schema.relation.clone(), Arc::new(Schema::new(fields))))
+        })
+        .collect()
+}
+
+fn rows_to_zset(
+    rows: &[RuntimeRow],
+    schema: SchemaRef,
+) -> io::Result<rockstream_ops::zset::ArrowZSet> {
+    let split = rows
+        .iter()
+        .map(|row| row.values_tsv.split('\t').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    if split.iter().any(|row| row.len() != schema.fields().len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TSV row width does not match source schema",
+        ));
+    }
+    let columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(column, field)| -> io::Result<ArrayRef> {
+            macro_rules! parsed {
+                ($ty:ty, $array:ty) => {{
+                    let values = split
+                        .iter()
+                        .map(|row| {
+                            (!row[column].is_empty() && row[column] != "\\N")
+                                .then(|| row[column].parse::<$ty>())
+                                .transpose()
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    Ok(Arc::new(<$array>::from(values)) as ArrayRef)
+                }};
+            }
+            match field.data_type() {
+                DataType::Int64 => parsed!(i64, Int64Array),
+                DataType::Float64 => parsed!(f64, Float64Array),
+                DataType::Boolean => {
+                    let values = split
+                        .iter()
+                        .map(|row| match row[column] {
+                            "" | "\\N" => Ok(None),
+                            value if value.eq_ignore_ascii_case("true") => Ok(Some(true)),
+                            value if value.eq_ignore_ascii_case("false") => Ok(Some(false)),
+                            value => Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid boolean value {value:?}"),
+                            )),
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    Ok(Arc::new(BooleanArray::from(values)))
+                }
+                DataType::Utf8 => Ok(Arc::new(StringArray::from(
+                    split
+                        .iter()
+                        .map(|row| {
+                            (!row[column].is_empty() && row[column] != "\\N").then_some(row[column])
+                        })
+                        .collect::<Vec<_>>(),
+                ))),
+                other => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported Arrow type {other}"),
+                )),
+            }
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let batch = RecordBatch::try_new(schema, columns)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(rockstream_ops::zset::ArrowZSet::new(
+        batch,
+        rows.iter().map(|row| row.weight).collect(),
+    ))
+}
+
+fn zset_to_rows(zset: &rockstream_ops::zset::ArrowZSet) -> io::Result<Vec<RuntimeRow>> {
+    (0..zset.data.num_rows())
+        .map(|row| {
+            let values_tsv = zset
+                .data
+                .columns()
+                .iter()
+                .map(|column| {
+                    if column.is_null(row) {
+                        return Ok(String::new());
+                    }
+                    match column.data_type() {
+                        DataType::Int64 => column
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .map(|array| array.value(row).to_string()),
+                        DataType::Float64 => column
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .map(|array| array.value(row).to_string()),
+                        DataType::Boolean => column
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .map(|array| array.value(row).to_string()),
+                        DataType::Utf8 => column
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .map(|array| array.value(row).to_string()),
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("unsupported Arrow type {other}"),
+                            ))
+                        }
+                    }
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Arrow array type mismatch")
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?
+                .join("\t");
+            Ok(RuntimeRow {
+                values_tsv,
+                weight: zset.weights[row],
+            })
+        })
+        .collect()
+}
+
+async fn execute_frame(
+    client: &WorkerClientHandle,
+    deployments: &WorkerDeployments,
+    frame: RuntimeExchangeMessage,
+) -> io::Result<()> {
+    let deployment = deployments
+        .read()
+        .get(&(frame.workload_id, frame.shard_id))
+        .cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workload is not deployed"))?;
+    let descriptor = &deployment.descriptor;
+    if frame.version != DEPLOYMENT_DESCRIPTOR_VERSION
+        || frame.shard_id != descriptor.shard.shard_id
+        || frame.operator_id != descriptor.sink_operator_id
+        || frame.lease_token != descriptor.shard.lease_token
+        || frame.epoch < descriptor.frontier
+        || client.worker_id() != Some(descriptor.shard.worker_id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "stale or mismatched execution identity",
+        ));
+    }
+    if !client
+        .check_fence_write(frame.shard_id, frame.lease_token)
+        .await?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lease fence rejected execution",
+        ));
+    }
+    let schema = deployment
+        .schemas
+        .get(&frame.source)
+        .cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown source relation"))?;
+    let input = rows_to_zset(&frame.rows, schema)?;
+    let output = if let Some(join) = &deployment.compiled.join {
+        let empty = |schema: SchemaRef| rows_to_zset(&[], schema);
+        if frame.source == join.left_source {
+            join.pipeline.process(
+                input,
+                empty(deployment.schemas[&join.right_source].clone())?,
+            )
+        } else if frame.source == join.right_source {
+            join.pipeline
+                .process(empty(deployment.schemas[&join.left_source].clone())?, input)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source is not an input of the join",
+            ));
+        }
+    } else {
+        deployment.compiled.pipeline.process(input)
+    }
+    .map_err(io::Error::other)?;
+    if !client
+        .check_fence_write(frame.shard_id, frame.lease_token)
+        .await?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lease fence rejected persistence",
+        ));
+    }
+    deployment
+        .compiled
+        .sink
+        .write_epoch(&output, frame.epoch)
+        .await
+        .map_err(io::Error::other)?;
+    if let Some(join) = &deployment.compiled.join {
+        join.pipeline
+            .persist(&deployment.db)
+            .await
+            .map_err(io::Error::other)?;
+    } else {
+        deployment
+            .compiled
+            .pipeline
+            .persist(&deployment.db)
+            .await
+            .map_err(io::Error::other)?;
+    }
+    deployment.db.flush().await.map_err(io::Error::other)?;
+    let output_rows = zset_to_rows(&output)?;
+    client
+        .msg_tx
+        .send(WorkerMessage::ExecutionProgress {
+            output: RuntimeOutputDelta {
+                version: frame.version,
+                request_id: frame.request_id,
+                workload_id: frame.workload_id,
+                shard_id: frame.shard_id,
+                epoch: frame.epoch,
+                operator_id: frame.operator_id,
+                lease_token: frame.lease_token,
+                source: frame.source,
+                rows: output_rows.clone(),
+            },
+            input_rows: frame.rows.len() as u64,
+            output_rows: output_rows.len() as u64,
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "client channel closed"))
+}
+
+#[cfg(test)]
+mod data_plane_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_rows_convert_exactly() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+            Field::new("enabled", DataType::Boolean, false),
+        ]));
+        let rows = vec![
+            RuntimeRow {
+                values_tsv: "7\tstone\tTRUE".into(),
+                weight: 1,
+            },
+            RuntimeRow {
+                values_tsv: "9\tstream\tFaLsE".into(),
+                weight: -2,
+            },
+        ];
+
+        assert_eq!(
+            zset_to_rows(&rows_to_zset(&rows, schema).unwrap()).unwrap(),
+            vec![
+                RuntimeRow {
+                    values_tsv: "7\tstone\ttrue".into(),
+                    weight: 1,
+                },
+                RuntimeRow {
+                    values_tsv: "9\tstream\tfalse".into(),
+                    weight: -2,
+                },
+            ]
+        );
+    }
+}
 
 /// Tracks a shard lease and its local active database instance.
 pub struct ShardState {
@@ -288,11 +603,29 @@ where
         secret_manager: secret_manager.clone(),
     };
 
+    let deployments = Arc::new(RwLock::new(HashMap::<
+        (WorkloadId, ShardId),
+        Arc<WorkerDeployment>,
+    >::new()));
+    let (execute_tx, mut execute_rx) = mpsc::channel::<RuntimeExchangeMessage>(32);
+    let executor_client = handle.clone();
+    let executor_deployments = deployments.clone();
+    tokio::spawn(async move {
+        // ponytail: one executor preserves deterministic order; shard-parallel queues if throughput requires it.
+        while let Some(frame) = execute_rx.recv().await {
+            if let Err(error) = execute_frame(&executor_client, &executor_deployments, frame).await
+            {
+                tracing::warn!(%error, "worker execution refused");
+            }
+        }
+    });
+
     let worker_id_clone = worker_id.clone();
     let active_shards_clone = active_shards.clone();
     let fence_waiters_clone = fence_waiters.clone();
     let storage_dir = storage_dir.to_path_buf();
     let secret_manager_clone = secret_manager.clone();
+    let deployments_clone = deployments.clone();
 
     let join_handle = tokio::spawn(async move {
         // 1. Send Registration message.
@@ -397,6 +730,105 @@ where
                     topology.clear();
                     topology.extend(workers.into_iter().map(|worker| (worker.worker_id, worker)));
                 }
+                ControlMessage::Deploy { descriptor } => {
+                    let result: io::Result<Arc<WorkerDeployment>> = async {
+                        if descriptor.version != DEPLOYMENT_DESCRIPTOR_VERSION
+                            || worker_id_clone.read().as_ref() != Some(&descriptor.shard.worker_id)
+                            || active_shards_clone
+                                .read()
+                                .get(&descriptor.shard.shard_id)
+                                .map(|state| state.lease.lease_token)
+                                != Some(descriptor.shard.lease_token)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "deployment identity does not match the current lease",
+                            ));
+                        }
+                        let path = descriptor
+                            .storage_identity
+                            .strip_prefix("lfs:")
+                            .unwrap_or(&descriptor.storage_identity);
+                        let store = rockstream_storage::build_runtime_object_store(
+                            Path::new(path),
+                            &descriptor.storage_root,
+                        )
+                        .map_err(io::Error::other)?;
+                        let db = Arc::new(
+                            ShardDb::builder("db", store)
+                                .build()
+                                .await
+                                .map_err(io::Error::other)?,
+                        );
+                        let schemas = deployment_schema(&descriptor)?;
+                        let plan: rockstream_plan::PlanNode =
+                            serde_json::from_str(&descriptor.plan_json).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?;
+                        let compiled = rockstream_ops::compile_plan_with_sink_id(
+                            &plan,
+                            db.clone(),
+                            &schemas,
+                            descriptor.sink_operator_id,
+                        )
+                        .map_err(io::Error::other)?;
+                        if let Some(join) = &compiled.join {
+                            join.pipeline.restore(&db).await.map_err(io::Error::other)?;
+                        } else {
+                            compiled
+                                .pipeline
+                                .restore(&db)
+                                .await
+                                .map_err(io::Error::other)?;
+                        }
+                        Ok(Arc::new(WorkerDeployment {
+                            descriptor,
+                            schemas,
+                            db,
+                            compiled,
+                        }))
+                    }
+                    .await;
+                    match result {
+                        Ok(deployment) => {
+                            let descriptor = &deployment.descriptor;
+                            let old_db = active_shards_clone
+                                .write()
+                                .insert(
+                                    descriptor.shard.shard_id,
+                                    ShardState {
+                                        lease: descriptor.shard.clone(),
+                                        db: Some((*deployment.db).clone()),
+                                    },
+                                )
+                                .and_then(|state| state.db);
+                            if let Some(db) = old_db {
+                                let _ = db.close().await;
+                            }
+                            deployments_clone.write().insert(
+                                (descriptor.workload_id, descriptor.shard.shard_id),
+                                deployment.clone(),
+                            );
+                            let _ = msg_tx
+                                .send(WorkerMessage::DeploymentReady {
+                                    version: descriptor.version,
+                                    workload_id: descriptor.workload_id,
+                                    shard_id: descriptor.shard.shard_id,
+                                    worker_id: descriptor.shard.worker_id,
+                                    process_id: std::process::id(),
+                                    operator_ids: vec![descriptor.sink_operator_id],
+                                    frontier: descriptor.frontier,
+                                })
+                                .await;
+                        }
+                        Err(error) => tracing::warn!(%error, "worker deployment refused"),
+                    }
+                }
+                ControlMessage::Execute { frame } => {
+                    if execute_tx.send(frame).await.is_err() {
+                        tracing::warn!("worker executor stopped");
+                    }
+                }
                 ControlMessage::ShardAssigned { lease } => {
                     tracing::info!("Received ShardAssigned lease for {:?}", lease.shard_id);
                     // Open database for this shard
@@ -491,6 +923,9 @@ where
                     if let Some(db) = db_to_close {
                         let _ = db.close().await;
                     }
+                    deployments_clone
+                        .write()
+                        .retain(|_, deployment| deployment.descriptor.shard.shard_id != shard_id);
                 }
                 ControlMessage::FenceAck { shard_id, valid } => {
                     tracing::info!("Received FenceAck for {:?}: valid={}", shard_id, valid);

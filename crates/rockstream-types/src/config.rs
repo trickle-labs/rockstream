@@ -123,6 +123,7 @@ impl Default for ClusterConfig {
 pub struct WorkerConfig {
     pub segment_cache_bytes: usize,
     pub max_rows_per_quantum: usize,
+    pub execution_threads: usize,
 }
 
 impl Default for WorkerConfig {
@@ -130,6 +131,7 @@ impl Default for WorkerConfig {
         Self {
             segment_cache_bytes: 64 * 1024 * 1024,
             max_rows_per_quantum: 8192,
+            execution_threads: 1,
         }
     }
 }
@@ -303,6 +305,7 @@ impl Default for RockstreamConfig {
             worker: WorkerConfig {
                 segment_cache_bytes: 536870912, // 512 MB
                 max_rows_per_quantum: 1000,
+                execution_threads: 1,
             },
             connector: ConnectorConfig {
                 dlq_warn_threshold: 100,

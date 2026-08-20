@@ -365,6 +365,7 @@ async fn same_host_shared_memory_quantum_budget_falls_back_without_duplication_s
             .with_worker_config(WorkerConfig {
                 segment_cache_bytes: 0,
                 max_rows_per_quantum: 1,
+                ..WorkerConfig::default()
             });
 
     let frame = ShuffleFrame {
@@ -614,6 +615,7 @@ async fn exchange_domain_rebuild_releases_row_credits_during_drain_sim() {
             .with_worker_config(WorkerConfig {
                 segment_cache_bytes: 0,
                 max_rows_per_quantum: 1,
+                ..WorkerConfig::default()
             });
 
     for (epoch, seq, row) in [(1, 9, (21, 210)), (2, 10, (22, 220))] {

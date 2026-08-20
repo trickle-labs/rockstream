@@ -22,9 +22,18 @@ async fn send_and_recv(stream: &mut TcpStream, msg: &WorkerMessage) -> String {
     stream.write_all(line.as_bytes()).await.unwrap();
 
     let mut reader = BufReader::new(stream);
-    let mut resp = String::new();
-    reader.read_line(&mut resp).await.unwrap();
-    resp
+    loop {
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        if matches!(msg, WorkerMessage::Register(_))
+            || !matches!(
+                serde_json::from_str(&response),
+                Ok(ControlMessage::TopologyChanged { .. })
+            )
+        {
+            return response;
+        }
+    }
 }
 
 /// P4: Real control-plane leader kill (SIGKILL leader) results in follower assuming

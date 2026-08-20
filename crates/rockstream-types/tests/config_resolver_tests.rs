@@ -16,9 +16,30 @@ fn test_precedence_defaults_only() {
     let overrides = CliConfigOverrides::default();
     let resolved = ConfigResolver::resolve(None, &overrides).expect("Resolution succeeds");
     assert_eq!(resolved.config.cluster.min_epoch_ms, 10);
+    assert_eq!(resolved.config.worker.execution_threads, 1);
     assert_eq!(
         resolved.origins.get("cluster.min_epoch_ms"),
         Some(&ConfigOrigin::Default)
+    );
+    assert_eq!(
+        resolved.origins.get("worker.execution_threads"),
+        Some(&ConfigOrigin::Default)
+    );
+}
+
+#[test]
+fn worker_execution_threads_uses_single_underscore_env() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("ROCKSTREAM_WORKER_EXECUTION_THREADS", "4");
+    let resolved = ConfigResolver::resolve(None, &CliConfigOverrides::default()).unwrap();
+    std::env::remove_var("ROCKSTREAM_WORKER_EXECUTION_THREADS");
+
+    assert_eq!(resolved.config.worker.execution_threads, 4);
+    assert_eq!(
+        resolved.origins.get("worker.execution_threads"),
+        Some(&ConfigOrigin::Environment(
+            "ROCKSTREAM_WORKER_EXECUTION_THREADS".to_string()
+        ))
     );
 }
 

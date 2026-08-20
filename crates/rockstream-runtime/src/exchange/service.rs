@@ -1040,6 +1040,7 @@ mod tests {
             .with_worker_config(WorkerConfig {
                 segment_cache_bytes: 0,
                 max_rows_per_quantum: 2,
+                ..WorkerConfig::default()
             });
 
         let first = ArrowZSet::from_ab_rows(&[(1, 10), (2, 20)], 1);
@@ -2292,6 +2293,7 @@ mod tests {
                 .with_worker_config(WorkerConfig {
                     segment_cache_bytes: 0,
                     max_rows_per_quantum: 16_384,
+                    ..WorkerConfig::default()
                 });
         let zset = make_wide_compressible_zset(16_384);
         let expected = serialize_zset(&zset).unwrap();
@@ -2368,6 +2370,7 @@ mod tests {
                 .with_worker_config(WorkerConfig {
                     segment_cache_bytes: 0,
                     max_rows_per_quantum: 8_192,
+                    ..WorkerConfig::default()
                 });
         let zset = make_wide_compressible_zset(8_192);
         let expected = serialize_zset(&zset).unwrap();
@@ -2455,6 +2458,7 @@ mod tests {
                 .with_worker_config(WorkerConfig {
                     segment_cache_bytes: 0,
                     max_rows_per_quantum: 8_192,
+                    ..WorkerConfig::default()
                 });
         let zset = make_wide_compressible_zset(8_192);
         let expected = serialize_zset(&zset).unwrap();

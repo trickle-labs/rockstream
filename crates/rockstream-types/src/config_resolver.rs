@@ -255,6 +255,10 @@ fn init_default_origins(origins: &mut BTreeMap<String, ConfigOrigin>) {
         ConfigOrigin::Default,
     );
     origins.insert(
+        "worker.execution_threads".to_string(),
+        ConfigOrigin::Default,
+    );
+    origins.insert(
         "connector.dlq_warn_threshold".to_string(),
         ConfigOrigin::Default,
     );
@@ -329,6 +333,15 @@ fn merge_toml_table_origins(
 }
 
 fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, ConfigOrigin>) {
+    if let Ok(value) = std::env::var("ROCKSTREAM_WORKER_EXECUTION_THREADS") {
+        if let Ok(value) = value.parse::<usize>() {
+            config.worker.execution_threads = value;
+            origins.insert(
+                "worker.execution_threads".to_string(),
+                ConfigOrigin::Environment("ROCKSTREAM_WORKER_EXECUTION_THREADS".to_string()),
+            );
+        }
+    }
     for (k, v) in std::env::vars() {
         if !k.starts_with("ROCKSTREAM__") {
             continue;
@@ -405,6 +418,15 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
                     config.worker.max_rows_per_quantum = val;
                     origins.insert(
                         "worker.max_rows_per_quantum".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["WORKER", "EXECUTION_THREADS"] => {
+                if let Ok(val) = v.parse::<usize>() {
+                    config.worker.execution_threads = val;
+                    origins.insert(
+                        "worker.execution_threads".to_string(),
                         ConfigOrigin::Environment(k),
                     );
                 }

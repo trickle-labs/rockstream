@@ -436,7 +436,18 @@ pub async fn start_gateway_with_shard(
         }
     };
 
-    let server = server.with_query_time_shard_topology_provider(topology_provider);
+    let mut server = server.with_query_time_shard_topology_provider(topology_provider);
+    if opts.role == "gateway" {
+        if let Some(control) = &opts.control {
+            server = server.with_distributed_data_plane(
+                rockstream_runtime::data_plane::DataPlaneClient::new(control),
+                opts.storage
+                    .join("distributed-shards")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
     if let Some(webhook_listen) = &opts.config.gateway.webhook_listen_addr {
         let webhook_addr = webhook_listen.parse().map_err(|e| {
             CliError::new(
@@ -572,8 +583,12 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     }
 
     // Start services in a tokio runtime
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+    if opts.role == "worker" {
+        runtime_builder.worker_threads(opts.config.worker.execution_threads);
+    }
+    let rt = runtime_builder
         .build()
         .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
 

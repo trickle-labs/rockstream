@@ -5241,6 +5241,7 @@ dependencies = [
  "rockstream-cli",
  "rockstream-control",
  "rockstream-ops",
+ "rockstream-plan",
  "rockstream-sim",
  "rockstream-storage",
  "rockstream-test-support",

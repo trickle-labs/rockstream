@@ -37,18 +37,27 @@ async fn send(addr: std::net::SocketAddr, msg: &WorkerMessage) -> Vec<ControlMes
     responses
 }
 
-async fn register(addr: std::net::SocketAddr, worker_id: u64) {
+async fn register(addr: std::net::SocketAddr, worker_id: u64) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
     let reg = WorkerRegistration::new(
         WorkerId(worker_id),
         NodeRole::Worker,
         format!("127.0.0.1:{}", 7000 + worker_id),
         CapacityHeadroom::FULL,
     );
-    let replies = send(addr, &WorkerMessage::Register(reg)).await;
-    assert!(matches!(
-        replies.first(),
-        Some(ControlMessage::Registered { .. })
-    ));
+    let line = serde_json::to_string(&WorkerMessage::Register(reg)).unwrap() + "\n";
+    stream.write_all(line.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(&mut stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    match serde_json::from_str::<ControlMessage>(response.trim()).unwrap() {
+        ControlMessage::Registered {
+            worker_id: registered,
+        } => assert_eq!(registered, WorkerId(worker_id)),
+        other => panic!("expected exact registration response, got {other:?}"),
+    }
+    drop(reader);
+    stream
 }
 
 async fn start_service(
@@ -73,8 +82,8 @@ async fn start_service(
 #[tokio::test]
 async fn draining_worker_receives_no_new_shards() {
     let (handle, catalog, _manager) = start_service(false).await;
-    register(handle.addr, 1).await;
-    register(handle.addr, 2).await;
+    let _worker_1 = register(handle.addr, 1).await;
+    let _worker_2 = register(handle.addr, 2).await;
 
     let replies = send(
         handle.addr,
@@ -113,8 +122,8 @@ async fn draining_worker_receives_no_new_shards() {
 #[tokio::test]
 async fn drain_completes_after_all_shards_migrate() {
     let (handle, catalog, manager) = start_service(true).await;
-    register(handle.addr, 1).await;
-    register(handle.addr, 2).await;
+    let _worker_1 = register(handle.addr, 1).await;
+    let _worker_2 = register(handle.addr, 2).await;
     manager.acquire(ShardId(7), WorkerId(1)).unwrap();
     manager.acquire(ShardId(8), WorkerId(1)).unwrap();
 
@@ -143,8 +152,8 @@ async fn drain_completes_after_all_shards_migrate() {
 #[tokio::test]
 async fn decommissioned_worker_removed_from_topology_after_grace_period() {
     let (handle, catalog, manager) = start_service(true).await;
-    register(handle.addr, 1).await;
-    register(handle.addr, 2).await;
+    let _worker_1 = register(handle.addr, 1).await;
+    let _worker_2 = register(handle.addr, 2).await;
     manager.acquire(ShardId(10), WorkerId(1)).unwrap();
 
     let _ = send(

@@ -276,6 +276,23 @@ pub enum ControlMessage {
         /// The canonical worker ID assigned by the control plane.
         worker_id: WorkerId,
     },
+    Deploy {
+        descriptor: crate::data_plane::DeploymentDescriptor,
+    },
+    Execute {
+        frame: crate::data_plane::RuntimeExchangeMessage,
+    },
+    DeploymentReady {
+        workload_id: crate::ids::WorkloadId,
+        workers: Vec<crate::data_plane::WorkerExecutionStatus>,
+    },
+    SourceDeltaCommitted {
+        request_id: String,
+        epoch: crate::timestamp::Epoch,
+    },
+    WorkloadSnapshot {
+        snapshot: crate::data_plane::WorkloadSnapshot,
+    },
     /// The topology has changed; the worker should update its view.
     TopologyChanged {
         /// Current list of healthy workers.
@@ -755,13 +772,34 @@ impl ClusterWorkerPressure {
 pub enum WorkerMessage {
     /// Initial registration request.
     Register(WorkerRegistration),
+    DeployWorkload(crate::data_plane::DeploymentRequest),
+    DeploymentReady {
+        version: u32,
+        workload_id: crate::ids::WorkloadId,
+        shard_id: ShardId,
+        worker_id: WorkerId,
+        process_id: u32,
+        operator_ids: Vec<crate::ids::OperatorId>,
+        frontier: crate::timestamp::Epoch,
+    },
+    SubmitSourceDelta(crate::data_plane::SourceDeltaRequest),
+    ExecutionProgress {
+        output: crate::data_plane::RuntimeOutputDelta,
+        input_rows: u64,
+        output_rows: u64,
+    },
+    ReadWorkload {
+        workload_id: crate::ids::WorkloadId,
+    },
     /// Periodic heartbeat with updated capacity.
     Heartbeat {
         worker_id: WorkerId,
         capacity_headroom: CapacityHeadroom,
     },
     /// Graceful deregistration.
-    Deregister { worker_id: WorkerId },
+    Deregister {
+        worker_id: WorkerId,
+    },
     /// Request the control plane to acquire a shard lease on behalf of this
     /// worker. The control plane responds with [`ControlMessage::ShardAssigned`]
     /// or an error (connection close).
@@ -815,7 +853,9 @@ pub enum WorkerMessage {
         worker_id: WorkerId,
     },
     /// Request a short-lived token for a catalog secret.
-    ResolveSecretToken { secret_name: String },
+    ResolveSecretToken {
+        secret_name: String,
+    },
 }
 
 #[cfg(test)]

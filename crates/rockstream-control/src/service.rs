@@ -20,6 +20,7 @@
 //! Worker → Control:  {"type":"deregister","worker_id":1}\n
 //! ```
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,11 +28,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 
+use rockstream_types::data_plane::{
+    DeploymentDescriptor, DeploymentRequest, RuntimeExchangeMessage, RuntimeOutputDelta,
+    ShardOutput, WorkerExecutionStatus, WorkloadSnapshot,
+};
 use rockstream_types::error_code::{RS_2410, RS_2411, RS_2412, RS_3604, RS_3610, RS_3611, RS_3612};
 use rockstream_types::identity::{InternalTlsConfig, NodeIdentity, NodeRole};
-use rockstream_types::ids::{ShardId, WorkerId};
+use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
 use rockstream_types::lease::ShardRevokeReason;
 use rockstream_types::migration::{BucketSet, MigrationRecord, MigrationState};
 use rockstream_types::topology::{
@@ -41,7 +46,9 @@ use rockstream_types::topology::{
 use crate::audit::{AuditEvent, FileAuditLog};
 use crate::frontier::FrontierAggregator;
 use crate::migration::{MigrationCoordinator, MigrationPersistentStore};
+use crate::placement::PlacementAlgorithm;
 use crate::raft::{RaftHandle, RaftRole};
+use crate::scheduler::ShardScheduler;
 use crate::secret_store::{SecretStore, SecretStoreError};
 use crate::shard::{ShardManager, ShardPersistentStore};
 use crate::topology::{TopologyCatalog, TopologyPersistentStore};
@@ -113,6 +120,28 @@ impl DrainFailure {
 struct DrainState {
     queue: std::collections::VecDeque<DrainTask>,
     next_migration_id: u64,
+}
+
+#[derive(Default)]
+struct DataPlaneState {
+    deployments: HashMap<WorkloadId, DeploymentState>,
+    source_waiters: HashMap<String, SourceWaiter>,
+}
+
+struct DeploymentState {
+    request: DeploymentRequest,
+    descriptors: HashMap<ShardId, DeploymentDescriptor>,
+    outputs: HashMap<ShardId, Vec<RuntimeOutputDelta>>,
+    workers: HashMap<WorkerId, WorkerExecutionStatus>,
+    ready_shards: HashSet<ShardId>,
+    ready_waiter: Option<mpsc::Sender<ControlMessage>>,
+}
+
+struct SourceWaiter {
+    sender: mpsc::Sender<ControlMessage>,
+    expected: usize,
+    received: usize,
+    epoch: u64,
 }
 
 /// Convert the internal [`RaftRole`] to its wire-serializable mirror.
@@ -228,6 +257,8 @@ pub struct ControlService {
     /// Optional internal TLS configuration for control plane mTLS.
     internal_tls: Option<InternalTlsConfig>,
     secret_store: Arc<SecretStore>,
+    worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    data_plane: Arc<AsyncMutex<DataPlaneState>>,
 }
 
 impl ControlService {
@@ -251,6 +282,8 @@ impl ControlService {
                     "rockstream-default-kek",
                 )),
             )),
+            worker_senders: Arc::new(AsyncMutex::new(HashMap::new())),
+            data_plane: Arc::new(AsyncMutex::new(DataPlaneState::default())),
         }
     }
 
@@ -353,6 +386,8 @@ impl ControlService {
             drain_state: self.drain_state.clone(),
             auto_drain: self.auto_drain,
             secret_store: self.secret_store.clone(),
+            worker_senders: self.worker_senders.clone(),
+            data_plane: self.data_plane.clone(),
         };
 
         let reloader = if let Some(tls_cfg) = &self.internal_tls {
@@ -461,6 +496,8 @@ struct ConnectionContext {
     drain_state: Arc<AsyncMutex<DrainState>>,
     auto_drain: bool,
     secret_store: Arc<SecretStore>,
+    worker_senders: Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    data_plane: Arc<AsyncMutex<DataPlaneState>>,
 }
 
 async fn persist_worker_if_needed(
@@ -478,6 +515,171 @@ async fn delete_worker_if_needed(
 ) {
     if let Some(store) = topology_store {
         let _ = store.delete_worker(worker_id).await;
+    }
+}
+
+fn data_plane_failure(message: impl Into<String>) -> ControlMessage {
+    ControlMessage::OperationFailed {
+        code: rockstream_types::error_code::RS_0001.to_string(),
+        message: message.into(),
+        next_steps: "Retry after the workload and workers are ready.".to_string(),
+    }
+}
+
+fn stable_route(value: &str, shard_count: usize) -> usize {
+    let hash = value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    hash as usize % shard_count
+}
+
+async fn deploy_workload(
+    request: DeploymentRequest,
+    sender: &mpsc::Sender<ControlMessage>,
+    catalog: &TopologyCatalog,
+    shard_manager: &ShardManager,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+) {
+    let healthy = catalog.healthy_workers();
+    let workers = PlacementAlgorithm::assign_n(&healthy, healthy.len());
+    if workers.is_empty() {
+        send_message(sender, &data_plane_failure("no healthy workers available")).await;
+        return;
+    }
+
+    let senders = worker_senders.lock().await.clone();
+    if workers.iter().any(|worker| !senders.contains_key(worker)) {
+        send_message(
+            sender,
+            &data_plane_failure("not all healthy workers have an active control connection"),
+        )
+        .await;
+        return;
+    }
+
+    let mut descriptors = HashMap::new();
+    for (index, worker_id) in workers.into_iter().enumerate() {
+        let shard_id = ShardId(
+            request
+                .workload_id
+                .0
+                .wrapping_mul(16)
+                .wrapping_add(index as u64),
+        );
+        let (lease, _) = shard_manager.force_acquire(shard_id, worker_id);
+        let storage_identity = format!(
+            "{}/workload-{}/shard-{}",
+            request.storage_root, request.workload_id.0, index
+        );
+        descriptors.insert(
+            shard_id,
+            DeploymentDescriptor::new(request.clone(), lease, storage_identity),
+        );
+    }
+
+    data_plane.lock().await.deployments.insert(
+        request.workload_id,
+        DeploymentState {
+            request,
+            descriptors: descriptors.clone(),
+            outputs: HashMap::new(),
+            workers: HashMap::new(),
+            ready_shards: HashSet::new(),
+            ready_waiter: Some(sender.clone()),
+        },
+    );
+    for descriptor in descriptors.into_values() {
+        if let Some(target) = senders.get(&descriptor.shard.worker_id) {
+            send_message(
+                target,
+                &ControlMessage::ShardAssigned {
+                    lease: descriptor.shard.clone(),
+                },
+            )
+            .await;
+            send_message(target, &ControlMessage::Deploy { descriptor }).await;
+        }
+    }
+}
+
+async fn submit_source_delta(
+    request: rockstream_types::data_plane::SourceDeltaRequest,
+    sender: &mpsc::Sender<ControlMessage>,
+    worker_senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    data_plane: &Arc<AsyncMutex<DataPlaneState>>,
+) {
+    let (routing_column, operator_id, descriptors) = {
+        let state = data_plane.lock().await;
+        let Some(deployment) = state.deployments.get(&request.workload_id) else {
+            send_message(sender, &data_plane_failure("workload is not deployed")).await;
+            return;
+        };
+        let Some(column) = deployment.request.routing_columns.get(&request.source) else {
+            send_message(sender, &data_plane_failure("source has no routing column")).await;
+            return;
+        };
+        let mut descriptors: Vec<_> = deployment.descriptors.values().cloned().collect();
+        descriptors.sort_by_key(|descriptor| descriptor.shard.shard_id);
+        (*column, deployment.request.sink_operator_id, descriptors)
+    };
+
+    let mut routed: HashMap<usize, Vec<_>> = HashMap::new();
+    for row in request.rows {
+        let Some(value) = row.values_tsv.split('\t').nth(routing_column) else {
+            send_message(
+                sender,
+                &data_plane_failure("row is missing its routing field"),
+            )
+            .await;
+            return;
+        };
+        routed
+            .entry(stable_route(value, descriptors.len()))
+            .or_default()
+            .push(row);
+    }
+    if routed.is_empty() {
+        send_message(
+            sender,
+            &ControlMessage::SourceDeltaCommitted {
+                request_id: request.request_id,
+                epoch: request.epoch,
+            },
+        )
+        .await;
+        return;
+    }
+
+    data_plane.lock().await.source_waiters.insert(
+        request.request_id.clone(),
+        SourceWaiter {
+            sender: sender.clone(),
+            expected: routed.len(),
+            received: 0,
+            epoch: request.epoch,
+        },
+    );
+    let senders = worker_senders.lock().await.clone();
+    for (index, rows) in routed {
+        let descriptor = &descriptors[index];
+        let frame = RuntimeExchangeMessage {
+            version: request.version,
+            request_id: request.request_id.clone(),
+            workload_id: request.workload_id,
+            shard_id: descriptor.shard.shard_id,
+            epoch: request.epoch,
+            operator_id,
+            lease_token: descriptor.shard.lease_token,
+            source: request.source.clone(),
+            rows,
+        };
+        if let Some(target) = senders.get(&descriptor.shard.worker_id) {
+            send_message(target, &ControlMessage::Execute { frame }).await;
+        }
     }
 }
 
@@ -798,7 +1000,7 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ctx: ConnectionC
 /// Handle a single worker connection over an arbitrary stream.
 async fn handle_connection_stream<R, W>(
     reader: R,
-    mut writer: W,
+    writer: W,
     peer: SocketAddr,
     ctx: ConnectionContext,
     peer_identity: Option<NodeIdentity>,
@@ -819,7 +1021,22 @@ async fn handle_connection_stream<R, W>(
         drain_state,
         auto_drain,
         secret_store,
+        worker_senders,
+        data_plane,
     } = ctx;
+    let (sender, mut outbound) = mpsc::channel::<ControlMessage>(32);
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(message) = outbound.recv().await {
+            let Ok(mut line) = serde_json::to_string(&message) else {
+                continue;
+            };
+            line.push('\n');
+            if writer.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    });
     let mut lines = BufReader::new(reader).lines();
     let mut connected_worker_id: Option<rockstream_types::ids::WorkerId> = None;
     let mut rotation_rx = secret_store.subscribe_rotation();
@@ -872,12 +1089,16 @@ async fn handle_connection_stream<R, W>(
                             next_steps: rockstream_types::error_code::next_steps(RS_2412)
                                 .to_string(),
                         };
-                        send_message(&mut writer, &reply).await;
+                        send_message(&sender, &reply).await;
                         return;
                     }
                 }
                 let worker_id = catalog.register(&reg);
                 connected_worker_id = Some(worker_id);
+                worker_senders
+                    .lock()
+                    .await
+                    .insert(worker_id, sender.clone());
                 tracing::info!(
                     worker_id = %worker_id,
                     address = %reg.address,
@@ -907,7 +1128,187 @@ async fn handle_connection_stream<R, W>(
                     persist_worker_if_needed(topology_store.as_ref(), &worker).await;
                 }
                 let reply = ControlMessage::Registered { worker_id };
-                send_message(&mut writer, &reply).await;
+                send_message(&sender, &reply).await;
+                broadcast_message(
+                    &worker_senders,
+                    ControlMessage::TopologyChanged {
+                        workers: catalog.healthy_workers(),
+                    },
+                )
+                .await;
+            }
+            WorkerMessage::DeployWorkload(request) => {
+                deploy_workload(
+                    request,
+                    &sender,
+                    &catalog,
+                    &shard_manager,
+                    &worker_senders,
+                    &data_plane,
+                )
+                .await;
+                if let Some(store) = &shard_store {
+                    persist_shard_state(&shard_manager, store).await;
+                }
+            }
+            WorkerMessage::DeploymentReady {
+                workload_id,
+                shard_id,
+                worker_id,
+                process_id,
+                operator_ids,
+                frontier: worker_frontier,
+                ..
+            } => {
+                let reply =
+                    {
+                        let mut state = data_plane.lock().await;
+                        let Some(deployment) = state.deployments.get_mut(&workload_id) else {
+                            continue;
+                        };
+                        let valid = deployment
+                            .descriptors
+                            .get(&shard_id)
+                            .map(|descriptor| {
+                                descriptor.shard.worker_id == worker_id
+                                    && operator_ids.contains(&descriptor.sink_operator_id)
+                            })
+                            .unwrap_or(false);
+                        if !valid {
+                            None
+                        } else {
+                            deployment.ready_shards.insert(shard_id);
+                            let status = deployment.workers.entry(worker_id).or_insert(
+                                WorkerExecutionStatus {
+                                    worker_id,
+                                    process_id,
+                                    shard_ids: Vec::new(),
+                                    input_rows: 0,
+                                    output_rows: 0,
+                                    frontier: worker_frontier,
+                                    ready: true,
+                                },
+                            );
+                            status.process_id = process_id;
+                            status.frontier = status.frontier.max(worker_frontier);
+                            status.ready = true;
+                            status.shard_ids.push(shard_id);
+                            status.shard_ids.sort();
+                            status.shard_ids.dedup();
+                            if deployment.ready_shards.len() == deployment.descriptors.len() {
+                                let mut workers: Vec<_> =
+                                    deployment.workers.values().cloned().collect();
+                                workers.sort_by_key(|status| status.worker_id);
+                                deployment.ready_waiter.take().map(|waiter| {
+                                    (
+                                        waiter,
+                                        ControlMessage::DeploymentReady {
+                                            workload_id,
+                                            workers,
+                                        },
+                                    )
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                if let Some((waiter, reply)) = reply {
+                    send_message(&waiter, &reply).await;
+                }
+            }
+            WorkerMessage::SubmitSourceDelta(request) => {
+                submit_source_delta(request, &sender, &worker_senders, &data_plane).await;
+            }
+            WorkerMessage::ExecutionProgress {
+                output,
+                input_rows,
+                output_rows,
+            } => {
+                let valid = data_plane
+                    .lock()
+                    .await
+                    .deployments
+                    .get(&output.workload_id)
+                    .and_then(|deployment| deployment.descriptors.get(&output.shard_id))
+                    .map(|descriptor| {
+                        descriptor.shard.lease_token == output.lease_token
+                            && descriptor.sink_operator_id == output.operator_id
+                    })
+                    .unwrap_or(false);
+                if !valid {
+                    send_message(
+                        &sender,
+                        &data_plane_failure("execution progress has a stale fence or operator"),
+                    )
+                    .await;
+                    continue;
+                }
+                let completion = {
+                    let mut state = data_plane.lock().await;
+                    let deployment = state.deployments.get_mut(&output.workload_id).unwrap();
+                    let worker_id = deployment.descriptors[&output.shard_id].shard.worker_id;
+                    deployment
+                        .outputs
+                        .entry(output.shard_id)
+                        .or_default()
+                        .push(output.clone());
+                    if let Some(status) = deployment.workers.get_mut(&worker_id) {
+                        status.input_rows += input_rows;
+                        status.output_rows += output_rows;
+                        status.frontier = status.frontier.max(output.epoch);
+                    }
+                    let waiter = state.source_waiters.get_mut(&output.request_id);
+                    waiter.and_then(|waiter| {
+                        waiter.received += 1;
+                        (waiter.received == waiter.expected).then(|| {
+                            (
+                                waiter.sender.clone(),
+                                output.request_id.clone(),
+                                waiter.epoch,
+                            )
+                        })
+                    })
+                };
+                if let Some((waiter, request_id, epoch)) = completion {
+                    data_plane.lock().await.source_waiters.remove(&request_id);
+                    send_message(
+                        &waiter,
+                        &ControlMessage::SourceDeltaCommitted { request_id, epoch },
+                    )
+                    .await;
+                }
+            }
+            WorkerMessage::ReadWorkload { workload_id } => {
+                let snapshot = {
+                    let state = data_plane.lock().await;
+                    state.deployments.get(&workload_id).map(|deployment| {
+                        let mut shards: Vec<_> = deployment
+                            .descriptors
+                            .keys()
+                            .map(|shard_id| ShardOutput {
+                                shard_id: *shard_id,
+                                deltas: deployment
+                                    .outputs
+                                    .get(shard_id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            })
+                            .collect();
+                        shards.sort_by_key(|shard| shard.shard_id);
+                        let mut workers: Vec<_> = deployment.workers.values().cloned().collect();
+                        workers.sort_by_key(|status| status.worker_id);
+                        WorkloadSnapshot {
+                            deployment: deployment.request.clone(),
+                            shards,
+                            workers,
+                        }
+                    })
+                };
+                let reply = snapshot
+                    .map(|snapshot| ControlMessage::WorkloadSnapshot { snapshot })
+                    .unwrap_or_else(|| data_plane_failure("workload is not deployed"));
+                send_message(&sender, &reply).await;
             }
             WorkerMessage::Heartbeat {
                 worker_id,
@@ -968,13 +1369,13 @@ async fn handle_connection_stream<R, W>(
                             shard_id,
                             reason: ShardRevokeReason::WorkerDead,
                         };
-                        send_message(&mut writer, &revoke).await;
+                        send_message(&sender, &revoke).await;
                     }
                 }
                 // Notify remaining workers about topology change.
                 let workers = catalog.healthy_workers();
                 let notify = ControlMessage::TopologyChanged { workers };
-                send_message(&mut writer, &notify).await;
+                broadcast_message(&worker_senders, notify).await;
             }
             WorkerMessage::RequestShard {
                 worker_id,
@@ -993,7 +1394,7 @@ async fn handle_connection_stream<R, W>(
                         next_steps: "Wait for the drain to complete or target an active worker instead."
                             .to_string(),
                     };
-                    send_message(&mut writer, &reply).await;
+                    send_message(&sender, &reply).await;
                     continue;
                 }
                 let requested_worker = catalog.get(worker_id).expect("worker was checked above");
@@ -1036,7 +1437,7 @@ async fn handle_connection_stream<R, W>(
                         )
                         .to_string(),
                     };
-                    send_message(&mut writer, &reply).await;
+                    send_message(&sender, &reply).await;
                     continue;
                 }
                 // M7-S2 leader-only write gate: a shard lease grant is a
@@ -1061,7 +1462,7 @@ async fn handle_connection_stream<R, W>(
                         let reply = ControlMessage::NotLeader {
                             current_leader: rft.current_leader(),
                         };
-                        send_message(&mut writer, &reply).await;
+                        send_message(&sender, &reply).await;
                         continue;
                     }
                     // v0.45.2 M7-S4/S5: this node is confirmed leader — make
@@ -1099,7 +1500,7 @@ async fn handle_connection_stream<R, W>(
                             persist_shard_state(&shard_manager, store).await;
                         }
                         let reply = ControlMessage::ShardAssigned { lease };
-                        send_message(&mut writer, &reply).await;
+                        send_message(&sender, &reply).await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1134,7 +1535,7 @@ async fn handle_connection_stream<R, W>(
                     "control: fence write check"
                 );
                 let reply = ControlMessage::FenceAck { shard_id, valid };
-                send_message(&mut writer, &reply).await;
+                send_message(&sender, &reply).await;
             }
             // v0.38 drain / lifecycle messages — acknowledged but not yet
             // fully handled by the control-plane service stub.
@@ -1199,7 +1600,7 @@ async fn handle_connection_stream<R, W>(
                                 .to_string(),
                         next_steps: rockstream_types::error_code::next_steps(RS_2410).to_string(),
                     };
-                    send_message(&mut writer, &reply).await;
+                    send_message(&sender, &reply).await;
                     continue;
                 };
                 match secret_store
@@ -1207,8 +1608,7 @@ async fn handle_connection_stream<R, W>(
                     .await
                 {
                     Ok(token) => {
-                        send_message(&mut writer, &ControlMessage::SecretTokenIssued { token })
-                            .await
+                        send_message(&sender, &ControlMessage::SecretTokenIssued { token }).await
                     }
                     Err(error) => {
                         let reply = ControlMessage::OperationFailed {
@@ -1216,7 +1616,7 @@ async fn handle_connection_stream<R, W>(
                             message: error.to_string(),
                             next_steps: secret_error_next_steps(&error),
                         };
-                        send_message(&mut writer, &reply).await;
+                        send_message(&sender, &reply).await;
                     }
                 }
             }
@@ -1237,7 +1637,7 @@ async fn handle_connection_stream<R, W>(
                         term: 0,
                     }
                 };
-                send_message(&mut writer, &reply).await;
+                send_message(&sender, &reply).await;
             }
             WorkerMessage::ReportShardFrontier { shard_id, epoch } => {
                 if let Some(agg) = &frontier {
@@ -1271,13 +1671,13 @@ async fn handle_connection_stream<R, W>(
                         let reply = ControlMessage::ClusterFrontierAdvanced {
                             epoch: published.unwrap_or(0),
                         };
-                        send_message(&mut writer, &reply).await;
+                        send_message(&sender, &reply).await;
                     }
                 } else if let Some(rft) = &raft {
                     let reply = ControlMessage::NotLeader {
                         current_leader: rft.current_leader(),
                     };
-                    send_message(&mut writer, &reply).await;
+                    send_message(&sender, &reply).await;
                 }
             }
             WorkerMessage::RequestDrain { worker_id } => {
@@ -1292,18 +1692,18 @@ async fn handle_connection_stream<R, W>(
                 .await
                 {
                     Ok((state, queue_fill, queue_capacity, request)) => {
-                        send_message(&mut writer, &ControlMessage::BeginDrain(request)).await;
+                        send_message(&sender, &ControlMessage::BeginDrain(request)).await;
                         let status = ControlMessage::DrainStatus {
                             worker_id,
                             state,
                             queue_fill,
                             queue_capacity,
                         };
-                        send_message(&mut writer, &status).await;
+                        send_message(&sender, &status).await;
                     }
                     Err(err) => {
                         let reply = drain_failure_message(err);
-                        send_message(&mut writer, &reply).await;
+                        send_message(&sender, &reply).await;
                     }
                 }
             }
@@ -1315,7 +1715,7 @@ async fn handle_connection_stream<R, W>(
                 current.clone()
             };
             if let Some(rotation) = rotation {
-                send_message(&mut writer, &ControlMessage::SecretRotated { rotation }).await;
+                send_message(&sender, &ControlMessage::SecretRotated { rotation }).await;
             }
         }
 
@@ -1334,15 +1734,18 @@ async fn handle_connection_stream<R, W>(
         }
     }
 
-    // Connection dropped without explicit deregister: release all shard leases
-    // but keep the topology catalog entry (it stays until explicit Deregister).
+    // A dropped worker session is a death signal: remove it from live topology
+    // and reassign its fenced shard leases to the remaining workers.
     if let Some(worker_id) = connected_worker_id {
-        let freed = shard_manager.release_worker(worker_id);
-        if !freed.is_empty() {
+        worker_senders.lock().await.remove(&worker_id);
+        let scheduler = ShardScheduler::new(catalog.clone(), shard_manager.clone());
+        catalog.deregister(worker_id);
+        let assignments = scheduler.on_worker_dead(worker_id).unwrap_or_default();
+        if !assignments.is_empty() {
             tracing::info!(
                 %worker_id,
-                freed_shards = freed.len(),
-                "control: released shard leases on disconnect"
+                reassigned_shards = assignments.len(),
+                "control: reassigned shard leases on disconnect"
             );
             if let Some(aud) = &audit {
                 let event = AuditEvent::now(
@@ -1350,33 +1753,73 @@ async fn handle_connection_stream<R, W>(
                     "worker.shards_released_on_disconnect",
                     worker_id.to_string(),
                 )
-                .with_detail(format!("freed_shards={}", freed.len()));
+                .with_detail(format!("reassigned_shards={}", assignments.len()));
                 let _ = aud.append(&event);
             }
             if let Some(store) = &shard_store {
                 persist_shard_state(&shard_manager, store).await;
             }
         }
+        for assignment in assignments {
+            let replacement = {
+                let mut state = data_plane.lock().await;
+                state.deployments.values_mut().find_map(|deployment| {
+                    deployment
+                        .descriptors
+                        .get_mut(&assignment.lease.shard_id)
+                        .map(|descriptor| {
+                            descriptor.shard = assignment.lease.clone();
+                            deployment.ready_shards.remove(&assignment.lease.shard_id);
+                            deployment.workers.remove(&worker_id);
+                            descriptor.clone()
+                        })
+                })
+            };
+            if let Some(target) = worker_senders
+                .lock()
+                .await
+                .get(&assignment.lease.worker_id)
+                .cloned()
+            {
+                send_message(
+                    &target,
+                    &ControlMessage::ShardAssigned {
+                        lease: assignment.lease,
+                    },
+                )
+                .await;
+                if let Some(descriptor) = replacement {
+                    send_message(&target, &ControlMessage::Deploy { descriptor }).await;
+                }
+            }
+        }
+        broadcast_message(
+            &worker_senders,
+            ControlMessage::TopologyChanged {
+                workers: catalog.healthy_workers(),
+            },
+        )
+        .await;
     }
 
+    drop(sender);
+    let _ = writer_task.await;
     tracing::debug!(%peer, "control: connection closed");
 }
 
-async fn send_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &ControlMessage) {
-    match serde_json::to_string(msg) {
-        Ok(mut line) => {
-            line.push('\n');
-            if let Err(e) = writer.write_all(line.as_bytes()).await {
-                tracing::warn!(error = %e, "control: write error");
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                code = %rockstream_types::error_code::RS_0001,
-                error = %e,
-                "control: failed to serialize message"
-            );
-        }
+async fn send_message(sender: &mpsc::Sender<ControlMessage>, msg: &ControlMessage) {
+    if sender.send(msg.clone()).await.is_err() {
+        tracing::warn!("control: connection writer closed");
+    }
+}
+
+async fn broadcast_message(
+    senders: &Arc<AsyncMutex<HashMap<WorkerId, mpsc::Sender<ControlMessage>>>>,
+    message: ControlMessage,
+) {
+    let senders: Vec<_> = senders.lock().await.values().cloned().collect();
+    for sender in senders {
+        send_message(&sender, &message).await;
     }
 }
 
@@ -1403,9 +1846,18 @@ mod tests {
         let line = serde_json::to_string(msg).unwrap() + "\n";
         stream.write_all(line.as_bytes()).await.unwrap();
         let mut reader = BufReader::new(&mut *stream);
-        let mut resp = String::new();
-        reader.read_line(&mut resp).await.unwrap();
-        resp
+        loop {
+            let mut resp = String::new();
+            reader.read_line(&mut resp).await.unwrap();
+            if matches!(msg, WorkerMessage::Register(_))
+                || !matches!(
+                    serde_json::from_str(&resp),
+                    Ok(ControlMessage::TopologyChanged { .. })
+                )
+            {
+                return resp;
+            }
+        }
     }
 
     fn registration_with_location(
@@ -1451,6 +1903,7 @@ mod tests {
     #[tokio::test]
     async fn topology_catalog_updated_after_registration() {
         let (handle, catalog) = start_test_service().await;
+        let mut streams = Vec::new();
 
         for i in 1..=3u64 {
             let mut stream = TcpStream::connect(handle.addr).await.unwrap();
@@ -1466,6 +1919,8 @@ mod tests {
             let mut reader = BufReader::new(&mut stream);
             let mut resp = String::new();
             reader.read_line(&mut resp).await.unwrap();
+            drop(reader);
+            streams.push(stream);
         }
 
         // Allow async tasks to process
@@ -2023,16 +2478,25 @@ mod tests {
         // means denial" wire-protocol contract), and that node B did NOT
         // grant a conflicting lease.
         let mut reader_b = BufReader::new(&mut stream_b);
-        let mut resp2 = String::new();
-        let read_result = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            reader_b.read_line(&mut resp2),
-        )
+        let mut unexpected = None;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            loop {
+                let mut response = String::new();
+                if reader_b.read_line(&mut response).await.unwrap() == 0 {
+                    break;
+                }
+                let reply = serde_json::from_str(response.trim()).unwrap();
+                if !matches!(reply, ControlMessage::TopologyChanged { .. }) {
+                    unexpected = Some(reply);
+                    break;
+                }
+            }
+        })
         .await;
         assert!(
-            read_result.is_err(),
+            unexpected.is_none(),
             "split-brain: node B replied to worker 20's conflicting request \
-             instead of silently denying it (resp={resp2:?})"
+             instead of silently denying it (reply={unexpected:?})"
         );
         // Connection is closed (LeaseError::AlreadyLeased) — correct:
         // node B adopted node A's persisted state and knows shard 1

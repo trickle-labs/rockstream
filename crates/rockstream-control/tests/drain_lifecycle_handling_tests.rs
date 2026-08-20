@@ -40,18 +40,27 @@ async fn send(addr: std::net::SocketAddr, msg: &WorkerMessage) -> Vec<ControlMes
     responses
 }
 
-async fn register(addr: std::net::SocketAddr, worker_id: u64) {
+async fn register(addr: std::net::SocketAddr, worker_id: u64) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
     let reg = WorkerRegistration::new(
         WorkerId(worker_id),
         NodeRole::Worker,
         format!("127.0.0.1:{}", 7000 + worker_id),
         CapacityHeadroom::FULL,
     );
-    let replies = send(addr, &WorkerMessage::Register(reg)).await;
-    assert!(matches!(
-        replies.first(),
-        Some(ControlMessage::Registered { .. })
-    ));
+    let line = serde_json::to_string(&WorkerMessage::Register(reg)).unwrap() + "\n";
+    stream.write_all(line.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(&mut stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    match serde_json::from_str::<ControlMessage>(response.trim()).unwrap() {
+        ControlMessage::Registered {
+            worker_id: registered,
+        } => assert_eq!(registered, WorkerId(worker_id)),
+        other => panic!("expected exact registration response, got {other:?}"),
+    }
+    drop(reader);
+    stream
 }
 
 fn worker_lease_count(manager: &ShardManager, worker_id: WorkerId) -> usize {
@@ -73,8 +82,8 @@ async fn test_drain_ack_completes_drain_and_evicts_worker() {
         .with_migration_store(Arc::new(MigrationPersistentStore::new(store)));
     let handle = service.start("127.0.0.1:0").await.unwrap();
 
-    register(handle.addr, 1).await;
-    register(handle.addr, 2).await;
+    let _worker_1 = register(handle.addr, 1).await;
+    let _worker_2 = register(handle.addr, 2).await;
     manager.acquire(ShardId(101), WorkerId(1)).unwrap();
 
     let pool = ShuffleClientPool::default();
@@ -127,7 +136,7 @@ async fn test_lifecycle_state_update_triggers_release_and_eviction() {
     let service = ControlService::new(catalog.clone()).with_shard_manager(manager.clone());
     let handle = service.start("127.0.0.1:0").await.unwrap();
 
-    register(handle.addr, 10).await;
+    let _worker = register(handle.addr, 10).await;
     manager.acquire(ShardId(50), WorkerId(10)).unwrap();
     assert_eq!(worker_lease_count(&manager, WorkerId(10)), 1);
 
