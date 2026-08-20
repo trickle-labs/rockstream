@@ -32,8 +32,8 @@ use tokio_postgres::NoTls;
 /// Serializes the Docker-based soak tests within the same test binary.
 /// Without this, parallel container workloads inflate RSS/FD/socket baselines
 /// and cause false gate failures.
-static SOAK_SERIALIZATION_LOCK: LazyLock<std::sync::Mutex<()>> =
-    LazyLock::new(|| std::sync::Mutex::new(()));
+static SOAK_SERIALIZATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 const IMAGE_NAME: &str = "rockstream-tc-test";
 const IMAGE_TAG: &str = "latest";
@@ -601,24 +601,18 @@ async fn run_soak(inject_teardown_leak: bool, use_minio: bool) {
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_lfs_churn_is_flat() {
-    let _lock = SOAK_SERIALIZATION_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = SOAK_SERIALIZATION_LOCK.lock().await;
     run_soak(false, false).await;
 }
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_minio_churn_is_flat() {
-    let _lock = SOAK_SERIALIZATION_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = SOAK_SERIALIZATION_LOCK.lock().await;
     run_soak(false, true).await;
 }
 
 #[tokio::test]
 async fn resource_leak_soak_real_binary_injected_teardown_deregistration_leak_fails_gate() {
-    let _lock = SOAK_SERIALIZATION_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = SOAK_SERIALIZATION_LOCK.lock().await;
     run_soak(true, false).await;
 }
