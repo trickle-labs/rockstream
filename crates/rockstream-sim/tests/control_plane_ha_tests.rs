@@ -511,6 +511,7 @@ mod tc {
         /// poll, not just the final one).
         pub async fn wait_for_single_leader(&self, timeout: Duration) -> (usize, u64) {
             let deadline = Instant::now() + timeout;
+            let mut stable_leader = None;
             loop {
                 let mut statuses = Vec::new();
                 for node in &self.nodes {
@@ -532,7 +533,12 @@ mod tc {
                         Some((_, _, term)) => term,
                         None => unreachable!(),
                     };
-                    return (idx, term);
+                    if stable_leader == Some((idx, term)) {
+                        return (idx, term);
+                    }
+                    stable_leader = Some((idx, term));
+                } else {
+                    stable_leader = None;
                 }
                 if Instant::now() > deadline {
                     if std::env::var("RS_TC_DEBUG").is_ok() {
