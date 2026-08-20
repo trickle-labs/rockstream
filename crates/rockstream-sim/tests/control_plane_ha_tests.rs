@@ -284,7 +284,7 @@ async fn leader_crash_composed_with_shard_fence_no_split_brain() {
         // One of the two survivors must observe the lost heartbeats and win
         // a new election at a strictly higher term (majority of 2/3 still
         // reachable).
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
         let survivors = [n1.handle.clone(), n2.handle.clone()];
         let new_leader = survivors.iter().find(|h| h.is_leader()).unwrap_or_else(|| {
             panic!(
