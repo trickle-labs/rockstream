@@ -83,3 +83,28 @@ impl EpochOutput {
         self.batches.iter().map(|b| b.num_rows()).sum()
     }
 }
+
+/// Delta-native result produced by a stateful operator for one epoch.
+#[derive(Debug)]
+pub struct OperatorEpochResult {
+    /// Output Z-set delta batch.
+    pub output_delta: ArrowZSet,
+    /// Exact state mutations (Puts, Merges, Deletes) generated in this epoch.
+    pub state_mutations: Vec<rockstream_types::state_mutation::StateMutation>,
+    /// Hot-path metrics for this operator execution.
+    pub metrics: rockstream_types::state_mutation::OperatorEpochMetrics,
+}
+
+impl OperatorEpochResult {
+    pub fn new(
+        output_delta: ArrowZSet,
+        state_mutations: Vec<rockstream_types::state_mutation::StateMutation>,
+        metrics: rockstream_types::state_mutation::OperatorEpochMetrics,
+    ) -> Self {
+        Self {
+            output_delta,
+            state_mutations,
+            metrics,
+        }
+    }
+}

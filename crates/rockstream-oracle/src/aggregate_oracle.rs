@@ -33,7 +33,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rockstream_ops::aggregate::AggregateOp;
-use rockstream_ops::op::Operator;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::ids::OperatorId;
 use rockstream_types::laws::sum_count::avg_from_sum_count;

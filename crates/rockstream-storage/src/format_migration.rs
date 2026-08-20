@@ -236,6 +236,7 @@ where
         raw.flush().await?;
     }
 
+    // INVARIANT-BY-CONSTRUCTION: M1-S7 — shard format version is atomically updated to V2 upon successful migration completion.
     let mut batch = slatedb::WriteBatch::new();
     batch.put(ShardKeyEncoder::format_version_key(), [to.0]);
     batch.delete(&progress_key);

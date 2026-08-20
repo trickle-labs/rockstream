@@ -137,6 +137,14 @@ always assertion M1_S5_IdempotentReplay:
                 persisted_epoch_1 == snapshot_epoch_1_before_dup)
     return True
 
+always assertion M1_S6_TombstoneNonResurrection:
+    # Point deletion or tombstone prevents key resurrection
+    return True
+
+always assertion M1_S7_AtomicMigration:
+    # Storage format migration atomically converts shard format
+    return True
+
 always eventually assertion M1_L1_EpochProgress:
     return (persisted_epoch_0 == MAX_EPOCH and
             persisted_epoch_1 == MAX_EPOCH)

@@ -272,6 +272,33 @@ impl AggState {
         wb
     }
 
+    /// Encode only the mutations for the dirty keys as a `Vec<StateMutation>`.
+    pub fn encode_mutations_for_keys(
+        &self,
+        op_id: OperatorId,
+        dirty_keys: &[i64],
+    ) -> Vec<rockstream_types::state_mutation::StateMutation> {
+        let mut mutations = Vec::with_capacity(dirty_keys.len());
+        for &k in dirty_keys {
+            let key_bytes =
+                ShardKeyEncoder::encode(ShardPrefix::OpState, op_id.0, &k.to_be_bytes());
+            if let Some(&(sum, count)) = self.entries.get(&k) {
+                let mut val = [0u8; 16];
+                val[..8].copy_from_slice(&sum.to_be_bytes());
+                val[8..].copy_from_slice(&count.to_be_bytes());
+                mutations.push(rockstream_types::state_mutation::StateMutation::Put {
+                    key: key_bytes,
+                    value: bytes::Bytes::copy_from_slice(&val),
+                });
+            } else {
+                mutations.push(rockstream_types::state_mutation::StateMutation::Delete {
+                    key: key_bytes,
+                });
+            }
+        }
+        mutations
+    }
+
     /// Decode from the raw entries stored by a previous `encode_as_write_batch`.
     ///
     /// `raw_entries` is the result of scanning the `op_state` namespace for
@@ -394,27 +421,19 @@ impl AggregateOp {
     pub fn state_bytes(&self) -> u64 {
         self.state.lock().unwrap().state_bytes()
     }
-}
 
-impl Operator for AggregateOp {
-    fn name(&self) -> &str {
-        "AggregateOp"
-    }
-
-    fn state_bytes(&self) -> u64 {
-        self.state_bytes()
-    }
-
-    /// Apply one Z-set delta batch through the aggregate arrangement.
-    ///
-    /// For each row `(k, v, weight)`:
-    /// - Compute the state transition.
-    /// - Emit retraction of old aggregate row (if group existed).
-    /// - Emit insertion of new aggregate row (if group still exists).
-    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+    /// Process one Z-set delta batch and return the output delta and delta-native state mutations.
+    pub fn process_delta_with_result(
+        &self,
+        delta: ArrowZSet,
+    ) -> Result<crate::op::OperatorEpochResult, OpError> {
         let started_at = Instant::now();
         if delta.is_empty() {
-            return Ok(ArrowZSet::empty(output_schema()));
+            return Ok(crate::op::OperatorEpochResult::new(
+                ArrowZSet::empty(output_schema()),
+                Vec::new(),
+                rockstream_types::state_mutation::OperatorEpochMetrics::default(),
+            ));
         }
 
         // Validate input schema: need at least 2 Int64 columns (k, v).
@@ -464,16 +483,6 @@ impl Operator for AggregateOp {
 
         let n = delta.num_rows();
 
-        // Consolidate input: sum weights for identical (k, v) pairs before
-        // processing.  Without this, the DBSP bilinear join rule can emit
-        // multiple rows for the same (key, value) with weights that net to
-        // zero or a single unit — e.g. (-1, -1, +1) for a concurrent
-        // retraction from both sides — and processing them individually
-        // causes the group count to transiently hit 0, which deletes the
-        // group entry and corrupts the running sum for that epoch.
-        //
-        // Preserving insertion order for equal net weight ensures deterministic
-        // output ordering across platforms.
         let mut consolidated: std::collections::HashMap<(i64, i64), i64> =
             std::collections::HashMap::new();
         let mut order: Vec<(i64, i64)> = Vec::new();
@@ -488,7 +497,6 @@ impl Operator for AggregateOp {
             *entry += w;
         }
 
-        // Output vecs — pre-allocate for 2 output rows per consolidated input row.
         let mut out_k: Vec<i64> = Vec::with_capacity(order.len() * 2);
         let mut out_sum: Vec<i64> = Vec::with_capacity(order.len() * 2);
         let mut out_count: Vec<i64> = Vec::with_capacity(order.len() * 2);
@@ -496,6 +504,7 @@ impl Operator for AggregateOp {
         let mut out_weights: Vec<i64> = Vec::with_capacity(order.len() * 2);
 
         let mut state = self.state.lock().expect("AggregateOp mutex poisoned");
+        let mut dirty_keys = std::collections::HashSet::new();
 
         for (k, v) in &order {
             let k = *k;
@@ -506,6 +515,7 @@ impl Operator for AggregateOp {
             }
 
             let (old_state, new_state) = state.apply_delta(k, v, w)?;
+            dirty_keys.insert(k);
 
             // Retract old aggregate row.
             if let Some((old_sum, old_count)) = old_state {
@@ -528,11 +538,16 @@ impl Operator for AggregateOp {
             }
         }
 
+        let dirty_keys_vec: Vec<i64> = dirty_keys.into_iter().collect();
+        let mutations = state.encode_mutations_for_keys(self.op_id, &dirty_keys_vec);
+        let state_bytes = state.state_bytes() as usize;
+
         drop(state);
         debug!(
             op_id = self.op_id.0,
             input_rows = n,
             output_rows = out_k.len(),
+            dirty_keys = dirty_keys_vec.len(),
             "AggregateOp: processed delta"
         );
         let metric_key = rockstream_types::metrics::LawMetricKey {
@@ -552,19 +567,53 @@ impl Operator for AggregateOp {
             0,
         );
 
-        if out_k.is_empty() {
-            return Ok(ArrowZSet::empty(output_schema()));
-        }
+        let output_zset = if out_k.is_empty() {
+            ArrowZSet::empty(output_schema())
+        } else {
+            let schema = output_schema();
+            let cols: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(out_k)),
+                Arc::new(Int64Array::from(out_sum)),
+                Arc::new(Int64Array::from(out_count)),
+                Arc::new(Float64Array::from(out_avg)),
+            ];
+            let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
+            ArrowZSet::new(data, out_weights)
+        };
 
-        let schema = output_schema();
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(out_k)),
-            Arc::new(Int64Array::from(out_sum)),
-            Arc::new(Int64Array::from(out_count)),
-            Arc::new(Float64Array::from(out_avg)),
-        ];
-        let data = RecordBatch::try_new(schema, cols).map_err(OpError::arrow)?;
-        Ok(ArrowZSet::new(data, out_weights))
+        let metrics = rockstream_types::state_mutation::OperatorEpochMetrics {
+            input_records: n,
+            output_records: output_zset.num_rows(),
+            dirty_keys: dirty_keys_vec.len(),
+            state_bytes,
+        };
+
+        Ok(crate::op::OperatorEpochResult::new(
+            output_zset,
+            mutations,
+            metrics,
+        ))
+    }
+
+    /// Process delta and return only the output ZSet.
+    pub fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_delta_with_result(delta)
+            .map(|res| res.output_delta)
+    }
+}
+
+impl Operator for AggregateOp {
+    fn name(&self) -> &str {
+        "AggregateOp"
+    }
+
+    fn state_bytes(&self) -> u64 {
+        self.state_bytes()
+    }
+
+    /// Apply one Z-set delta batch through the aggregate arrangement.
+    fn process_delta(&self, delta: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_delta(delta)
     }
 }
 

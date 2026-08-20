@@ -29,6 +29,7 @@ pub use keys::{
 };
 pub use merge_registry::{MergeOperatorRegistry, SumCountMergeOperator};
 pub use reader::ShardReader;
+pub use rockstream_types::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 pub use shard_db::{
     is_allow_law_operand_fallback, set_allow_law_operand_fallback, BatchOp, CheckpointHandle,
     PartialAggSpec, ShardDb, WriteBatch,

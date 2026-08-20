@@ -36,6 +36,7 @@ pub mod schema_evolution;
 pub mod secret;
 pub mod sink;
 pub mod state_budget;
+pub mod state_mutation;
 pub mod tiering;
 pub mod topology;
 pub mod view_lifecycle;
@@ -49,6 +50,7 @@ pub use evidence_manifest::{
     EvidenceIntegrityError, EvidenceManifest, RunnerEnvironment, SummaryMetric, TestSuiteResult,
     WorkflowRunInfo,
 };
+pub use state_mutation::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 
 /// Timestamp types.
 pub mod timestamp {

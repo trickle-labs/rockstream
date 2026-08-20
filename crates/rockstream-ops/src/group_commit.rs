@@ -89,6 +89,39 @@ impl GroupCommit {
         Ok(())
     }
 
+    /// Convert state mutations directly into a `WriteBatch` and add to the pending queue.
+    pub fn add_mutations(
+        &self,
+        mutations: Vec<rockstream_types::state_mutation::StateMutation>,
+    ) -> Result<(), OpError> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let mut wb = WriteBatch::new();
+        for mutation in mutations {
+            match mutation {
+                rockstream_types::state_mutation::StateMutation::Put { key, value } => {
+                    wb.put(&key, &value);
+                }
+                rockstream_types::state_mutation::StateMutation::Delete { key } => {
+                    wb.delete(&key);
+                }
+                rockstream_types::state_mutation::StateMutation::Merge { key, operand, .. } => {
+                    wb.merge(&key, &operand);
+                }
+            }
+        }
+        self.add_batch(wb)
+    }
+
+    /// Add an `EpochStateDelta` to the pending group commit.
+    pub fn add_epoch_delta(
+        &self,
+        delta: rockstream_types::state_mutation::EpochStateDelta,
+    ) -> Result<(), OpError> {
+        self.add_mutations(delta.mutations)
+    }
+
     /// Flush: merge all pending batches into one and commit atomically.
     ///
     /// Returns the number of individual batches that were merged (0 if

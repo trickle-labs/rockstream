@@ -29,6 +29,7 @@ fn all_role_opts(storage: &Path, listen_addr: &str) -> StartOptions {
         raft_bind: None,
         raft_bootstrap: false,
         daemon: false,
+        worker_id: None,
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: Vec::new(),

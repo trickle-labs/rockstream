@@ -25,7 +25,6 @@ use arrow::record_batch::RecordBatch;
 
 use rockstream_ops::aggregate::AggregateOp;
 use rockstream_ops::join::JoinOp;
-use rockstream_ops::op::Operator;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::ids::OperatorId;
 

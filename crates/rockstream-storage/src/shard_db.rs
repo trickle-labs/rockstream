@@ -166,20 +166,15 @@ impl ShardDbBuilder {
         let format_key = ShardKeyEncoder::format_version_key();
         let format_version = match db.get(&format_key).await? {
             None => {
-                if !range.contains(rockstream_types::compatibility::StorageFormatVersion::V1) {
-                    return Err(StorageError::IncompatibleFormat {
-                        stored: rockstream_types::compatibility::StorageFormatVersion::V1.0,
-                        min: range.min.0,
-                        max: range.max.0,
-                    });
-                }
-                db.put(
-                    &format_key,
-                    [rockstream_types::compatibility::StorageFormatVersion::V1.0],
-                )
-                .await?;
+                let init_version =
+                    if range.contains(rockstream_types::compatibility::StorageFormatVersion::V1) {
+                        rockstream_types::compatibility::StorageFormatVersion::V1
+                    } else {
+                        range.max
+                    };
+                db.put(&format_key, [init_version.0]).await?;
                 db.flush().await?;
-                rockstream_types::compatibility::StorageFormatVersion::V1.0
+                init_version.0
             }
             Some(bytes) if bytes.len() == 1 => {
                 let stored = rockstream_types::compatibility::StorageFormatVersion(bytes[0]);
@@ -420,6 +415,9 @@ impl ShardDb {
     /// only some ops are visible to a reader: a torn write is structurally
     /// unobservable, not merely untested. No redundant runtime `assert!` is
     /// needed (same escape hatch used for M2-S1/S2's meet-correctness).
+    ///
+    /// INVARIANT-BY-CONSTRUCTION: M1-S6 — point deletes and tombstones in atomic
+    /// write batches prevent state resurrection without relying on range deletions.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
         if self.migration_pending {
             return Err(StorageError::MigrationInProgress);

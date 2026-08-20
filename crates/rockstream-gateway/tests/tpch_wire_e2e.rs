@@ -40,7 +40,6 @@ use rockstream_gateway::{
 };
 use rockstream_ops::aggregate::AggregateOp;
 use rockstream_ops::join::JoinOp;
-use rockstream_ops::op::Operator;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_oracle::tpch_gen;
 use rockstream_storage::{ShardDb, ShardReader};

@@ -70,7 +70,13 @@ impl MergeOperator for SumCountMergeOperator {
                 }
                 let a = i64::from_be_bytes(existing[1..9].try_into().unwrap());
                 let b = i64::from_be_bytes(value[1..9].try_into().unwrap());
-                let result = a.wrapping_add(b);
+                let res_128 = (a as i128) + (b as i128);
+                if res_128 < (i64::MIN as i128) || res_128 > (i64::MAX as i128) {
+                    return Err(MergeOperatorError::Callback {
+                        message: "RS-1002: arithmetic overflow during merge".into(),
+                    });
+                }
+                let result = res_128 as i64;
                 let mut out = Vec::with_capacity(9);
                 out.push(MergeTag::Sum as u8);
                 out.extend_from_slice(&result.to_be_bytes());
@@ -84,7 +90,11 @@ impl MergeOperator for SumCountMergeOperator {
                 }
                 let a = u64::from_be_bytes(existing[1..9].try_into().unwrap());
                 let b = u64::from_be_bytes(value[1..9].try_into().unwrap());
-                let result = a.wrapping_add(b);
+                let result = a
+                    .checked_add(b)
+                    .ok_or_else(|| MergeOperatorError::Callback {
+                        message: "RS-1002: arithmetic overflow during merge".into(),
+                    })?;
                 let mut out = Vec::with_capacity(9);
                 out.push(MergeTag::Count as u8);
                 out.extend_from_slice(&result.to_be_bytes());
@@ -126,7 +136,11 @@ impl MergeOperator for SumCountMergeOperator {
                 }
                 let a = i64::from_be_bytes(existing[1..9].try_into().unwrap());
                 let b = i64::from_be_bytes(value[1..9].try_into().unwrap());
-                let result = a.wrapping_add(b);
+                let result = a
+                    .checked_add(b)
+                    .ok_or_else(|| MergeOperatorError::Callback {
+                        message: "RS-1002: arithmetic overflow during merge".into(),
+                    })?;
                 let mut out = Vec::with_capacity(9);
                 out.push(MergeTag::PNCounter as u8);
                 out.extend_from_slice(&result.to_be_bytes());
@@ -158,9 +172,9 @@ impl MergeOperator for SumCountMergeOperator {
                 Ok(Bytes::from(out))
             }
             _ => {
-                // Fail-closed: unknown tag (RS-3009).
+                // Fail-closed: unknown tag (RS-5002 / RS-3009).
                 Err(MergeOperatorError::Callback {
-                    message: "RS-3009: unknown merge tag byte".into(),
+                    message: "RS-5002: unknown merge law tag byte".into(),
                 })
             }
         }

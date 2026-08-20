@@ -120,6 +120,10 @@ pub enum Command {
         #[arg(long)]
         host_id: Option<String>,
 
+        /// Explicit worker ID advertised during worker registration.
+        #[arg(long)]
+        worker_id: Option<u64>,
+
         /// Availability zone advertised during worker registration.
         #[arg(long)]
         availability_zone: Option<String>,

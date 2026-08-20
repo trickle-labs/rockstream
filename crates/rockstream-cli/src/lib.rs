@@ -135,6 +135,8 @@ pub struct StartOptions {
     /// cluster, where every node's process must stay alive to serve peers
     /// and workers.
     pub daemon: bool,
+    /// Explicit worker ID advertised during worker registration.
+    pub worker_id: Option<u64>,
     /// v0.45.2 M7 S4: override the address the `control` role's
     /// worker-facing `ControlService` binds to. Defaults to
     /// `127.0.0.1:8000` when `None` (the pre-v0.45.2 convention).
@@ -164,6 +166,31 @@ pub struct StartOptions {
     /// path as the local gateway shard (normally `db`). The gateway refreshes
     /// all of them and accepts a query only at a common durable frontier.
     pub query_time_shard_dirs: Vec<PathBuf>,
+}
+
+impl Default for StartOptions {
+    fn default() -> Self {
+        Self {
+            storage: PathBuf::from("data"),
+            role: "all".to_string(),
+            control: None,
+            auth_mode: "off".to_string(),
+            worker_location: WorkerLocation::default(),
+            worker_capabilities: WorkerCapabilities::default(),
+            config: RockstreamConfig::default(),
+            metrics_addr: None,
+            listen_addr: None,
+            raft_peers: None,
+            raft_node_id: None,
+            raft_bind: None,
+            raft_bootstrap: false,
+            daemon: false,
+            worker_id: None,
+            control_bind: None,
+            control_shared_storage: None,
+            query_time_shard_dirs: Vec::new(),
+        }
+    }
 }
 
 /// The result of a successful `rockstream start` no-op run.
@@ -718,11 +745,12 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
 
         if opts.role == "worker" || opts.role == "all" {
             let url = control_url.as_deref().unwrap_or("127.0.0.1:8000");
+            let proposed_worker_id = opts.worker_id.unwrap_or(1);
             let mut worker = None;
             let mut last_error = None;
             for _ in 0..20 {
                 match rockstream_runtime::start_worker_client_with_metadata(
-                    1,
+                    proposed_worker_id,
                     url,
                     &opts.storage,
                     opts.worker_location.clone(),
@@ -877,27 +905,34 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             // real multi-process control-plane cluster stay up long enough
             // for peers/workers to reach it. Every other combination keeps
             // the pre-v0.45.2 short-sleep-then-exit behavior unchanged.
-            let daemon_mode = opts.daemon && opts.role == "control";
+            let daemon_mode = (opts.daemon && opts.role == "control") || opts.role == "worker" || opts.daemon;
             if daemon_mode {
-                tracing::info!(
-                    role = %opts.role,
-                    "control node running in daemon mode — blocking until shutdown signal"
-                );
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut sigterm = signal(SignalKind::terminate())
-                        .unwrap_or_else(|_| panic!("failed to install SIGTERM handler"));
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = sigterm.recv() => {}
+                let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok());
+                if let Some(sleep_ms) = e2e_sleep {
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                } else {
+                    tracing::info!(
+                        role = %opts.role,
+                        "node running in daemon mode — blocking until shutdown signal"
+                    );
+                    #[cfg(unix)]
+                    {
+                        use tokio::signal::unix::{signal, SignalKind};
+                        let mut sigterm = signal(SignalKind::terminate())
+                            .unwrap_or_else(|_| panic!("failed to install SIGTERM handler"));
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {}
+                            _ = sigterm.recv() => {}
+                        }
                     }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
+                    tracing::info!("shutdown signal received — stopping daemon");
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-                tracing::info!("shutdown signal received — stopping control daemon");
             } else {
                 // Allow live interactions to complete, then exit cleanly.
                 let sleep_ms = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
@@ -2242,6 +2277,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "all".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "invalid".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2275,6 +2311,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let err = run_start(&StartOptions {
                 storage: dir.path().to_path_buf(), role: "all".to_string(), control: None,
+                worker_id: None,
                 auth_mode: "off".to_string(), worker_location: WorkerLocation::default(),
                 worker_capabilities: WorkerCapabilities::default(), config, metrics_addr: None,
                 listen_addr: None, raft_peers: None, raft_node_id: None, raft_bind: None,
@@ -2292,6 +2329,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "gateway".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2370,6 +2408,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "all".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2420,6 +2459,7 @@ mod tests {
             storage: nested.clone(),
             role: "all".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2446,6 +2486,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "worker".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2474,6 +2515,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "gateway".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2502,6 +2544,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "frontier".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2550,6 +2593,7 @@ mod tests {
                 storage: dir.path().to_path_buf(),
                 role: "control".to_string(),
                 control: None,
+                worker_id: None,
                 auth_mode: "off".to_string(),
                 worker_location: WorkerLocation::default(),
                 worker_capabilities: WorkerCapabilities::default(),
@@ -2577,6 +2621,7 @@ mod tests {
                 storage: dir.path().to_path_buf(),
                 role: "control".to_string(),
                 control: None,
+                worker_id: None,
                 auth_mode: "off".to_string(),
                 worker_location: WorkerLocation::default(),
                 worker_capabilities: WorkerCapabilities::default(),
@@ -2607,6 +2652,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "control".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),
@@ -2636,6 +2682,7 @@ mod tests {
             storage: dir.path().to_path_buf(),
             role: "control".to_string(),
             control: None,
+            worker_id: None,
             auth_mode: "off".to_string(),
             worker_location: WorkerLocation::default(),
             worker_capabilities: WorkerCapabilities::default(),

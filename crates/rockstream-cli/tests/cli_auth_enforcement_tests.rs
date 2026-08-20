@@ -23,6 +23,7 @@ fn test_options(storage: PathBuf, auth_mode: &str, listen: Option<String>) -> St
         raft_bind: None,
         raft_bootstrap: false,
         daemon: false,
+        worker_id: None,
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: Vec::new(),

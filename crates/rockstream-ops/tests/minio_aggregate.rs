@@ -15,7 +15,6 @@ use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use rockstream_ops::aggregate::{load_frontier, persist_agg_state, persist_frontier, AggregateOp};
 use rockstream_ops::group_commit::GroupCommit;
-use rockstream_ops::op::Operator;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_storage::{ShardDb, WriteBatch};
 use rockstream_types::ids::OperatorId;

@@ -5372,6 +5372,8 @@ dependencies = [
  "rcgen",
  "rockstream-types",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

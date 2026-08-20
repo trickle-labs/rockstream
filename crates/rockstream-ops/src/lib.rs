@@ -74,7 +74,7 @@ pub use live_exec::{
 };
 pub use map::MapOp;
 pub use minmax::{persist_minmax_state, MinMaxKind, MinMaxOp, MinMaxState};
-pub use op::{EpochOutput, Operator};
+pub use op::{EpochOutput, Operator, OperatorEpochResult};
 pub use outer_join::OuterJoinOp;
 pub use pipeline::{LinearPipeline, StageTimestampTracker};
 pub use project::ProjectOp;
