@@ -78,6 +78,7 @@ pub struct StorageFormatVersion(pub u8);
 impl StorageFormatVersion {
     pub const V1: Self = Self(1);
     pub const V2: Self = Self(2);
+    pub const V3: Self = Self(3);
 }
 
 impl From<u8> for StorageFormatVersion {
@@ -114,6 +115,18 @@ impl SupportedStorageFormatRange {
 
     pub const fn v2_only() -> Self {
         Self::new(StorageFormatVersion::V2, StorageFormatVersion::V2)
+    }
+
+    pub const fn v2_through_v3() -> Self {
+        Self::new(StorageFormatVersion::V2, StorageFormatVersion::V3)
+    }
+
+    pub const fn v3_only() -> Self {
+        Self::new(StorageFormatVersion::V3, StorageFormatVersion::V3)
+    }
+
+    pub const fn v1_through_v3() -> Self {
+        Self::new(StorageFormatVersion::V1, StorageFormatVersion::V3)
     }
 
     pub fn contains(self, version: StorageFormatVersion) -> bool {

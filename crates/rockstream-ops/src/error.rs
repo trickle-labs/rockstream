@@ -141,9 +141,20 @@ pub enum OpError {
         detail: String,
         code: ErrorCode,
     },
+
+    /// Internal error.
+    #[error("[{code}] Internal error: {detail}; next_steps: report this issue")]
+    Internal { detail: String, code: ErrorCode },
 }
 
 impl OpError {
+    pub fn internal(detail: impl Into<String>) -> Self {
+        Self::Internal {
+            detail: detail.into(),
+            code: RS_0001,
+        }
+    }
+
     pub fn arrow(source: arrow::error::ArrowError) -> Self {
         Self::Arrow {
             source,

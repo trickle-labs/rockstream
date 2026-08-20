@@ -336,6 +336,34 @@ impl ExplainRow {
     }
 }
 
+/// Arrangement sharing facts for EXPLAIN INCREMENTAL and SHOW VIEW STATUS (v0.59.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArrangementSharingInfo {
+    pub arrangement_id: Option<crate::ids::ArrangementId>,
+    pub consumer_count: usize,
+    pub shared_state_bytes: u64,
+    pub bytes_saved_by_sharing: u64,
+    pub compaction_frontier: u64,
+}
+
+impl ArrangementSharingInfo {
+    pub fn new(
+        arrangement_id: Option<crate::ids::ArrangementId>,
+        consumer_count: usize,
+        shared_state_bytes: u64,
+        bytes_saved_by_sharing: u64,
+        compaction_frontier: u64,
+    ) -> Self {
+        Self {
+            arrangement_id,
+            consumer_count,
+            shared_state_bytes,
+            bytes_saved_by_sharing,
+            compaction_frontier,
+        }
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

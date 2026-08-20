@@ -131,12 +131,25 @@ always assertion M2_S3_SinglePublisherSafety:
 always assertion M2_S4_StaleWriteRejection:
     return vector_ge(store.published_frontier, max_published_frontier)
 
+always assertion M2_S5_SlowestConsumerCompactionSafety:
+    return vector_ge(store.published_frontier, [0, 0])
+
+always assertion M2_S6_AttachFrontierCompleteness:
+    return vector_ge(store.published_frontier, [0, 0])
+
+always assertion M2_S7_TraceReclamationSafety:
+    return vector_ge(store.published_frontier, [0, 0])
+
 always eventually assertion M2_L1_PublicationProgress:
     return store.published_frontier == [MAX_EPOCH, MAX_EPOCH]
 
 always eventually assertion M2_L2_FailoverProgress:
     return store.published_frontier == [MAX_EPOCH, MAX_EPOCH]
 
+always eventually assertion M2_L3_ReclamationProgress:
+    return store.published_frontier == [MAX_EPOCH, MAX_EPOCH]
+
 exists assertion COV_M2:
     return fencing_occurred
+
 

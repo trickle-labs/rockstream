@@ -61,10 +61,13 @@ pub async fn migrate_storage_format(
     from: StorageFormatVersion,
     to: StorageFormatVersion,
 ) -> Result<Vec<FormatMigrationReport>, StorageError> {
-    if (from, to) != (StorageFormatVersion::V1, StorageFormatVersion::V2) {
-        return Err(StorageError::Unsupported(
-            "RS-0002: only storage format migration 1→2 is supported".to_string(),
-        ));
+    let valid_step = (from, to) == (StorageFormatVersion::V1, StorageFormatVersion::V2)
+        || (from, to) == (StorageFormatVersion::V2, StorageFormatVersion::V3)
+        || (from, to) == (StorageFormatVersion::V1, StorageFormatVersion::V3);
+    if !valid_step {
+        return Err(StorageError::Unsupported(format!(
+            "RS-0002: storage format migration {from}→{to} is not supported"
+        )));
     }
     let store =
         crate::build_migration_object_store(storage_url).map_err(StorageError::Unsupported)?;
@@ -119,6 +122,32 @@ pub(crate) fn logical_key_from_format_v2(key: &[u8]) -> Option<&[u8]> {
     key.strip_prefix(V2_KEY_MAGIC)
 }
 
+const V3_KEY_MAGIC: &[u8] = b"\xffV3";
+
+pub(crate) fn format_v3_key(key: &[u8]) -> Vec<u8> {
+    let raw = if let Some(stripped) = logical_key_from_format_v2(key) {
+        stripped
+    } else {
+        key
+    };
+    let mut encoded = Vec::with_capacity(V3_KEY_MAGIC.len() + raw.len());
+    encoded.extend_from_slice(V3_KEY_MAGIC);
+    encoded.extend_from_slice(raw);
+    encoded
+}
+
+pub(crate) fn is_format_v3_key(key: &[u8]) -> bool {
+    key.starts_with(V3_KEY_MAGIC)
+}
+
+pub(crate) fn format_v3_prefix(prefix: &[u8]) -> Vec<u8> {
+    format_v3_key(prefix)
+}
+
+pub(crate) fn logical_key_from_format_v3(key: &[u8]) -> Option<&[u8]> {
+    key.strip_prefix(V3_KEY_MAGIC)
+}
+
 pub(crate) fn migration_progress_key(
     from: StorageFormatVersion,
     to: StorageFormatVersion,
@@ -137,7 +166,7 @@ pub(crate) fn is_data_key(key: &[u8]) -> bool {
     key.first().copied() != Some(ShardPrefix::ShardMeta.as_byte())
 }
 
-/// Migrate one shard using the synthetic, real 1→2 layout transform.
+/// Migrate one shard using the synthetic, real 1→2 or 2→3 layout transform.
 pub async fn migrate_shard_format<F, T>(
     path: impl Into<String>,
     object_store: Arc<dyn ObjectStore>,
@@ -167,14 +196,64 @@ where
     let path = path.into();
     let from = from.into();
     let to = to.into();
-    if (from, to) != (StorageFormatVersion::V1, StorageFormatVersion::V2) {
+    let valid_step = (from, to) == (StorageFormatVersion::V1, StorageFormatVersion::V2)
+        || (from, to) == (StorageFormatVersion::V2, StorageFormatVersion::V3)
+        || (from, to) == (StorageFormatVersion::V1, StorageFormatVersion::V3);
+    if !valid_step {
         return Err(StorageError::Unsupported(format!(
-            "RS-0002: only storage format migration 1→2 is supported (requested {from}→{to})"
+            "RS-0002: only storage format migrations 1→2, 2→3, and 1→3 are supported (requested {from}→{to})"
         )));
     }
 
+    if (from, to) == (StorageFormatVersion::V1, StorageFormatVersion::V3) {
+        let r1 = migrate_shard_format_single_step(
+            path.clone(),
+            object_store.clone(),
+            StorageFormatVersion::V1,
+            StorageFormatVersion::V2,
+            options,
+        )
+        .await?;
+        let r2 = migrate_shard_format_single_step(
+            path.clone(),
+            object_store,
+            StorageFormatVersion::V2,
+            StorageFormatVersion::V3,
+            options,
+        )
+        .await?;
+        return Ok(FormatMigrationReport {
+            path,
+            from,
+            to,
+            objects_migrated: r1.objects_migrated + r2.objects_migrated,
+            already_complete: r1.already_complete && r2.already_complete,
+            max_objects_in_flight: r1.max_objects_in_flight.max(r2.max_objects_in_flight),
+        });
+    }
+
+    migrate_shard_format_single_step(path, object_store, from, to, options).await
+}
+
+async fn migrate_shard_format_single_step(
+    path: String,
+    object_store: Arc<dyn ObjectStore>,
+    from: StorageFormatVersion,
+    to: StorageFormatVersion,
+    options: MigrationOptions,
+) -> Result<FormatMigrationReport, StorageError> {
+    let supported_range = match (from, to) {
+        (StorageFormatVersion::V1, StorageFormatVersion::V2) => {
+            SupportedStorageFormatRange::v1_through_v2()
+        }
+        (StorageFormatVersion::V2, StorageFormatVersion::V3) => {
+            SupportedStorageFormatRange::v2_through_v3()
+        }
+        _ => SupportedStorageFormatRange::v1_through_v3(),
+    };
+
     let db = ShardDb::builder(path.clone(), object_store)
-        .with_supported_format_range(SupportedStorageFormatRange::v1_through_v2())
+        .with_supported_format_range(supported_range)
         .build()
         .await?;
     let raw = db.raw_db();
@@ -204,7 +283,13 @@ where
     let mut processed = 0usize;
     let mut iter = raw.scan::<&[u8], _>(..).await?;
     while let Some(entry) = iter.next().await? {
-        if !is_data_key(&entry.key) || is_format_v2_key(&entry.key) {
+        if !is_data_key(&entry.key) {
+            continue;
+        }
+        if to == StorageFormatVersion::V2 && is_format_v2_key(&entry.key) {
+            continue;
+        }
+        if to == StorageFormatVersion::V3 && is_format_v3_key(&entry.key) {
             continue;
         }
         if options
@@ -219,7 +304,11 @@ where
         MIGRATION_MAX_OBJECTS_IN_FLIGHT.fetch_max(1, Ordering::Relaxed);
         let _in_flight = InFlightObject;
 
-        let new_key = format_v2_key(&entry.key);
+        let new_key = if to == StorageFormatVersion::V3 {
+            format_v3_key(&entry.key)
+        } else {
+            format_v2_key(&entry.key)
+        };
         raw.put(&new_key, &entry.value).await?;
         raw.flush().await?;
         if raw.get(&new_key).await?.as_deref() != Some(entry.value.as_ref()) {
@@ -236,7 +325,7 @@ where
         raw.flush().await?;
     }
 
-    // INVARIANT-BY-CONSTRUCTION: M1-S7 — shard format version is atomically updated to V2 upon successful migration completion.
+    // INVARIANT-BY-CONSTRUCTION: M1-S7 — shard format version is atomically updated upon successful migration completion.
     let mut batch = slatedb::WriteBatch::new();
     batch.put(ShardKeyEncoder::format_version_key(), [to.0]);
     batch.delete(&progress_key);

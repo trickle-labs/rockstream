@@ -16,6 +16,7 @@
 //! - **`EXPLAIN INCREMENTAL ESTIMATE`** — static cost model reporting predicted
 //!   state size and per-operator `epoch_ms` without deploying.
 
+pub mod canonicalize;
 pub mod catalog;
 pub mod distribution;
 pub mod error;
@@ -26,12 +27,14 @@ pub mod frontend;
 pub mod lower;
 pub mod workload_catalog;
 
+pub use canonicalize::ExpressionNormalizer;
 pub use catalog::{ColumnDef, SchemaCatalog, ViewEntry};
 pub use distribution::apply_distribution;
 pub use error::SqlError;
 pub use estimate::{explain_incremental_estimate, format_estimate, EstimateRow};
 pub use explain_incremental::{
     explain_incremental, explain_incremental_analyze, explain_incremental_verbose,
+    explain_incremental_with_arrangements,
 };
 pub use extension::{IncAggregate, IncDistinct, IncJoin};
 pub use frontend::SqlFrontend;

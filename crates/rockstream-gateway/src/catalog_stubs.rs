@@ -368,6 +368,8 @@ struct CatalogStubsInner {
     shard_stats: HashMap<String, Vec<ShardColumnStats>>,
 }
 
+use rockstream_types::explain::ArrangementSharingInfo;
+
 /// In-memory catalog of views exposed to Postgres clients.
 ///
 /// Thread-safe via interior `RwLock` so that `Arc<CatalogStubs>` can be
@@ -381,6 +383,7 @@ pub struct CatalogStubs {
     view_budgets: RwLock<HashMap<String, Arc<StateBudget>>>,
     view_states: RwLock<HashMap<String, ViewState>>,
     backfills: RwLock<HashMap<String, BackfillProgress>>,
+    view_arrangements: RwLock<HashMap<String, ArrangementSharingInfo>>,
     /// Monotonic counter minting gateway-local `op_id`s for `CREATE INDEX`
     /// automatic backfill (Slice 5, v0.51.2). Not derived from any real
     /// runtime-DAG `IndexArrangeOp` — see v0.51.2 plan §2 scoping decision.
@@ -453,6 +456,7 @@ impl CatalogStubs {
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
             backfills: RwLock::new(HashMap::new()),
+            view_arrangements: RwLock::new(HashMap::new()),
             next_index_op_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -467,6 +471,7 @@ impl CatalogStubs {
             view_budgets: RwLock::new(HashMap::new()),
             view_states: RwLock::new(HashMap::new()),
             backfills: RwLock::new(HashMap::new()),
+            view_arrangements: RwLock::new(HashMap::new()),
             next_index_op_id: std::sync::atomic::AtomicU64::new(1),
         };
         let workloads = workload_catalog.load_all_workloads().await?;
@@ -532,6 +537,14 @@ impl CatalogStubs {
     pub fn get_view(&self, name: &str) -> Option<CatalogView> {
         let inner = self.inner.read().unwrap();
         inner.views.get(name).cloned()
+    }
+
+    /// Set arrangement sharing metadata for a view.
+    pub fn set_view_arrangement_sharing(&self, view_name: &str, info: ArrangementSharingInfo) {
+        self.view_arrangements
+            .write()
+            .unwrap()
+            .insert(view_name.to_string(), info);
     }
 
     pub fn add_workload(&self, workload: WorkloadDef) -> bool {
@@ -1163,6 +1176,27 @@ impl CatalogStubs {
                     })
                     .unwrap_or_default();
                 let degradation_status = derive_degradation_status(&view_state, Some(stage_lag));
+                let arrangement_info = self.view_arrangements.read().unwrap().get(&v.name).cloned();
+                let arr_id_str = arrangement_info
+                    .as_ref()
+                    .and_then(|a| a.arrangement_id.map(|id| id.to_string()))
+                    .unwrap_or_else(|| "-".to_string());
+                let consumer_count_str = arrangement_info
+                    .as_ref()
+                    .map(|a| a.consumer_count.to_string())
+                    .unwrap_or_else(|| "1".to_string());
+                let shared_bytes_str = arrangement_info
+                    .as_ref()
+                    .map(|a| a.shared_state_bytes.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let saved_bytes_str = arrangement_info
+                    .as_ref()
+                    .map(|a| a.bytes_saved_by_sharing.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let compaction_frontier_str = arrangement_info
+                    .as_ref()
+                    .map(|a| a.compaction_frontier.to_string())
+                    .unwrap_or_else(|| "0".to_string());
                 vec![
                     Some(v.namespace),
                     Some(v.name),
@@ -1192,6 +1226,11 @@ impl CatalogStubs {
                     degradation_status
                         .estimated_remaining_ms
                         .map(|value| value.to_string()),
+                    Some(arr_id_str),
+                    Some(consumer_count_str),
+                    Some(shared_bytes_str),
+                    Some(saved_bytes_str),
+                    Some(compaction_frontier_str),
                 ]
             })
             .collect();
@@ -2986,6 +3025,11 @@ pub(crate) fn view_status_columns() -> Vec<String> {
         "bytes_remaining".to_string(),
         "rows_remaining".to_string(),
         "estimated_remaining_ms".to_string(),
+        "arrangement_id".to_string(),
+        "consumer_count".to_string(),
+        "shared_state_bytes".to_string(),
+        "bytes_saved_by_sharing".to_string(),
+        "compaction_frontier".to_string(),
     ]
 }
 

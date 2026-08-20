@@ -16,6 +16,7 @@
 //! - [`tls`] — mTLS configuration scaffolding
 
 pub mod acl;
+pub mod arrangement;
 pub mod audit;
 pub mod checkpoint;
 pub mod checkpoint_export;

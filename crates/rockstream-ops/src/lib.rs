@@ -45,9 +45,12 @@ pub mod task;
 pub mod tco;
 pub mod time_window;
 pub mod topk;
+pub mod view_attach;
 pub mod view_ref;
 pub mod window;
 pub mod zset;
+
+pub use view_attach::{AttachedView, AttachmentDeltaBuffer, ViewAttachmentMetrics};
 
 pub use spill::{SerdeSpill, SpillKey, SpillValue, SpillableArrangement};
 

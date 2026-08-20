@@ -5,6 +5,7 @@
 //! batch types, merge-law descriptors, law implementations, and audit events.
 
 pub mod acl;
+pub mod arrangement;
 pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
@@ -42,6 +43,11 @@ pub mod topology;
 pub mod view_lifecycle;
 pub mod workload;
 
+pub use arrangement::{
+    ArrangementSpec, CanonicalBinaryOp, CanonicalExpr, CanonicalLiteral, CanonicalType,
+    CanonicalUnaryOp, CollationId, CollationVersion, NullSemantics, PartitioningSpec,
+    SourceIdentity, TimeDomainSemantics,
+};
 pub use candidate_identity::CandidateIdentity;
 pub use compatibility::{
     ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
@@ -50,6 +56,7 @@ pub use evidence_manifest::{
     EvidenceIntegrityError, EvidenceManifest, RunnerEnvironment, SummaryMetric, TestSuiteResult,
     WorkflowRunInfo,
 };
+pub use ids::{ArrangementId, TenantId};
 pub use state_mutation::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 
 /// Timestamp types.

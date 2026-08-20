@@ -11,6 +11,12 @@ pub enum StorageError {
     #[error("key encoding error: {0}")]
     KeyEncoding(String),
 
+    #[error("invalid storage key: {0}")]
+    InvalidKey(String),
+
+    #[error("arrangement not found: {0}")]
+    ArrangementNotFound(String),
+
     #[error("merge operator not configured")]
     MergeOperatorNotConfigured,
 

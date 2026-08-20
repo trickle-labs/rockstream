@@ -51,6 +51,26 @@ pub struct ZSetRow {
     pub weight: Weight,
 }
 
+impl ZSetRow {
+    /// Create an insertion row (weight = +1).
+    pub fn insert(key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self {
+            key,
+            value,
+            weight: 1,
+        }
+    }
+
+    /// Create a deletion row (weight = -1).
+    pub fn delete(key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self {
+            key,
+            value,
+            weight: -1,
+        }
+    }
+}
+
 /// A Z-set: a finite map from `(key, value)` to `Weight`.
 ///
 /// This is the fundamental data structure of IVM. A Z-set represents a

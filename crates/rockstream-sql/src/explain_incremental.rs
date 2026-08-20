@@ -10,7 +10,7 @@
 //! v0.9 when the runtime has a running pipeline to query.
 
 use rockstream_plan::{AggregateFunc, PlanNode};
-use rockstream_types::explain::{OperatorStats, ShardInfo};
+use rockstream_types::explain::{ArrangementSharingInfo, OperatorStats, ShardInfo};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::laws::weight_add::WEIGHT_ADD_ID;
 use rockstream_types::merge_law::MergeLawId;
@@ -96,6 +96,37 @@ pub fn explain_incremental_analyze(plan: &PlanNode, stats: &[OperatorStats]) -> 
                     stat.rmw_ratio,
                     stat.p99_latency_ms,
                     stat.dlq_entries
+                )
+            } else {
+                line.base_line.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    format_explain_block(&rendered)
+}
+
+pub fn explain_incremental_with_arrangements(
+    plan: &PlanNode,
+    arrangements: &[ArrangementSharingInfo],
+) -> String {
+    let lines = collect_plan_lines(plan);
+    let rendered = lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            if let Some(arr) = arrangements.get(idx) {
+                let arr_id_str = arr
+                    .arrangement_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                format!(
+                    "{}  [arrangement_id={} consumers={} shared_bytes={} saved_bytes={} compaction_frontier={}]",
+                    line.base_line,
+                    arr_id_str,
+                    arr.consumer_count,
+                    arr.shared_state_bytes,
+                    arr.bytes_saved_by_sharing,
+                    arr.compaction_frontier
                 )
             } else {
                 line.base_line.clone()

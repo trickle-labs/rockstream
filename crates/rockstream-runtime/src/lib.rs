@@ -10,6 +10,7 @@ pub use rockstream_ops::embedded::{EmbeddedCounters, EmbeddedRuntime};
 pub use rockstream_ops::scheduler::CreditScheduler;
 pub use rockstream_ops::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
 
+pub mod arrangement_attach;
 pub mod client;
 pub mod secrets;
 pub mod tls;

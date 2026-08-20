@@ -81,6 +81,16 @@ define_id!(
     AggregatorId, u64, "aggregator"
 );
 
+define_id!(
+    /// Identifies a tenant within the cluster (v0.59.6).
+    TenantId, u64, "tenant"
+);
+
+define_id!(
+    /// Identifies a physical shared arrangement (v0.59.6).
+    ArrangementId, u64, "arr"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
