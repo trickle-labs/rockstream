@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -139,9 +140,10 @@ def build_candidate(root: Path, candidate_id: str, artifact_dir: Path) -> dict:
         worktree = Path(temporary) / "source"
         run(["git", "worktree", "add", "--detach", str(worktree), source_commit], root)
         try:
-            rustc_version = run(["rustc", "--version"], worktree).stdout.strip()
+            pinned_toolchain = toolchain_name(toolchain)
+            rustc_version = run(["rustup", "run", pinned_toolchain, "rustc", "--version"], worktree).stdout.strip()
             build_env = {
-                **dict(__import__("os").environ),
+                **dict(os.environ),
                 "CARGO_TARGET_DIR": str(Path(temporary) / "target"),
                 "CARGO_INCREMENTAL": "0",
                 "ROCKSTREAM_COMMIT_SHA": source_commit,
@@ -149,7 +151,17 @@ def build_candidate(root: Path, candidate_id: str, artifact_dir: Path) -> dict:
                 "ROCKSTREAM_RUSTC_VERSION": rustc_version,
             }
             run(
-                ["cargo", "build", "--locked", "--release", "--bin", "rockstream"],
+                [
+                    "rustup",
+                    "run",
+                    pinned_toolchain,
+                    "cargo",
+                    "build",
+                    "--locked",
+                    "--release",
+                    "--bin",
+                    "rockstream",
+                ],
                 worktree,
                 env=build_env,
             )
@@ -201,7 +213,6 @@ def build_candidate(root: Path, candidate_id: str, artifact_dir: Path) -> dict:
         "effective_config_sha256": sha256_bytes(
             json.dumps(effective_config, sort_keys=True, separators=(",", ":")).encode()
         ),
-        "effective_config": effective_config,
     }
 
 
@@ -265,7 +276,7 @@ def verify(root: Path, record_path: Path) -> None:
         effective_digest = sha256_bytes(
             json.dumps(effective_config, sort_keys=True, separators=(",", ":")).encode()
         )
-        if effective_digest != candidate["effective_config_sha256"] or effective_config != candidate["effective_config"]:
+        if effective_digest != candidate["effective_config_sha256"]:
             fail(f"{candidate['id']} effective configuration changed")
     print("R1 local candidate records verified")
 
