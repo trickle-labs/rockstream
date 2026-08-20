@@ -191,9 +191,16 @@ evidence/r1-local/
 Keep the evidence compact enough to commit. Profiles may use folded stack text
 rather than large binary traces. No remote artifact store is required.
 
-## 6. Implementation Slices
+## 6. R1 Milestones
 
-### S0: Freeze the local contract
+The implementation slices below are the binding R1 milestones. They are ordered
+by dependency: M0-M1 freeze the evidence contract and candidate identities; M2
+implements the worker data plane; M3-M5 add the measurements and deterministic
+proofs; M6 builds the independent harness; M7 collects the evidence; and M8
+generates and enforces the decision. A milestone is complete only when its
+listed green check passes.
+
+### M0 / S0: Freeze the local contract
 
 Create the profile, corpus, and thresholds files before scored measurement.
 `thresholds.toml` contains exactly the values from Section 3. The corpus fixes
@@ -214,7 +221,7 @@ Green check:
 - Repeated corpus generation produces byte-identical input and SQL digests.
 - The Python verifier rejects any changed threshold, workload, or profile.
 
-### S1: Identify B0 and the current candidate
+### M1 / S1: Identify B0 and the current candidate
 
 Do not create B1.
 
@@ -238,7 +245,7 @@ Green check:
 - Candidate records and binary hashes match before every run.
 - The verifier rejects a changed source or binary digest.
 
-### S2: Make standalone workers execute real dataflows
+### M2 / S2: Make standalone workers execute real dataflows
 
 The current worker role registers and sends heartbeats but does not execute an
 assigned compiled view. Fix this before measuring worker scaling.
@@ -285,7 +292,7 @@ Green check:
 - Killing a worker in a non-scored correctness case fences the old owner and
   preserves exact committed output after reassignment.
 
-### S3: Add actual work and resource counters
+### M3 / S3: Add actual work and resource counters
 
 Add counters at the production boundaries used by the local gate.
 
@@ -329,7 +336,7 @@ Green check:
 - Attachment/read-only work does not increment source-index maintenance.
 - Encoded exchange counters equal the bytes produced by fixture serialization.
 
-### S4: Add compile-time strategy control
+### M4 / S4: Add compile-time strategy control
 
 Add one startup/deployment setting:
 
@@ -353,7 +360,7 @@ Start the current binary in all three modes, assert effective configuration and
 reported strategy through public surfaces, feed identical changes, and compare
 complete outputs.
 
-### S5: Correct the deterministic structural proofs
+### M5 / S5: Correct the deterministic structural proofs
 
 #### One-key persistence
 
@@ -389,7 +396,7 @@ intermediate reduction, and exact reconciliation of all work counters.
 
 Structural test failures are RED. Wall-clock speed cannot override them.
 
-### S6: Implement the independent local harness
+### M6 / S6: Implement the independent local harness
 
 `tools/r1-local-harness` is a small standalone Cargo workspace with its own
 lockfile and no RockStream crate dependency. It interacts through process,
@@ -424,7 +431,7 @@ The harness:
 - Exits nonzero on wrong output, missing worker activity, unstable identity,
   missing counters, or incomplete evidence.
 
-### S7: Collect local measurements
+### M7 / S7: Collect local measurements
 
 Use fixed seeds and the same generated input for every paired comparison.
 
@@ -464,7 +471,7 @@ repetition. A repetition with macOS serious/critical thermal pressure, swap
 thrash, or an unrelated sustained process is invalid; invalidate the whole
 five-repetition batch rather than dropping that one sample.
 
-### S8: Generate and enforce the decision
+### M8 / S8: Generate and enforce the decision
 
 `r1-local-harness evaluate` generates `evidence/r1-local/decision.json` from raw
 samples and structural results. `scripts/check-r1-local-evidence.py` uses only
