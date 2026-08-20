@@ -43,7 +43,8 @@ table before writing the sign-off.
    if any `- [ ]` remains.
 3. Update the version's status in the roadmap to `✅ Done` only after the
    sign-off is complete.
-4. Run `rtk ./scripts/check-exit-criteria.sh` and `rtk make e2e` (or `rtk make e2e-nextest`) and confirm
+4. Bump Cargo.toml
+5. Run `rtk ./scripts/check-exit-criteria.sh` and `rtk make e2e` (or `rtk make e2e-nextest`) and confirm
    both pass.
 
 ---
