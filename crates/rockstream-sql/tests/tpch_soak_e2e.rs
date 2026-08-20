@@ -956,6 +956,11 @@ async fn test_tpch_queries_incremental_vs_batch() {
         total_batch_time
     );
 
+    // Coverage instrumentation distorts this performance comparison.
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        return;
+    }
+
     // Assert >=10x speedup for deltas vs full batch re-execution
     let speedup = (total_batch_time.as_secs_f64() / total_inc_time.as_secs_f64()).max(1.0);
     println!("Measured delta speedup: {:.2}x", speedup);
