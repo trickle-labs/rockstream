@@ -70,7 +70,7 @@ use rockstream_ops::sink::{column_values_to_tsv_bytes, materialize_view_state};
 use rockstream_ops::ArrowZSet;
 use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_sql::SqlFrontend;
-use rockstream_types::config::ScatterPruningConfig;
+use rockstream_types::config::{JoinStrategy, ScatterPruningConfig};
 use rockstream_types::data_plane::{
     DeploymentColumn, DeploymentRequest, DeploymentSchema, RuntimeRow, SourceDeltaRequest,
     WorkloadSnapshot, DEPLOYMENT_DESCRIPTOR_VERSION,
@@ -1732,6 +1732,7 @@ pub struct GatewayHandler {
     /// by dependency component only after measured contention.
     shard_commit_lock: Arc<tokio::sync::Mutex<()>>,
     pub secret_store: Arc<rockstream_control::SecretStore>,
+    join_strategy: JoinStrategy,
 }
 
 impl GatewayHandler {
@@ -1904,6 +1905,7 @@ impl GatewayHandler {
             pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             secret_store,
+            join_strategy: JoinStrategy::Auto,
         }
     }
 
@@ -1951,11 +1953,17 @@ impl GatewayHandler {
             pgoutput_registry_lock: Arc::new(tokio::sync::Mutex::new(())),
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             secret_store,
+            join_strategy: JoinStrategy::Auto,
         }
     }
 
     pub fn with_secret_store(mut self, secret_store: Arc<rockstream_control::SecretStore>) -> Self {
         self.secret_store = secret_store;
+        self
+    }
+
+    pub fn with_join_strategy(mut self, join_strategy: JoinStrategy) -> Self {
+        self.join_strategy = join_strategy;
         self
     }
 
@@ -2037,9 +2045,33 @@ impl GatewayHandler {
             ),
         };
 
-        match rockstream_ops::compile_plan(&view_plan, shard_db, table_schemas) {
-            Ok(compiled) => Ok(compiled),
+        match rockstream_ops::compile_plan_with_strategy(
+            &view_plan,
+            shard_db,
+            table_schemas,
+            self.join_strategy,
+        ) {
+            Ok(compiled) => {
+                if let Some(join) = &compiled.join {
+                    rockstream_types::metrics::record_compiled_join_strategy(
+                        if join.pipeline.strategy() == "factorized" {
+                            rockstream_types::metrics::R1ExecutionStrategy::Factorized
+                        } else {
+                            rockstream_types::metrics::R1ExecutionStrategy::Classic
+                        },
+                    );
+                }
+                Ok(compiled)
+            }
             Err(compile_err) => {
+                if compile_err
+                    .to_string()
+                    .contains("execution.join_strategy=factorized")
+                {
+                    return Err(format!(
+                        "[RS-1019] compile_plan: {compile_err}; next_steps: simplify the view query or verify its source schemas"
+                    ));
+                }
                 let mut diff_ctx = rockstream_diff::DiffCtx::new();
                 let _physical_plan = diff_ctx
                     .differentiate(&view_plan)
@@ -2075,14 +2107,23 @@ impl GatewayHandler {
             ),
         };
 
-        match rockstream_ops::compile_plan_with_sink_id(
+        match rockstream_ops::compile_plan_with_sink_id_and_strategy(
             &view_plan,
             shard_db,
             table_schemas,
             sink_op_id,
+            self.join_strategy,
         ) {
             Ok(compiled) => Ok(compiled),
             Err(compile_err) => {
+                if compile_err
+                    .to_string()
+                    .contains("execution.join_strategy=factorized")
+                {
+                    return Err(format!(
+                        "[RS-1019] compile_plan_with_sink_id: {compile_err}; next_steps: simplify the view query or verify its source schemas"
+                    ));
+                }
                 let mut diff_ctx = rockstream_diff::DiffCtx::new();
                 let _physical_plan = diff_ctx
                     .differentiate(&view_plan)
@@ -7211,6 +7252,7 @@ impl GatewayHandler {
                             detail: format!("serialize distributed plan {view_name}: {error}"),
                         }))
                     })?,
+                    join_strategy: self.join_strategy,
                     schemas: compile_deps
                         .iter()
                         .filter_map(|relation| {
@@ -11698,6 +11740,14 @@ impl GatewayServer {
     ) -> Self {
         if let Some(h) = Arc::get_mut(&mut self.handler) {
             h.query_time_shard_topology_provider = Some(Arc::new(provider));
+        }
+        self
+    }
+
+    /// Fix the join strategy before the server starts compiling views.
+    pub fn with_join_strategy(mut self, join_strategy: JoinStrategy) -> Self {
+        if let Some(handler) = Arc::get_mut(&mut self.handler) {
+            handler.join_strategy = join_strategy;
         }
         self
     }

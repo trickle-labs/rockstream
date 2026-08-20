@@ -436,7 +436,9 @@ pub async fn start_gateway_with_shard(
         }
     };
 
-    let mut server = server.with_query_time_shard_topology_provider(topology_provider);
+    let mut server = server
+        .with_query_time_shard_topology_provider(topology_provider)
+        .with_join_strategy(opts.config.execution.join_strategy);
     if opts.role == "gateway" {
         if let Some(control) = &opts.control {
             server = server.with_distributed_data_plane(

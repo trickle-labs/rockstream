@@ -219,6 +219,22 @@ pub struct StorageConfig {
     pub tiering: StorageTieringConfig,
 }
 
+/// Join implementation selected when a view is compiled.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinStrategy {
+    #[default]
+    Auto,
+    Classic,
+    Factorized,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExecutionConfig {
+    pub join_strategy: JoinStrategy,
+}
+
 /// v0.51.5: gateway-facing (client SQL-port) TLS termination configuration.
 /// Distinct from any *internal* control<->worker/worker<->worker mTLS.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -257,6 +273,8 @@ pub struct RockstreamConfig {
     pub exchange: ExchangeConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub execution: ExecutionConfig,
     #[serde(default)]
     pub pricing: Option<PricingConfig>,
     #[serde(default)]
@@ -313,6 +331,7 @@ impl Default for RockstreamConfig {
             },
             exchange: ExchangeConfig::default(),
             storage: StorageConfig::default(),
+            execution: ExecutionConfig::default(),
             pricing: None,
             gateway: GatewayConfig::default(),
             internal_tls: crate::identity::InternalTlsConfig::default(),

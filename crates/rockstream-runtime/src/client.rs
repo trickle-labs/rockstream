@@ -801,11 +801,12 @@ where
                             serde_json::from_str(&descriptor.plan_json).map_err(|error| {
                                 io::Error::new(io::ErrorKind::InvalidData, error)
                             })?;
-                        let compiled = rockstream_ops::compile_plan_with_sink_id(
+                        let compiled = rockstream_ops::compile_plan_with_sink_id_and_strategy(
                             &plan,
                             db.clone(),
                             &schemas,
                             descriptor.sink_operator_id,
+                            descriptor.join_strategy,
                         )
                         .map_err(io::Error::other)?;
                         if let Some(join) = &compiled.join {

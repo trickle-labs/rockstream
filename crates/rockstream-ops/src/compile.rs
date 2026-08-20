@@ -42,7 +42,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use rockstream_plan::{AggregateFunc, Expr, OuterJoinKind, PlanNode};
 use rockstream_storage::ShardDb;
-use rockstream_types::ids::OperatorId;
+use rockstream_types::{config::JoinStrategy, ids::OperatorId};
 
 use crate::aggregate::{AggregateOp, DecimalAggregateFormatOp};
 use crate::distinct::DistinctOp;
@@ -133,11 +133,21 @@ pub fn compile_plan(
     db: Arc<ShardDb>,
     table_schemas: &HashMap<String, SchemaRef>,
 ) -> Result<CompiledView, OpError> {
+    compile_plan_with_strategy(plan, db, table_schemas, JoinStrategy::Auto)
+}
+
+/// Compile a view using a strategy fixed for this compilation.
+pub fn compile_plan_with_strategy(
+    plan: &PlanNode,
+    db: Arc<ShardDb>,
+    table_schemas: &HashMap<String, SchemaRef>,
+    join_strategy: JoinStrategy,
+) -> Result<CompiledView, OpError> {
     // Stateless operators (Filter/Project/Map) carry no persisted identity;
     // the sink is the only node whose `OperatorId` addresses persisted
     // `view_output` storage, so it must be unique across compiled views.
     let sink_op_id = OperatorId(NEXT_VIEW_SINK_OP_ID.fetch_add(1, Ordering::Relaxed));
-    compile_plan_with_sink_id(plan, db, table_schemas, sink_op_id)
+    compile_plan_with_sink_id_and_strategy(plan, db, table_schemas, sink_op_id, join_strategy)
 }
 
 /// Same as `compile_plan`, but reuses `sink_op_id` instead of minting a
@@ -156,6 +166,17 @@ pub fn compile_plan_with_sink_id(
     table_schemas: &HashMap<String, SchemaRef>,
     sink_op_id: OperatorId,
 ) -> Result<CompiledView, OpError> {
+    compile_plan_with_sink_id_and_strategy(plan, db, table_schemas, sink_op_id, JoinStrategy::Auto)
+}
+
+/// Compile a view with a durable sink id and fixed join strategy.
+pub fn compile_plan_with_sink_id_and_strategy(
+    plan: &PlanNode,
+    db: Arc<ShardDb>,
+    table_schemas: &HashMap<String, SchemaRef>,
+    sink_op_id: OperatorId,
+    join_strategy: JoinStrategy,
+) -> Result<CompiledView, OpError> {
     let PlanNode::ViewSink {
         view_name,
         pk,
@@ -169,7 +190,15 @@ pub fn compile_plan_with_sink_id(
     };
 
     with_view_id_scope(view_name, || {
-        compile_plan_body(view_name, pk, child, db, table_schemas, sink_op_id)
+        compile_plan_body(
+            view_name,
+            pk,
+            child,
+            db,
+            table_schemas,
+            sink_op_id,
+            join_strategy,
+        )
     })
 }
 
@@ -180,11 +209,19 @@ fn compile_plan_body(
     db: Arc<ShardDb>,
     table_schemas: &HashMap<String, SchemaRef>,
     sink_op_id: OperatorId,
+    join_strategy: JoinStrategy,
 ) -> Result<CompiledView, OpError> {
     // v0.51.4 Slice 3: an `InnerJoin`/`OuterJoin`-shaped view compiles
     // through the two-input `JoinPipeline` path instead of the single-input
     // `StatefulPipeline` below.
-    if let Some(shape) = try_compile_join_shape(child, table_schemas)? {
+    if let Some(shape) = try_compile_join_shape(child, table_schemas, join_strategy)? {
+        if join_strategy == JoinStrategy::Factorized
+            && !matches!(shape.join, JoinKind::Factorized(_))
+        {
+            return Err(OpError::unsupported_plan_node(
+                "execution.join_strategy=factorized requires an eligible inner join aggregate",
+            ));
+        }
         let sink = ViewSinkOp::new(db, sink_op_id);
         return Ok(CompiledView {
             pipeline: StatefulPipeline::new(),
@@ -203,6 +240,11 @@ fn compile_plan_body(
             view_name: view_name.to_string(),
             pk: pk.to_vec(),
         });
+    }
+    if join_strategy == JoinStrategy::Factorized {
+        return Err(OpError::unsupported_plan_node(
+            "execution.join_strategy=factorized requires an eligible inner join aggregate",
+        ));
     }
 
     let source_name = find_source_name(child).unwrap_or_default();
@@ -344,6 +386,8 @@ pub(crate) struct JoinShape {
     /// `try_compile_join_shape` doesn't otherwise track schema at all.
     post_n_cols: usize,
     factorized_spec: Option<FactorizedJoinSpec>,
+    /// Maps the current join-output columns back to factorized input columns.
+    factorized_columns: Option<Vec<usize>>,
 }
 
 struct FactorizedJoinSpec {
@@ -646,6 +690,7 @@ fn transfer_predicate(shape: &mut JoinShape, predicate: &Expr) -> bool {
 pub(crate) fn try_compile_join_shape(
     node: &PlanNode,
     table_schemas: &HashMap<String, SchemaRef>,
+    join_strategy: JoinStrategy,
 ) -> Result<Option<JoinShape>, OpError> {
     match node {
         PlanNode::InnerJoin {
@@ -706,6 +751,7 @@ pub(crate) fn try_compile_join_shape(
                 right_n_cols: right_schema.fields().len(),
                 post_n_cols,
                 factorized_spec,
+                factorized_columns: Some((0..post_n_cols).collect()),
             }))
         }
         PlanNode::OuterJoin {
@@ -758,10 +804,11 @@ pub(crate) fn try_compile_join_shape(
                 right_n_cols: right_schema.fields().len(),
                 post_n_cols,
                 factorized_spec: None,
+                factorized_columns: None,
             }))
         }
         PlanNode::Filter { input, predicate } => {
-            match try_compile_join_shape(input, table_schemas)? {
+            match try_compile_join_shape(input, table_schemas, join_strategy)? {
                 Some(mut shape) => {
                     if !transfer_predicate(&mut shape, predicate) {
                         shape.factorized_spec = None;
@@ -774,35 +821,50 @@ pub(crate) fn try_compile_join_shape(
                 None => Ok(None),
             }
         }
-        PlanNode::Project { input, columns } => match try_compile_join_shape(input, table_schemas)?
-        {
-            Some(mut shape) => {
-                shape.factorized_spec = None;
-                let named: Vec<NamedExpr> = columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, expr)| NamedExpr::new(format!("col{i}"), expr.clone()))
-                    .collect();
-                shape.post_n_cols = named.len();
-                shape
-                    .post
-                    .push(Stage::Stateless(Arc::new(ProjectOp::new(named))));
-                Ok(Some(shape))
+        PlanNode::Project { input, columns } => {
+            match try_compile_join_shape(input, table_schemas, join_strategy)? {
+                Some(mut shape) => {
+                    if let Some(previous) = &shape.factorized_columns {
+                        shape.factorized_columns = columns
+                            .iter()
+                            .map(|expr| match expr {
+                                Expr::Column(column) => previous.get(*column).copied(),
+                                _ => None,
+                            })
+                            .collect();
+                        if shape.factorized_columns.is_none() {
+                            shape.factorized_spec = None;
+                        }
+                    }
+                    let named: Vec<NamedExpr> = columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, expr)| NamedExpr::new(format!("col{i}"), expr.clone()))
+                        .collect();
+                    shape.post_n_cols = named.len();
+                    shape
+                        .post
+                        .push(Stage::Stateless(Arc::new(ProjectOp::new(named))));
+                    Ok(Some(shape))
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
-        },
-        PlanNode::Map { input, func } => match try_compile_join_shape(input, table_schemas)? {
-            Some(mut shape) => {
-                shape.factorized_spec = None;
-                shape.post_n_cols += 1;
-                shape.post.push(Stage::Stateless(Arc::new(MapOp::new(
-                    func.clone(),
-                    "value",
-                ))));
-                Ok(Some(shape))
+        }
+        PlanNode::Map { input, func } => {
+            match try_compile_join_shape(input, table_schemas, join_strategy)? {
+                Some(mut shape) => {
+                    shape.factorized_spec = None;
+                    shape.factorized_columns = None;
+                    shape.post_n_cols += 1;
+                    shape.post.push(Stage::Stateless(Arc::new(MapOp::new(
+                        func.clone(),
+                        "value",
+                    ))));
+                    Ok(Some(shape))
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
-        },
+        }
         // v0.51.4 gap-fix: `Aggregate` directly over a join (e.g. Nexmark
         // q4's `SELECT a.category, AVG(b.price) FROM auction a JOIN bid b
         // ON ... WHERE ... GROUP BY a.category`) — composite group keys are
@@ -812,7 +874,7 @@ pub(crate) fn try_compile_join_shape(
             input,
             group_by,
             aggregates,
-        } => match try_compile_join_shape(input, table_schemas)? {
+        } => match try_compile_join_shape(input, table_schemas, join_strategy)? {
             Some(mut shape) => {
                 if group_by.len() != 1 || aggregates.is_empty() {
                     return Err(OpError::unsupported_plan_node(
@@ -839,12 +901,14 @@ pub(crate) fn try_compile_join_shape(
                     && (matches!(agg.input, Expr::Column(_))
                         || matches!(agg.func, AggregateFunc::Count))
                     && shape.factorized_spec.is_some()
-                    && shape.factorized_spec.as_ref().is_some_and(|spec| {
-                        DeltaAmplificationGovernor::select(
-                            factorized_compile_estimate(spec),
-                            DEFAULT_FACTORIZED_DELTA_BUDGET,
-                        ) == PlanStrategy::Factorized
-                    })
+                    && (join_strategy == JoinStrategy::Factorized
+                        || (join_strategy == JoinStrategy::Auto
+                            && shape.factorized_spec.as_ref().is_some_and(|spec| {
+                                DeltaAmplificationGovernor::select(
+                                    factorized_compile_estimate(spec),
+                                    DEFAULT_FACTORIZED_DELTA_BUDGET,
+                                ) == PlanStrategy::Factorized
+                            })))
                     && matches!(
                         agg.func,
                         AggregateFunc::Sum | AggregateFunc::Count | AggregateFunc::Avg
@@ -857,6 +921,15 @@ pub(crate) fn try_compile_join_shape(
                     let value_col = match agg.input {
                         Expr::Column(column) => column,
                         _ => 0,
+                    };
+                    let Some(columns) = &shape.factorized_columns else {
+                        return Ok(None);
+                    };
+                    let Some(group_col) = columns.get(group_col).copied() else {
+                        return Ok(None);
+                    };
+                    let Some(value_col) = columns.get(value_col).copied() else {
+                        return Ok(None);
                     };
                     let kind = match agg.func {
                         AggregateFunc::Sum => FactorizedAggregateKind::Sum,
@@ -905,7 +978,7 @@ pub(crate) fn try_compile_join_shape(
         PlanNode::Window {
             input,
             window_exprs,
-        } => match try_compile_join_shape(input, table_schemas)? {
+        } => match try_compile_join_shape(input, table_schemas, join_strategy)? {
             Some(mut shape) => {
                 let op = Arc::new(WindowOp::new(
                     int64_schema(shape.post_n_cols + window_exprs.len()),

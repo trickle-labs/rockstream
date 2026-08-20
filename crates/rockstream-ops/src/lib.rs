@@ -60,7 +60,10 @@ pub use aggregate::{
     load_frontier, persist_agg_state, persist_bucketed_agg_state, persist_frontier, AggState,
     AggregateOp, BucketedAggregateOp,
 };
-pub use compile::{compile_plan, compile_plan_with_sink_id, CompiledView};
+pub use compile::{
+    compile_plan, compile_plan_with_sink_id, compile_plan_with_sink_id_and_strategy,
+    compile_plan_with_strategy, CompiledView,
+};
 pub use debugger::{
     decode_user_key, explain_view_op_ids, format_explain_op_ids, inspect_arrangement_db,
     inspect_arrangement_reader, ArrangementDebugResult, DecodedArrangementKey, OperatorNodeInfo,

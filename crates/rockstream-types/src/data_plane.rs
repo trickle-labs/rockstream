@@ -4,11 +4,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::JoinStrategy;
 use crate::ids::{LeaseToken, OperatorId, ShardId, WorkerId, WorkloadId};
 use crate::lease::ShardLease;
 use crate::timestamp::Epoch;
 
-pub const DEPLOYMENT_DESCRIPTOR_VERSION: u32 = 1;
+pub const DEPLOYMENT_DESCRIPTOR_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeploymentColumn {
@@ -27,6 +28,7 @@ pub struct DeploymentRequest {
     pub version: u32,
     pub workload_id: WorkloadId,
     pub plan_json: String,
+    pub join_strategy: JoinStrategy,
     pub schemas: Vec<DeploymentSchema>,
     pub frontier: Epoch,
     pub storage_root: String,
@@ -42,6 +44,7 @@ pub struct DeploymentDescriptor {
     pub version: u32,
     pub workload_id: WorkloadId,
     pub plan_json: String,
+    pub join_strategy: JoinStrategy,
     pub schemas: Vec<DeploymentSchema>,
     pub frontier: Epoch,
     pub storage_root: String,
@@ -60,6 +63,7 @@ impl DeploymentDescriptor {
             version: request.version,
             workload_id: request.workload_id,
             plan_json: request.plan_json,
+            join_strategy: request.join_strategy,
             schemas: request.schemas,
             frontier: request.frontier,
             storage_root: request.storage_root,
@@ -178,6 +182,7 @@ mod tests {
             version: DEPLOYMENT_DESCRIPTOR_VERSION,
             workload_id: WorkloadId(7),
             plan_json: "{\"operator\":\"aggregate\"}".into(),
+            join_strategy: JoinStrategy::Auto,
             schemas: vec![DeploymentSchema {
                 relation: "orders".into(),
                 columns: vec![DeploymentColumn {

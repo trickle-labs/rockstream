@@ -210,6 +210,7 @@ fn init_default_origins(origins: &mut BTreeMap<String, ConfigOrigin>) {
         ConfigOrigin::Default,
     );
     origins.insert("cluster.state_budget_gb".to_string(), ConfigOrigin::Default);
+    origins.insert("execution.join_strategy".to_string(), ConfigOrigin::Default);
     origins.insert(
         "cluster.index_prefer_selectivity_threshold".to_string(),
         ConfigOrigin::Default,
@@ -436,6 +437,16 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
                     config.recursion_max_iterations = val;
                     origins.insert(
                         "recursion_max_iterations".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["EXECUTION", "JOIN_STRATEGY"] => {
+                if let Ok(val) = toml::from_str::<crate::config::JoinStrategy>(&format!("\"{v}\""))
+                {
+                    config.execution.join_strategy = val;
+                    origins.insert(
+                        "execution.join_strategy".to_string(),
                         ConfigOrigin::Environment(k),
                     );
                 }

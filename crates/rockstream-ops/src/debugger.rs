@@ -126,7 +126,11 @@ fn explain_plan_op_ids_scoped(
         .cloned()
         .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
 
-    if let Some(shape) = crate::compile::try_compile_join_shape(child, table_schemas)? {
+    if let Some(shape) = crate::compile::try_compile_join_shape(
+        child,
+        table_schemas,
+        rockstream_types::config::JoinStrategy::Auto,
+    )? {
         let sink_op_id = crate::live_exec::next_stateful_op_id();
         match shape.join {
             crate::live_exec::JoinKind::Inner(join_op) => {

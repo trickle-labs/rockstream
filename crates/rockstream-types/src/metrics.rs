@@ -372,6 +372,7 @@ fn p99_latency_ms(samples_ms: &mut [u32]) -> f64 {
 /// Global registry for merge-law metric counters.
 struct MetricRegistry {
     r1_execution: HashMap<R1ExecutionKey, R1ExecutionCounters>,
+    compiled_join_views: [u64; 2],
     r1_persistence: HashMap<OperatorId, R1PersistenceCounters>,
     r1_arrangements: HashMap<ArrangementId, R1ArrangementCounters>,
     r1_workers: HashMap<WorkerId, R1WorkerActivity>,
@@ -486,6 +487,7 @@ impl MetricRegistry {
     fn new() -> Self {
         Self {
             r1_execution: HashMap::new(),
+            compiled_join_views: [0; 2],
             r1_persistence: HashMap::new(),
             r1_arrangements: HashMap::new(),
             r1_workers: HashMap::new(),
@@ -678,6 +680,14 @@ pub fn record_r1_execution(key: R1ExecutionKey, delta: R1ExecutionCounters) {
         worker.exchange_bytes = worker
             .exchange_bytes
             .saturating_add(delta.encoded_exchange_bytes);
+    });
+}
+
+/// Record the strategy selected while compiling one join view.
+pub fn record_compiled_join_strategy(strategy: R1ExecutionStrategy) {
+    with_registry(|reg| {
+        reg.compiled_join_views
+            [usize::from(matches!(strategy, R1ExecutionStrategy::Factorized))] += 1;
     });
 }
 
@@ -1091,6 +1101,7 @@ fn pipeline_stall_report_from_map(
 pub fn reset_all() {
     with_registry(|reg| {
         reg.r1_execution.clear();
+        reg.compiled_join_views = [0; 2];
         reg.r1_persistence.clear();
         reg.r1_arrangements.clear();
         reg.r1_workers.clear();
@@ -2760,6 +2771,19 @@ pub fn generate_prometheus_metrics() -> String {
             }
             out.push('\n');
         }
+
+        out.push_str(
+            "# HELP rockstream_compiled_join_views Join views by fixed compile-time strategy.\n",
+        );
+        out.push_str("# TYPE rockstream_compiled_join_views gauge\n");
+        out.push_str(&format!(
+            "rockstream_compiled_join_views{{strategy=\"classic\"}} {}\n",
+            reg.compiled_join_views[0]
+        ));
+        out.push_str(&format!(
+            "rockstream_compiled_join_views{{strategy=\"factorized\"}} {}\n\n",
+            reg.compiled_join_views[1]
+        ));
 
         let mut workers: Vec<_> = reg.r1_workers.iter().collect();
         workers.sort_by_key(|(worker_id, _)| **worker_id);
