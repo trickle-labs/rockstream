@@ -60,7 +60,7 @@ applies even when implementation starts in parallel.
 | v0.59.5 | v0.59.4 | v0.59.4 |
 | v0.59.6 | v0.59.5 | v0.59.5 |
 | v0.59.7 | v0.59.6 | v0.59.6 |
-| v0.59.8 | v0.59.6, v0.59.7 | v0.59.6, v0.59.7, R1 |
+| v0.59.8 | v0.59.6, v0.59.7, R1 | v0.59.6, v0.59.7, R1 |
 | v0.59.9 | v0.59.5, v0.59.6, v0.59.7, v0.59.8 | v0.59.5, v0.59.6, v0.59.7, v0.59.8 |
 | v0.59.10 | v0.59.9 | v0.59.9, R2 |
 | v0.59.11 | v0.59.9 | v0.59.9 |
@@ -1648,16 +1648,17 @@ product, SQL, quality, lifecycle, deployment, and capacity work shifts to
 v0.59.10–v0.59.23. v0.59.24 remains a pure, blocking qualification gate over
 the finished product and may not introduce engine architecture.
 
-The order is binding for two reasons. First, v0.59.5 establishes real,
-independently identified workers and captures two baselines: B0 is the exact
-v0.59.4 artifact under the existing one-worker topology, while B1 is the
-v0.59.5 S1 artifact with the new worker substrate at 1/2/4/8 workers. The B0
-one-worker result is compared with B1 at one worker; any regression is
-quantified and explained, and a regression above 10% requires remediation or
-explicit approval. S2-S4 and v0.59.6-v0.59.9 compare against B1. Every
-architecture version republishes the same workload and raw profile so its
-throughput, latency, memory, logical-write, and physical-write effects are
-attributable rather than guessed. Second, observability and capacity calibration must
+The order is binding for two reasons. First, v0.59.5 was intended to establish
+real, independently identified workers and capture two baselines: B0 as the
+exact v0.59.4 artifact under the existing one-worker topology, and B1 as the
+v0.59.5 S1 artifact with the new worker substrate at 1/2/4/8 workers. That
+artifact capture did not occur, and the v0.59.5 implementation combined worker
+registration and delta-native changes in one commit. R1 does not fabricate or
+retroactively label a B1 artifact. Its developer-profile correction below
+rebuilds B0 source for a one-worker ordinary-workload comparison and uses
+paired current-candidate measurements for sharing, factorization, and local
+worker scaling. R2 restores the full production-profile comparison before the
+architecture freezes. Second, observability and capacity calibration must
 describe the architecture that will ship: arrangement sharing, factorization,
 delta persistence, commit grouping, and skew routing all change what should be
 measured and how state is sized. The large architectural choices freeze after
@@ -1672,22 +1673,24 @@ DSLs, SQL semantics contracts, and other surfaces that do not freeze runtime,
 storage, metric, deployment, or capacity assumptions may proceed in parallel.
 It must rebase and requalify against the v0.59.9 architecture before sign-off.
 
-**Binding benchmark contract.** From v0.59.5 onward, every performance artifact
-records CPU model and core count, CPU affinity and NUMA placement, memory and
-storage topology, placement of workers, Kafka, PostgreSQL, and MinIO, and
-whether infrastructure services share worker hosts. It also records warm-up
-duration, repetition count, variance and confidence interval, the open-loop
-offered-load schedule, load-generator and sink-consumer headroom, Kafka and
-MinIO utilization, input and checkpoint backlog slopes, compaction-debt slope,
-completed checkpoint and compaction cycles, and cost per million accepted
-changes. The harness must prove that the load generator, Kafka, MinIO,
-PostgreSQL, gateway client, oracle, and sink consumer each independently sustain
-at least 1.25x the candidate's maximum accepted rate at the same payload shape;
-otherwise the measured saturation point of that component is an explicit upper
-bound on candidate capacity. Sustainable throughput means the maximum
-offered rate at which the workload's p99 freshness SLO holds, input and
-checkpoint backlog slopes are non-positive, memory and queues remain bounded,
-and the declared minimum checkpoint and compaction cycle counts complete.
+**Binding benchmark contract.** Production-capacity artifacts, R2, and
+v0.59.24 record CPU model and core count, CPU affinity and NUMA placement,
+memory and storage topology, placement of workers, Kafka, PostgreSQL, and
+MinIO, and whether infrastructure services share worker hosts. They also record
+warm-up duration, repetition count, variance and confidence interval, the
+open-loop offered-load schedule, load-generator and sink-consumer headroom,
+Kafka and MinIO utilization, input and checkpoint backlog slopes,
+compaction-debt slope, completed checkpoint and compaction cycles, and cost per
+million accepted changes. The production harness must prove that the load
+generator, Kafka, MinIO, PostgreSQL, gateway client, oracle, and sink consumer
+each independently sustain at least 1.25x the candidate's maximum accepted rate
+at the same payload shape; otherwise the measured saturation point of that
+component is an explicit upper bound on candidate capacity. Sustainable
+throughput means the maximum offered rate at which the workload's p99 freshness
+SLO holds, input and checkpoint backlog slopes are non-positive, memory and
+queues remain bounded, and the declared minimum checkpoint and compaction cycle
+counts complete. R1 uses the bounded developer-profile exception below and
+makes no production-capacity claim.
 
 To make the estimate auditable, v0.59.5 and v0.59.9 have mandatory internal
 sign-off slices, and the split rule above applies to each one:
@@ -1702,28 +1705,53 @@ sign-off slices, and the split rule above applies to each one:
    localized arrangement rebuilds, and frontier-pinned serving replicas are an
    optional S5 admitted only by the measurements named in the v0.59.9 row.
 
-**Scalability Value Review — R1.** This is a mandatory proof prerequisite
-after v0.59.7 and before v0.59.8. Re-run the exact B0/B1 workload corpus and
-determine whether delta-native persistence, durable shared arrangements, and
-factorized/filtered IVM have materially reduced work per changed row, state per
-logical fact, and intermediate and network data per change. Publish
-`sign-offs/scalability-value-review-v0.59.7.md` with raw evidence and a
-`GREEN`, `YELLOW`, or `RED` decision. `GREEN` requires every asymptotic property
-below to pass, no ordinary-workload regression above 10%, material arrangement
-state savings, material factorization amplification reduction, and an
-encouraging four-worker trajectory. `YELLOW` pauses v0.59.8 for one focused
-profiling and redesign cycle. `RED` reopens the owning v0.59.5–v0.59.7 version;
-v0.59.8 may not begin.
+**Scalability Value Review - R1 developer profile.** This remains a mandatory
+proof prerequisite after v0.59.7 and before v0.59.8, but it answers an
+architecture-value question rather than certifying production capacity. Run it
+on the named `MBP-M5Pro-48GB-v1` profile: a 16-inch MacBook Pro with M5 Pro and
+48 GB RAM, on AC power with Low Power Mode disabled. Record the exact CPU/core
+layout, macOS and filesystem versions, build identity, available memory, Docker
+Desktop version/allocation when used, and whether a platform control such as
+CPU affinity, NUMA placement, or hardware counters is unsupported. Unsupported
+platform controls are recorded rather than fabricated.
 
-| R1 property | Gate |
+Use native LFS for scored storage measurements and public PGWire/process
+surfaces for end-to-end checks. Kafka, PostgreSQL CDC, MinIO, eight-worker,
+state-over-RAM, multi-host network, cost, and production headroom measurements
+remain mandatory at R2/v0.59.24 but are not R1 prerequisites. Rebuild
+`a4e4ad4` on the same profile as the one-worker ordinary-workload baseline; do
+not invent B1. Run five alternating paired repetitions for timing/resource
+rows, giving five samples per comparison side. Publish every raw sample and
+require coefficient of variation no greater than 15%. For the five samples,
+use sample CV `sqrt(sum((x_i - mean)^2) / 4) / abs(mean)`; five all-zero values
+have CV zero and a zero mean with any nonzero value is invalid. Deterministic
+structural rows use exact counters and complete output.
+
+The local corpus is fixed before measurement: 1K/100K/10M live groups for the
+one-key persistence proof; 100K source rows for one-versus-twenty arrangement
+sharing; at least 10K changed rows and fan-out 100 for factorized
+join-to-aggregate; 100K rows for ordinary aggregate/join regression; and 100K
+live groups plus a fixed change stream for 1/2/4 real-worker scaling. Every
+workload includes inserts, updates, deletes/retractions, and complete multiset
+comparison against an independent oracle.
+
+Publish `sign-offs/scalability-value-review-v0.59.7.md` plus machine-readable
+local raw evidence with a `GREEN`, `YELLOW`, or `RED` decision. `GREEN` requires
+every row below to pass. `YELLOW` means all correctness and structural rows pass
+but exactly one timing/resource row needs one focused profiling cycle. `RED`
+means any wrong result, full-state scan, missing evidence, idle declared worker,
+measurement that remains unstable after one complete clean rerun, or more than
+one failed timing/resource row. v0.59.8 may not begin until GREEN.
+
+| R1 developer-profile property | GREEN gate |
 |---|---|
-| One-key persistence versus 1K/100K/10M state | Approximately constant |
-| Twenty shared consumers versus one | ≤1.5× shared arrangement state |
-| Shared source-index maintenance CPU | ≤1.5× one-consumer case |
-| High-fan-out factorized intermediate reduction | ≥10× on the target workload |
-| Factorized throughput or resource improvement | ≥2× throughput or ≥50% CPU/network reduction |
-| Ordinary-workload regression | ≤10% |
-| Four-worker uniform aggregate | GREEN ≥2.5×; YELLOW 2.0–2.5×; RED <2.0× |
+| One-key persistence at 1K/100K/10M live groups | Same mutation count per operation, ≤10% logical-byte variation, zero full-state entries visited |
+| Twenty shared consumers versus one at 100K source rows | ≤1.5× logical and LFS state; at least 80% less state than twenty private arrangements |
+| Shared source-index maintenance | ≤1.5× key/trace work and ≤1.75× process CPU per accepted change |
+| Factorized intermediate reduction at fan-out 100 | ≥10× fewer flattened intermediate tuples |
+| Factorized throughput or resource improvement | ≥1.5× throughput or both CPU and encoded exchange bytes per accepted, query-visible change reduced by ≥33% |
+| One-worker ordinary aggregate/join versus rebuilt B0 | Throughput and p99 freshness regress by ≤15% |
+| Real-worker uniform aggregate at 1/2/4 workers | All workers own shards and do nonzero work; GREEN ≥2.0× at four workers; YELLOW ≥1.5× and <2.0×; RED <1.5× |
 
 **Architecture Exit Review — R2.** This is a mandatory proof prerequisite
 after v0.59.9 and before v0.59.10 or any architecture-dependent later sign-off.
@@ -1776,6 +1804,13 @@ not be selected merely because it is slightly below an already observed result.
 v0.23-v0.59.24 is all active base models: M1-M4 and M6-M7, plus every admitted
 v0.59.x protocol variant. M5 was retired by v0.52.4 and is not a release
 prerequisite.
+
+**Active R1 proof-status correction.** The `Done` labels on v0.59.5-v0.59.7
+mean their implementation slices and then-declared tests were completed. Their
+scalability-value proof is reopened by the R1 review and they are not complete
+under this roadmap's proof definition until local R1 is GREEN. Local R1
+supersedes only their unavailable developer-profile evidence. Their full
+production-profile performance obligations remain binding at R2/v0.59.24.
 
 | Version | Focus | Scope | Proof | Backends |
 |---|---|---|---|---|
