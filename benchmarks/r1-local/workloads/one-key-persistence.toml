@@ -1,0 +1,6 @@
+name = "one-key-persistence"
+seed = 5907001
+kind = "structural"
+live_groups = [1000, 100000, 10000000]
+operations = ["insert", "update", "delete"]
+sql = "sql/one-key-persistence.sql"

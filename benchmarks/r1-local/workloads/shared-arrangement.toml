@@ -1,0 +1,6 @@
+name = "shared-arrangement"
+seed = 5907002
+source_rows = 100000
+consumer_counts = [1, 20]
+arrangement_modes = ["shared", "private"]
+sql = "sql/shared-arrangement.sql"

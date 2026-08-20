@@ -1,0 +1,7 @@
+name = "uniform-worker-scaling"
+seed = 5907006
+source_rows = 100000
+live_groups = 100000
+workers = [1, 2, 4]
+distribution = "uniform"
+sql = "sql/uniform-worker-scaling.sql"

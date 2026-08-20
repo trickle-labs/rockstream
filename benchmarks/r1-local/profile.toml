@@ -1,0 +1,35 @@
+contract_version = 1
+profile_id = "MBP-M5Pro-48GB-v1"
+revision = 1
+state = "unsealed"
+
+[required_machine]
+form_factor = "16-inch MacBook Pro"
+chip = "Apple M5 Pro"
+memory_bytes = 51539607552
+storage = "native_lfs"
+ac_power = true
+low_power_mode = false
+
+[observed]
+model = ""
+performance_cores = 0
+efficiency_cores = 0
+macos_version = ""
+filesystem = ""
+available_disk_bytes = 0
+rust_target = ""
+rust_toolchain = ""
+thermal_pressure_before = ""
+thermal_pressure_after = ""
+free_memory_bytes_before = 0
+free_memory_bytes_after = 0
+docker_desktop_version = ""
+docker_cpu_allocation = 0
+docker_memory_bytes = 0
+unsupported_controls = []
+build_flags = []
+enabled_features = []
+lockfile_sha256 = ""
+source_sha = ""
+binary_sha256 = ""

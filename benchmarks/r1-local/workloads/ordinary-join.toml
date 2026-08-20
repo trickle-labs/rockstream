@@ -1,0 +1,7 @@
+name = "ordinary-join"
+seed = 5907005
+source_rows = 100000
+dimension_rows = 1000
+workers = 1
+candidates = ["b0-v0.59.4-local-rebuild", "current"]
+sql = "sql/ordinary-join.sql"

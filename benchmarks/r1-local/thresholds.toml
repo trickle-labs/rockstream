@@ -1,0 +1,35 @@
+contract_version = 1
+
+[sampling]
+repetitions = 5
+max_sample_cv = 0.15
+
+[one_key_persistence]
+live_groups = [1000, 100000, 10000000]
+max_logical_byte_ratio = 1.10
+max_full_state_entries_visited = 0
+require_identical_mutation_counts = true
+
+[shared_state]
+max_shared_20_to_shared_1_ratio = 1.50
+max_shared_20_to_private_20_ratio = 0.20
+
+[shared_source_index]
+max_key_build_ratio = 1.50
+max_trace_rows_written_ratio = 1.50
+max_cpu_per_accepted_change_ratio = 1.75
+
+[factorized]
+min_classic_to_factorized_intermediate_ratio = 10.0
+min_throughput_ratio = 1.50
+max_cpu_per_visible_change_ratio = 0.67
+max_exchange_bytes_per_visible_change_ratio = 0.67
+
+[ordinary_regression]
+min_throughput_ratio = 0.85
+max_p99_freshness_ratio = 1.15
+
+[worker_scaling]
+min_four_to_one_throughput_ratio = 2.00
+yellow_min_four_to_one_throughput_ratio = 1.50
+require_nonzero_work_per_worker = true

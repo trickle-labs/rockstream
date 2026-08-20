@@ -1,0 +1,8 @@
+name = "factorized-join"
+seed = 5907003
+source_rows = 100000
+dimension_rows = 1000
+changed_rows = 10000
+fan_out = 100
+strategies = ["classic", "factorized"]
+sql = "sql/factorized-join.sql"
