@@ -26,6 +26,7 @@ use rockstream_types::ids::OperatorId;
 use crate::aggregate::{append_agg_state, persist_agg_state, AggregateOp};
 use crate::distinct::{persist_distinct_state, DistinctOp};
 use crate::error::OpError;
+use crate::factorized::FactorizedJoinAggregateOp;
 use crate::join::JoinOp;
 use crate::op::Operator;
 use crate::outer_join::OuterJoinOp;
@@ -1359,6 +1360,7 @@ impl MultiAggregatePipeline {
 pub enum JoinKind {
     Inner(Arc<JoinOp>),
     Outer(Arc<OuterJoinOp>),
+    Factorized(Arc<FactorizedJoinAggregateOp>),
 }
 
 impl JoinKind {
@@ -1366,6 +1368,7 @@ impl JoinKind {
         match self {
             JoinKind::Inner(op) => op.process_epoch(left, right),
             JoinKind::Outer(op) => op.process_epoch(left, right),
+            JoinKind::Factorized(op) => op.process_epoch(left, right),
         }
     }
 
@@ -1373,13 +1376,15 @@ impl JoinKind {
         match self {
             JoinKind::Inner(op) => op.persist_state(db).await,
             JoinKind::Outer(op) => op.persist_state(db).await,
+            JoinKind::Factorized(op) => op.persist_state(db).await,
         }
     }
 
-    fn append_state(&self, target: &mut WriteBatch) -> Result<(), OpError> {
+    async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
         match self {
             JoinKind::Inner(op) => op.append_state(target),
             JoinKind::Outer(op) => op.append_state(target),
+            JoinKind::Factorized(op) => op.append_state_with_db(db, target).await,
         }
     }
 
@@ -1393,6 +1398,7 @@ impl JoinKind {
         match self {
             JoinKind::Inner(op) => op.restore_in_place(db).await,
             JoinKind::Outer(_) => Ok(()),
+            JoinKind::Factorized(op) => op.restore_in_place(db).await,
         }
     }
 }
@@ -1437,6 +1443,21 @@ impl JoinPipeline {
         }
     }
 
+    pub fn strategy(&self) -> &'static str {
+        match &self.join {
+            JoinKind::Factorized(_) => "factorized",
+            JoinKind::Inner(_) | JoinKind::Outer(_) => "classic",
+        }
+    }
+
+    pub fn selection_rule_version(&self) -> u32 {
+        crate::governor::FACTORIZED_SELECTION_RULE_VERSION
+    }
+
+    pub fn predicate_transfer_rule_version(&self) -> u32 {
+        1
+    }
+
     /// Process one commit's left-source delta and right-source delta
     /// (either or both may be empty) through the full join pipeline,
     /// returning the combined output delta.
@@ -1478,7 +1499,7 @@ impl JoinPipeline {
     }
 
     pub async fn append_state(&self, db: &ShardDb, target: &mut WriteBatch) -> Result<(), OpError> {
-        self.join.append_state(target)?;
+        self.join.append_state(db, target).await?;
         for stage in self
             .left_pre
             .iter()

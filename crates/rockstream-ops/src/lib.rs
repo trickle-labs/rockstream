@@ -22,7 +22,9 @@ pub mod distinct;
 pub mod embedded;
 pub mod error;
 pub mod expr;
+pub mod factorized;
 pub mod filter;
+pub mod governor;
 pub mod group_commit;
 pub mod index_arrange;
 pub mod join;
@@ -67,7 +69,16 @@ pub use distinct::{
     load_distinct_state, persist_distinct_state, DistinctOp, DualArrangement, ExceptOp, IntersectOp,
 };
 pub use error::OpError;
+pub use factorized::{
+    FactorizedAggregateKind, FactorizedJoinAggregateOp, FactorizedStarJoinOp,
+    MAX_FACTOR_PAYLOAD_BYTES, MAX_FACTOR_PAYLOAD_ROWS,
+};
 pub use filter::FilterOp;
+pub use governor::{
+    AmplificationDimension, DeltaAmplificationBudget, DeltaAmplificationCounters,
+    DeltaAmplificationGovernor, PlanStrategy, DEFAULT_FACTORIZED_DELTA_BUDGET,
+    FACTORIZED_SELECTION_RULE_VERSION,
+};
 pub use group_commit::{GroupCommit, GROUP_COMMIT_MAX_BATCHES};
 pub use join::JoinOp;
 pub use lateral::LateralOp;

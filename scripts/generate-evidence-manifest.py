@@ -81,7 +81,7 @@ def get_workspace_version(root: Path) -> str:
             line = line.strip()
             if line.startswith("version = "):
                 return line.split("=")[1].strip().strip('"')
-    return "0.59.6"
+    return "0.59.7"
 
 def generate_manifest(root: Path, out_path: Path) -> dict:
     lockfile_path = root / "Cargo.lock"

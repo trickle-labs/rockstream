@@ -41,5 +41,7 @@ async fn root_migrate_dispatches_and_reports_exact_results() {
 fn root_migrate_rejects_unsupported_transition_with_rs0002() {
     let error = run_format_migrate(OutputFormat::Text, 3, 4, "/tmp/does-not-matter").unwrap_err();
     assert_eq!(error.code.to_string(), "RS-0002");
-    assert!(error.message.contains("storage format migration 3→4 is not supported"));
+    assert!(error
+        .message
+        .contains("storage format migration 3→4 is not supported"));
 }

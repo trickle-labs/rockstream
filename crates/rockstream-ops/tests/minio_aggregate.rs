@@ -16,6 +16,7 @@ use object_store::ObjectStore;
 use rockstream_ops::aggregate::{load_frontier, persist_agg_state, persist_frontier, AggregateOp};
 use rockstream_ops::group_commit::GroupCommit;
 use rockstream_ops::zset::ArrowZSet;
+use rockstream_ops::{FactorizedAggregateKind, FactorizedJoinAggregateOp};
 use rockstream_storage::{ShardDb, WriteBatch};
 use rockstream_types::ids::OperatorId;
 use sha2::{Digest, Sha256};
@@ -225,6 +226,88 @@ async fn minio_aggregate_writes_and_persists() {
             .unwrap();
         assert_eq!(op.live_groups(), 2, "2 live groups must survive on MinIO");
     }
+}
+
+#[tokio::test]
+async fn factorized_join_replays_and_retracts_on_minio() {
+    assert!(docker_available(), "Docker is required for the MinIO proof");
+    let (_container, port) = start_minio().await;
+    {
+        let db = open_shard_db_minio(port, "factorized-join").await;
+        let op = FactorizedJoinAggregateOp::new(
+            OperatorId(59_701),
+            vec![0],
+            vec![0],
+            2,
+            2,
+            0,
+            3,
+            FactorizedAggregateKind::Sum,
+        );
+        assert!(op
+            .process_epoch(
+                make_kv_batch(&[(1, 2, 1)]),
+                ArrowZSet::empty(make_kv_batch(&[]).schema())
+            )
+            .unwrap()
+            .is_empty());
+        let mut writes = WriteBatch::new();
+        op.append_state_with_db(&db, &mut writes).await.unwrap();
+        db.write_batch(writes).await.unwrap();
+        db.flush().await.unwrap();
+        Arc::try_unwrap(db)
+            .ok()
+            .expect("single owner")
+            .close()
+            .await
+            .unwrap();
+    }
+    let db = open_shard_db_minio(port, "factorized-join").await;
+    let restored = FactorizedJoinAggregateOp::new(
+        OperatorId(59_701),
+        vec![0],
+        vec![0],
+        2,
+        2,
+        0,
+        3,
+        FactorizedAggregateKind::Sum,
+    );
+    restored.restore_in_place(&db).await.unwrap();
+    let inserted = restored
+        .process_epoch(
+            ArrowZSet::empty(make_kv_batch(&[]).schema()),
+            make_kv_batch(&[(1, 5, 1)]),
+        )
+        .unwrap();
+    assert_eq!(inserted.weights, vec![1]);
+    assert_eq!(
+        inserted
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .values(),
+        &[5]
+    );
+    let retracted = restored
+        .process_epoch(
+            ArrowZSet::empty(make_kv_batch(&[]).schema()),
+            make_kv_batch(&[(1, 5, -1)]),
+        )
+        .unwrap();
+    assert_eq!(retracted.weights, vec![-1]);
+    assert_eq!(
+        retracted
+            .data
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .values(),
+        &[5]
+    );
 }
 
 // ─── Test 2: GroupCommit reduces durability events ≥5× on MinIO ──────────────

@@ -3,7 +3,7 @@ use rockstream_types::candidate_identity::CandidateIdentity;
 #[test]
 fn test_candidate_identity_fields_populated() {
     let id = CandidateIdentity::current();
-    assert_eq!(id.semantic_version, "0.59.6");
+    assert_eq!(id.semantic_version, "0.59.7");
     assert!(!id.commit_sha.is_empty(), "commit_sha must not be empty");
     assert!(
         !id.build_timestamp_rfc3339.is_empty(),
@@ -50,7 +50,7 @@ fn test_candidate_identity_serialization_roundtrip() {
 fn test_candidate_identity_display_text() {
     let id = CandidateIdentity::current();
     let display = id.display_text();
-    assert!(display.contains("rockstream 0.59.6"));
+    assert!(display.contains("rockstream 0.59.7"));
     assert!(display.contains(&format!("commit: {}", id.commit_sha)));
     assert!(display.contains(&format!("lockfile_digest: {}", id.lockfile_digest)));
 }

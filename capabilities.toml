@@ -1,5 +1,5 @@
 [contract]
-version = "v0.59.6"
+version = "v0.59.7"
 
 roadmap = "NEW_ROADMAP.md"
 promise = "RockStream ingests changing data, continuously maintains a documented SQL subset as durable materialized views, and serves globally committed results to PostgreSQL-compatible clients while surviving ordinary distributed-system failures without losing or silently corrupting committed state."

@@ -25,6 +25,7 @@ pub mod explain;
 pub mod frontier;
 pub mod identity;
 pub mod ids;
+pub mod key_capsule;
 pub mod laws;
 pub mod lease;
 pub mod merge_law;
@@ -57,6 +58,7 @@ pub use evidence_manifest::{
     WorkflowRunInfo,
 };
 pub use ids::{ArrangementId, TenantId};
+pub use key_capsule::{KeyCapsule, KeyCapsuleError, KeyValue};
 pub use state_mutation::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 
 /// Timestamp types.

@@ -63,6 +63,11 @@ pub const TK_DISCRIMINATOR: [u8; 2] = [0x54, 0x4B];
 /// Recursion arrangement discriminator bytes (v0.50): ASCII 'R', 'C'.
 pub const RC_DISCRIMINATOR: [u8; 2] = [0x52, 0x43];
 
+/// Factorized payload arrangement discriminator (v0.59.7): ASCII `FP`.
+pub const FACTOR_PAYLOAD_DISCRIMINATOR: [u8; 2] = [0x46, 0x50];
+/// Factorized operator metadata discriminator (v0.59.7): ASCII `FG`.
+pub const FACTOR_GOVERNOR_DISCRIMINATOR: [u8; 2] = [0x46, 0x47];
+
 /// Left/right side discriminator for join arrangements (v0.8 — IVM-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinSide {
@@ -151,7 +156,7 @@ impl ShardKeyEncoder {
         Some((prefix, operator_id, suffix))
     }
 
-    /// Encode a join arrangement key: `[0x01][side_disc:2][op_id:8][join_key][row_id:16]`
+    /// Encode a join arrangement key using the shared capsule bytes.
     pub fn join_arr_key(side: JoinSide, op_id: u64, join_key: &[u8], row_id: u128) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + 2 + 8 + join_key.len() + 16);
         key.push(ShardPrefix::OpState.as_byte());
@@ -199,6 +204,43 @@ impl ShardKeyEncoder {
         prefix.extend_from_slice(&side.disc_bytes());
         prefix.extend_from_slice(&op_id.to_be_bytes());
         prefix
+    }
+
+    /// Encode a factorized payload node with one shared capsule key.
+    pub fn factor_payload_key(
+        side: JoinSide,
+        op_id: u64,
+        capsule_bytes: &[u8],
+        row_id: u128,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 2 + 8 + 4 + capsule_bytes.len() + 16);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.extend_from_slice(&FACTOR_PAYLOAD_DISCRIMINATOR);
+        key.extend_from_slice(&side.disc_bytes());
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key.extend_from_slice(&(capsule_bytes.len() as u32).to_be_bytes());
+        key.extend_from_slice(capsule_bytes);
+        key.extend_from_slice(&row_id.to_be_bytes());
+        key
+    }
+
+    /// Prefix for point/scan cleanup of factorized payload nodes.
+    pub fn factor_payload_op_prefix(side: JoinSide, op_id: u64) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(1 + 2 + 2 + 8);
+        prefix.push(ShardPrefix::OpState.as_byte());
+        prefix.extend_from_slice(&FACTOR_PAYLOAD_DISCRIMINATOR);
+        prefix.extend_from_slice(&side.disc_bytes());
+        prefix.extend_from_slice(&op_id.to_be_bytes());
+        prefix
+    }
+
+    /// Key for the factorized operator's durable governor counters.
+    pub fn factor_governor_key(op_id: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 2 + 8);
+        key.push(ShardPrefix::OpState.as_byte());
+        key.extend_from_slice(&FACTOR_GOVERNOR_DISCRIMINATOR);
+        key.extend_from_slice(&op_id.to_be_bytes());
+        key
     }
 
     /// Build the prefix bytes for scanning all keys of a given operator.

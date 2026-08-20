@@ -22,7 +22,7 @@ members = [
 overflow-checks = true
 
 [workspace.package]
-version = "0.59.6"
+version = "0.59.7"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"

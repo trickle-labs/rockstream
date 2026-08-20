@@ -46,6 +46,7 @@ use tracing::debug;
 
 use rockstream_storage::{JoinSide, ShardDb, ShardKeyEncoder, WriteBatch};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::KeyCapsule;
 
 use crate::error::OpError;
 use crate::zset::ArrowZSet;
@@ -310,17 +311,18 @@ impl JoinOp {
     }
 
     /// Extract the join key bytes from a row (as big-endian i64 bytes concatenated).
-    fn extract_key(row: &RecordBatch, row_idx: usize, key_cols: &[usize]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(key_cols.len() * 8);
-        for &col in key_cols {
-            let arr = row
-                .column(col)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("join key column must be Int64");
-            key.extend_from_slice(&arr.value(row_idx).to_be_bytes());
-        }
-        key
+    fn extract_key(
+        row: &RecordBatch,
+        row_idx: usize,
+        key_cols: &[usize],
+    ) -> Result<Option<Vec<u8>>, OpError> {
+        let arrays: Vec<&dyn arrow::array::Array> = key_cols
+            .iter()
+            .map(|column| row.column(*column).as_ref())
+            .collect();
+        let capsule = KeyCapsule::from_arrays(&arrays, row_idx)
+            .map_err(|error| OpError::unsupported_plan_node(error.to_string()))?;
+        Ok((!capsule.contains_null()).then(|| capsule.typed_bytes().to_vec()))
     }
 
     /// Serialize all columns of a row (excluding any weight column) as bytes.
@@ -375,7 +377,10 @@ impl JoinOp {
 
         for row_idx in 0..delta.num_rows() {
             let w = delta.weights[row_idx];
-            let join_key = Self::extract_key(&delta.data, row_idx, &self.left_key_cols);
+            let Some(join_key) = Self::extract_key(&delta.data, row_idx, &self.left_key_cols)?
+            else {
+                continue;
+            };
             let row_bytes = Self::serialize_row(&delta.data, row_idx);
             let row_id = stable_row_id(self.op_id.0, &join_key, &row_bytes);
 
@@ -422,7 +427,10 @@ impl JoinOp {
 
         for row_idx in 0..delta.num_rows() {
             let w = delta.weights[row_idx];
-            let join_key = Self::extract_key(&delta.data, row_idx, &self.right_key_cols);
+            let Some(join_key) = Self::extract_key(&delta.data, row_idx, &self.right_key_cols)?
+            else {
+                continue;
+            };
             let row_bytes = Self::serialize_row(&delta.data, row_idx);
             let row_id = stable_row_id(self.op_id.0, &join_key, &row_bytes);
 

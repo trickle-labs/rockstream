@@ -28,6 +28,7 @@ use arrow::record_batch::RecordBatch;
 use rockstream_plan::OuterJoinKind;
 use rockstream_storage::{JoinSide, ShardDb, ShardKeyEncoder, WriteBatch};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::KeyCapsule;
 
 use crate::error::OpError;
 use crate::join::{concat_zsets, stable_row_id};
@@ -242,17 +243,22 @@ impl OuterJoinOp {
         }
     }
 
-    fn extract_key(row: &RecordBatch, row_idx: usize, key_cols: &[usize]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(key_cols.len() * 8);
-        for &col in key_cols {
-            let arr = row
-                .column(col)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("join key column must be Int64");
-            key.extend_from_slice(&arr.value(row_idx).to_be_bytes());
-        }
-        key
+    pub fn kind(&self) -> OuterJoinKind {
+        self.kind
+    }
+
+    fn extract_key(
+        row: &RecordBatch,
+        row_idx: usize,
+        key_cols: &[usize],
+    ) -> Result<(Vec<u8>, bool), OpError> {
+        let arrays: Vec<&dyn arrow::array::Array> = key_cols
+            .iter()
+            .map(|column| row.column(*column).as_ref())
+            .collect();
+        let capsule = KeyCapsule::from_arrays(&arrays, row_idx)
+            .map_err(|error| OpError::unsupported_plan_node(error.to_string()))?;
+        Ok((capsule.typed_bytes().to_vec(), capsule.contains_null()))
     }
 
     fn serialize_row(batch: &RecordBatch, row_idx: usize) -> Vec<u8> {
@@ -323,34 +329,48 @@ impl OuterJoinOp {
     }
 
     /// Stage a left delta into left_staged (no probing yet).
-    fn stage_left(&self, delta: &ArrowZSet) {
+    fn stage_left(&self, delta: &ArrowZSet) -> Result<(), OpError> {
         let mut staged = self.left_staged.lock().unwrap();
         for row_idx in 0..delta.num_rows() {
             let w = delta.weights[row_idx];
-            let join_key = Self::extract_key(&delta.data, row_idx, &self.left_key_cols);
+            let (capsule_key, is_null) =
+                Self::extract_key(&delta.data, row_idx, &self.left_key_cols)?;
             let row_bytes = Self::serialize_row(&delta.data, row_idx);
-            let row_id = stable_row_id(self.op_id.0, &join_key, &row_bytes);
+            let row_id = stable_row_id(self.op_id.0, &capsule_key, &row_bytes);
+            let join_key = if is_null {
+                [capsule_key, row_id.to_be_bytes().to_vec()].concat()
+            } else {
+                capsule_key
+            };
             staged.push(join_key, row_id, row_bytes, w);
         }
+        Ok(())
     }
 
     /// Stage a right delta into right_staged (no probing yet).
-    fn stage_right(&self, delta: &ArrowZSet) {
+    fn stage_right(&self, delta: &ArrowZSet) -> Result<(), OpError> {
         let mut staged = self.right_staged.lock().unwrap();
         for row_idx in 0..delta.num_rows() {
             let w = delta.weights[row_idx];
-            let join_key = Self::extract_key(&delta.data, row_idx, &self.right_key_cols);
+            let (capsule_key, is_null) =
+                Self::extract_key(&delta.data, row_idx, &self.right_key_cols)?;
             let row_bytes = Self::serialize_row(&delta.data, row_idx);
-            let row_id = stable_row_id(self.op_id.0, &join_key, &row_bytes);
+            let row_id = stable_row_id(self.op_id.0, &capsule_key, &row_bytes);
+            let join_key = if is_null {
+                [capsule_key, row_id.to_be_bytes().to_vec()].concat()
+            } else {
+                capsule_key
+            };
             staged.push(join_key, row_id, row_bytes, w);
         }
+        Ok(())
     }
 
     // ─── LEFT JOIN ────────────────────────────────────────────────────────────
 
     fn process_epoch_left(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left);
-        self.stage_right(&right);
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
 
         let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
         let mut outputs: Vec<ArrowZSet> = Vec::new();
@@ -478,8 +498,8 @@ impl OuterJoinOp {
     // ─── RIGHT JOIN ───────────────────────────────────────────────────────────
 
     fn process_epoch_right(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left);
-        self.stage_right(&right);
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
 
         let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
         let mut outputs: Vec<ArrowZSet> = Vec::new();
@@ -595,8 +615,8 @@ impl OuterJoinOp {
     // ─── FULL OUTER JOIN ──────────────────────────────────────────────────────
 
     fn process_epoch_full(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left);
-        self.stage_right(&right);
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
 
         let out_schema = outer_join_output_schema_n(self.left_n_cols, self.right_n_cols);
         let mut outputs: Vec<ArrowZSet> = Vec::new();
@@ -794,8 +814,8 @@ impl OuterJoinOp {
     // ─── SEMI JOIN ────────────────────────────────────────────────────────────
 
     fn process_epoch_semi(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left);
-        self.stage_right(&right);
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
 
         let out_schema = semi_anti_output_schema_n(self.left_n_cols);
         let mut outputs: Vec<ArrowZSet> = Vec::new();
@@ -867,8 +887,8 @@ impl OuterJoinOp {
     // ─── ANTI JOIN ────────────────────────────────────────────────────────────
 
     fn process_epoch_anti(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
-        self.stage_left(&left);
-        self.stage_right(&right);
+        self.stage_left(&left)?;
+        self.stage_right(&right)?;
 
         let out_schema = semi_anti_output_schema_n(self.left_n_cols);
         let mut outputs: Vec<ArrowZSet> = Vec::new();

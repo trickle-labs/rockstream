@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use rockstream_plan::{AggregateFunc, Expr, PlanNode};
+use rockstream_plan::{AggregateFunc, Expr, OuterJoinKind, PlanNode};
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::OperatorId;
 
@@ -48,7 +48,12 @@ use crate::aggregate::{AggregateOp, DecimalAggregateFormatOp};
 use crate::distinct::DistinctOp;
 use crate::error::OpError;
 use crate::expr::lit;
+use crate::factorized::{FactorizedAggregateKind, FactorizedJoinAggregateOp};
 use crate::filter::FilterOp;
+use crate::governor::{
+    DeltaAmplificationCounters, DeltaAmplificationGovernor, PlanStrategy,
+    DEFAULT_FACTORIZED_DELTA_BUDGET,
+};
 use crate::join::JoinOp;
 use crate::live_exec::{
     int64_schema, next_stateful_op_id, with_view_id_scope, GroupKeyPacker, JoinKind, JoinPipeline,
@@ -92,6 +97,18 @@ pub struct CompiledView {
     pub view_name: String,
     /// Primary-key column indices for the view.
     pub pk: Vec<usize>,
+}
+
+impl CompiledView {
+    pub fn strategy(&self) -> &'static str {
+        self.join
+            .as_ref()
+            .map_or("classic", |join| join.pipeline.strategy())
+    }
+
+    pub fn selection_rule_version(&self) -> u32 {
+        crate::governor::FACTORIZED_SELECTION_RULE_VERSION
+    }
 }
 
 /// Compile `plan` (which must be rooted at `PlanNode::ViewSink`) into a
@@ -317,6 +334,8 @@ pub(crate) struct JoinShape {
     pub(crate) post: Vec<Stage>,
     pub(crate) left_source: String,
     pub(crate) right_source: String,
+    left_n_cols: usize,
+    right_n_cols: usize,
     /// Running output column count after `post` (so far) is applied — the
     /// join's own `left_n_cols + right_n_cols` initially, updated by
     /// `Project`/`Aggregate`/`Window` wrapping arms as they change
@@ -324,6 +343,17 @@ pub(crate) struct JoinShape {
     /// constructor requires the *input* column count, since
     /// `try_compile_join_shape` doesn't otherwise track schema at all.
     post_n_cols: usize,
+    factorized_spec: Option<FactorizedJoinSpec>,
+}
+
+struct FactorizedJoinSpec {
+    left_pre: Vec<Stage>,
+    right_pre: Vec<Stage>,
+    left_keys: Vec<usize>,
+    right_keys: Vec<usize>,
+    left_n_cols: usize,
+    right_n_cols: usize,
+    op_id: OperatorId,
 }
 
 /// Compile one side of a join (`left` or `right` of `PlanNode::InnerJoin`/
@@ -443,6 +473,168 @@ fn compile_join_side(
     Ok((stages, packed_schema, table_name, utf8_packers))
 }
 
+fn factorized_side_specs(
+    left: &PlanNode,
+    right: &PlanNode,
+    left_keys: &[usize],
+    right_keys: &[usize],
+    table_schemas: &HashMap<String, SchemaRef>,
+    op_id: OperatorId,
+) -> Result<Option<FactorizedJoinSpec>, OpError> {
+    let Some(left_source) = find_source_name(left) else {
+        return Ok(None);
+    };
+    let Some(right_source) = find_source_name(right) else {
+        return Ok(None);
+    };
+    let left_source_schema = table_schemas
+        .get(&left_source)
+        .cloned()
+        .unwrap_or_else(|| Arc::new(Schema::empty()));
+    let right_source_schema = table_schemas
+        .get(&right_source)
+        .cloned()
+        .unwrap_or_else(|| Arc::new(Schema::empty()));
+    let Ok((left_pre, left_schema)) = compile_node(left, &left_source_schema) else {
+        return Ok(None);
+    };
+    let Ok((right_pre, right_schema)) = compile_node(right, &right_source_schema) else {
+        return Ok(None);
+    };
+    if !factorized_schema_supported(&left_schema, left_keys)
+        || !factorized_schema_supported(&right_schema, right_keys)
+    {
+        return Ok(None);
+    }
+    Ok(Some(FactorizedJoinSpec {
+        left_pre,
+        right_pre,
+        left_keys: left_keys.to_vec(),
+        right_keys: right_keys.to_vec(),
+        left_n_cols: left_schema.fields().len(),
+        right_n_cols: right_schema.fields().len(),
+        op_id,
+    }))
+}
+
+fn factorized_schema_supported(schema: &SchemaRef, key_cols: &[usize]) -> bool {
+    schema
+        .fields()
+        .iter()
+        .all(|field| matches!(field.data_type(), DataType::Int64 | DataType::Utf8))
+        && key_cols.iter().all(|column| {
+            schema
+                .fields()
+                .get(*column)
+                .is_some_and(|field| matches!(field.data_type(), DataType::Int64 | DataType::Utf8))
+        })
+}
+
+fn factorized_compile_estimate(spec: &FactorizedJoinSpec) -> DeltaAmplificationCounters {
+    let input_deltas = (spec.left_n_cols + spec.right_n_cols) as u64;
+    DeltaAmplificationCounters {
+        input_deltas,
+        probes: (spec.left_n_cols as u64).saturating_mul(spec.right_n_cols as u64),
+        shuffled_bytes: input_deltas.saturating_mul(8),
+        intermediate_tuples: 0,
+        output_deltas: 1,
+        state_writes: input_deltas,
+    }
+}
+
+fn remap_predicate(expr: &Expr, map: &impl Fn(usize) -> Option<usize>) -> Option<Expr> {
+    Some(match expr {
+        Expr::Column(column) => Expr::Column(map(*column)?),
+        Expr::Literal(value) => Expr::Literal(value.clone()),
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op: *op,
+            left: Box::new(remap_predicate(left, map)?),
+            right: Box::new(remap_predicate(right, map)?),
+        },
+        Expr::ScalarUdf { name, args } => Expr::ScalarUdf {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| remap_predicate(arg, map))
+                .collect::<Option<Vec<_>>>()?,
+        },
+        Expr::Case {
+            when_then,
+            else_expr,
+        } => Expr::Case {
+            when_then: when_then
+                .iter()
+                .map(|(when, then)| {
+                    Some((remap_predicate(when, map)?, remap_predicate(then, map)?))
+                })
+                .collect::<Option<Vec<_>>>()?,
+            else_expr: Box::new(remap_predicate(else_expr, map)?),
+        },
+    })
+}
+
+fn transfer_predicate(shape: &mut JoinShape, predicate: &Expr) -> bool {
+    if !shape.post.is_empty() {
+        return false;
+    }
+    let left_n_cols = shape.left_n_cols;
+    let right_n_cols = shape.right_n_cols;
+    let total_n_cols = left_n_cols + right_n_cols;
+    let left = remap_predicate(predicate, &|column| {
+        (column < left_n_cols).then_some(column)
+    });
+    let right = remap_predicate(predicate, &|column| {
+        if column >= left_n_cols && column < total_n_cols {
+            Some(column - left_n_cols)
+        } else {
+            None
+        }
+    });
+    let left_is_raw = shape.left_pre.is_empty();
+    let right_is_raw = shape.right_pre.is_empty();
+    let allowed = match &shape.join {
+        JoinKind::Inner(_) => (
+            left.is_some() && left_is_raw,
+            right.is_some() && right_is_raw,
+        ),
+        JoinKind::Outer(op) => match op.kind() {
+            OuterJoinKind::Left | OuterJoinKind::Semi | OuterJoinKind::Anti => {
+                (left.is_some() && left_is_raw, false)
+            }
+            OuterJoinKind::Right => (false, right.is_some() && right_is_raw),
+            OuterJoinKind::Full => (false, false),
+        },
+        JoinKind::Factorized(_) => (
+            left.is_some() && left_is_raw,
+            right.is_some() && right_is_raw,
+        ),
+    };
+    let (left, right) = match allowed {
+        (true, false) => (left, None),
+        (false, true) => (None, right),
+        _ => return false,
+    };
+    if let Some(predicate) = left {
+        shape
+            .left_pre
+            .push(Stage::Stateless(Arc::new(FilterOp::new(predicate.clone()))));
+        if let Some(spec) = &mut shape.factorized_spec {
+            spec.left_pre
+                .push(Stage::Stateless(Arc::new(FilterOp::new(predicate))));
+        }
+    }
+    if let Some(predicate) = right {
+        shape
+            .right_pre
+            .push(Stage::Stateless(Arc::new(FilterOp::new(predicate.clone()))));
+        if let Some(spec) = &mut shape.factorized_spec {
+            spec.right_pre
+                .push(Stage::Stateless(Arc::new(FilterOp::new(predicate))));
+        }
+    }
+    true
+}
+
 /// Recognize an `InnerJoin`/`OuterJoin` subtree, optionally wrapped by
 /// `Filter`/`Project`/`Map` (the common "equi-join + residual filter, then a
 /// final projection" Nexmark q3/q4/q8/q13/q20 shape) directly beneath
@@ -478,9 +670,19 @@ pub(crate) fn try_compile_join_shape(
                 .collect();
             let (right_pre, right_schema, right_source, right_utf8) =
                 compile_join_side(right, table_schemas, &shared_right_packers)?;
-            if !schema_all_int64(&left_schema) || !schema_all_int64(&right_schema) {
+            let factorized_spec = factorized_side_specs(
+                left,
+                right,
+                left_keys,
+                right_keys,
+                table_schemas,
+                *left_arr_id,
+            )?;
+            if (!schema_all_int64(&left_schema) || !schema_all_int64(&right_schema))
+                && factorized_spec.is_none()
+            {
                 return Err(OpError::unsupported_plan_node(
-                    "InnerJoin over a non-Int64-only side schema (JoinOp only supports Int64 columns)",
+                    "InnerJoin over unsupported side schema (classic and factorized paths reject these column types)",
                 ));
             }
             let join_op = Arc::new(JoinOp::with_schema(
@@ -500,7 +702,10 @@ pub(crate) fn try_compile_join_shape(
                 post,
                 left_source,
                 right_source,
+                left_n_cols: left_schema.fields().len(),
+                right_n_cols: right_schema.fields().len(),
                 post_n_cols,
+                factorized_spec,
             }))
         }
         PlanNode::OuterJoin {
@@ -549,15 +754,21 @@ pub(crate) fn try_compile_join_shape(
                 post,
                 left_source,
                 right_source,
+                left_n_cols: left_schema.fields().len(),
+                right_n_cols: right_schema.fields().len(),
                 post_n_cols,
+                factorized_spec: None,
             }))
         }
         PlanNode::Filter { input, predicate } => {
             match try_compile_join_shape(input, table_schemas)? {
                 Some(mut shape) => {
-                    shape
-                        .post
-                        .push(Stage::Stateless(Arc::new(FilterOp::new(predicate.clone()))));
+                    if !transfer_predicate(&mut shape, predicate) {
+                        shape.factorized_spec = None;
+                        shape
+                            .post
+                            .push(Stage::Stateless(Arc::new(FilterOp::new(predicate.clone()))));
+                    }
                     Ok(Some(shape))
                 }
                 None => Ok(None),
@@ -566,6 +777,7 @@ pub(crate) fn try_compile_join_shape(
         PlanNode::Project { input, columns } => match try_compile_join_shape(input, table_schemas)?
         {
             Some(mut shape) => {
+                shape.factorized_spec = None;
                 let named: Vec<NamedExpr> = columns
                     .iter()
                     .enumerate()
@@ -581,6 +793,7 @@ pub(crate) fn try_compile_join_shape(
         },
         PlanNode::Map { input, func } => match try_compile_join_shape(input, table_schemas)? {
             Some(mut shape) => {
+                shape.factorized_spec = None;
                 shape.post_n_cols += 1;
                 shape.post.push(Stage::Stateless(Arc::new(MapOp::new(
                     func.clone(),
@@ -609,6 +822,52 @@ pub(crate) fn try_compile_join_shape(
                     ));
                 }
                 let agg = &aggregates[0];
+                if !agg.distinct
+                    && matches!(group_by[0], Expr::Column(_))
+                    && (matches!(agg.input, Expr::Column(_))
+                        || matches!(agg.func, AggregateFunc::Count))
+                    && shape.factorized_spec.is_some()
+                    && shape.factorized_spec.as_ref().is_some_and(|spec| {
+                        DeltaAmplificationGovernor::select(
+                            factorized_compile_estimate(spec),
+                            DEFAULT_FACTORIZED_DELTA_BUDGET,
+                        ) == PlanStrategy::Factorized
+                    })
+                    && matches!(
+                        agg.func,
+                        AggregateFunc::Sum | AggregateFunc::Count | AggregateFunc::Avg
+                    )
+                {
+                    let spec = shape.factorized_spec.take().expect("checked above");
+                    let Expr::Column(group_col) = group_by[0] else {
+                        return Ok(None);
+                    };
+                    let value_col = match agg.input {
+                        Expr::Column(column) => column,
+                        _ => 0,
+                    };
+                    let kind = match agg.func {
+                        AggregateFunc::Sum => FactorizedAggregateKind::Sum,
+                        AggregateFunc::Count => FactorizedAggregateKind::Count,
+                        AggregateFunc::Avg => FactorizedAggregateKind::Avg,
+                        _ => return Ok(None),
+                    };
+                    shape.join = JoinKind::Factorized(Arc::new(FactorizedJoinAggregateOp::new(
+                        spec.op_id,
+                        spec.left_keys,
+                        spec.right_keys,
+                        spec.left_n_cols,
+                        spec.right_n_cols,
+                        group_col,
+                        value_col,
+                        kind,
+                    )));
+                    shape.left_pre = spec.left_pre;
+                    shape.right_pre = spec.right_pre;
+                    shape.post.clear();
+                    shape.post_n_cols = 2;
+                    return Ok(Some(shape));
+                }
                 shape
                     .post
                     .push(Stage::Stateless(Arc::new(ProjectOp::new(vec![

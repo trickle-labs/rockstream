@@ -225,8 +225,8 @@ def generated_block(text: str) -> str | None:
 def check_full_semantics(
     root: Path, contract: dict, capabilities: list[dict], errors: list[str]
 ) -> None:
-    if contract.get("version") not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6"}:
-        fail(errors, "capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4 or v0.59.6")
+    if contract.get("version") not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7"}:
+        fail(errors, "capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6 or v0.59.7")
 
 
     for capability in capabilities:
@@ -304,8 +304,8 @@ def main() -> int:
     errors: list[str] = []
     contract, capabilities = load_source(root, errors)
     if contract:
-        if contract.get("version") not in {"v0.57", "v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6"}:
-            fail(errors, "capabilities.toml contract.version must be v0.57, v0.57.1, v0.59.1, v0.59.3, v0.59.4 or v0.59.6")
+        if contract.get("version") not in {"v0.57", "v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7"}:
+            fail(errors, "capabilities.toml contract.version must be v0.57, v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6 or v0.59.7")
 
         check_promises(root, contract.get("promise"), errors)
     check_external_surface(capabilities, errors)

@@ -24,7 +24,9 @@ pub enum OpError {
     ExprTypeMismatch { context: String, code: ErrorCode },
 
     /// A column index is out of bounds.
-    #[error("[{code}] Column index {index} out of bounds (schema has {num_cols} columns); next_steps: check plan column references")]
+    #[error(
+        "[{code}] Column index {index} out of bounds (schema has {num_cols} columns); next_steps: check plan column references"
+    )]
     ColumnOutOfBounds {
         index: usize,
         num_cols: usize,
@@ -32,7 +34,9 @@ pub enum OpError {
     },
 
     /// A column is not of the expected type.
-    #[error("[{code}] Column type mismatch: expected {expected}, got {got}; next_steps: ensure source schema matches plan")]
+    #[error(
+        "[{code}] Column type mismatch: expected {expected}, got {got}; next_steps: ensure source schema matches plan"
+    )]
     ColumnTypeMismatch {
         expected: String,
         got: String,
@@ -44,11 +48,15 @@ pub enum OpError {
     InvalidLiteral { detail: String, code: ErrorCode },
 
     /// Feature not yet implemented in this version.
-    #[error("[{code}] Not implemented in v0.4: {feature}; next_steps: this feature arrives in a later version")]
+    #[error(
+        "[{code}] Not implemented in v0.4: {feature}; next_steps: this feature arrives in a later version"
+    )]
     Unimplemented { feature: String, code: ErrorCode },
 
     /// Storage error from the ShardDb layer.
-    #[error("[{code}] Storage error: {source}; next_steps: check disk space and object store connectivity")]
+    #[error(
+        "[{code}] Storage error: {source}; next_steps: check disk space and object store connectivity"
+    )]
     Storage {
         #[source]
         source: rockstream_storage::StorageError,
@@ -56,7 +64,9 @@ pub enum OpError {
     },
 
     /// Group-commit capacity exceeded; applying back-pressure.
-    #[error("[{code}] Group-commit queue full ({current}/{max} batches pending); next_steps: reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards")]
+    #[error(
+        "[{code}] Group-commit queue full ({current}/{max} batches pending); next_steps: reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards"
+    )]
     GroupCommitFull {
         current: usize,
         max: usize,
@@ -64,11 +74,15 @@ pub enum OpError {
     },
 
     /// Aggregate running sum overflowed i64.
-    #[error("[{code}] Aggregate sum overflow for group key {group_key}: next_steps: reduce value magnitudes or switch to a wider numeric type")]
+    #[error(
+        "[{code}] Aggregate sum overflow for group key {group_key}: next_steps: reduce value magnitudes or switch to a wider numeric type"
+    )]
     AggregateOverflow { group_key: i64, code: ErrorCode },
 
     /// MIN/MAX multiset retraction underflow.
-    #[error("[{code}] MIN/MAX retraction underflow for group key {group_key}, value {value}: next_steps: ensure every retraction is matched by a prior insertion; check source event ordering")]
+    #[error(
+        "[{code}] MIN/MAX retraction underflow for group key {group_key}, value {value}: next_steps: ensure every retraction is matched by a prior insertion; check source event ordering"
+    )]
     MinMaxRetractionUnderflow {
         group_key: i64,
         value: i64,
@@ -76,11 +90,15 @@ pub enum OpError {
     },
 
     /// TopK buffer overflow: too many unique rows in a single partition.
-    #[error("[{code}] TopK buffer overflow: {limit} unique positive-weight rows exceeded in one partition; next_steps: reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add partition columns")]
+    #[error(
+        "[{code}] TopK buffer overflow: {limit} unique positive-weight rows exceeded in one partition; next_steps: reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add partition columns"
+    )]
     TopKBufferOverflow { limit: usize, code: ErrorCode },
 
     /// Hop-window state exceeded its configured overlap-aware bound.
-    #[error("[{code}] Hop window state bound exceeded ({current}/{limit} rows); next_steps: reduce hop overlap, increase HOP_WINDOW_STATE_LIMIT, or shard the windowed stream more finely")]
+    #[error(
+        "[{code}] Hop window state bound exceeded ({current}/{limit} rows); next_steps: reduce hop overlap, increase HOP_WINDOW_STATE_LIMIT, or shard the windowed stream more finely"
+    )]
     HopWindowStateOverflow {
         current: usize,
         limit: usize,
@@ -88,7 +106,9 @@ pub enum OpError {
     },
 
     /// Session-window state exceeded its configured bound.
-    #[error("[{code}] Session window state bound exceeded ({current}/{limit} sessions); next_steps: reduce session cardinality, increase SESSION_WINDOW_STATE_LIMIT, or shard the windowed stream more finely")]
+    #[error(
+        "[{code}] Session window state bound exceeded ({current}/{limit} sessions); next_steps: reduce session cardinality, increase SESSION_WINDOW_STATE_LIMIT, or shard the windowed stream more finely"
+    )]
     SessionWindowStateOverflow {
         current: usize,
         limit: usize,
@@ -96,19 +116,48 @@ pub enum OpError {
     },
 
     /// Late-data side-channel queue exceeded its configured bound.
-    #[error("[{code}] Late-data side-channel queue full ({current}/{limit} rows); next_steps: drain the configured late-data sink, reduce late-event volume, or increase TUMBLE_WINDOW_LATE_ROUTE_LIMIT after verifying available capacity")]
+    #[error(
+        "[{code}] Late-data side-channel queue full ({current}/{limit} rows); next_steps: drain the configured late-data sink, reduce late-event volume, or increase TUMBLE_WINDOW_LATE_ROUTE_LIMIT after verifying available capacity"
+    )]
     LateRouteOverflow {
         current: usize,
         limit: usize,
         code: ErrorCode,
     },
 
+    /// Factorized payload tree exceeded its row or byte bound.
+    #[error(
+        "[{code}] Factorized payload bound exceeded ({current_rows}/{max_rows} rows, {current_bytes}/{max_bytes} bytes); next_steps: reduce join fan-out, increase the factor payload bound after capacity review, or use the classic join path"
+    )]
+    FactorPayloadOverflow {
+        current_rows: usize,
+        max_rows: usize,
+        current_bytes: usize,
+        max_bytes: usize,
+        code: ErrorCode,
+    },
+
+    /// A factorized epoch would exceed one of its immutable amplification budgets.
+    #[error(
+        "[{code}] Delta amplification budget exceeded for {dimension} ({current}/{limit}); next_steps: use the classic plan, reduce the input delta, or raise the reviewed operator budget"
+    )]
+    DeltaAmplificationExceeded {
+        dimension: &'static str,
+        current: u64,
+        limit: u64,
+        code: ErrorCode,
+    },
+
     /// Monotone recursion received a negative delta.
-    #[error("[{code}] Non-monotone delta rejected in monotone recursion; next_steps: mark the recursive query non-monotone or remove retractions from the input stream")]
+    #[error(
+        "[{code}] Non-monotone delta rejected in monotone recursion; next_steps: mark the recursive query non-monotone or remove retractions from the input stream"
+    )]
     RecursionNonMonotoneDelta { code: ErrorCode },
 
     /// Recursion arrangement exceeded its configured bound.
-    #[error("[{code}] Recursion state bound exceeded ({current}/{limit} rows); next_steps: reduce recursive fan-out, increase RECURSION_STATE_LIMIT, or shard the recursive relation more finely")]
+    #[error(
+        "[{code}] Recursion state bound exceeded ({current}/{limit} rows); next_steps: reduce recursive fan-out, increase RECURSION_STATE_LIMIT, or shard the recursive relation more finely"
+    )]
     RecursionStateOverflow {
         current: usize,
         limit: usize,
@@ -116,26 +165,36 @@ pub enum OpError {
     },
 
     /// Distributed recursion stalled without advancing the inner frontier.
-    #[error("[{code}] Distributed recursion inner frontier stalled; next_steps: inspect slow shards, restart the stalled worker, or allow per-shard recompute fallback")]
+    #[error(
+        "[{code}] Distributed recursion inner frontier stalled; next_steps: inspect slow shards, restart the stalled worker, or allow per-shard recompute fallback"
+    )]
     RecursionInnerFrontierStalled { code: ErrorCode },
 
     /// Recursion hit its max-iteration safety cap.
-    #[error("[{code}] Recursion max-iteration cap exceeded after {max_iterations} iterations; next_steps: increase recursion_max_iterations or simplify the recursive step to converge faster")]
+    #[error(
+        "[{code}] Recursion max-iteration cap exceeded after {max_iterations} iterations; next_steps: increase recursion_max_iterations or simplify the recursive step to converge faster"
+    )]
     RecursionMaxIterations {
         max_iterations: usize,
         code: ErrorCode,
     },
 
     /// `compile_plan` encountered a `PlanNode` shape it does not support.
-    #[error("[{code}] Plan node not supported by the direct operator compiler: {kind}; next_steps: this query shape requires the DiffCtx/OpNode physical-plan path, not the v0.51.3 fast-path compiler")]
+    #[error(
+        "[{code}] Plan node not supported by the direct operator compiler: {kind}; next_steps: this query shape requires the DiffCtx/OpNode physical-plan path, not the v0.51.3 fast-path compiler"
+    )]
     UnsupportedPlanNode { kind: String, code: ErrorCode },
 
     /// Operator not found in pipeline (v0.53.2 IVM arrangement debugger).
-    #[error("[{code}] Operator '{op_id}' not found in pipeline; next_steps: run rockstream explain <view> --op-ids to inspect available operator IDs for this view")]
+    #[error(
+        "[{code}] Operator '{op_id}' not found in pipeline; next_steps: run rockstream explain <view> --op-ids to inspect available operator IDs for this view"
+    )]
     OperatorNotFound { op_id: String, code: ErrorCode },
 
     /// Arrangement key decoding failed or unsupported family (v0.53.2 IVM arrangement debugger).
-    #[error("[{code}] Arrangement key decoding failed for family '{family}': {detail}; next_steps: check arrangement key syntax or verify if the operator family key codec is supported")]
+    #[error(
+        "[{code}] Arrangement key decoding failed for family '{family}': {detail}; next_steps: check arrangement key syntax or verify if the operator family key codec is supported"
+    )]
     ArrangementKeyDecodeFailed {
         family: String,
         detail: String,
@@ -276,6 +335,32 @@ impl OpError {
             current,
             limit,
             code: RS_2028,
+        }
+    }
+
+    pub fn factor_payload_overflow(
+        current_rows: usize,
+        max_rows: usize,
+        current_bytes: usize,
+        max_bytes: usize,
+    ) -> Self {
+        use rockstream_types::error_code::RS_2030;
+        Self::FactorPayloadOverflow {
+            current_rows,
+            max_rows,
+            current_bytes,
+            max_bytes,
+            code: RS_2030,
+        }
+    }
+
+    pub fn delta_amplification_exceeded(dimension: &'static str, current: u64, limit: u64) -> Self {
+        use rockstream_types::error_code::RS_2030;
+        Self::DeltaAmplificationExceeded {
+            dimension,
+            current,
+            limit,
+            code: RS_2030,
         }
     }
 

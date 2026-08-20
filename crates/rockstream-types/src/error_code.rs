@@ -205,6 +205,8 @@ pub const RS_2026: ErrorCode = ErrorCode::new(2026);
 pub const RS_2027: ErrorCode = ErrorCode::new(2027);
 /// Late-data side-channel queue reached its bounded capacity (v0.51.12).
 pub const RS_2028: ErrorCode = ErrorCode::new(2028);
+/// Factorized payload rows or bytes exceeded its named bound (v0.59.7).
+pub const RS_2030: ErrorCode = ErrorCode::new(2030);
 
 // 24xx: Auth (v0.26)
 /// Unauthenticated: request missing or carrying invalid credentials.
@@ -476,6 +478,7 @@ pub fn slug(code: ErrorCode) -> &'static str {
         2022 => "write.malformed_returning_clause",
         2023 => "window.hop_state_overflow",
         2024 => "window.session_state_overflow",
+        2030 => "ivm.factor_payload_overflow",
         2400 => "auth.unauthenticated",
         2401 => "auth.permission_denied",
         2402 => "auth.namespace_access_denied",
@@ -661,6 +664,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         2022 => "UPDATE/DELETE RETURNING clause is malformed",
         2023 => "Hop window state exceeded its configured overlap-aware bound",
         2024 => "Session window state exceeded its configured open-session bound",
+        2030 => "Factorized payload exceeded its configured row or byte bound",
         2028 => "Late-data side-channel queue reached its configured bound",
         2013 => "Transaction RETURNING read-back could not find the row at the current frontier",
         2400 => "Unauthenticated: request missing or carrying invalid credentials",
@@ -798,6 +802,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         2022 => "Check RETURNING syntax; it must be RETURNING * or RETURNING <col>[, <col>...] with no trailing content.",
         2023 => "Reduce hop overlap, increase HOP_WINDOW_STATE_LIMIT, or shard the windowed stream more finely.",
         2024 => "Reduce session cardinality, increase SESSION_WINDOW_STATE_LIMIT, or shard the windowed stream more finely.",
+        2030 => "Reduce join fan-out, increase the factor payload bound after capacity review, or use the classic join path.",
         2028 => "Drain the configured late-data sink, reduce late-event volume, or increase TUMBLE_WINDOW_LATE_ROUTE_LIMIT after verifying available capacity.",
         2013 => "Retry the write; if the row is consistently missing, check that the frontier used for the read-back has advanced past the commit epoch.",
         3003 => "Reduce input rate or increase local_buffer_max_epochs; check object store availability.",
@@ -952,7 +957,7 @@ mod tests {
             RS_2013, RS_2022, // v0.48 UPDATE/DELETE RETURNING (Track A)
             RS_1019, // v0.51.4 Slice 8 — CREATE VIEW compile-failure is a real error
             RS_2403, RS_2404, RS_2405, RS_2406, // v0.51.5-v0.51.26 gateway TLS/mTLS
-            RS_2028, // v0.51.12 bounded late-data side-channel
+            RS_2028, RS_2030, // v0.51.12/v0.59.7 bounded state
             RS_1020, RS_1021, // v0.53.2 IVM arrangement debugger
             RS_3701, RS_3702, RS_3703, RS_3704, RS_3705, RS_3706, RS_3707,
             RS_3708, // v0.54.1 explainability taxonomy

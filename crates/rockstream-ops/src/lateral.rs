@@ -107,7 +107,7 @@ impl LateralOp {
                                 expected: "Utf8 or LargeUtf8".to_string(),
                                 got: format!("{other:?}"),
                                 code: RS_1013,
-                            })
+                            });
                         }
                     };
                     Ok(values.map(|vals| Arc::new(vals) as ArrayRef))

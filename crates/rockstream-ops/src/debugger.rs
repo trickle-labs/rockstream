@@ -151,6 +151,17 @@ fn explain_plan_op_ids_scoped(
                     )),
                 });
             }
+            crate::live_exec::JoinKind::Factorized(factorized_op) => {
+                out.push(OperatorNodeInfo {
+                    op_id: factorized_op.op_id().to_string(),
+                    kind: "FactorizedJoinAggregate".to_string(),
+                    details: "BOUNDED FACTORIZED INNER JOIN AGGREGATE".to_string(),
+                    schema: Some(format!(
+                        "left_source: {}, right_source: {}",
+                        shape.left_source, shape.right_source
+                    )),
+                });
+            }
         }
         for (i, stage) in shape.post.iter().enumerate() {
             if let Some(op_id) = stage.op_id() {

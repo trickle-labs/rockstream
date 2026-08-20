@@ -72,6 +72,24 @@ async fn read_view_state(
     state
 }
 
+async fn read_factorized_view_state(client: &tokio_postgres::Client) -> Vec<(i64, i64)> {
+    let mut rows = client
+        .simple_query("SELECT * FROM factorized_sum")
+        .await
+        .expect("SELECT should succeed")
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap().parse().unwrap(),
+                row.get(1).unwrap().parse().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
+}
+
 /// Batch oracle: recompute the equi-join `a.k = b.k` from scratch over
 /// `a_rows` (id -> k) and `b_rows` (id -> (k, val)).
 fn oracle_state(
@@ -210,6 +228,42 @@ async fn compiled_join_view_matches_batch_oracle_when_either_side_commits() {
         read_view_state(&client, "a_join_b").await,
         oracle_state(&a_rows, &b_rows),
         "after right-side delete commit"
+    );
+}
+
+#[tokio::test]
+async fn factorized_join_aggregate_is_reachable_over_simple_and_extended_pgwire() {
+    let (_dir, _handle, _catalog, client, handler) = setup().await;
+    let created = client
+        .simple_query(
+            "CREATE MATERIALIZED VIEW factorized_sum AS \
+             SELECT a.k, SUM(b.val) FROM a JOIN b ON a.k = b.k GROUP BY a.k",
+        )
+        .await
+        .expect("CREATE MATERIALIZED VIEW should succeed");
+    assert!(created.iter().any(|message| matches!(
+        message,
+        tokio_postgres::SimpleQueryMessage::CommandComplete(_)
+    )));
+    assert!(handler.has_compiled_view("factorized_sum"));
+
+    client
+        .execute("INSERT INTO a (id, k) VALUES (1, 10)", &[])
+        .await
+        .expect("extended INSERT should succeed");
+    client
+        .execute("INSERT INTO b (id, k, val) VALUES (2, 10, 7)", &[])
+        .await
+        .expect("extended INSERT should succeed");
+    assert_eq!(read_factorized_view_state(&client).await, vec![(10, 7)]);
+
+    client
+        .simple_query("DELETE FROM b WHERE id = 2, k = 10, val = 7")
+        .await
+        .expect("simple DELETE should succeed");
+    assert_eq!(
+        read_factorized_view_state(&client).await,
+        Vec::<(i64, i64)>::new()
     );
 }
 
