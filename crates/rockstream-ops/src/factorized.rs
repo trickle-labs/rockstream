@@ -233,9 +233,11 @@ impl FactorizedJoinAggregateOp {
             None
         };
         let mut next = self.state.lock().unwrap().clone();
+        let old_probes = (next.left.len() as u64).saturating_mul(next.right.len() as u64);
         let old_aggregate = self.aggregate(&next)?;
-        self.apply_delta(&mut next, &left, true)?;
-        self.apply_delta(&mut next, &right, false)?;
+        let state_writes = self
+            .apply_delta(&mut next, &left, true)?
+            .saturating_add(self.apply_delta(&mut next, &right, false)?);
         let (rows, bytes) = next.usage();
         if rows > self.max_payload_rows || bytes > self.max_payload_bytes {
             return Err(OpError::factor_payload_overflow(
@@ -245,15 +247,16 @@ impl FactorizedJoinAggregateOp {
                 self.max_payload_bytes,
             ));
         }
+        let new_probes = (next.left.len() as u64).saturating_mul(next.right.len() as u64);
         let new_aggregate = self.aggregate(&next)?;
         let output = self.output_delta(&old_aggregate, &new_aggregate)?;
         let delta_counters = DeltaAmplificationCounters {
             input_deltas: (left.num_rows() + right.num_rows()) as u64,
-            probes: (next.left.len() as u64).saturating_mul(next.right.len() as u64),
+            probes: old_probes.saturating_add(new_probes),
             shuffled_bytes: 0,
             intermediate_tuples: 0,
             output_deltas: output.num_rows() as u64,
-            state_writes: next.usage().0 as u64,
+            state_writes,
         };
         if let Some(dimension) = self.governor.exceeded(delta_counters) {
             let current = self.governor.projected(delta_counters).get(dimension);
@@ -276,9 +279,9 @@ impl FactorizedJoinAggregateOp {
         state: &mut PayloadState,
         delta: &ArrowZSet,
         left: bool,
-    ) -> Result<(), OpError> {
+    ) -> Result<u64, OpError> {
         if delta.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let expected_cols = if left {
             self.left_n_cols
@@ -304,6 +307,7 @@ impl FactorizedJoinAggregateOp {
         if let Some(&column) = key_cols.iter().find(|column| **column >= expected_cols) {
             return Err(OpError::column_out_of_bounds(column, expected_cols));
         }
+        let mut state_writes = 0_u64;
         for row in 0..delta.num_rows() {
             let values = delta
                 .data
@@ -322,19 +326,18 @@ impl FactorizedJoinAggregateOp {
             }
             let key = capsule.typed_bytes().to_vec();
             let row_key = (key, values);
-            let weight = target
-                .get(&row_key)
-                .copied()
-                .unwrap_or(0)
+            let old_weight = target.get(&row_key).copied().unwrap_or(0);
+            let weight = old_weight
                 .checked_add(delta.weights[row])
                 .ok_or_else(|| OpError::internal("factorized payload weight overflow"))?;
+            state_writes += u64::from(weight != old_weight);
             if weight == 0 {
                 target.remove(&row_key);
             } else {
                 target.insert(row_key, weight);
             }
         }
-        Ok(())
+        Ok(state_writes)
     }
 
     fn aggregate(&self, state: &PayloadState) -> Result<BTreeMap<Scalar, (i64, i64)>, OpError> {

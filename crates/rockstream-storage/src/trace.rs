@@ -14,6 +14,26 @@ use rockstream_types::ids::{ArrangementId, ViewId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
+#[cfg(unix)]
+fn thread_cpu_time_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) } == 0 {
+        (time.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(time.tv_nsec as u64)
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_time_ns() -> u64 {
+    0
+}
+
 /// A descriptor of an immutable delta batch segment stored in an arrangement trace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceSegmentDescriptor {
@@ -123,6 +143,7 @@ impl SharedArrangementTrace {
     pub fn register_consumer_frontier(&mut self, consumer_id: ViewId, initial_frontier: u64) {
         self.consumer_frontiers
             .insert(consumer_id, initial_frontier);
+        self.record_consumer_metadata();
     }
 
     /// Advance a consumer's read frontier.
@@ -132,19 +153,43 @@ impl SharedArrangementTrace {
                 *f = new_frontier;
             }
         }
+        self.record_consumer_metadata();
     }
 
     /// Deregister a consumer from tracking.
     pub fn deregister_consumer(&mut self, consumer_id: ViewId) {
         self.consumer_frontiers.remove(&consumer_id);
+        self.record_consumer_metadata();
     }
 
     /// Append an immutable consolidated delta batch to the trace.
-    pub fn commit_trace_batch(
+    pub fn commit_trace_batch(&mut self, from_frontier: u64, to_frontier: u64, rows: Vec<ZSetRow>) {
+        let cpu_started = thread_cpu_time_ns();
+        self.commit_built_trace_batch(from_frontier, to_frontier, rows, 0, cpu_started);
+    }
+
+    /// Build canonical source keys and append one trace batch under one native
+    /// thread-CPU measurement.
+    pub fn commit_source_batch<T>(
+        &mut self,
+        from_frontier: u64,
+        to_frontier: u64,
+        changes: Vec<T>,
+        mut build_row: impl FnMut(T) -> ZSetRow,
+    ) {
+        let cpu_started = thread_cpu_time_ns();
+        let rows: Vec<_> = changes.into_iter().map(&mut build_row).collect();
+        let key_builds = rows.len() as u64;
+        self.commit_built_trace_batch(from_frontier, to_frontier, rows, key_builds, cpu_started);
+    }
+
+    fn commit_built_trace_batch(
         &mut self,
         from_frontier: u64,
         to_frontier: u64,
         mut rows: Vec<ZSetRow>,
+        key_builds: u64,
+        cpu_started: u64,
     ) {
         assert!(
             from_frontier >= self.base_frontier,
@@ -164,11 +209,35 @@ impl SharedArrangementTrace {
                 .then_with(|| a.weight.cmp(&b.weight))
         });
 
+        let trace_rows = rows.len() as u64;
+        let accepted_changes = rows
+            .iter()
+            .map(|row| row.weight.unsigned_abs())
+            .sum::<u64>();
         self.delta_batches.push(TraceBatch {
             from_frontier,
             to_frontier,
             rows,
         });
+        rockstream_types::metrics::record_r1_arrangement_commit(
+            self.arrangement_id,
+            key_builds,
+            trace_rows,
+            accepted_changes,
+            thread_cpu_time_ns().saturating_sub(cpu_started),
+            self.byte_size() as u64,
+        );
+    }
+
+    pub fn record_lfs_usage(&self, files: u64, bytes: u64) {
+        rockstream_types::metrics::set_r1_arrangement_lfs_usage(self.arrangement_id, files, bytes);
+    }
+
+    fn record_consumer_metadata(&self) {
+        rockstream_types::metrics::set_r1_arrangement_consumer_metadata(
+            self.arrangement_id,
+            (self.consumer_frontiers.len() * (std::mem::size_of::<ViewId>() + 8)) as u64,
+        );
     }
 
     /// Read the materialized arrangement snapshot as of `target_frontier`.
@@ -276,6 +345,14 @@ impl SharedArrangementTrace {
 
         self.delta_batches = remaining_batches;
         self.base_frontier = compaction_frontier;
+        rockstream_types::metrics::record_r1_arrangement_commit(
+            self.arrangement_id,
+            0,
+            0,
+            0,
+            0,
+            self.byte_size() as u64,
+        );
         self.base_frontier
     }
 

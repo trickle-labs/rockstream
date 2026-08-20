@@ -521,11 +521,45 @@ impl JoinOp {
     ///
     /// Returns the combined `ΔL ⋈ R₀ + L₀ ⋈ ΔR + ΔL ⋈ ΔR` output.
     pub fn process_epoch(&self, left: ArrowZSet, right: ArrowZSet) -> Result<ArrowZSet, OpError> {
+        self.process_epoch_with_counters(left, right)
+            .map(|(output, _)| output)
+    }
+
+    pub(crate) fn process_epoch_with_counters(
+        &self,
+        left: ArrowZSet,
+        right: ArrowZSet,
+    ) -> Result<(ArrowZSet, crate::governor::DeltaAmplificationCounters), OpError> {
+        let input_deltas = (left.num_rows() + right.num_rows()) as u64;
         let left_out = self.process_left_delta(left)?;
         let right_out = self.process_right_delta(right)?;
+        let (arrangement_probes, state_writes) = {
+            let left_staged = self.left_staged.lock().unwrap();
+            let right_staged = self.right_staged.lock().unwrap();
+            (
+                (left_staged.rows.len() + right_staged.rows.len()) as u64,
+                left_staged
+                    .rows
+                    .iter()
+                    .chain(&right_staged.rows)
+                    .filter(|(_, _, _, weight)| *weight != 0)
+                    .count() as u64,
+            )
+        };
         let correction = self.commit_epoch()?;
         let out_schema = join_output_schema_n(self.left_n_cols, self.right_n_cols);
-        concat_zsets(vec![left_out, right_out, correction], out_schema)
+        let output = concat_zsets(vec![left_out, right_out, correction], out_schema)?;
+        Ok((
+            output,
+            crate::governor::DeltaAmplificationCounters {
+                input_deltas,
+                probes: arrangement_probes,
+                shuffled_bytes: 0,
+                intermediate_tuples: 0,
+                output_deltas: 0,
+                state_writes,
+            },
+        ))
     }
 
     /// Fill-level metric for the left arrangement.

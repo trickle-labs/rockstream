@@ -5,11 +5,13 @@ use std::time::{Duration, Instant};
 use rockstream_runtime::data_plane::DataPlaneClient;
 use rockstream_types::data_plane::WorkerExecutionStatus;
 use rockstream_types::ids::{ShardId, WorkerId, WorkloadId};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::{Client, NoTls};
 
 struct Processes {
     control: Child,
     workers: Vec<Child>,
+    worker_metrics: Vec<String>,
     gateway: Child,
 }
 
@@ -70,6 +72,42 @@ async fn connect_gateway(addr: &str) -> Client {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("gateway did not accept pgwire connections at {addr}");
+}
+
+async fn read_metrics(addr: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await {
+            stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            if let Some((_, body)) = response.split_once("\r\n\r\n") {
+                return body.to_string();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("worker metrics endpoint did not respond at {addr}");
+}
+
+fn metric_value(body: &str, series: &str) -> u64 {
+    body.lines()
+        .find_map(|line| {
+            line.strip_prefix(series)
+                .and_then(|value| value.strip_prefix(' '))
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or_else(|| panic!("missing metric series {series}"))
+}
+
+fn metric_sum(body: &str, name: &str) -> u64 {
+    body.lines()
+        .filter(|line| line.starts_with(name))
+        .map(|line| line.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap())
+        .sum()
 }
 
 fn stable_name_id(namespace: &str, name: &str) -> u64 {
@@ -154,8 +192,10 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         "--daemon",
     ]);
     let mut workers = Vec::new();
+    let mut worker_metrics = Vec::new();
     for worker_id in 1..=worker_count {
         let storage = root.path().join(format!("worker-{worker_id}"));
+        let metrics_addr = free_addr();
         std::fs::create_dir_all(&storage).unwrap();
         workers.push(spawn(&[
             "start",
@@ -167,7 +207,10 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
             &control_addr,
             "--worker-id",
             &worker_id.to_string(),
+            "--metrics-addr",
+            &metrics_addr,
         ]));
+        worker_metrics.push(metrics_addr);
     }
     wait_for_registered_workers(&control_storage.join("audit.jsonl"), worker_count).await;
     let gateway = spawn(&[
@@ -184,6 +227,7 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
     let mut processes = Processes {
         control,
         workers,
+        worker_metrics,
         gateway,
     };
     let client = connect_gateway(&gateway_addr).await;
@@ -269,6 +313,76 @@ async fn run_cluster(worker_count: usize, kill_worker: bool) {
         })
         .collect::<Vec<_>>();
     assert_eq!(snapshot.workers, expected_statuses);
+
+    let join_workload_id = WorkloadId(stable_name_id("workload", "r1_ordinary_join"));
+    let join_snapshot = DataPlaneClient::new(&control_addr)
+        .read_workload(join_workload_id)
+        .await
+        .unwrap();
+    for (index, metrics_addr) in processes.worker_metrics.iter().enumerate() {
+        let worker_id = WorkerId(index as u64 + 1);
+        let body = read_metrics(metrics_addr).await;
+        let uniform = snapshot
+            .workers
+            .iter()
+            .find(|status| status.worker_id == worker_id)
+            .unwrap();
+        let join = join_snapshot
+            .workers
+            .iter()
+            .find(|status| status.worker_id == worker_id)
+            .unwrap();
+        assert_eq!(
+            metric_value(
+                &body,
+                &format!(
+                    "rockstream_r1_worker_shards_owned{{worker_id=\"{}\"}}",
+                    worker_id.0
+                )
+            ),
+            2
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                &format!(
+                    "rockstream_r1_worker_input_rows_total{{worker_id=\"{}\"}}",
+                    worker_id.0
+                )
+            ),
+            uniform.input_rows + join.input_rows
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                &format!(
+                    "rockstream_r1_worker_output_rows_total{{worker_id=\"{}\"}}",
+                    worker_id.0
+                )
+            ),
+            uniform.output_rows + join.output_rows
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                &format!(
+                    "rockstream_r1_worker_state_writes_total{{worker_id=\"{}\"}}",
+                    worker_id.0
+                )
+            ),
+            metric_sum(&body, "rockstream_r1_changed_state_writes_total{")
+        );
+        assert_eq!(
+            metric_value(
+                &body,
+                &format!(
+                    "rockstream_r1_worker_exchange_bytes_total{{worker_id=\"{}\"}}",
+                    worker_id.0
+                )
+            ),
+            metric_sum(&body, "rockstream_r1_encoded_exchange_bytes_total{")
+        );
+    }
 
     if kill_worker {
         let dead_route = (0..16)

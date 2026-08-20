@@ -86,6 +86,9 @@ pub struct OperatorEpochMetrics {
     pub input_records: usize,
     pub output_records: usize,
     pub dirty_keys: usize,
+    pub state_mutations: usize,
+    pub logical_mutation_bytes: usize,
+    pub full_state_entries_visited: usize,
     pub state_bytes: usize,
 }
 

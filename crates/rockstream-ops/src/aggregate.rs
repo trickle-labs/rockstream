@@ -350,6 +350,7 @@ impl AggState {
 /// Uses interior mutability (`Mutex`) so it satisfies `Operator: &self`.
 pub struct AggregateOp {
     state: Mutex<AggState>,
+    dirty_keys: Mutex<std::collections::HashSet<i64>>,
     pub op_id: OperatorId,
 }
 
@@ -358,6 +359,7 @@ impl AggregateOp {
     pub fn new(op_id: OperatorId) -> Self {
         AggregateOp {
             state: Mutex::new(AggState::new()),
+            dirty_keys: Mutex::new(std::collections::HashSet::new()),
             op_id,
         }
     }
@@ -366,6 +368,7 @@ impl AggregateOp {
     pub fn with_state(op_id: OperatorId, state: AggState) -> Self {
         AggregateOp {
             state: Mutex::new(state),
+            dirty_keys: Mutex::new(std::collections::HashSet::new()),
             op_id,
         }
     }
@@ -538,9 +541,16 @@ impl AggregateOp {
             }
         }
 
-        let dirty_keys_vec: Vec<i64> = dirty_keys.into_iter().collect();
+        let mut dirty_keys_vec: Vec<i64> = dirty_keys.into_iter().collect();
+        dirty_keys_vec.sort_unstable();
         let mutations = state.encode_mutations_for_keys(self.op_id, &dirty_keys_vec);
+        let logical_mutation_bytes = mutations.iter().map(|mutation| mutation.size_bytes()).sum();
         let state_bytes = state.state_bytes() as usize;
+
+        self.dirty_keys
+            .lock()
+            .expect("AggregateOp dirty-key mutex poisoned")
+            .extend(dirty_keys_vec.iter().copied());
 
         drop(state);
         debug!(
@@ -585,8 +595,28 @@ impl AggregateOp {
             input_records: n,
             output_records: output_zset.num_rows(),
             dirty_keys: dirty_keys_vec.len(),
+            state_mutations: mutations.len(),
+            logical_mutation_bytes,
+            full_state_entries_visited: 0,
             state_bytes,
         };
+        rockstream_types::metrics::record_r1_persistence(
+            self.op_id,
+            metrics.state_mutations as u64,
+            metrics.logical_mutation_bytes as u64,
+            metrics.dirty_keys as u64,
+        );
+        rockstream_types::metrics::record_current_r1_execution(
+            self.op_id,
+            rockstream_types::metrics::R1ExecutionStrategy::Classic,
+            rockstream_types::metrics::R1ExecutionCounters {
+                input_deltas: metrics.input_records as u64,
+                arrangement_probes: metrics.dirty_keys as u64,
+                output_deltas: metrics.output_records as u64,
+                changed_state_writes: metrics.state_mutations as u64,
+                ..Default::default()
+            },
+        );
 
         Ok(crate::op::OperatorEpochResult::new(
             output_zset,
@@ -925,7 +955,12 @@ pub async fn append_agg_state(
     // across an await point (clippy::await_holding_lock).
     let wb = {
         let state = op.state.lock().expect("AggregateOp mutex poisoned");
+        let dirty_keys = op
+            .dirty_keys
+            .lock()
+            .expect("AggregateOp dirty-key mutex poisoned");
         let mut wb = WriteBatch::new();
+        let mut full_state_entries_visited = 0_u64;
 
         // Deletions: existing entries whose group key is not in current state.
         for (key, _) in &existing {
@@ -937,19 +972,33 @@ pub async fn append_agg_state(
                 Err(_) => continue,
             };
             let k = i64::from_be_bytes(k_bytes);
+            full_state_entries_visited += u64::from(!dirty_keys.contains(&k));
             if !state.entries.contains_key(&k) {
                 wb.delete(key);
             }
         }
 
         // Insertions: current live entries.
+        full_state_entries_visited += state
+            .entries
+            .keys()
+            .filter(|key| !dirty_keys.contains(key))
+            .count() as u64;
         let new_wb = state.encode_as_write_batch(op.op_id);
         wb.merge_from(new_wb);
+        rockstream_types::metrics::add_r1_full_state_entries_visited(
+            op.op_id,
+            full_state_entries_visited,
+        );
         wb
         // `state` (MutexGuard) is dropped here — before any await
     };
 
     target.merge_from(wb);
+    op.dirty_keys
+        .lock()
+        .expect("AggregateOp dirty-key mutex poisoned")
+        .clear();
     Ok(())
 }
 

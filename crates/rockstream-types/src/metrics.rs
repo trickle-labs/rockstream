@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::OperatorId;
+use crate::ids::{ArrangementId, OperatorId, ShardId, WorkerId, WorkloadId};
 use crate::merge_law::MergeLawId;
 
 const PIPELINE_STATE_BYTES_CAPACITY: usize = 256;
@@ -38,6 +38,9 @@ pub const STORAGE_PRESSURE_FLUSH_LATENCY_MS_THRESHOLD: u64 = 500;
 pub const STORAGE_PRESSURE_WRITE_AMPLIFICATION_THRESHOLD: f64 = 15.0;
 pub const STORAGE_PRESSURE_OBJECT_STORE_LATENCY_MS_THRESHOLD: u64 = 1000;
 pub const STORAGE_PRESSURE_OBJECT_STORE_FAILURE_RATE_THRESHOLD: f64 = 0.05;
+
+type R1CounterDescriptor<T> = (&'static str, &'static str, fn(&T) -> u64);
+type R1MetricDescriptor<T> = (&'static str, &'static str, &'static str, fn(&T) -> u64);
 
 /// Separately attributable storage pressure admission signals.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -268,6 +271,95 @@ pub struct OperatorRuntimeSnapshot {
     pub latency_sample_fill_level: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum R1ExecutionStrategy {
+    Classic,
+    Factorized,
+}
+
+impl R1ExecutionStrategy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Factorized => "factorized",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct R1ExecutionContext {
+    pub worker_id: WorkerId,
+    pub workload_id: WorkloadId,
+    pub shard_id: ShardId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct R1ExecutionKey {
+    pub worker_id: WorkerId,
+    pub workload_id: WorkloadId,
+    pub shard_id: ShardId,
+    pub operator_id: OperatorId,
+    pub strategy: R1ExecutionStrategy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct R1ExecutionCounters {
+    pub input_deltas: u64,
+    pub arrangement_probes: u64,
+    pub flattened_intermediate_tuples: u64,
+    pub output_deltas: u64,
+    pub changed_state_writes: u64,
+    pub encoded_exchange_bytes: u64,
+    pub factor_payload_rows: u64,
+    pub factor_payload_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct R1PersistenceCounters {
+    pub state_mutations: u64,
+    pub logical_mutation_bytes: u64,
+    pub dirty_keys: u64,
+    pub full_state_entries_visited: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct R1ArrangementCounters {
+    pub logical_trace_bytes: u64,
+    pub consumer_metadata_bytes: u64,
+    pub lfs_files: u64,
+    pub lfs_bytes: u64,
+    pub source_key_builds: u64,
+    pub trace_rows_written: u64,
+    pub accepted_source_changes: u64,
+    pub source_index_cpu_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct R1WorkerActivity {
+    pub shards_owned: u64,
+    pub input_rows: u64,
+    pub output_rows: u64,
+    pub state_writes: u64,
+    pub exchange_bytes: u64,
+}
+
+thread_local! {
+    static R1_EXECUTION_CONTEXT: std::cell::RefCell<Option<R1ExecutionContext>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn with_r1_execution_context<R>(context: R1ExecutionContext, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<R1ExecutionContext>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            R1_EXECUTION_CONTEXT.with(|slot| slot.replace(self.0));
+        }
+    }
+
+    let previous = R1_EXECUTION_CONTEXT.with(|slot| slot.replace(Some(context)));
+    let _restore = Restore(previous);
+    f()
+}
+
 fn p99_latency_ms(samples_ms: &mut [u32]) -> f64 {
     if samples_ms.is_empty() {
         return 0.0;
@@ -279,6 +371,10 @@ fn p99_latency_ms(samples_ms: &mut [u32]) -> f64 {
 
 /// Global registry for merge-law metric counters.
 struct MetricRegistry {
+    r1_execution: HashMap<R1ExecutionKey, R1ExecutionCounters>,
+    r1_persistence: HashMap<OperatorId, R1PersistenceCounters>,
+    r1_arrangements: HashMap<ArrangementId, R1ArrangementCounters>,
+    r1_workers: HashMap<WorkerId, R1WorkerActivity>,
     applied: HashMap<LawMetricKey, Counter>,
     fallback: HashMap<LawMetricKey, Counter>,
     /// RMW avoided: abelian-group laws that can merge without a prior read.
@@ -389,6 +485,10 @@ pub struct OperatorFrontierSnapshot {
 impl MetricRegistry {
     fn new() -> Self {
         Self {
+            r1_execution: HashMap::new(),
+            r1_persistence: HashMap::new(),
+            r1_arrangements: HashMap::new(),
+            r1_workers: HashMap::new(),
             applied: HashMap::new(),
             fallback: HashMap::new(),
             rmw_avoided: HashMap::new(),
@@ -473,6 +573,167 @@ where
 {
     let mut guard = REGISTRY.lock().expect("merge law metrics mutex poisoned");
     f(&mut guard)
+}
+
+pub fn record_r1_persistence(
+    operator_id: OperatorId,
+    state_mutations: u64,
+    logical_mutation_bytes: u64,
+    dirty_keys: u64,
+) {
+    with_registry(|reg| {
+        let counters = reg.r1_persistence.entry(operator_id).or_default();
+        counters.state_mutations = counters.state_mutations.saturating_add(state_mutations);
+        counters.logical_mutation_bytes = counters
+            .logical_mutation_bytes
+            .saturating_add(logical_mutation_bytes);
+        counters.dirty_keys = counters.dirty_keys.saturating_add(dirty_keys);
+    });
+}
+
+pub fn add_r1_full_state_entries_visited(operator_id: OperatorId, entries: u64) {
+    with_registry(|reg| {
+        let counters = reg.r1_persistence.entry(operator_id).or_default();
+        counters.full_state_entries_visited =
+            counters.full_state_entries_visited.saturating_add(entries);
+    });
+}
+
+pub fn r1_persistence_snapshot() -> Vec<(OperatorId, R1PersistenceCounters)> {
+    with_registry(|reg| {
+        let mut snapshot: Vec<_> = reg.r1_persistence.iter().map(|(k, v)| (*k, *v)).collect();
+        snapshot.sort_by_key(|(operator_id, _)| *operator_id);
+        snapshot
+    })
+}
+
+pub fn record_r1_arrangement_commit(
+    arrangement_id: ArrangementId,
+    key_builds: u64,
+    trace_rows: u64,
+    accepted_changes: u64,
+    cpu_ns: u64,
+    logical_trace_bytes: u64,
+) {
+    with_registry(|reg| {
+        let counters = reg.r1_arrangements.entry(arrangement_id).or_default();
+        counters.source_key_builds = counters.source_key_builds.saturating_add(key_builds);
+        counters.trace_rows_written = counters.trace_rows_written.saturating_add(trace_rows);
+        counters.accepted_source_changes = counters
+            .accepted_source_changes
+            .saturating_add(accepted_changes);
+        counters.source_index_cpu_ns = counters.source_index_cpu_ns.saturating_add(cpu_ns);
+        counters.logical_trace_bytes = logical_trace_bytes;
+    });
+}
+
+pub fn set_r1_arrangement_consumer_metadata(arrangement_id: ArrangementId, bytes: u64) {
+    with_registry(|reg| {
+        reg.r1_arrangements
+            .entry(arrangement_id)
+            .or_default()
+            .consumer_metadata_bytes = bytes;
+    });
+}
+
+pub fn set_r1_arrangement_lfs_usage(arrangement_id: ArrangementId, files: u64, bytes: u64) {
+    with_registry(|reg| {
+        let counters = reg.r1_arrangements.entry(arrangement_id).or_default();
+        counters.lfs_files = files;
+        counters.lfs_bytes = bytes;
+    });
+}
+
+pub fn r1_arrangement_snapshot() -> Vec<(ArrangementId, R1ArrangementCounters)> {
+    with_registry(|reg| {
+        let mut snapshot: Vec<_> = reg.r1_arrangements.iter().map(|(k, v)| (*k, *v)).collect();
+        snapshot.sort_by_key(|(arrangement_id, _)| *arrangement_id);
+        snapshot
+    })
+}
+
+pub fn record_r1_execution(key: R1ExecutionKey, delta: R1ExecutionCounters) {
+    with_registry(|reg| {
+        let counters = reg.r1_execution.entry(key).or_default();
+        counters.input_deltas = counters.input_deltas.saturating_add(delta.input_deltas);
+        counters.arrangement_probes = counters
+            .arrangement_probes
+            .saturating_add(delta.arrangement_probes);
+        counters.flattened_intermediate_tuples = counters
+            .flattened_intermediate_tuples
+            .saturating_add(delta.flattened_intermediate_tuples);
+        counters.output_deltas = counters.output_deltas.saturating_add(delta.output_deltas);
+        counters.changed_state_writes = counters
+            .changed_state_writes
+            .saturating_add(delta.changed_state_writes);
+        counters.encoded_exchange_bytes = counters
+            .encoded_exchange_bytes
+            .saturating_add(delta.encoded_exchange_bytes);
+        counters.factor_payload_rows = delta.factor_payload_rows;
+        counters.factor_payload_bytes = delta.factor_payload_bytes;
+        let worker = reg.r1_workers.entry(key.worker_id).or_default();
+        worker.state_writes = worker
+            .state_writes
+            .saturating_add(delta.changed_state_writes);
+        worker.exchange_bytes = worker
+            .exchange_bytes
+            .saturating_add(delta.encoded_exchange_bytes);
+    });
+}
+
+pub fn record_current_r1_execution(
+    operator_id: OperatorId,
+    strategy: R1ExecutionStrategy,
+    delta: R1ExecutionCounters,
+) {
+    R1_EXECUTION_CONTEXT.with(|slot| {
+        if let Some(context) = *slot.borrow() {
+            record_r1_execution(
+                R1ExecutionKey {
+                    worker_id: context.worker_id,
+                    workload_id: context.workload_id,
+                    shard_id: context.shard_id,
+                    operator_id,
+                    strategy,
+                },
+                delta,
+            );
+        }
+    });
+}
+
+pub fn r1_execution_snapshot() -> Vec<(R1ExecutionKey, R1ExecutionCounters)> {
+    with_registry(|reg| {
+        let mut snapshot: Vec<_> = reg.r1_execution.iter().map(|(k, v)| (*k, *v)).collect();
+        snapshot.sort_by_key(|(key, _)| *key);
+        snapshot
+    })
+}
+
+pub fn set_r1_worker_shards_owned(worker_id: WorkerId, shards: u64) {
+    with_registry(|reg| {
+        reg.r1_workers.entry(worker_id).or_default().shards_owned = shards;
+    });
+}
+
+pub fn add_r1_worker_rows(worker_id: WorkerId, input_rows: u64, output_rows: u64) {
+    with_registry(|reg| {
+        let activity = reg.r1_workers.entry(worker_id).or_default();
+        activity.input_rows = activity.input_rows.saturating_add(input_rows);
+        activity.output_rows = activity.output_rows.saturating_add(output_rows);
+    });
+}
+
+pub fn read_r1_worker_activity(worker_id: WorkerId) -> R1WorkerActivity {
+    with_registry(|reg| reg.r1_workers.get(&worker_id).copied().unwrap_or_default())
+}
+
+pub fn r1_worker_snapshot() -> Vec<(WorkerId, R1WorkerActivity)> {
+    with_registry(|reg| {
+        let mut snapshot: Vec<_> = reg.r1_workers.iter().map(|(k, v)| (*k, *v)).collect();
+        snapshot.sort_by_key(|(worker_id, _)| *worker_id);
+        snapshot
+    })
 }
 
 // ─── merge_law_applied / merge_law_fallback ───────────────────────────────────
@@ -829,6 +1090,10 @@ fn pipeline_stall_report_from_map(
 #[doc(hidden)]
 pub fn reset_all() {
     with_registry(|reg| {
+        reg.r1_execution.clear();
+        reg.r1_persistence.clear();
+        reg.r1_arrangements.clear();
+        reg.r1_workers.clear();
         reg.applied.clear();
         reg.fallback.clear();
         reg.rmw_avoided.clear();
@@ -2363,6 +2628,186 @@ pub fn generate_prometheus_metrics() -> String {
                     .load(Ordering::Relaxed)
             )
         ));
+
+        let mut persistence: Vec<_> = reg.r1_persistence.iter().collect();
+        persistence.sort_by_key(|(operator_id, _)| **operator_id);
+        let persistence_metrics: [R1CounterDescriptor<R1PersistenceCounters>; 4] = [
+            (
+                "rockstream_r1_state_mutations_total",
+                "State mutations produced by changed-key commits.",
+                |c| c.state_mutations,
+            ),
+            (
+                "rockstream_r1_logical_mutation_bytes_total",
+                "Logical key and value bytes in changed-key mutations.",
+                |c| c.logical_mutation_bytes,
+            ),
+            (
+                "rockstream_r1_dirty_keys_total",
+                "Dirty keys produced by operator commits.",
+                |c| c.dirty_keys,
+            ),
+            (
+                "rockstream_r1_full_state_entries_visited_total",
+                "Existing state entries visited outside changed keys during ordinary commits.",
+                |c| c.full_state_entries_visited,
+            ),
+        ];
+        for (name, help, value) in persistence_metrics {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+            for (operator_id, counters) in &persistence {
+                out.push_str(&format!(
+                    "{name}{{operator_id=\"{}\"}} {}\n",
+                    operator_id.0,
+                    value(counters)
+                ));
+            }
+            out.push('\n');
+        }
+
+        let mut arrangements: Vec<_> = reg.r1_arrangements.iter().collect();
+        arrangements.sort_by_key(|(arrangement_id, _)| **arrangement_id);
+        let arrangement_metrics: [R1MetricDescriptor<R1ArrangementCounters>; 8] = [
+            ("rockstream_r1_arrangement_logical_trace_bytes", "Logical bytes held by a shared arrangement trace.", "gauge", |c| c.logical_trace_bytes),
+            ("rockstream_r1_arrangement_consumer_metadata_bytes", "Logical bytes held by shared-arrangement consumer metadata.", "gauge", |c| c.consumer_metadata_bytes),
+            ("rockstream_r1_arrangement_lfs_files", "LFS files used by a shared arrangement.", "gauge", |c| c.lfs_files),
+            ("rockstream_r1_arrangement_lfs_bytes", "LFS bytes used by a shared arrangement.", "gauge", |c| c.lfs_bytes),
+            ("rockstream_r1_source_key_builds_total", "Canonical source keys built for shared-index maintenance.", "counter", |c| c.source_key_builds),
+            ("rockstream_r1_trace_rows_written_total", "Rows written to shared arrangement traces.", "counter", |c| c.trace_rows_written),
+            ("rockstream_r1_accepted_source_changes_total", "Accepted source changes maintained in shared indexes.", "counter", |c| c.accepted_source_changes),
+            ("rockstream_r1_source_index_cpu_nanoseconds_total", "Native thread CPU nanoseconds spent building source keys and committing trace batches.", "counter", |c| c.source_index_cpu_ns),
+        ];
+        for (name, help, metric_type, value) in arrangement_metrics {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} {metric_type}\n"
+            ));
+            for (arrangement_id, counters) in &arrangements {
+                out.push_str(&format!(
+                    "{name}{{arrangement_id=\"{}\"}} {}\n",
+                    arrangement_id.0,
+                    value(counters)
+                ));
+            }
+            out.push('\n');
+        }
+
+        let mut execution: Vec<_> = reg.r1_execution.iter().collect();
+        execution.sort_by_key(|(key, _)| **key);
+        let execution_metrics: [R1MetricDescriptor<R1ExecutionCounters>; 8] = [
+            (
+                "rockstream_r1_input_deltas_total",
+                "Input deltas processed by an execution strategy.",
+                "counter",
+                |c| c.input_deltas,
+            ),
+            (
+                "rockstream_r1_arrangement_probes_total",
+                "Actual arrangement probes performed by an execution strategy.",
+                "counter",
+                |c| c.arrangement_probes,
+            ),
+            (
+                "rockstream_r1_flattened_intermediate_tuples_total",
+                "Flattened tuples emitted immediately before downstream aggregation.",
+                "counter",
+                |c| c.flattened_intermediate_tuples,
+            ),
+            (
+                "rockstream_r1_output_deltas_total",
+                "Output deltas produced by an execution strategy.",
+                "counter",
+                |c| c.output_deltas,
+            ),
+            (
+                "rockstream_r1_changed_state_writes_total",
+                "Changed state entries written by an execution strategy.",
+                "counter",
+                |c| c.changed_state_writes,
+            ),
+            (
+                "rockstream_r1_encoded_exchange_bytes_total",
+                "Bytes produced by exchange serialization.",
+                "counter",
+                |c| c.encoded_exchange_bytes,
+            ),
+            (
+                "rockstream_r1_factor_payload_rows",
+                "Current factor payload rows.",
+                "gauge",
+                |c| c.factor_payload_rows,
+            ),
+            (
+                "rockstream_r1_factor_payload_bytes",
+                "Current factor payload logical bytes.",
+                "gauge",
+                |c| c.factor_payload_bytes,
+            ),
+        ];
+        for (name, help, metric_type, value) in execution_metrics {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} {metric_type}\n"
+            ));
+            for (key, counters) in &execution {
+                out.push_str(&format!(
+                    "{name}{{worker_id=\"{}\",workload_id=\"{}\",shard_id=\"{}\",operator_id=\"{}\",strategy=\"{}\"}} {}\n",
+                    key.worker_id.0,
+                    key.workload_id.0,
+                    key.shard_id.0,
+                    key.operator_id.0,
+                    key.strategy.as_str(),
+                    value(counters)
+                ));
+            }
+            out.push('\n');
+        }
+
+        let mut workers: Vec<_> = reg.r1_workers.iter().collect();
+        workers.sort_by_key(|(worker_id, _)| **worker_id);
+        let worker_metrics: [R1MetricDescriptor<R1WorkerActivity>; 5] = [
+            (
+                "rockstream_r1_worker_shards_owned",
+                "Shards currently owned by a worker.",
+                "gauge",
+                |c| c.shards_owned,
+            ),
+            (
+                "rockstream_r1_worker_input_rows_total",
+                "Input rows processed by a worker.",
+                "counter",
+                |c| c.input_rows,
+            ),
+            (
+                "rockstream_r1_worker_output_rows_total",
+                "Output rows produced by a worker.",
+                "counter",
+                |c| c.output_rows,
+            ),
+            (
+                "rockstream_r1_worker_state_writes_total",
+                "Changed state writes performed by a worker.",
+                "counter",
+                |c| c.state_writes,
+            ),
+            (
+                "rockstream_r1_worker_exchange_bytes_total",
+                "Encoded exchange bytes handled by a worker.",
+                "counter",
+                |c| c.exchange_bytes,
+            ),
+        ];
+        for (name, help, metric_type, value) in worker_metrics {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} {metric_type}\n"
+            ));
+            for (worker_id, activity) in &workers {
+                out.push_str(&format!(
+                    "{name}{{worker_id=\"{}\"}} {}\n",
+                    worker_id.0,
+                    value(activity)
+                ));
+            }
+            out.push('\n');
+        }
     });
     out
 }
@@ -2385,6 +2830,134 @@ mod tests {
             law_version: 1,
             operator_id: None,
         }
+    }
+
+    #[test]
+    fn r1_counter_snapshot_and_prometheus_output_are_exact() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        record_r1_persistence(OperatorId(4), 3, 44, 2);
+        add_r1_full_state_entries_visited(OperatorId(4), 7);
+        record_r1_arrangement_commit(ArrangementId(5), 2, 2, 3, 11, 99);
+        set_r1_arrangement_consumer_metadata(ArrangementId(5), 16);
+        set_r1_arrangement_lfs_usage(ArrangementId(5), 2, 120);
+        let execution_key = R1ExecutionKey {
+            worker_id: WorkerId(1),
+            workload_id: WorkloadId(2),
+            shard_id: ShardId(3),
+            operator_id: OperatorId(4),
+            strategy: R1ExecutionStrategy::Factorized,
+        };
+        record_r1_execution(
+            execution_key,
+            R1ExecutionCounters {
+                input_deltas: 2,
+                arrangement_probes: 3,
+                flattened_intermediate_tuples: 4,
+                output_deltas: 5,
+                changed_state_writes: 6,
+                encoded_exchange_bytes: 7,
+                factor_payload_rows: 8,
+                factor_payload_bytes: 9,
+            },
+        );
+        set_r1_worker_shards_owned(WorkerId(1), 2);
+        add_r1_worker_rows(WorkerId(1), 10, 5);
+
+        assert_eq!(
+            r1_persistence_snapshot(),
+            vec![(
+                OperatorId(4),
+                R1PersistenceCounters {
+                    state_mutations: 3,
+                    logical_mutation_bytes: 44,
+                    dirty_keys: 2,
+                    full_state_entries_visited: 7,
+                },
+            )]
+        );
+        assert_eq!(
+            r1_arrangement_snapshot(),
+            vec![(
+                ArrangementId(5),
+                R1ArrangementCounters {
+                    logical_trace_bytes: 99,
+                    consumer_metadata_bytes: 16,
+                    lfs_files: 2,
+                    lfs_bytes: 120,
+                    source_key_builds: 2,
+                    trace_rows_written: 2,
+                    accepted_source_changes: 3,
+                    source_index_cpu_ns: 11,
+                },
+            )]
+        );
+        assert_eq!(
+            r1_execution_snapshot(),
+            vec![(
+                execution_key,
+                R1ExecutionCounters {
+                    input_deltas: 2,
+                    arrangement_probes: 3,
+                    flattened_intermediate_tuples: 4,
+                    output_deltas: 5,
+                    changed_state_writes: 6,
+                    encoded_exchange_bytes: 7,
+                    factor_payload_rows: 8,
+                    factor_payload_bytes: 9,
+                },
+            )]
+        );
+        assert_eq!(
+            r1_worker_snapshot(),
+            vec![(
+                WorkerId(1),
+                R1WorkerActivity {
+                    shards_owned: 2,
+                    input_rows: 10,
+                    output_rows: 5,
+                    state_writes: 6,
+                    exchange_bytes: 7,
+                },
+            )]
+        );
+
+        let prometheus = generate_prometheus_metrics();
+        let lines: Vec<_> = prometheus
+            .lines()
+            .filter(|line| line.starts_with("rockstream_r1_"))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "rockstream_r1_state_mutations_total{operator_id=\"4\"} 3",
+                "rockstream_r1_logical_mutation_bytes_total{operator_id=\"4\"} 44",
+                "rockstream_r1_dirty_keys_total{operator_id=\"4\"} 2",
+                "rockstream_r1_full_state_entries_visited_total{operator_id=\"4\"} 7",
+                "rockstream_r1_arrangement_logical_trace_bytes{arrangement_id=\"5\"} 99",
+                "rockstream_r1_arrangement_consumer_metadata_bytes{arrangement_id=\"5\"} 16",
+                "rockstream_r1_arrangement_lfs_files{arrangement_id=\"5\"} 2",
+                "rockstream_r1_arrangement_lfs_bytes{arrangement_id=\"5\"} 120",
+                "rockstream_r1_source_key_builds_total{arrangement_id=\"5\"} 2",
+                "rockstream_r1_trace_rows_written_total{arrangement_id=\"5\"} 2",
+                "rockstream_r1_accepted_source_changes_total{arrangement_id=\"5\"} 3",
+                "rockstream_r1_source_index_cpu_nanoseconds_total{arrangement_id=\"5\"} 11",
+                "rockstream_r1_input_deltas_total{worker_id=\"1\",workload_id=\"2\",shard_id=\"3\",operator_id=\"4\",strategy=\"factorized\"} 2",
+                "rockstream_r1_arrangement_probes_total{worker_id=\"1\",workload_id=\"2\",shard_id=\"3\",operator_id=\"4\",strategy=\"factorized\"} 3",
+                "rockstream_r1_flattened_intermediate_tuples_total{worker_id=\"1\",workload_id=\"2\",shard_id=\"3\",operator_id=\"4\",strategy=\"factorized\"} 4",
+                "rockstream_r1_output_deltas_total{worker_id=\"1\",workload_id=\"2\",shard_id=\"3\",operator_id=\"4\",strategy=\"factorized\"} 5",
+                "rockstream_r1_changed_state_writes_total{worker_id=\"1\",workload_id=\"2\",shard_id=\"3\",operator_id=\"4\",strategy=\"factorized\"} 6",
+                "rockstream_r1_encoded_exchange_bytes_total{worker_id=\"1\",workload_id=\"2\",shard_id=\"3\",operator_id=\"4\",strategy=\"factorized\"} 7",
+                "rockstream_r1_factor_payload_rows{worker_id=\"1\",workload_id=\"2\",shard_id=\"3\",operator_id=\"4\",strategy=\"factorized\"} 8",
+                "rockstream_r1_factor_payload_bytes{worker_id=\"1\",workload_id=\"2\",shard_id=\"3\",operator_id=\"4\",strategy=\"factorized\"} 9",
+                "rockstream_r1_worker_shards_owned{worker_id=\"1\"} 2",
+                "rockstream_r1_worker_input_rows_total{worker_id=\"1\"} 10",
+                "rockstream_r1_worker_output_rows_total{worker_id=\"1\"} 5",
+                "rockstream_r1_worker_state_writes_total{worker_id=\"1\"} 6",
+                "rockstream_r1_worker_exchange_bytes_total{worker_id=\"1\"} 7",
+            ]
+        );
     }
 
     #[test]

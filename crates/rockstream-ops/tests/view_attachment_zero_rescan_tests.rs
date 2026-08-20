@@ -13,6 +13,7 @@ use rockstream_types::arrangement::{
 use rockstream_types::batch::ZSetRow;
 use rockstream_types::ids::{TenantId, ViewId};
 use rockstream_types::merge_law::{MergeLawId, MergeLawVersion};
+use rockstream_types::metrics;
 
 fn sample_spec() -> ArrangementSpec {
     ArrangementSpec {
@@ -37,6 +38,7 @@ fn sample_spec() -> ArrangementSpec {
 
 #[test]
 fn test_view_attachment_zero_rescan() {
+    metrics::reset_all();
     let mut trace = SharedArrangementTrace::new(sample_spec());
 
     // Populate trace up to frontier 100
@@ -72,6 +74,7 @@ fn test_view_attachment_zero_rescan() {
             },
         ],
     );
+    let before = metrics::r1_arrangement_snapshot()[0].1;
 
     let mut delta_buffer = AttachmentDeltaBuffer::new(1000);
 
@@ -91,5 +94,20 @@ fn test_view_attachment_zero_rescan() {
     assert_eq!(
         attached.state.get(b"GOOG".as_ref()),
         Some(&(b"2800".to_vec(), 1))
+    );
+    let after = metrics::r1_arrangement_snapshot()[0].1;
+    assert_eq!(
+        (
+            after.source_key_builds,
+            after.trace_rows_written,
+            after.accepted_source_changes,
+            after.source_index_cpu_ns,
+        ),
+        (
+            before.source_key_builds,
+            before.trace_rows_written,
+            before.accepted_source_changes,
+            before.source_index_cpu_ns,
+        )
     );
 }

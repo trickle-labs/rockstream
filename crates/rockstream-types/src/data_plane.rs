@@ -103,6 +103,34 @@ pub struct RuntimeExchangeMessage {
     pub rows: Vec<RuntimeRow>,
 }
 
+impl RuntimeExchangeMessage {
+    pub fn encoded_len(&self) -> Result<usize, serde_json::Error> {
+        serde_json::to_vec(self).map(|bytes| bytes.len())
+    }
+
+    pub fn record_encoded_exchange(
+        &self,
+        worker_id: WorkerId,
+        strategy: crate::metrics::R1ExecutionStrategy,
+    ) -> Result<u64, serde_json::Error> {
+        let bytes = self.encoded_len()? as u64;
+        crate::metrics::record_r1_execution(
+            crate::metrics::R1ExecutionKey {
+                worker_id,
+                workload_id: self.workload_id,
+                shard_id: self.shard_id,
+                operator_id: self.operator_id,
+                strategy,
+            },
+            crate::metrics::R1ExecutionCounters {
+                encoded_exchange_bytes: bytes,
+                ..Default::default()
+            },
+        );
+        Ok(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeOutputDelta {
     pub version: u32,
@@ -224,6 +252,9 @@ mod tests {
             source: output.source.clone(),
             rows: output.rows.clone(),
         };
+        let encoded_exchange = "{\"version\":1,\"request_id\":\"request-9\",\"workload_id\":7,\"shard_id\":2,\"epoch\":12,\"operator_id\":3,\"lease_token\":13,\"source\":\"orders\",\"rows\":[{\"values_tsv\":\"42\",\"weight\":-1}]}";
+        assert_eq!(serde_json::to_string(&exchange).unwrap(), encoded_exchange);
+        assert_eq!(exchange.encoded_len().unwrap(), encoded_exchange.len());
 
         macro_rules! assert_round_trip {
             ($value:expr, $type:ty) => {

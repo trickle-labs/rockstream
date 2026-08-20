@@ -232,27 +232,58 @@ async fn execute_frame(
         .get(&frame.source)
         .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown source relation"))?;
-    let input = rows_to_zset(&frame.rows, schema)?;
-    let output = if let Some(join) = &deployment.compiled.join {
-        let empty = |schema: SchemaRef| rows_to_zset(&[], schema);
-        if frame.source == join.left_source {
-            join.pipeline.process(
-                input,
-                empty(deployment.schemas[&join.right_source].clone())?,
-            )
-        } else if frame.source == join.right_source {
-            join.pipeline
-                .process(empty(deployment.schemas[&join.left_source].clone())?, input)
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "source is not an input of the join",
-            ));
-        }
+    let worker_id = client
+        .worker_id()
+        .expect("execution identity checked above");
+    let strategy = if deployment
+        .compiled
+        .join
+        .as_ref()
+        .is_some_and(|join| join.pipeline.strategy() == "factorized")
+    {
+        rockstream_types::metrics::R1ExecutionStrategy::Factorized
     } else {
-        deployment.compiled.pipeline.process(input)
-    }
-    .map_err(io::Error::other)?;
+        rockstream_types::metrics::R1ExecutionStrategy::Classic
+    };
+    frame
+        .record_encoded_exchange(worker_id, strategy)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let input = rows_to_zset(&frame.rows, schema)?;
+    let output = rockstream_types::metrics::with_r1_execution_context(
+        rockstream_types::metrics::R1ExecutionContext {
+            worker_id,
+            workload_id: frame.workload_id,
+            shard_id: frame.shard_id,
+        },
+        || -> io::Result<_> {
+            if let Some(join) = &deployment.compiled.join {
+                let empty = |schema: SchemaRef| rows_to_zset(&[], schema);
+                if frame.source == join.left_source {
+                    join.pipeline
+                        .process(
+                            input,
+                            empty(deployment.schemas[&join.right_source].clone())?,
+                        )
+                        .map_err(io::Error::other)
+                } else if frame.source == join.right_source {
+                    join.pipeline
+                        .process(empty(deployment.schemas[&join.left_source].clone())?, input)
+                        .map_err(io::Error::other)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "source is not an input of the join",
+                    ))
+                }
+            } else {
+                deployment
+                    .compiled
+                    .pipeline
+                    .process(input)
+                    .map_err(io::Error::other)
+            }
+        },
+    )?;
     if !client
         .check_fence_write(frame.shard_id, frame.lease_token)
         .await?
@@ -283,6 +314,11 @@ async fn execute_frame(
     }
     deployment.db.flush().await.map_err(io::Error::other)?;
     let output_rows = zset_to_rows(&output)?;
+    rockstream_types::metrics::add_r1_worker_rows(
+        worker_id,
+        frame.rows.len() as u64,
+        output_rows.len() as u64,
+    );
     client
         .msg_tx
         .send(WorkerMessage::ExecutionProgress {
@@ -805,6 +841,10 @@ where
                             if let Some(db) = old_db {
                                 let _ = db.close().await;
                             }
+                            rockstream_types::metrics::set_r1_worker_shards_owned(
+                                descriptor.shard.worker_id,
+                                active_shards_clone.read().len() as u64,
+                            );
                             deployments_clone.write().insert(
                                 (descriptor.workload_id, descriptor.shard.shard_id),
                                 deployment.clone(),
@@ -862,12 +902,17 @@ where
                     }
                     match builder.build().await {
                         Ok(db) => {
+                            let owner = lease.worker_id;
                             active_shards_clone.write().insert(
                                 lease.shard_id,
                                 ShardState {
                                     lease,
                                     db: Some(db),
                                 },
+                            );
+                            rockstream_types::metrics::set_r1_worker_shards_owned(
+                                owner,
+                                active_shards_clone.read().len() as u64,
                             );
                         }
                         Err(e) => match &e {
@@ -923,6 +968,12 @@ where
                     if let Some(db) = db_to_close {
                         let _ = db.close().await;
                     }
+                    if let Some(worker_id) = *worker_id_clone.read() {
+                        rockstream_types::metrics::set_r1_worker_shards_owned(
+                            worker_id,
+                            active_shards_clone.read().len() as u64,
+                        );
+                    }
                     deployments_clone
                         .write()
                         .retain(|_, deployment| deployment.descriptor.shard.shard_id != shard_id);
@@ -939,6 +990,12 @@ where
                         };
                         if let Some(db) = db_to_close {
                             let _ = db.close().await;
+                        }
+                        if let Some(worker_id) = *worker_id_clone.read() {
+                            rockstream_types::metrics::set_r1_worker_shards_owned(
+                                worker_id,
+                                active_shards_clone.read().len() as u64,
+                            );
                         }
                     }
                     // Notify waiters

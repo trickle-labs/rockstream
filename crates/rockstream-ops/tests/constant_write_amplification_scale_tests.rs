@@ -10,6 +10,7 @@ use arrow::record_batch::RecordBatch;
 use rockstream_ops::aggregate::AggregateOp;
 use rockstream_ops::zset::ArrowZSet;
 use rockstream_types::ids::OperatorId;
+use rockstream_types::metrics::{self, R1PersistenceCounters};
 use std::sync::Arc;
 
 fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
@@ -33,12 +34,14 @@ fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
 
 #[test]
 fn test_constant_write_amplification_across_scales() {
+    metrics::reset_all();
     let scales = [1_000, 100_000, 1_000_000];
     let mut mutation_counts = Vec::new();
     let mut write_bytes = Vec::new();
 
     for &scale in &scales {
         let op = AggregateOp::new(OperatorId(scale as u64));
+        let mut expected_counters = R1PersistenceCounters::default();
 
         // Pre-populate with `scale` groups in chunks of 50,000
         let chunk_size = 50_000;
@@ -49,7 +52,11 @@ fn test_constant_write_amplification_across_scales() {
                 .map(|i| (i as i64, i as i64, 1))
                 .collect();
             let batch = make_kv_batch(&entries);
-            let _ = op.process_delta_with_result(batch).unwrap();
+            let result = op.process_delta_with_result(batch).unwrap();
+            expected_counters.state_mutations += result.metrics.state_mutations as u64;
+            expected_counters.logical_mutation_bytes +=
+                result.metrics.logical_mutation_bytes as u64;
+            expected_counters.dirty_keys += result.metrics.dirty_keys as u64;
             populated += this_chunk;
         }
 
@@ -58,6 +65,9 @@ fn test_constant_write_amplification_across_scales() {
         // Perform a single 1-key update
         let one_key_delta = make_kv_batch(&[(42, 999, 1)]);
         let result = op.process_delta_with_result(one_key_delta).unwrap();
+        expected_counters.state_mutations += result.metrics.state_mutations as u64;
+        expected_counters.logical_mutation_bytes += result.metrics.logical_mutation_bytes as u64;
+        expected_counters.dirty_keys += result.metrics.dirty_keys as u64;
 
         // Must emit exactly 1 state mutation regardless of scale (O(1))
         assert_eq!(
@@ -71,6 +81,13 @@ fn test_constant_write_amplification_across_scales() {
         let delta_bytes: usize = result.state_mutations.iter().map(|m| m.size_bytes()).sum();
         mutation_counts.push(result.state_mutations.len());
         write_bytes.push(delta_bytes);
+        assert_eq!(
+            metrics::r1_persistence_snapshot()
+                .into_iter()
+                .find(|(operator_id, _)| *operator_id == op.op_id)
+                .unwrap(),
+            (op.op_id, expected_counters)
+        );
     }
 
     // All mutation counts must be exactly 1

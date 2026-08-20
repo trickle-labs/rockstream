@@ -55,6 +55,7 @@ proptest = "1"
 rand = { version = "0.8", features = ["small_rng"] }
 dashmap = "6"
 lru = "0.12"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 sha2 = "0.10"
 md5 = "0.7"
