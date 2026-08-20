@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tokio_util::task::AbortOnDropHandle;
 
 use rockstream_types::data_plane::{
     DeploymentDescriptor, RuntimeExchangeMessage, RuntimeOutputDelta, RuntimeRow,
@@ -691,7 +692,7 @@ where
         // 2. Spawn writer task to forward WorkerMessage channel over TCP.
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let mut writer_tx = writer;
-        tokio::spawn(async move {
+        let _writer_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     msg = msg_rx.recv() => {
@@ -716,12 +717,12 @@ where
                     }
                 }
             }
-        });
+        }));
 
         // 3. Spawn heartbeat task once registered.
         let msg_tx_hb = msg_tx.clone();
         let worker_id_hb = worker_id_clone.clone();
-        tokio::spawn(async move {
+        let _heartbeat_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
                 let wid_opt = *worker_id_hb.read();
                 if let Some(wid) = wid_opt {
@@ -735,7 +736,7 @@ where
                 }
                 sleep(Duration::from_millis(500)).await;
             }
-        });
+        }));
 
         // 4. Read Loop: process ControlMessage commands from control plane.
         let mut lines = BufReader::new(reader).lines();

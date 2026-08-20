@@ -115,7 +115,7 @@ fn accumulate_full_rows(zset: &ArrowZSet, acc: &mut BTreeMap<Vec<i64>, i64>) {
 
 /// One randomized CRUD epoch on relation R (key -> value). Returns the delta as
 /// a Z-set of (key, value, weight) rows and updates the live model in place.
-fn random_epoch_delta(rng: &mut StdRng, live: &mut HashMap<i64, i64>) -> ArrowZSet {
+fn random_epoch_delta(rng: &mut StdRng, live: &mut BTreeMap<i64, i64>) -> ArrowZSet {
     let choice = rng.gen_range(0..3);
     let mut rows: Vec<(i64, i64, i64)> = Vec::new();
     match choice {
@@ -324,7 +324,7 @@ async fn quantum_coupled_exchange_rechunking_incremental_equals_batch() {
     let aggregate = AggregateOp::new(OperatorId(2));
 
     let mut rng = StdRng::seed_from_u64(0xA11CE);
-    let mut live: HashMap<i64, i64> = HashMap::new();
+    let mut live = BTreeMap::new();
     let mut net_input: BTreeMap<(i64, i64), i64> = BTreeMap::new();
     let mut incremental_agg: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
     let mut seq = 0u64;
@@ -438,7 +438,7 @@ async fn durable_fallback_after_fast_path_failure_incremental_equals_batch() {
     let aggregate = AggregateOp::new(OperatorId(2));
 
     let mut rng = StdRng::seed_from_u64(0xFEED5);
-    let mut live: HashMap<i64, i64> = HashMap::new();
+    let mut live = BTreeMap::new();
     let mut net_input: BTreeMap<(i64, i64), i64> = BTreeMap::new();
     let mut incremental_agg: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
     let mut sent_epochs: Vec<u64> = Vec::new();

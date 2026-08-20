@@ -1,15 +1,18 @@
-//! v0.59.6 Slice 9: Scale Proof (20 Views Sharing + 21st Attach) Tests.
+//! R1 structural proof for shared arrangements.
 //!
 //! Asserts:
-//! 1. 20 semantically equivalent views with syntax variations share 1 physical arrangement.
-//! 2. Shared storage byte volume is bounded (< 1.3x baseline 1-view state size).
-//! 3. 21st view attaches dynamically at frontier F with zero source scans and zero visibility gaps.
-//! 4. Sequential dropping preserves arrangement until the last consumer is deregistered.
+//! 1. One consumer, 20 shared consumers, and 20 private arrangements each process 100K rows.
+//! 2. Every consumer observes the complete output at the same frontier with zero source rescans.
+//! 3. Shared state stays within 1.5x of one consumer and saves at least 80% versus private state.
+//! 4. Logical and LFS bytes are measured after flush, and all arrangements are reclaimed.
 
-use rockstream_ops::view_attach::{AttachedView, AttachmentDeltaBuffer};
+use object_store::local::LocalFileSystem;
+use rockstream_ops::view_attach::{AttachedView, AttachmentDeltaBuffer, ViewAttachmentMetrics};
 use rockstream_sql::canonicalize::ExpressionNormalizer;
 use rockstream_storage::arrangement_catalog::ArrangementCatalog;
+use rockstream_storage::keys::{ShardKeyEncoder, ShardPrefix};
 use rockstream_storage::trace::SharedArrangementTrace;
+use rockstream_storage::ShardDb;
 use rockstream_types::arrangement::{
     ArrangementSpec, CanonicalBinaryOp, CanonicalExpr, CanonicalType, CollationId,
     CollationVersion, NullSemantics, PartitioningSpec, SourceIdentity, TimeDomainSemantics,
@@ -17,7 +20,20 @@ use rockstream_types::arrangement::{
 use rockstream_types::batch::ZSetRow;
 use rockstream_types::ids::{TenantId, ViewId};
 use rockstream_types::merge_law::{MergeLawId, MergeLawVersion};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+use tempfile::TempDir;
+
+const SOURCE_ROWS: usize = 100_000;
+const FRONTIER: u64 = 100_000;
+
+#[derive(Debug, PartialEq, Eq)]
+struct FixtureStats {
+    logical_bytes: u64,
+    physical_bytes: u64,
+    lfs_files: u64,
+}
 
 fn create_view_spec(view_index: usize) -> ArrangementSpec {
     // Variations in harmless syntax across 20 views:
@@ -108,119 +124,171 @@ fn create_view_spec(view_index: usize) -> ArrangementSpec {
     ExpressionNormalizer::canonicalize_spec(&spec)
 }
 
-#[tokio::test]
-async fn test_scale_proof_20_views_sharing_and_21st_attach() {
+fn expected_state() -> BTreeMap<Vec<u8>, (Vec<u8>, i64)> {
+    (0..SOURCE_ROWS)
+        .map(|row| {
+            (
+                (row as i64).to_be_bytes().to_vec(),
+                (((row as i64) * 3 + 7).to_be_bytes().to_vec(), 1),
+            )
+        })
+        .collect()
+}
+
+fn lfs_usage(path: &Path) -> (u64, u64) {
+    let mut pending = vec![path.to_path_buf()];
+    let mut files = 0;
+    let mut bytes = 0;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                files += 1;
+                bytes += metadata.len();
+            }
+        }
+    }
+    (files, bytes)
+}
+
+async fn run_fixture(consumers: usize, private_arrangements: bool) -> FixtureStats {
+    let directory = TempDir::new().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(directory.path()).unwrap());
+    let db = ShardDb::builder("r1-shared-arrangement-proof", store)
+        .build()
+        .await
+        .unwrap();
     let catalog = ArrangementCatalog::new();
+    let expected = expected_state();
+    let arrangement_count = if private_arrangements { consumers } else { 1 };
+    let mut arrangement_ids = Vec::with_capacity(arrangement_count);
+    let mut logical_bytes = 0;
 
-    // 1. Register 20 semantically equivalent views with syntax variations
-    let mut initial_arr_id = None;
-    for i in 1..=20 {
-        let view_id = ViewId(i as u64);
-        let spec = create_view_spec(i);
-        let (arr_id, is_new) = catalog.register_consumer(view_id, spec).await;
-        if i == 1 {
-            assert!(is_new);
-            initial_arr_id = Some(arr_id);
+    for arrangement_index in 0..arrangement_count {
+        let view_ids = if private_arrangements {
+            vec![ViewId((arrangement_index + 1) as u64)]
         } else {
-            assert!(!is_new);
-            assert_eq!(Some(arr_id), initial_arr_id);
+            (1..=consumers).map(|id| ViewId(id as u64)).collect()
+        };
+        let mut spec = create_view_spec(arrangement_index + 1);
+        if private_arrangements {
+            spec.security_policy_digest[0] = (arrangement_index + 1) as u8;
         }
-    }
 
-    // Assert only 1 physical arrangement in catalog for all 20 views
-    assert_eq!(catalog.physical_arrangements_count().await, 1);
-    let arr_id = initial_arr_id.unwrap();
-    assert_eq!(catalog.consumer_count(arr_id).await, 20);
-
-    // 2. Feed stream events into physical shared trace
-    let spec = create_view_spec(1);
-    let mut trace = SharedArrangementTrace::new(spec.clone());
-    for i in 1..=20 {
-        trace.register_consumer_frontier(ViewId(i as u64), 0);
-    }
-
-    // Simulate events committed across 10 delta batches
-    let mut oracle_state: HashMap<Vec<u8>, (Vec<u8>, i64)> = HashMap::new();
-    for batch_idx in 1..=10 {
-        let from_f = (batch_idx - 1) * 10_000;
-        let to_f = batch_idx * 10_000;
-        let mut rows = Vec::new();
-        for row_idx in 1..=500 {
-            let user_id = row_idx as i64;
-            let key = user_id.to_le_bytes().to_vec();
-            let amount = (batch_idx * 1000 + row_idx) as i64;
-            let val = amount.to_le_bytes().to_vec();
-            rows.push(ZSetRow::insert(key.clone(), val.clone()));
-            oracle_state
-                .entry(key)
-                .and_modify(|e| {
-                    e.0 = val.clone();
-                    e.1 += 1;
-                })
-                .or_insert((val, 1));
+        let mut arrangement_id = None;
+        for (consumer_index, view_id) in view_ids.iter().enumerate() {
+            let (registered_id, is_new) = catalog.register_consumer(*view_id, spec.clone()).await;
+            assert_eq!(is_new, consumer_index == 0);
+            assert_eq!(arrangement_id.get_or_insert(registered_id), &registered_id);
         }
-        trace.commit_trace_batch(from_f, to_f, rows);
-        for i in 1..=20 {
-            trace.advance_consumer_frontier(ViewId(i as u64), to_f);
+        let arrangement_id = arrangement_id.unwrap();
+        arrangement_ids.push(arrangement_id);
+
+        let mut trace = SharedArrangementTrace::new(spec);
+        trace.commit_source_batch(0, FRONTIER, (0..SOURCE_ROWS).collect::<Vec<_>>(), |row| {
+            ZSetRow::insert(
+                (row as i64).to_be_bytes().to_vec(),
+                ((row as i64) * 3 + 7).to_be_bytes().to_vec(),
+            )
+        });
+        assert_eq!(trace.byte_size(), SOURCE_ROWS * 24);
+
+        for view_id in &view_ids {
+            let attached = AttachedView::attach(
+                *view_id,
+                &mut trace,
+                FRONTIER,
+                &mut AttachmentDeltaBuffer::new(0),
+            )
+            .unwrap();
+            assert_eq!(attached.state, expected);
+            assert_eq!(
+                attached.metrics,
+                ViewAttachmentMetrics {
+                    source_scan_requests: 0,
+                    pinned_frontier: FRONTIER,
+                    snapshot_rows_loaded: SOURCE_ROWS,
+                    buffered_delta_batches: 0,
+                    buffered_delta_rows: 0,
+                    live_attached_frontier: FRONTIER,
+                }
+            );
         }
-    }
 
-    // Verify 1-view vs 20-view memory and byte footprint
-    let single_view_bytes = trace.byte_size();
-    // 20 views share the exact 1 physical trace, byte volume is identical (1.0x <= 1.3x)
-    assert!(
-        trace.byte_size() as f64 <= single_view_bytes as f64 * 1.3,
-        "Shared state bytes exceeded 1.3x single view baseline"
-    );
-
-    // 3. Attach 21st view dynamically at frontier 100,000 without source rescan
-    let mut delta_buffer = AttachmentDeltaBuffer::new(50_000);
-    let view_21 = ViewId(21);
-    let (arr_id_21, is_new_21) = catalog.register_consumer(view_21, spec.clone()).await;
-    assert_eq!(arr_id_21, arr_id);
-    assert!(!is_new_21);
-    assert_eq!(catalog.consumer_count(arr_id).await, 21);
-
-    let attached_21 = AttachedView::attach(view_21, &mut trace, 100_000, &mut delta_buffer)
-        .expect("view 21 attach succeeds");
-
-    // Verify zero source scans and multiset match against oracle
-    assert_eq!(attached_21.metrics.source_scan_requests, 0);
-    assert_eq!(attached_21.metrics.pinned_frontier, 100_000);
-    assert_eq!(attached_21.state.len(), oracle_state.len());
-
-    for (k, (v, w)) in &oracle_state {
-        let attached_entry = attached_21.state.get(k.as_slice());
-        assert!(attached_entry.is_some());
-        let (attached_val, attached_weight) = attached_entry.unwrap();
-        assert_eq!(attached_val, v);
-        assert_eq!(*attached_weight, *w);
-    }
-
-    // 4. Reference-counted dropping: drop views 1 through 20
-    for i in 1..=20 {
-        let marked = catalog
-            .deregister_consumer(ViewId(i as u64), arr_id)
+        logical_bytes += trace.byte_size() as u64
+            + (trace.consumer_frontiers.len()
+                * (std::mem::size_of::<ViewId>() + std::mem::size_of::<u64>()))
+                as u64;
+        let trace_key = ShardKeyEncoder::encode(
+            ShardPrefix::OpState,
+            arrangement_index as u64,
+            b"trace_data",
+        );
+        db.put(&trace_key, &serde_json::to_vec(&trace).unwrap())
             .await
             .unwrap();
-        assert!(
-            !marked,
-            "Arrangement must not be marked for GC while view 21 is active"
-        );
+        db.flush().await.unwrap();
+
+        for (consumer_index, view_id) in view_ids.iter().enumerate() {
+            trace.deregister_consumer(*view_id);
+            assert_eq!(
+                catalog
+                    .deregister_consumer(*view_id, arrangement_id)
+                    .await
+                    .unwrap(),
+                consumer_index + 1 == view_ids.len()
+            );
+        }
+        assert!(trace.consumer_frontiers.is_empty());
+        catalog
+            .update_compaction_frontier(arrangement_id, FRONTIER)
+            .await;
     }
-    assert_eq!(catalog.consumer_count(arr_id).await, 1);
-    assert_eq!(catalog.physical_arrangements_count().await, 1);
 
-    // Drop 21st view: triggers deferred reclamation
-    let marked_last = catalog.deregister_consumer(view_21, arr_id).await.unwrap();
-    assert!(
-        marked_last,
-        "Dropping last consumer must mark arrangement for GC"
+    assert_eq!(
+        catalog.physical_arrangements_count().await,
+        arrangement_count
     );
-    assert_eq!(catalog.consumer_count(arr_id).await, 0);
-
-    catalog.update_compaction_frontier(arr_id, 100_000).await;
-    let reclaimed = catalog.reclaim_unreferenced_arrangements(100_000).await;
-    assert_eq!(reclaimed, vec![arr_id]);
+    let mut reclaimed = catalog.reclaim_unreferenced_arrangements(FRONTIER).await;
+    reclaimed.sort_unstable();
+    arrangement_ids.sort_unstable();
+    arrangement_ids.dedup();
+    assert_eq!(reclaimed, arrangement_ids);
     assert_eq!(catalog.physical_arrangements_count().await, 0);
+
+    db.close().await.unwrap();
+    let (lfs_files, physical_bytes) = lfs_usage(directory.path());
+    FixtureStats {
+        logical_bytes,
+        physical_bytes,
+        lfs_files,
+    }
+}
+
+#[tokio::test]
+async fn test_scale_proof_20_views_sharing() {
+    let single = run_fixture(1, false).await;
+    let shared = run_fixture(20, false).await;
+    let private = run_fixture(20, true).await;
+    let trace_bytes = (SOURCE_ROWS * 24) as u64;
+
+    assert_eq!(
+        single.logical_bytes,
+        trace_bytes + (std::mem::size_of::<ViewId>() + std::mem::size_of::<u64>()) as u64
+    );
+    assert_eq!(
+        shared.logical_bytes,
+        trace_bytes + (20 * (std::mem::size_of::<ViewId>() + std::mem::size_of::<u64>())) as u64
+    );
+    assert_eq!(private.logical_bytes, single.logical_bytes * 20);
+    assert!(single.lfs_files > 0 && single.physical_bytes > 0);
+    assert!(shared.lfs_files > 0 && shared.physical_bytes > 0);
+    assert!(private.lfs_files > 0 && private.physical_bytes > 0);
+    assert!(shared.logical_bytes * 2 <= single.logical_bytes * 3);
+    assert!(shared.physical_bytes * 2 <= single.physical_bytes * 3);
+    assert!(shared.logical_bytes * 5 <= private.logical_bytes);
+    assert!(shared.physical_bytes * 5 <= private.physical_bytes);
 }

@@ -2,11 +2,17 @@ use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
-use rockstream_ops::{compile_plan, int64_schema};
-use rockstream_ops::{ArrowZSet, FactorizedAggregateKind, FactorizedJoinAggregateOp};
+use rockstream_ops::{
+    compile_plan, int64_schema, AggregateOp, ArrowZSet, FactorizedAggregateKind,
+    FactorizedJoinAggregateOp, JoinKind, JoinOp, JoinPipeline, Stage,
+};
 use rockstream_plan::{AggregateExpr, AggregateFunc, Expr, JoinSemantics, PlanNode};
 use rockstream_storage::{JoinSide, ShardDb, ShardKeyEncoder, WriteBatch};
-use rockstream_types::ids::OperatorId;
+use rockstream_types::ids::{OperatorId, ShardId, WorkerId, WorkloadId};
+use rockstream_types::metrics::{
+    self, R1ExecutionContext, R1ExecutionCounters, R1ExecutionKey, R1ExecutionStrategy,
+    R1WorkerActivity,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -61,6 +67,24 @@ fn utf8_batch(rows: &[(&str, i64)]) -> ArrowZSet {
 
 fn empty(schema: &arrow::datatypes::SchemaRef) -> ArrowZSet {
     ArrowZSet::empty(schema.clone())
+}
+
+fn logical_sum_rows(output: &ArrowZSet) -> Vec<(i64, i64, i64)> {
+    let groups = output
+        .data
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sums = output
+        .data
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    (0..output.num_rows())
+        .map(|row| (groups.value(row), sums.value(row), output.weights[row]))
+        .collect()
 }
 
 fn run(kind: FactorizedAggregateKind, left: ArrowZSet, right: ArrowZSet) -> ArrowZSet {
@@ -481,29 +505,167 @@ fn inner_pk_fk_utf8_incremental_equals_batch() {
 }
 
 #[test]
-fn one_dimension_high_fanout_emits_no_joined_intermediate() {
-    let op = FactorizedJoinAggregateOp::new(
-        OperatorId(4),
+fn fanout_100_classic_and_factorized_outputs_and_work_are_exact() {
+    metrics::reset_all();
+    let context = R1ExecutionContext {
+        worker_id: WorkerId(1),
+        workload_id: WorkloadId(7),
+        shard_id: ShardId(9),
+    };
+    let classic = JoinPipeline::new(
+        Vec::new(),
+        Vec::new(),
+        JoinKind::Inner(Arc::new(JoinOp::new(OperatorId(1), vec![0], vec![0]))),
+        vec![Stage::Aggregate(Arc::new(AggregateOp::new(OperatorId(2))))],
+    );
+    let factorized_op = Arc::new(FactorizedJoinAggregateOp::new(
+        OperatorId(3),
         vec![0],
         vec![0],
         2,
         2,
         0,
-        3,
+        1,
         FactorizedAggregateKind::Sum,
+    ));
+    let factorized = JoinPipeline::new(
+        Vec::new(),
+        Vec::new(),
+        JoinKind::Factorized(factorized_op.clone()),
+        Vec::new(),
     );
-    let out = op
-        .process_epoch(int_batch(&[(1, 2), (1, 3)]), int_batch(&[(1, 5), (1, 7)]))
-        .unwrap();
-    assert_eq!(op.joined_intermediate_rows(), 0);
+    let right = (0..100).map(|value| (1, value)).collect::<Vec<_>>();
+
+    let classic_outputs = [
+        metrics::with_r1_execution_context(context, || {
+            classic.process(int_batch(&[(1, 2)]), int_batch(&right))
+        })
+        .unwrap(),
+        metrics::with_r1_execution_context(context, || {
+            classic.process(
+                int_batch_with_weights(&[(1, 2), (1, 3)], vec![-1, 1]),
+                int_batch(&[]),
+            )
+        })
+        .unwrap(),
+        metrics::with_r1_execution_context(context, || {
+            classic.process(int_batch_with_weights(&[(1, 3)], vec![-1]), int_batch(&[]))
+        })
+        .unwrap(),
+    ];
+    let factorized_outputs = [
+        metrics::with_r1_execution_context(context, || {
+            factorized.process(int_batch(&[(1, 2)]), int_batch(&right))
+        })
+        .unwrap(),
+        metrics::with_r1_execution_context(context, || {
+            factorized.process(
+                int_batch_with_weights(&[(1, 2), (1, 3)], vec![-1, 1]),
+                int_batch(&[]),
+            )
+        })
+        .unwrap(),
+        metrics::with_r1_execution_context(context, || {
+            factorized.process(int_batch_with_weights(&[(1, 3)], vec![-1]), int_batch(&[]))
+        })
+        .unwrap(),
+    ];
+    let expected = [
+        vec![(1, 200, 1)],
+        vec![(1, 200, -1), (1, 300, 1)],
+        vec![(1, 300, -1)],
+    ];
     assert_eq!(
-        out.data
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
-        24
+        classic_outputs.map(|output| logical_sum_rows(&output)),
+        expected
+    );
+    assert_eq!(
+        factorized_outputs.map(|output| logical_sum_rows(&output)),
+        expected
+    );
+
+    let snapshot = metrics::r1_execution_snapshot();
+    assert_eq!(
+        snapshot,
+        vec![
+            (
+                R1ExecutionKey {
+                    worker_id: WorkerId(1),
+                    workload_id: WorkloadId(7),
+                    shard_id: ShardId(9),
+                    operator_id: OperatorId(1),
+                    strategy: R1ExecutionStrategy::Classic,
+                },
+                R1ExecutionCounters {
+                    input_deltas: 104,
+                    arrangement_probes: 104,
+                    flattened_intermediate_tuples: 400,
+                    output_deltas: 4,
+                    changed_state_writes: 104,
+                    ..Default::default()
+                },
+            ),
+            (
+                R1ExecutionKey {
+                    worker_id: WorkerId(1),
+                    workload_id: WorkloadId(7),
+                    shard_id: ShardId(9),
+                    operator_id: OperatorId(2),
+                    strategy: R1ExecutionStrategy::Classic,
+                },
+                R1ExecutionCounters {
+                    input_deltas: 400,
+                    arrangement_probes: 3,
+                    output_deltas: 4,
+                    changed_state_writes: 3,
+                    ..Default::default()
+                },
+            ),
+            (
+                R1ExecutionKey {
+                    worker_id: WorkerId(1),
+                    workload_id: WorkloadId(7),
+                    shard_id: ShardId(9),
+                    operator_id: OperatorId(3),
+                    strategy: R1ExecutionStrategy::Factorized,
+                },
+                R1ExecutionCounters {
+                    input_deltas: 104,
+                    arrangement_probes: 400,
+                    output_deltas: 4,
+                    changed_state_writes: 104,
+                    factor_payload_rows: 100,
+                    factor_payload_bytes: 3_900,
+                    ..Default::default()
+                },
+            ),
+        ]
+    );
+    assert!(snapshot[0].1.flattened_intermediate_tuples > 0);
+    assert!(
+        snapshot[0].1.flattened_intermediate_tuples
+            >= snapshot[2].1.flattened_intermediate_tuples * 10
+    );
+    assert_eq!(
+        factorized_op.governor().counters(),
+        rockstream_ops::DeltaAmplificationCounters {
+            input_deltas: 104,
+            probes: 400,
+            shuffled_bytes: 0,
+            intermediate_tuples: 0,
+            output_deltas: 4,
+            state_writes: 104,
+        }
+    );
+    assert_eq!(
+        metrics::r1_worker_snapshot(),
+        vec![(
+            WorkerId(1),
+            R1WorkerActivity {
+                state_writes: 211,
+                ..Default::default()
+            },
+        )]
     );
 }
 

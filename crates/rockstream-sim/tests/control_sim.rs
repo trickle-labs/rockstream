@@ -75,25 +75,22 @@ async fn sim_control_plane_leases() {
 
     if inject_partition {
         worker_handle1.abort();
+        let _ = worker_handle1.await;
     }
 
-    // Give time for the control plane to detect worker disconnect, clean up, and allow worker 2 to request it.
+    // Give the control plane time to detect the disconnect and reassign the lease.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !manager.is_empty() {
+        while manager
+            .get(ShardId(10))
+            .is_none_or(|lease| lease.worker_id != WorkerId(2))
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("worker 1 lease was not released within 5 seconds");
+    .expect("shard 10 was not reassigned to worker 2 within 5 seconds");
 
-    // Lease should be released
-    assert!(
-        manager.is_empty(),
-        "lease should be released by control plane"
-    );
-
-    // 7. Worker 2 requests lease for shard 10
-    client2.request_shard(ShardId(10)).await.unwrap();
+    // 7. Worker 2 receives the reassigned lease for shard 10.
     let leases2 = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let leases = client2.leases();

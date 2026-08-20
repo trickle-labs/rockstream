@@ -4,13 +4,17 @@
 //! 1,000, 100,000, and 10,000,000 groups produces approximately constant
 //! state mutations and logical write bytes (O(1) write amplification).
 
-use arrow::array::Int64Array;
+use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 use rockstream_ops::aggregate::AggregateOp;
+use rockstream_ops::op::OperatorEpochResult;
 use rockstream_ops::zset::ArrowZSet;
+use rockstream_storage::keys::{ShardKeyEncoder, ShardPrefix};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::metrics::{self, R1PersistenceCounters};
+use rockstream_types::state_mutation::{OperatorEpochMetrics, StateMutation};
 use std::sync::Arc;
 
 fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
@@ -32,18 +36,67 @@ fn make_kv_batch(rows: &[(i64, i64, i64)]) -> ArrowZSet {
     ArrowZSet::new(data, weights)
 }
 
+fn state_key(operator_id: OperatorId, key: i64) -> Vec<u8> {
+    ShardKeyEncoder::encode(ShardPrefix::OpState, operator_id.0, &key.to_be_bytes())
+}
+
+fn put(operator_id: OperatorId, key: i64, sum: i64, count: i64) -> StateMutation {
+    let mut value = Vec::with_capacity(16);
+    value.extend_from_slice(&sum.to_be_bytes());
+    value.extend_from_slice(&count.to_be_bytes());
+    StateMutation::Put {
+        key: state_key(operator_id, key),
+        value: Bytes::from(value),
+    }
+}
+
+fn assert_result(
+    result: &OperatorEpochResult,
+    integer_columns: &[Vec<i64>],
+    averages: &[f64],
+    weights: &[i64],
+    mutations: Vec<StateMutation>,
+    metrics: OperatorEpochMetrics,
+) {
+    assert_eq!(
+        result
+            .output_delta
+            .data
+            .columns()
+            .iter()
+            .take(3)
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>(),
+        integer_columns
+    );
+    assert_eq!(
+        result
+            .output_delta
+            .data
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .values(),
+        averages
+    );
+    assert_eq!(result.output_delta.weights, weights);
+    assert_eq!(result.state_mutations, mutations);
+    assert_eq!(result.metrics, metrics);
+}
+
 #[test]
 fn test_constant_write_amplification_across_scales() {
-    metrics::reset_all();
-    let scales = [1_000, 100_000, 1_000_000];
-    let mut mutation_counts = Vec::new();
-    let mut write_bytes = Vec::new();
-
-    for &scale in &scales {
-        let op = AggregateOp::new(OperatorId(scale as u64));
-        let mut expected_counters = R1PersistenceCounters::default();
-
-        // Pre-populate with `scale` groups in chunks of 50,000
+    for scale in [1_000, 100_000, 10_000_000] {
+        let operator_id = OperatorId(scale as u64);
+        let op = AggregateOp::new(operator_id);
         let chunk_size = 50_000;
         let mut populated = 0;
         while populated < scale {
@@ -52,54 +105,87 @@ fn test_constant_write_amplification_across_scales() {
                 .map(|i| (i as i64, i as i64, 1))
                 .collect();
             let batch = make_kv_batch(&entries);
-            let result = op.process_delta_with_result(batch).unwrap();
-            expected_counters.state_mutations += result.metrics.state_mutations as u64;
-            expected_counters.logical_mutation_bytes +=
-                result.metrics.logical_mutation_bytes as u64;
-            expected_counters.dirty_keys += result.metrics.dirty_keys as u64;
+            op.process_delta_with_result(batch).unwrap();
             populated += this_chunk;
         }
+        assert_eq!(op.live_groups(), scale);
+        metrics::reset_all();
+
+        let inserted = op
+            .process_delta_with_result(make_kv_batch(&[(scale as i64, 7, 1)]))
+            .unwrap();
+        assert_result(
+            &inserted,
+            &[vec![scale as i64], vec![7], vec![1]],
+            &[7.0],
+            &[1],
+            vec![put(operator_id, scale as i64, 7, 1)],
+            OperatorEpochMetrics {
+                input_records: 1,
+                output_records: 1,
+                dirty_keys: 1,
+                state_mutations: 1,
+                logical_mutation_bytes: 33,
+                full_state_entries_visited: 0,
+                state_bytes: (scale + 1) * 24,
+            },
+        );
+
+        let updated = op
+            .process_delta_with_result(make_kv_batch(&[(42, 42, -1), (42, 99, 1)]))
+            .unwrap();
+        assert_result(
+            &updated,
+            &[vec![42, 42], vec![42, 99], vec![1, 1]],
+            &[42.0, 99.0],
+            &[-1, 1],
+            vec![put(operator_id, 42, 99, 1)],
+            OperatorEpochMetrics {
+                input_records: 2,
+                output_records: 2,
+                dirty_keys: 1,
+                state_mutations: 1,
+                logical_mutation_bytes: 33,
+                full_state_entries_visited: 0,
+                state_bytes: (scale + 1) * 24,
+            },
+        );
+
+        let deleted = op
+            .process_delta_with_result(make_kv_batch(&[(43, 43, -1)]))
+            .unwrap();
+        assert_result(
+            &deleted,
+            &[vec![43], vec![43], vec![1]],
+            &[43.0],
+            &[-1],
+            vec![StateMutation::Delete {
+                key: state_key(operator_id, 43),
+            }],
+            OperatorEpochMetrics {
+                input_records: 1,
+                output_records: 1,
+                dirty_keys: 1,
+                state_mutations: 1,
+                logical_mutation_bytes: 17,
+                full_state_entries_visited: 0,
+                state_bytes: scale * 24,
+            },
+        );
 
         assert_eq!(op.live_groups(), scale);
-
-        // Perform a single 1-key update
-        let one_key_delta = make_kv_batch(&[(42, 999, 1)]);
-        let result = op.process_delta_with_result(one_key_delta).unwrap();
-        expected_counters.state_mutations += result.metrics.state_mutations as u64;
-        expected_counters.logical_mutation_bytes += result.metrics.logical_mutation_bytes as u64;
-        expected_counters.dirty_keys += result.metrics.dirty_keys as u64;
-
-        // Must emit exactly 1 state mutation regardless of scale (O(1))
+        assert_eq!(op.state_bytes(), (scale * 24) as u64);
         assert_eq!(
-            result.state_mutations.len(),
-            1,
-            "Scale {} must emit exactly 1 mutation for 1-key change",
-            scale
-        );
-        assert_eq!(result.metrics.dirty_keys, 1);
-
-        let delta_bytes: usize = result.state_mutations.iter().map(|m| m.size_bytes()).sum();
-        mutation_counts.push(result.state_mutations.len());
-        write_bytes.push(delta_bytes);
-        assert_eq!(
-            metrics::r1_persistence_snapshot()
-                .into_iter()
-                .find(|(operator_id, _)| *operator_id == op.op_id)
-                .unwrap(),
-            (op.op_id, expected_counters)
-        );
-    }
-
-    // All mutation counts must be exactly 1
-    assert!(mutation_counts.iter().all(|&c| c == 1));
-
-    // Logical write bytes must be identical/constant across all scale orders
-    let first_bytes = write_bytes[0];
-    for (i, &bytes) in write_bytes.iter().enumerate() {
-        assert_eq!(
-            bytes, first_bytes,
-            "Scale {} bytes {} must match initial scale bytes {}",
-            scales[i], bytes, first_bytes
+            metrics::r1_persistence_snapshot(),
+            vec![(
+                operator_id,
+                R1PersistenceCounters {
+                    state_mutations: 3,
+                    logical_mutation_bytes: 83,
+                    dirty_keys: 3,
+                    full_state_entries_visited: 0,
+                },
+            )]
         );
     }
 }

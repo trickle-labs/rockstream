@@ -130,6 +130,7 @@ const KNOWN_TOP_LEVEL_TABLES: &[&str] = &[
     "connector",
     "exchange",
     "storage",
+    "execution",
     "pricing",
     "gateway",
     "internal_tls",
@@ -220,6 +221,8 @@ const KNOWN_INTERNAL_TLS_KEYS: &[&str] = &[
 
 const KNOWN_STORAGE_KEYS: &[&str] = &["tiering"];
 
+const KNOWN_EXECUTION_KEYS: &[&str] = &["join_strategy"];
+
 const DEPRECATED_TIERING_KEYS: &[&str] = &[
     "shard_meta_backend",
     "cold_sst_backend",
@@ -293,6 +296,9 @@ fn validate_keys_in_table(
                 ),
                 "storage" => {
                     validate_keys_in_table(sub, "storage", KNOWN_STORAGE_KEYS, diagnostics)
+                }
+                "execution" => {
+                    validate_keys_in_table(sub, "execution", KNOWN_EXECUTION_KEYS, diagnostics)
                 }
                 "storage.tiering" => {
                     for (tk, _) in sub {
@@ -646,6 +652,34 @@ pub fn validate_semantic_bounds(
         check_file(
             &config.internal_tls.ca_cert_path,
             "internal_tls.ca_cert_path",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_keys_are_validated_exactly() {
+        assert_eq!(
+            validate_config_str("[execution]\njoin_strategy = \"factorized\"\n", false),
+            ConfigValidationReport::success()
+        );
+        assert_eq!(
+            validate_config_str("[execution]\njoin_stratgey = \"factorized\"\n", false),
+            ConfigValidationReport {
+                valid: false,
+                diagnostics: vec![ConfigDiagnostic {
+                    path: "execution.join_stratgey".to_string(),
+                    severity: ConfigDiagnosticSeverity::Error,
+                    code: "RS-0002".to_string(),
+                    message: "Unknown key `join_stratgey` in section `execution`".to_string(),
+                    suggestion: Some("Did you mean `join_strategy`?".to_string()),
+                    line: None,
+                    column: None,
+                }],
+            }
         );
     }
 }
