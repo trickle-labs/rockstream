@@ -13560,11 +13560,16 @@ async fn committed_dml_ops(
                 values_tsv,
                 ..
             } => {
-                images.insert(
-                    (table.to_ascii_lowercase(), row_key.clone()),
-                    Some(values_tsv.clone()),
-                );
-                true
+                let image = cached_row_image(shard_db, &mut images, table, row_key).await?;
+                if image.is_none() {
+                    images.insert(
+                        (table.to_ascii_lowercase(), row_key.clone()),
+                        Some(values_tsv.clone()),
+                    );
+                    true
+                } else {
+                    false
+                }
             }
             DmlOp::Update {
                 table,
