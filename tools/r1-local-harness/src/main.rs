@@ -425,7 +425,8 @@ async fn run_side(
     .await?;
     let (rockstream_rows, rockstream_sha256) = canonical_rows(loaded.rows)?;
     let mut expected = generated.clone();
-    expected.changes = loaded.final_changes.clone();
+    expected.source = loaded.final_source.clone();
+    expected.changes.clear();
     let (oracle_rows, oracle_sha256) =
         canonical_rows(oracle::complete_output(&expected, oracle_query)?)?;
     let result: Result<RawSample> = async {

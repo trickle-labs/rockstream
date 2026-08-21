@@ -10,7 +10,7 @@ pub struct LoadOutcome {
     pub visible_changes: u64,
     pub freshness_counts: Vec<u64>,
     pub rows: Vec<Vec<String>>,
-    pub final_changes: Vec<Change>,
+    pub final_source: Vec<SourceRow>,
     pub logical_bytes: u64,
 }
 
@@ -130,6 +130,7 @@ pub async fn execute(
     }
     let duration = started.elapsed();
     let rows = query_rows(&prepared.admin, &format!("SELECT * FROM {view}")).await?;
+    let final_source = query_source(&prepared.admin).await?;
     let mut freshness_counts = vec![0; histogram_bounds_ms.len()];
     for latency in latencies {
         let elapsed_ms = latency.as_micros().div_ceil(1_000) as u64;
@@ -145,7 +146,7 @@ pub async fn execute(
         visible_changes: accepted_changes,
         freshness_counts,
         rows,
-        final_changes,
+        final_source,
         logical_bytes,
     })
 }
@@ -301,6 +302,26 @@ async fn query_rows(client: &Client, sql: &str) -> Result<Vec<Vec<String>>> {
         .with_context(|| format!("query complete RockStream output {sql:?}"))?
         .iter()
         .map(canonical_row)
+        .collect()
+}
+
+async fn query_source(client: &Client) -> Result<Vec<SourceRow>> {
+    client
+        .query(
+            "SELECT id, group_id, dimension_id, value, active FROM r1_source ORDER BY id",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(SourceRow {
+                id: row.try_get::<_, i64>(0)? as u64,
+                group_id: row.try_get::<_, i64>(1)? as u64,
+                dimension_id: row.try_get::<_, i64>(2)? as u64,
+                value: row.try_get(3)?,
+                active: row.try_get(4)?,
+            })
+        })
         .collect()
 }
 
