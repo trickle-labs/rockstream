@@ -233,7 +233,9 @@ async fn insert_dimensions(client: &Client, rows: &[(u64, u64)], chunk_size: usi
             .collect::<Vec<_>>()
             .join(",");
         client
-            .batch_execute(&format!("INSERT INTO r1_dimension VALUES {values}"))
+            .batch_execute(&format!(
+                "INSERT INTO r1_dimension (id, bucket) VALUES {values}"
+            ))
             .await?;
     }
     Ok(())
@@ -247,7 +249,9 @@ async fn insert_sources(client: &Client, rows: &[SourceRow], chunk_size: usize) 
             .collect::<Vec<_>>()
             .join(",");
         client
-            .batch_execute(&format!("INSERT INTO r1_source VALUES {values}"))
+            .batch_execute(&format!(
+                "INSERT INTO r1_source (id, group_id, dimension_id, value, active) VALUES {values}"
+            ))
             .await?;
     }
     Ok(())
@@ -258,7 +262,10 @@ fn transaction_sql(changes: &[Change]) -> String {
     for change in changes {
         match change {
             Change::Insert { after } => {
-                sql.push_str(&format!("INSERT INTO r1_source VALUES {};", source_values(after)));
+                sql.push_str(&format!(
+                    "INSERT INTO r1_source (id, group_id, dimension_id, value, active) VALUES {};",
+                    source_values(after)
+                ));
             }
             Change::Update { before, after } => sql.push_str(&format!(
                 "UPDATE r1_source SET group_id={},dimension_id={},value={},active={} WHERE id={} AND group_id={} AND dimension_id={} AND value={} AND active={};",
