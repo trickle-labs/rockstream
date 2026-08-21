@@ -164,7 +164,7 @@ async fn persistence_counters_match_mutations_and_full_state_walks() {
                 state_mutations: 5,
                 logical_mutation_bytes: 149,
                 dirty_keys: 5,
-                full_state_entries_visited: 8,
+                full_state_entries_visited: 0,
             },
         )]
     );

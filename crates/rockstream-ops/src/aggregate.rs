@@ -938,63 +938,31 @@ pub async fn load_frontier(db: &ShardDb) -> Result<Option<u64>, OpError> {
 ///
 /// Call this after each epoch commit to ensure storage reflects current state.
 pub async fn append_agg_state(
-    db: &ShardDb,
+    _db: &ShardDb,
     op: &AggregateOp,
     target: &mut WriteBatch,
 ) -> Result<(), OpError> {
-    let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpState, op.op_id.0);
-
-    // Scan all existing state entries (64 MB cap — a bound on the scan).
-    let (existing, _truncated) = db
-        .scan_prefix_bounded(&prefix, 64 * 1024 * 1024)
-        .await
-        .map_err(OpError::storage)?;
-
-    // Build a write batch: delete all stale entries, write all live entries.
-    // Drop the mutex guard BEFORE the .await call to avoid holding a lock
-    // across an await point (clippy::await_holding_lock).
-    let wb = {
+    let mutations = {
         let state = op.state.lock().expect("AggregateOp mutex poisoned");
         let dirty_keys = op
             .dirty_keys
             .lock()
             .expect("AggregateOp dirty-key mutex poisoned");
-        let mut wb = WriteBatch::new();
-        let mut full_state_entries_visited = 0_u64;
-
-        // Deletions: existing entries whose group key is not in current state.
-        for (key, _) in &existing {
-            if key.len() < prefix.len() + 8 {
-                continue;
+        let mut keys = dirty_keys.iter().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        state.encode_mutations_for_keys(op.op_id, &keys)
+    };
+    for mutation in mutations {
+        match mutation {
+            rockstream_types::state_mutation::StateMutation::Put { key, value } => {
+                target.put(&key, &value)
             }
-            let k_bytes: [u8; 8] = match key[prefix.len()..prefix.len() + 8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let k = i64::from_be_bytes(k_bytes);
-            full_state_entries_visited += u64::from(!dirty_keys.contains(&k));
-            if !state.entries.contains_key(&k) {
-                wb.delete(key);
+            rockstream_types::state_mutation::StateMutation::Delete { key } => target.delete(&key),
+            rockstream_types::state_mutation::StateMutation::Merge { key, operand, .. } => {
+                target.merge(&key, &operand)
             }
         }
-
-        // Insertions: current live entries.
-        full_state_entries_visited += state
-            .entries
-            .keys()
-            .filter(|key| !dirty_keys.contains(key))
-            .count() as u64;
-        let new_wb = state.encode_as_write_batch(op.op_id);
-        wb.merge_from(new_wb);
-        rockstream_types::metrics::add_r1_full_state_entries_visited(
-            op.op_id,
-            full_state_entries_visited,
-        );
-        wb
-        // `state` (MutexGuard) is dropped here — before any await
-    };
-
-    target.merge_from(wb);
+    }
     op.dirty_keys
         .lock()
         .expect("AggregateOp dirty-key mutex poisoned")
