@@ -1,4 +1,4 @@
-use crate::corpus::{Change, Corpus, SourceRow};
+use crate::corpus::{canonical_changes_json, Change, Corpus, SourceRow};
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 use tokio_postgres::types::Type;
@@ -10,21 +10,24 @@ pub struct LoadOutcome {
     pub visible_changes: u64,
     pub freshness_counts: Vec<u64>,
     pub rows: Vec<Vec<String>>,
+    pub final_changes: Vec<Change>,
+    pub logical_bytes: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn execute(
+pub struct PreparedLoad {
+    admin: Client,
+}
+
+pub async fn prepare(
     address: &str,
     workload_sql: &str,
     view: &str,
     corpus: &Corpus,
-    lanes: usize,
     transaction_rows: usize,
     warm_up: Duration,
-    histogram_bounds_ms: &[u64],
-) -> Result<LoadOutcome> {
-    if lanes == 0 || transaction_rows == 0 || histogram_bounds_ms.is_empty() {
-        bail!("load lanes, transaction rows, and histogram bounds must be nonzero");
+) -> Result<PreparedLoad> {
+    if transaction_rows == 0 {
+        bail!("transaction rows must be nonzero");
     }
     let admin = connect(address).await?;
     for statement in workload_sql
@@ -44,6 +47,27 @@ pub async fn execute(
         .await
         .context("warm materialized view")?;
     tokio::time::sleep(warm_up).await;
+    Ok(PreparedLoad { admin })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute(
+    prepared: PreparedLoad,
+    address: &str,
+    view: &str,
+    corpus: &Corpus,
+    lanes: usize,
+    transaction_rows: usize,
+    measurement: Duration,
+    histogram_bounds_ms: &[u64],
+) -> Result<LoadOutcome> {
+    if lanes == 0
+        || transaction_rows == 0
+        || measurement.is_zero()
+        || histogram_bounds_ms.is_empty()
+    {
+        bail!("load lanes, transaction rows, measurement, and histogram bounds must be nonzero");
+    }
 
     let chunks = corpus.changes.chunks(transaction_rows).collect::<Vec<_>>();
     let mut per_lane = vec![Vec::new(); lanes];
@@ -51,35 +75,63 @@ pub async fn execute(
         per_lane[index % lanes].push(chunk.to_vec());
     }
     let started = Instant::now();
+    let deadline = started + measurement;
     let mut tasks = Vec::with_capacity(lanes);
     for lane in per_lane {
         let address = address.to_string();
         let view = view.to_string();
         tasks.push(tokio::spawn(async move {
             let client = connect(&address).await?;
-            let mut latencies = Vec::with_capacity(lane.len());
-            for changes in lane {
-                let sql = transaction_sql(&changes);
-                client
-                    .batch_execute(&sql)
-                    .await
-                    .context("submit change transaction")?;
-                let committed = Instant::now();
-                client
-                    .query(&format!("SELECT COUNT(*) FROM {view}"), &[])
-                    .await
-                    .context("await query-visible output frontier")?;
-                latencies.push(committed.elapsed());
+            let inverse = inverse_changes(&lane);
+            let forward_changes = lane.iter().flatten().cloned().collect::<Vec<_>>();
+            let mut final_changes = Vec::new();
+            let mut accepted_changes = 0;
+            let mut logical_bytes = 0;
+            let mut latencies = Vec::new();
+            let mut forward = true;
+            while Instant::now() < deadline {
+                final_changes = if forward {
+                    Vec::new()
+                } else {
+                    forward_changes.clone()
+                };
+                for changes in if forward { &lane } else { &inverse } {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    client
+                        .batch_execute(&transaction_sql(changes))
+                        .await
+                        .context("submit change transaction")?;
+                    let committed = Instant::now();
+                    client
+                        .query(&format!("SELECT COUNT(*) FROM {view}"), &[])
+                        .await
+                        .context("await query-visible output frontier")?;
+                    final_changes.extend_from_slice(changes);
+                    accepted_changes += changes.len() as u64;
+                    logical_bytes += canonical_changes_json(changes).len() as u64;
+                    latencies.push(committed.elapsed());
+                }
+                forward = !forward;
             }
-            Ok::<_, anyhow::Error>(latencies)
+            Ok::<_, anyhow::Error>((latencies, final_changes, accepted_changes, logical_bytes))
         }));
     }
     let mut latencies = Vec::new();
+    let mut final_changes = Vec::new();
+    let mut accepted_changes = 0;
+    let mut logical_bytes = 0;
     for task in tasks {
-        latencies.extend(task.await.context("load lane panicked")??);
+        let (lane_latencies, lane_changes, lane_accepted, lane_logical_bytes) =
+            task.await.context("load lane panicked")??;
+        latencies.extend(lane_latencies);
+        final_changes.extend(lane_changes);
+        accepted_changes += lane_accepted;
+        logical_bytes += lane_logical_bytes;
     }
     let duration = started.elapsed();
-    let rows = query_rows(&admin, &format!("SELECT * FROM {view}")).await?;
+    let rows = query_rows(&prepared.admin, &format!("SELECT * FROM {view}")).await?;
     let mut freshness_counts = vec![0; histogram_bounds_ms.len()];
     for latency in latencies {
         let elapsed_ms = latency.as_micros().div_ceil(1_000) as u64;
@@ -91,11 +143,38 @@ pub async fn execute(
     }
     Ok(LoadOutcome {
         duration,
-        accepted_changes: corpus.changes.len() as u64,
-        visible_changes: corpus.changes.len() as u64,
+        accepted_changes,
+        visible_changes: accepted_changes,
         freshness_counts,
         rows,
+        final_changes,
+        logical_bytes,
     })
+}
+
+fn inverse_changes(changes: &[Vec<Change>]) -> Vec<Vec<Change>> {
+    changes
+        .iter()
+        .rev()
+        .map(|changes| {
+            changes
+                .iter()
+                .rev()
+                .map(|change| match change {
+                    Change::Insert { after } => Change::Delete {
+                        before: after.clone(),
+                    },
+                    Change::Update { before, after } => Change::Update {
+                        before: after.clone(),
+                        after: before.clone(),
+                    },
+                    Change::Delete { before } => Change::Insert {
+                        after: before.clone(),
+                    },
+                })
+                .collect()
+        })
+        .collect()
 }
 
 async fn connect(address: &str) -> Result<Client> {
@@ -235,4 +314,39 @@ fn canonical_row(row: &Row) -> Result<Vec<String>> {
             ref kind => bail!("unsupported PGWire output type {kind}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inverse_changes_exactly_reverses_a_transaction_sequence() {
+        let row = |id, value| SourceRow {
+            id,
+            group_id: 1,
+            dimension_id: 2,
+            value,
+            active: true,
+        };
+        let changes = vec![vec![
+            Change::Insert { after: row(3, 30) },
+            Change::Update {
+                before: row(1, 10),
+                after: row(1, 11),
+            },
+            Change::Delete { before: row(2, 20) },
+        ]];
+        assert_eq!(
+            inverse_changes(&changes),
+            vec![vec![
+                Change::Insert { after: row(2, 20) },
+                Change::Update {
+                    before: row(1, 11),
+                    after: row(1, 10),
+                },
+                Change::Delete { before: row(3, 30) },
+            ]]
+        );
+    }
 }

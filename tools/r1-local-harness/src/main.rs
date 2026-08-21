@@ -69,6 +69,7 @@ struct LoadConfig {
     lanes: usize,
     transaction_rows: usize,
     warm_up_seconds: u64,
+    measurement_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,8 +321,6 @@ async fn run_workload(name: &str, workers: usize, output: &Path) -> Result<()> {
     let change_sha256 = sha256(&canonical_changes_json(&generated.changes));
     let sql = fs::read_to_string(benchmark.join(&workload.sql))?;
     let (view, oracle_query) = oracle::admitted_query(&sql)?;
-    let (oracle_rows, oracle_sha256) =
-        canonical_rows(oracle::complete_output(&generated, &oracle_query)?)?;
     let candidates: CandidateRecord =
         serde_json::from_slice(&fs::read(output.join("candidates.json"))?)?;
     let sides = comparison_sides(name, &candidates)?;
@@ -346,10 +345,9 @@ async fn run_workload(name: &str, workers: usize, output: &Path) -> Result<()> {
                 &generated,
                 &sql,
                 &view,
+                &oracle_query,
                 &input_sha256,
                 &change_sha256,
-                &oracle_sha256,
-                &oracle_rows,
                 &profile_path,
                 &corpus_path,
                 &thresholds_path,
@@ -375,10 +373,9 @@ async fn run_side(
     generated: &r1_local_harness::corpus::Corpus,
     sql: &str,
     view: &str,
+    oracle_query: &str,
     input_sha256: &str,
     change_sha256: &str,
-    oracle_sha256: &str,
-    oracle_rows: &[Vec<String>],
     profile_path: &Path,
     corpus_path: &Path,
     thresholds_path: &Path,
@@ -402,20 +399,33 @@ async fn run_side(
         side.candidate.kind == "baseline_rebuild",
     )
     .await?;
-    let before = cluster.process_snapshots()?;
-    let (workers_before, _) = cluster.observed_workers().await?;
-    let loaded = load::execute(
+    let prepared = load::prepare(
         &cluster.pgwire_addr,
         sql,
         view,
         generated,
-        corpus_config.load.lanes,
         corpus_config.load.transaction_rows,
         Duration::from_secs(corpus_config.load.warm_up_seconds),
+    )
+    .await?;
+    let before = cluster.process_snapshots()?;
+    let (workers_before, operator_counters_before) = cluster.observed_workers().await?;
+    let loaded = load::execute(
+        prepared,
+        &cluster.pgwire_addr,
+        view,
+        generated,
+        corpus_config.load.lanes,
+        corpus_config.load.transaction_rows,
+        Duration::from_secs(corpus_config.load.measurement_seconds),
         &corpus_config.freshness.histogram_buckets_ms,
     )
     .await?;
     let (rockstream_rows, rockstream_sha256) = canonical_rows(loaded.rows)?;
+    let mut expected = generated.clone();
+    expected.changes = loaded.final_changes.clone();
+    let (oracle_rows, oracle_sha256) =
+        canonical_rows(oracle::complete_output(&expected, oracle_query)?)?;
     let result: Result<RawSample> = async {
         let after = cluster.process_snapshots()?;
         let (observed_workers, operator_counters) = cluster.observed_workers().await?;
@@ -444,8 +454,32 @@ async fn run_side(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let logical_bytes = canonical_changes_json(&generated.changes).len() as u64;
-        let exchange_bytes = observed_workers
+        let measurement_workers = observed_workers
+            .iter()
+            .zip(&workers_before)
+            .map(
+                |(after, before)| r1_local_harness::metrics::WorkerActivity {
+                    worker_id: after.worker_id,
+                    pid: after.pid,
+                    shards_owned: after.shards_owned,
+                    input_rows: after.input_rows.saturating_sub(before.input_rows),
+                    output_rows: after.output_rows.saturating_sub(before.output_rows),
+                    state_writes: after.state_writes.saturating_sub(before.state_writes),
+                    exchange_bytes: after.exchange_bytes.saturating_sub(before.exchange_bytes),
+                },
+            )
+            .collect::<Vec<_>>();
+        let operator_counters = operator_counters
+            .into_iter()
+            .map(|(name, after)| {
+                (
+                    name.clone(),
+                    after.saturating_sub(*operator_counters_before.get(&name).unwrap_or(&0)),
+                )
+            })
+            .collect();
+        let logical_bytes = loaded.logical_bytes;
+        let exchange_bytes = measurement_workers
             .iter()
             .map(|worker| worker.exchange_bytes)
             .sum();
@@ -485,10 +519,10 @@ async fn run_side(
             exchange_bytes,
             max_queue_depth: 0,
             operator_counters,
-            workers: observed_workers,
+            workers: measurement_workers,
             canonical_input_sha256: input_sha256.to_string(),
             rockstream_output_sha256: rockstream_sha256.clone(),
-            sqlite_oracle_output_sha256: oracle_sha256.to_string(),
+            sqlite_oracle_output_sha256: oracle_sha256.clone(),
             outputs_equal: rockstream_sha256 == oracle_sha256,
         };
         sample.validate()?;
@@ -504,9 +538,9 @@ async fn run_side(
                     error: format!("{error:#}"),
                     canonical_input_sha256: input_sha256,
                     rockstream_output_sha256: &rockstream_sha256,
-                    sqlite_oracle_output_sha256: oracle_sha256,
+                    sqlite_oracle_output_sha256: &oracle_sha256,
                     rockstream_rows: &rockstream_rows,
-                    sqlite_oracle_rows: oracle_rows,
+                    sqlite_oracle_rows: &oracle_rows,
                 },
             )?;
             Err(error)
