@@ -683,6 +683,26 @@ mod tc {
         None
     }
 
+    pub async fn register_and_request_shard(
+        cluster: &TcCluster,
+        worker_id: u64,
+        shard_id: u64,
+    ) -> (usize, rockstream_types::lease::ShardLease) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(1)).await;
+            let addr = cluster.nodes[leader_idx].control_addr;
+            register_worker(addr, worker_id).await;
+            if let Some(lease) = request_shard(addr, worker_id, shard_id).await {
+                return (leader_idx, lease);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shard-lease request did not converge"
+            );
+        }
+    }
+
     /// Report a shard's frontier; returns `true` if the reply was
     /// `ClusterFrontierAdvanced` (published — this node is currently
     /// leader), `false` for `NotLeader` or no reply within the timeout.
@@ -781,18 +801,15 @@ async fn leader_kill_recovers_within_budget_tc() {
 
     let cluster = tc::TcCluster::boot("kill").await;
 
-    let (leader_idx, old_term) = cluster
+    let (_, old_term) = cluster
         .wait_for_single_leader(Duration::from_secs(15))
         .await;
-    let old_leader_addr = cluster.nodes[leader_idx].control_addr;
 
     // Pre-kill: a worker acquires shard 7's lease against the original
     // leader — this is the "in-flight" state whose continuity the kill
     // must not corrupt.
-    let mut worker10 = tc::register_worker(old_leader_addr, 10).await;
-    let lease_before = tc::request_shard_on_stream(&mut worker10, 10, 7)
-        .await
-        .expect("pre-kill shard-lease request against the real leader must succeed");
+    let (leader_idx, lease_before) = tc::register_and_request_shard(&cluster, 10, 7).await;
+    let old_leader_addr = cluster.nodes[leader_idx].control_addr;
     assert_eq!(lease_before.worker_id, WorkerId(10));
 
     // Pre-kill: frontier publication succeeds against the original leader.
@@ -981,13 +998,8 @@ async fn rolling_restart_preserves_worker_leases_and_quotas_tc() {
     let (leader_idx, _) = cluster
         .wait_for_single_leader(Duration::from_secs(15))
         .await;
-    let leader_addr = cluster.nodes[leader_idx].control_addr;
-
     // A worker acquires a real shard lease before the rolling restart begins.
-    let mut worker10 = tc::register_worker(leader_addr, 10).await;
-    let lease = tc::request_shard_on_stream(&mut worker10, 10, 3)
-        .await
-        .expect("pre-restart shard-lease request must succeed");
+    let (_, lease) = tc::register_and_request_shard(&cluster, 10, 3).await;
     assert_eq!(lease.worker_id, WorkerId(10));
 
     // A workload's quota/catalog state is registered directly against the
