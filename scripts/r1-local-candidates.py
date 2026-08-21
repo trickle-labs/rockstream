@@ -101,11 +101,17 @@ def contract_digests(root: Path) -> dict[str, str]:
 
 
 def status_is_clean(root: Path) -> bool:
-    status = str(git(root, "status", "--porcelain", "--untracked-files=all"))
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
     allowed = ("AGENTS.md", "evidence/r1-local/")
     return all(
         not line or line[3:] == allowed[0] or line[3:].startswith(allowed[1])
-        for line in status.splitlines()
+        for line in status
     )
 
 
