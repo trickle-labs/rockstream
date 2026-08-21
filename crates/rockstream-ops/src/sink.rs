@@ -92,6 +92,8 @@ pub struct ViewSinkOp {
     epoch: std::sync::atomic::AtomicU64,
 }
 
+const VIEW_OUTPUT_READ_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 impl ViewSinkOp {
     /// Create a new sink backed by `db` with the given operator ID.
     pub fn new(db: Arc<ShardDb>, op_id: OperatorId) -> Self {
@@ -331,11 +333,16 @@ pub async fn read_view_output(
     num_cols: usize,
 ) -> Result<Vec<(u64, u64, Vec<ColumnValue>, i64)>, OpError> {
     let prefix = view_output_prefix(op_id);
-    let entries = db
-        .scan_prefix_bounded(&prefix, 10_000_000)
+    let (entries, truncated) = db
+        .scan_prefix_bounded(&prefix, VIEW_OUTPUT_READ_MAX_BYTES)
         .await
         .map_err(OpError::storage)?;
-    Ok(decode_view_output_entries(entries.0, num_cols))
+    if truncated {
+        return Err(OpError::internal(format!(
+            "view output exceeds {VIEW_OUTPUT_READ_MAX_BYTES} byte read limit"
+        )));
+    }
+    Ok(decode_view_output_entries(entries, num_cols))
 }
 
 /// Same as [`read_view_output`] but reads through a read-only `ShardReader`

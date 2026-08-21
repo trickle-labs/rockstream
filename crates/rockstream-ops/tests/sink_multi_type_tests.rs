@@ -183,3 +183,37 @@ async fn mixed_type_row_is_byte_identical_after_multiple_epochs() {
     assert_eq!(cols1[3], ColumnValue::Float64(-2.25));
     assert_eq!(*w1, 1);
 }
+
+#[tokio::test]
+async fn read_view_output_returns_every_row_beyond_ten_mebibytes() {
+    let dir = TempDir::new().unwrap();
+    let db = open_shard_db(&dir).await;
+    let sink = ViewSinkOp::new(db.clone(), OperatorId(4));
+    let count = 250_000_i64;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..count)),
+            Arc::new(Int64Array::from_iter_values((0..count).map(|id| -id))),
+        ],
+    )
+    .unwrap();
+    sink.write_next_epoch(&ArrowZSet::new(batch, vec![1; count as usize]))
+        .await
+        .unwrap();
+    db.flush().await.unwrap();
+
+    let actual = read_view_output(db.as_ref(), OperatorId(4), 2)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, row, weight)| (row[0].as_i64(), row[1].as_i64(), weight))
+        .collect::<Vec<_>>();
+    let expected = (0..count)
+        .map(|id| (Some(id), Some(-id), 1))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
