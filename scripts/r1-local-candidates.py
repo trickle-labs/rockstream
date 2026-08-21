@@ -175,6 +175,8 @@ def build_candidate(root: Path, candidate_id: str, artifact_dir: Path) -> dict:
             if not built_binary.is_file():
                 fail(f"release binary was not produced: {built_binary}")
             shutil.copy2(built_binary, artifact_path)
+            run(["strip", "-x", str(artifact_path)], worktree)
+            run(["codesign", "--force", "--sign", "-", str(artifact_path)], worktree)
             version = public_json(artifact_path, worktree, "version", "--json")
             effective_config = public_json(
                 artifact_path,
