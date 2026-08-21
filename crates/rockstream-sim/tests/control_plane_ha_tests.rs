@@ -652,38 +652,35 @@ mod tc {
 
     /// Request a shard lease; returns `Some(lease)` on
     /// `ControlMessage::ShardAssigned`, `None` on any other reply (denial —
-    /// per this wire protocol's "silence/close means denial" convention —
-    /// or `NotLeader`).
+    /// per this wire protocol's "silence/close means denial" convention).
     pub async fn request_shard(
         addr: SocketAddr,
         worker_id: u64,
         shard_id: u64,
     ) -> Option<rockstream_types::lease::ShardLease> {
-        let mut stream = TcpStream::connect(addr).await.ok()?;
-        request_shard_on_stream(&mut stream, worker_id, shard_id).await
-    }
-
-    pub async fn request_shard_on_stream(
-        stream: &mut TcpStream,
-        worker_id: u64,
-        shard_id: u64,
-    ) -> Option<rockstream_types::lease::ShardLease> {
-        let req = WorkerMessage::RequestShard {
-            worker_id: WorkerId(worker_id),
-            shard_id: ShardId(shard_id),
-        };
-        let line = serde_json::to_string(&req).unwrap() + "\n";
-        stream.write_all(line.as_bytes()).await.ok()?;
-        let mut reader = BufReader::new(stream);
-        let mut resp = String::new();
-        tokio::time::timeout(Duration::from_millis(800), reader.read_line(&mut resp))
-            .await
-            .ok()?
-            .ok()?;
-        match serde_json::from_str(resp.trim()).ok()? {
-            ControlMessage::ShardAssigned { lease } => Some(lease),
-            _ => None,
+        for _ in 0..50 {
+            let mut stream = TcpStream::connect(addr).await.ok()?;
+            let req = WorkerMessage::RequestShard {
+                worker_id: WorkerId(worker_id),
+                shard_id: ShardId(shard_id),
+            };
+            let line = serde_json::to_string(&req).unwrap() + "\n";
+            stream.write_all(line.as_bytes()).await.ok()?;
+            let mut reader = BufReader::new(&mut stream);
+            let mut resp = String::new();
+            tokio::time::timeout(Duration::from_millis(800), reader.read_line(&mut resp))
+                .await
+                .ok()?
+                .ok()?;
+            match serde_json::from_str(resp.trim()).ok()? {
+                ControlMessage::ShardAssigned { lease } => return Some(lease),
+                ControlMessage::NotLeader { .. } => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                _ => return None,
+            }
         }
+        None
     }
 
     /// Report a shard's frontier; returns `true` if the reply was
