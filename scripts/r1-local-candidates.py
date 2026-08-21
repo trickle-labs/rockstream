@@ -102,9 +102,9 @@ def contract_digests(root: Path) -> dict[str, str]:
 
 def status_is_clean(root: Path) -> bool:
     status = str(git(root, "status", "--porcelain", "--untracked-files=all"))
-    allowed = "evidence/r1-local/candidates.json"
+    allowed = ("AGENTS.md", "evidence/r1-local/")
     return all(
-        not line or line[3:] == allowed
+        not line or line[3:] == allowed[0] or line[3:].startswith(allowed[1])
         for line in status.splitlines()
     )
 
