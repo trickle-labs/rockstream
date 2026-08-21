@@ -995,7 +995,7 @@ async fn rolling_restart_preserves_worker_leases_and_quotas_tc() {
     }
 
     let mut cluster = tc::TcCluster::boot("roll").await;
-    let (leader_idx, _) = cluster
+    let _ = cluster
         .wait_for_single_leader(Duration::from_secs(15))
         .await;
     // A worker acquires a real shard lease before the rolling restart begins.
