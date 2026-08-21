@@ -659,20 +659,32 @@ mod tc {
         shard_id: u64,
     ) -> Option<rockstream_types::lease::ShardLease> {
         for _ in 0..50 {
-            let mut stream = TcpStream::connect(addr).await.ok()?;
+            let Ok(mut stream) = TcpStream::connect(addr).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
             let req = WorkerMessage::RequestShard {
                 worker_id: WorkerId(worker_id),
                 shard_id: ShardId(shard_id),
             };
             let line = serde_json::to_string(&req).unwrap() + "\n";
-            stream.write_all(line.as_bytes()).await.ok()?;
+            if stream.write_all(line.as_bytes()).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             let mut reader = BufReader::new(&mut stream);
             let mut resp = String::new();
-            tokio::time::timeout(Duration::from_millis(800), reader.read_line(&mut resp))
-                .await
-                .ok()?
-                .ok()?;
-            match serde_json::from_str(resp.trim()).ok()? {
+            let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(800), reader.read_line(&mut resp)).await
+            else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let Ok(message) = serde_json::from_str(resp.trim()) else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            match message {
                 ControlMessage::ShardAssigned { lease } => return Some(lease),
                 ControlMessage::NotLeader { .. } => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
