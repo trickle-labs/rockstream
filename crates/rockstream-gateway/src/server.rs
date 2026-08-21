@@ -8818,9 +8818,18 @@ impl GatewayHandler {
         }
 
         let ops = entry.drain();
-        let affected = ops.len();
         drop(entry); // release DashMap entry guard before await
         let _commit_guard = self.shard_commit_lock.lock().await;
+        let ops = committed_dml_ops(shard_db, ops)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e))))?;
+        let affected = ops.len();
+        if ops.is_empty() {
+            self.flush_pending_notifies(conn_id);
+            return Ok(vec![promote_response(Response::TransactionEnd(Tag::new(
+                "COMMIT",
+            )))]);
+        }
 
         // Allocate next epoch
         let epoch = shard_db.try_next_epoch().ok_or_else(|| {
@@ -13535,6 +13544,90 @@ fn append_dml_ops(batch: &mut rockstream_storage::WriteBatch, ops: &[DmlOp]) {
             }
         }
     }
+}
+
+async fn committed_dml_ops(
+    shard_db: &rockstream_storage::ShardDb,
+    ops: Vec<DmlOp>,
+) -> Result<Vec<DmlOp>, rockstream_storage::StorageError> {
+    let mut images = HashMap::<(String, String), Option<String>>::new();
+    let mut committed = Vec::with_capacity(ops.len());
+    for op in ops {
+        let valid = match &op {
+            DmlOp::Insert {
+                table,
+                row_key,
+                values_tsv,
+                ..
+            } => {
+                let image = cached_row_image(shard_db, &mut images, table, row_key).await?;
+                if image.is_none() {
+                    images.insert(
+                        (table.to_ascii_lowercase(), row_key.clone()),
+                        Some(values_tsv.clone()),
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            DmlOp::Update {
+                table,
+                old_row_key,
+                old_tsv,
+                new_row_key,
+                new_tsv,
+            } => {
+                let image = cached_row_image(shard_db, &mut images, table, old_row_key).await?;
+                if image.as_deref() == Some(old_tsv) {
+                    images.insert((table.to_ascii_lowercase(), old_row_key.clone()), None);
+                    images.insert(
+                        (table.to_ascii_lowercase(), new_row_key.clone()),
+                        Some(new_tsv.clone()),
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            DmlOp::Delete {
+                table,
+                row_key,
+                returning_tsv,
+            } => {
+                let image = cached_row_image(shard_db, &mut images, table, row_key).await?;
+                if returning_tsv.as_deref() == image.as_deref() {
+                    images.insert((table.to_ascii_lowercase(), row_key.clone()), None);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if valid {
+            committed.push(op);
+        }
+    }
+    Ok(committed)
+}
+
+async fn cached_row_image(
+    shard_db: &rockstream_storage::ShardDb,
+    images: &mut HashMap<(String, String), Option<String>>,
+    table: &str,
+    row_key: &str,
+) -> Result<Option<String>, rockstream_storage::StorageError> {
+    let key = (table.to_ascii_lowercase(), row_key.to_string());
+    if let Some(image) = images.get(&key) {
+        return Ok(image.clone());
+    }
+    let storage_key = format!("view_output/{table}/{row_key}");
+    let image = shard_db
+        .get(storage_key.as_bytes())
+        .await?
+        .map(|value| String::from_utf8_lossy(&value).into_owned());
+    images.insert(key, image.clone());
+    Ok(image)
 }
 
 fn source_view_connector_id(source_name: &str, view_name: &str) -> ConnectorId {
