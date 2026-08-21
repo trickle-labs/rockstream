@@ -421,6 +421,7 @@ async fn run_side(
         corpus_config.load.transaction_rows,
         Duration::from_secs(corpus_config.load.measurement_seconds),
         &corpus_config.freshness.histogram_buckets_ms,
+        oracle_query,
     )
     .await?;
     let (rockstream_rows, rockstream_sha256) = canonical_rows(loaded.rows)?;

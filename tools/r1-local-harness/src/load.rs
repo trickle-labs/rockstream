@@ -1,4 +1,6 @@
+use crate::artifact::canonical_rows;
 use crate::corpus::{canonical_changes_json, Change, Corpus, SourceRow};
+use crate::oracle;
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 use tokio_postgres::types::Type;
@@ -64,6 +66,7 @@ pub async fn execute(
     transaction_rows: usize,
     measurement: Duration,
     histogram_bounds_ms: &[u64],
+    oracle_query: &str,
 ) -> Result<LoadOutcome> {
     if lanes == 0
         || transaction_rows == 0
@@ -129,8 +132,23 @@ pub async fn execute(
         logical_bytes += lane_logical_bytes;
     }
     let duration = started.elapsed();
-    let rows = query_rows(&prepared.admin, &format!("SELECT * FROM {view}")).await?;
     let final_source = query_source(&prepared.admin).await?;
+    let mut expected = corpus.clone();
+    expected.source = final_source.clone();
+    expected.changes.clear();
+    let (expected_rows, _) = canonical_rows(oracle::complete_output(&expected, oracle_query)?)?;
+    let drain_deadline = Instant::now() + Duration::from_secs(60);
+    let rows = loop {
+        let rows = query_rows(&prepared.admin, &format!("SELECT * FROM {view}")).await?;
+        let (canonical, _) = canonical_rows(rows)?;
+        if canonical == expected_rows {
+            break canonical;
+        }
+        if Instant::now() >= drain_deadline {
+            bail!("output did not reach the source frontier within the 60-second drain");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     let mut freshness_counts = vec![0; histogram_bounds_ms.len()];
     for latency in latencies {
         let elapsed_ms = latency.as_micros().div_ceil(1_000) as u64;
