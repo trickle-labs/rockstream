@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Prepared R1 corpus manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_sha256", "value"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "source_sha256": {"$ref": "#/$defs/sha256"},
+    "value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "profile_id", "load", "changes", "freshness", "generation", "repetitions", "schemas", "inputs"],
+      "properties": {
+        "contract_version": {"type": "integer", "const": 1},
+        "profile_id": {"type": "string", "const": "MBP-M5Pro-48GB-v1"},
+        "load": {"type": "object"},
+        "changes": {"type": "object"},
+        "freshness": {"type": "object"},
+        "generation": {"type": "object"},
+        "repetitions": {"type": "object"},
+        "schemas": {"type": "object"},
+        "inputs": {"type": "object"}
+      }
+    }
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

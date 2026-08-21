@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Prepared R1 local profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_sha256", "value"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "source_sha256": {"$ref": "#/$defs/sha256"},
+    "value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "profile_id", "revision", "state", "required_machine", "observed"],
+      "properties": {
+        "contract_version": {"type": "integer", "const": 1},
+        "profile_id": {"type": "string", "const": "MBP-M5Pro-48GB-v1"},
+        "revision": {"type": "integer", "minimum": 1},
+        "state": {"type": "string", "enum": ["unsealed", "sealed"]},
+        "required_machine": {"type": "object"},
+        "observed": {"type": "object"}
+      }
+    }
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

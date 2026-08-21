@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "R1 local decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "verdict", "raw_sample_count", "structural_result_count", "cells"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "verdict": {"enum": ["GREEN", "YELLOW", "RED", "INCOMPLETE"]},
+    "raw_sample_count": {"type": "integer", "minimum": 0},
+    "structural_result_count": {"type": "integer", "minimum": 0},
+    "cells": {"type": "array", "items": {"$ref": "#/$defs/cell"}}
+  },
+  "$defs": {
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workload", "candidate_id", "strategy", "worker_count", "raw_throughput_rows_per_second", "mean_throughput_rows_per_second", "coefficient_of_variation", "max_coefficient_of_variation", "comparator", "verdict"],
+      "properties": {
+        "workload": {"type": "string"},
+        "candidate_id": {"type": "string"},
+        "strategy": {"type": "string"},
+        "worker_count": {"type": "integer", "minimum": 0},
+        "raw_throughput_rows_per_second": {"type": "array", "items": {"type": "number", "minimum": 0}},
+        "mean_throughput_rows_per_second": {"type": "number", "minimum": 0},
+        "coefficient_of_variation": {"type": "number", "minimum": 0},
+        "max_coefficient_of_variation": {"type": "number", "minimum": 0},
+        "comparator": {"type": "string", "const": "<="},
+        "verdict": {"enum": ["GREEN", "RED"]}
+      }
+    }
+  }
+}

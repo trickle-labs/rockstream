@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "R1 structural results",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "results"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "results": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/result"}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "passed", "counters", "log_sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "passed": {"type": "boolean"},
+        "counters": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "integer", "minimum": 0}},
+        "log_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}
