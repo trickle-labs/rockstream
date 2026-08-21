@@ -87,18 +87,12 @@ pub async fn execute(
         tasks.push(tokio::spawn(async move {
             let client = connect(&address).await?;
             let inverse = inverse_changes(&lane);
-            let forward_changes = lane.iter().flatten().cloned().collect::<Vec<_>>();
             let mut final_changes = Vec::new();
             let mut accepted_changes = 0;
             let mut logical_bytes = 0;
             let mut latencies = Vec::new();
             let mut forward = true;
             while Instant::now() < deadline {
-                final_changes = if forward {
-                    Vec::new()
-                } else {
-                    forward_changes.clone()
-                };
                 for changes in if forward { &lane } else { &inverse } {
                     if Instant::now() >= deadline {
                         break;
@@ -112,7 +106,7 @@ pub async fn execute(
                         .query(&visibility_query(&view), &[])
                         .await
                         .context("await query-visible output frontier")?;
-                    final_changes.extend_from_slice(changes);
+                    track_final_changes(&mut final_changes, changes, forward);
                     accepted_changes += changes.len() as u64;
                     logical_bytes += canonical_changes_json(changes).len() as u64;
                     latencies.push(committed.elapsed());
@@ -179,6 +173,14 @@ fn inverse_changes(changes: &[Vec<Change>]) -> Vec<Vec<Change>> {
                 .collect()
         })
         .collect()
+}
+
+fn track_final_changes(applied: &mut Vec<Change>, changes: &[Change], forward: bool) {
+    if forward {
+        applied.extend_from_slice(changes);
+    } else {
+        applied.truncate(applied.len() - changes.len());
+    }
 }
 
 async fn connect(address: &str) -> Result<Client> {
@@ -367,5 +369,28 @@ mod tests {
             visibility_query("r1_factorized"),
             "SELECT * FROM r1_factorized LIMIT 1"
         );
+    }
+
+    #[test]
+    fn inverse_prefix_leaves_the_exact_forward_prefix() {
+        let row = |id| SourceRow {
+            id,
+            group_id: 1,
+            dimension_id: 2,
+            value: id as i64,
+            active: true,
+        };
+        let forward = vec![
+            Change::Insert { after: row(1) },
+            Change::Insert { after: row(2) },
+            Change::Insert { after: row(3) },
+        ];
+        let inverse = inverse_changes(std::slice::from_ref(&forward));
+        let mut applied = Vec::new();
+
+        track_final_changes(&mut applied, &forward, true);
+        track_final_changes(&mut applied, &inverse[0][..2], false);
+
+        assert_eq!(applied, vec![Change::Insert { after: row(1) }]);
     }
 }
