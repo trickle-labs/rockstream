@@ -176,6 +176,20 @@ fn parse_cpu_time(value: &str) -> Result<u64> {
         Some((days, clock)) => (days.parse::<u64>().context("parse CPU days")?, clock),
         None => (0, value),
     };
+    let (clock, fractional_ns) = match clock.rsplit_once('.') {
+        Some((clock, fractional)) => {
+            if fractional.is_empty() || !fractional.bytes().all(|byte| byte.is_ascii_digit()) {
+                bail!("invalid CPU time {value:?}");
+            }
+            let digits = fractional.len().min(9);
+            let nanos = fractional[..digits]
+                .parse::<u64>()
+                .context("parse CPU fractional seconds")?
+                * 10u64.pow((9 - digits) as u32);
+            (clock, nanos)
+        }
+        None => (clock, 0),
+    };
     let parts = clock
         .split(':')
         .map(|part| part.parse::<u64>().context("parse CPU clock"))
@@ -185,7 +199,7 @@ fn parse_cpu_time(value: &str) -> Result<u64> {
         [hours, minutes, seconds] => days * 86_400 + hours * 3_600 + minutes * 60 + seconds,
         _ => bail!("invalid CPU time {value:?}"),
     };
-    Ok(seconds * 1_000_000_000)
+    Ok(seconds * 1_000_000_000 + fractional_ns)
 }
 
 #[cfg(test)]
@@ -210,5 +224,10 @@ mod tests {
                 exchange_bytes: 44,
             }
         );
+    }
+
+    #[test]
+    fn parses_macos_cpu_clock_with_fractional_seconds() {
+        assert_eq!(parse_cpu_time("0:04.28").unwrap(), 4_280_000_000);
     }
 }
