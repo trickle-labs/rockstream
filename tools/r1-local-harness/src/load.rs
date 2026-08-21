@@ -46,7 +46,7 @@ pub async fn prepare(
             .with_context(|| format!("execute workload DDL {statement:?}"))?;
     }
     admin
-        .query(&format!("SELECT COUNT(*) FROM {view}"), &[])
+        .query(&visibility_query(view), &[])
         .await
         .context("warm materialized view")?;
     tokio::time::sleep(warm_up).await;
@@ -59,6 +59,10 @@ fn setup_statements(workload_sql: &str) -> (Vec<&str>, Vec<&str>) {
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
         .partition(|statement| !statement.starts_with("CREATE MATERIALIZED VIEW "))
+}
+
+fn visibility_query(view: &str) -> String {
+    format!("SELECT * FROM {view} LIMIT 1")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -116,7 +120,7 @@ pub async fn execute(
                         .context("submit change transaction")?;
                     let committed = Instant::now();
                     client
-                        .query(&format!("SELECT COUNT(*) FROM {view}"), &[])
+                        .query(&visibility_query(&view), &[])
                         .await
                         .context("await query-visible output frontier")?;
                     final_changes.extend_from_slice(changes);
@@ -380,6 +384,14 @@ mod tests {
                 ],
                 vec!["CREATE MATERIALIZED VIEW r1_view AS SELECT * FROM r1_source"],
             )
+        );
+    }
+
+    #[test]
+    fn visibility_query_requests_one_complete_row() {
+        assert_eq!(
+            visibility_query("r1_factorized"),
+            "SELECT * FROM r1_factorized LIMIT 1"
         );
     }
 }
