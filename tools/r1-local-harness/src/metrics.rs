@@ -104,7 +104,8 @@ fn parse_labels(labels: &str) -> Result<BTreeMap<String, String>> {
 pub fn worker_activity(metrics: &[Metric], pid: u32) -> Result<WorkerActivity> {
     let worker_id = metrics
         .iter()
-        .find_map(|metric| metric.labels.get("worker_id"))
+        .find(|metric| metric.name == "rockstream_r1_worker_shards_owned")
+        .and_then(|metric| metric.labels.get("worker_id"))
         .context("worker metrics have no worker_id")?
         .parse()
         .context("worker_id is not an integer")?;
@@ -209,7 +210,7 @@ mod tests {
     #[test]
     fn parses_worker_metrics_exactly() {
         let metrics = parse(
-            "rockstream_r1_worker_shards_owned{worker_id=\"7\"} 2\nrockstream_r1_worker_input_rows_total{worker_id=\"7\"} 9\nrockstream_r1_worker_output_rows_total{worker_id=\"7\"} 8\nrockstream_r1_worker_state_writes_total{worker_id=\"7\"} 3\nrockstream_r1_worker_exchange_bytes_total{worker_id=\"7\"} 44\n",
+            "rockstream_r1_other_total{worker_id=\"gateway\"} 1\nrockstream_r1_worker_shards_owned{worker_id=\"7\"} 2\nrockstream_r1_worker_input_rows_total{worker_id=\"7\"} 9\nrockstream_r1_worker_output_rows_total{worker_id=\"7\"} 8\nrockstream_r1_worker_state_writes_total{worker_id=\"7\"} 3\nrockstream_r1_worker_exchange_bytes_total{worker_id=\"7\"} 44\n",
         )
         .unwrap();
         assert_eq!(
