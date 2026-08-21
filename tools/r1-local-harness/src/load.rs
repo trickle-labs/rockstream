@@ -30,8 +30,11 @@ pub async fn prepare(
         bail!("transaction rows must be nonzero");
     }
     let admin = connect(address).await?;
-    let (tables, views) = setup_statements(workload_sql);
-    for statement in tables {
+    for statement in workload_sql
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
         admin
             .batch_execute(statement)
             .await
@@ -39,26 +42,12 @@ pub async fn prepare(
     }
     insert_dimensions(&admin, &corpus.dimension, transaction_rows).await?;
     insert_sources(&admin, &corpus.source, transaction_rows).await?;
-    for statement in views {
-        admin
-            .batch_execute(statement)
-            .await
-            .with_context(|| format!("execute workload DDL {statement:?}"))?;
-    }
     admin
         .query(&visibility_query(view), &[])
         .await
         .context("warm materialized view")?;
     tokio::time::sleep(warm_up).await;
     Ok(PreparedLoad { admin })
-}
-
-fn setup_statements(workload_sql: &str) -> (Vec<&str>, Vec<&str>) {
-    workload_sql
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-        .partition(|statement| !statement.starts_with("CREATE MATERIALIZED VIEW "))
 }
 
 fn visibility_query(view: &str) -> String {
@@ -369,21 +358,6 @@ mod tests {
                 },
                 Change::Delete { before: row(3, 30) },
             ]]
-        );
-    }
-
-    #[test]
-    fn setup_loads_tables_before_materialized_views() {
-        let sql = "CREATE TABLE r1_source (id BIGINT);\nCREATE MATERIALIZED VIEW r1_view AS SELECT * FROM r1_source;\nCREATE TABLE r1_dimension (id BIGINT);";
-        assert_eq!(
-            setup_statements(sql),
-            (
-                vec![
-                    "CREATE TABLE r1_source (id BIGINT)",
-                    "CREATE TABLE r1_dimension (id BIGINT)",
-                ],
-                vec!["CREATE MATERIALIZED VIEW r1_view AS SELECT * FROM r1_source"],
-            )
         );
     }
 
