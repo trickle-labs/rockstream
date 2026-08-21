@@ -18,4 +18,4 @@ CREATE MATERIALIZED VIEW r1_shared_16 AS SELECT group_id, SUM(value) AS total FR
 CREATE MATERIALIZED VIEW r1_shared_17 AS SELECT group_id, SUM(value) AS total FROM r1_source GROUP BY group_id;
 CREATE MATERIALIZED VIEW r1_shared_18 AS SELECT group_id, SUM(value) AS total FROM r1_source GROUP BY group_id;
 CREATE MATERIALIZED VIEW r1_shared_19 AS SELECT group_id, SUM(value) AS total FROM r1_source GROUP BY group_id;
-CREATE MATERIALIZED VIEW r1_shared_20 AS SELECT group_id, COUNT(*) AS rows FROM r1_source GROUP BY group_id;
+CREATE MATERIALIZED VIEW r1_shared_20 AS SELECT group_id, SUM(value) AS total FROM r1_source GROUP BY group_id;

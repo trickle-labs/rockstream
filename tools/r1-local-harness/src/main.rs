@@ -116,6 +116,8 @@ struct Candidate {
 struct Side {
     candidate: Candidate,
     strategy: String,
+    join_strategy: String,
+    sql: String,
 }
 
 #[derive(Serialize)]
@@ -319,11 +321,9 @@ async fn run_workload(name: &str, workers: usize, output: &Path) -> Result<()> {
     );
     let input_sha256 = sha256(&canonical_input_json(&generated));
     let change_sha256 = sha256(&canonical_changes_json(&generated.changes));
-    let sql = fs::read_to_string(benchmark.join(&workload.sql))?;
-    let (view, oracle_query) = oracle::admitted_query(&sql)?;
     let candidates: CandidateRecord =
         serde_json::from_slice(&fs::read(output.join("candidates.json"))?)?;
-    let sides = comparison_sides(name, &candidates)?;
+    let sides = comparison_sides(name, &candidates, &workload)?;
     for repetition in 0..corpus_config.repetitions.count {
         let mut ordered = sides.clone();
         if corpus_config.repetitions.order[repetition] == "b_then_a" {
@@ -332,6 +332,8 @@ async fn run_workload(name: &str, workers: usize, output: &Path) -> Result<()> {
         for side in ordered {
             let pair_id = format!("{name}-{workers}-pair-{}", repetition + 1);
             let run_id = format!("{pair_id}-{}-{}", side.candidate.id, side.strategy);
+            let sql = fs::read_to_string(benchmark.join(&side.sql))?;
+            let (view, oracle_query) = oracle::admitted_query(&sql)?;
             let sample = run_side(
                 &root,
                 output,
@@ -389,7 +391,7 @@ async fn run_side(
     fs::create_dir_all(&run_dir)?;
     fs::write(
         &config_path,
-        format!("[execution]\njoin_strategy = \"{}\"\n", side.strategy),
+        format!("[execution]\njoin_strategy = \"{}\"\n", side.join_strategy),
     )?;
     let cluster = Cluster::start(
         &binary,
@@ -548,7 +550,11 @@ async fn run_side(
     }
 }
 
-fn comparison_sides(workload: &str, record: &CandidateRecord) -> Result<Vec<Side>> {
+fn comparison_sides(
+    workload: &str,
+    record: &CandidateRecord,
+    config: &WorkloadConfig,
+) -> Result<Vec<Side>> {
     let candidate = |id: &str| {
         record
             .candidates
@@ -562,25 +568,55 @@ fn comparison_sides(workload: &str, record: &CandidateRecord) -> Result<Vec<Side
             Side {
                 candidate: candidate("b0-v0.59.4-local-rebuild")?,
                 strategy: "auto".to_string(),
+                join_strategy: "auto".to_string(),
+                sql: config.sql.clone(),
             },
             Side {
                 candidate: candidate("current")?,
                 strategy: "auto".to_string(),
+                join_strategy: "auto".to_string(),
+                sql: config.sql.clone(),
             },
         ]),
         "factorized-join" => Ok(vec![
             Side {
                 candidate: candidate("current")?,
                 strategy: "classic".to_string(),
+                join_strategy: "classic".to_string(),
+                sql: config.sql.clone(),
             },
             Side {
                 candidate: candidate("current")?,
                 strategy: "factorized".to_string(),
+                join_strategy: "factorized".to_string(),
+                sql: config.sql.clone(),
             },
         ]),
-        "shared-arrangement" | "uniform-worker-scaling" => Ok(vec![Side {
+        "shared-arrangement" => Ok(vec![
+            Side {
+                candidate: candidate("current")?,
+                strategy: "one-shared".to_string(),
+                join_strategy: "auto".to_string(),
+                sql: "sql/shared-arrangement-one.sql".to_string(),
+            },
+            Side {
+                candidate: candidate("current")?,
+                strategy: "twenty-shared".to_string(),
+                join_strategy: "auto".to_string(),
+                sql: config.sql.clone(),
+            },
+            Side {
+                candidate: candidate("current")?,
+                strategy: "twenty-private".to_string(),
+                join_strategy: "auto".to_string(),
+                sql: config.sql.clone(),
+            },
+        ]),
+        "uniform-worker-scaling" => Ok(vec![Side {
             candidate: candidate("current")?,
             strategy: "auto".to_string(),
+            join_strategy: "auto".to_string(),
+            sql: config.sql.clone(),
         }]),
         _ => bail!("unknown timing workload {workload}"),
     }
@@ -605,4 +641,57 @@ fn repository_root(start: &Path) -> Result<PathBuf> {
         }
     }
     bail!("could not find repository root from {}", start.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_arrangement_has_all_three_exact_profiles() {
+        let record = CandidateRecord {
+            candidates: vec![Candidate {
+                id: "current".to_string(),
+                kind: "current".to_string(),
+                binary_path: PathBuf::from("target/release/rockstream"),
+                binary_sha256: "binary".to_string(),
+            }],
+        };
+        let config = WorkloadConfig {
+            name: "shared-arrangement".to_string(),
+            seed: 1,
+            source_rows: Some(100_000),
+            dimension_rows: None,
+            changed_rows: None,
+            live_groups: None,
+            sql: "sql/shared-arrangement.sql".to_string(),
+        };
+
+        let profiles = comparison_sides("shared-arrangement", &record, &config)
+            .unwrap()
+            .into_iter()
+            .map(|side| (side.strategy, side.join_strategy, side.sql))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            profiles,
+            vec![
+                (
+                    "one-shared".to_string(),
+                    "auto".to_string(),
+                    "sql/shared-arrangement-one.sql".to_string(),
+                ),
+                (
+                    "twenty-shared".to_string(),
+                    "auto".to_string(),
+                    "sql/shared-arrangement.sql".to_string(),
+                ),
+                (
+                    "twenty-private".to_string(),
+                    "auto".to_string(),
+                    "sql/shared-arrangement.sql".to_string(),
+                ),
+            ]
+        );
+    }
 }

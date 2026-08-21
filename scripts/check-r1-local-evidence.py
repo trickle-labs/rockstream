@@ -54,7 +54,15 @@ EXPECTED_WORKLOADS = [
     "workloads/shared-arrangement.toml",
     "workloads/uniform-worker-scaling.toml",
 ]
-EXPECTED_SQL = [path.replace("workloads/", "sql/").replace(".toml", ".sql") for path in EXPECTED_WORKLOADS]
+EXPECTED_SQL = [
+    "sql/factorized-join.sql",
+    "sql/one-key-persistence.sql",
+    "sql/ordinary-aggregate.sql",
+    "sql/ordinary-join.sql",
+    "sql/shared-arrangement-one.sql",
+    "sql/shared-arrangement.sql",
+    "sql/uniform-worker-scaling.sql",
+]
 EXPECTED_WORKLOAD_CONFIGS = {
     "factorized-join.toml": {
         "name": "factorized-join",
