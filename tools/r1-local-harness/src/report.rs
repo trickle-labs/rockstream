@@ -76,9 +76,16 @@ pub fn evaluate(evidence_dir: &Path) -> Result<Decision> {
     if cells.is_empty() {
         bail!("raw evidence has no timing cells");
     }
+    let verdict = if structural.results.len() == 3
+        && cells.iter().all(|cell| cell.verdict == "GREEN")
+    {
+        "GREEN"
+    } else {
+        "INCOMPLETE"
+    };
     Ok(Decision {
         schema_version: 1,
-        verdict: "INCOMPLETE".to_string(),
+        verdict: verdict.to_string(),
         raw_sample_count: samples.len(),
         structural_result_count: structural.results.len(),
         cells,
