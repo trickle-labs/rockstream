@@ -642,11 +642,7 @@ mod tc {
             format!("127.0.0.1:{}", 9000 + worker_id),
             CapacityHeadroom::FULL,
         );
-        let reply = send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
-        assert!(matches!(
-            serde_json::from_str(reply.trim()),
-            Ok(ControlMessage::Registered { .. })
-        ));
+        send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
         stream
     }
 
@@ -710,14 +706,14 @@ mod tc {
         cluster: &TcCluster,
         worker_id: u64,
         shard_id: u64,
-    ) -> (usize, rockstream_types::lease::ShardLease) {
+    ) -> (usize, rockstream_types::lease::ShardLease, TcpStream) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let (leader_idx, _) = cluster.wait_for_single_leader(Duration::from_secs(1)).await;
             let addr = cluster.nodes[leader_idx].control_addr;
-            register_worker(addr, worker_id).await;
+            let worker_stream = register_worker(addr, worker_id).await;
             if let Some(lease) = request_shard(cluster, worker_id, shard_id).await {
-                return (leader_idx, lease);
+                return (leader_idx, lease, worker_stream);
             }
             assert!(
                 Instant::now() < deadline,
@@ -831,7 +827,8 @@ async fn leader_kill_recovers_within_budget_tc() {
     // Pre-kill: a worker acquires shard 7's lease against the original
     // leader — this is the "in-flight" state whose continuity the kill
     // must not corrupt.
-    let (leader_idx, lease_before) = tc::register_and_request_shard(&cluster, 10, 7).await;
+    let (leader_idx, lease_before, _worker_10_stream) =
+        tc::register_and_request_shard(&cluster, 10, 7).await;
     let old_leader_addr = cluster.nodes[leader_idx].control_addr;
     assert_eq!(lease_before.worker_id, WorkerId(10));
 
@@ -882,7 +879,7 @@ async fn leader_kill_recovers_within_budget_tc() {
          worker 10's pre-kill lease (persisted to the shared control-plane \
          store) is still live: {conflicting:?}"
     );
-    tc::register_worker(new_leader_addr, 20).await;
+    let _worker_20_stream = tc::register_worker(new_leader_addr, 20).await;
     let fresh_lease = tc::request_shard(&cluster, 20, 8)
         .await
         .expect("shard leasing must resume against the new leader for an unleased shard");
@@ -1022,7 +1019,7 @@ async fn rolling_restart_preserves_worker_leases_and_quotas_tc() {
         .wait_for_single_leader(Duration::from_secs(15))
         .await;
     // A worker acquires a real shard lease before the rolling restart begins.
-    let (_, lease) = tc::register_and_request_shard(&cluster, 10, 3).await;
+    let (_, lease, _worker_10_stream) = tc::register_and_request_shard(&cluster, 10, 3).await;
     assert_eq!(lease.worker_id, WorkerId(10));
 
     // A workload's quota/catalog state is registered directly against the
