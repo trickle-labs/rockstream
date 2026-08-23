@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "source_sha256": "f4c3ba9545e2eb2896424f33edcb30e9079b4d82e79b758a3a80a6e44116099d",
+  "value": {
+    "changes": {
+      "delete_percent": 20,
+      "delete_semantics": "retraction",
+      "insert_percent": 50,
+      "oracle_comparison": "complete_multiset",
+      "update_percent": 30
+    },
+    "contract_version": 1,
+    "freshness": {
+      "histogram_buckets_ms": [
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000,
+        2000,
+        5000,
+        10000
+      ]
+    },
+    "generation": {
+      "change_rows_per_workload": 10000,
+      "format": "r1-input-v1-big-endian"
+    },
+    "inputs": {
+      "sql": [
+        "sql/factorized-join.sql",
+        "sql/one-key-persistence.sql",
+        "sql/ordinary-aggregate.sql",
+        "sql/ordinary-join.sql",
+        "sql/shared-arrangement-one.sql",
+        "sql/shared-arrangement.sql",
+        "sql/uniform-worker-scaling.sql"
+      ],
+      "workloads": [
+        "workloads/factorized-join.toml",
+        "workloads/one-key-persistence.toml",
+        "workloads/ordinary-aggregate.toml",
+        "workloads/ordinary-join.toml",
+        "workloads/shared-arrangement.toml",
+        "workloads/uniform-worker-scaling.toml"
+      ]
+    },
+    "load": {
+      "lanes": 8,
+      "max_in_flight_transactions_per_lane": 1,
+      "measurement_seconds": 60,
+      "protocol": "pgwire",
+      "transaction_rows": 256,
+      "visibility_barrier": "output_frontier_query_visible",
+      "warm_up_seconds": 30
+    },
+    "profile_id": "MBP-M5Pro-48GB-v1",
+    "repetitions": {
+      "count": 5,
+      "order": [
+        "a_then_b",
+        "b_then_a",
+        "a_then_b",
+        "b_then_a",
+        "a_then_b"
+      ]
+    },
+    "schemas": {
+      "dimension": {
+        "columns": [
+          "id BIGINT NOT NULL",
+          "bucket BIGINT NOT NULL"
+        ],
+        "primary_key": "id"
+      },
+      "source": {
+        "columns": [
+          "id BIGINT NOT NULL",
+          "group_id BIGINT NOT NULL",
+          "dimension_id BIGINT NOT NULL",
+          "value BIGINT NOT NULL",
+          "active BOOLEAN NOT NULL"
+        ],
+        "primary_key": "id"
+      }
+    }
+  }
+}

@@ -4,10 +4,10 @@
   "profile_revision": 1,
   "contract_digests": {
     "profile_sha256": "ec7c2c5ee6b1992454ea4aef0285dc2b733908e20beeba9036d7b6d3b6958d13",
-    "corpus_sha256": "ef33e68f3d73d6856c85b8c477c0fc4c8d9b4c4baf6c3b424043ee9d0fa998e9",
-    "sql_sha256": "1d5b568855b2eda56d3979563a76ae22032b2faaadb6066bc8e26b69c91eb302",
+    "corpus_sha256": "fc484c9482422a70b4e3d67c50cb6f10d0e52cad129ea63921c825fffa3c3704",
+    "sql_sha256": "c39e27439bdda209f7680ed9f7e0be9398358f22ea1ccfe32bac868e3a086319",
     "thresholds_sha256": "aac9d1dc2a8c8d057472636673d9b1113c34dc3932f741eadb5b73bf5606752d",
-    "contract_sha256": "ba9d36575bda5f9681d90269952b1df0d859ac8e87058221bd74ab8e0540c146"
+    "contract_sha256": "bb90f031da38a28503dc51cbaeb6b8d39c09f525968ce8fa4d9997defb0d0cb1"
   },
   "candidates": [
     {
@@ -24,7 +24,7 @@
       "toolchain_sha256": "74d98fe505e9e397bd46d6f232894aea501a75fb2b0bb0562774b9a5193796f4",
       "toolchain": "1.88",
       "binary_path": "evidence/r1-local/artifacts/b0-v0.59.4-local-rebuild/rockstream",
-      "binary_sha256": "4fde92850b65a472f60359b4d3da6ca71bc23aaa168854cc04c34aa5d9a34ab2",
+      "binary_sha256": "95d4f55ca666327707cf63bcd63760e9a7725b55cff24c90d9ecb9b1a5efa4b1",
       "version": {
         "semantic_version": "0.59.4",
         "commit_sha": "a4e4ad4e17913cad7320ae7fe06491cabb80df68",
@@ -46,22 +46,22 @@
         "ordinary-join",
         "uniform-worker-scaling"
       ],
-      "source_commit": "f66a60b5c109b4a4cf24bc18b89c4f553bfb161b",
-      "source_tree_sha256": "f3a8084f31400480ca988ad2f4883812751d5e6e422f95a27a38ee90694819a4",
-      "lockfile_sha256": "2dfab8ab153e664974b576519fa277048c4e60202741764e1678310d68e2f44e",
+      "source_commit": "9559999137fd2485d950c0b308c6f626bd7f5a5b",
+      "source_tree_sha256": "984a572043292595056eb567179d0d913a308de07a0b34c31a778cc3012b9e27",
+      "lockfile_sha256": "ce260b5cfa9c777c3b8fb9f5aaaf6297188d2d2a28db19647db36570a59074fa",
       "toolchain_sha256": "74d98fe505e9e397bd46d6f232894aea501a75fb2b0bb0562774b9a5193796f4",
       "toolchain": "1.88",
       "binary_path": "evidence/r1-local/artifacts/current/rockstream",
-      "binary_sha256": "82f961e16f696150d5ad79a934eb712309199cc1b414cfb7897f89c3dae2f41b",
+      "binary_sha256": "aa53aa45783f604b7a275e3e2d822069801b43a3df38c7305e6ecf0a643c67d5",
       "version": {
         "semantic_version": "0.59.7",
-        "commit_sha": "f66a60b5c109b4a4cf24bc18b89c4f553bfb161b",
-        "build_timestamp_rfc3339": "2026-08-20T15:45:31+02:00",
+        "commit_sha": "9559999137fd2485d950c0b308c6f626bd7f5a5b",
+        "build_timestamp_rfc3339": "2026-08-23T13:57:54+02:00",
         "compiler_version": "rustc 1.88.0 (6b00bc388 2025-06-23)",
-        "lockfile_digest": "2dfab8ab153e664974b576519fa277048c4e60202741764e1678310d68e2f44e",
+        "lockfile_digest": "ce260b5cfa9c777c3b8fb9f5aaaf6297188d2d2a28db19647db36570a59074fa",
         "enabled_features": []
       },
-      "effective_config_sha256": "952eb32c1ca7f99609423d7d58f63a093ed3848f4083e240d2fa171b441ae319"
+      "effective_config_sha256": "5b99a904ddda6a9a04da16b96c0043bb1dbf569500f164d5eb52b3713745779b"
     }
   ]
 }

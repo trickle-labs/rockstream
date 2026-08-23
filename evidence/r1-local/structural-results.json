@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "results": [
+    {
+      "name": "one-key-persistence",
+      "passed": true,
+      "counters": {
+        "exact_proof_passed": 1
+      },
+      "log_sha256": "80a499769e9e6239ab79f16735e50061e9d855264a5a9a86f65c5e9921623194"
+    },
+    {
+      "name": "shared-arrangement",
+      "passed": true,
+      "counters": {
+        "exact_proof_passed": 1
+      },
+      "log_sha256": "9703b1136f706a2bc1378c6b40777431e008b03464b55c9dcadc19eb8f2c1dad"
+    },
+    {
+      "name": "factorized-join",
+      "passed": true,
+      "counters": {
+        "exact_proof_passed": 1
+      },
+      "log_sha256": "4757ade0e04f3efbed526bc7c048d314e2d92ca1e6fcc68246e3e3986fcbdf64"
+    }
+  ]
+}

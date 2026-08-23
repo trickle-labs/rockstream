@@ -1,0 +1,9 @@
+
+running 1 test
+test fanout_100_classic_and_factorized_outputs_and_work_are_exact ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+   Compiling rockstream-ops v0.59.7 (/Users/grove/projects/rockstream/crates/rockstream-ops)
+    Finished `release` profile [optimized] target(s) in 7.15s
+     Running tests/factorized_join_aggregate_oracle_tests.rs (target/release/deps/factorized_join_aggregate_oracle_tests-1a81ab324ce4d5b1)

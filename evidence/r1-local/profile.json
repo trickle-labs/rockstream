@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source_sha256": "ec7c2c5ee6b1992454ea4aef0285dc2b733908e20beeba9036d7b6d3b6958d13",
+  "value": {
+    "contract_version": 1,
+    "observed": {
+      "available_disk_bytes": 0,
+      "binary_sha256": "",
+      "build_flags": [],
+      "docker_cpu_allocation": 0,
+      "docker_desktop_version": "",
+      "docker_memory_bytes": 0,
+      "efficiency_cores": 0,
+      "enabled_features": [],
+      "filesystem": "",
+      "free_memory_bytes_after": 0,
+      "free_memory_bytes_before": 0,
+      "lockfile_sha256": "",
+      "macos_version": "",
+      "model": "",
+      "performance_cores": 0,
+      "rust_target": "",
+      "rust_toolchain": "",
+      "source_sha": "",
+      "thermal_pressure_after": "",
+      "thermal_pressure_before": "",
+      "unsupported_controls": []
+    },
+    "profile_id": "MBP-M5Pro-48GB-v1",
+    "required_machine": {
+      "ac_power": true,
+      "chip": "Apple M5 Pro",
+      "form_factor": "16-inch MacBook Pro",
+      "low_power_mode": false,
+      "memory_bytes": 51539607552,
+      "storage": "native_lfs"
+    },
+    "revision": 1,
+    "state": "unsealed"
+  }
+}

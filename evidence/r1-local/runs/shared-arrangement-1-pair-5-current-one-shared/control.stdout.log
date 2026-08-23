@@ -1,0 +1,7 @@
+2026-08-23T16:26:02.765574Z  INFO rockstream_cli: metrics server started metrics_addr=127.0.0.1:59659
+2026-08-23T16:26:02.765893Z  INFO rockstream_control::service: control service listening addr=127.0.0.1:59658
+2026-08-23T16:26:02.765913Z  INFO rockstream_cli: node running in daemon mode — blocking until shutdown signal role=control
+2026-08-23T16:26:02.768248Z  INFO rockstream_control::service: control: worker registered worker_id=worker-1 address=127.0.0.1:0 host_id= availability_zone= headroom=1.00
+2026-08-23T16:29:19.722583Z  INFO rockstream_cli: shutdown signal received — stopping daemon
+2026-08-23T16:29:19.723095Z  INFO rockstream_control::service: control service shutting down
+2026-08-23T16:29:19.736022Z  INFO rockstream: rockstream: node stopped cleanly audit=/var/folders/vq/593qxcm57l90w1dlpywl_7nw0000gn/T/rockstream-r1-local-J9htDK/control/audit.jsonl bundle=/var/folders/vq/593qxcm57l90w1dlpywl_7nw0000gn/T/rockstream-r1-local-J9htDK/control/support-bundle-1787502559726.json events=6

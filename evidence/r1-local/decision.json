@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "verdict": "GREEN",
+  "raw_sample_count": 15,
+  "structural_result_count": 3,
+  "cells": [
+    {
+      "workload": "shared-arrangement",
+      "candidate_id": "current",
+      "strategy": "one-shared",
+      "worker_count": 1,
+      "raw_throughput_rows_per_second": [
+        5733.827078506153,
+        5471.742423568389,
+        5742.120907978339,
+        5559.170043138769,
+        4867.541696958219
+      ],
+      "mean_throughput_rows_per_second": 5474.8804300299735,
+      "coefficient_of_variation": 0.06550359906001683,
+      "max_coefficient_of_variation": 0.15,
+      "comparator": "<=",
+      "verdict": "GREEN"
+    },
+    {
+      "workload": "shared-arrangement",
+      "candidate_id": "current",
+      "strategy": "twenty-private",
+      "worker_count": 1,
+      "raw_throughput_rows_per_second": [
+        86.61982899053994,
+        91.42357553947528,
+        93.36614161438966,
+        100.94635172938085,
+        106.64323002763167
+      ],
+      "mean_throughput_rows_per_second": 95.79982558028348,
+      "coefficient_of_variation": 0.08308442535272473,
+      "max_coefficient_of_variation": 0.15,
+      "comparator": "<=",
+      "verdict": "GREEN"
+    },
+    {
+      "workload": "shared-arrangement",
+      "candidate_id": "current",
+      "strategy": "twenty-shared",
+      "worker_count": 1,
+      "raw_throughput_rows_per_second": [
+        100.83240427597876,
+        86.32144550674874,
+        88.33282710593532,
+        88.80654972639694,
+        87.24461846887378
+      ],
+      "mean_throughput_rows_per_second": 90.30756901678672,
+      "coefficient_of_variation": 0.06602205472518796,
+      "max_coefficient_of_variation": 0.15,
+      "comparator": "<=",
+      "verdict": "GREEN"
+    }
+  ]
+}
