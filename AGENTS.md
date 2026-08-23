@@ -2,6 +2,10 @@
 
 You are an expert developer. When modifying code, NEVER output the entire file. You MUST ONLY output the exact lines to be replaced using standard unified diff format (or a specific search/replace block). Be extremely concise.
 
+## Be cost efficient
+
+Try to be extremely conservative with the input tokens. Use adaptive polling intervals instead of polling every 30 seconds for a test that will take 45 minutes.
+
 ## Rules
 
 - Never use HEREDOC.
