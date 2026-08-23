@@ -44,21 +44,24 @@ fn role_all_creates_exactly_one_shard_directory() {
 
     let join = std::thread::spawn(move || run_start(&opts));
 
-    // Poll for the shared shard-0 directory and its first flushed object.
+    // Poll until the gateway has installed its signal handler and finished
+    // opening/flushing the shared shard.
     let shard0_dir = storage.join("shards").join("0");
+    let audit_path = storage.join("audit.jsonl");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while (!shard0_dir.exists()
-        || std::fs::read_dir(&shard0_dir)
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(true))
+    while !std::fs::read_to_string(&audit_path)
+        .map(|contents| contents.contains("\"gateway.started\""))
+        .unwrap_or(false)
         && std::time::Instant::now() < deadline
     {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        shard0_dir.exists(),
-        "expected {} to be created by `--role all`",
-        shard0_dir.display()
+        std::fs::read_to_string(&audit_path)
+            .map(|contents| contents.contains("\"gateway.started\""))
+            .unwrap_or(false),
+        "expected gateway startup event in {}",
+        audit_path.display()
     );
 
     let gateway_shard_dir = storage.join("gateway-shard");
