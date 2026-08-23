@@ -44,11 +44,15 @@ fn role_all_creates_exactly_one_shard_directory() {
 
     let join = std::thread::spawn(move || run_start(&opts));
 
-    // Poll for the shared shard-0 directory to appear (created once the
-    // embedded worker's lease flow completes and the gateway opens it).
+    // Poll for the shared shard-0 directory and its first flushed object.
     let shard0_dir = storage.join("shards").join("0");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !shard0_dir.exists() && std::time::Instant::now() < deadline {
+    while (!shard0_dir.exists()
+        || std::fs::read_dir(&shard0_dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true))
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -56,11 +60,6 @@ fn role_all_creates_exactly_one_shard_directory() {
         "expected {} to be created by `--role all`",
         shard0_dir.display()
     );
-
-    // Give the gateway a moment to finish binding/flushing before we
-    // request shutdown, and to prove the directory layout is stable (not a
-    // transient partial write).
-    std::thread::sleep(Duration::from_millis(200));
 
     let gateway_shard_dir = storage.join("gateway-shard");
     assert!(
@@ -83,7 +82,6 @@ fn role_all_creates_exactly_one_shard_directory() {
     );
     assert_eq!(entries[0].to_string_lossy(), "0");
 
-    // The shard directory must contain a valid (non-empty) manifest —
     // ShardDb::flush()/GatewayServer bind wrote at least one object.
     let has_files = std::fs::read_dir(&shard0_dir).unwrap().next().is_some();
     assert!(
