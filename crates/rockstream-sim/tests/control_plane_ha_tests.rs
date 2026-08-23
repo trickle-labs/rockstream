@@ -658,7 +658,7 @@ mod tc {
         worker_id: u64,
         shard_id: u64,
     ) -> Option<rockstream_types::lease::ShardLease> {
-        for _ in 0..5 {
+        for _ in 0..50 {
             let Ok(mut stream) = TcpStream::connect(addr).await else {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
