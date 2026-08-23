@@ -34,6 +34,10 @@ pub const MAX_VERIFY_SCAN_KEYS: usize = 1024;
 pub const MAX_CONSUMER_FRONTIERS: usize = 1024;
 /// Named upper bound for bucket-map-version observer tracking.
 pub const MAX_VERSION_OBSERVERS: usize = 64;
+/// Maximum rows in one migration copy chunk.
+pub const MAX_COPY_CHUNK_ROWS: usize = 256;
+/// Maximum key/value bytes in one migration copy chunk.
+pub const MAX_COPY_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Fill-level metric for bounded migration buffers/maps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +50,16 @@ impl MigrationFillLevel {
     pub fn fraction(&self) -> f64 {
         self.used as f64 / self.capacity as f64
     }
+}
+
+/// Exact counters from one bounded migration-copy pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MigrationCopyStats {
+    pub chunks: usize,
+    pub copied_rows: u64,
+    pub copied_bytes: u64,
+    pub max_chunk_rows: usize,
+    pub max_chunk_bytes: usize,
 }
 
 /// Phase start timestamps for [`MigrationCoordinator::drive_planned_to_copying`],
@@ -111,6 +125,11 @@ pub enum MigrationError {
         max: usize,
         next_steps: &'static str,
     },
+    #[error(
+        "RS-5033: donor reclamation is not frontier-safe in state {state}; \
+         next_steps: wait until every consumer reaches the committed cutover frontier"
+    )]
+    ReclamationNotReady { state: MigrationState },
     #[error(
         "RS-5034: verification divergence detected for key {key_hex}; \
          next_steps: return to dual-writing, recopy the divergent bucket set, and re-run verification"
@@ -437,6 +456,9 @@ impl MigrationCoordinator {
             record
                 .donor_checkpoints
                 .insert(donor.shard_id, handle.shard_checkpoint_id);
+            record
+                .donor_checkpoint_snapshots
+                .insert(donor.shard_id, handle.snapshot_id.clone());
             checkpoint_coordinator
                 .record_shard_checkpoint(
                     donor.shard_id,
@@ -459,8 +481,81 @@ impl MigrationCoordinator {
             audit,
         )?;
 
-        copy_from_donors_to_recipient(donors, recipient).await?;
+        self.copy_bounded_chunks(record, donors, recipient).await?;
         Ok(cluster_checkpoint)
+    }
+
+    /// Copy migration state through backpressured, bounded pages.
+    ///
+    /// Re-running this method is safe: recipient writes are idempotent and the
+    /// persisted checkpoint snapshot keeps the source view stable.
+    pub async fn copy_bounded_chunks(
+        &self,
+        record: &mut MigrationRecord,
+        donors: &[MigrationShard],
+        recipient: &MigrationShard,
+    ) -> Result<MigrationCopyStats, MigrationError> {
+        let mut stats = MigrationCopyStats::default();
+        for donor in donors {
+            let snapshot_id = record
+                .donor_checkpoint_snapshots
+                .get(&donor.shard_id)
+                .cloned();
+            let reader = if let Some(snapshot_id) = snapshot_id {
+                ShardReader::open_with_snapshot_id(
+                    donor.path.clone(),
+                    donor.object_store.clone(),
+                    &snapshot_id,
+                )
+                .await
+            } else {
+                ShardReader::open(donor.path.clone(), donor.object_store.clone()).await
+            }
+            .map_err(|e| MigrationError::Storage(format!("open donor reader: {e}")))?;
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let producer = tokio::spawn(async move {
+                reader
+                    .scan_prefix_pages(b"", MAX_COPY_CHUNK_ROWS, MAX_COPY_CHUNK_BYTES, sender)
+                    .await;
+            });
+
+            while let Some(page) = receiver.recv().await {
+                let entries =
+                    page.map_err(|e| MigrationError::Storage(format!("scan donor page: {e}")))?;
+                let chunk_rows = entries.len();
+                let chunk_bytes: usize = entries
+                    .iter()
+                    .map(|(key, value)| key.len() + value.len())
+                    .sum();
+                let mut batch = WriteBatch::new();
+                for (key, value) in &entries {
+                    batch.put(key, value);
+                }
+                recipient
+                    .db
+                    .write_batch(batch)
+                    .await
+                    .map_err(|e| MigrationError::Storage(format!("copy into recipient: {e}")))?;
+                recipient
+                    .db
+                    .flush()
+                    .await
+                    .map_err(|e| MigrationError::Storage(format!("flush copy chunk: {e}")))?;
+                stats.chunks += 1;
+                stats.copied_rows += chunk_rows as u64;
+                stats.copied_bytes += chunk_bytes as u64;
+                stats.max_chunk_rows = stats.max_chunk_rows.max(chunk_rows);
+                stats.max_chunk_bytes = stats.max_chunk_bytes.max(chunk_bytes);
+                record.record_progress(
+                    record.copied_bytes.unwrap_or(0) + chunk_bytes as u64,
+                    record.copied_rows.unwrap_or(0) + chunk_rows as u64,
+                );
+            }
+            producer
+                .await
+                .map_err(|e| MigrationError::Storage(format!("scan donor page task: {e}")))?;
+        }
+        Ok(stats)
     }
 
     pub fn begin_dual_writing(
@@ -503,13 +598,40 @@ impl MigrationCoordinator {
         started_at: Instant,
         audit: Option<&FileAuditLog>,
     ) -> Result<bool, MigrationError> {
+        let committed_frontier = record.planned_frontier;
+        self.await_cutover_readiness_at_frontier(
+            record,
+            observed_versions,
+            required_components,
+            committed_frontier,
+            started_at,
+            audit,
+        )
+    }
+
+    /// Require both observer convergence and a committed frontier before cutover.
+    pub fn await_cutover_readiness_at_frontier(
+        &self,
+        record: &mut MigrationRecord,
+        observed_versions: &BucketMapVersionTracker,
+        required_components: &[&str],
+        committed_frontier: Epoch,
+        started_at: Instant,
+        audit: Option<&FileAuditLog>,
+    ) -> Result<bool, MigrationError> {
+        if committed_frontier < record.planned_frontier {
+            return Ok(false);
+        }
         if record.state == MigrationState::FencingOld {
             self.transition_record(record, MigrationState::Cutover, audit)?;
         }
         match observed_versions
             .all_observed(record.target_bucket_map_version, required_components)?
         {
-            true => Ok(true),
+            true => {
+                record.cutover_epoch = Some(committed_frontier);
+                Ok(true)
+            }
             false => {
                 if started_at.elapsed() > self.cutover_timeout {
                     self.abort_on_timeout(
@@ -593,6 +715,11 @@ impl MigrationCoordinator {
         store: Option<&MigrationPersistentStore>,
         audit: Option<&FileAuditLog>,
     ) -> Result<CleanupStats, MigrationError> {
+        if record.state != MigrationState::GcEligible {
+            return Err(MigrationError::ReclamationNotReady {
+                state: record.state,
+            });
+        }
         let stats = cleanup_donor_buckets(donor, &record.buckets).await?;
         self.transition_record(record, MigrationState::Done, audit)?;
         if let Some(store) = store {
@@ -700,36 +827,6 @@ fn assert_single_authoritative(record: &MigrationRecord) {
         "M6-S1 violation: migration state {} must have exactly one authoritative shard",
         record.state
     );
-}
-
-async fn copy_from_donors_to_recipient(
-    donors: &[MigrationShard],
-    recipient: &MigrationShard,
-) -> Result<(), MigrationError> {
-    for donor in donors {
-        let reader = ShardReader::open(donor.path.clone(), donor.object_store.clone())
-            .await
-            .map_err(|e| MigrationError::Storage(format!("open donor reader: {e}")))?;
-        let entries = reader
-            .scan_prefix(b"")
-            .await
-            .map_err(|e| MigrationError::Storage(format!("scan donor reader: {e}")))?;
-        let mut batch = WriteBatch::new();
-        for (key, value) in &entries {
-            batch.put(key, value);
-        }
-        recipient
-            .db
-            .write_batch(batch)
-            .await
-            .map_err(|e| MigrationError::Storage(format!("copy into recipient: {e}")))?;
-    }
-    recipient
-        .db
-        .flush()
-        .await
-        .map_err(|e| MigrationError::Storage(format!("flush recipient after copy: {e}")))?;
-    Ok(())
 }
 
 async fn filtered_entries(

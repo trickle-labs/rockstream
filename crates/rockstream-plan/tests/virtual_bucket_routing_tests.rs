@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use rockstream_plan::virtual_bucket::route_virtual_bucket;
+use rockstream_plan::virtual_bucket::{
+    normalize_power_of_two_bucket_count, route_power_of_two_bucket, route_virtual_bucket,
+    validate_power_of_two_bucket_count,
+};
 use rockstream_plan::{OpKind, OpNode};
 use rockstream_types::ids::OperatorId;
 
@@ -70,4 +73,20 @@ fn virtual_bucket_routing_spreads_synthetic_keys_across_all_buckets_with_bounded
             "bucket {bucket} skew {skew:.3} exceeded bound {max_skew:.3}; counts={counts:?}"
         );
     }
+}
+
+#[test]
+fn power_of_two_routing_is_deterministic_and_bounded() {
+    let key = b"customer-42";
+
+    assert_eq!(validate_power_of_two_bucket_count(8), Ok(()));
+    assert!(validate_power_of_two_bucket_count(6).is_err());
+    assert_eq!(normalize_power_of_two_bucket_count(6), 8);
+    assert_eq!(normalize_power_of_two_bucket_count(0), 1);
+    assert_eq!(route_power_of_two_bucket(key, 0, key.len()), None);
+    assert_eq!(
+        route_power_of_two_bucket(key, 8, key.len()),
+        route_power_of_two_bucket(key, 8, key.len())
+    );
+    assert!(route_power_of_two_bucket(key, 8, key.len()).unwrap() < 8);
 }

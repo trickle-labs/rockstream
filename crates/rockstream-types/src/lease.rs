@@ -20,6 +20,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ids::{LeaseToken, ShardId, WorkerId};
 
+/// Bounded, non-authoritative heat carried with a shard lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LeaseHeatHint {
+    pub hot_key_prefixes: Vec<Vec<u8>>,
+    pub hot_sst_ids: Vec<String>,
+    pub hot_block_ranges: Vec<(u64, u64)>,
+    pub expected_read_rate: u64,
+}
+
+impl LeaseHeatHint {
+    pub const MAX_ENTRIES: usize = 64;
+
+    /// Decay rate exponentially by epoch while retaining the useful locality hints.
+    pub fn decay(&mut self, elapsed_epochs: u64, half_life_epochs: u64) {
+        if half_life_epochs == 0 {
+            self.expected_read_rate = 0;
+            return;
+        }
+        let factor = 0.5_f64.powf(elapsed_epochs as f64 / half_life_epochs as f64);
+        self.expected_read_rate = (self.expected_read_rate as f64 * factor) as u64;
+    }
+
+    pub fn bounded(mut self) -> Self {
+        self.hot_key_prefixes.truncate(Self::MAX_ENTRIES);
+        self.hot_sst_ids.truncate(Self::MAX_ENTRIES);
+        self.hot_block_ranges.truncate(Self::MAX_ENTRIES);
+        self
+    }
+}
+
 /// The reason a shard lease was revoked by the control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,6 +89,9 @@ pub struct ShardLease {
     pub lease_token: LeaseToken,
     /// Wall-clock timestamp (ms since Unix epoch) when the lease was acquired.
     pub acquired_at_ms: u64,
+    /// Heat hint retained across reassignment; it is never authoritative state.
+    #[serde(default)]
+    pub heat_hint: LeaseHeatHint,
 }
 
 impl ShardLease {
@@ -73,7 +106,13 @@ impl ShardLease {
             worker_id,
             lease_token,
             acquired_at_ms,
+            heat_hint: LeaseHeatHint::default(),
         }
+    }
+
+    pub fn with_heat_hint(mut self, heat_hint: LeaseHeatHint) -> Self {
+        self.heat_hint = heat_hint.bounded();
+        self
     }
 }
 

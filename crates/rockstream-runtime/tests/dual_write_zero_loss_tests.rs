@@ -25,6 +25,42 @@ fn make_key(bucket: u64, suffix: &str) -> Vec<u8> {
     format!("bucket/{bucket}/{suffix}").into_bytes()
 }
 
+#[test]
+fn migration_epoch_routes_old_and_new_writes_exactly_once() {
+    let mut record = make_record().with_migration_epoch(100);
+    record
+        .apply_transition(MigrationState::Snapshotting)
+        .unwrap();
+    record.apply_transition(MigrationState::Copying).unwrap();
+    record
+        .apply_transition(MigrationState::DualWriting)
+        .unwrap();
+    let router = DualWriteRouter::new(record.clone());
+
+    assert_eq!(
+        router.route_targets_at_epoch(7, 9, 99).unwrap(),
+        vec![ShardId(1)]
+    );
+    assert_eq!(
+        router.route_targets_at_epoch(7, 9, 100).unwrap(),
+        vec![ShardId(1), ShardId(2)]
+    );
+
+    record.apply_transition(MigrationState::CatchingUp).unwrap();
+    record.apply_transition(MigrationState::FencingOld).unwrap();
+    record.apply_transition(MigrationState::Cutover).unwrap();
+    record.cutover_epoch = Some(120);
+    let router = DualWriteRouter::new(record);
+    assert_eq!(
+        router.route_targets_at_epoch(7, 9, 119).unwrap(),
+        vec![ShardId(1)]
+    );
+    assert_eq!(
+        router.route_targets_at_epoch(7, 9, 120).unwrap(),
+        vec![ShardId(2)]
+    );
+}
+
 async fn make_shard(
     shard_id: u64,
     path: &str,

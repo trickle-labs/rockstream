@@ -104,6 +104,12 @@ pub struct MigrationRecord {
     /// Donor checkpoint ids keyed by donor shard.
     #[serde(default)]
     pub donor_checkpoints: BTreeMap<ShardId, u64>,
+    /// Snapshot UUIDs for copying the exact donor checkpoint.
+    #[serde(default)]
+    pub donor_checkpoint_snapshots: BTreeMap<ShardId, String>,
+    /// Logical epoch at which writes enter the migration routing policy.
+    #[serde(default)]
+    pub migration_epoch: Epoch,
     /// Epoch used to gate `GC_ELIGIBLE`.
     pub cutover_epoch: Option<Epoch>,
     /// Wall-clock timestamp (ms since Unix epoch) when the record was created.
@@ -144,6 +150,8 @@ impl MigrationRecord {
             planned_frontier,
             target_bucket_map_version,
             donor_checkpoints: BTreeMap::new(),
+            donor_checkpoint_snapshots: BTreeMap::new(),
+            migration_epoch: planned_frontier,
             cutover_epoch: None,
             created_at_ms: now,
             updated_at_ms: now,
@@ -152,6 +160,12 @@ impl MigrationRecord {
             total_rows: None,
             copied_rows: None,
         }
+    }
+
+    /// Set the epoch used by dual routing without changing the migration plan.
+    pub fn with_migration_epoch(mut self, migration_epoch: Epoch) -> Self {
+        self.migration_epoch = migration_epoch;
+        self
     }
 
     /// Attach work estimates to this record.

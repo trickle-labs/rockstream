@@ -39,6 +39,7 @@ pub mod pipeline;
 pub mod project;
 pub mod recursion;
 pub mod scheduler;
+pub mod shared_window;
 pub mod sink;
 pub mod snapshot;
 pub mod source;
@@ -100,6 +101,10 @@ pub use recursion::{
     RecursionStrategy, RECURSION_STATE_LIMIT,
 };
 pub use scheduler::CreditScheduler;
+pub use shared_window::{
+    SharedWindowError, SharedWindowFabric, SharedWindowFillLevel, MAX_SHARED_WINDOW_CONSUMERS,
+    MAX_SHARED_WINDOW_QUERY_SLICES, MAX_SHARED_WINDOW_SLICES,
+};
 pub use sink::{read_view_output, ColumnValue, ViewSinkOp};
 pub use snapshot::{SnapshotOp, SNAPSHOT_BUFFER_LIMIT};
 pub use source::{GenerateRowsSource, VecDeltaSource};

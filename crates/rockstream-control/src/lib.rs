@@ -50,7 +50,8 @@ pub use frontier::{AggregatorError, FrontierAggregator};
 pub use kek::{AwsKmsKekProvider, EnvKekProvider, KekError, KekProvider};
 pub use migration::{
     BucketMapVersionTracker, MigrationConsumerFrontierTracker, MigrationCoordinator,
-    MigrationError, MigrationFillLevel, MigrationPersistentStore, MigrationShard, PhaseClocks,
+    MigrationCopyStats, MigrationError, MigrationFillLevel, MigrationPersistentStore,
+    MigrationShard, PhaseClocks, MAX_COPY_CHUNK_BYTES, MAX_COPY_CHUNK_ROWS,
 };
 pub use namespace::NamespaceCatalog;
 pub use placement::PlacementAlgorithm;

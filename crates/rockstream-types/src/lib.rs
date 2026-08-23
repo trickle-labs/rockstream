@@ -37,6 +37,7 @@ pub mod raft;
 pub mod rendezvous;
 pub mod schema_evolution;
 pub mod secret;
+pub mod shared_window;
 pub mod sink;
 pub mod state_budget;
 pub mod state_mutation;
@@ -60,6 +61,7 @@ pub use evidence_manifest::{
 };
 pub use ids::{ArrangementId, TenantId};
 pub use key_capsule::{KeyCapsule, KeyCapsuleError, KeyValue};
+pub use shared_window::{SharedWindowSpec, SharedWindowSpecError};
 pub use state_mutation::{EpochStateDelta, OperatorEpochMetrics, StateMutation};
 
 /// Timestamp types.

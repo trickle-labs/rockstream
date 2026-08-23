@@ -37,3 +37,19 @@ fn composable_laws_use_virtual_bucket_split_and_combine() {
         HotKeyMitigationPlan::Split { bucket_count, source, .. } if bucket_count == 8 && source == OperatorId(11)
     ));
 }
+
+#[test]
+fn composable_laws_use_power_of_two_virtual_bucket_split() {
+    let plan = plan_hot_key_mitigation(
+        &LawDescriptor::from_bundle(&SumCountV1),
+        OperatorId(11),
+        6,
+        ShardId(99),
+    );
+
+    assert!(matches!(
+        plan,
+        HotKeyMitigationPlan::Split { bucket_count, .. }
+            if bucket_count.is_power_of_two() && bucket_count >= 6
+    ));
+}

@@ -3,6 +3,7 @@
 use rockstream_storage::ShardDb;
 use rockstream_types::ids::ShardId;
 use rockstream_types::migration::{MigrationRecord, MigrationState};
+use rockstream_types::timestamp::Epoch;
 use thiserror::Error;
 
 /// One logical write routed through the bucket map.
@@ -40,6 +41,16 @@ impl DualWriteRouter {
     }
 
     pub fn route_targets(&self, bucket: u64, version: u64) -> Result<Vec<ShardId>, RoutingError> {
+        self.route_targets_at_epoch(bucket, version, self.record.migration_epoch)
+    }
+
+    /// Route a replay or live write according to the migration epoch it carries.
+    pub fn route_targets_at_epoch(
+        &self,
+        bucket: u64,
+        version: u64,
+        epoch: Epoch,
+    ) -> Result<Vec<ShardId>, RoutingError> {
         let migrating = self.record.buckets.contains(bucket);
         let state = self.record.state;
         if migrating
@@ -66,9 +77,29 @@ impl DualWriteRouter {
             MigrationState::DualWriting
             | MigrationState::CatchingUp
             | MigrationState::FencingOld
-                if migrating =>
+                if migrating && epoch >= self.record.migration_epoch =>
             {
                 vec![self.record.donor_shards[0], self.record.recipient_shard]
+            }
+            MigrationState::DualWriting
+            | MigrationState::CatchingUp
+            | MigrationState::FencingOld
+                if migrating =>
+            {
+                vec![self.record.donor_shards[0]]
+            }
+            MigrationState::Cutover
+            | MigrationState::Verifying
+            | MigrationState::GcEligible
+            | MigrationState::Done
+                if migrating
+                    && epoch
+                        >= self
+                            .record
+                            .cutover_epoch
+                            .unwrap_or(self.record.migration_epoch) =>
+            {
+                vec![self.record.recipient_shard]
             }
             MigrationState::Cutover
             | MigrationState::Verifying
@@ -76,7 +107,7 @@ impl DualWriteRouter {
             | MigrationState::Done
                 if migrating =>
             {
-                vec![self.record.recipient_shard]
+                vec![self.record.donor_shards[0]]
             }
             _ => vec![self.record.donor_shards[0]],
         };
@@ -89,7 +120,18 @@ impl DualWriteRouter {
         donor: &ShardDb,
         recipient: &ShardDb,
     ) -> Result<usize, RoutingError> {
-        let targets = self.route_targets(write.bucket, write.bucket_map_version)?;
+        self.apply_write_at_epoch(write, self.record.migration_epoch, donor, recipient)
+            .await
+    }
+
+    pub async fn apply_write_at_epoch(
+        &self,
+        write: &RoutedWrite,
+        epoch: Epoch,
+        donor: &ShardDb,
+        recipient: &ShardDb,
+    ) -> Result<usize, RoutingError> {
+        let targets = self.route_targets_at_epoch(write.bucket, write.bucket_map_version, epoch)?;
         for target in &targets {
             let db = if *target == self.record.recipient_shard {
                 recipient

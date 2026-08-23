@@ -41,7 +41,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use tracing::debug;
 
-use rockstream_plan::virtual_bucket::route_virtual_bucket;
+use rockstream_plan::virtual_bucket::{
+    normalize_power_of_two_bucket_count, route_power_of_two_bucket,
+};
 use rockstream_storage::{ShardDb, ShardKeyEncoder, ShardPrefix, WriteBatch};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::laws::sum_count::avg_from_sum_count;
@@ -664,7 +666,7 @@ impl BucketedAggregateOp {
             partials: Mutex::new(HashMap::new()),
             op_id,
             hot_key,
-            bucket_count,
+            bucket_count: normalize_power_of_two_bucket_count(bucket_count),
         }
     }
 
@@ -672,7 +674,7 @@ impl BucketedAggregateOp {
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&k.to_be_bytes());
         key[8..].copy_from_slice(&v.to_be_bytes());
-        route_virtual_bucket(&key, self.bucket_count, key.len()).unwrap_or(0)
+        route_power_of_two_bucket(&key, self.bucket_count, key.len()).unwrap_or(0)
     }
 
     pub fn live_partials(&self) -> usize {

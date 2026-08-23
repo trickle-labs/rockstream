@@ -137,6 +137,41 @@ async fn copying_recipient_matches_donor_checkpoint() {
         scan_bucket(&donor.db, 7).await,
         scan_bucket(&recipient.db, 7).await
     );
+    assert_eq!(record.donor_checkpoint_snapshots.len(), 1);
+    assert_eq!(
+        record.copied_rows,
+        Some(donor.db.scan_prefix(b"").await.unwrap().len() as u64)
+    );
+}
+
+#[tokio::test]
+async fn bounded_copy_chunks_report_exact_limits_and_output() {
+    let store = Arc::new(InMemory::new());
+    let donor = make_shard(1, "migration/chunks-donor", store.clone(), 42).await;
+    let recipient = make_shard(2, "migration/chunks-recipient", store.clone(), 42).await;
+    let mut batch = WriteBatch::new();
+    for i in 0..300 {
+        batch.put(&make_key(7, &format!("k{i:04}")), b"value");
+    }
+    donor.db.write_batch(batch).await.unwrap();
+    donor.db.flush().await.unwrap();
+
+    let mut record = make_record();
+    record
+        .apply_transition(MigrationState::Snapshotting)
+        .unwrap();
+    record.apply_transition(MigrationState::Copying).unwrap();
+    let source_rows = donor.db.scan_prefix(b"").await.unwrap().len();
+    let stats = MigrationCoordinator::new()
+        .copy_bounded_chunks(&mut record, &[donor], &recipient)
+        .await
+        .unwrap();
+
+    assert_eq!(stats.copied_rows, source_rows as u64);
+    assert_eq!(stats.chunks, 2);
+    assert!(stats.max_chunk_rows <= 256);
+    assert!(stats.max_chunk_bytes <= 1024 * 1024);
+    assert_eq!(scan_bucket(&recipient.db, 7).await.len(), 300);
 }
 
 #[tokio::test]
@@ -336,6 +371,65 @@ async fn cutover_waits_for_all_observers_before_verifying() {
             None,
         )
         .unwrap());
+}
+
+#[test]
+fn cutover_requires_a_committed_frontier() {
+    let tracker = BucketMapVersionTracker::new();
+    let mut record = make_record();
+    for state in [
+        MigrationState::Snapshotting,
+        MigrationState::Copying,
+        MigrationState::DualWriting,
+        MigrationState::CatchingUp,
+        MigrationState::FencingOld,
+    ] {
+        record.apply_transition(state).unwrap();
+    }
+    for component in ["reader", "exchange", "gateway"] {
+        tracker.observe(component, 9).unwrap();
+    }
+
+    let coordinator = MigrationCoordinator::new();
+    assert!(!coordinator
+        .await_cutover_readiness_at_frontier(
+            &mut record,
+            &tracker,
+            &["reader", "exchange", "gateway"],
+            41,
+            Instant::now(),
+            None,
+        )
+        .unwrap());
+    assert_eq!(record.state, MigrationState::FencingOld);
+    assert!(coordinator
+        .await_cutover_readiness_at_frontier(
+            &mut record,
+            &tracker,
+            &["reader", "exchange", "gateway"],
+            42,
+            Instant::now(),
+            None,
+        )
+        .unwrap());
+    assert_eq!(record.cutover_epoch, Some(42));
+}
+
+#[tokio::test]
+async fn donor_reclamation_is_rejected_before_frontier_gate() {
+    let store = Arc::new(InMemory::new());
+    let donor = make_shard(1, "migration/early-gc-donor", store, 42).await;
+    donor.db.put(&make_key(7, "keep"), b"value").await.unwrap();
+    donor.db.flush().await.unwrap();
+    let mut record = make_record();
+    step_to_cutover(&mut record);
+
+    let err = MigrationCoordinator::new()
+        .finish_done(&mut record, &donor, None, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("RS-5033"));
+    assert_eq!(scan_bucket(&donor.db, 7).await.len(), 1);
 }
 
 #[test]

@@ -18,6 +18,7 @@ use crate::migration::{
     PhaseClocks,
 };
 use crate::CheckpointCoordinator;
+use rockstream_plan::virtual_bucket::normalize_power_of_two_bucket_count;
 
 pub const MAX_TRACKED_KEY_LOADS: usize = 1024;
 pub const MAX_PROACTIVE_SPLIT_SAMPLE_KEYS: usize = 1024;
@@ -326,10 +327,11 @@ impl ProactiveSplitter {
                 .map_err(|err| ProactiveSplitError::Migration(err.to_string()))?;
         }
         coordinator
-            .await_cutover_readiness(
+            .await_cutover_readiness_at_frontier(
                 &mut record,
                 &tracker,
                 &["reader", "exchange", "gateway"],
+                donor.frontier.min(recipient.frontier),
                 Instant::now(),
                 audit,
             )
@@ -749,6 +751,7 @@ pub fn plan_hot_key_mitigation(
     spill_shard: ShardId,
 ) -> HotKeyMitigationPlan {
     if law.composable() {
+        let bucket_count = normalize_power_of_two_bucket_count(bucket_count);
         HotKeyMitigationPlan::Split {
             bucket_count,
             source,

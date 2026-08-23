@@ -27,8 +27,10 @@
 //! is rejected with [`SchedulerError::NotLeader`] (`RS-1731
 //! control.not_leader`) before it ever reaches [`ShardManager`].
 
+use std::collections::HashMap;
+
 use rockstream_types::ids::{ShardId, WorkerId};
-use rockstream_types::lease::ShardLease;
+use rockstream_types::lease::{LeaseHeatHint, ShardLease};
 
 use crate::placement::PlacementAlgorithm;
 use crate::raft::RaftHandle;
@@ -193,6 +195,13 @@ impl ShardScheduler {
         dead_worker_id: WorkerId,
     ) -> Result<Vec<ShardAssignment>, SchedulerError> {
         self.require_leader()?;
+        let carried_heat: HashMap<_, _> = self
+            .manager
+            .leases()
+            .into_iter()
+            .filter(|lease| lease.worker_id == dead_worker_id)
+            .map(|lease| (lease.shard_id, lease.heat_hint))
+            .collect();
         let freed = self.manager.release_worker(dead_worker_id);
         if freed.is_empty() {
             return Ok(Vec::new());
@@ -232,14 +241,19 @@ impl ShardScheduler {
             ) {
                 // acquire() should always succeed here because we just released
                 // the shard; no other worker holds it.
-                match self.manager.acquire(shard_id, winner.worker_id) {
+                match self.manager.acquire_with_heat(
+                    shard_id,
+                    winner.worker_id,
+                    carried_heat
+                        .get(&shard_id)
+                        .cloned()
+                        .unwrap_or_else(LeaseHeatHint::default),
+                ) {
                     Ok(lease) => assignments.push(ShardAssignment {
                         lease,
                         evicted: Some(dead_worker_id),
                     }),
                     Err(LeaseError::AlreadyLeased { .. }) => {
-                        // Race: another thread already assigned it.  Return the
-                        // current lease instead.
                         if let Some(lease) = self.manager.get(shard_id) {
                             assignments.push(ShardAssignment {
                                 lease,
@@ -344,6 +358,13 @@ mod tests {
         // Worker 1 owns shards 1 and 2.
         sched.manager.acquire(ShardId(1), WorkerId(1)).unwrap();
         sched.manager.acquire(ShardId(2), WorkerId(1)).unwrap();
+        let heat = LeaseHeatHint {
+            hot_key_prefixes: vec![b"customer-42".to_vec()],
+            hot_sst_ids: vec!["sst-7".to_string()],
+            hot_block_ranges: vec![(10, 20)],
+            expected_read_rate: 100,
+        };
+        assert!(sched.manager.update_heat(ShardId(1), heat.clone()));
 
         let old_token_1 = sched.manager.get(ShardId(1)).unwrap().lease_token;
         let old_token_2 = sched.manager.get(ShardId(2)).unwrap().lease_token;
@@ -357,6 +378,15 @@ mod tests {
             assert_eq!(a.lease.worker_id, WorkerId(2));
             assert_eq!(a.evicted, Some(WorkerId(1)));
         }
+        assert_eq!(
+            reassignments
+                .iter()
+                .find(|a| a.lease.shard_id == ShardId(1))
+                .unwrap()
+                .lease
+                .heat_hint,
+            heat
+        );
 
         // Old tokens must be invalid.
         assert!(!sched.manager.is_valid_writer(ShardId(1), old_token_1));

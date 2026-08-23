@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use rockstream_types::ids::{LeaseToken, ShardId, WorkerId};
-use rockstream_types::lease::ShardLease;
+use rockstream_types::lease::{LeaseHeatHint, ShardLease};
 
 /// Errors returned by [`ShardManager`] operations.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -144,6 +144,16 @@ impl ShardManager {
         shard_id: ShardId,
         worker_id: WorkerId,
     ) -> Result<ShardLease, LeaseError> {
+        self.acquire_with_heat(shard_id, worker_id, LeaseHeatHint::default())
+    }
+
+    /// Acquire a lease while supplying heat for a previously unleased shard.
+    pub fn acquire_with_heat(
+        &self,
+        shard_id: ShardId,
+        worker_id: WorkerId,
+        heat_hint: LeaseHeatHint,
+    ) -> Result<ShardLease, LeaseError> {
         let mut guard = self.inner.write();
         if let Some(existing) = guard.leases.get(&shard_id) {
             if existing.worker_id != worker_id {
@@ -154,7 +164,12 @@ impl ShardManager {
             }
         }
         let token = mint_token(&mut guard);
-        let lease = ShardLease::new(shard_id, worker_id, token);
+        let heat_hint = guard
+            .leases
+            .get(&shard_id)
+            .map(|lease| lease.heat_hint.clone())
+            .unwrap_or(heat_hint);
+        let lease = ShardLease::new(shard_id, worker_id, token).with_heat_hint(heat_hint);
         guard.leases.insert(shard_id, lease.clone());
         Ok(lease)
     }
@@ -169,11 +184,62 @@ impl ShardManager {
         worker_id: WorkerId,
     ) -> (ShardLease, Option<WorkerId>) {
         let mut guard = self.inner.write();
+        let heat_hint = guard
+            .leases
+            .get(&shard_id)
+            .map(|lease| lease.heat_hint.clone())
+            .unwrap_or_default();
+        self.force_acquire_with_heat_locked(&mut guard, shard_id, worker_id, heat_hint)
+    }
+
+    /// Force-acquire while explicitly carrying the latest heat summary.
+    pub fn force_acquire_with_heat(
+        &self,
+        shard_id: ShardId,
+        worker_id: WorkerId,
+        heat_hint: LeaseHeatHint,
+    ) -> (ShardLease, Option<WorkerId>) {
+        let mut guard = self.inner.write();
+        self.force_acquire_with_heat_locked(&mut guard, shard_id, worker_id, heat_hint)
+    }
+
+    fn force_acquire_with_heat_locked(
+        &self,
+        guard: &mut ShardManagerInner,
+        shard_id: ShardId,
+        worker_id: WorkerId,
+        heat_hint: LeaseHeatHint,
+    ) -> (ShardLease, Option<WorkerId>) {
         let evicted = guard.leases.get(&shard_id).map(|l| l.worker_id);
-        let token = mint_token(&mut guard);
-        let lease = ShardLease::new(shard_id, worker_id, token);
+        let token = mint_token(guard);
+        let lease = ShardLease::new(shard_id, worker_id, token).with_heat_hint(heat_hint);
         guard.leases.insert(shard_id, lease.clone());
         (lease, evicted)
+    }
+
+    /// Replace the non-authoritative heat summary for an active shard lease.
+    pub fn update_heat(&self, shard_id: ShardId, heat_hint: LeaseHeatHint) -> bool {
+        let mut guard = self.inner.write();
+        let Some(lease) = guard.leases.get_mut(&shard_id) else {
+            return false;
+        };
+        lease.heat_hint = heat_hint.bounded();
+        true
+    }
+
+    /// Decay an active lease's heat before it is reassigned or renewed.
+    pub fn decay_heat(
+        &self,
+        shard_id: ShardId,
+        elapsed_epochs: u64,
+        half_life_epochs: u64,
+    ) -> bool {
+        let mut guard = self.inner.write();
+        let Some(lease) = guard.leases.get_mut(&shard_id) else {
+            return false;
+        };
+        lease.heat_hint.decay(elapsed_epochs, half_life_epochs);
+        true
     }
 
     /// Release the lease for `shard_id` if the provided `token` matches.
@@ -479,6 +545,31 @@ mod tests {
             m.is_valid_writer(ShardId(1), lease_b.lease_token),
             "Worker B must be the valid writer"
         );
+    }
+
+    #[test]
+    fn heat_hint_decays_and_survives_reassignment() {
+        let m = mgr();
+        let lease = m.acquire(ShardId(1), WorkerId(1)).unwrap();
+        let heat = rockstream_types::lease::LeaseHeatHint {
+            hot_key_prefixes: vec![b"customer-42".to_vec()],
+            hot_sst_ids: vec!["sst-7".to_string()],
+            hot_block_ranges: vec![(10, 20)],
+            expected_read_rate: 100,
+        };
+        assert!(m.update_heat(ShardId(1), heat));
+        assert!(m.decay_heat(ShardId(1), 1, 1));
+        let (reassigned, evicted) = m.force_acquire(ShardId(1), WorkerId(2));
+
+        assert_eq!(evicted, Some(WorkerId(1)));
+        assert_eq!(reassigned.heat_hint.expected_read_rate, 50);
+        assert_eq!(
+            reassigned.heat_hint.hot_key_prefixes,
+            vec![b"customer-42".to_vec()]
+        );
+        assert_eq!(reassigned.heat_hint.hot_sst_ids, vec!["sst-7"]);
+        assert_eq!(reassigned.heat_hint.hot_block_ranges, vec![(10, 20)]);
+        assert!(reassigned.lease_token.0 > lease.lease_token.0);
     }
 
     // -----------------------------------------------------------------------
