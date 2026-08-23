@@ -27,7 +27,7 @@ use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::SinkExt;
-use futures::{stream, Sink, StreamExt};
+use futures::{stream, Sink, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use pgwire::api::auth::{
     finish_authentication, save_startup_parameters_to_metadata, ServerParameterProvider,
@@ -13550,7 +13550,20 @@ async fn committed_dml_ops(
     shard_db: &rockstream_storage::ShardDb,
     ops: Vec<DmlOp>,
 ) -> Result<Vec<DmlOp>, rockstream_storage::StorageError> {
-    let mut images = HashMap::<(String, String), Option<String>>::new();
+    let mut images = stream::iter(dml_image_tables(&ops))
+        .map(|(key, table)| async move {
+            let storage_key = format!("view_output/{table}/{}", key.1);
+            let image = shard_db
+                .get(storage_key.as_bytes())
+                .await?
+                .map(|value| String::from_utf8_lossy(&value).into_owned());
+            Ok::<_, rockstream_storage::StorageError>((key, image))
+        })
+        .buffer_unordered(64)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
     let mut committed = Vec::with_capacity(ops.len());
     for op in ops {
         let valid = match &op {
@@ -13609,6 +13622,63 @@ async fn committed_dml_ops(
         }
     }
     Ok(committed)
+}
+
+fn dml_image_tables(ops: &[DmlOp]) -> HashMap<(String, String), String> {
+    let mut tables = HashMap::new();
+    for op in ops {
+        let (table, row_key) = match op {
+            DmlOp::Insert { table, row_key, .. } | DmlOp::Delete { table, row_key, .. } => {
+                (table, row_key)
+            }
+            DmlOp::Update {
+                table, old_row_key, ..
+            } => (table, old_row_key),
+        };
+        tables
+            .entry((table.to_ascii_lowercase(), row_key.clone()))
+            .or_insert_with(|| table.clone());
+    }
+    tables
+}
+
+#[cfg(test)]
+#[test]
+fn dml_image_tables_normalizes_and_deduplicates_preimages() {
+    let images = dml_image_tables(&[
+        DmlOp::Insert {
+            table: "Orders".to_string(),
+            cols: vec![],
+            values_tsv: "1".to_string(),
+            row_key: "id=1".to_string(),
+        },
+        DmlOp::Update {
+            table: "orders".to_string(),
+            old_row_key: "id=1".to_string(),
+            old_tsv: "1".to_string(),
+            new_row_key: "id=2".to_string(),
+            new_tsv: "2".to_string(),
+        },
+        DmlOp::Delete {
+            table: "items".to_string(),
+            row_key: "id=3".to_string(),
+            returning_tsv: Some("3".to_string()),
+        },
+    ]);
+
+    assert_eq!(
+        images,
+        HashMap::from([
+            (
+                ("orders".to_string(), "id=1".to_string()),
+                "Orders".to_string()
+            ),
+            (
+                ("items".to_string(), "id=3".to_string()),
+                "items".to_string()
+            ),
+        ])
+    );
 }
 
 async fn cached_row_image(
