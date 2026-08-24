@@ -402,6 +402,16 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: cargo llvm-cov report --package rockstream-test-support --fail-under-regions 70
+      - name: cargo llvm-cov (rockstream-docgen lines ≥70%)
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        run: cargo llvm-cov report --package rockstream-docgen --fail-under-lines 70
+      - name: cargo llvm-cov (rockstream-docgen regions ≥70%)
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        run: cargo llvm-cov report --package rockstream-docgen --fail-under-regions 70
       - name: upload coverage artifact
         uses: actions/upload-artifact@v4
         with:

@@ -110,6 +110,8 @@ coverage-gate:
 	cargo llvm-cov report --package rockstream-oracle --fail-under-regions 81
 	cargo llvm-cov report --package rockstream-test-support --fail-under-lines 70
 	cargo llvm-cov report --package rockstream-test-support --fail-under-regions 70
+	cargo llvm-cov report --package rockstream-docgen --fail-under-lines 70
+	cargo llvm-cov report --package rockstream-docgen --fail-under-regions 70
 	@echo "Coverage gate passed."
 
 # Re-measure all four v0.45.4 performance-regression benchmark suites and
