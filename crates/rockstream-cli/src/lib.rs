@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod cli_args;
 pub mod demo;
 pub mod doctor;
+pub mod init;
 pub mod metrics_server;
 pub mod output;
 pub mod transport;
@@ -40,6 +41,7 @@ pub use doctor::{
     run_doctor, run_doctor_checks, DiagnosticCheckResult, DiagnosticStatus, DoctorOptions,
     DoctorReport,
 };
+pub use init::{run_init, scaffold_project, InitOptions, InitOutcome};
 
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts

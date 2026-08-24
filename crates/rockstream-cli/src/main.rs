@@ -14,14 +14,14 @@ use rockstream_cli::{
     run_checkpoint_restore, run_checkpoint_show, run_cluster_quotas, run_cluster_status,
     run_cluster_workers_drain, run_cluster_workers_list, run_cluster_workers_status,
     run_completions, run_config_print_effective, run_config_validate, run_debug_arrangement,
-    run_demo, run_doctor, run_explain_view, run_format_migrate, run_manifest_validate, run_qualify,
-    run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
+    run_demo, run_doctor, run_explain_view, run_format_migrate, run_init, run_manifest_validate,
+    run_qualify, run_resource_cluster, run_resource_usage, run_schema_create, run_schema_drop,
     run_schema_evolution_history, run_schema_evolution_status, run_schema_list, run_schema_show,
     run_shard_list, run_shard_migrate, run_source_drop, run_source_list, run_source_pause,
     run_source_resume, run_source_show, run_sql_compile, run_start, run_support_bundle,
     run_view_list, run_view_pause, run_view_query, run_view_resume, run_view_show, run_view_status,
     run_view_subscribe, run_workload_alter, run_workload_create, run_workload_drop,
-    run_workload_list, run_workload_show, DemoOptions, DoctorOptions, StartOptions,
+    run_workload_list, run_workload_show, DemoOptions, DoctorOptions, InitOptions, StartOptions,
 };
 use rockstream_types::acl::Role;
 use rockstream_types::config_resolver::CliConfigOverrides;
@@ -476,6 +476,20 @@ fn main() -> ExitCode {
             }
         },
         Command::Completions { shell } => handle_result(run_completions(shell), format),
+        Command::Init {
+            name,
+            template,
+            dir,
+            force,
+        } => {
+            let opts = InitOptions {
+                name,
+                template,
+                dir,
+                force,
+            };
+            handle_result(run_init(format, &opts), format)
+        }
         Command::Demo {
             scenario,
             storage,

@@ -1,0 +1,22 @@
+# RockStream Configuration — Reference Application
+[gateway]
+listen = "0.0.0.0:5432"
+
+[storage]
+backend = "lfs"
+path = "./storage"
+
+[connectors.kafka]
+brokers = ["redpanda:9092"]
+
+[connectors.postgres]
+connection_url = "postgres://postgres:postgres@postgres:5432/source_db"
+publication = "ecommerce_pub"
+slot = "ecommerce_slot"
+
+[metrics]
+listen = "0.0.0.0:9090"
+enabled = true
+
+[logging]
+level = "info"

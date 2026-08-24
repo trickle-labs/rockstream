@@ -304,6 +304,24 @@ pub enum Command {
         #[arg(value_enum)]
         shell: ShellType,
     },
+    /// Initialize a new RockStream project from a template.
+    Init {
+        /// Project name (defaults to "my_project").
+        #[arg(default_value = "my_project")]
+        name: String,
+
+        /// Project template: "local", "kafka", or "postgres-cdc".
+        #[arg(long, default_value = "local")]
+        template: String,
+
+        /// Target directory to scaffold the project into (defaults to ./<name>).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Overwrite existing files in non-empty directory.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Run an embedded demonstration scenario proving incremental view maintenance.
     Demo {
         /// Demo scenario to execute (default: orders).

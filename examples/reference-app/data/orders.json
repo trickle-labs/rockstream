@@ -1,0 +1,6 @@
+[
+  {"order_id": 1001, "customer_id": 1, "store_id": 50, "amount": 500, "risk_score": 15},
+  {"order_id": 1002, "customer_id": 2, "store_id": 50, "amount": 1200, "risk_score": 85},
+  {"order_id": 1003, "customer_id": 3, "store_id": 60, "amount": 300, "risk_score": 10},
+  {"order_id": 1004, "customer_id": 1, "store_id": 60, "amount": 2500, "risk_score": 92}
+]

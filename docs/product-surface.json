@@ -1106,6 +1106,70 @@
         ]
       },
       {
+        "name": "init",
+        "about": "Initialize a new RockStream project from a template",
+        "options": [
+          {
+            "name": "dir",
+            "long": "dir",
+            "help": "Target directory to scaffold the project into (defaults to ./<name>)",
+            "required": false,
+            "value_name": "DIR"
+          },
+          {
+            "name": "force",
+            "long": "force",
+            "help": "Overwrite existing files in non-empty directory",
+            "required": false,
+            "value_name": "FORCE",
+            "default_value": "false",
+            "possible_values": [
+              "true",
+              "false"
+            ]
+          },
+          {
+            "name": "name",
+            "help": "Project name (defaults to \"my_project\")",
+            "required": false,
+            "value_name": "NAME",
+            "default_value": "my_project"
+          },
+          {
+            "name": "template",
+            "long": "template",
+            "help": "Project template: \"local\", \"kafka\", or \"postgres-cdc\"",
+            "required": false,
+            "value_name": "TEMPLATE",
+            "default_value": "local"
+          }
+        ],
+        "exit_codes": [
+          {
+            "code": 0,
+            "title": "Success",
+            "description": "Command completed successfully without error"
+          },
+          {
+            "code": 1,
+            "title": "Execution Error",
+            "description": "Runtime failure or operation error during execution"
+          },
+          {
+            "code": 2,
+            "title": "Usage Error",
+            "description": "Invalid arguments, options, or flags provided to CLI"
+          }
+        ],
+        "error_codes": [
+          "RS-0001",
+          "RS-1001",
+          "RS-1012",
+          "RS-1013",
+          "RS-2001"
+        ]
+      },
+      {
         "name": "manifest",
         "about": "Evidence manifest verification and inspection",
         "subcommands": [

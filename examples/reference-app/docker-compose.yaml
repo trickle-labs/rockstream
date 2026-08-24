@@ -1,0 +1,51 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ref_postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=source_db
+    ports:
+      - "5433:5432"
+    command: ["postgres", "-c", "wal_level=logical"]
+
+  redpanda:
+    image: vectorized/redpanda:latest
+    container_name: ref_redpanda
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://127.0.0.1:9092
+
+  rockstream:
+    image: rockstream/rockstream:latest
+    container_name: ref_rockstream
+    depends_on:
+      - postgres
+      - redpanda
+    ports:
+      - "5432:5432"
+      - "9090:9090"
+    volumes:
+      - ./rockstream.toml:/etc/rockstream/rockstream.toml
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    environment:
+      - ROCKSTREAM_CONFIG=/etc/rockstream/rockstream.toml
+
+  verifier:
+    image: rockstream/rockstream-verifier:latest
+    container_name: ref_verifier
+    depends_on:
+      - rockstream
+    environment:
+      - ROCKSTREAM_HOST=rockstream
+      - ROCKSTREAM_PORT=5432
