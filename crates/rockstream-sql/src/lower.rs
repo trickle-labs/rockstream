@@ -712,27 +712,57 @@ pub fn lower_expr(expr: &DfExpr, schema: &DFSchema) -> Result<Expr, SqlError> {
             })
         }
 
-        // Scalar functions used by Nexmark q14/q21/q22 (v0.51.4, Slice 7).
-        // DataFusion's SQL parser lowers the `length(...)` call to a scalar
-        // function literally named `character_length`, not `length` — the
-        // two are normalized to the same `Expr::ScalarUdf` name here since
-        // `rockstream-ops`'s evaluator only implements one such function.
-        DfExpr::ScalarFunction(sf)
-            if matches!(
-                sf.func.name(),
-                "regexp_replace" | "split_part" | "length" | "character_length" | "replace"
-            ) =>
-        {
-            let name = match sf.func.name() {
-                "character_length" => "length".to_string(),
+        // Scalar functions across string, null-handling, and date/time categories (v0.59.11 SQL-04).
+        DfExpr::ScalarFunction(sf) => {
+            let raw_name = sf.func.name();
+            let name = match raw_name {
+                "character_length" | "char_length" => "length".to_string(),
+                "substr" => "substring".to_string(),
+                "btrim" => "trim".to_string(),
+                "position" => "strpos".to_string(),
+                "datetrunc" => "date_trunc".to_string(),
+                "extract" => "date_part".to_string(),
+                "current_timestamp" => "now".to_string(),
+                "today" => "current_date".to_string(),
                 other => other.to_lowercase(),
             };
-            let args = sf
-                .args
-                .iter()
-                .map(|a| lower_expr(a, schema))
-                .collect::<Result<Vec<_>, SqlError>>()?;
-            Ok(Expr::ScalarUdf { name, args })
+            if matches!(
+                name.as_str(),
+                "regexp_replace"
+                    | "split_part"
+                    | "length"
+                    | "replace"
+                    | "upper"
+                    | "lower"
+                    | "substring"
+                    | "trim"
+                    | "ltrim"
+                    | "rtrim"
+                    | "concat"
+                    | "concat_ws"
+                    | "lpad"
+                    | "rpad"
+                    | "strpos"
+                    | "coalesce"
+                    | "nullif"
+                    | "date_trunc"
+                    | "date_part"
+                    | "age"
+                    | "to_char"
+                    | "now"
+                    | "current_date"
+            ) {
+                let args = sf
+                    .args
+                    .iter()
+                    .map(|a| lower_expr(a, schema))
+                    .collect::<Result<Vec<_>, SqlError>>()?;
+                Ok(Expr::ScalarUdf { name, args })
+            } else {
+                Err(SqlError::UnsupportedPlanNode {
+                    node_type: format!("expr:scalar_function:{raw_name}"),
+                })
+            }
         }
 
         other => Err(SqlError::UnsupportedPlanNode {
@@ -814,9 +844,39 @@ pub fn encode_scalar(scalar: &ScalarValue) -> Result<Vec<u8>, SqlError> {
         ScalarValue::Float64(Some(v)) => Ok(v.to_bits().to_be_bytes().to_vec()),
         ScalarValue::Float32(Some(v)) => Ok(((*v as f64).to_bits()).to_be_bytes().to_vec()),
         ScalarValue::Boolean(Some(b)) => Ok(vec![if *b { 1u8 } else { 0u8 }]),
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Ok(s.as_bytes().to_vec()),
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Ok(s.as_bytes().to_vec()),
+        ScalarValue::Date32(Some(v)) => Ok((*v as i64).to_be_bytes().to_vec()),
+        ScalarValue::Date64(Some(v)) => Ok(v.to_be_bytes().to_vec()),
+        ScalarValue::TimestampSecond(Some(v), _) => {
+            Ok((v.saturating_mul(1_000_000)).to_be_bytes().to_vec())
+        }
+        ScalarValue::TimestampMillisecond(Some(v), _) => {
+            Ok((v.saturating_mul(1_000)).to_be_bytes().to_vec())
+        }
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Ok(v.to_be_bytes().to_vec()),
+        ScalarValue::TimestampNanosecond(Some(v), _) => Ok((v / 1_000).to_be_bytes().to_vec()),
+        ScalarValue::IntervalMonthDayNano(Some(v)) => {
+            let total_micros = (v.days as i64)
+                .saturating_mul(86_400_000_000)
+                .saturating_add(v.nanoseconds / 1_000)
+                .saturating_add((v.months as i64).saturating_mul(30 * 86_400_000_000));
+            Ok(total_micros.to_be_bytes().to_vec())
+        }
+        ScalarValue::IntervalDayTime(Some(v)) => {
+            let total_micros = (v.days as i64)
+                .saturating_mul(86_400_000_000)
+                .saturating_add((v.milliseconds as i64).saturating_mul(1_000));
+            Ok(total_micros.to_be_bytes().to_vec())
+        }
+        ScalarValue::IntervalYearMonth(Some(v)) => {
+            let total_micros = (*v as i64).saturating_mul(30 * 86_400_000_000);
+            Ok(total_micros.to_be_bytes().to_vec())
+        }
         // NULL variants — empty bytes
-        ScalarValue::Int8(None)
+        ScalarValue::Null
+        | ScalarValue::Int8(None)
         | ScalarValue::Int16(None)
         | ScalarValue::Int32(None)
         | ScalarValue::Int64(None)
@@ -828,7 +888,17 @@ pub fn encode_scalar(scalar: &ScalarValue) -> Result<Vec<u8>, SqlError> {
         | ScalarValue::Float64(None)
         | ScalarValue::Boolean(None)
         | ScalarValue::Utf8(None)
-        | ScalarValue::LargeUtf8(None) => Ok(vec![]),
+        | ScalarValue::LargeUtf8(None)
+        | ScalarValue::Utf8View(None)
+        | ScalarValue::Date32(None)
+        | ScalarValue::Date64(None)
+        | ScalarValue::TimestampSecond(None, _)
+        | ScalarValue::TimestampMillisecond(None, _)
+        | ScalarValue::TimestampMicrosecond(None, _)
+        | ScalarValue::TimestampNanosecond(None, _)
+        | ScalarValue::IntervalMonthDayNano(None)
+        | ScalarValue::IntervalDayTime(None)
+        | ScalarValue::IntervalYearMonth(None) => Ok(vec![]),
         other => Err(SqlError::UnsupportedPlanNode {
             node_type: format!("scalar:{other:?}"),
         }),

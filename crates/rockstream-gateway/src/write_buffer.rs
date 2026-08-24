@@ -138,6 +138,11 @@ impl WriteBuffer {
         std::mem::take(&mut self.ops)
     }
 
+    /// Read-only slice of buffered operations.
+    pub fn ops(&self) -> &[DmlOp] {
+        &self.ops
+    }
+
     /// Clear without returning the ops.
     pub fn clear(&mut self) {
         self.ops.clear();

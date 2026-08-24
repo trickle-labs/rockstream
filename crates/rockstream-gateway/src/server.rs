@@ -471,6 +471,55 @@ async fn infer_parameter_types(catalog: &CatalogStubs, sql: &str) -> Vec<Type> {
         }
     }
 
+    let ql = sql.to_lowercase();
+    if ql.starts_with("update ") {
+        if let Ok((table_name, _, _, _)) = parse_update(sql) {
+            if let Some(catalog_table) = catalog.get_table(&table_name) {
+                for col in &catalog_table.columns {
+                    let oid = arrow_type_to_pg_oid(&col.data_type);
+                    let pg_type = pg_type_from_oid(oid);
+                    for idx in 1..=max_idx {
+                        let patterns = [
+                            format!("{} = ${}", col.name.to_lowercase(), idx),
+                            format!("{} =${}", col.name.to_lowercase(), idx),
+                            format!("{}= ${}", col.name.to_lowercase(), idx),
+                            format!("{}=${}", col.name.to_lowercase(), idx),
+                        ];
+                        if patterns.iter().any(|p| ql.contains(p))
+                            && idx <= max_idx
+                            && !explicit_casts.contains_key(&idx)
+                        {
+                            inferred_types[idx - 1] = pg_type.clone();
+                        }
+                    }
+                }
+            }
+        }
+    } else if ql.starts_with("delete from ") {
+        if let Ok((table_name, _, _)) = parse_delete(sql) {
+            if let Some(catalog_table) = catalog.get_table(&table_name) {
+                for col in &catalog_table.columns {
+                    let oid = arrow_type_to_pg_oid(&col.data_type);
+                    let pg_type = pg_type_from_oid(oid);
+                    for idx in 1..=max_idx {
+                        let patterns = [
+                            format!("{} = ${}", col.name.to_lowercase(), idx),
+                            format!("{} =${}", col.name.to_lowercase(), idx),
+                            format!("{}= ${}", col.name.to_lowercase(), idx),
+                            format!("{}=${}", col.name.to_lowercase(), idx),
+                        ];
+                        if patterns.iter().any(|p| ql.contains(p))
+                            && idx <= max_idx
+                            && !explicit_casts.contains_key(&idx)
+                        {
+                            inferred_types[idx - 1] = pg_type.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     inferred_types
 }
 
@@ -4888,9 +4937,30 @@ impl GatewayHandler {
             return Some(self.handle_create_table(q));
         }
 
-        // CREATE SINK — v0.44 pgwire DDL wiring
+        // DROP TABLE [IF EXISTS]
+        if ql.starts_with("drop table ") {
+            return Some(self.handle_drop_table(q));
+        }
+
+        // DROP VIEW / DROP MATERIALIZED VIEW [IF EXISTS]
+        if ql.starts_with("drop view ") || ql.starts_with("drop materialized view ") {
+            return Some(self.handle_drop_view(q).await);
+        }
+
+        // CREATE SCHEMA / DROP SCHEMA [IF EXISTS]
+        if ql.starts_with("create schema ") {
+            return Some(self.handle_create_schema(q));
+        }
+        if ql.starts_with("drop schema ") {
+            return Some(self.handle_drop_schema(q));
+        }
+
+        // CREATE SINK / DROP SINK — v0.44 pgwire DDL wiring
         if ql.starts_with("create sink ") {
             return Some(self.handle_create_sink(q));
+        }
+        if ql.starts_with("drop sink ") {
+            return Some(self.handle_drop_sink(q));
         }
 
         // CREATE SOURCE / ALTER SOURCE / DROP SOURCE — v0.51.9 pgwire DDL wiring
@@ -7129,6 +7199,8 @@ impl GatewayHandler {
     async fn handle_create_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let ql = q.to_lowercase();
         let is_materialized = ql.contains("materialized view");
+        let if_not_exists = ql.contains("if not exists");
+        let or_replace = ql.contains("or replace");
         let tag = if is_materialized {
             "CREATE MATERIALIZED VIEW"
         } else {
@@ -7137,6 +7209,18 @@ impl GatewayHandler {
 
         // Extract view name and query SQL for cycle detection.
         if let Some(view_name) = parse_create_view_name(q) {
+            if self.catalog.get_view(&view_name).is_some() {
+                if if_not_exists {
+                    return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
+                }
+                if !or_replace {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42P07".to_owned(),
+                        format!("[RS-4001] view.already_exists: view '{view_name}' already exists. Next steps: use CREATE OR REPLACE VIEW or drop the existing view first."),
+                    )))]);
+                }
+            }
             let select_sql = parse_create_view_query(q).unwrap_or_default();
             let workload_name = parse_create_view_workload(q);
             let deps = extract_sql_refs(&select_sql);
@@ -7508,7 +7592,82 @@ impl GatewayHandler {
         Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))])
     }
 
+    async fn handle_drop_view<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let is_materialized = ql.contains("materialized view");
+        let if_exists = ql.contains("if exists");
+        let tag = if is_materialized {
+            "DROP MATERIALIZED VIEW"
+        } else {
+            "DROP VIEW"
+        };
+
+        let prefix_len = if is_materialized {
+            if if_exists {
+                ql.find("if exists")
+                    .map(|p| p + "if exists".len())
+                    .unwrap_or("drop materialized view if exists".len())
+            } else {
+                ql.find("drop materialized view")
+                    .map(|p| p + "drop materialized view".len())
+                    .unwrap_or("drop materialized view".len())
+            }
+        } else {
+            if if_exists {
+                ql.find("if exists")
+                    .map(|p| p + "if exists".len())
+                    .unwrap_or("drop view if exists".len())
+            } else {
+                ql.find("drop view")
+                    .map(|p| p + "drop view".len())
+                    .unwrap_or("drop view".len())
+            }
+        };
+
+        let rest = q.get(prefix_len..).unwrap_or("").trim();
+        let view_name = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if view_name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                format!("{tag} requires a view name"),
+            )))]);
+        }
+
+        if self.catalog.get_view(&view_name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P01".to_owned(),
+                format!("[RS-4004] view.not_found: view '{view_name}' does not exist"),
+            )))]);
+        }
+
+        self.catalog.remove_view(&view_name);
+        self.compiled_views.remove(&view_name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "drop_view",
+                &view_name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(Tag::new(tag).with_rows(0))])
+    }
+
     async fn handle_create_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
+        let ql = q.to_lowercase();
+        let if_not_exists = ql.contains("if not exists");
         let Some(parsed) = parse_create_workload(q) else {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -7516,17 +7675,37 @@ impl GatewayHandler {
                 "[RS-1006] workload.invalid_definition: CREATE WORKLOAD requires a name and optional WITH (...) settings. Next steps: use CREATE WORKLOAD fast WITH (MEMORY_LIMIT = 1048576, FRESHNESS_SLO_MS = 500).".to_owned(),
             )))]);
         };
+        if self.catalog.get_workload(&parsed.name).is_some() {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE WORKLOAD").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42710".to_owned(),
+                format!(
+                    "[RS-4001] workload.already_exists: workload '{}' already exists. Next steps: choose a different workload name or drop the existing workload first.",
+                    parsed.name
+                ),
+            )))]);
+        }
         let inserted = self
             .catalog
             .add_workload_async(parsed.clone())
             .await
             .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
         if !inserted {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE WORKLOAD").with_rows(0),
+                )]);
+            }
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42710".to_owned(),
                 format!(
-                    "[RS-1006] workload.already_exists: workload '{}' already exists. Next steps: choose a different workload name or drop the existing workload first.",
+                    "[RS-4001] workload.already_exists: workload '{}' already exists. Next steps: choose a different workload name or drop the existing workload first.",
                     parsed.name
                 ),
             )))]);
@@ -7590,6 +7769,8 @@ impl GatewayHandler {
     }
 
     async fn handle_drop_workload(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
         let Some(workload_name) = parse_drop_workload(q) else {
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -7598,11 +7779,16 @@ impl GatewayHandler {
             )))]);
         };
         if self.catalog.get_workload(&workload_name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP WORKLOAD").with_rows(0),
+                )]);
+            }
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42704".to_owned(),
                 format!(
-                    "[RS-1005] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before dropping it.",
+                    "[RS-4004] workload.not_found: workload '{}' does not exist. Next steps: run CREATE WORKLOAD {} WITH (...) before dropping it.",
                     workload_name, workload_name
                 ),
             )))]);
@@ -7764,12 +7950,219 @@ impl GatewayHandler {
         )])
     }
 
+    fn handle_drop_table<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
+        let after = if if_exists {
+            let pos = match ql.find("if exists") {
+                Some(p) => p + "if exists".len(),
+                None => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "[RS-2000] malformed DROP TABLE DDL".to_owned(),
+                    )))]);
+                }
+            };
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = match ql.find("drop table") {
+                Some(p) => p + "drop table".len(),
+                None => {
+                    return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "[RS-2000] malformed DROP TABLE DDL".to_owned(),
+                    )))]);
+                }
+            };
+            q.get(pos..).unwrap_or("").trim()
+        };
+
+        let name = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "DROP TABLE requires a table name".to_owned(),
+            )))]);
+        }
+
+        if self.catalog.get_table(&name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP TABLE").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P01".to_owned(),
+                format!("[RS-4004] table.not_found: table '{name}' does not exist"),
+            )))]);
+        }
+
+        self.catalog.remove_table(&name);
+        self.table_insert_metadata.remove(&name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "drop_table",
+                &name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("DROP TABLE").with_rows(0),
+        )])
+    }
+
+    fn handle_create_schema<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_not_exists = ql.contains("if not exists");
+        let after = if if_not_exists {
+            let pos = ql
+                .find("if not exists")
+                .map(|p| p + "if not exists".len())
+                .unwrap_or("create schema if not exists".len());
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = ql
+                .find("create schema")
+                .map(|p| p + "create schema".len())
+                .unwrap_or("create schema".len());
+            q.get(pos..).unwrap_or("").trim()
+        };
+
+        let name = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "CREATE SCHEMA requires a schema name".to_owned(),
+            )))]);
+        }
+
+        if self.catalog.has_schema(&name) {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SCHEMA").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P06".to_owned(),
+                format!("[RS-4001] schema.already_exists: schema '{name}' already exists"),
+            )))]);
+        }
+
+        self.catalog.add_schema(&name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "create_schema",
+                &name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("CREATE SCHEMA").with_rows(0),
+        )])
+    }
+
+    fn handle_drop_schema<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
+        let after = if if_exists {
+            let pos = ql
+                .find("if exists")
+                .map(|p| p + "if exists".len())
+                .unwrap_or("drop schema if exists".len());
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = ql
+                .find("drop schema")
+                .map(|p| p + "drop schema".len())
+                .unwrap_or("drop schema".len());
+            q.get(pos..).unwrap_or("").trim()
+        };
+
+        let name = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "DROP SCHEMA requires a schema name".to_owned(),
+            )))]);
+        }
+
+        if !self.catalog.has_schema(&name) {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SCHEMA").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "3F000".to_owned(),
+                format!("[RS-4004] schema.not_found: schema '{name}' does not exist"),
+            )))]);
+        }
+
+        self.catalog.remove_schema(&name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "drop_schema",
+                &name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("DROP SCHEMA").with_rows(0),
+        )])
+    }
+
     /// Handle `CREATE SINK <name> FOR VIEW <view> TO ICEBERG|DELTA '<path>' WITH (...)` — v0.44.
     fn handle_create_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_not_exists = ql.contains("if not exists");
         let parsed = match parse_create_sink_ddl(q) {
             Ok(parsed) => parsed,
             Err(message) => return Ok(vec![create_sink_error_response(message)]),
         };
+
+        if self.catalog.get_sink(&parsed.name).is_some() {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SINK").with_rows(0),
+                )]);
+            }
+            return Ok(vec![create_sink_error_response(format!(
+                "[RS-4001] sink.already_exists: sink '{}' already exists",
+                parsed.name
+            ))]);
+        }
 
         if self.catalog.get_view(&parsed.view).is_none() {
             return Ok(vec![create_sink_error_response(format!(
@@ -7845,6 +8238,66 @@ impl GatewayHandler {
         )])
     }
 
+    fn handle_drop_sink<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
+        let after = if if_exists {
+            let pos = ql
+                .find("if exists")
+                .map(|p| p + "if exists".len())
+                .unwrap_or("drop sink if exists".len());
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = ql
+                .find("drop sink")
+                .map(|p| p + "drop sink".len())
+                .unwrap_or("drop sink".len());
+            q.get(pos..).unwrap_or("").trim()
+        };
+
+        let name = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .to_lowercase();
+
+        if name.is_empty() {
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "DROP SINK requires a sink name".to_owned(),
+            )))]);
+        }
+
+        if self.catalog.get_sink(&name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SINK").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42704".to_owned(),
+                format!("[RS-4004] sink.not_found: sink '{name}' does not exist"),
+            )))]);
+        }
+
+        self.catalog.remove_sink(&name);
+        if let Some(log) = &self.audit_log {
+            let _ = log.append(&rockstream_types::audit::AuditEvent::now(
+                "system",
+                "drop_sink",
+                &name,
+            ));
+        }
+
+        Ok(vec![Response::Execution(
+            Tag::new("DROP SINK").with_rows(0),
+        )])
+    }
+
     async fn handle_create_source<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
         let parsed = match parse_create_source_ddl(q) {
             Ok(parsed) => parsed,
@@ -7852,8 +8305,13 @@ impl GatewayHandler {
         };
 
         if self.catalog.get_source(&parsed.name).is_some() {
+            if parsed.if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SOURCE").with_rows(0),
+                )]);
+            }
             return Ok(vec![create_source_error_response(format!(
-                "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
         }
@@ -7921,8 +8379,13 @@ impl GatewayHandler {
         }
 
         if !self.catalog.add_source(entry) {
+            if parsed.if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SOURCE").with_rows(0),
+                )]);
+            }
             return Ok(vec![create_source_error_response(format!(
-                "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
         }
@@ -7955,6 +8418,16 @@ impl GatewayHandler {
         };
 
         let ns = 0u128;
+        if parsed.if_not_exists {
+            if let Ok(exists) = self.secret_store.contains_secret(ns, &parsed.name).await {
+                if exists {
+                    return Ok(vec![Response::Execution(
+                        Tag::new("CREATE SECRET").with_rows(0),
+                    )]);
+                }
+            }
+        }
+
         if let Err(err) = self
             .secret_store
             .create_secret(
@@ -7966,6 +8439,16 @@ impl GatewayHandler {
             )
             .await
         {
+            if parsed.if_not_exists
+                && matches!(
+                    err,
+                    rockstream_control::SecretStoreError::AlreadyExists { .. }
+                )
+            {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE SECRET").with_rows(0),
+                )]);
+            }
             return Ok(vec![secret_error_response(err.to_string())]);
         }
 
@@ -8061,9 +8544,21 @@ impl GatewayHandler {
             Err(message) => return Ok(vec![create_source_error_response(message)]),
         };
 
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
         if self.catalog.get_source(&parsed.name).is_none() {
+            if if_exists && parsed.action == AlterSourceAction::Drop {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP SOURCE").with_rows(0),
+                )]);
+            }
+            let err_code = if parsed.action == AlterSourceAction::Drop {
+                "[RS-4004]"
+            } else {
+                "[RS-4009]"
+            };
             return Ok(vec![create_source_error_response(format!(
-                "[RS-4009] source.not_found: source '{}' does not exist. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
+                "{err_code} source.not_found: source '{}' does not exist. Next steps: {ALTER_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
         }
@@ -8282,8 +8777,14 @@ impl GatewayHandler {
     async fn handle_create_index(&self, q: &str) -> PgWireResult<Vec<Response<'static>>> {
         use crate::catalog_stubs::{CatalogIndexEntry, CatalogIndexState};
 
-        // Parse: CREATE INDEX <name> ON <table> (<cols>)
-        let after_keyword = q["CREATE INDEX".len()..].trim();
+        // Parse: CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<cols>)
+        let raw_after = q["CREATE INDEX".len()..].trim();
+        let (after_keyword, if_not_exists) =
+            if raw_after.to_lowercase().starts_with("if not exists ") {
+                (raw_after["if not exists ".len()..].trim(), true)
+            } else {
+                (raw_after, false)
+            };
         let upper_after = after_keyword.to_uppercase();
 
         let on_pos = match upper_after.find(" ON ") {
@@ -8327,6 +8828,21 @@ impl GatewayHandler {
             )))]);
         }
 
+        if self.catalog.get_index(&index_name).is_some() {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE INDEX").with_rows(0),
+                )]);
+            }
+            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42710".to_owned(),
+                format!(
+                    "[RS-4001] Index name conflict: index '{index_name}' already exists. Choose a unique index name or drop the existing index first."
+                ),
+            )))]);
+        }
+
         let entry = CatalogIndexEntry {
             name: index_name.clone(),
             table: table.clone(),
@@ -8336,12 +8852,16 @@ impl GatewayHandler {
         };
 
         if !self.catalog.add_index(entry) {
+            if if_not_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("CREATE INDEX").with_rows(0),
+                )]);
+            }
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42710".to_owned(),
                 format!(
-                    "[RS-2016] Index name conflict: index '{index_name}' already exists for a \
-                     different table. Choose a unique index name or drop the existing index first."
+                    "[RS-4001] Index name conflict: index '{index_name}' already exists. Choose a unique index name or drop the existing index first."
                 ),
             )))]);
         }
@@ -8541,14 +9061,29 @@ impl GatewayHandler {
         }
     }
 
-    /// Handle `DROP INDEX <name>` — v0.32.
+    /// Handle `DROP INDEX [IF EXISTS] <name>` — v0.32.
     fn handle_drop_index<'a>(&'a self, q: &str) -> PgWireResult<Vec<Response<'a>>> {
-        let rest = q["DROP INDEX".len()..].trim();
-        let name = rest
+        let ql = q.to_lowercase();
+        let if_exists = ql.contains("if exists");
+        let after = if if_exists {
+            let pos = ql
+                .find("if exists")
+                .map(|p| p + "if exists".len())
+                .unwrap_or("drop index if exists".len());
+            q.get(pos..).unwrap_or("").trim()
+        } else {
+            let pos = ql
+                .find("drop index")
+                .map(|p| p + "drop index".len())
+                .unwrap_or("drop index".len());
+            q.get(pos..).unwrap_or("").trim()
+        };
+        let name = after
             .split_whitespace()
             .next()
             .unwrap_or("")
             .trim_end_matches(';')
+            .trim_matches('"')
             .to_lowercase();
 
         if name.is_empty() {
@@ -8560,10 +9095,15 @@ impl GatewayHandler {
         }
 
         if self.catalog.get_index(&name).is_none() {
+            if if_exists {
+                return Ok(vec![Response::Execution(
+                    Tag::new("DROP INDEX").with_rows(0),
+                )]);
+            }
             return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "42704".to_owned(),
-                format!("index \"{name}\" does not exist"),
+                format!("[RS-4004] index \"{name}\" does not exist"),
             )))]);
         }
 
@@ -9681,15 +10221,13 @@ impl GatewayHandler {
             let schema_fields = if let Some(ct) = self.catalog.get_table(&table) {
                 ct.columns
                     .iter()
-                    .map(|c| {
+                    .enumerate()
+                    .map(|(idx, c)| {
                         let oid = arrow_type_to_pg_oid(&c.data_type);
-                        FieldInfo::new(
-                            c.name.clone(),
-                            None,
-                            None,
-                            pg_type_from_oid(oid),
-                            FieldFormat::Text,
-                        )
+                        let format = PORTAL_FORMAT
+                            .try_with(|f| f.format_for(idx))
+                            .unwrap_or(FieldFormat::Text);
+                        FieldInfo::new(c.name.clone(), None, None, pg_type_from_oid(oid), format)
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -9701,9 +10239,12 @@ impl GatewayHandler {
             let schema_ref = schema.clone();
             let data_stream = stream::iter(returning_rows).map(move |values| {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
-                for v in &values {
-                    encoder
-                        .encode_field(&Some(v.clone()))
+                for (i, v) in values.iter().enumerate() {
+                    let dt = schema_ref
+                        .get(i)
+                        .map(|f| f.datatype())
+                        .unwrap_or(&Type::TEXT);
+                    encode_typed_field(&mut encoder, dt, Some(v.as_str()))
                         .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
                 }
                 encoder.finish()
@@ -9738,7 +10279,11 @@ impl GatewayHandler {
         let catalog_table = self.catalog.get_table(table);
         let schema_fields: Vec<FieldInfo> = projected_cols
             .iter()
-            .map(|col| {
+            .enumerate()
+            .map(|(idx, col)| {
+                let format = PORTAL_FORMAT
+                    .try_with(|f| f.format_for(idx))
+                    .unwrap_or(FieldFormat::Text);
                 if let Some(ct) = &catalog_table {
                     if let Some(c) = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
                         let oid = arrow_type_to_pg_oid(&c.data_type);
@@ -9747,11 +10292,11 @@ impl GatewayHandler {
                             None,
                             None,
                             pg_type_from_oid(oid),
-                            FieldFormat::Text,
+                            format,
                         );
                     }
                 }
-                FieldInfo::new(col.clone(), None, None, Type::TEXT, FieldFormat::Text)
+                FieldInfo::new(col.clone(), None, None, Type::TEXT, format)
             })
             .collect();
         let schema = Arc::new(schema_fields);
@@ -9773,9 +10318,12 @@ impl GatewayHandler {
             .collect();
         let data_stream = stream::iter(projected_rows).map(move |values| {
             let mut encoder = DataRowEncoder::new(schema_ref.clone());
-            for v in &values {
-                encoder
-                    .encode_field(&Some(v.clone()))
+            for (i, v) in values.iter().enumerate() {
+                let dt = schema_ref
+                    .get(i)
+                    .map(|f| f.datatype())
+                    .unwrap_or(&Type::TEXT);
+                encode_typed_field(&mut encoder, dt, Some(v.as_str()))
                     .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
             }
             encoder.finish()
@@ -9784,13 +10332,112 @@ impl GatewayHandler {
         promote_response(Response::Query(QueryResponse::new(schema, stream)))
     }
 
-    /// UPDATE handler: true read-modify-write (v0.48 Slice A2/A3).
-    ///
-    /// Reads the existing row via `shard_db.get()` *before* buffering the
-    /// write, so the complete new row (untouched columns preserved, per
-    /// DESIGN.md §12.8.2) can be built and — when `RETURNING` was requested —
-    /// projected back to the client. A nonexistent row is a zero-row no-op:
-    /// no `DmlOp` is buffered.
+    /// Scan and overlay write buffers to find all live rows matching the WHERE predicates.
+    async fn find_matching_rows_for_table(
+        &self,
+        table: &str,
+        table_columns: &[String],
+        where_pairs: &[(String, String)],
+        conn_id: Option<&str>,
+    ) -> PgWireResult<Vec<(String, Vec<String>)>> {
+        let mut live_rows: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        if let Some(shard_db) = &self.shard_db {
+            let prefix = format!("view_output/{table}/");
+            let kvs = shard_db.scan_prefix(prefix.as_bytes()).await.map_err(|e| {
+                PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
+            })?;
+            for (k, v) in kvs {
+                if let Ok(key_str) = std::str::from_utf8(&k) {
+                    if let Some(row_key) = key_str.strip_prefix(&prefix) {
+                        if let Ok(val_str) = std::str::from_utf8(&v) {
+                            live_rows.insert(row_key.to_string(), val_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(id) = conn_id {
+            if let Some(buffer) = self.write_buffers.get(id) {
+                for op in buffer.ops() {
+                    match op {
+                        DmlOp::Insert {
+                            table: op_table,
+                            row_key,
+                            values_tsv,
+                            ..
+                        } if op_table.eq_ignore_ascii_case(table) => {
+                            live_rows.insert(row_key.clone(), values_tsv.clone());
+                        }
+                        DmlOp::Update {
+                            table: op_table,
+                            old_row_key,
+                            new_row_key,
+                            new_tsv,
+                            ..
+                        } if op_table.eq_ignore_ascii_case(table) => {
+                            live_rows.remove(old_row_key.as_str());
+                            live_rows.insert(new_row_key.clone(), new_tsv.clone());
+                        }
+                        DmlOp::Delete {
+                            table: op_table,
+                            row_key,
+                            ..
+                        } if op_table.eq_ignore_ascii_case(table) => {
+                            live_rows.remove(row_key.as_str());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mut matched = Vec::new();
+        for (row_key, tsv) in live_rows {
+            let mut fields: Vec<String> = tsv.split('\t').map(|s| s.to_string()).collect();
+            if fields.len() < table_columns.len() {
+                fields.resize(table_columns.len(), String::new());
+            }
+
+            let mut all_match = true;
+            for (where_col, where_val) in where_pairs {
+                let col_pos = table_columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(where_col));
+                let expected = where_val.trim_matches('\'');
+                if let Some(pos) = col_pos {
+                    let actual = fields.get(pos).map(|s| s.as_str()).unwrap_or("");
+                    if actual != expected {
+                        all_match = false;
+                        break;
+                    }
+                } else {
+                    let key_pairs = parse_kv_list(&row_key);
+                    if let Some((_, actual)) = key_pairs
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(where_col))
+                    {
+                        if actual != expected {
+                            all_match = false;
+                            break;
+                        }
+                    } else {
+                        all_match = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_match {
+                matched.push((row_key, fields));
+            }
+        }
+
+        Ok(matched)
+    }
+
+    /// UPDATE handler: hardened multi-row read-modify-write (v0.59.11 SQL-01).
     async fn handle_update(
         &self,
         q: &str,
@@ -9805,16 +10452,11 @@ impl GatewayHandler {
             }
         };
 
-        // Build old row key from WHERE clause (unchanged from prior versions).
-        let (old_cols, old_vals): (Vec<_>, Vec<_>) = where_pairs
+        let (old_cols, _old_vals): (Vec<_>, Vec<_>) = where_pairs
             .iter()
             .map(|(c, v)| (c.clone(), v.clone()))
             .unzip();
-        let old_row_key = build_row_key(&old_cols, &old_vals);
 
-        // Full declared column order — used to build the complete merged
-        // row. Falls back to WHERE ∪ SET columns if the table isn't in the
-        // catalog (defensive; CREATE TABLE always registers it in practice).
         let table_columns: Vec<String> = self
             .catalog
             .get_table(&table)
@@ -9829,35 +10471,11 @@ impl GatewayHandler {
                 cols
             });
 
-        let Some(shard_db) = &self.shard_db else {
-            // No shard attached: nothing to read or write.
-            return Ok(vec![promote_response(Response::Execution(
-                Tag::new("UPDATE 0").with_rows(0),
-            ))]);
-        };
+        let matched_rows = self
+            .find_matching_rows_for_table(&table, &table_columns, &where_pairs, conn_id)
+            .await?;
 
-        let buffered_existing = conn_id.and_then(|id| {
-            self.write_buffers
-                .get(id)
-                .and_then(|buffer| buffer.current_row_image(&table, &old_row_key))
-        });
-        let existing_str = match buffered_existing {
-            Some(Some(tsv)) => Some(tsv),
-            Some(None) => None,
-            None => {
-                let old_key = format!("view_output/{table}/{old_row_key}");
-                shard_db
-                    .get(old_key.as_bytes())
-                    .await
-                    .map_err(|e| {
-                        PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-                    })?
-                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-            }
-        };
-
-        let Some(existing_str) = existing_str else {
-            // Row does not exist: zero rows affected, no write buffered.
+        if matched_rows.is_empty() {
             if let Some(returning_cols) = &returning_cols {
                 return Ok(vec![self.build_returning_response(
                     &table,
@@ -9869,52 +10487,53 @@ impl GatewayHandler {
             return Ok(vec![promote_response(Response::Execution(
                 Tag::new("UPDATE 0").with_rows(0),
             ))]);
-        };
-
-        let existing_fields: Vec<String> =
-            existing_str.split('\t').map(|s| s.to_string()).collect();
-        let mut value_map: HashMap<String, String> = HashMap::new();
-        for (i, col) in table_columns.iter().enumerate() {
-            value_map.insert(
-                col.clone(),
-                existing_fields.get(i).cloned().unwrap_or_default(),
-            );
         }
-        for (c, v) in &set_pairs {
-            value_map.insert(c.clone(), v.clone());
-        }
-        let new_vals: Vec<String> = table_columns
-            .iter()
-            .map(|c| value_map.get(c).cloned().unwrap_or_default())
-            .collect();
-        let new_row_key = build_row_key(&table_columns, &new_vals);
-        let new_tsv = new_vals.join("\t");
 
-        let op = DmlOp::Update {
-            table: table.clone(),
-            old_row_key: old_row_key.clone(),
-            old_tsv: existing_str,
-            new_row_key: new_row_key.clone(),
-            new_tsv: new_tsv.clone(),
-        };
+        let mut result_rows = Vec::with_capacity(matched_rows.len());
 
-        if let Some(id) = conn_id {
-            let mut entry = self.write_buffers.entry(id.to_string()).or_default();
-            if let Err(e) = entry.push(op) {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
-                )))]);
+        for (old_row_key, existing_fields) in matched_rows {
+            let old_tsv = existing_fields.join("\t");
+            let mut value_map: HashMap<String, String> = HashMap::new();
+            for (i, col) in table_columns.iter().enumerate() {
+                value_map.insert(
+                    col.clone(),
+                    existing_fields.get(i).cloned().unwrap_or_default(),
+                );
             }
+            for (c, v) in &set_pairs {
+                value_map.insert(c.clone(), v.trim_matches('\'').to_string());
+            }
+            let new_vals: Vec<String> = table_columns
+                .iter()
+                .map(|c| value_map.get(c).cloned().unwrap_or_default())
+                .collect();
+            let new_row_key = build_row_key(&table_columns, &new_vals);
+            let new_tsv = new_vals.join("\t");
+
+            let op = DmlOp::Update {
+                table: table.clone(),
+                old_row_key,
+                old_tsv,
+                new_row_key,
+                new_tsv,
+            };
+
+            if let Some(id) = conn_id {
+                let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+                if let Err(e) = entry.push(op) {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
+                    )))]);
+                }
+            }
+            result_rows.push(new_vals);
         }
 
-        // Standard-PostgreSQL autocommit: any statement outside an explicit
-        // `BEGIN...COMMIT`/`ROLLBACK` block commits immediately on success,
-        // whether or not it has a `RETURNING` clause.
         let in_explicit_block = conn_id
             .and_then(|id| self.sessions.get(id))
             .map(|s| s.in_explicit_block)
             .unwrap_or(false);
-        let mut result_row = new_vals.clone();
+
         if !in_explicit_block {
             let commit_responses = self.handle_commit(conn_id).await?;
             if commit_responses
@@ -9923,68 +10542,24 @@ impl GatewayHandler {
             {
                 return Ok(commit_responses);
             }
-            if returning_cols.is_some() {
-                if let Some(id) = conn_id {
-                    let timeout_ms = self
-                        .sessions
-                        .get(id)
-                        .map(|s| s.session_wait_for_timeout_ms)
-                        .unwrap_or(5_000);
-                    if let Some(token) = self
-                        .sessions
-                        .get(id)
-                        .and_then(|s| s.last_written_epoch.clone())
-                    {
-                        let _ = self.wait_for_epoch(token.source_epoch, timeout_ms).await;
-                    }
-                }
-                let new_key = format!("view_output/{table}/{new_row_key}");
-                if let Some(raw) = shard_db.get(new_key.as_bytes()).await.map_err(|e| {
-                    PgWireError::ApiError(Box::new(crate::error::GatewayError::Storage(e)))
-                })? {
-                    let mut row: Vec<String> = String::from_utf8_lossy(&raw)
-                        .split('\t')
-                        .map(|s| s.to_string())
-                        .collect();
-                    row.resize(table_columns.len(), String::new());
-                    result_row = row;
-                } else {
-                    return Ok(vec![promote_response(Response::Error(Box::new(
-                        ErrorInfo::new(
-                            "ERROR".to_owned(),
-                            "XX000".to_owned(),
-                            "[RS-2013] transaction.returning_key_not_found: UPDATE ... RETURNING committed, but the gateway could not read the expected post-update row at the current frontier. next_steps: Retry the write; if the row is consistently missing, check that the frontier used for the read-back has advanced past the commit epoch.".to_owned(),
-                        ),
-                    )))]);
-                }
-            }
         }
+
         if let Some(returning_cols) = &returning_cols {
-            // Slice A3: reuse the INSERT ... RETURNING read-back pattern —
-            // only performed outside an explicit transaction block; inside
-            // one, RETURNING resolves at the eventual COMMIT using the
-            // already-computed merged row (matches INSERT's literal-echo
-            // behavior when no server-side generated value is involved).
             return Ok(vec![self.build_returning_response(
                 &table,
                 &table_columns,
                 returning_cols,
-                vec![result_row],
+                result_rows,
             )]);
         }
 
+        let count = result_rows.len();
         Ok(vec![promote_response(Response::Execution(
-            Tag::new("UPDATE 1").with_rows(1),
+            Tag::new(&format!("UPDATE {count}")).with_rows(count),
         ))])
     }
 
-    /// DELETE handler: pre-image capture for RETURNING (v0.48 Slice A4/A5).
-    ///
-    /// When a `RETURNING` clause is present, the existing row is read via
-    /// `shard_db.get()` *before* the write is enqueued — the row is gone
-    /// from `view_output` once the `WriteBatch` commits, so this is the only
-    /// point the pre-delete state can be captured (DESIGN.md §13.5.2). Plain
-    /// `DELETE` (no `RETURNING`) skips this extra read entirely.
+    /// DELETE handler: pre-image capture for RETURNING (v0.59.11 SQL-02).
     async fn handle_delete(
         &self,
         q: &str,
@@ -9999,11 +10574,10 @@ impl GatewayHandler {
             }
         };
 
-        let (cols, vals): (Vec<_>, Vec<_>) = where_pairs
+        let (cols, _vals): (Vec<_>, Vec<_>) = where_pairs
             .iter()
             .map(|(c, v)| (c.clone(), v.clone()))
             .unzip();
-        let row_key = build_row_key(&cols, &vals);
 
         let table_columns: Vec<String> = self
             .catalog
@@ -10011,84 +10585,50 @@ impl GatewayHandler {
             .map(|ct| ct.columns.into_iter().map(|c| c.name).collect())
             .unwrap_or_else(|| cols.clone());
 
-        // Pre-image capture: v0.51.4 Slice 0 needs this for every DELETE (not
-        // just `RETURNING` ones) so the compiled-view refresh path can build
-        // a true row-level delta (weight -1) instead of a full-table
-        // rescan — see `DmlOp::Delete::returning_tsv` doc comment. This is a
-        // single-row `get()` by key, bounded and proportional to one row,
-        // not a table scan.
-        let mut captured_row: Option<Vec<String>> = None;
-        {
-            let buffered_existing = conn_id.and_then(|id| {
-                self.write_buffers
-                    .get(id)
-                    .and_then(|buffer| buffer.current_row_image(&table, &row_key))
-            });
-            let existing_str = match buffered_existing {
-                Some(Some(tsv)) => Some(tsv),
-                Some(None) => None,
-                None => {
-                    if let Some(shard_db) = &self.shard_db {
-                        let key = format!("view_output/{table}/{row_key}");
-                        shard_db
-                            .get(key.as_bytes())
-                            .await
-                            .map_err(|e| {
-                                PgWireError::ApiError(Box::new(
-                                    crate::error::GatewayError::Storage(e),
-                                ))
-                            })?
-                            .map(|raw| String::from_utf8_lossy(&raw).to_string())
-                    } else {
-                        None
-                    }
-                }
+        let matched_rows = self
+            .find_matching_rows_for_table(&table, &table_columns, &where_pairs, conn_id)
+            .await?;
+
+        if matched_rows.is_empty() {
+            if let Some(returning_cols) = &returning_cols {
+                return Ok(vec![self.build_returning_response(
+                    &table,
+                    &table_columns,
+                    returning_cols,
+                    Vec::new(),
+                )]);
+            }
+            return Ok(vec![promote_response(Response::Execution(
+                Tag::new("DELETE 0").with_rows(0),
+            ))]);
+        }
+
+        let mut captured_rows = Vec::with_capacity(matched_rows.len());
+
+        for (row_key, existing_fields) in matched_rows {
+            let returning_tsv = Some(existing_fields.join("\t"));
+            let op = DmlOp::Delete {
+                table: table.clone(),
+                row_key,
+                returning_tsv,
             };
-            match existing_str {
-                Some(tsv) => {
-                    let mut row: Vec<String> = tsv.split('\t').map(|s| s.to_string()).collect();
-                    row.resize(table_columns.len(), String::new());
-                    captured_row = Some(row);
-                }
-                None if returning_cols.is_some() => {
-                    if let Some(ref rcols) = returning_cols {
-                        return Ok(vec![self.build_returning_response(
-                            &table,
-                            &table_columns,
-                            rcols,
-                            Vec::new(),
-                        )]);
-                    }
-                }
 
-                None => {}
+            if let Some(id) = conn_id {
+                let mut entry = self.write_buffers.entry(id.to_string()).or_default();
+                if let Err(e) = entry.push(op) {
+                    return Ok(vec![promote_response(Response::Error(Box::new(
+                        ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
+                    )))]);
+                }
             }
+            captured_rows.push(existing_fields);
         }
 
-        let returning_tsv = captured_row.as_ref().map(|row| row.join("\t"));
-
-        let op = DmlOp::Delete {
-            table: table.clone(),
-            row_key,
-            returning_tsv,
-        };
-
-        if let Some(id) = conn_id {
-            let mut entry = self.write_buffers.entry(id.to_string()).or_default();
-            if let Err(e) = entry.push(op) {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new("ERROR".to_owned(), "53400".to_owned(), e.to_string()),
-                )))]);
-            }
-        }
-
-        // Standard-PostgreSQL autocommit: any statement outside an explicit
-        // `BEGIN...COMMIT`/`ROLLBACK` block commits immediately on success,
-        // whether or not it has a `RETURNING` clause.
         let in_explicit_block = conn_id
             .and_then(|id| self.sessions.get(id))
             .map(|s| s.in_explicit_block)
             .unwrap_or(false);
+
         if !in_explicit_block {
             let commit_responses = self.handle_commit(conn_id).await?;
             if commit_responses
@@ -10100,23 +10640,17 @@ impl GatewayHandler {
         }
 
         if let Some(returning_cols) = &returning_cols {
-            // Slice A5: project the captured pre-image directly — the row
-            // is gone from view_output once the WriteBatch commits, so
-            // there is no post-commit re-read to perform. ROLLBACK / ROLLBACK
-            // TO SAVEPOINT discard this buffered DmlOp::Delete (and its
-            // captured returning_tsv) via WriteBuffer's existing mechanism;
-            // nothing is ever written to the shard before an actual COMMIT.
-            let row = captured_row.unwrap_or_default();
             return Ok(vec![self.build_returning_response(
                 &table,
                 &table_columns,
                 returning_cols,
-                vec![row],
+                captured_rows,
             )]);
         }
 
+        let count = captured_rows.len();
         Ok(vec![promote_response(Response::Execution(
-            Tag::new("DELETE 1").with_rows(1),
+            Tag::new(&format!("DELETE {count}")).with_rows(count),
         ))])
     }
 
@@ -14519,8 +15053,64 @@ fn parse_copy_to_stdout_view(q: &str) -> Option<String> {
     }
 }
 
+/// Build FieldInfo list for a RETURNING clause.
+fn describe_returning_fields(
+    catalog: &CatalogStubs,
+    table: &str,
+    returning_cols: &[String],
+) -> Vec<FieldInfo> {
+    let catalog_table = catalog.get_table(table);
+    let table_columns: Vec<String> = catalog_table
+        .as_ref()
+        .map(|ct| ct.columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    let is_star = returning_cols.len() == 1 && returning_cols[0] == "*";
+    let projected_cols: Vec<String> = if is_star {
+        table_columns
+    } else {
+        returning_cols.to_vec()
+    };
+    projected_cols
+        .iter()
+        .map(|col| {
+            if let Some(ct) = &catalog_table {
+                if let Some(c) = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
+                    let oid = arrow_type_to_pg_oid(&c.data_type);
+                    return FieldInfo::new(
+                        c.name.clone(),
+                        None,
+                        None,
+                        pg_type_from_oid(oid),
+                        FieldFormat::Text,
+                    );
+                }
+            }
+            FieldInfo::new(col.clone(), None, None, Type::TEXT, FieldFormat::Text)
+        })
+        .collect()
+}
+
 /// Build FieldInfo list for a query (for DESCRIBE).
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
+    let ql = q.trim().to_lowercase();
+    if ql.starts_with("update ") {
+        if let Ok((table, _, _, Some(ret_cols))) = parse_update(q) {
+            return describe_returning_fields(catalog, &table, &ret_cols);
+        }
+    }
+    if ql.starts_with("delete from ") {
+        if let Ok((table, _, Some(ret_cols))) = parse_delete(q) {
+            return describe_returning_fields(catalog, &table, &ret_cols);
+        }
+    }
+    if ql.starts_with("insert into ") && ql.contains(" returning ") {
+        if let Ok((table, _, _)) = parse_insert(q) {
+            if let Ok((_, Some(ret_cols))) = split_returning_clause(q) {
+                return describe_returning_fields(catalog, &table, &ret_cols);
+            }
+        }
+    }
+
     if let Some(CatalogResponse::Rows { columns, .. }) =
         catalog.handle_query(q, &crate::catalog_stubs::SessionInfo::default())
     {
@@ -14768,9 +15358,7 @@ fn connector_removed_error_response() -> Response<'static> {
 fn is_removed_connector_ddl(query: &str) -> bool {
     let removed_sink = query.starts_with("create sink ")
         && query.contains(" for view ")
-        && (query.contains(" to iceberg")
-            || query.contains(" to delta")
-            || query.contains(" to parquet")
+        && (query.contains(" to parquet")
             || query.contains(" to s3")
             || query.contains(" to object_store"));
     removed_sink
@@ -14787,7 +15375,15 @@ fn parse_create_sink_ddl(q: &str) -> Result<ParsedCreateSink, String> {
         ));
     }
 
-    let after_create = &trimmed["CREATE SINK".len()..].trim();
+    let raw_after_create = &trimmed["CREATE SINK".len()..].trim();
+    let after_create = if raw_after_create
+        .to_lowercase()
+        .starts_with("if not exists ")
+    {
+        raw_after_create["if not exists ".len()..].trim()
+    } else {
+        raw_after_create
+    };
     let after_create_lower = after_create.to_lowercase();
     let for_view_pos = after_create_lower.find(" for view ").ok_or_else(|| {
         format!(
@@ -15038,6 +15634,7 @@ struct ParsedCreateSecret {
     name: String,
     secret_type: rockstream_types::secret::SecretType,
     payload: std::collections::HashMap<String, String>,
+    if_not_exists: bool,
 }
 
 fn parse_key_value_options(
@@ -15097,7 +15694,15 @@ fn parse_create_secret_ddl(q: &str) -> Result<ParsedCreateSecret, String> {
         ));
     }
 
-    let after_create = trimmed["CREATE SECRET".len()..].trim();
+    let raw_after_create = trimmed["CREATE SECRET".len()..].trim();
+    let (after_create, if_not_exists) = if raw_after_create
+        .to_lowercase()
+        .starts_with("if not exists ")
+    {
+        (raw_after_create["if not exists ".len()..].trim(), true)
+    } else {
+        (raw_after_create, false)
+    };
     let paren_pos = after_create.find('(').ok_or_else(|| {
         format!(
             "[RS-2424] secret.ddl_invalid: CREATE SECRET requires option list in parentheses. Next steps: {CREATE_SECRET_NEXT_STEPS}"
@@ -15142,6 +15747,7 @@ fn parse_create_secret_ddl(q: &str) -> Result<ParsedCreateSecret, String> {
         name,
         secret_type,
         payload: options,
+        if_not_exists,
     })
 }
 
@@ -15273,6 +15879,7 @@ struct ParsedCreateSource {
     source_type: String,
     options: std::collections::HashMap<String, String>,
     format: String,
+    if_not_exists: bool,
 }
 
 fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
@@ -15284,7 +15891,15 @@ fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
         ));
     }
 
-    let after_create = trimmed["CREATE SOURCE".len()..].trim();
+    let raw_after_create = trimmed["CREATE SOURCE".len()..].trim();
+    let (after_create, if_not_exists) = if raw_after_create
+        .to_lowercase()
+        .starts_with("if not exists ")
+    {
+        (raw_after_create["if not exists ".len()..].trim(), true)
+    } else {
+        (raw_after_create, false)
+    };
     let after_create_lower = after_create.to_lowercase();
     let type_pos = after_create_lower.find(" type ").ok_or_else(|| {
         format!(
@@ -15374,6 +15989,7 @@ fn parse_create_source_ddl(q: &str) -> Result<ParsedCreateSource, String> {
         source_type,
         options,
         format: format_str,
+        if_not_exists,
     })
 }
 
@@ -15453,10 +16069,15 @@ fn parse_alter_source_ddl(q: &str) -> Result<ParsedAlterSource, String> {
     let lower = trimmed.to_lowercase();
 
     if lower.starts_with("drop source ") {
-        let name = trimmed["DROP SOURCE".len()..]
-            .trim()
-            .trim_matches('"')
-            .to_lowercase();
+        let after_drop = trimmed["DROP SOURCE".len()..].trim();
+        let name = if after_drop.to_lowercase().starts_with("if exists ") {
+            after_drop["if exists ".len()..]
+                .trim()
+                .trim_matches('"')
+                .to_lowercase()
+        } else {
+            after_drop.trim_matches('"').to_lowercase()
+        };
         if name.is_empty() {
             return Err(format!(
                 "[RS-4008] DROP SOURCE requires a source name. Next steps: {ALTER_SOURCE_NEXT_STEPS}"
@@ -15721,7 +16342,7 @@ fn find_top_level_equals(input: &str) -> Option<usize> {
 
 fn parse_create_view_name(q: &str) -> Option<String> {
     let ql = q.trim().to_lowercase();
-    let after: &str = if ql.starts_with("create or replace materialized view ") {
+    let mut after: &str = if ql.starts_with("create or replace materialized view ") {
         q[36..].trim()
     } else if ql.starts_with("create materialized view ") {
         q[25..].trim()
@@ -15732,6 +16353,9 @@ fn parse_create_view_name(q: &str) -> Option<String> {
     } else {
         return None;
     };
+    if after.to_lowercase().starts_with("if not exists ") {
+        after = after["if not exists ".len()..].trim();
+    }
     // Take up to " AS" followed by any whitespace (handles AS\n, AS\t, AS )
     let as_pos = find_as_separator(&after.to_lowercase())?;
     let raw = after[..as_pos]
@@ -15863,12 +16487,15 @@ fn apply_workload_settings(workload: &mut WorkloadDef, settings: &WorkloadSettin
 }
 
 fn parse_create_workload(q: &str) -> Option<WorkloadDef> {
-    let after = q
+    let mut after = q
         .trim()
         .strip_prefix("CREATE WORKLOAD ")
         .or_else(|| q.trim().strip_prefix("create workload "))?
         .trim()
         .trim_end_matches(';');
+    if after.to_lowercase().starts_with("if not exists ") {
+        after = after["if not exists ".len()..].trim();
+    }
     let (name_part, options_part) = if let Some((name, rest)) = after.split_once(" WITH ") {
         (name.trim(), Some(rest.trim()))
     } else if let Some((name, rest)) = after.split_once(" with ") {
@@ -15909,12 +16536,15 @@ fn parse_alter_workload(q: &str) -> Option<(String, WorkloadSettings)> {
 }
 
 fn parse_drop_workload(q: &str) -> Option<String> {
-    let after = q
+    let mut after = q
         .trim()
         .strip_prefix("DROP WORKLOAD ")
         .or_else(|| q.trim().strip_prefix("drop workload "))?
         .trim()
         .trim_end_matches(';');
+    if after.to_lowercase().starts_with("if exists ") {
+        after = after["if exists ".len()..].trim();
+    }
     let workload_name = after.trim_matches('"');
     if workload_name.is_empty() {
         None
@@ -16047,18 +16677,42 @@ fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
         let placeholder = format!("${}", i + 1);
         let replacement = match param {
             None => "NULL".to_string(),
-            Some(bytes) => match std::str::from_utf8(bytes) {
-                Err(_) => "NULL".to_string(),
-                Ok(s) => {
-                    // If the value is purely numeric (integer or float), use it bare.
+            Some(bytes) => {
+                if bytes
+                    .iter()
+                    .any(|&b| b < 32 && b != b'\t' && b != b'\n' && b != b'\r')
+                {
+                    // Binary parameter decoding (e.g. from tokio-postgres prepared statements)
+                    if bytes.len() == 8 {
+                        let num = bytes[..8].try_into().map(i64::from_be_bytes).unwrap_or(0);
+                        num.to_string()
+                    } else if bytes.len() == 4 {
+                        let num = bytes[..4].try_into().map(i32::from_be_bytes).unwrap_or(0);
+                        num.to_string()
+                    } else if bytes.len() == 2 {
+                        let num = bytes[..2].try_into().map(i16::from_be_bytes).unwrap_or(0);
+                        num.to_string()
+                    } else if bytes.len() == 1 {
+                        if bytes[0] == 0 {
+                            "false".to_string()
+                        } else if bytes[0] == 1 {
+                            "true".to_string()
+                        } else {
+                            bytes[0].to_string()
+                        }
+                    } else {
+                        "NULL".to_string()
+                    }
+                } else if let Ok(s) = std::str::from_utf8(bytes) {
                     if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
                         s.to_string()
                     } else {
-                        // Escape single-quotes and wrap in single quotes.
                         format!("'{}'", s.replace('\'', "''"))
                     }
+                } else {
+                    "NULL".to_string()
                 }
-            },
+            }
         };
         // Replace `$N::cast_type` as well as bare `$N`.
         // We do a simple regex-free replacement: find `$N` and strip any

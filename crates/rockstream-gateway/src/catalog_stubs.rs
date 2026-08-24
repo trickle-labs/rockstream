@@ -388,6 +388,8 @@ struct CatalogStubsInner {
     view_workloads: HashMap<String, String>,
     /// View name → latest per-shard pruning statistics.
     shard_stats: HashMap<String, Vec<ShardColumnStats>>,
+    /// Registered schemas.
+    schemas: HashSet<String>,
     /// Registered nodes.
     nodes: Vec<CatalogNodeEntry>,
     /// Recorded checkpoints.
@@ -804,6 +806,37 @@ impl CatalogStubs {
         let mut v: Vec<CatalogTable> = inner.tables.values().cloned().collect();
         v.sort_by_key(|t| t.name.clone());
         v
+    }
+
+    /// Remove a table from the catalog (DROP TABLE).
+    pub fn remove_table(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        inner.tables.remove(name).is_some()
+    }
+
+    /// Add a schema to the catalog (CREATE SCHEMA).
+    pub fn add_schema(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.schemas.contains(name) || name.eq_ignore_ascii_case("public") {
+            return false;
+        }
+        inner.schemas.insert(name.to_string());
+        true
+    }
+
+    /// Remove a schema from the catalog (DROP SCHEMA).
+    pub fn remove_schema(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        inner.schemas.remove(name)
+    }
+
+    /// Check if a schema exists in the catalog.
+    pub fn has_schema(&self, name: &str) -> bool {
+        if name.eq_ignore_ascii_case("public") {
+            return true;
+        }
+        let inner = self.inner.read().unwrap();
+        inner.schemas.contains(name)
     }
 
     /// Check whether adding a new view with the given dependencies would
