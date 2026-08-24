@@ -1,4 +1,4 @@
-//! PGWire SQL tests for `SHOW VIEW STATUS` arrangement sharing facts (v0.59.6).
+//! PGWire SQL tests for `SELECT rockstream_version()` candidate identity function (v0.59.10 OBS-02).
 
 use std::sync::Arc;
 use tokio_postgres::NoTls;
@@ -6,12 +6,11 @@ use tokio_postgres::NoTls;
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use rockstream_gateway::{
-    catalog_stubs::{CatalogStubs, CatalogView},
+    catalog_stubs::CatalogStubs,
     view_reader::{ViewReadStrategy, ViewReader},
     GatewayError, GatewayServer,
 };
-use rockstream_types::explain::ArrangementSharingInfo;
-use rockstream_types::ids::ArrangementId;
+use rockstream_types::candidate_identity::CandidateIdentity;
 
 struct NoopViewReader;
 
@@ -76,43 +75,76 @@ async fn simple_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Opti
 }
 
 #[tokio::test]
-async fn test_pgwire_show_view_status_arrangement_sharing_facts() {
+async fn test_select_rockstream_version_columns() {
     let _g = TEST_LOCK.lock().await;
-    rockstream_types::metrics::reset_all();
     let catalog = CatalogStubs::new();
-
-    catalog.add_view(CatalogView {
-        name: "shared_orders_view".to_string(),
-        sql: "SELECT customer_id, sum(amount) FROM orders GROUP BY customer_id".to_string(),
-        columns: vec![],
-        namespace: "public".to_string(),
-        op_id: None,
-    });
-
-    catalog.set_view_arrangement_sharing(
-        "shared_orders_view",
-        ArrangementSharingInfo {
-            arrangement_id: Some(ArrangementId(1001)),
-            consumer_count: 3,
-            shared_state_bytes: 2097152,
-            bytes_saved_by_sharing: 4194304,
-            compaction_frontier: 50,
-        },
-    );
-
     let (addr, _handle) = start_gateway(catalog).await;
     let client = connect(&addr).await;
 
-    let rows = simple_rows(&client, "SHOW VIEW STATUS FOR shared_orders_view;").await;
+    let id = CandidateIdentity::current();
+    let rows = simple_rows(&client, "SELECT rockstream_version();").await;
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
-    assert_eq!(row.len(), 44);
-    assert_eq!(row[1].as_deref(), Some("shared_orders_view"));
-    // Verify the 5 arrangement sharing columns:
-    // arrangement_id, consumer_count, shared_state_bytes, bytes_saved_by_sharing, compaction_frontier
-    assert_eq!(row[22].as_deref(), Some("arr-1001"));
-    assert_eq!(row[23].as_deref(), Some("3"));
-    assert_eq!(row[24].as_deref(), Some("2097152"));
-    assert_eq!(row[25].as_deref(), Some("4194304"));
-    assert_eq!(row[26].as_deref(), Some("50"));
+    assert_eq!(row.len(), 4);
+
+    assert_eq!(
+        row[0].as_deref(),
+        Some(id.semantic_version.as_str()),
+        "product_version must match"
+    );
+    assert_eq!(
+        row[1].as_deref(),
+        Some(id.candidate_id().as_str()),
+        "candidate_id must match"
+    );
+    assert_eq!(
+        row[2].as_deref(),
+        Some(id.commit_sha.as_str()),
+        "source_sha must match"
+    );
+    assert_eq!(
+        row[3].as_deref(),
+        Some(id.lockfile_digest.as_str()),
+        "artifact_digest must match"
+    );
+}
+
+#[tokio::test]
+async fn test_select_rockstream_version_extended_protocol() {
+    let _g = TEST_LOCK.lock().await;
+    let catalog = CatalogStubs::new();
+    let (addr, _handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+
+    let id = CandidateIdentity::current();
+    let rows = client
+        .query("SELECT rockstream_version()", &[])
+        .await
+        .expect("extended query protocol failed");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.len(), 4);
+
+    let product_version: &str = row.get(0);
+    let candidate_id: &str = row.get(1);
+    let source_sha: &str = row.get(2);
+    let artifact_digest: &str = row.get(3);
+
+    assert_eq!(product_version, id.semantic_version);
+    assert_eq!(candidate_id, id.candidate_id());
+    assert_eq!(source_sha, id.commit_sha);
+    assert_eq!(artifact_digest, id.lockfile_digest);
+}
+
+#[tokio::test]
+async fn test_select_rockstream_version_reachability() {
+    let _g = TEST_LOCK.lock().await;
+    let catalog = CatalogStubs::new();
+    let (addr, _handle) = start_gateway(catalog).await;
+    let client = connect(&addr).await;
+
+    // Both simple and lower/upper case queries work
+    let rows = simple_rows(&client, "select ROCKSTREAM_VERSION()").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 4);
 }

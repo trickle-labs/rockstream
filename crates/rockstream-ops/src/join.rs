@@ -338,9 +338,11 @@ impl JoinOp {
     /// Deserialize a row from bytes into Int64 column values (n_cols columns).
     fn deserialize_row(bytes: &[u8], n_cols: usize) -> Vec<i64> {
         bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .take(n_cols)
-            .map(|c| i64::from_be_bytes(c.try_into().unwrap()))
+            .map(|c| i64::from_be_bytes(*c))
             .collect()
     }
 

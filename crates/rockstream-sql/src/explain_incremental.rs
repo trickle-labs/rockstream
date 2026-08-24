@@ -10,7 +10,9 @@
 //! v0.9 when the runtime has a running pipeline to query.
 
 use rockstream_plan::{AggregateFunc, PlanNode};
-use rockstream_types::explain::{ArrangementSharingInfo, OperatorStats, ShardInfo};
+use rockstream_types::explain::{
+    ArrangementSharingInfo, OperatorStats, ShardInfo, ViewEngineFacts,
+};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::laws::weight_add::WEIGHT_ADD_ID;
 use rockstream_types::merge_law::MergeLawId;
@@ -127,6 +129,55 @@ pub fn explain_incremental_with_arrangements(
                     arr.shared_state_bytes,
                     arr.bytes_saved_by_sharing,
                     arr.compaction_frontier
+                )
+            } else {
+                line.base_line.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    format_explain_block(&rendered)
+}
+
+pub fn explain_incremental_with_engine_facts(plan: &PlanNode, facts: &[ViewEngineFacts]) -> String {
+    let lines = collect_plan_lines(plan);
+    let rendered = lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            if let Some(f) = facts.get(idx) {
+                let arr_id_str = f
+                    .arrangement_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                format!(
+                    "{}  [arrangement_id={} consumers={} shared_bytes={} saved_bytes={} delta_amp={:.2} join_amp={:.2} merge_operands={} dirty_keys={} logical_bytes={} physical_write_amp={:.2} hot_keys={} strategy={} selectivity={:.2} cache_hit_rate={:.2} epoch_group={} checkpoint_mode={} compaction_debt={} degradation={} reason_code={} dominant_contributor={} source_lag_ms={} compute_lag_ms={} spill_bytes={} checkpoint_id={} frontier={} action={}]",
+                    line.base_line,
+                    arr_id_str,
+                    f.consumer_count,
+                    f.shared_state_bytes,
+                    f.bytes_saved_by_sharing,
+                    f.delta_amplification,
+                    f.join_amplification,
+                    f.merge_operand_count,
+                    f.dirty_key_count,
+                    f.logical_write_bytes,
+                    f.physical_write_amplification,
+                    f.hot_key_bucket_count,
+                    f.factorization_strategy,
+                    f.predicate_filter_selectivity,
+                    f.cache_hit_rate,
+                    f.epoch_group_size,
+                    f.checkpoint_mode,
+                    f.compaction_debt,
+                    f.degradation_reason,
+                    f.reason_code,
+                    f.dominant_contributor,
+                    f.source_lag_ms,
+                    f.compute_lag_ms,
+                    f.spill_bytes,
+                    f.checkpoint_id,
+                    f.frontier,
+                    f.recommended_action_key
                 )
             } else {
                 line.base_line.clone()

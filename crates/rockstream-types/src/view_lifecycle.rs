@@ -612,14 +612,23 @@ mod tests {
             ),
         ];
         for (input, expected) in matrix {
-            assert_eq!(dominant_contributor(Some(input)), expected);
+            assert_eq!(
+                dominant_contributor_with_signals(
+                    Some(input),
+                    Some(StoragePressureSignals::default())
+                ),
+                expected
+            );
         }
     }
 
     #[test]
     fn test_dominant_contributor_multi_cause_max() {
-        let status =
-            derive_degradation_status(&ViewState::Running, Some(lag(15, 2, 2, 2, 2, 24, 1)));
+        let status = derive_degradation_status_with_signals(
+            &ViewState::Running,
+            Some(lag(15, 2, 2, 2, 2, 24, 1)),
+            Some(StoragePressureSignals::default()),
+        );
         assert_eq!(status.degradation_reason, DegradationReason::Spilling);
         assert_eq!(status.dominant_contributor, DominantContributor::SpillLag);
     }
@@ -628,18 +637,27 @@ mod tests {
     fn test_dominant_contributor_tie_break_is_deterministic() {
         let tied = lag(9, 9, 9, 9, 9, 9, 9);
         assert_eq!(
-            dominant_contributor(Some(tied)),
+            dominant_contributor_with_signals(Some(tied), Some(StoragePressureSignals::default())),
             DominantContributor::SourceLag
         );
         assert_eq!(
-            derive_degradation_status(&ViewState::Running, Some(tied)).degradation_reason,
+            derive_degradation_status_with_signals(
+                &ViewState::Running,
+                Some(tied),
+                Some(StoragePressureSignals::default())
+            )
+            .degradation_reason,
             DegradationReason::Spilling
         );
     }
 
     #[test]
     fn test_healthy_status_has_closed_vocabulary() {
-        let status = derive_degradation_status(&ViewState::Running, Some(lag(0, 0, 0, 0, 0, 0, 0)));
+        let status = derive_degradation_status_with_signals(
+            &ViewState::Running,
+            Some(lag(0, 0, 0, 0, 0, 0, 0)),
+            Some(StoragePressureSignals::default()),
+        );
         assert_eq!(
             status.degradation_reason,
             DegradationReason::WaitingOnSource

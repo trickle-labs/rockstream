@@ -34,7 +34,7 @@ pub use error::SqlError;
 pub use estimate::{explain_incremental_estimate, format_estimate, EstimateRow};
 pub use explain_incremental::{
     explain_incremental, explain_incremental_analyze, explain_incremental_verbose,
-    explain_incremental_with_arrangements,
+    explain_incremental_with_arrangements, explain_incremental_with_engine_facts,
 };
 pub use extension::{IncAggregate, IncDistinct, IncJoin};
 pub use frontend::SqlFrontend;

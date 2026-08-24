@@ -5996,6 +5996,20 @@ impl GatewayHandler {
                 self.catalog.view_status_response(Some(view_name), None),
             ))]);
         }
+        if ql.trim_end_matches(';') == "show rockstream capabilities"
+            || ql.trim_end_matches(';') == "show capabilities"
+        {
+            return Ok(vec![promote_response(catalog_resp_to_response(
+                self.catalog.capabilities_response(q, &[]),
+            ))]);
+        }
+        if ql.starts_with("show capabilities ") || ql.starts_with("show rockstream capabilities ") {
+            return Ok(vec![promote_response(Response::Error(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "[RS-1019] syntax.invalid_show_capabilities: invalid syntax for SHOW CAPABILITIES. Next steps: use 'SHOW ROCKSTREAM CAPABILITIES' or 'SHOW CAPABILITIES'.".to_owned(),
+            ))))]);
+        }
         if ql.trim_end_matches(';') == "show resource usage" {
             return Ok(vec![catalog_resp_to_response(
                 self.catalog.view_resource_usage(&[]),

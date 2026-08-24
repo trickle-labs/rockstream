@@ -77,6 +77,14 @@ impl CandidateIdentity {
         }
     }
 
+    /// Retrieve candidate identity label (e.g. `rc.1` or `dev`).
+    pub fn candidate_id(&self) -> String {
+        option_env!("ROCKSTREAM_CANDIDATE_ID")
+            .or(option_env!("CANDIDATE_ID"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "dev".to_string())
+    }
+
     /// Compute the hex-encoded SHA-256 digest of the given bytes.
     pub fn compute_sha256_hex(data: &[u8]) -> String {
         let mut hasher = Sha256::new();

@@ -483,7 +483,7 @@ async fn test_show_view_status_reason_schema_all_forms() {
     ] {
         let rows = simple_rows(&client, sql).await;
         assert_eq!(rows.len(), 1, "{sql}");
-        assert_eq!(rows[0].len(), 27, "{sql}");
+        assert_eq!(rows[0].len(), 44, "{sql}");
         assert_eq!(rows[0][15].as_deref(), Some("waiting_on_source"), "{sql}");
         assert_eq!(rows[0][16].as_deref(), Some("RS-3701"), "{sql}");
         assert_eq!(rows[0][17].as_deref(), Some("source_lag"), "{sql}");

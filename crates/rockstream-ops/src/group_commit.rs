@@ -251,7 +251,7 @@ impl PhysicalCommitGroup {
                 .map(|(&epoch, batch)| (epoch, batch.clone()))
                 .collect();
             let mut merged = WriteBatch::new();
-            for (_, batch) in pending.iter() {
+            for batch in pending.values() {
                 merged.merge_from(batch.clone());
             }
             pending.clear();
@@ -270,6 +270,10 @@ impl PhysicalCommitGroup {
             return Err(OpError::storage(error));
         }
         if let Some(last) = epochs.last().copied() {
+            assert!(
+                last >= self.last_committed.load(Ordering::Relaxed),
+                "M1-S8: physical group committed epoch must be monotonic"
+            );
             self.last_committed.store(last, Ordering::Release);
             self.has_committed.store(true, Ordering::Release);
         }

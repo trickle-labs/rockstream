@@ -422,7 +422,7 @@ pub fn build_runtime_object_store(
 pub fn build_migration_object_store(storage_url: &str) -> Result<Arc<dyn ObjectStore>, String> {
     let (scheme, rest) = storage_url
         .split_once("://")
-        .map_or(("file", storage_url), |parts| parts);
+        .unwrap_or(("file", storage_url));
     if scheme == "file" {
         let path = rest;
         let local_path = LocalPath::new(path);

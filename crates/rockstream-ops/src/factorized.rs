@@ -607,8 +607,10 @@ impl FactorizedJoinAggregateOp {
                 let values = bytes
                     .get(4..)
                     .unwrap()
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_be_bytes(chunk.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_be_bytes(*chunk))
                     .collect::<Vec<_>>();
                 self.governor.restore(DeltaAmplificationCounters {
                     input_deltas: values[0],

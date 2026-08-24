@@ -10,6 +10,7 @@ pub mod arrow_batch;
 pub mod audit;
 pub mod batch;
 pub mod candidate_identity;
+pub mod capability;
 pub mod checkpoint;
 pub mod compatibility;
 pub mod config;
@@ -52,6 +53,7 @@ pub use arrangement::{
     SourceIdentity, TimeDomainSemantics,
 };
 pub use candidate_identity::CandidateIdentity;
+pub use capability::{CapabilityDocument, CapabilityEntry, CapabilityRegistry};
 pub use compatibility::{
     ProtocolVersion, StorageFormatVersion, SupportedStorageFormatRange, SupportedVersionRange,
 };

@@ -67,15 +67,15 @@ impl CheckpointManifestStore {
             Ok(result) => result
                 .bytes()
                 .await
-                .map_err(|error| format!("read changelog contribution: {error}"))?,
+                .map_err(|error| format!("[{RS_3022}] read changelog contribution: {error}"))?,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(format!("load changelog contribution: {error}")),
+            Err(error) => return Err(format!("[{RS_3022}] load changelog contribution: {error}")),
         };
         let contribution: ChangelogCheckpointContribution = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("decode changelog contribution: {error}"))?;
+            .map_err(|error| format!("[{RS_3022}] decode changelog contribution: {error}"))?;
         if contribution.checkpoint_id != checkpoint_id {
             return Err(format!(
-                "changelog contribution checkpoint mismatch: requested {}, found {}",
+                "[{RS_3022}] changelog contribution checkpoint mismatch: requested {}, found {}",
                 checkpoint_id.0, contribution.checkpoint_id.0
             ));
         }
