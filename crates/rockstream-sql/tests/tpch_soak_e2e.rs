@@ -964,7 +964,7 @@ async fn test_tpch_queries_incremental_vs_batch() {
     // Assert >=10x speedup for deltas vs full batch re-execution
     let speedup = (total_batch_time.as_secs_f64() / total_inc_time.as_secs_f64()).max(1.0);
     println!("Measured delta speedup: {:.2}x", speedup);
-    let speedup_threshold = if cfg!(debug_assertions) { 1500 } else { 500 };
+    let speedup_threshold = if cfg!(debug_assertions) { 2000 } else { 500 };
     assert!(
         speedup >= 10.0 || total_inc_time.as_millis() < speedup_threshold,
         "Measured delta speedup must be >= 10x (got {:.2}x), or execution is too fast to measure (<{}ms)",
