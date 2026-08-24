@@ -1,5 +1,7 @@
 # RockStream Error Code Reference (`RS-XXXX`)
 
+This historical URL is retained for existing links. The canonical manifest-generated reference is [error reference](reference/errors.md).
+
 Contract version: `v0.59.12` — Authoritative Static Error Catalog (`DOC-01`)
 
 Every user-visible, client-returned, or operator-logged error in RockStream carries a registered `RS-XXXX` code.

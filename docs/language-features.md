@@ -1,5 +1,7 @@
 # RockStream Language Features
 
+Canonical generated references: [functions](reference/functions.md) and [SQL support](reference/sql-support.md).
+
 ## Secret DDL — Tier: Maintain
 
 ```sql

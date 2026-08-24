@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e e2e-lfs e2e-nextest qualify approve clean error-codes exit-criteria failure-matrix coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
+.PHONY: build test clippy fmt documentation check e2e e2e-lfs e2e-nextest qualify approve clean error-codes exit-criteria failure-matrix coverage coverage-gate release verify verify-relaxed path-coupling bench-baseline-update
 
 # Build the workspace
 build:
@@ -16,8 +16,13 @@ clippy:
 fmt:
 	cargo fmt --all --check
 
+# Check documentation links, generated references, claims, terminology, and commands.
+documentation:
+	bash scripts/check-documentation.sh
+	bash scripts/check-documentation.test.sh
+
 # Run all checks (what CI does)
-check: fmt clippy test error-codes exit-criteria verify path-coupling failure-matrix
+check: fmt clippy test documentation error-codes exit-criteria verify path-coupling failure-matrix
 
 # Run formal verification specs
 verify:

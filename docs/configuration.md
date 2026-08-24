@@ -1,5 +1,7 @@
 # RockStream Configuration Reference
 
+This compatibility URL is retained for existing links. The canonical manifest-generated reference is [configuration reference](reference/configuration.md).
+
 This document provides a comprehensive reference for the system-wide configuration knobs migrated to `rockstream.toml`.
 
 This table is generated from — and locked to — `RockstreamConfig` (and its

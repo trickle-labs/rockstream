@@ -54,6 +54,10 @@ jobs:
         run: bash scripts/check-threat-model-links.test.sh
       - name: dependency-audit checker self-test
         run: bash scripts/check-dependency-audit.test.sh
+      - name: documentation admission gate
+        run: bash scripts/check-documentation.sh
+      - name: documentation checker self-test
+        run: bash scripts/check-documentation.test.sh
       - name: error-code enforcement
         run: bash scripts/check-error-codes.sh
       - name: error-code checker self-test

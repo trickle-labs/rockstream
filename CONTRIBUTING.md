@@ -1,5 +1,8 @@
 # Contributing to RockStream
 
+Start with the [contributor guide](docs/contributors.md) for the repository
+workflow and documentation map.
+
 Thank you for considering contributing to RockStream!
 
 ## Development Setup

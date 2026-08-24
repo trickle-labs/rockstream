@@ -6,8 +6,10 @@
 pub mod contributors;
 pub mod generator;
 pub mod manifest;
+pub mod markdown;
 pub mod sql_matrix;
 
 pub use generator::generate_manifest;
 pub use manifest::ProductSurfaceManifest;
+pub use markdown::{render_markdown_references, render_reference_docs};
 pub use sql_matrix::{SqlMatrixDocument, SqlMatrixError};

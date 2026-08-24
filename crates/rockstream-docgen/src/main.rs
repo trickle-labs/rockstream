@@ -5,7 +5,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process;
 
-use rockstream_docgen::{generate_manifest, SqlMatrixDocument};
+use rockstream_docgen::{
+    generate_manifest, render_reference_docs, ProductSurfaceManifest, SqlMatrixDocument,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,6 +35,13 @@ enum Commands {
     ValidateSqlMatrix {
         #[arg(long, default_value = "contracts/sql-type-matrix.toml")]
         matrix_path: PathBuf,
+    },
+    /// Generate deterministic Markdown references from a product-surface manifest.
+    GenerateReferences {
+        #[arg(long, default_value = "docs/product-surface.json")]
+        manifest_path: PathBuf,
+        #[arg(long, default_value = "docs/reference")]
+        output_dir: PathBuf,
     },
 }
 
@@ -117,6 +126,45 @@ fn main() {
                     process::exit(1);
                 }
             }
+        }
+        Commands::GenerateReferences {
+            manifest_path,
+            output_dir,
+        } => {
+            let content = match fs::read_to_string(&manifest_path) {
+                Ok(content) => content,
+                Err(err) => {
+                    eprintln!(
+                        "Error reading manifest at {}: {err}",
+                        manifest_path.display()
+                    );
+                    process::exit(1);
+                }
+            };
+            let manifest: ProductSurfaceManifest = match serde_json::from_str(&content) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    eprintln!(
+                        "Error parsing manifest at {}: {err}",
+                        manifest_path.display()
+                    );
+                    process::exit(1);
+                }
+            };
+            if let Err(err) = fs::create_dir_all(&output_dir) {
+                eprintln!("Error creating {}: {err}", output_dir.display());
+                process::exit(1);
+            }
+            for (name, markdown) in render_reference_docs(&manifest) {
+                if let Err(err) = fs::write(output_dir.join(&name), markdown) {
+                    eprintln!("Error writing {}/{}: {err}", output_dir.display(), name);
+                    process::exit(1);
+                }
+            }
+            println!(
+                "Successfully generated Markdown references: {}",
+                output_dir.display()
+            );
         }
     }
 }

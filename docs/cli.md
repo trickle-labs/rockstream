@@ -1,5 +1,7 @@
 # RockStream CLI Reference
 
+This compatibility URL is retained for existing links. The canonical manifest-generated reference is [CLI reference](reference/cli.md).
+
 ## Secret handling
 
 Support bundles contain sanitized metadata and audit events only. Secret

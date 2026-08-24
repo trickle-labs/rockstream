@@ -57,6 +57,8 @@ def render_markdown(contract: dict, errors: list[dict]) -> str:
     lines: list[str] = []
     lines.append("# RockStream Error Code Reference (`RS-XXXX`)")
     lines.append("")
+    lines.append("This historical URL is retained for existing links. The canonical manifest-generated reference is [error reference](reference/errors.md).")
+    lines.append("")
     version = contract.get("version", "v0.59.12")
     lines.append(f"Contract version: `{version}` — Authoritative Static Error Catalog (`DOC-01`)")
     lines.append("")

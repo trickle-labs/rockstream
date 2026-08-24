@@ -27,3 +27,11 @@ This reference application demonstrates a production-grade streaming analytics p
    ```bash
    bash scripts/cleanup.sh
    ```
+
+When Docker is unavailable, verification prints this deterministic result:
+
+```console
+$ bash scripts/verify.sh
+==> Verifying Reference Application E-Commerce & Fraud pipeline...
+Notice: docker command not found, skipping container verification.
+```
