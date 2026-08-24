@@ -5,9 +5,10 @@ use std::sync::Arc;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::ObjectStore;
-use rockstream_control::CheckpointManifestStore;
+use rockstream_control::{ChangelogCheckpointContribution, CheckpointManifestStore};
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint, PerShardCheckpoint};
 use rockstream_types::ids::ShardId;
+use rockstream_types::state_mutation::{EpochStateDelta, StateMutation};
 use support::{create_minio_bucket, docker_available, minio_object_store};
 
 const MINIO_BUCKET: &str = "rockstream-checkpoint-manifest-durability-test";
@@ -24,6 +25,21 @@ fn manifest(checkpoint_id: u64, shard_base: u64) -> ClusterCheckpoint {
         PerShardCheckpoint::new(checkpoint_id, 20 + shard_base),
     );
     manifest
+}
+
+fn changelog(checkpoint_id: u64) -> ChangelogCheckpointContribution {
+    ChangelogCheckpointContribution::new(
+        CheckpointId(checkpoint_id),
+        EpochStateDelta::from_mutations(vec![
+            StateMutation::Put {
+                key: b"orders/7".to_vec(),
+                value: bytes::Bytes::from_static(b"paid"),
+            },
+            StateMutation::Delete {
+                key: b"orders/4".to_vec(),
+            },
+        ]),
+    )
 }
 
 #[tokio::test]
@@ -43,6 +59,30 @@ async fn zstd_checkpoint_manifests_survive_lfs_restart() {
     ));
     assert_eq!(
         reloaded.load_manifest(CheckpointId(7)).await,
+        Some(expected)
+    );
+}
+
+#[tokio::test]
+async fn aligned_changelog_checkpoint_survives_lfs_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let checkpoints = CheckpointManifestStore::new(store);
+    let expected = changelog(7);
+    checkpoints
+        .save_changelog_contribution(ShardId(2), &expected)
+        .await
+        .unwrap();
+
+    let reloaded = CheckpointManifestStore::new(Arc::new(
+        LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+    ));
+    assert_eq!(
+        reloaded
+            .load_changelog_contribution(CheckpointId(7), ShardId(2))
+            .await
+            .unwrap(),
         Some(expected)
     );
 }
@@ -88,5 +128,39 @@ async fn legacy_json_and_zstd_checkpoint_manifests_survive_minio_tc_restart() {
     assert_eq!(
         reloaded.load_manifest(CheckpointId(9)).await,
         Some(legacy_manifest)
+    );
+}
+
+#[tokio::test]
+async fn aligned_changelog_checkpoint_survives_minio_tc_restart() {
+    if !docker_available() {
+        eprintln!(
+            "SKIP aligned_changelog_checkpoint_survives_minio_tc_restart: Docker not available"
+        );
+        return;
+    }
+
+    use testcontainers::runners::AsyncRunner;
+    let container = testcontainers_modules::minio::MinIO::default()
+        .start()
+        .await
+        .unwrap();
+    let port = container.get_host_port_ipv4(9000).await.unwrap();
+    create_minio_bucket(port, MINIO_BUCKET).await;
+
+    let expected = changelog(8);
+    let checkpoints = CheckpointManifestStore::new(minio_object_store(port, MINIO_BUCKET));
+    checkpoints
+        .save_changelog_contribution(ShardId(3), &expected)
+        .await
+        .unwrap();
+
+    let reloaded = CheckpointManifestStore::new(minio_object_store(port, MINIO_BUCKET));
+    assert_eq!(
+        reloaded
+            .load_changelog_contribution(CheckpointId(8), ShardId(3))
+            .await
+            .unwrap(),
+        Some(expected)
     );
 }

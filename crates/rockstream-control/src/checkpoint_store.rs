@@ -5,8 +5,10 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
 use rockstream_types::error_code::RS_3022;
+use rockstream_types::ids::ShardId;
 
 use crate::audit::{AuditEvent, FileAuditLog};
+use crate::checkpoint::ChangelogCheckpointContribution;
 
 const MANIFEST_MAGIC: &[u8; 4] = b"RSC1";
 const MANIFEST_HEADER_LEN: usize = 4 + 1 + 1 + 8;
@@ -27,6 +29,94 @@ impl CheckpointManifestStore {
 
     fn manifest_path(&self, checkpoint_id: CheckpointId) -> Path {
         self.prefix.child(checkpoint_id.0.to_string())
+    }
+
+    fn changelog_path(&self, checkpoint_id: CheckpointId, shard_id: ShardId) -> Path {
+        Path::from("control/changelog-checkpoints")
+            .child(format!("{}-{}", checkpoint_id.0, shard_id.0))
+    }
+
+    /// Persist one shard's delta-native checkpoint contribution before that
+    /// shard confirms the cluster manifest.
+    pub async fn save_changelog_contribution(
+        &self,
+        shard_id: ShardId,
+        contribution: &ChangelogCheckpointContribution,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_vec(contribution)
+            .map_err(|error| format!("serialize changelog contribution: {error}"))?;
+        self.store
+            .put(
+                &self.changelog_path(contribution.checkpoint_id, shard_id),
+                payload.into(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("persist changelog contribution: {error}"))
+    }
+
+    /// Load a single durable shard contribution without scanning live state.
+    pub async fn load_changelog_contribution(
+        &self,
+        checkpoint_id: CheckpointId,
+        shard_id: ShardId,
+    ) -> Result<Option<ChangelogCheckpointContribution>, String> {
+        let path = self.changelog_path(checkpoint_id, shard_id);
+        let result = self.store.get(&path).await;
+        let bytes = match result {
+            Ok(result) => result
+                .bytes()
+                .await
+                .map_err(|error| format!("read changelog contribution: {error}"))?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(format!("load changelog contribution: {error}")),
+        };
+        let contribution: ChangelogCheckpointContribution = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("decode changelog contribution: {error}"))?;
+        if contribution.checkpoint_id != checkpoint_id {
+            return Err(format!(
+                "changelog contribution checkpoint mismatch: requested {}, found {}",
+                checkpoint_id.0, contribution.checkpoint_id.0
+            ));
+        }
+        Ok(Some(contribution))
+    }
+
+    /// Delete expired changelog objects one at a time. This deliberately uses
+    /// object listing plus point deletion, never SlateDB range deletion.
+    pub async fn gc_old_changelog_contributions(
+        &self,
+        latest_checkpoint_id: CheckpointId,
+        retention_horizon: u64,
+    ) -> Result<Vec<(CheckpointId, ShardId)>, String> {
+        if latest_checkpoint_id.0 <= retention_horizon {
+            return Ok(Vec::new());
+        }
+        let cutoff = latest_checkpoint_id.0 - retention_horizon;
+        let prefix = Path::from("control/changelog-checkpoints");
+        let mut listing = self.store.list(Some(&prefix));
+        let mut deleted = Vec::new();
+        while let Some(entry) = listing.next().await {
+            let entry = entry.map_err(|error| format!("list changelog contributions: {error}"))?;
+            let Some(name) = entry.location.filename() else {
+                continue;
+            };
+            let Some((checkpoint, shard)) = name.split_once('-') else {
+                continue;
+            };
+            let (Ok(checkpoint_id), Ok(shard_id)) = (checkpoint.parse(), shard.parse()) else {
+                continue;
+            };
+            if checkpoint_id < cutoff {
+                self.store
+                    .delete(&entry.location)
+                    .await
+                    .map_err(|error| format!("delete changelog contribution: {error}"))?;
+                deleted.push((CheckpointId(checkpoint_id), ShardId(shard_id)));
+            }
+        }
+        deleted.sort_unstable();
+        Ok(deleted)
     }
 
     pub async fn save_manifest(
@@ -203,12 +293,93 @@ mod tests {
     use object_store::memory::InMemory;
     use rockstream_types::checkpoint::PerShardCheckpoint;
     use rockstream_types::ids::ShardId;
+    use rockstream_types::state_mutation::{EpochStateDelta, StateMutation};
 
     fn manifest() -> ClusterCheckpoint {
         let mut manifest = ClusterCheckpoint::new(CheckpointId(7));
         manifest.record_shard(ShardId(1), PerShardCheckpoint::new(CheckpointId(7), 11));
         manifest.record_shard(ShardId(2), PerShardCheckpoint::new(CheckpointId(7), 22));
         manifest
+    }
+
+    #[tokio::test]
+    async fn changelog_contribution_roundtrip_preserves_exact_delta() {
+        let store = Arc::new(InMemory::new());
+        let checkpoints = CheckpointManifestStore::new(store);
+        let contribution = ChangelogCheckpointContribution::new(
+            CheckpointId(7),
+            EpochStateDelta::from_mutations(vec![
+                StateMutation::Put {
+                    key: b"orders/7".to_vec(),
+                    value: bytes::Bytes::from_static(b"paid"),
+                },
+                StateMutation::Delete {
+                    key: b"orders/4".to_vec(),
+                },
+            ]),
+        );
+
+        checkpoints
+            .save_changelog_contribution(ShardId(2), &contribution)
+            .await
+            .unwrap();
+        assert_eq!(
+            checkpoints
+                .load_changelog_contribution(CheckpointId(7), ShardId(2))
+                .await
+                .unwrap(),
+            Some(contribution)
+        );
+    }
+
+    #[tokio::test]
+    async fn changelog_gc_uses_point_deletes_and_keeps_the_retention_window() {
+        let store = Arc::new(InMemory::new());
+        let checkpoints = CheckpointManifestStore::new(store);
+        for checkpoint_id in [CheckpointId(4), CheckpointId(5), CheckpointId(6)] {
+            checkpoints
+                .save_changelog_contribution(
+                    ShardId(2),
+                    &ChangelogCheckpointContribution::new(checkpoint_id, EpochStateDelta::new()),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            checkpoints
+                .gc_old_changelog_contributions(CheckpointId(6), 1)
+                .await
+                .unwrap(),
+            vec![(CheckpointId(4), ShardId(2))]
+        );
+        assert_eq!(
+            checkpoints
+                .load_changelog_contribution(CheckpointId(4), ShardId(2))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            checkpoints
+                .load_changelog_contribution(CheckpointId(5), ShardId(2))
+                .await
+                .unwrap(),
+            Some(ChangelogCheckpointContribution::new(
+                CheckpointId(5),
+                EpochStateDelta::new(),
+            ))
+        );
+        assert_eq!(
+            checkpoints
+                .load_changelog_contribution(CheckpointId(6), ShardId(2))
+                .await
+                .unwrap(),
+            Some(ChangelogCheckpointContribution::new(
+                CheckpointId(6),
+                EpochStateDelta::new(),
+            ))
+        );
     }
 
     #[tokio::test]

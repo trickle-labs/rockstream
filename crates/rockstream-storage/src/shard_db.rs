@@ -1005,6 +1005,7 @@ pub enum BatchOp {
 /// Internally stores operations as a `Vec<BatchOp>` so that multiple batches
 /// can be coalesced (via [`merge_from`]) into a single atomic commit — the
 /// basis of group-commit (v0.5).
+#[derive(Debug, Clone)]
 pub struct WriteBatch {
     ops: Vec<BatchOp>,
 }

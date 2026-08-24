@@ -33,13 +33,16 @@ use rockstream_types::topology::{
 };
 
 use crate::secrets::WorkerSecretManager;
-use rockstream_storage::ShardDb;
+use crate::shard_actor::{FrameExecutor, ShardActorRegistry};
+use rockstream_ops::PhysicalCommitGroup;
+use rockstream_storage::{ShardDb, WriteBatch};
 
 struct WorkerDeployment {
     descriptor: DeploymentDescriptor,
     schemas: HashMap<String, SchemaRef>,
     db: Arc<ShardDb>,
     compiled: rockstream_ops::compile::CompiledView,
+    commit_group: Arc<PhysicalCommitGroup>,
 }
 
 type WorkerDeployments = Arc<RwLock<HashMap<(WorkloadId, ShardId), Arc<WorkerDeployment>>>>;
@@ -294,26 +297,29 @@ async fn execute_frame(
             "lease fence rejected persistence",
         ));
     }
+    let mut writes = WriteBatch::new();
     deployment
         .compiled
         .sink
-        .write_epoch(&output, frame.epoch)
-        .await
-        .map_err(io::Error::other)?;
+        .append_epoch(&mut writes, &output, frame.epoch);
     if let Some(join) = &deployment.compiled.join {
         join.pipeline
-            .persist(&deployment.db)
+            .append_state(&deployment.db, &mut writes)
             .await
             .map_err(io::Error::other)?;
     } else {
         deployment
             .compiled
             .pipeline
-            .persist(&deployment.db)
+            .append_state(&deployment.db, &mut writes)
             .await
             .map_err(io::Error::other)?;
     }
-    deployment.db.flush().await.map_err(io::Error::other)?;
+    deployment
+        .commit_group
+        .commit_epoch(frame.epoch, writes)
+        .await
+        .map_err(io::Error::other)?;
     let output_rows = zset_to_rows(&output)?;
     rockstream_types::metrics::add_r1_worker_rows(
         worker_id,
@@ -644,17 +650,21 @@ where
         (WorkloadId, ShardId),
         Arc<WorkerDeployment>,
     >::new()));
-    let (execute_tx, mut execute_rx) = mpsc::channel::<RuntimeExchangeMessage>(32);
+    let actor_registry = ShardActorRegistry::new();
     let executor_client = handle.clone();
     let executor_deployments = deployments.clone();
-    tokio::spawn(async move {
-        // ponytail: one executor preserves deterministic order; shard-parallel queues if throughput requires it.
-        while let Some(frame) = execute_rx.recv().await {
-            if let Err(error) = execute_frame(&executor_client, &executor_deployments, frame).await
-            {
-                tracing::warn!(%error, "worker execution refused");
+    let execute: FrameExecutor = Arc::new(move |frame| {
+        let client = executor_client.clone();
+        let deployments = executor_deployments.clone();
+        Box::pin(async move {
+            if let Err(error) = execute_frame(&client, &deployments, frame).await {
+                tracing::warn!(
+                    code = %rockstream_types::error_code::RS_0001,
+                    %error,
+                    "worker execution refused"
+                );
             }
-        }
+        })
     });
 
     let worker_id_clone = worker_id.clone();
@@ -663,6 +673,8 @@ where
     let storage_dir = storage_dir.to_path_buf();
     let secret_manager_clone = secret_manager.clone();
     let deployments_clone = deployments.clone();
+    let actor_registry_clone = actor_registry.clone();
+    let execute_clone = execute.clone();
 
     let join_handle = tokio::spawn(async move {
         // 1. Send Registration message.
@@ -822,6 +834,7 @@ where
                         Ok(Arc::new(WorkerDeployment {
                             descriptor,
                             schemas,
+                            commit_group: Arc::new(PhysicalCommitGroup::new(db.clone())),
                             db,
                             compiled,
                         }))
@@ -867,8 +880,12 @@ where
                     }
                 }
                 ControlMessage::Execute { frame } => {
-                    if execute_tx.send(frame).await.is_err() {
-                        tracing::warn!("worker executor stopped");
+                    if let Err(error) = actor_registry_clone.enqueue(frame) {
+                        tracing::warn!(
+                            code = %rockstream_types::error_code::RS_0001,
+                            %error,
+                            "worker execution frame refused"
+                        );
                     }
                 }
                 ControlMessage::ShardAssigned { lease } => {
@@ -904,13 +921,20 @@ where
                     }
                     match builder.build().await {
                         Ok(db) => {
+                            let shard_id = lease.shard_id;
+                            let lease_token = lease.lease_token;
                             let owner = lease.worker_id;
                             active_shards_clone.write().insert(
-                                lease.shard_id,
+                                shard_id,
                                 ShardState {
                                     lease,
                                     db: Some(db),
                                 },
+                            );
+                            actor_registry_clone.register(
+                                shard_id,
+                                lease_token,
+                                execute_clone.clone(),
                             );
                             rockstream_types::metrics::set_r1_worker_shards_owned(
                                 owner,
@@ -960,6 +984,7 @@ where
                         shard_id,
                         reason
                     );
+                    actor_registry_clone.revoke(shard_id);
                     // Close and drop ShardDb without holding lock across await
                     let db_to_close = {
                         active_shards_clone
@@ -983,6 +1008,7 @@ where
                 ControlMessage::FenceAck { shard_id, valid } => {
                     tracing::info!("Received FenceAck for {:?}: valid={}", shard_id, valid);
                     if !valid {
+                        actor_registry_clone.revoke(shard_id);
                         // Immediately detach and close ShardDb
                         let db_to_close = {
                             active_shards_clone
@@ -1066,6 +1092,7 @@ where
         for db in dbs_to_close {
             let _ = db.close().await;
         }
+        actor_registry_clone.shutdown();
 
         let _ = shutdown_tx.send(true);
     });

@@ -12,16 +12,24 @@ pub use rockstream_ops::task::{OperatorTask, OPERATOR_CHANNEL_CAPACITY};
 
 pub mod arrangement_attach;
 pub mod client;
+pub mod compaction;
 pub mod data_plane;
 pub mod secrets;
+pub mod shard_actor;
 pub mod tls;
 pub use client::{
     start_worker_client, start_worker_client_with_metadata, start_worker_client_with_tls,
     start_worker_client_with_tls_and_metadata, ShardState, WorkerClientHandle,
 };
+pub use compaction::{CompactionBudget, CompactionPermit, CompactionWorker};
 pub use data_plane::DataPlaneClient;
 pub use secrets::{
     ResolvedSecret, SecretManagerError, WorkerSecretManager, MAX_WORKER_SECRET_TOKENS,
+};
+pub use shard_actor::{
+    CreditError, ExchangeCredit, ExchangeCredits, ExecutionMorsel, FrameExecutor, MailboxFillLevel,
+    MorselError, MorselFullReason, MorselLimits, ShardActorError, ShardActorRegistry,
+    SHARD_ACTOR_MAILBOX_BYTES, SHARD_ACTOR_MAILBOX_MESSAGES,
 };
 
 pub mod exchange;

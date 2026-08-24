@@ -20,6 +20,8 @@ action Init:
     max_persisted_0 = 0
     max_persisted_1 = 0
     max_cluster_committed = 0
+    physical_group_committed = 0
+    max_physical_group_committed = 0
 
     # D6.5: track duplicate delivery.
     duplicate_commit_delivered = False
@@ -84,6 +86,17 @@ atomic action CrashAndReplay1:
     if recovered >= worker_last_epoch_1:
         worker_last_epoch_1 = recovered
 
+# v0.59.9: publish only complete logical epochs after the physical write and
+# flush succeed. The group frontier is the durable cluster frontier, so a
+# physical group cannot expose one shard's logical epoch by itself.
+atomic fair action FlushPhysicalGroup:
+    require persisted_epoch_0 > physical_group_committed
+    require persisted_epoch_1 > physical_group_committed
+    next_group = persisted_epoch_0 if persisted_epoch_0 < persisted_epoch_1 else persisted_epoch_1
+    physical_group_committed = next_group
+    if physical_group_committed > max_physical_group_committed:
+        max_physical_group_committed = physical_group_committed
+
 # D6.5: Duplicate commit delivery (M1-S5 duplication variant).
 # Re-delivers an already-committed epoch's commit message to shard 0.
 # The duplicate MUST be a no-op: persisted state must not change.
@@ -144,6 +157,11 @@ always assertion M1_S6_TombstoneNonResurrection:
 always assertion M1_S7_AtomicMigration:
     # Storage format migration atomically converts shard format
     return True
+
+always assertion M1_S8_PhysicalGroupNoPartialLogicalEpoch:
+    return (physical_group_committed <= persisted_epoch_0 and
+            physical_group_committed <= persisted_epoch_1 and
+            physical_group_committed >= max_physical_group_committed)
 
 always eventually assertion M1_L1_EpochProgress:
     return (persisted_epoch_0 == MAX_EPOCH and

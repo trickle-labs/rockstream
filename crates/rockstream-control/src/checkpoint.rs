@@ -38,6 +38,7 @@ use rockstream_types::checkpoint::{
     PerShardCheckpoint,
 };
 use rockstream_types::ids::ShardId;
+use rockstream_types::state_mutation::EpochStateDelta;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -70,6 +71,12 @@ pub enum CoordinatorError {
         expected: CheckpointId,
         got: CheckpointId,
     },
+    /// A changelog contribution does not belong to this checkpoint round.
+    StaleChangelogContribution {
+        shard_id: ShardId,
+        expected: CheckpointId,
+        got: CheckpointId,
+    },
 }
 
 impl std::fmt::Display for CoordinatorError {
@@ -98,6 +105,31 @@ impl std::fmt::Display for CoordinatorError {
                 f,
                 "stale confirmation from shard {shard_id}: expected {expected}, got {got}"
             ),
+            Self::StaleChangelogContribution {
+                shard_id,
+                expected,
+                got,
+            } => write!(
+                f,
+                "stale changelog contribution from shard {shard_id}: expected {expected}, got {got}"
+            ),
+        }
+    }
+}
+
+/// The delta-native state contribution durably staged by one shard for an
+/// aligned checkpoint. The coordinator accepts it only for its matching round.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChangelogCheckpointContribution {
+    pub checkpoint_id: CheckpointId,
+    pub delta: EpochStateDelta,
+}
+
+impl ChangelogCheckpointContribution {
+    pub fn new(checkpoint_id: CheckpointId, delta: EpochStateDelta) -> Self {
+        Self {
+            checkpoint_id,
+            delta,
         }
     }
 }
@@ -125,6 +157,8 @@ struct InProgressRound {
     barrier_arrivals: BTreeMap<ShardId, u64>,
     /// Per-shard confirmations received so far.
     confirmations: BTreeMap<ShardId, PerShardCheckpoint>,
+    /// Durable delta-native contributions received so far.
+    changelog_contributions: BTreeMap<ShardId, ChangelogCheckpointContribution>,
     /// Shards still pending confirmation.
     pending: Vec<ShardId>,
     /// Credits held by this round (one per pending shard).
@@ -194,9 +228,10 @@ impl CheckpointCoordinator {
 
     /// Begin a new checkpoint round.
     ///
-    /// This allocates one credit per shard, then invokes `inject_barrier` with
-    /// the new `CheckpointBarrier` for each registered shard. The caller is
-    /// responsible for delivering the barrier to the source operators.
+    /// This allocates one reserved barrier credit per shard, then invokes
+    /// `inject_barrier` with the new `CheckpointBarrier` for each registered
+    /// shard. These credits are owned by the coordinator, so saturated data
+    /// exchange credits cannot block aligned-barrier injection.
     ///
     /// Returns the new `CheckpointId` on success, or a [`CoordinatorError`] if
     /// credits are exhausted or a round is already in progress.
@@ -266,6 +301,7 @@ impl CheckpointCoordinator {
             started_at: Instant::now(),
             barrier_arrivals: BTreeMap::new(),
             confirmations: BTreeMap::new(),
+            changelog_contributions: BTreeMap::new(),
             pending: shards,
             credits_held: acquired,
         });
@@ -273,6 +309,59 @@ impl CheckpointCoordinator {
         tracing::info!(checkpoint_id = checkpoint_id.0, "audit: checkpoint.started");
 
         Ok(checkpoint_id)
+    }
+
+    /// Record one shard's already-durable changelog contribution and aligned
+    /// SlateDB checkpoint. The manifest callback runs only after every shard
+    /// supplied both records.
+    pub fn record_shard_changelog_checkpoint<F>(
+        &self,
+        shard_id: ShardId,
+        psc: PerShardCheckpoint,
+        contribution: ChangelogCheckpointContribution,
+        commit_manifest: F,
+    ) -> Result<Option<ClusterCheckpoint>, CoordinatorError>
+    where
+        F: FnOnce(
+            &ClusterCheckpoint,
+            &BTreeMap<ShardId, ChangelogCheckpointContribution>,
+        ) -> Result<(), CoordinatorError>,
+    {
+        let contributions = {
+            let mut guard = self.inner.lock();
+            let round = guard
+                .in_progress
+                .as_mut()
+                .ok_or(CoordinatorError::UnknownShard(shard_id))?;
+            if !round.pending.contains(&shard_id) {
+                return Err(CoordinatorError::UnknownShard(shard_id));
+            }
+            if psc.checkpoint_id != round.checkpoint_id {
+                return Err(CoordinatorError::StaleConfirmation {
+                    shard_id,
+                    expected: round.checkpoint_id,
+                    got: psc.checkpoint_id,
+                });
+            }
+            if contribution.checkpoint_id != round.checkpoint_id {
+                return Err(CoordinatorError::StaleChangelogContribution {
+                    shard_id,
+                    expected: round.checkpoint_id,
+                    got: contribution.checkpoint_id,
+                });
+            }
+            round.changelog_contributions.insert(shard_id, contribution);
+            round.changelog_contributions.clone()
+        };
+
+        self.record_shard_checkpoint(shard_id, psc, |manifest| {
+            assert_eq!(
+                manifest.shards.len(),
+                contributions.len(),
+                "M1-S1: a changelog checkpoint manifest requires one durable contribution per shard"
+            );
+            commit_manifest(manifest, &contributions)
+        })
     }
 
     /// Record when a shard receives a checkpoint barrier across exchange channels.
@@ -541,6 +630,18 @@ mod tests {
         Ok(())
     }
 
+    fn changelog(id: CheckpointId, key: u8, value: u8) -> ChangelogCheckpointContribution {
+        ChangelogCheckpointContribution::new(
+            id,
+            EpochStateDelta::from_mutations(vec![
+                rockstream_types::state_mutation::StateMutation::Put {
+                    key: vec![key],
+                    value: bytes::Bytes::from(vec![value]),
+                },
+            ]),
+        )
+    }
+
     // ── begin_checkpoint ──────────────────────────────────────────────────────
 
     #[test]
@@ -617,6 +718,28 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 3);
     }
 
+    #[test]
+    fn reserved_barrier_lane_works_with_exhausted_data_credits() {
+        let data_credits = rockstream_runtime::ExchangeCredits::new(8, 1);
+        let _data = data_credits.try_acquire(8, 1).unwrap();
+        let injected = Arc::new(Mutex::new(Vec::new()));
+        let target = injected.clone();
+        let coord = CheckpointCoordinator::with_config(vec![ShardId(0), ShardId(1)], 2, 3);
+
+        let checkpoint_id = coord
+            .begin_checkpoint(|shard_id, barrier| target.lock().push((shard_id, barrier)))
+            .unwrap();
+
+        assert_eq!(data_credits.available_bytes(), 0);
+        assert_eq!(
+            *injected.lock(),
+            vec![
+                (ShardId(0), CheckpointBarrier::new(checkpoint_id)),
+                (ShardId(1), CheckpointBarrier::new(checkpoint_id)),
+            ]
+        );
+    }
+
     // ── record_shard_checkpoint ───────────────────────────────────────────────
 
     #[test]
@@ -640,6 +763,50 @@ mod tests {
         let manifest = result.unwrap();
         assert_eq!(manifest.checkpoint_id, id);
         assert_eq!(manifest.shards.len(), 2);
+    }
+
+    #[test]
+    fn changelog_manifest_waits_for_every_durable_shard_contribution() {
+        let coord = make_coordinator(&[0, 1]);
+        let id = coord.begin_checkpoint(noop_inject).unwrap();
+        let first = changelog(id, 1, 10);
+        let second = changelog(id, 2, 20);
+
+        assert_eq!(
+            coord
+                .record_shard_changelog_checkpoint(
+                    ShardId(0),
+                    PerShardCheckpoint::new(id, 10),
+                    first.clone(),
+                    |_, _| panic!("manifest must wait for every shard"),
+                )
+                .unwrap(),
+            None
+        );
+
+        let manifest = coord
+            .record_shard_changelog_checkpoint(
+                ShardId(1),
+                PerShardCheckpoint::new(id, 20),
+                second.clone(),
+                |manifest, contributions| {
+                    assert_eq!(
+                        manifest.shards,
+                        BTreeMap::from([
+                            (ShardId(0), PerShardCheckpoint::new(id, 10)),
+                            (ShardId(1), PerShardCheckpoint::new(id, 20)),
+                        ])
+                    );
+                    assert_eq!(
+                        contributions,
+                        &BTreeMap::from([(ShardId(0), first), (ShardId(1), second)])
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.checkpoint_id, id);
     }
 
     #[test]

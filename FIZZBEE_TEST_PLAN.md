@@ -634,6 +634,10 @@ header comments and in `formal/findings.md`.
 
 ### 3.6 Cross-Cutting Coverage Assertions
 
+The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
+`formal/m1_epoch_commit.fizz`: logical epochs may stage independently, but the
+published physical frontier advances only after a complete group is durable.
+
 To guard against vacuously-passing models (a model that never reaches the
 interesting state trivially satisfies every `always`), each spec includes
 `exists` coverage assertions

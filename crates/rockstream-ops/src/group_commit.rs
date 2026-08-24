@@ -32,8 +32,9 @@
 //! calls issued.  In a test with N ≥ 5 operators and one `flush()`, this
 //! equals 1 (vs N individual commits), proving the ≥ 5× reduction.
 
+use std::collections::BTreeMap;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -48,6 +49,9 @@ use crate::error::OpError;
 /// Named bound: **`GROUP_COMMIT_MAX_BATCHES`** — every buffer must have a
 /// named upper bound (DESIGN.md).
 pub const GROUP_COMMIT_MAX_BATCHES: usize = 64;
+
+/// Maximum number of complete logical epochs held in one physical commit.
+pub const PHYSICAL_COMMIT_GROUP_MAX_EPOCHS: usize = 64;
 
 /// Shard-level group-commit coalescer.
 ///
@@ -141,15 +145,17 @@ impl GroupCommit {
 
         // Merge all fragments into one WriteBatch.
         let mut merged = WriteBatch::new();
-        for wb in batches {
+        for wb in batches.iter().cloned() {
             merged.merge_from(wb);
         }
 
         // One atomic commit — the only Db::write() call for this epoch.
-        self.db
-            .write_batch(merged)
-            .await
-            .map_err(OpError::storage)?;
+        if let Err(error) = self.db.write_batch(merged).await {
+            let mut pending = self.pending.lock().expect("GroupCommit mutex poisoned");
+            pending.extend(batches);
+            self.fill_level.store(pending.len(), Ordering::Release);
+            return Err(OpError::storage(error));
+        }
         self.commit_count.fetch_add(1, Ordering::Relaxed);
         Ok(n)
     }
@@ -170,6 +176,123 @@ impl GroupCommit {
     /// reduction.
     pub fn commit_count(&self) -> u64 {
         self.commit_count.load(Ordering::Relaxed)
+    }
+}
+
+/// Atomic physical commit grouping behind logical visibility epochs.
+///
+/// A caller stages all sink and operator-state writes for an epoch in one
+/// `WriteBatch`. Nothing is reported as committed until both `write_batch` and
+/// `flush` succeed, so a failed physical group cannot publish a partial epoch.
+pub struct PhysicalCommitGroup {
+    db: Arc<ShardDb>,
+    pending: Mutex<BTreeMap<rockstream_types::timestamp::Epoch, WriteBatch>>,
+    last_committed: AtomicU64,
+    has_committed: AtomicBool,
+}
+
+impl PhysicalCommitGroup {
+    pub fn new(db: Arc<ShardDb>) -> Self {
+        Self {
+            db,
+            pending: Mutex::new(BTreeMap::new()),
+            last_committed: AtomicU64::new(0),
+            has_committed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn fill_level(&self) -> usize {
+        self.pending
+            .lock()
+            .expect("PhysicalCommitGroup mutex poisoned")
+            .len()
+    }
+
+    pub fn last_committed(&self) -> rockstream_types::timestamp::Epoch {
+        self.last_committed.load(Ordering::Acquire)
+    }
+
+    pub fn add_epoch(
+        &self,
+        epoch: rockstream_types::timestamp::Epoch,
+        batch: WriteBatch,
+    ) -> Result<(), OpError> {
+        let last_committed = self.last_committed();
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("PhysicalCommitGroup mutex poisoned");
+        if (self.has_committed.load(Ordering::Acquire) && epoch <= last_committed)
+            || pending.contains_key(&epoch)
+        {
+            return Err(OpError::internal(format!(
+                "logical epoch {epoch} is not newer than physical frontier {last_committed}"
+            )));
+        }
+        if pending.len() >= PHYSICAL_COMMIT_GROUP_MAX_EPOCHS {
+            return Err(OpError::group_commit_full(pending.len()));
+        }
+        pending.insert(epoch, batch);
+        Ok(())
+    }
+
+    /// Flush all staged complete logical epochs as one durable physical group.
+    pub async fn flush(&self) -> Result<Vec<rockstream_types::timestamp::Epoch>, OpError> {
+        let (entries, merged) = {
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("PhysicalCommitGroup mutex poisoned");
+            if pending.is_empty() {
+                return Ok(Vec::new());
+            }
+            let entries: Vec<_> = pending
+                .iter()
+                .map(|(&epoch, batch)| (epoch, batch.clone()))
+                .collect();
+            let mut merged = WriteBatch::new();
+            for (_, batch) in pending.iter() {
+                merged.merge_from(batch.clone());
+            }
+            pending.clear();
+            (entries, merged)
+        };
+
+        let epochs: Vec<_> = entries.iter().map(|(epoch, _)| *epoch).collect();
+        if let Err(error) = self.db.write_batch(merged).await {
+            self.restore_pending(entries.clone());
+            return Err(OpError::storage(error));
+        }
+        if let Err(error) = self.db.flush().await {
+            // Replaying the same epoch is safe: sink keys are epoch-scoped and
+            // the frontier is advanced only after this flush succeeds.
+            self.restore_pending(entries);
+            return Err(OpError::storage(error));
+        }
+        if let Some(last) = epochs.last().copied() {
+            self.last_committed.store(last, Ordering::Release);
+            self.has_committed.store(true, Ordering::Release);
+        }
+        Ok(epochs)
+    }
+
+    pub async fn commit_epoch(
+        &self,
+        epoch: rockstream_types::timestamp::Epoch,
+        batch: WriteBatch,
+    ) -> Result<(), OpError> {
+        self.add_epoch(epoch, batch)?;
+        self.flush().await.map(|_| ())
+    }
+
+    fn restore_pending(&self, entries: Vec<(rockstream_types::timestamp::Epoch, WriteBatch)>) {
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("PhysicalCommitGroup mutex poisoned");
+        for (epoch, batch) in entries {
+            pending.entry(epoch).or_insert(batch);
+        }
     }
 }
 
@@ -200,5 +323,10 @@ mod tests {
         let fill = AtomicUsize::new(10);
         fill.store(0, Ordering::Relaxed);
         assert_eq!(fill.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn physical_group_bound_is_named() {
+        assert_eq!(PHYSICAL_COMMIT_GROUP_MAX_EPOCHS, 64);
     }
 }

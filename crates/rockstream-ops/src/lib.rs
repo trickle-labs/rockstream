@@ -83,7 +83,9 @@ pub use governor::{
     DeltaAmplificationGovernor, PlanStrategy, DEFAULT_FACTORIZED_DELTA_BUDGET,
     FACTORIZED_SELECTION_RULE_VERSION,
 };
-pub use group_commit::{GroupCommit, GROUP_COMMIT_MAX_BATCHES};
+pub use group_commit::{
+    GroupCommit, PhysicalCommitGroup, GROUP_COMMIT_MAX_BATCHES, PHYSICAL_COMMIT_GROUP_MAX_EPOCHS,
+};
 pub use join::JoinOp;
 pub use lateral::LateralOp;
 pub use live_exec::{
