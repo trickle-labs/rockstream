@@ -8852,8 +8852,8 @@ impl GatewayHandler {
             )))]);
         }
 
-        if self.catalog.get_index(&index_name).is_some() {
-            if if_not_exists {
+        if let Some(existing) = self.catalog.get_index(&index_name) {
+            if if_not_exists || existing.table == table {
                 return Ok(vec![Response::Execution(
                     Tag::new("CREATE INDEX").with_rows(0),
                 )]);
