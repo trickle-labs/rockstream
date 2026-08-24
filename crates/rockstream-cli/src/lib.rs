@@ -832,19 +832,37 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             ))?;
 
             if opts.role == "all" {
-                // Wait for worker registration handshake
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                // Acquire the real shard-0 lease through the normal
-                // control-plane lease flow (no demo/bypass lease): this is
-                // the single shard both the worker's data-plane DAG and the
-                // gateway's pgwire reads serve from in `--role all`.
-                let shard_id = rockstream_types::ids::ShardId(0);
-                for _ in 0..20 {
+                for _ in 0..200 {
                     if client.worker_id().is_some() {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
+                client.worker_id().ok_or_else(|| {
+                    CliError::new(
+                        RS_0003,
+                        "worker registration did not complete in time",
+                        "Check that the embedded control service is healthy.",
+                    )
+                })?;
+                // Acquire the real shard-0 lease through the normal
+                // control-plane lease flow (no demo/bypass lease): this is
+                // the single shard both the worker's data-plane DAG and the
+                // gateway's pgwire reads serve from in `--role all`.
+                let shard_id = rockstream_types::ids::ShardId(0);
+                for _ in 0..200 {
+                    if client.worker_id().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                client.worker_id().ok_or_else(|| {
+                    CliError::new(
+                        RS_0003,
+                        "worker registration did not complete in time",
+                        "Check that the embedded control service is healthy.",
+                    )
+                })?;
                 client.request_shard(shard_id).await.map_err(|error| {
                     CliError::new(
                         RS_0003,
@@ -856,19 +874,22 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 // processed (client.rs opens the ShardDb asynchronously
                 // when it arrives).
                 let mut shard_db = None;
-                for _ in 0..50 {
+                for _ in 0..200 {
                     if let Some(db) = client.get_shard_db(shard_id) {
                         shard_db = Some(db);
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                if let Some(db) = shard_db {
-                    let shard_path = opts.storage.join("shards").join("0");
-                    let store = rockstream_storage::build_runtime_object_store(
-                        &shard_path,
-                        "shards/0",
+                let db = shard_db.ok_or_else(|| {
+                    CliError::new(
+                        RS_0003,
+                        "shared shard-0 did not become ready in time",
+                        "Check the embedded worker and storage directory.",
                     )
+                })?;
+                let shard_path = opts.storage.join("shards").join("0");
+                let store = rockstream_storage::build_runtime_object_store(&shard_path, "shards/0")
                     .map_err(|error| {
                         CliError::new(
                             RS_0003,
@@ -876,8 +897,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                             "Check storage directory or object-store credentials.",
                         )
                     })?;
-                    shared_gateway_shard = Some((Arc::new(db), store));
-                }
+                shared_gateway_shard = Some((Arc::new(db), store));
             }
             worker_handle = Some(handle);
         }

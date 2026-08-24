@@ -134,14 +134,16 @@ async fn send(addr: SocketAddr, msg: &WorkerMessage) -> Vec<ControlMessage> {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let line = serde_json::to_string(msg).unwrap() + "\n";
     stream.write_all(line.as_bytes()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let mut reader = BufReader::new(stream);
     let mut out = Vec::new();
     loop {
         let mut line = String::new();
-        let Ok(read) =
-            tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut line)).await
-        else {
+        let timeout = if out.is_empty() {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(50)
+        };
+        let Ok(read) = tokio::time::timeout(timeout, reader.read_line(&mut line)).await else {
             break;
         };
         let Ok(read) = read else { break };
