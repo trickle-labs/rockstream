@@ -7,7 +7,8 @@ use std::path::Path;
 #[test]
 fn test_workspace_version_matches_candidate_identity() {
     let id = CandidateIdentity::current();
-    assert_eq!(id.semantic_version, "0.59.17");
+    let expected_version = env!("CARGO_PKG_VERSION");
+    assert_eq!(id.semantic_version, expected_version);
 
     let cargo_toml = std::fs::read_to_string("../../Cargo.toml")
         .or_else(|_| std::fs::read_to_string("../Cargo.toml"))
@@ -15,16 +16,17 @@ fn test_workspace_version_matches_candidate_identity() {
         .expect("Cargo.toml must exist");
 
     assert!(
-        cargo_toml.contains("version = \"0.59.17\""),
-        "Workspace Cargo.toml must declare version = \"0.59.17\""
+        cargo_toml.contains(&format!("version = \"{expected_version}\"")),
+        "Workspace Cargo.toml must declare version = \"{expected_version}\""
     );
 }
 
 #[test]
 fn test_cli_version_structured_identity() {
     let id = CandidateIdentity::current();
+    let expected_version = env!("CARGO_PKG_VERSION");
     let text = id.display_text();
-    assert!(text.contains("rockstream 0.59.17"));
+    assert!(text.contains(&format!("rockstream {expected_version}")));
     assert!(text.contains(&format!("commit: {}", id.commit_sha)));
     assert!(text.contains(&format!("build_timestamp: {}", id.build_timestamp_rfc3339)));
     assert!(text.contains(&format!("compiler: {}", id.compiler_version)));
@@ -32,7 +34,7 @@ fn test_cli_version_structured_identity() {
 
     let json_str = id.to_json().expect("to_json must succeed");
     let v: serde_json::Value = serde_json::from_str(&json_str).expect("must parse JSON");
-    assert_eq!(v["semantic_version"], "0.59.17");
+    assert_eq!(v["semantic_version"], expected_version);
     assert_eq!(v["commit_sha"], id.commit_sha);
     assert_eq!(v["build_timestamp_rfc3339"], id.build_timestamp_rfc3339);
     assert_eq!(v["compiler_version"], id.compiler_version);
