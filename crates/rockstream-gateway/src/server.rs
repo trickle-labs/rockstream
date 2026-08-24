@@ -15350,9 +15350,11 @@ fn create_sink_error_response(message: String) -> Response<'static> {
 }
 
 fn connector_removed_error_response() -> Response<'static> {
-    create_sink_error_response(
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "0A000".to_owned(),
         "[RS-4017] connector.removed: This connector has been removed. Next steps: use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output.".to_string(),
-    )
+    )))
 }
 
 fn is_removed_connector_ddl(query: &str) -> bool {

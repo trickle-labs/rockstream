@@ -1,0 +1,1834 @@
+[contract]
+version = "v0.59.12"
+roadmap = "NEW_ROADMAP.md"
+description = "Authoritative static RS-XXXX error catalog specification"
+
+[[error]]
+code = "RS-0001"
+key = "internal.error"
+title = "Internal error"
+severity = "Fatal"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Report this bug with the support bundle."
+doc_anchor = "rs-0001"
+
+[[error]]
+code = "RS-0002"
+key = "config.invalid"
+title = "Configuration error"
+severity = "Error"
+sqlstate = "22023"
+retry_class = "NonRetryable"
+default_next_steps = "Check configuration file and CLI flags."
+doc_anchor = "rs-0002"
+
+[[error]]
+code = "RS-0003"
+key = "storage.unavailable"
+title = "Storage unavailable"
+severity = "Error"
+sqlstate = "53100"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Verify storage directory permissions and disk space."
+doc_anchor = "rs-0003"
+
+[[error]]
+code = "RS-0004"
+key = "cluster.unreachable"
+title = "Cluster control plane unreachable"
+severity = "Error"
+sqlstate = "08006"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Verify the control service URL and ensure the control node is running and reachable."
+doc_anchor = "rs-0004"
+
+[[error]]
+code = "RS-0005"
+key = "cli.confirmation_required"
+title = "Destructive command confirmation required"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "Pass --yes for script execution or answer y at the prompt."
+doc_anchor = "rs-0005"
+
+[[error]]
+code = "RS-1001"
+key = "pipeline.not_found"
+title = "Pipeline not found"
+severity = "Error"
+sqlstate = "42P01"
+retry_class = "NonRetryable"
+default_next_steps = "Check pipeline name and ensure it has been created."
+doc_anchor = "rs-1001"
+
+[[error]]
+code = "RS-1002"
+key = "schema.incompatible_change"
+title = "Incompatible schema change"
+severity = "Error"
+sqlstate = "42804"
+retry_class = "NonRetryable"
+default_next_steps = "Review schema evolution rules; a new view may be required."
+doc_anchor = "rs-1002"
+
+[[error]]
+code = "RS-1003"
+key = "record.decode_error"
+title = "Record decode error"
+severity = "Error"
+sqlstate = "22000"
+retry_class = "NonRetryable"
+default_next_steps = "Inspect the dead-letter queue for malformed records."
+doc_anchor = "rs-1003"
+
+[[error]]
+code = "RS-1004"
+key = "pipeline.already_exists"
+title = "Pipeline already exists"
+severity = "Error"
+sqlstate = "42710"
+retry_class = "NonRetryable"
+default_next_steps = "Use a different pipeline name or drop the existing one."
+doc_anchor = "rs-1004"
+
+[[error]]
+code = "RS-1005"
+key = "workload.not_found"
+title = "Workload not found"
+severity = "Error"
+sqlstate = "42P01"
+retry_class = "NonRetryable"
+default_next_steps = "Check the workload name; ensure it has been created with CREATE WORKLOAD."
+doc_anchor = "rs-1005"
+
+[[error]]
+code = "RS-1006"
+key = "workload.already_exists"
+title = "Workload already exists"
+severity = "Error"
+sqlstate = "42710"
+retry_class = "NonRetryable"
+default_next_steps = "Use a different workload name or drop the existing workload first."
+doc_anchor = "rs-1006"
+
+[[error]]
+code = "RS-1007"
+key = "view.already_paused"
+title = "View is already paused"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "The view is already paused; use RESUME MATERIALIZED VIEW to restart it."
+doc_anchor = "rs-1007"
+
+[[error]]
+code = "RS-1008"
+key = "view.not_paused"
+title = "View is not paused"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "The view is not paused; only paused views can be resumed."
+doc_anchor = "rs-1008"
+
+[[error]]
+code = "RS-1009"
+key = "recursion.non_monotone_delta"
+title = "Non-monotone delta rejected in monotone recursion"
+severity = "Error"
+sqlstate = "22000"
+retry_class = "NonRetryable"
+default_next_steps = "Ensure the recursive query is monotone or restructure it; check EXPLAIN for recursion rules."
+doc_anchor = "rs-1009"
+
+[[error]]
+code = "RS-1010"
+key = "connector.bootstrap_interrupted"
+title = "Bootstrap interrupted; connector position lost"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Verify connector positions, reset offsets, or perform a full bootstrap rebuild."
+doc_anchor = "rs-1010"
+
+[[error]]
+code = "RS-1011"
+key = "view.dag_cycle_detected"
+title = "View-on-view DAG contains a cycle"
+severity = "Error"
+sqlstate = "42P16"
+retry_class = "NonRetryable"
+default_next_steps = "Resolve cycle in view dependencies; view-on-view relations must form a DAG."
+doc_anchor = "rs-1011"
+
+[[error]]
+code = "RS-1012"
+key = "sql.parse_error"
+title = "SQL statement could not be parsed"
+severity = "Error"
+sqlstate = "42601"
+retry_class = "NonRetryable"
+default_next_steps = "Check SQL syntax; see docs/language-features.md for the supported SQL subset."
+doc_anchor = "rs-1012"
+
+[[error]]
+code = "RS-1013"
+key = "sql.unsupported_feature"
+title = "Query contains a feature not supported by the incremental planner"
+severity = "Error"
+sqlstate = "0A000"
+retry_class = "NonRetryable"
+default_next_steps = "Simplify the query or check docs/language-features.md for the supported incremental SQL subset."
+doc_anchor = "rs-1013"
+
+[[error]]
+code = "RS-1014"
+key = "workload.has_assigned_views"
+title = "Workload still has assigned views"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "Reassign or drop the workload's views before dropping the workload."
+doc_anchor = "rs-1014"
+
+[[error]]
+code = "RS-1015"
+key = "aggregate.group_commit_full"
+title = "Group-commit capacity exceeded; backpressure applied"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce epoch rate, increase GROUP_COMMIT_MAX_BATCHES, or add more shards."
+doc_anchor = "rs-1015"
+
+[[error]]
+code = "RS-1016"
+key = "aggregate.numeric_overflow"
+title = "Aggregate running sum overflowed i64"
+severity = "Error"
+sqlstate = "22003"
+retry_class = "NonRetryable"
+default_next_steps = "Reduce value magnitudes or switch to a wider numeric type."
+doc_anchor = "rs-1016"
+
+[[error]]
+code = "RS-1017"
+key = "aggregate.retraction_underflow"
+title = "MIN/MAX multiset retraction underflow: value has no positive weight"
+severity = "Error"
+sqlstate = "22000"
+retry_class = "NonRetryable"
+default_next_steps = "Ensure every retraction is matched by a prior insertion; check source event ordering and idempotency."
+doc_anchor = "rs-1017"
+
+[[error]]
+code = "RS-1018"
+key = "aggregate.topk_overflow"
+title = "TopK buffer overflow: too many unique rows in a single partition"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce partition cardinality, increase TOPK_BUFFER_LIMIT, or add more partition columns."
+doc_anchor = "rs-1018"
+
+[[error]]
+code = "RS-1019"
+key = "view.compilation_failed"
+title = "View query could not be compiled into an executable operator pipeline"
+severity = "Error"
+sqlstate = "0A000"
+retry_class = "NonRetryable"
+default_next_steps = "Simplify the query to a supported shape (see docs/language-features.md), or reference only base tables — views over other views are not yet compiled."
+doc_anchor = "rs-1019"
+
+[[error]]
+code = "RS-1020"
+key = "operator.not_found"
+title = "Operator not found in pipeline"
+severity = "Error"
+sqlstate = "42P01"
+retry_class = "NonRetryable"
+default_next_steps = "Run rockstream explain <view> --op-ids to inspect available operator IDs for this view."
+doc_anchor = "rs-1020"
+
+[[error]]
+code = "RS-1021"
+key = "arrangement.key_decode_failed"
+title = "Arrangement key decoding failed or unsupported"
+severity = "Error"
+sqlstate = "22000"
+retry_class = "NonRetryable"
+default_next_steps = "Check arrangement key syntax or verify if the operator family key codec is supported."
+doc_anchor = "rs-1021"
+
+[[error]]
+code = "RS-1030"
+key = "migration.timeout_exceeded"
+title = "Migration state exceeded its configured timeout budget"
+severity = "Error"
+sqlstate = "57014"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Check donor/recipient shard health, then retry or abort the migration; increase the specific migration timeout only if the cluster is healthy but the workload is larger than expected."
+doc_anchor = "rs-1030"
+
+[[error]]
+code = "RS-1512"
+key = "recursion.inner_frontier_stall"
+title = "Inner-frontier stall in distributed recursion; per-shard recompute triggered"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs."
+doc_anchor = "rs-1512"
+
+[[error]]
+code = "RS-1513"
+key = "recursion.max_iteration_exceeded"
+title = "Distributed recursion max-iteration cap exceeded without convergence"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Increase max_iterations or restructure the recursive query to converge faster."
+doc_anchor = "rs-1513"
+
+[[error]]
+code = "RS-1601"
+key = "lease.rejected"
+title = "Lease acquisition rejected: shard already leased or fence token invalid"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterLeaderElection"
+default_next_steps = "Inspect shard lease ownership and retry after lease re-acquisition."
+doc_anchor = "rs-1601"
+
+[[error]]
+code = "RS-1603"
+key = "recovery.slow_recovery"
+title = "Recovery active for > 60s; pipeline freshness behind SLO"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Monitor worker throughput and checkpoint progress; verify storage health."
+doc_anchor = "rs-1603"
+
+[[error]]
+code = "RS-1701"
+key = "lease.shard_already_leased"
+title = "Shard is already leased by a different worker"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterLeaderElection"
+default_next_steps = "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead."
+doc_anchor = "rs-1701"
+
+[[error]]
+code = "RS-1702"
+key = "lease.stale_token"
+title = "Stale lease token; worker has been fenced out"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterLeaderElection"
+default_next_steps = "Worker has been fenced out; acquire a new lease before retrying."
+doc_anchor = "rs-1702"
+
+[[error]]
+code = "RS-1703"
+key = "lease.no_active_lease"
+title = "Shard has no active lease"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterLeaderElection"
+default_next_steps = "No lease exists for this shard; acquire a lease before operating on it."
+doc_anchor = "rs-1703"
+
+[[error]]
+code = "RS-1731"
+key = "control.not_leader"
+title = "Write rejected: acting control node is not the current Raft leader"
+severity = "Error"
+sqlstate = "08006"
+retry_class = "AfterLeaderElection"
+default_next_steps = "Retry the write against the current Raft leader (query cluster status for the elected leader's address); do not retry against this node until it wins a future election."
+doc_anchor = "rs-1731"
+
+[[error]]
+code = "RS-2000"
+key = "sql.malformed_ddl"
+title = "Malformed table DDL statement"
+severity = "Error"
+sqlstate = "42601"
+retry_class = "NonRetryable"
+default_next_steps = "Check CREATE/DROP TABLE syntax against documentation."
+doc_anchor = "rs-2000"
+
+[[error]]
+code = "RS-2001"
+key = "query.view_not_found"
+title = "View not found"
+severity = "Error"
+sqlstate = "42P01"
+retry_class = "NonRetryable"
+default_next_steps = "Check view name and ensure the pipeline is running."
+doc_anchor = "rs-2001"
+
+[[error]]
+code = "RS-2002"
+key = "query.timeout"
+title = "Query timeout"
+severity = "Error"
+sqlstate = "57014"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce query scope or increase timeout."
+doc_anchor = "rs-2002"
+
+[[error]]
+code = "RS-2003"
+key = "isolation.unsupported_level"
+title = "Unsupported isolation level"
+severity = "Error"
+sqlstate = "25001"
+retry_class = "NonRetryable"
+default_next_steps = "Use a supported isolation level (snapshot or eventual)."
+doc_anchor = "rs-2003"
+
+[[error]]
+code = "RS-2004"
+key = "view.cannot_drop_inline"
+title = "Cannot drop inline view: dependent materialized views still exist"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "Drop all dependent materialized views first, or use CASCADE."
+doc_anchor = "rs-2004"
+
+[[error]]
+code = "RS-2005"
+key = "query.rate_limit_exceeded"
+title = "Query rate limit exceeded"
+severity = "Error"
+sqlstate = "57014"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce query rate, bundle queries, or increase tenant concurrency limits."
+doc_anchor = "rs-2005"
+
+[[error]]
+code = "RS-2006"
+key = "query.epoch_before_retention"
+title = "Historical query beyond checkpoint retention window"
+severity = "Error"
+sqlstate = "22000"
+retry_class = "NonRetryable"
+default_next_steps = "Query a more recent epoch or timestamp, or increase the catalog's checkpoint_retention_duration."
+doc_anchor = "rs-2006"
+
+[[error]]
+code = "RS-2007"
+key = "write.idempotency_key_required"
+title = "Idempotency key required for non-idempotent write"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Provide a client-supplied idempotency key or an exactly-once source-epoch envelope."
+doc_anchor = "rs-2007"
+
+[[error]]
+code = "RS-2008"
+key = "transaction.optimistic_conflict"
+title = "Optimistic transaction conflict: a concurrent write committed to the same key"
+severity = "Error"
+sqlstate = "40001"
+retry_class = "Immediate"
+default_next_steps = "Retry the transaction; if conflicts persist, reduce write concurrency or switch to a serializable protocol."
+doc_anchor = "rs-2008"
+
+[[error]]
+code = "RS-2012"
+key = "session.wait_for_timeout"
+title = "Session wait-for deadline exceeded; query proceeded at current frontier"
+severity = "Warning"
+sqlstate = "57014"
+retry_class = "Immediate"
+default_next_steps = "Increase session_wait_for_timeout or reduce write latency."
+doc_anchor = "rs-2012"
+
+[[error]]
+code = "RS-2013"
+key = "transaction.returning_key_not_found"
+title = "Transaction RETURNING read-back could not find the row at the current frontier"
+severity = "Error"
+sqlstate = "42P01"
+retry_class = "Immediate"
+default_next_steps = "Retry the write; if the row is consistently missing, check that the frontier used for the read-back has advanced past the commit epoch."
+doc_anchor = "rs-2013"
+
+[[error]]
+code = "RS-2014"
+key = "index.is_building"
+title = "Index is building"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Wait for index backfill to complete."
+doc_anchor = "rs-2014"
+
+[[error]]
+code = "RS-2015"
+key = "index.max_lag_exceeded"
+title = "Index frontier lag exceeded limit"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Index is too far behind view. Wait for synchronization or increase index_max_lag_ms."
+doc_anchor = "rs-2015"
+
+[[error]]
+code = "RS-2016"
+key = "index.name_conflict"
+title = "Index name conflict"
+severity = "Error"
+sqlstate = "42710"
+retry_class = "NonRetryable"
+default_next_steps = "An index with the same name already exists."
+doc_anchor = "rs-2016"
+
+[[error]]
+code = "RS-2017"
+key = "shard_stats.too_stale"
+title = "Shard statistics are too stale for safe pruning; query fell back to a full scatter scan"
+severity = "Warning"
+sqlstate = "01000"
+retry_class = "NonRetryable"
+default_next_steps = "Wait for the next checkpoint to publish fresh shard_stats, or increase shard_stats_max_age_checkpoints if this fallback is expected for the workload."
+doc_anchor = "rs-2017"
+
+[[error]]
+code = "RS-2018"
+key = "session.max_staleness_exceeded"
+title = "Published frontier exceeded the session max_staleness bound; query proceeded"
+severity = "Warning"
+sqlstate = "01000"
+retry_class = "NonRetryable"
+default_next_steps = "Increase rockstream.max_staleness, reduce publish lag, or switch to session_wait_for mode."
+doc_anchor = "rs-2018"
+
+[[error]]
+code = "RS-2019"
+key = "write.shard_backpressure"
+title = "Shard write buffer full; backpressure applied"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Wait for downstream IVM processing to drain, then retry COMMIT."
+doc_anchor = "rs-2019"
+
+[[error]]
+code = "RS-2020"
+key = "subscribe.consumer_lag_exceeded"
+title = "Subscribe consumer fell behind the change-log retention window"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Reconnect with AS OF NOW WITH SNAPSHOT or increase CHANGE_LOG_MAX_ENTRIES."
+doc_anchor = "rs-2020"
+
+[[error]]
+code = "RS-2021"
+key = "copy.malformed_statement"
+title = "COPY FROM STDIN statement is malformed"
+severity = "Error"
+sqlstate = "42601"
+retry_class = "NonRetryable"
+default_next_steps = "Check COPY syntax; the statement must be COPY <table> [(<col>, ...)] FROM STDIN [WITH (...)]."
+doc_anchor = "rs-2021"
+
+[[error]]
+code = "RS-2022"
+key = "write.malformed_returning_clause"
+title = "UPDATE/DELETE RETURNING clause is malformed"
+severity = "Error"
+sqlstate = "42601"
+retry_class = "NonRetryable"
+default_next_steps = "Check RETURNING syntax; it must be RETURNING * or RETURNING <col>[, <col>...] with no trailing content."
+doc_anchor = "rs-2022"
+
+[[error]]
+code = "RS-2023"
+key = "window.hop_state_overflow"
+title = "Hop window state exceeded its configured overlap-aware bound"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce hop overlap, increase HOP_WINDOW_STATE_LIMIT, or shard the windowed stream more finely."
+doc_anchor = "rs-2023"
+
+[[error]]
+code = "RS-2024"
+key = "window.session_state_overflow"
+title = "Session window state exceeded its configured open-session bound"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce session cardinality, increase SESSION_WINDOW_STATE_LIMIT, or shard the windowed stream more finely."
+doc_anchor = "rs-2024"
+
+[[error]]
+code = "RS-2025"
+key = "query.query_time_result_set_too_large"
+title = "Query-time DataFusion source scan exceeded its configured bounded row/byte budget"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Reduce source-table cardinality, add a LIMIT, or materialize the query into a view."
+doc_anchor = "rs-2025"
+
+[[error]]
+code = "RS-2026"
+key = "query.query_time_execution_failed"
+title = "Query-time DataFusion planning or execution failed for an ad hoc query"
+severity = "Error"
+sqlstate = "0A000"
+retry_class = "NonRetryable"
+default_next_steps = "Simplify the query, validate referenced table/view schemas, or materialize the query into a view."
+doc_anchor = "rs-2026"
+
+[[error]]
+code = "RS-2027"
+key = "index.backfill_row_limit_exceeded"
+title = "CREATE INDEX automatic backfill scan exceeded its configured bounded row budget"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Reduce table cardinality before indexing, or drop and recreate the index once the table is smaller."
+doc_anchor = "rs-2027"
+
+[[error]]
+code = "RS-2028"
+key = "query.query_time_scatter_topology_unavailable"
+title = "Late-data side-channel queue reached its configured bound / scatter topology unavailable"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Drain the configured late-data sink, reduce late-event volume, or increase TUMBLE_WINDOW_LATE_ROUTE_LIMIT after verifying available capacity."
+doc_anchor = "rs-2028"
+
+[[error]]
+code = "RS-2029"
+key = "query.scatter_budget_exceeded"
+title = "Query-time scatter scan exceeded pathological row/byte budget"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Narrow the predicate, add a LIMIT, or materialize the query into a view."
+doc_anchor = "rs-2029"
+
+[[error]]
+code = "RS-2030"
+key = "ivm.factor_payload_overflow"
+title = "Factorized payload exceeded its configured row or byte bound / scatter frontier mismatch"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Reduce join fan-out, increase the factor payload bound after capacity review, or use the classic join path."
+doc_anchor = "rs-2030"
+
+[[error]]
+code = "RS-2040"
+key = "limit.result_set_too_large"
+title = "Result set exceeded max_in_flight_rows bound"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Add a LIMIT clause or paginate using cursors."
+doc_anchor = "rs-2040"
+
+[[error]]
+code = "RS-2050"
+key = "query.cancelled"
+title = "Query was cancelled by a client CancelRequest"
+severity = "Error"
+sqlstate = "57014"
+retry_class = "Immediate"
+default_next_steps = "Retry the query or adjust client timeout settings."
+doc_anchor = "rs-2050"
+
+[[error]]
+code = "RS-2051"
+key = "cursor.not_found"
+title = "Cursor does not exist"
+severity = "Error"
+sqlstate = "34000"
+retry_class = "NonRetryable"
+default_next_steps = "Use DECLARE to open a cursor before FETCH/MOVE/CLOSE."
+doc_anchor = "rs-2051"
+
+[[error]]
+code = "RS-2052"
+key = "cursor.already_exists"
+title = "Cursor already exists or cursor limit exceeded"
+severity = "Error"
+sqlstate = "42P03"
+retry_class = "NonRetryable"
+default_next_steps = "CLOSE the existing cursor or use a different name."
+doc_anchor = "rs-2052"
+
+[[error]]
+code = "RS-2053"
+key = "limit.memory_limit_exceeded"
+title = "Per-connection memory limit exceeded"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Close unused cursors, reduce result set sizes, or split the query."
+doc_anchor = "rs-2053"
+
+[[error]]
+code = "RS-2054"
+key = "query.statement_timeout"
+title = "Query exceeded the configured statement timeout"
+severity = "Error"
+sqlstate = "57014"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Increase statement_timeout or optimize the query."
+doc_anchor = "rs-2054"
+
+[[error]]
+code = "RS-2055"
+key = "limit.connection_limit_exceeded"
+title = "Server-wide connection limit reached"
+severity = "Error"
+sqlstate = "53300"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Close idle connections or increase max_connections."
+doc_anchor = "rs-2055"
+
+[[error]]
+code = "RS-2056"
+key = "write.malformed_values_list"
+title = "Malformed INSERT VALUES list or schema mismatch"
+severity = "Error"
+sqlstate = "42601"
+retry_class = "NonRetryable"
+default_next_steps = "Ensure every VALUES row has matching parenthesis and correct column count."
+doc_anchor = "rs-2056"
+
+[[error]]
+code = "RS-2060"
+key = "write.epoch_exhausted"
+title = "Commit epoch reached u64::MAX"
+severity = "Fatal"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Create a new shard before retrying."
+doc_anchor = "rs-2060"
+
+[[error]]
+code = "RS-2400"
+key = "auth.unauthenticated"
+title = "Unauthenticated: request missing or carrying invalid credentials"
+severity = "Error"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Provide valid credentials (Bearer token or mTLS certificate)"
+doc_anchor = "rs-2400"
+
+[[error]]
+code = "RS-2401"
+key = "auth.permission_denied"
+title = "Permission denied: authenticated principal lacks required RBAC role"
+severity = "Error"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Request elevated RBAC role from an admin or contact the namespace owner"
+doc_anchor = "rs-2401"
+
+[[error]]
+code = "RS-2402"
+key = "auth.namespace_access_denied"
+title = "Namespace access denied: cross-namespace access attempt by non-admin principal"
+severity = "Error"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Switch to the correct namespace with SET search_path or request cross-namespace admin role"
+doc_anchor = "rs-2402"
+
+[[error]]
+code = "RS-2403"
+key = "auth.mtls_requires_ca_cert"
+title = "--auth=mtls configured without tls_ca_cert_path; gateway refused to start"
+severity = "Fatal"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Set --tls-ca-cert-path (or gateway.tls_ca_cert_path in rockstream.toml) to the CA that signs client certificates."
+doc_anchor = "rs-2403"
+
+[[error]]
+code = "RS-2404"
+key = "auth.mtls_no_verified_cert"
+title = "mTLS connection has no verified client certificate CN for its peer address"
+severity = "Fatal"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Connect with a client certificate signed by the configured CA over sslmode=verify-full; a bare TCP or TLS connection without a client cert cannot use --auth=mtls."
+doc_anchor = "rs-2404"
+
+[[error]]
+code = "RS-2405"
+key = "auth.tls_config_invalid"
+title = "Gateway TLS certificate/key/CA material failed to load or parse"
+severity = "Fatal"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Verify the configured paths point to valid PEM-encoded certificate/key files readable by the gateway process."
+doc_anchor = "rs-2405"
+
+[[error]]
+code = "RS-2406"
+key = "auth.mtls_connection_cap_exceeded"
+title = "mTLS handshake rejected: connection identity map is at capacity"
+severity = "Error"
+sqlstate = "53300"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce concurrent connections or raise MAX_CONNECTIONS. The gateway rejected the handshake to avoid silently dropping the peer identity."
+doc_anchor = "rs-2406"
+
+[[error]]
+code = "RS-2410"
+key = "auth.internal_mtls_required"
+title = "Internal mTLS connection rejected: client certificate required"
+severity = "Fatal"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Configure internal TLS client certificates (--internal-tls-cert-path, --internal-tls-key-path, --internal-tls-ca-cert-path) so the node can authenticate with the cluster."
+doc_anchor = "rs-2410"
+
+[[error]]
+code = "RS-2411"
+key = "auth.internal_mtls_invalid_cert"
+title = "Internal mTLS client certificate invalid, expired, or signed by an untrusted CA"
+severity = "Fatal"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Verify the internal TLS client certificate is valid, not expired, and signed by the trusted cluster CA root certificate."
+doc_anchor = "rs-2411"
+
+[[error]]
+code = "RS-2412"
+key = "auth.internal_mtls_node_identity_mismatch"
+title = "Presented client certificate node identity does not match registration payload"
+severity = "Fatal"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Ensure the node ID and role presented in the internal TLS certificate Common Name / SAN match the node registration parameters."
+doc_anchor = "rs-2412"
+
+[[error]]
+code = "RS-2413"
+key = "auth.internal_mtls_rotation_failed"
+title = "Internal mTLS certificate rotation or reload failed"
+severity = "Error"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Verify the new certificate and private key files exist, have matching keys, and are signed by a trusted CA before triggering certificate rotation."
+doc_anchor = "rs-2413"
+
+[[error]]
+code = "RS-2420"
+key = "secret.not_found"
+title = "Secret not found in secret catalog"
+severity = "Error"
+sqlstate = "42P01"
+retry_class = "NonRetryable"
+default_next_steps = "Verify the secret name or run CREATE SECRET to define it."
+doc_anchor = "rs-2420"
+
+[[error]]
+code = "RS-2421"
+key = "secret.already_exists"
+title = "Secret already exists in catalog"
+severity = "Error"
+sqlstate = "42710"
+retry_class = "NonRetryable"
+default_next_steps = "Choose a distinct secret name or run ALTER SECRET to modify the existing secret."
+doc_anchor = "rs-2421"
+
+[[error]]
+code = "RS-2422"
+key = "secret.encryption_failed"
+title = "Secret encryption or envelope DEK wrap/unwrap failed"
+severity = "Fatal"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Check KEK provider configuration and key access permissions."
+doc_anchor = "rs-2422"
+
+[[error]]
+code = "RS-2423"
+key = "secret.token_invalid"
+title = "Secret token is invalid, expired, or failed node-identity verification"
+severity = "Error"
+sqlstate = "28000"
+retry_class = "NonRetryable"
+default_next_steps = "Request a fresh secret token using valid mTLS node credentials."
+doc_anchor = "rs-2423"
+
+[[error]]
+code = "RS-2424"
+key = "secret.ddl_invalid"
+title = "Secret DDL syntax or configuration is invalid"
+severity = "Error"
+sqlstate = "42601"
+retry_class = "NonRetryable"
+default_next_steps = "Check CREATE/ALTER SECRET syntax and required options (e.g. TYPE)."
+doc_anchor = "rs-2424"
+
+[[error]]
+code = "RS-2425"
+key = "secret.rotation_failed"
+title = "Secret or KEK rotation failed"
+severity = "Fatal"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Verify the target KEK provider is reachable and active connectors are responsive."
+doc_anchor = "rs-2425"
+
+[[error]]
+code = "RS-2426"
+key = "secret.in_use_by_source_or_sink"
+title = "Secret drop rejected because it is in active use by a source or sink"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "Drop or alter referencing sources and sinks before dropping the secret."
+doc_anchor = "rs-2426"
+
+[[error]]
+code = "RS-2500"
+key = "copy.table_not_found"
+title = "COPY target table does not exist in the catalog"
+severity = "Error"
+sqlstate = "42P01"
+retry_class = "NonRetryable"
+default_next_steps = "Register the table with CREATE TABLE before using COPY FROM STDIN."
+doc_anchor = "rs-2500"
+
+[[error]]
+code = "RS-2501"
+key = "copy.column_count_mismatch"
+title = "COPY row field count does not match declared column count or invalid encoding"
+severity = "Error"
+sqlstate = "22000"
+retry_class = "NonRetryable"
+default_next_steps = "Check that the TSV row matches the column count declared in COPY or the catalog."
+doc_anchor = "rs-2501"
+
+[[error]]
+code = "RS-2560"
+key = "transaction.in_failed_sql_transaction"
+title = "Query cannot run inside a failed transaction block"
+severity = "Error"
+sqlstate = "25P02"
+retry_class = "NonRetryable"
+default_next_steps = "Issue ROLLBACK to exit the failed block, then retry."
+doc_anchor = "rs-2560"
+
+[[error]]
+code = "RS-2561"
+key = "transaction.savepoint_not_found"
+title = "Savepoint does not exist"
+severity = "Error"
+sqlstate = "3B001"
+retry_class = "NonRetryable"
+default_next_steps = "Use SAVEPOINT <name> to create one before ROLLBACK TO."
+doc_anchor = "rs-2561"
+
+[[error]]
+code = "RS-2562"
+key = "transaction.two_phase_not_supported"
+title = "PREPARE TRANSACTION / XA two-phase commit is not supported"
+severity = "Error"
+sqlstate = "0A000"
+retry_class = "NonRetryable"
+default_next_steps = "Use a single-phase COMMIT instead."
+doc_anchor = "rs-2562"
+
+[[error]]
+code = "RS-2563"
+key = "transaction.savepoint_limit_exceeded"
+title = "Per-transaction savepoint limit exceeded"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "RELEASE earlier savepoints before creating new ones."
+doc_anchor = "rs-2563"
+
+[[error]]
+code = "RS-2564"
+key = "notify.channel_limit_exceeded"
+title = "Notify channel limit exceeded"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "UNLISTEN unused channels."
+doc_anchor = "rs-2564"
+
+[[error]]
+code = "RS-2600"
+key = "limit.prepared_statements_exceeded"
+title = "Prepared statement limit exceeded for this connection"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "Immediate"
+default_next_steps = "Deallocate unused prepared statements using DEALLOCATE."
+doc_anchor = "rs-2600"
+
+[[error]]
+code = "RS-2601"
+key = "limit.portals_exceeded"
+title = "Portal limit exceeded for this connection"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "Immediate"
+default_next_steps = "Close unused portals."
+doc_anchor = "rs-2601"
+
+[[error]]
+code = "RS-3001"
+key = "storage.writer_fenced"
+title = "Shard writer fenced out: lease lost"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterLeaderElection"
+default_next_steps = "Acquire a new lease or refresh cluster leadership before retrying write."
+doc_anchor = "rs-3001"
+
+[[error]]
+code = "RS-3003"
+key = "storage.object_store_brownout"
+title = "Pipeline blocked: object store brownout, local buffer exhausted"
+severity = "Error"
+sqlstate = "53100"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce input rate or increase local_buffer_max_epochs; check object store availability."
+doc_anchor = "rs-3003"
+
+[[error]]
+code = "RS-3005"
+key = "config.self_fencing_invalid"
+title = "Self-fencing configuration invalid: self_fence_after constraint violated"
+severity = "Error"
+sqlstate = "22023"
+retry_class = "NonRetryable"
+default_next_steps = "Set self_fence_after so that: dead_after < self_fence_after < 2 × shard_recovery_budget."
+doc_anchor = "rs-3005"
+
+[[error]]
+code = "RS-3009"
+key = "storage.merge_operand_malformed"
+title = "Merge operand malformed"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Inspect the stored arrangement value; possible data corruption or law version mismatch."
+doc_anchor = "rs-3009"
+
+[[error]]
+code = "RS-3010"
+key = "storage.shuffle_io_retired"
+title = "Legacy durable shuffle error (retired, use RS-3011..3016)"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Upgrade to the granular durable shuffle error codes RS-3011 through RS-3016."
+doc_anchor = "rs-3010"
+
+[[error]]
+code = "RS-3011"
+key = "storage.durable_shuffle_rate_limit"
+title = "Durable shuffle rate-limit retry budget exhausted"
+severity = "Error"
+sqlstate = "53100"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Object store is rate-limiting requests; reduce shuffle write concurrency or request a higher rate limit/quota from the object store provider."
+doc_anchor = "rs-3011"
+
+[[error]]
+code = "RS-3012"
+key = "storage.durable_shuffle_io_failure"
+title = "Durable shuffle generic object-store I/O failure"
+severity = "Error"
+sqlstate = "53100"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Verify object store connectivity, credentials, and bucket settings."
+doc_anchor = "rs-3012"
+
+[[error]]
+code = "RS-3013"
+key = "storage.durable_shuffle_buffer_full"
+title = "Durable shuffle in-memory buffer capacity exceeded"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce per-epoch shuffle frame size or flush more frequently; increase MAX_DURABLE_BUFFER_SIZE_BYTES if the workload legitimately needs a larger buffer."
+doc_anchor = "rs-3013"
+
+[[error]]
+code = "RS-3014"
+key = "storage.durable_shuffle_footer_serialize_failed"
+title = "Durable shuffle footer serialization failed"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Report this bug with the support bundle; the index footer failed to serialize to JSON."
+doc_anchor = "rs-3014"
+
+[[error]]
+code = "RS-3015"
+key = "storage.durable_shuffle_footer_deserialize_failed"
+title = "Durable shuffle footer deserialization failed"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "The stored footer bytes are not valid JSON; the object may be corrupt or written by an incompatible version. Re-run the shuffle epoch."
+doc_anchor = "rs-3015"
+
+[[error]]
+code = "RS-3016"
+key = "storage.durable_shuffle_footer_corrupt"
+title = "Durable shuffle footer is corrupt or undersized"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "The coalesced shuffle object is truncated or its footer-length header is inconsistent with the object size; re-run the shuffle epoch or restore from a prior checkpoint."
+doc_anchor = "rs-3016"
+
+[[error]]
+code = "RS-3017"
+key = "exchange.ipc_decode_error"
+title = "Exchange IPC shuffle decode error"
+severity = "Error"
+sqlstate = "22000"
+retry_class = "NonRetryable"
+default_next_steps = "Inspect the Arrow IPC shuffle payload; possible truncation or a version mismatch between the writer and reader."
+doc_anchor = "rs-3017"
+
+[[error]]
+code = "RS-3018"
+key = "exchange.loopback_target_missing"
+title = "Exchange loopback route target shard has no active ShardDb"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterLeaderElection"
+default_next_steps = "Verify the target shard is registered and its ShardDb has been attached before routing; check shard assignment and worker startup order."
+doc_anchor = "rs-3018"
+
+[[error]]
+code = "RS-3019"
+key = "exchange.shm_segment_unavailable"
+title = "Same-host shared-memory segment unavailable; exchange fell back to the direct path"
+severity = "Warning"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Check same_host_shm_segment_bytes, same_host_shm_segments_per_peer, and host-level shared-memory permissions/capacity."
+doc_anchor = "rs-3019"
+
+[[error]]
+code = "RS-3020"
+key = "exchange.shuffle_codec_unknown"
+title = "Shuffle payload codec is unknown or decompression failed"
+severity = "Error"
+sqlstate = "22000"
+retry_class = "NonRetryable"
+default_next_steps = "Verify both peers advertise shuffle_codec_v1, inspect the payload bytes for corruption, and retry after rolling the cluster to a compatible build."
+doc_anchor = "rs-3020"
+
+[[error]]
+code = "RS-3021"
+key = "exchange.worker_locality_stale"
+title = "Worker locality metadata is missing or stale; exchange fell back to the safe route"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Check worker host_id/availability_zone registration, wait for topology refresh, or force the durable path during the rollout."
+doc_anchor = "rs-3021"
+
+[[error]]
+code = "RS-3022"
+key = "cluster.checkpoint_manifest_codec_error"
+title = "Cluster checkpoint manifest codec decode error"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Verify the control-plane capability floor, inspect the stored checkpoint manifest bytes for corruption, and finish the rolling upgrade before re-enabling manifest compression."
+doc_anchor = "rs-3022"
+
+[[error]]
+code = "RS-3023"
+key = "exchange.fast_path_frontier_read_failed"
+title = "Fast-path shuffle frontier read failed during replay dedup"
+severity = "Warning"
+sqlstate = "53100"
+retry_class = "Immediate"
+default_next_steps = "Inspect target shard storage health and the committed frontier key; the frame was delivered conservatively, so verify downstream idempotency if the shard is unhealthy."
+doc_anchor = "rs-3023"
+
+[[error]]
+code = "RS-3024"
+key = "exchange.row_budget_exceeded"
+title = "Shuffle frame row budget exceeded worker.max_rows_per_quantum"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce exchange batch size/rechunking or raise worker.max_rows_per_quantum only if the worker can safely absorb a larger in-flight row budget."
+doc_anchor = "rs-3024"
+
+[[error]]
+code = "RS-3501"
+key = "merge_law.accumulator_decode_error"
+title = "Merge-law accumulator wire bytes have the wrong size"
+severity = "Error"
+sqlstate = "22000"
+retry_class = "NonRetryable"
+default_next_steps = "Inspect the stored merge-law accumulator bytes; possible data corruption or an accumulator wire-format version mismatch."
+doc_anchor = "rs-3501"
+
+[[error]]
+code = "RS-3601"
+key = "checkpoint.alignment_buffer_overflow"
+title = "Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation."
+doc_anchor = "rs-3601"
+
+[[error]]
+code = "RS-3602"
+key = "cluster.checkpoint_recovery_in_progress"
+title = "Cluster checkpoint recovery in progress"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Wait for recovery to complete; monitor shard reassignment and frontier progress via SHOW VIEW STATUS."
+doc_anchor = "rs-3602"
+
+[[error]]
+code = "RS-3603"
+key = "cluster.freshness_recovery_slow"
+title = "Pipeline freshness recovery SLO exceeded; RECOVERING_SLOW state"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Recovery is exceeding SLO; check worker health, storage latency, and frontier progress. Escalate if recovery does not complete within expected bounds."
+doc_anchor = "rs-3603"
+
+[[error]]
+code = "RS-3604"
+key = "worker.drain_in_progress"
+title = "Worker drain in progress; new shard assignments rejected"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Wait for worker drain to complete, or target active workers for shard assignment."
+doc_anchor = "rs-3604"
+
+[[error]]
+code = "RS-3605"
+key = "cluster.skew_threshold_exceeded"
+title = "Shard load factor exceeds skew threshold; adaptive re-sharding scheduled"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Allow adaptive re-sharding to complete or manually trigger partition splitting."
+doc_anchor = "rs-3605"
+
+[[error]]
+code = "RS-3606"
+key = "worker.drain_deadline_exceeded"
+title = "Worker drain deadline exceeded; worker self-fenced"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Investigate slow network/compaction preventing worker from draining; review worker logs."
+doc_anchor = "rs-3606"
+
+[[error]]
+code = "RS-3607"
+key = "schema.blue_green_required"
+title = "Schema change requires blue/green clone; in-place apply rejected"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "Perform a zero-downtime view replacement using a blue/green deployment strategy."
+doc_anchor = "rs-3607"
+
+[[error]]
+code = "RS-3608"
+key = "view.clone_already_in_progress"
+title = "A blue/green clone operation is already in progress for this view"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Wait for the existing clone backfill to finish before starting a new one."
+doc_anchor = "rs-3608"
+
+[[error]]
+code = "RS-3609"
+key = "view.clone_backfill_lag_exceeded"
+title = "Clone backfill lag exceeded the allowed threshold before flip"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Reduce write load or check worker resource usage to allow backfill to catch up before flip."
+doc_anchor = "rs-3609"
+
+[[error]]
+code = "RS-3610"
+key = "worker.drain_target_not_found"
+title = "Worker drain target does not exist in the current topology"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Verify target worker ID exists in active cluster topology before initiating drain."
+doc_anchor = "rs-3610"
+
+[[error]]
+code = "RS-3611"
+key = "worker.no_active_drain_recipient"
+title = "Worker drain cannot proceed because no active recipient worker is available"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Ensure at least one active recipient worker is online before initiating drain."
+doc_anchor = "rs-3611"
+
+[[error]]
+code = "RS-3612"
+key = "worker.drain_queue_capacity_reached"
+title = "Worker drain queue reached its configured bound; backpressure applied"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Wait for in-flight shard drain tasks to complete before enqueueing additional assignments."
+doc_anchor = "rs-3612"
+
+[[error]]
+code = "RS-3701"
+key = "view.waiting_on_source"
+title = "View is waiting on source/frontier progress"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Check source/frontier health and producer lag; verify watermark advancement for the upstream source."
+doc_anchor = "rs-3701"
+
+[[error]]
+code = "RS-3702"
+key = "view.quota_admission_rejected"
+title = "View admission rejected by quota controls"
+severity = "Warning"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce state pressure, free quota in competing workloads, or adjust admission and memory budgets before retrying."
+doc_anchor = "rs-3702"
+
+[[error]]
+code = "RS-3703"
+key = "view.spilling"
+title = "View lag is dominated by spill delay"
+severity = "Warning"
+sqlstate = "53100"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce spill pressure by lowering hot-key skew, increasing memory budget, or reducing ingest burst size."
+doc_anchor = "rs-3703"
+
+[[error]]
+code = "RS-3704"
+key = "view.over_budget_relaxed"
+title = "View is in over-budget relaxed mode"
+severity = "Warning"
+sqlstate = "53200"
+retry_class = "NonRetryable"
+default_next_steps = "Reduce view memory usage or increase workload memory limit so the view can exit relaxed mode."
+doc_anchor = "rs-3704"
+
+[[error]]
+code = "RS-3705"
+key = "view.checkpoint_alignment_stalled"
+title = "View checkpoint alignment is stalled"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Inspect checkpoint barrier holders and slow shards; resolve stalled operators before retrying."
+doc_anchor = "rs-3705"
+
+[[error]]
+code = "RS-3706"
+key = "view.sink_blocked"
+title = "View sink commit path is blocked"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Check sink connectivity/commit latency and transactional backpressure; recover sink health before retrying."
+doc_anchor = "rs-3706"
+
+[[error]]
+code = "RS-3707"
+key = "view.topology_transition_in_progress"
+title = "View topology transition is in progress"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Wait for migration/drain to complete, or inspect topology transition progress and blocked shard ownership."
+doc_anchor = "rs-3707"
+
+[[error]]
+code = "RS-3708"
+key = "view.recovering"
+title = "View is recovering from checkpoint/reassignment work"
+severity = "Warning"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Wait for recovery to complete; monitor checkpoint and shard reassignment progress via SHOW VIEW STATUS."
+doc_anchor = "rs-3708"
+
+[[error]]
+code = "RS-4001"
+key = "source.connection_failed"
+title = "Source connection failed or table already exists"
+severity = "Error"
+sqlstate = "42710"
+retry_class = "NonRetryable"
+default_next_steps = "Verify source connection settings and network connectivity."
+doc_anchor = "rs-4001"
+
+[[error]]
+code = "RS-4002"
+key = "sink.write_failed"
+title = "Sink write failed"
+severity = "Error"
+sqlstate = "53100"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Check sink availability and credentials."
+doc_anchor = "rs-4002"
+
+[[error]]
+code = "RS-4003"
+key = "sink.pre_commit_failed"
+title = "Sink 2PC pre-commit failed; epoch not staged"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Retry the epoch; check sink connector health and connectivity."
+doc_anchor = "rs-4003"
+
+[[error]]
+code = "RS-4004"
+key = "sink.commit_failed"
+title = "Sink 2PC commit failed after pre-commit; recovery required"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Trigger manual recovery or restart the connector; check sink idempotency profile."
+doc_anchor = "rs-4004"
+
+[[error]]
+code = "RS-4005"
+key = "sink.duplicate_delivery"
+title = "Sink 2PC duplicate delivery detected and suppressed"
+severity = "Info"
+sqlstate = "00000"
+retry_class = "Immediate"
+default_next_steps = "This is informational; the duplicate was suppressed. Check the source for duplicate delivery."
+doc_anchor = "rs-4005"
+
+[[error]]
+code = "RS-4006"
+key = "source.epoch_registry_full"
+title = "Source-epoch registry full; too many uncommitted epochs in flight"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce source epoch rate or increase max_in_flight_source_epochs."
+doc_anchor = "rs-4006"
+
+[[error]]
+code = "RS-4007"
+key = "sink.ddl_invalid"
+title = "CREATE SINK DDL parse or validation failed"
+severity = "Error"
+sqlstate = "42601"
+retry_class = "NonRetryable"
+default_next_steps = "Check CREATE SINK syntax, referenced view name, and WITH option types; use catalog=filesystem|glue|rest|hive|ducklake."
+doc_anchor = "rs-4007"
+
+[[error]]
+code = "RS-4008"
+key = "source.ddl_invalid"
+title = "CREATE SOURCE DDL parse or validation failed"
+severity = "Error"
+sqlstate = "42601"
+retry_class = "NonRetryable"
+default_next_steps = "Check CREATE SOURCE syntax, connector options, and source credentials."
+doc_anchor = "rs-4008"
+
+[[error]]
+code = "RS-4009"
+key = "source.not_found"
+title = "Source not found"
+severity = "Error"
+sqlstate = "42P01"
+retry_class = "NonRetryable"
+default_next_steps = "Check the source name and ensure it has been created."
+doc_anchor = "rs-4009"
+
+[[error]]
+code = "RS-4010"
+key = "source.already_exists"
+title = "Source already exists"
+severity = "Error"
+sqlstate = "42710"
+retry_class = "NonRetryable"
+default_next_steps = "Use a different source name or drop the existing source first."
+doc_anchor = "rs-4010"
+
+[[error]]
+code = "RS-4011"
+key = "postgres_cdc.recovery_required"
+title = "PostgreSQL CDC replication cannot proceed without recovery"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Repair the PostgreSQL slot or publication, then run the bounded resnapshot workflow."
+doc_anchor = "rs-4011"
+
+[[error]]
+code = "RS-4012"
+key = "source.owner_recovery_required"
+title = "Source owner registration requires checkpoint recovery"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Run checkpoint recovery before registering the source owner, then retry owner registration."
+doc_anchor = "rs-4012"
+
+[[error]]
+code = "RS-4013"
+key = "postgres_cdc.protocol_error"
+title = "PostgreSQL CDC protocol or ownership validation failed"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "Validate pgoutput protocol, source identity, slot ownership, and durable routing before retrying."
+doc_anchor = "rs-4013"
+
+[[error]]
+code = "RS-4014"
+key = "source.bounds_exceeded"
+title = "Source bounded in-flight capacity was exceeded"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Drain the source or reduce transaction and epoch size before increasing the configured bound."
+doc_anchor = "rs-4014"
+
+[[error]]
+code = "RS-4015"
+key = "source.fence_mismatch"
+title = "Source checkpoint fence did not advance monotonically"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Recover the highest committed source checkpoint and retry with the next fenced epoch."
+doc_anchor = "rs-4015"
+
+[[error]]
+code = "RS-4016"
+key = "source.acknowledgement_failed"
+title = "Source checkpoint acknowledgement failed"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Retain source ownership, recover the committed checkpoint, and retry upstream acknowledgement."
+doc_anchor = "rs-4016"
+
+[[error]]
+code = "RS-4017"
+key = "connector.removed"
+title = "Connector has been removed"
+severity = "Error"
+sqlstate = "0A000"
+retry_class = "NonRetryable"
+default_next_steps = "Use an external loader through pgwire or Kafka for S3 input, an external HTTP-to-Kafka (or HTTP-to-PostgreSQL) adapter for webhooks, or RockStream to Kafka to a downstream writer for sink output."
+doc_anchor = "rs-4017"
+
+[[error]]
+code = "RS-4018"
+key = "source.epoch_exhausted"
+title = "Source epoch exhausted"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Create a new connector before retrying."
+doc_anchor = "rs-4018"
+
+[[error]]
+code = "RS-4019"
+key = "source.backfill_cursor_invalid"
+title = "Source backfill cursor or lifecycle is invalid"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Recover or recreate the committed backfill cursor or lifecycle, then retry."
+doc_anchor = "rs-4019"
+
+[[error]]
+code = "RS-4020"
+key = "backfill.live_delta_buffer_full"
+title = "Backfill live-delta buffer is full"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Wait for snapshot catch-up or reduce live-delta volume before retrying."
+doc_anchor = "rs-4020"
+
+[[error]]
+code = "RS-4021"
+key = "backfill.admission_rejected"
+title = "Backfill admission reservation rejected"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Wait for a backfill to finish or reduce BACKFILL_LIVE_DELTA_MAX_BYTES before retrying."
+doc_anchor = "rs-4021"
+
+[[error]]
+code = "RS-4022"
+key = "backfill.not_published"
+title = "Materialized view backfill is not published"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Run SHOW BACKFILL STATUS and retry after the materialized view reaches RUNNING, or create it first."
+doc_anchor = "rs-4022"
+
+[[error]]
+code = "RS-4029"
+key = "quota.backpressure_refusal"
+title = "Quota or backpressure refusal during ingestion burst"
+severity = "Warning"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce ingestion rate or increase quota allocation."
+doc_anchor = "rs-4029"
+
+[[error]]
+code = "RS-5001"
+key = "storage.incompatible_format"
+title = "Incompatible storage format"
+severity = "Fatal"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "Run rockstream migrate --from=N --to=M --storage=<url> before upgrading the binary."
+doc_anchor = "rs-5001"
+
+[[error]]
+code = "RS-5002"
+key = "arrangement.unknown_merge_law"
+title = "Unknown merge law in arrangement header"
+severity = "Fatal"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Register the merge law or migrate the arrangement before attaching the shard."
+doc_anchor = "rs-5002"
+
+[[error]]
+code = "RS-5003"
+key = "legacy.validation_failure"
+title = "Legacy validation failure"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Inspect the failing component and its version-specific validation guidance."
+doc_anchor = "rs-5003"
+
+[[error]]
+code = "RS-5004"
+key = "quota.counter_overflow"
+title = "Quota counter overflow detected"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Release quota or create a new workload before requesting additional capacity."
+doc_anchor = "rs-5004"
+
+[[error]]
+code = "RS-5018"
+key = "resource.budget_warning_80"
+title = "Resource usage budget warning (80% threshold reached)"
+severity = "Warning"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Examine view resource usage and plan to scale out cluster capacity or adjust memory limits."
+doc_anchor = "rs-5018"
+
+[[error]]
+code = "RS-5019"
+key = "resource.budget_critical_95"
+title = "Resource usage budget critical (95% threshold reached)"
+severity = "Warning"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Immediately free unused view resources or scale cluster capacity to prevent pipeline stalls."
+doc_anchor = "rs-5019"
+
+[[error]]
+code = "RS-5021"
+key = "wire.version_not_supported"
+title = "Wire protocol version not supported; rolling upgrade version skew"
+severity = "Fatal"
+sqlstate = "08006"
+retry_class = "NonRetryable"
+default_next_steps = "Use a peer with an overlapping protocol range, or finish the rolling upgrade before retrying."
+doc_anchor = "rs-5021"
+
+[[error]]
+code = "RS-5022"
+key = "storage.latency_budget_breach"
+title = "Object store latency or amplification budget breach"
+severity = "Warning"
+sqlstate = "53100"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Check object store performance, batch sizes, and write amplification."
+doc_anchor = "rs-5022"
+
+[[error]]
+code = "RS-5023"
+key = "window.partition_too_large"
+title = "Window partition size exceeded skew warning threshold"
+severity = "Warning"
+sqlstate = "01000"
+retry_class = "NonRetryable"
+default_next_steps = "Add partition keys to distribute window load across shards."
+doc_anchor = "rs-5023"
+
+[[error]]
+code = "RS-5030"
+key = "migration.illegal_state_transition"
+title = "Illegal shard-migration state transition rejected"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "NonRetryable"
+default_next_steps = "Drive the migration through the documented next state only, or resume from the persisted record instead of forcing a skipped state."
+doc_anchor = "rs-5030"
+
+[[error]]
+code = "RS-5031"
+key = "migration.verify_scan_window_full"
+title = "Shard-migration verify scan window exceeded its configured bound"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce verify_sample_rate, split the migration into fewer buckets, or increase the configured verify scan bound if memory headroom allows."
+doc_anchor = "rs-5031"
+
+[[error]]
+code = "RS-5032"
+key = "migration.bucket_map_version_mismatch"
+title = "Shard-migration bucket-map version or watcher acknowledgement mismatch"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "Immediate"
+default_next_steps = "Wait for every reader, exchange receiver, and gateway to observe the new bucket_map_version, then retry the migration step under the current version."
+doc_anchor = "rs-5032"
+
+[[error]]
+code = "RS-5033"
+key = "migration.reclamation_not_safe"
+title = "Donor reclamation is not frontier-safe in current state"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Wait for migration state machine to advance to a safe reclamation state."
+doc_anchor = "rs-5033"
+
+[[error]]
+code = "RS-5034"
+key = "migration.verification_divergence"
+title = "Migration verification divergence detected for key"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "AfterClusterRecovery"
+default_next_steps = "Inspect donor and recipient shard state; reconcile divergent keys."
+doc_anchor = "rs-5034"
+
+[[error]]
+code = "RS-5035"
+key = "skew.slo_cannot_be_met"
+title = "Skew-bound SLO cannot be met without composable partial-state splitting"
+severity = "Error"
+sqlstate = "54000"
+retry_class = "NonRetryable"
+default_next_steps = "Add composable partial-state semantics for this operator, reduce the hot key's skew at the source, or route the workload to a spill-shard plan that can tolerate the SLO miss."
+doc_anchor = "rs-5035"
+
+[[error]]
+code = "RS-5036"
+key = "skew.non_composable_hot_key"
+title = "Non-composable hot key routed to a single spill shard"
+severity = "Warning"
+sqlstate = "01000"
+retry_class = "NonRetryable"
+default_next_steps = "Keep the hot key on a single spill shard, watch that shard's pressure, and switch to a composable law before enabling virtual-bucket splitting for this workload."
+doc_anchor = "rs-5036"
+
+[[error]]
+code = "RS-6001"
+key = "schema.upstream_evolution_detected"
+title = "Incompatible upstream schema evolution detected"
+severity = "Warning"
+sqlstate = "42804"
+retry_class = "NonRetryable"
+default_next_steps = "Apply view replacement or run manual migration to match the new upstream schema."
+doc_anchor = "rs-6001"
+
+[[error]]
+code = "RS-8001"
+key = "frontier.aggregator_registry_full"
+title = "Frontier aggregator shard registry is full; new shard reports rejected"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Scale out frontier aggregators (add more nodes with --role=frontier) or reduce shard count below the configured limit."
+doc_anchor = "rs-8001"
+
+[[error]]
+code = "RS-8002"
+key = "frontier.stale_fence_token"
+title = "Stale fencing token on frontier-aggregator publisher-lease CAS or publish"
+severity = "Error"
+sqlstate = "55000"
+retry_class = "AfterLeaderElection"
+default_next_steps = "Re-acquire the publisher lease under the current fence token before retrying; this aggregator has been fenced out by a newer publisher."
+doc_anchor = "rs-8002"
+
+[[error]]
+code = "RS-8003"
+key = "frontier.sync_flush_violation"
+title = "Sync-flush-before-lease-handoff-read violation on frontier publication"
+severity = "Error"
+sqlstate = "XX000"
+retry_class = "NonRetryable"
+default_next_steps = "Verify every publish_frontier write path uses WriteOptions { await_durable: true }; this indicates a durability regression in FrontierLeaseStore."
+doc_anchor = "rs-8003"
+
+[[error]]
+code = "RS-9001"
+key = "admission.capacity_request_rejected"
+title = "Admission control rejected the capacity request"
+severity = "Error"
+sqlstate = "53200"
+retry_class = "ExponentialBackoff"
+default_next_steps = "Reduce the requesting workload's demand, raise the cluster state budget, or lower the priority of contending workloads so admission control can pause them."
+doc_anchor = "rs-9001"
