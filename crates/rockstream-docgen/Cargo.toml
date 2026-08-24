@@ -1,0 +1,34 @@
+[package]
+name = "rockstream-docgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Product surface manifest generator and contract verification engine (DOC-001)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rockstream-docgen"
+path = "src/main.rs"
+
+[dependencies]
+rockstream-types = { workspace = true }
+rockstream-cli = { workspace = true }
+rockstream-runtime = { workspace = true }
+rockstream-sql = { workspace = true }
+rockstream-ops = { workspace = true }
+rockstream-gateway = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rockstream-test-support = { workspace = true }
+tokio = { workspace = true }

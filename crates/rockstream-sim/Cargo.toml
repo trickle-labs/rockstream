@@ -47,3 +47,4 @@ tonic = { workspace = true }
 tokio-postgres = { workspace = true }
 futures = { workspace = true }
 rockstream-cli = { workspace = true }
+rockstream-docgen = { workspace = true }

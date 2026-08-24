@@ -1,0 +1,674 @@
+[contract]
+version = "0.59.13"
+roadmap = "DOC-001"
+description = "Authoritative SQL Type Compatibility and Operation Contract Matrix"
+
+[[type]]
+name = "INT2"
+family = "exact_integer"
+aliases = ["SMALLINT", "INT2"]
+description = "Signed two-byte integer"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Core"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Core"
+
+[[type.operations]]
+operation = "bitwise"
+status = "Core"
+
+[[type.operations]]
+operation = "comparison"
+status = "Core"
+
+[[type.operations]]
+operation = "dml"
+status = "Core"
+
+[[type.operations]]
+operation = "joins"
+status = "Core"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Core"
+
+[[type.operations]]
+operation = "windows"
+status = "Core"
+
+[[type]]
+name = "INT4"
+family = "exact_integer"
+aliases = ["INT", "INTEGER", "INT4"]
+description = "Signed four-byte integer"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Core"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Core"
+
+[[type.operations]]
+operation = "bitwise"
+status = "Core"
+
+[[type.operations]]
+operation = "comparison"
+status = "Core"
+
+[[type.operations]]
+operation = "dml"
+status = "Core"
+
+[[type.operations]]
+operation = "joins"
+status = "Core"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Core"
+
+[[type.operations]]
+operation = "windows"
+status = "Core"
+
+[[type]]
+name = "INT8"
+family = "exact_integer"
+aliases = ["BIGINT", "INT8"]
+description = "Signed eight-byte integer"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Core"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Core"
+
+[[type.operations]]
+operation = "bitwise"
+status = "Core"
+
+[[type.operations]]
+operation = "comparison"
+status = "Core"
+
+[[type.operations]]
+operation = "dml"
+status = "Core"
+
+[[type.operations]]
+operation = "joins"
+status = "Core"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Core"
+
+[[type.operations]]
+operation = "windows"
+status = "Core"
+
+[[type]]
+name = "FLOAT4"
+family = "floating_point"
+aliases = ["REAL", "FLOAT4"]
+description = "Single-precision four-byte floating-point number"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Supported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+rejection_code = "RS-1019"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "FLOAT8"
+family = "floating_point"
+aliases = ["DOUBLE PRECISION", "FLOAT8"]
+description = "Double-precision eight-byte floating-point number"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Supported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+rejection_code = "RS-1019"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "NUMERIC"
+family = "decimal"
+aliases = ["DECIMAL", "NUMERIC"]
+description = "Arbitrary-precision fixed-point number"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Supported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "DECIMAL"
+family = "decimal"
+aliases = ["DEC", "DECIMAL"]
+description = "Exact decimal precision number"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Supported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "BOOLEAN"
+family = "boolean"
+aliases = ["BOOL", "BOOLEAN"]
+description = "Logical boolean (true/false/null)"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "TEXT"
+family = "character_string"
+aliases = ["STRING", "TEXT"]
+description = "Variable-length character string without limit"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "VARCHAR"
+family = "character_string"
+aliases = ["CHARACTER VARYING", "VARCHAR"]
+description = "Variable-length character string with length constraint"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "BYTEA"
+family = "binary"
+aliases = ["BLOB", "BYTEA"]
+description = "Binary octet string sequence"
+
+[[type.operations]]
+operation = "aggregates"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "arithmetic"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "DATE"
+family = "temporal"
+aliases = ["CALENDAR_DATE", "DATE"]
+description = "Calendar date (year, month, day)"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Supported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "TIMESTAMP"
+family = "temporal"
+aliases = ["TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP"]
+description = "Date and time without time zone"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Supported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "TIMESTAMPTZ"
+family = "temporal"
+aliases = ["TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ"]
+description = "Date and time with UTC time zone"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Supported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "INTERVAL"
+family = "temporal"
+aliases = ["TIME INTERVAL", "INTERVAL"]
+description = "Time span / duration delta"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+status = "Supported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+rejection_code = "RS-1021"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "UUID"
+family = "uuid"
+aliases = ["GUID", "UUID"]
+description = "Universally unique identifier 128-bit"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"
+
+[[type]]
+name = "ARRAY"
+family = "array"
+aliases = ["LIST", "T[]", "ARRAY"]
+description = "Homogeneous element sequence array"
+
+[[type.operations]]
+operation = "aggregates"
+status = "Supported"
+
+[[type.operations]]
+operation = "arithmetic"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "bitwise"
+rejection_code = "RS-1012"
+status = "Unsupported"
+
+[[type.operations]]
+operation = "comparison"
+status = "Supported"
+
+[[type.operations]]
+operation = "dml"
+status = "Supported"
+
+[[type.operations]]
+operation = "joins"
+status = "Supported"
+
+[[type.operations]]
+operation = "parameter_binding"
+status = "Supported"
+
+[[type.operations]]
+operation = "windows"
+status = "Supported"

@@ -4955,7 +4955,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-cli"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "arrow",
  "clap",
@@ -4985,7 +4985,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-connectors"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5016,7 +5016,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-control"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "async-trait",
  "base64",
@@ -5061,7 +5061,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-diff"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "rockstream-plan",
  "rockstream-types",
@@ -5070,8 +5070,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "rockstream-docgen"
+version = "0.59.13"
+dependencies = [
+ "chrono",
+ "clap",
+ "rockstream-cli",
+ "rockstream-gateway",
+ "rockstream-ops",
+ "rockstream-runtime",
+ "rockstream-sql",
+ "rockstream-test-support",
+ "rockstream-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "rockstream-fuzz"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5086,7 +5108,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-gateway"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5143,7 +5165,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-ops"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5178,7 +5200,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-oracle"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5211,7 +5233,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-plan"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "rockstream-types",
  "serde",
@@ -5220,7 +5242,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-runtime"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -5268,7 +5290,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sim"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5283,6 +5305,7 @@ dependencies = [
  "rockstream-cli",
  "rockstream-connectors",
  "rockstream-control",
+ "rockstream-docgen",
  "rockstream-gateway",
  "rockstream-ops",
  "rockstream-oracle",
@@ -5305,7 +5328,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sql"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5338,7 +5361,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-storage"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5370,7 +5393,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-test-support"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "rcgen",
  "rockstream-types",
@@ -5382,7 +5405,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-types"
-version = "0.59.12"
+version = "0.59.13"
 dependencies = [
  "antichain",
  "arrow",

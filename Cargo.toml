@@ -5,6 +5,7 @@ members = [
     "crates/rockstream-connectors",
     "crates/rockstream-control",
     "crates/rockstream-diff",
+    "crates/rockstream-docgen",
     "crates/rockstream-gateway",
     "crates/rockstream-ops",
     "crates/rockstream-oracle",
@@ -23,7 +24,7 @@ overflow-checks = true
 strip = "symbols"
 
 [workspace.package]
-version = "0.59.12"
+version = "0.59.13"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -95,6 +96,7 @@ rockstream-cli = { path = "crates/rockstream-cli" }
 rockstream-connectors = { path = "crates/rockstream-connectors" }
 rockstream-control = { path = "crates/rockstream-control" }
 rockstream-diff = { path = "crates/rockstream-diff" }
+rockstream-docgen = { path = "crates/rockstream-docgen" }
 rockstream-gateway = { path = "crates/rockstream-gateway" }
 rockstream-ops = { path = "crates/rockstream-ops" }
 rockstream-oracle = { path = "crates/rockstream-oracle" }
