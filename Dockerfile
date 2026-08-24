@@ -7,7 +7,7 @@ RUN cargo build --release --bin rockstream
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.title="rockstream" \
       org.opencontainers.image.description="RockStream incremental view maintenance engine" \
-      org.opencontainers.image.version="0.59.7" \
+      org.opencontainers.image.version="0.59.8" \
       org.opencontainers.image.revision="main" \
       org.opencontainers.image.created="2026-08-18T12:00:00Z" \
       org.opencontainers.image.source="https://github.com/trickle-labs/rockstream" \
