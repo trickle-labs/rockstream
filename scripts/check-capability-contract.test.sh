@@ -99,9 +99,18 @@ printf '%s\n' \
   >> "$TMP_ROOT/capabilities.toml"
 run_bad "unknown connector"
 
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); p.write_text(s.replace("proof_levels_achieved = [\"L0\", \"L1\", \"L2\", \"L3\", \"L5\"]\nmin_proof_level = [\"L0\", \"L1\", \"L2\", \"L3\", \"L5\"]\ndocumentation = \"docs/language-features.md#implemented-today\"\nbehavior = [\n  { behavior = \"incremental\", statement = \"INSERT, UPDATE,", "proof_levels_achieved = [\"L0\", \"L1\", \"L2\", \"L3\"]\nmin_proof_level = [\"L0\", \"L1\", \"L2\", \"L3\", \"L5\"]\ndocumentation = \"docs/language-features.md#implemented-today\"\nbehavior = [\n  { behavior = \"incremental\", statement = \"INSERT, UPDATE,", 1))'
+run_bad "missing_proof_level_is_rejected" "missing required proof level"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
+if ! python3 "$ROOT/scripts/check-capability-contract.py" "$ROOT" >"$OUT" 2>&1; then
+  cat "$OUT"
+  fail "unmodified tree failed the capability contract check without --full-semantics"
+fi
+
 if ! bash "$CHECKER" >"$OUT" 2>&1; then
   cat "$OUT"
-  fail "unmodified tree failed the capability contract check"
+  fail "unmodified tree failed the capability contract check with --full-semantics"
 fi
 
 echo "OK: check-capability-contract.sh self-test passed."

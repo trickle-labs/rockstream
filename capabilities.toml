@@ -93,6 +93,8 @@ tier = "Core"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_dml_tests.rs::test_create_view_and_select"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
   { behavior = "incremental", statement = "A committed row delta is reflected in the same SELECT transcript as the corresponding source change.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_query_read_incremental" },
@@ -110,6 +112,8 @@ tier = "Core"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering"]
 proof = "crates/rockstream-sql/tests/tpch_plans.rs::tpch_q6_filter_aggregate_no_join"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
   { behavior = "incremental", statement = "Scalar expressions are recomputed for each changed input row and preserve the exact projected transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_scalar_incremental" },
@@ -171,6 +175,8 @@ tier = "Core"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "view_dispatch", "plan_compilation"]
 proof = "crates/rockstream-sql/tests/lfs_catalog.rs::test_5_level_view_chain_convergence"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
   { behavior = "incremental", statement = "View-on-view deltas propagate through the dependency DAG once and preserve the downstream transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_view_dag_incremental" },
@@ -188,6 +194,8 @@ tier = "Core"
 reachability = "SUBSCRIBE over pgwire"
 dispatch = ["query_async_entry", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_pgwire_dispatch"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
   { behavior = "incremental", statement = "SUBSCRIBE emits the snapshot followed by each committed delta in order.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_incremental", paired_proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_subscribe_pgwire_dispatch" },
@@ -205,6 +213,8 @@ tier = "Core"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "query_sync_entry", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_proof_tests.rs::write_fence_token_can_be_used_by_another_session_via_after_fence"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
   { behavior = "incremental", statement = "Freshness controls make committed writes visible according to the session fence.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_freshness_incremental" },
@@ -222,6 +232,8 @@ tier = "Core"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "plan_compilation", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_dml_tests.rs::test_update_accumulates_in_write_buffer"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
   { behavior = "incremental", statement = "INSERT, UPDATE, and DELETE deltas change the materialized result exactly once.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_dml_incremental" },
@@ -239,6 +251,8 @@ tier = "Core"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "query_sync_entry", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_proof_tests.rs::explicit_idempotency_key_dedupes_multi_statement_transaction_replay"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
   { behavior = "incremental", statement = "A committed transaction applies its complete statement set atomically to the result transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_transaction_incremental" },
@@ -256,6 +270,8 @@ tier = "Core"
 reachability = "SQL over pgwire"
 dispatch = ["query_async_entry", "sql_lowering", "view_dispatch", "plan_compilation", "response_encoding"]
 proof = "crates/rockstream-gateway/tests/gateway_dml_tests.rs::test_refresh_materialized_view_roundtrip"
+proof_levels_achieved = ["L0", "L1", "L2", "L3", "L5"]
+min_proof_level = ["L0", "L1", "L2", "L3", "L5"]
 documentation = "docs/language-features.md#implemented-today"
 behavior = [
   { behavior = "incremental", statement = "View maintenance publishes each source delta to the materialized view transcript.", proof = "crates/rockstream-gateway/tests/core_operator_semantics_e2e_tests.rs::core_views_incremental" },
@@ -543,7 +559,12 @@ tier = "Core"
 reachability = "Connector runtime"
 dispatch = ["postgres_cdc_runtime"]
 proof = "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs::postgres_cdc_snapshot_stream_fence_has_exact_transcript"
+proof_levels_achieved = ["L0", "L1", "L3", "L4", "L5"]
+min_proof_level = ["L0", "L1", "L3", "L4", "L5"]
 documentation = "docs/connectors.md#postgresql-cdc"
+behavior = [
+  { behavior = "checkpoint_recovery", statement = "Each committed replication-slot LSN boundary recovers exactly the changes committed after it.", proof = "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs::postgres_cdc_each_commit_boundary_recovers_exactly_once" },
+]
 
 [[capability]]
 id = "connector.kafka-source"
@@ -553,7 +574,12 @@ tier = "Core"
 reachability = "Connector runtime"
 dispatch = ["kafka_source_runtime"]
 proof = "crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs::kafka_source_mid_epoch_rebalance_recovers_exact_transcript"
+proof_levels_achieved = ["L0", "L1", "L3", "L4", "L5"]
+min_proof_level = ["L0", "L1", "L3", "L4", "L5"]
 documentation = "docs/connectors.md#kafka-source"
+behavior = [
+  { behavior = "checkpoint_recovery", statement = "A recovered source resumes at the committed offset and observes exactly the records produced after it.", proof = "crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs::kafka_source_committed_offset_recovery_has_exact_transcript" },
+]
 
 [[capability]]
 id = "sink.kafka"
@@ -563,4 +589,9 @@ tier = "Core"
 reachability = "Connector runtime"
 dispatch = ["kafka_sink_runtime"]
 proof = "crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_crash_before_commit_has_no_visible_payload_and_recovers_exactly"
+proof_levels_achieved = ["L0", "L1", "L3", "L4", "L5"]
+min_proof_level = ["L0", "L1", "L3", "L4", "L5"]
 documentation = "docs/connectors.md#kafka-sink"
+behavior = [
+  { behavior = "checkpoint_recovery", statement = "A recovery checkpoint persisted to and restored from an object-store backend commits byte-identical output across a simulated restart, in both local and object-store backends.", proof = "crates/rockstream-connectors/tests/connector_scenario_durability_lfs_tests.rs::kafka_sink_checkpoint_restart_lfs_has_byte_identical_commit", paired_proof = "crates/rockstream-connectors/tests/connector_scenario_durability_minio_tests.rs::kafka_sink_checkpoint_restart_minio_has_byte_identical_commit" },
+]

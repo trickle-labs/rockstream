@@ -141,6 +141,28 @@ def check_external_surface(capabilities: list[dict], errors: list[str]) -> None:
             fail(errors, f"{item.get('id')} must be Core")
 
 
+def check_proof_levels(capabilities: list[dict], errors: list[str]) -> None:
+    valid_levels = {"L0", "L1", "L2", "L3", "L4", "L5"}
+    for item in capabilities:
+        if item.get("tier") != "Core":
+            continue
+        cap_id = item.get("id")
+        achieved = item.get("proof_levels_achieved")
+        minimum = item.get("min_proof_level")
+        if not isinstance(achieved, list) or not achieved:
+            fail(errors, f"{cap_id} is missing proof_levels_achieved")
+            continue
+        if not isinstance(minimum, list) or not minimum:
+            fail(errors, f"{cap_id} is missing min_proof_level")
+            continue
+        if not set(achieved) <= valid_levels or not set(minimum) <= valid_levels:
+            fail(errors, f"{cap_id} has an invalid proof level (must be one of {sorted(valid_levels)})")
+            continue
+        missing = set(minimum) - set(achieved)
+        if missing:
+            fail(errors, f"{cap_id} is missing required proof level(s): {sorted(missing)}")
+
+
 def check_promises(root: Path, promise: object, errors: list[str]) -> None:
     if not isinstance(promise, str) or not promise:
         fail(errors, "contract.promise must not be empty")
@@ -309,6 +331,7 @@ def main() -> int:
 
         check_promises(root, contract.get("promise"), errors)
     check_external_surface(capabilities, errors)
+    check_proof_levels(capabilities, errors)
     check_documented_tiers(root, capabilities, errors)
     check_generated_matrix(root, errors)
     if "--full-semantics" in arguments:

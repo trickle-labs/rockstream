@@ -107,6 +107,27 @@ pub fn fault_count() -> usize {
     GLOBAL_FAULT_MODEL.read().len()
 }
 
+/// Registers the v0.59.17 scenario-reproducibility fault-injection points
+/// into the global fault model. Idempotent: safe to call more than once
+/// (e.g. from multiple test binaries) since [`register_fault`] is only
+/// invoked the first time each ID is missing.
+pub fn register_scenario_faults() {
+    for (id, description) in [(
+        "v05917.scenario.mismatch_injection",
+        "Injects a deliberate scenario-transcript mismatch during a SimRuntime \
+             run, so the reproducibility-artifact machinery can be exercised under \
+             deterministic replay (same seed must reproduce the same mismatch).",
+    )] {
+        if get_fault(id).is_none() {
+            register_fault(FaultEntry {
+                id,
+                description,
+                category: FaultCategory::Logic,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

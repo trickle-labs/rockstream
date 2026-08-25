@@ -14,6 +14,36 @@
 
 use crate::sim::SimRuntime;
 
+/// Upper bound on the number of SQL steps a single [`ScenarioMismatchArtifact`]
+/// may retain, mirroring the spirit of
+/// `rockstream_oracle::scenario::transcript::MAX_TRANSCRIPT_EVENTS`: a
+/// minimized reproducer must never grow unbounded.
+pub const MAX_ARTIFACT_STEPS: usize = 10_000;
+
+/// One observed event, shaped identically to
+/// `rockstream_oracle::scenario::transcript::ScenarioEvent`. Duplicated here
+/// (rather than depending on `rockstream-oracle` from this crate's normal
+/// dependencies) because `rockstream-oracle` -> `rockstream-sql` ->
+/// `rockstream-control` -> `rockstream-sim` would otherwise be a real
+/// (non-dev) dependency cycle. `rockstream-oracle` remains a dev-dependency
+/// of this crate and its own `TranscriptMismatch`/`ScenarioEvent` convert
+/// losslessly to/from this shape in tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactEvent {
+    pub step_index: usize,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// A mismatch between an expected and actual [`ArtifactEvent`], shaped
+/// identically to
+/// `rockstream_oracle::scenario::transcript::TranscriptMismatch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactMismatch {
+    pub index: usize,
+    pub expected: Option<ArtifactEvent>,
+    pub actual: Option<ArtifactEvent>,
+}
+
 /// A seed entry covering a specific merge law under fault injection.
 #[derive(Debug, Clone)]
 pub struct LawSeed {
@@ -34,10 +64,57 @@ pub struct RegressionSeed {
     pub description: &'static str,
 }
 
+/// A minimized, replayable scenario-mismatch artifact: a small enough
+/// reproducer (SQL steps) plus the exact [`ArtifactMismatch`] it is known
+/// to reproduce, so a differential or connector scenario failure can be
+/// stored and replayed the same way a `SimRuntime` fault-seed regression
+/// is. Bounded by [`MAX_ARTIFACT_STEPS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScenarioMismatchArtifact {
+    /// Name of the source `Scenario` (e.g. a differential or
+    /// connector-tagged scenario such as `"kafka_sink_smoke"`).
+    pub scenario_name: String,
+    /// Minimal `ExecuteSql` steps needed to reproduce `mismatch`.
+    pub steps: Vec<String>,
+    /// The exact mismatch this artifact is known to reproduce.
+    pub mismatch: ArtifactMismatch,
+}
+
+/// Returned by [`ScenarioMismatchArtifact::new`] when `steps` would exceed
+/// [`MAX_ARTIFACT_STEPS`]. The artifact is not built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactStepsExceeded {
+    pub attempted: usize,
+    pub max: usize,
+}
+
+impl ScenarioMismatchArtifact {
+    /// Build a bounded artifact, failing closed rather than truncating
+    /// silently if `steps` exceeds [`MAX_ARTIFACT_STEPS`].
+    pub fn new(
+        scenario_name: String,
+        steps: Vec<String>,
+        mismatch: ArtifactMismatch,
+    ) -> Result<Self, ArtifactStepsExceeded> {
+        if steps.len() > MAX_ARTIFACT_STEPS {
+            return Err(ArtifactStepsExceeded {
+                attempted: steps.len(),
+                max: MAX_ARTIFACT_STEPS,
+            });
+        }
+        Ok(Self {
+            scenario_name,
+            steps,
+            mismatch,
+        })
+    }
+}
+
 /// The simulation seed corpus.
 pub struct SeedCorpus {
     law_seeds: Vec<LawSeed>,
     regression_seeds: Vec<RegressionSeed>,
+    scenario_mismatch_artifacts: Vec<ScenarioMismatchArtifact>,
 }
 
 impl SeedCorpus {
@@ -45,6 +122,7 @@ impl SeedCorpus {
         Self {
             law_seeds: Vec::new(),
             regression_seeds: Vec::new(),
+            scenario_mismatch_artifacts: Vec::new(),
         }
     }
 
@@ -54,6 +132,16 @@ impl SeedCorpus {
 
     pub fn add_regression_seed(&mut self, seed: RegressionSeed) {
         self.regression_seeds.push(seed);
+    }
+
+    /// Add a minimized, replayable scenario-mismatch artifact alongside the
+    /// existing `SimRuntime` fault-seed regressions.
+    pub fn add_scenario_mismatch_artifact(&mut self, artifact: ScenarioMismatchArtifact) {
+        self.scenario_mismatch_artifacts.push(artifact);
+    }
+
+    pub fn scenario_mismatch_artifacts(&self) -> &[ScenarioMismatchArtifact] {
+        &self.scenario_mismatch_artifacts
     }
 
     /// Sorted, deduplicated list of law IDs covered by the corpus.

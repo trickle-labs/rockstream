@@ -61,7 +61,7 @@ pub use failure_matrix::{
     all_cells, find_by_id_str, get_failure_mode, validate_registry, FailureMatrixCell,
     FailureModeId, FAILURE_MATRIX_CELLS,
 };
-pub use fault_model::{FaultEntry, FaultModel};
+pub use fault_model::{register_scenario_faults, FaultEntry, FaultModel};
 pub use law_faults::{register_law_faults, LAW_FAULT_IDS};
 pub use liveness::{DegradedState, LivenessChecker, LivenessStatus};
 pub use network::{SimNetwork, SimNetworkHandle};
@@ -86,7 +86,8 @@ pub use runtime::{Runtime, Spawner};
 pub use shard_map::{ShardOwnership, ShardRange, SimShardMap};
 pub use sim::SimRuntime;
 pub use soak::{
-    build_initial_corpus, LawSeed, RegressionSeed, SeedCorpus, SeedOutcome, SoakRunner,
+    build_initial_corpus, ArtifactEvent, ArtifactMismatch, ArtifactStepsExceeded, LawSeed,
+    RegressionSeed, ScenarioMismatchArtifact, SeedCorpus, SeedOutcome, SoakRunner,
 };
 pub use spike::{OscillationDetector, SpikeResult, SpikeScenario};
 pub use tokio_rt::TokioRuntime;

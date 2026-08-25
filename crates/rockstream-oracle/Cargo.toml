@@ -14,25 +14,30 @@ arrow = { workspace = true }
 datafusion = { workspace = true }
 rockstream-sql = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+tokio-postgres = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["kafka", "minio"] }
+tempfile = { workspace = true }
+rockstream-test-support = { workspace = true }
 
 [dev-dependencies]
-rockstream-test-support.workspace = true
+rockstream-connectors = { workspace = true }
+rdkafka = { workspace = true }
 rockstream-runtime = { workspace = true }
 parking_lot = { workspace = true }
 proptest = { workspace = true }
 rockstream-gateway = { workspace = true }
 object_store = { workspace = true }
 rockstream-sim = { workspace = true }
-tokio-postgres = { workspace = true }
-async-trait = { workspace = true }
 bytes = { workspace = true }
 rockstream-storage = { workspace = true }
 rand = { workspace = true }
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
+serde_json = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
 tonic = { workspace = true }
-tempfile = { workspace = true }
+toml = { workspace = true }
