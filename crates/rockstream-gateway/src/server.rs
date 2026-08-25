@@ -15594,10 +15594,10 @@ fn is_removed_connector_ddl(query: &str) -> bool {
     let removed_sink = query.starts_with("create sink ")
         && query.contains(" for view ")
         && (query.contains(" to parquet")
-            || query.contains(" to iceberg")
-            || query.contains(" to delta")
             || query.contains(" to s3")
-            || query.contains(" to object_store"));
+            || query.contains(" to object_store")
+            || ((query.contains(" to iceberg") || query.contains(" to delta"))
+                && !(query.contains("catalog") && query.contains("filesystem"))));
     removed_sink
         || (query.starts_with("create source ")
             && (query.contains(" type s3") || query.contains(" type http_webhook")))
