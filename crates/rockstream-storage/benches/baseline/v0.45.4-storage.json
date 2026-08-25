@@ -1,5 +1,5 @@
 {
-  "storage_get/point_read_warm_key": 725.6518428294419,
-  "storage_merge/sum_merge_operator": 102655001.19,
-  "storage_put/point_write_fixed_size": 102623144.16
+  "storage_get/point_read_warm_key": 1209.7117918562312,
+  "storage_merge/sum_merge_operator": 101112110.44,
+  "storage_put/point_write_fixed_size": 101060599.51
 }
