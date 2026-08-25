@@ -2,6 +2,15 @@ use std::process::Command;
 
 use rockstream_types::checkpoint::{CheckpointId, ClusterCheckpoint};
 
+fn normalize_correlation_id(stderr: Vec<u8>) -> String {
+    let stderr = String::from_utf8(stderr).unwrap();
+    let marker = "(correlation_id=";
+    let start = stderr.find(marker).unwrap() + marker.len();
+    let end = start + stderr[start..].find(' ').unwrap();
+    uuid::Uuid::parse_str(&stderr[start..end]).unwrap();
+    stderr.replacen(&stderr[start..end], "<correlation_id>", 1)
+}
+
 fn seed_checkpoint(path: &std::path::Path, checkpoint_id: u64) -> u64 {
     let bytes = serde_json::to_vec(&ClusterCheckpoint::new(CheckpointId(checkpoint_id))).unwrap();
     let dir = path.join("control/checkpoints");
@@ -94,8 +103,8 @@ fn checkpoint_export_restore_cli_outputs_and_audits_exactly() {
     assert!(!denied.status.success());
     assert_eq!(String::from_utf8(denied.stdout).unwrap(), "");
     assert_eq!(
-        String::from_utf8(denied.stderr).unwrap(),
-        "RS-2401 permission denied: principal 'dr-viewer' lacks required role Admin\n  next steps: Request elevated RBAC role (Admin) or run under an authorized principal.\n"
+        normalize_correlation_id(denied.stderr),
+        "[RS-2401] auth.permission_denied: Permission denied: authenticated principal lacks required RBAC role (detail=permission denied: principal 'dr-viewer' lacks required role Admin) (correlation_id=<correlation_id> context=detail=permission denied: principal 'dr-viewer' lacks required role Admin) next_steps: Request elevated RBAC role from an admin or contact the namespace owner\n  next steps: Request elevated RBAC role (Admin) or run under an authorized principal.\n"
     );
 
     let audit_lines: Vec<rockstream_types::audit::AuditEvent> =
@@ -173,9 +182,8 @@ fn checkpoint_restore_rejects_missing_export_with_rs5035() {
         .unwrap();
     assert!(!result.status.success());
     assert_eq!(String::from_utf8(result.stdout).unwrap(), "");
-    assert!(String::from_utf8(result.stderr)
-        .unwrap()
-        .starts_with(
-            "RS-5035 checkpoint export integrity validation failed: no committed export generation exists"
-        ));
+    assert_eq!(
+        normalize_correlation_id(result.stderr),
+        "[RS-5035] skew.slo_cannot_be_met: Skew-bound SLO cannot be met without composable partial-state splitting (detail=checkpoint export integrity validation failed: no committed export generation exists; next_steps: discard the incomplete generation and retry from the same committed checkpoint) (correlation_id=<correlation_id> context=detail=checkpoint export integrity validation failed: no committed export generation exists; next_steps: discard the incomplete generation and retry from the same committed checkpoint) next_steps: Add composable partial-state semantics for this operator, reduce the hot key's skew at the source, or route the workload to a spill-shard plan that can tolerate the SLO miss.\n  next steps: Verify the committed export, object-store access, and target freshness, then retry.\n"
+    );
 }

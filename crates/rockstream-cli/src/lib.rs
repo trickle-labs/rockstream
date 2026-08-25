@@ -90,12 +90,6 @@ impl CliError {
             cause: None,
         });
         record_diagnostic(occurrence.clone());
-        tracing::error!(
-            code = %occurrence.code,
-            correlation_id = %occurrence.correlation_id,
-            diagnostic = %occurrence.render_json(),
-            "cli diagnostic"
-        );
         Self {
             code,
             message,
