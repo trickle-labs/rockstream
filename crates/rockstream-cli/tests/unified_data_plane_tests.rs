@@ -6,6 +6,8 @@
 //! test process (this is the only test in this binary, so it is safe to
 //! self-signal) once the shard layout has settled.
 
+#![allow(clippy::result_large_err)]
+
 use std::path::Path;
 use std::time::Duration;
 

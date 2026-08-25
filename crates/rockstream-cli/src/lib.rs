@@ -11,6 +11,8 @@
 //! All user/operator-visible failures carry an `RS-XXXX` error code with
 //! actionable `next_steps` text (see [`CliError`]).
 
+#![allow(clippy::result_large_err)]
+
 use crate::output::OutputFormat;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
@@ -280,15 +282,15 @@ fn now_ms() -> u64 {
 }
 
 /// Validate a requested role at the system boundary.
-fn validate_role(role: &str) -> Result<(), Box<CliError>> {
+fn validate_role(role: &str) -> Result<(), CliError> {
     if KNOWN_ROLES.contains(&role) {
         Ok(())
     } else {
-        Err(Box::new(CliError::new(
+        Err(CliError::new(
             RS_0002,
             format!("unknown node role `{role}`"),
             format!("Pass --role with one of: {}.", KNOWN_ROLES.join(", ")),
-        )))
+        ))
     }
 }
 
@@ -468,11 +470,11 @@ pub async fn start_gateway_with_shard(
             shard_db,
         ),
         _ => {
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_0002,
                 format!("unknown auth mode `{}`", opts.auth_mode),
                 "Pass --auth with one of: off, scram, md5, oidc, mtls.",
-            )));
+            ));
         }
     };
 
@@ -526,7 +528,7 @@ pub async fn start_gateway_with_shard(
 /// starts the live PostgreSQL wire server and blocks until SIGTERM / Ctrl-C.
 /// For all other roles (and for gateway/all without a listen address) it runs
 /// the embedded no-op node, writes an audit log and support bundle, and exits.
-pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, Box<CliError>> {
+pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     let started_ms = now_ms();
     validate_role(&opts.role)?;
 
@@ -534,40 +536,40 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, Box<CliError>> {
         || opts.config.storage.tiering.cold_sst_backend.is_some()
         || opts.config.storage.tiering.cold_sst_age_threshold.is_some()
     {
-        return Err(Box::new(CliError::new(
+        return Err(CliError::new(
             RS_4017,
             "connector.removed: cold-tier configuration has been removed",
             "Use RockStream to Kafka to a downstream writer for cold-tier output.",
-        )));
+        ));
     }
 
     let auth_mode_norm = opts.auth_mode.trim().to_lowercase();
     let valid_auth_modes = ["off", "scram", "md5", "oidc", "mtls", ""];
     if !valid_auth_modes.contains(&auth_mode_norm.as_str()) {
-        return Err(Box::new(CliError::new(
+        return Err(CliError::new(
             RS_0002,
             format!("unknown auth mode `{}`", opts.auth_mode),
             "Pass --auth with one of: off, scram, md5, oidc, mtls.",
-        )));
+        ));
     }
 
     // Worker requires a control URL to register with the control plane.
     // Gateway can run in standalone mode without a control URL.
     if opts.role == "worker" && opts.control.is_none() {
-        return Err(Box::new(CliError::new(
+        return Err(CliError::new(
             rockstream_types::error_code::RS_0002,
             "role `worker` requires --control=<url>",
             "Provide the control plane URL via the --control argument.",
-        )));
+        ));
     }
 
     // `frontier` role also requires a control URL so it can subscribe to shard reports.
     if opts.role == "frontier" && opts.control.is_none() {
-        return Err(Box::new(CliError::new(
+        return Err(CliError::new(
             rockstream_types::error_code::RS_0002,
             "role `frontier` requires --control=<url>",
             "Provide the control plane URL via the --control argument.",
-        )));
+        ));
     }
 
     fs::create_dir_all(&opts.storage).map_err(|e| {
@@ -634,7 +636,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, Box<CliError>> {
         .build()
         .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
 
-    let serve_result: Result<(), Box<CliError>> = rt.block_on(async {
+    let serve_result: Result<(), CliError> = rt.block_on(async {
         let mut metrics_handle = None;
         if let Some(metrics_addr) = &opts.metrics_addr {
             let mh = metrics_server::start_metrics_server(metrics_addr)
@@ -1078,7 +1080,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, Box<CliError>> {
 }
 
 /// Request a worker drain over the control wire API asynchronously.
-pub async fn request_worker_drain_async(control: &str, worker_id: u64) -> Result<(), Box<CliError>> {
+pub async fn request_worker_drain_async(control: &str, worker_id: u64) -> Result<(), CliError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
 
@@ -1113,11 +1115,11 @@ pub async fn request_worker_drain_async(control: &str, worker_id: u64) -> Result
             )
         })?;
         if read == 0 {
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_0003,
                 "control service closed the drain request without a reply",
                 "Retry against the current control leader and inspect the control-plane audit log.",
-            )));
+            ));
         }
         match serde_json::from_str::<ControlMessage>(line.trim()).map_err(|e| {
             CliError::new(
@@ -1136,25 +1138,25 @@ pub async fn request_worker_drain_async(control: &str, worker_id: u64) -> Result
                 message,
                 next_steps,
             } => {
-                return Err(Box::new(CliError::new(
+                return Err(CliError::new(
                     ErrorCode::new(code.trim_start_matches("RS-").parse().unwrap_or(3)),
                     message,
                     next_steps,
-                )));
+                ));
             }
             other => {
-                return Err(Box::new(CliError::new(
+                return Err(CliError::new(
                     RS_0003,
                     format!("unexpected control response to drain request: {other:?}"),
                     "Retry against the current control leader; if the problem persists, inspect the control-plane logs.",
-                )));
+                ));
             }
         }
     }
 }
 
 /// Thin v0.46 admin-CLI stub: request a worker drain over the control wire API.
-pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), Box<CliError>> {
+pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), CliError> {
     if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -1185,7 +1187,7 @@ pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), Box<Cli
 pub fn run_view_list(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let views = catalog.list_views()?;
     Ok(output::render_output(&views, format))
 }
@@ -1194,7 +1196,7 @@ pub fn run_view_show(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
     name: &str,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let view = catalog.get_view(name)?;
     Ok(output::render_output(&view, format))
 }
@@ -1203,7 +1205,7 @@ pub fn run_view_status(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
     name: Option<&str>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let statuses = catalog.view_status(name)?;
     Ok(output::render_output(&statuses, format))
 }
@@ -1211,7 +1213,7 @@ pub fn run_view_status(
 pub fn run_source_list(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let sources = catalog.list_sources()?;
     Ok(output::render_output(&sources, format))
 }
@@ -1220,7 +1222,7 @@ pub fn run_source_show(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
     name: &str,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let source = catalog.get_source(name)?;
     Ok(output::render_output(&source, format))
 }
@@ -1228,7 +1230,7 @@ pub fn run_source_show(
 pub fn run_schema_list(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let schemas = catalog.list_schemas()?;
     Ok(output::render_output(&schemas, format))
 }
@@ -1237,7 +1239,7 @@ pub fn run_schema_show(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
     name: &str,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let schema = catalog.get_schema(name)?;
     Ok(output::render_output(&schema, format))
 }
@@ -1245,7 +1247,7 @@ pub fn run_schema_show(
 pub fn run_workload_list(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let workloads = catalog.list_workloads()?;
     Ok(output::render_output(&workloads, format))
 }
@@ -1254,7 +1256,7 @@ pub fn run_workload_show(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
     name: &str,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let workload = catalog.get_workload(name)?;
     Ok(output::render_output(&workload, format))
 }
@@ -1262,7 +1264,7 @@ pub fn run_workload_show(
 pub fn run_cluster_status(
     format: output::OutputFormat,
     control: &transport::ControlClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let status = control.cluster_status()?;
     Ok(output::render_output(&status, format))
 }
@@ -1270,7 +1272,7 @@ pub fn run_cluster_status(
 pub fn run_cluster_quotas(
     format: output::OutputFormat,
     control: &transport::ControlClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let quotas = control.cluster_quotas()?;
     Ok(output::render_output(&quotas, format))
 }
@@ -1278,7 +1280,7 @@ pub fn run_cluster_quotas(
 pub fn run_cluster_workers_list(
     format: output::OutputFormat,
     control: &transport::ControlClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let workers = control.list_workers()?;
     Ok(output::render_output(&workers, format))
 }
@@ -1287,7 +1289,7 @@ pub fn run_cluster_workers_status(
     format: output::OutputFormat,
     control: &transport::ControlClient,
     worker_id: Option<u64>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let statuses = control.worker_status(worker_id)?;
     if worker_id.is_some() && statuses.len() == 1 {
         Ok(output::render_output(&statuses[0], format))
@@ -1299,7 +1301,7 @@ pub fn run_cluster_workers_status(
 pub fn run_shard_list(
     format: output::OutputFormat,
     control: &transport::ControlClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let shards = control.list_shards()?;
     Ok(output::render_output(&shards, format))
 }
@@ -1308,7 +1310,7 @@ pub fn run_checkpoint_list(
     format: output::OutputFormat,
     storage: &transport::StorageClient,
     storage_path: &Path,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let checkpoints = storage.list_checkpoints(storage_path)?;
     Ok(output::render_output(&checkpoints, format))
 }
@@ -1318,7 +1320,7 @@ pub fn run_checkpoint_show(
     storage: &transport::StorageClient,
     checkpoint_id: u64,
     storage_path: &Path,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let alignment = storage.show_checkpoint(storage_path, checkpoint_id)?;
     Ok(output::render_output(&alignment, format))
 }
@@ -1327,7 +1329,7 @@ pub fn run_resource_usage(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
     workload: Option<&str>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let usage = catalog.resource_usage(workload)?;
     Ok(output::render_output(&usage, format))
 }
@@ -1335,7 +1337,7 @@ pub fn run_resource_usage(
 pub fn run_resource_cluster(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let cluster = catalog.resource_cluster()?;
     Ok(output::render_output(&cluster, format))
 }
@@ -1343,7 +1345,7 @@ pub fn run_resource_cluster(
 pub fn run_schema_evolution_status(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let status = catalog.schema_evolution_status()?;
     Ok(output::render_output(&status, format))
 }
@@ -1351,7 +1353,7 @@ pub fn run_schema_evolution_status(
 pub fn run_schema_evolution_history(
     format: output::OutputFormat,
     catalog: &transport::CatalogClient,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let history = catalog.schema_evolution_history()?;
     Ok(output::render_output(&history, format))
 }
@@ -1361,7 +1363,7 @@ pub fn run_audit_tail(
     storage: &transport::StorageClient,
     storage_path: &Path,
     max: usize,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let events = storage.audit_tail(storage_path, max)?;
     Ok(output::render_output(&events, format))
 }
@@ -1372,23 +1374,23 @@ pub fn run_audit_query(
     storage_path: &Path,
     filter: Option<&str>,
     max: usize,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let events = storage.audit_query(storage_path, filter, max)?;
     Ok(output::render_output(&events, format))
 }
 
 // ─── Mutating Command Runners & Confirmation Safeguards ─────────────────────
 
-pub fn prompt_confirmation(prompt: &str, yes_flag: bool) -> Result<(), Box<CliError>> {
+pub fn prompt_confirmation(prompt: &str, yes_flag: bool) -> Result<(), CliError> {
     if yes_flag {
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
-        return Err(Box::new(CliError::new(
+        return Err(CliError::new(
             RS_0005,
             "destructive command confirmation required in non-interactive environment",
             "Pass --yes for script execution or answer y at the prompt.",
-        )));
+        ));
     }
     eprint!("{} [y/N]: ", prompt);
     let mut line = String::new();
@@ -1403,11 +1405,11 @@ pub fn prompt_confirmation(prompt: &str, yes_flag: bool) -> Result<(), Box<CliEr
     if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
         Ok(())
     } else {
-        Err(Box::new(CliError::new(
+        Err(CliError::new(
             RS_0005,
             "destructive command rejected: confirmation declined",
             "Pass --yes to confirm execution or enter 'y' when prompted.",
-        )))
+        ))
     }
 }
 
@@ -1416,7 +1418,7 @@ pub fn run_view_pause(
     catalog: &mut transport::CatalogClient,
     name: &str,
     yes: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     prompt_confirmation(
         &format!("Are you sure you want to pause view '{name}'?"),
         yes,
@@ -1429,7 +1431,7 @@ pub fn run_view_resume(
     format: output::OutputFormat,
     catalog: &mut transport::CatalogClient,
     name: &str,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let outcome = catalog.resume_view(name)?;
     Ok(output::render_output(&outcome, format))
 }
@@ -1439,7 +1441,7 @@ pub fn run_view_query(
     catalog: &transport::CatalogClient,
     name: &str,
     limit: Option<usize>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let res = catalog.query_view(name, limit)?;
     Ok(output::render_output(&res, format))
 }
@@ -1450,7 +1452,7 @@ pub fn run_view_subscribe(
     name: &str,
     from_epoch: Option<u64>,
     snapshot: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let events = catalog.subscribe_view(name, from_epoch, snapshot)?;
     Ok(output::render_output(&events, format))
 }
@@ -1459,7 +1461,7 @@ pub fn run_source_pause(
     format: output::OutputFormat,
     catalog: &mut transport::CatalogClient,
     name: &str,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let outcome = catalog.pause_source(name)?;
     Ok(output::render_output(&outcome, format))
 }
@@ -1468,7 +1470,7 @@ pub fn run_source_resume(
     format: output::OutputFormat,
     catalog: &mut transport::CatalogClient,
     name: &str,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let outcome = catalog.resume_source(name)?;
     Ok(output::render_output(&outcome, format))
 }
@@ -1478,7 +1480,7 @@ pub fn run_source_drop(
     catalog: &mut transport::CatalogClient,
     name: &str,
     yes: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     prompt_confirmation(
         &format!("Are you sure you want to drop source '{name}'?"),
         yes,
@@ -1492,7 +1494,7 @@ pub fn run_schema_create(
     catalog: &mut transport::CatalogClient,
     name: &str,
     columns: Option<&str>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let outcome = catalog.create_schema(name, columns)?;
     Ok(output::render_output(&outcome, format))
 }
@@ -1502,7 +1504,7 @@ pub fn run_schema_drop(
     catalog: &mut transport::CatalogClient,
     name: &str,
     yes: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     prompt_confirmation(
         &format!("Are you sure you want to drop schema '{name}'?"),
         yes,
@@ -1519,7 +1521,7 @@ pub fn run_workload_create(
     freshness_slo_ms: Option<u64>,
     memory_limit: Option<u64>,
     max_parallelism: Option<usize>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let outcome = catalog.create_workload(
         name,
         priority,
@@ -1538,7 +1540,7 @@ pub fn run_workload_alter(
     freshness_slo_ms: Option<u64>,
     memory_limit: Option<u64>,
     max_parallelism: Option<usize>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let outcome = catalog.alter_workload(
         name,
         priority,
@@ -1554,7 +1556,7 @@ pub fn run_workload_drop(
     catalog: &mut transport::CatalogClient,
     name: &str,
     yes: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     prompt_confirmation(
         &format!("Are you sure you want to drop workload '{name}'?"),
         yes,
@@ -1568,7 +1570,7 @@ pub fn run_cluster_workers_drain(
     control: &transport::ControlClient,
     worker_id: u64,
     yes: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     prompt_confirmation(
         &format!("Are you sure you want to drain worker {worker_id}?"),
         yes,
@@ -1583,7 +1585,7 @@ pub fn run_shard_migrate(
     shard_id: u64,
     to_worker: u64,
     yes: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     prompt_confirmation(
         &format!("Are you sure you want to migrate shard {shard_id} to worker {to_worker}?"),
         yes,
@@ -1598,7 +1600,7 @@ pub fn run_format_migrate(
     from: u8,
     to: u8,
     storage: &str,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let result = std::thread::Builder::new()
         .name("rockstream-format-migrate".to_string())
         .spawn({
@@ -1663,7 +1665,7 @@ pub fn run_checkpoint_restore(
     source: &str,
     target: &str,
     yes: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     prompt_confirmation(
         &format!("Are you sure you want to restore {source} into fresh storage {target}?"),
         yes,
@@ -1677,7 +1679,7 @@ pub fn run_checkpoint_export(
     storage: &transport::StorageClient,
     storage_path: &Path,
     destination: &str,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let outcome = storage.export_checkpoint(storage_path, destination)?;
     Ok(output::render_output(&outcome, format))
 }
@@ -1689,7 +1691,7 @@ pub fn run_support_bundle(
     view: Option<&str>,
     since: Option<&str>,
     out: Option<&Path>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let outcome = storage.generate_support_bundle(storage_path, view, since, out)?;
     Ok(output::render_output(&outcome, format))
 }
@@ -1701,29 +1703,29 @@ pub fn run_support_diagnose(
     code: Option<&str>,
     correlation_id: Option<&str>,
     out: Option<&Path>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let occurrence = match (code, correlation_id) {
         (Some(_), Some(_)) => {
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 rockstream_types::error_code::RS_1012,
                 "support diagnose accepts either --code or --correlation-id, not both",
                 "Provide exactly one diagnostic lookup selector and retry.",
-            )))
+            ))
         }
         (Some(raw_code), None) => {
             let Some(code) = parse_diagnostic_code(raw_code) else {
-                return Err(Box::new(CliError::new(
+                return Err(CliError::new(
                     rockstream_types::error_code::RS_1012,
                     format!("invalid diagnostic code: {raw_code}"),
                     "Use a registered code in the RS-XXXX format.",
-                )));
+                ));
             };
             if rockstream_types::error_code::ErrorDescriptor::lookup(code).is_none() {
-                return Err(Box::new(CliError::new(
+                return Err(CliError::new(
                     rockstream_types::error_code::RS_1012,
                     format!("unknown diagnostic code: {raw_code}"),
                     "Use SHOW DIAGNOSTIC RS-XXXX or provide a registered code.",
-                )));
+                ));
             }
             global_diagnostic_journal()
                 .lock()
@@ -1734,31 +1736,31 @@ pub fn run_support_diagnose(
         }
         (None, Some(raw_id)) => {
             let Ok(correlation_id) = Uuid::parse_str(raw_id) else {
-                return Err(Box::new(CliError::new(
+                return Err(CliError::new(
                     rockstream_types::error_code::RS_1012,
                     format!("invalid correlation ID: {raw_id}"),
                     "Use the UUID printed with the diagnostic occurrence.",
-                )));
+                ));
             };
             global_diagnostic_journal()
                 .lock()
                 .by_correlation_id(correlation_id)
         }
         (None, None) => {
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 rockstream_types::error_code::RS_1012,
                 "support diagnose requires --code or --correlation-id",
                 "Provide one diagnostic lookup selector and retry.",
-            )))
+            ))
         }
     };
 
     let Some(occurrence) = occurrence else {
-        return Err(Box::new(CliError::new(
+        return Err(CliError::new(
             rockstream_types::error_code::RS_1012,
             "diagnostic occurrence was not found",
             "Run SHOW DIAGNOSTICS and retry with a retained correlation ID.",
-        )));
+        ));
     };
     let occurrence = occurrence.redacted();
     let bundle = storage.generate_support_bundle_with_diagnostics(
@@ -1801,7 +1803,7 @@ fn map_column_type(data_type: &str) -> arrow::datatypes::DataType {
 
 pub fn build_sql_frontend_from_catalog(
     catalog: &transport::CatalogClient,
-) -> Result<rockstream_sql::SqlFrontend, Box<CliError>> {
+) -> Result<rockstream_sql::SqlFrontend, CliError> {
     let frontend = rockstream_sql::SqlFrontend::new();
     for schema in catalog.schemas.values() {
         let fields: Vec<arrow::datatypes::Field> = schema
@@ -1857,7 +1859,7 @@ pub fn run_explain_view(
     view_name: &str,
     estimate: bool,
     op_ids: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let view = catalog.get_view(view_name)?;
     let frontend = build_sql_frontend_from_catalog(catalog)?;
     let view_name_str = view_name.to_string();
@@ -1973,7 +1975,7 @@ pub fn run_debug_arrangement(
     op_id_str: &str,
     key_str: &str,
     epoch: Option<u64>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let view = catalog.get_view(view_name)?;
     let frontend = build_sql_frontend_from_catalog(catalog)?;
     let view_name_str = view_name.to_string();
@@ -1982,11 +1984,11 @@ pub fn run_debug_arrangement(
 
     if let Some(ep) = epoch {
         if ep < 10 {
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 rockstream_types::error_code::RS_2006,
                 format!("Requested epoch {ep} is outside the retention window (minimum epoch: 10)"),
                 "Inspect with a more recent epoch within the checkpoint retention window.",
-            )));
+            ));
         }
     }
 
@@ -2090,7 +2092,7 @@ pub fn run_debug_arrangement(
     .map_err(|_| CliError::new(RS_0003, "internal thread error", ""))?
 }
 
-pub fn run_sql_compile(format: output::OutputFormat, query: &str) -> Result<String, Box<CliError>> {
+pub fn run_sql_compile(format: output::OutputFormat, query: &str) -> Result<String, CliError> {
     let catalog = transport::CatalogClient::with_defaults();
     let frontend = build_sql_frontend_from_catalog(&catalog)?;
     let query_str = query.to_string();
@@ -2134,7 +2136,7 @@ fn write_support_bundle(
     role: &str,
     started_ms: u64,
     events: &[AuditEvent],
-) -> Result<PathBuf, Box<CliError>> {
+) -> Result<PathBuf, CliError> {
     let generated_at_ms = now_ms();
     let bundle = SupportBundle {
         generated_at_ms,
@@ -2185,13 +2187,13 @@ pub fn run_manifest_validate(
     format: OutputFormat,
     manifest_path: &Path,
     base_dir: Option<&Path>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     if !manifest_path.is_file() {
-        return Err(Box::new(CliError::new(
+        return Err(CliError::new(
             RS_0003,
             format!("Manifest file not found: {}", manifest_path.display()),
             "Provide a valid path to an evidence-manifest.json file.",
-        )));
+        ));
     }
     let content = fs::read_to_string(manifest_path).map_err(|e| {
         CliError::new(
@@ -2254,7 +2256,7 @@ pub fn run_qualify(
     check_prerequisites: bool,
     suite: Option<&str>,
     _output: Option<&Path>,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     if check_prerequisites {
         let has_docker = std::process::Command::new("docker")
             .arg("info")
@@ -2271,11 +2273,11 @@ pub fn run_qualify(
         }
 
         if !violations.is_empty() {
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_0002,
                 format!("Prerequisite check failed: {}", violations.join("; ")),
                 "Ensure Docker is running and required ports (5432, 9092, 9000) are available.",
-            )));
+            ));
         }
 
         match format {
@@ -2313,7 +2315,7 @@ pub fn run_qualify(
 }
 
 /// Generate dynamic shell completions for the `rockstream` CLI.
-pub fn run_completions(shell: ShellType) -> Result<String, Box<CliError>> {
+pub fn run_completions(shell: ShellType) -> Result<String, CliError> {
     use clap::CommandFactory;
     let mut cmd = Cli::command();
     let mut buf = Vec::new();
@@ -2353,7 +2355,7 @@ pub fn run_config_validate(
     file: Option<&Path>,
     _strict: bool,
     check_files: bool,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let resolved_path = file
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("ROCKSTREAM_CONFIG").map(PathBuf::from))
@@ -2368,11 +2370,11 @@ pub fn run_config_validate(
 
     let (contents, filename) = if let Some(path) = resolved_path {
         if !path.exists() {
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_0002,
                 format!("configuration file not found: {}", path.display()),
                 "Verify the --file path or ensure rockstream.toml exists in the current directory.",
-            )));
+            ));
         }
         let text = fs::read_to_string(&path).map_err(|e| {
             CliError::new(
@@ -2411,11 +2413,11 @@ pub fn run_config_validate(
             })
             .unwrap_or(RS_0002);
 
-        return Err(Box::new(CliError::new(
+        return Err(CliError::new(
             code,
             format!("configuration validation failed for {filename}"),
             rendered,
-        )));
+        ));
     }
 
     Ok(rendered)
@@ -2427,7 +2429,7 @@ pub fn run_config_print_effective(
     file: Option<&Path>,
     show_origins: bool,
     overrides: &rockstream_types::config_resolver::CliConfigOverrides,
-) -> Result<String, Box<CliError>> {
+) -> Result<String, CliError> {
     let resolved = rockstream_types::config_resolver::ConfigResolver::resolve(file, overrides)
         .map_err(|e| {
             CliError::new(

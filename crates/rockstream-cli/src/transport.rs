@@ -119,18 +119,18 @@ impl ClientIdentity {
         self
     }
 
-    pub fn require_role(&self, min_role: Role) -> Result<(), Box<CliError>> {
+    pub fn require_role(&self, min_role: Role) -> Result<(), CliError> {
         if self.role >= min_role {
             Ok(())
         } else {
-            Err(Box::new(CliError::new(
+            Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
                     self.user, min_role
                 ),
                 "Request elevated RBAC role (PipelineOwner / Admin) or run under an authorized principal.",
-            )))
+            ))
         }
     }
 }
@@ -215,7 +215,7 @@ impl ControlClient {
         self
     }
 
-    pub fn cluster_status(&self) -> Result<ClusterStatusInfo, Box<CliError>> {
+    pub fn cluster_status(&self) -> Result<ClusterStatusInfo, CliError> {
         if let Some(workers) = &self.mock_workers {
             let active = workers.len();
             let healthy = workers.iter().filter(|w| w.healthy).count();
@@ -258,39 +258,39 @@ impl ControlClient {
                     if tls.is_enabled() {
                         let connector = match rockstream_runtime::tls::build_client_tls_connector(tls) {
                             Ok(c) => c,
-                            Err(e) => return Err(Box::new(CliError::new(
+                            Err(e) => return Err(CliError::new(
                                 RS_2411,
                                 format!("internal mTLS configuration error: {e}"),
                                 "Verify certificate and CA paths.",
-                            ))),
+                            )),
                         };
                         let stream = match TcpStream::connect(&addr_clone).await {
                             Ok(s) => s,
-                            Err(e) => return Err(Box::new(CliError::new(
+                            Err(e) => return Err(CliError::new(
                                 RS_0004,
                                 format!("failed to reach control plane at {addr_clone}: {e}"),
                                 "Verify the control service URL and ensure the control node is running and reachable.",
-                            ))),
+                            )),
                         };
                         let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
                             .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap());
                         let mut tls_stream = match connector.connect(server_name, stream).await {
                             Ok(s) => s,
-                            Err(e) => return Err(Box::new(CliError::new(
+                            Err(e) => return Err(CliError::new(
                                 RS_2411,
                                 format!("internal mTLS handshake failed: {e}"),
                                 "Verify that client certificate is valid, not expired, and signed by cluster CA.",
-                            ))),
+                            )),
                         };
                         let _ = tls_stream.write_all(b"\n").await;
                         let mut buf = [0u8; 1];
                         let probe = tokio::time::timeout(tokio::time::Duration::from_millis(150), tls_stream.read(&mut buf)).await;
                         if let Ok(Ok(0)) | Ok(Err(_)) = probe {
-                            return Err(Box::new(CliError::new(
+                            return Err(CliError::new(
                                 RS_2411,
                                 "connection closed by control plane (client certificate untrusted or invalid)",
                                 "Verify that client certificate is valid, not expired, and signed by cluster CA.",
-                            )));
+                            ));
                         }
                         return Ok(ClusterStatusInfo {
                             node_id: Some(1),
@@ -306,21 +306,21 @@ impl ControlClient {
 
                 let mut stream = match TcpStream::connect(&addr_clone).await {
                     Ok(s) => s,
-                    Err(e) => return Err(Box::new(CliError::new(
+                    Err(e) => return Err(CliError::new(
                         RS_0004,
                         format!("failed to reach control plane at {addr_clone}: {e}"),
                         "Verify the control service URL and ensure the control node is running and reachable.",
-                    ))),
+                    )),
                 };
                 let _ = stream.write_all(b"{\"type\":\"ping\"}\n").await;
                 let mut buf = [0u8; 1];
                 let probe = tokio::time::timeout(tokio::time::Duration::from_millis(150), stream.read(&mut buf)).await;
                 if probe.is_ok() {
-                    return Err(Box::new(CliError::new(
+                    return Err(CliError::new(
                         RS_2410,
                         format!("connection refused by control plane at {addr_clone}: client certificate required (internal mTLS enabled)"),
                         "Provide --tls-cert-path, --tls-key-path, and --tls-ca-cert-path with a valid client certificate.",
-                    )));
+                    ));
                 }
 
                 Ok(ClusterStatusInfo {
@@ -338,7 +338,7 @@ impl ControlClient {
         .map_err(|_| CliError::new(RS_0003, "internal thread error", ""))?
     }
 
-    pub fn cluster_quotas(&self) -> Result<ClusterQuotasInfo, Box<CliError>> {
+    pub fn cluster_quotas(&self) -> Result<ClusterQuotasInfo, CliError> {
         if let Some(quotas) = &self.mock_quotas {
             return Ok(quotas.clone());
         }
@@ -386,11 +386,11 @@ impl ControlClient {
         if let Some(id) = worker_id {
             let matched: Vec<_> = workers.into_iter().filter(|w| w.worker_id == id).collect();
             if matched.is_empty() {
-                return Err(Box::new(CliError::new(
+                return Err(CliError::new(
                     RS_1001,
                     format!("Worker ID {id} not found"),
                     "Run 'rockstream cluster workers list' to check registered worker IDs.",
-                )));
+                ));
             }
             Ok(matched)
         } else {
@@ -420,7 +420,7 @@ impl ControlClient {
         ])
     }
 
-    pub fn drain_worker(&self, worker_id: u64) -> Result<DrainOutcome, Box<CliError>> {
+    pub fn drain_worker(&self, worker_id: u64) -> Result<DrainOutcome, CliError> {
         if self.identity.role < required_role("cluster workers drain") {
             self.record_audit(
                 "cluster.workers.drain",
@@ -428,7 +428,7 @@ impl ControlClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -436,7 +436,7 @@ impl ControlClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if let Some(addr) = &self.control_addr {
@@ -450,11 +450,11 @@ impl ControlClient {
                     Some("worker not found"),
                     Some("RS-1001"),
                 );
-                return Err(Box::new(CliError::new(
+                return Err(CliError::new(
                     RS_1001,
                     format!("Worker ID {worker_id} not found"),
                     "Run 'rockstream cluster workers list' to check registered worker IDs.",
-                )));
+                ));
             }
         }
 
@@ -477,7 +477,7 @@ impl ControlClient {
         &self,
         shard_id: u64,
         target_worker: u64,
-    ) -> Result<MigrationOutcome, Box<CliError>> {
+    ) -> Result<MigrationOutcome, CliError> {
         if self.identity.role < required_role("shard migrate") {
             self.record_audit(
                 "shard.migrate",
@@ -485,7 +485,7 @@ impl ControlClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -493,7 +493,7 @@ impl ControlClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if shard_id == 999 {
@@ -503,13 +503,13 @@ impl ControlClient {
                 Some("in-flight migration conflict"),
                 Some("RS-5030"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_5030,
                 format!(
                     "Illegal shard-migration state transition rejected: shard {shard_id} migration already in flight"
                 ),
                 "Drive the migration through the documented next state only, or resume from the persisted record instead of forcing a skipped state.",
-            )));
+            ));
         }
 
         self.record_audit(
@@ -700,7 +700,7 @@ impl CatalogClient {
             .collect())
     }
 
-    pub fn get_view(&self, name: &str) -> Result<ViewDetail, Box<CliError>> {
+    pub fn get_view(&self, name: &str) -> Result<ViewDetail, CliError> {
         self.views.get(name).cloned().ok_or_else(|| {
             CliError::new(
                 RS_1001,
@@ -793,7 +793,7 @@ impl CatalogClient {
             .collect())
     }
 
-    pub fn get_source(&self, name: &str) -> Result<SourceDetail, Box<CliError>> {
+    pub fn get_source(&self, name: &str) -> Result<SourceDetail, CliError> {
         self.sources.get(name).cloned().ok_or_else(|| {
             CliError::new(
                 RS_4009,
@@ -815,7 +815,7 @@ impl CatalogClient {
             .collect())
     }
 
-    pub fn get_schema(&self, name: &str) -> Result<SchemaDetail, Box<CliError>> {
+    pub fn get_schema(&self, name: &str) -> Result<SchemaDetail, CliError> {
         self.schemas.get(name).cloned().ok_or_else(|| {
             CliError::new(
                 RS_1001,
@@ -840,7 +840,7 @@ impl CatalogClient {
             .collect())
     }
 
-    pub fn get_workload(&self, name: &str) -> Result<WorkloadDetail, Box<CliError>> {
+    pub fn get_workload(&self, name: &str) -> Result<WorkloadDetail, CliError> {
         self.workloads.get(name).cloned().ok_or_else(|| {
             CliError::new(
                 RS_1005,
@@ -872,17 +872,17 @@ impl CatalogClient {
         }
         if let Some(w) = workload {
             if results.is_empty() && !self.workloads.contains_key(w) {
-                return Err(Box::new(CliError::new(
+                return Err(CliError::new(
                     RS_1005,
                     format!("Workload '{w}' not found"),
                     "Check the workload name; ensure it has been created with CREATE WORKLOAD.",
-                )));
+                ));
             }
         }
         Ok(results)
     }
 
-    pub fn resource_cluster(&self) -> Result<ClusterResourceUsageInfo, Box<CliError>> {
+    pub fn resource_cluster(&self) -> Result<ClusterResourceUsageInfo, CliError> {
         let total_mem: u64 = self
             .views
             .values()
@@ -924,7 +924,7 @@ impl CatalogClient {
             .collect())
     }
 
-    pub fn pause_view(&mut self, name: &str) -> Result<MutationOutcome, Box<CliError>> {
+    pub fn pause_view(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("view pause") {
             self.record_audit(
                 "view.pause",
@@ -932,7 +932,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -940,16 +940,16 @@ impl CatalogClient {
                     Role::PipelineOwner
                 ),
                 "Request elevated RBAC role (PipelineOwner / Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if !self.views.contains_key(name) {
             self.record_audit("view.pause", name, Some("view not found"), Some("RS-1001"));
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_1001,
                 format!("View '{name}' not found"),
                 "Check pipeline name and ensure it has been created.",
-            )));
+            ));
         }
 
         let view = self.views.get_mut(name).unwrap();
@@ -960,11 +960,11 @@ impl CatalogClient {
                 Some("view already paused"),
                 Some("RS-1007"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_1007,
                 format!("View '{name}' is already paused"),
                 "The view is already paused; use RESUME MATERIALIZED VIEW to restart it.",
-            )));
+            ));
         }
 
         view.state = "PAUSED".to_string();
@@ -978,7 +978,7 @@ impl CatalogClient {
         })
     }
 
-    pub fn resume_view(&mut self, name: &str) -> Result<MutationOutcome, Box<CliError>> {
+    pub fn resume_view(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("view resume") {
             self.record_audit(
                 "view.resume",
@@ -986,7 +986,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -994,16 +994,16 @@ impl CatalogClient {
                     Role::PipelineOwner
                 ),
                 "Request elevated RBAC role (PipelineOwner / Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if !self.views.contains_key(name) {
             self.record_audit("view.resume", name, Some("view not found"), Some("RS-1001"));
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_1001,
                 format!("View '{name}' not found"),
                 "Check pipeline name and ensure it has been created.",
-            )));
+            ));
         }
 
         let view = self.views.get_mut(name).unwrap();
@@ -1014,11 +1014,11 @@ impl CatalogClient {
                 Some("view not paused"),
                 Some("RS-1008"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_1008,
                 format!("View '{name}' is not paused"),
                 "The view is not paused; only paused views can be resumed.",
-            )));
+            ));
         }
 
         view.state = "RUNNING".to_string();
@@ -1032,7 +1032,7 @@ impl CatalogClient {
         })
     }
 
-    pub fn query_view(&self, name: &str, limit: Option<usize>) -> Result<QueryResult, Box<CliError>> {
+    pub fn query_view(&self, name: &str, limit: Option<usize>) -> Result<QueryResult, CliError> {
         if self.identity.role < Role::Viewer {
             self.record_audit(
                 "view.query",
@@ -1040,7 +1040,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1048,7 +1048,7 @@ impl CatalogClient {
                     Role::Viewer
                 ),
                 "Request elevated RBAC role (Viewer / Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         let view = self.views.get(name).ok_or_else(|| {
@@ -1092,7 +1092,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1100,7 +1100,7 @@ impl CatalogClient {
                     Role::Viewer
                 ),
                 "Request elevated RBAC role (Viewer / Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         let view = self.views.get(name).ok_or_else(|| {
@@ -1125,11 +1125,11 @@ impl CatalogClient {
                     Some("epoch before retention window"),
                     Some("RS-2006"),
                 );
-                return Err(Box::new(CliError::new(
+                return Err(CliError::new(
                     RS_2006,
                     format!("Requested epoch {epoch} is outside the retention window (minimum epoch: 10)"),
                     "Subscribe with --snapshot or a more recent epoch.",
-                )));
+                ));
             }
         }
 
@@ -1161,7 +1161,7 @@ impl CatalogClient {
         Ok(events)
     }
 
-    pub fn pause_source(&mut self, name: &str) -> Result<MutationOutcome, Box<CliError>> {
+    pub fn pause_source(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("source pause") {
             self.record_audit(
                 "source.pause",
@@ -1169,7 +1169,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1177,7 +1177,7 @@ impl CatalogClient {
                     Role::PipelineOwner
                 ),
                 "Request elevated RBAC role (PipelineOwner / Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if !self.sources.contains_key(name) {
@@ -1187,11 +1187,11 @@ impl CatalogClient {
                 Some("source not found"),
                 Some("RS-4009"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_4009,
                 format!("Source '{name}' not found"),
                 "Check the source name and ensure it has been created.",
-            )));
+            ));
         }
 
         let source = self.sources.get_mut(name).unwrap();
@@ -1206,7 +1206,7 @@ impl CatalogClient {
         })
     }
 
-    pub fn resume_source(&mut self, name: &str) -> Result<MutationOutcome, Box<CliError>> {
+    pub fn resume_source(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("source resume") {
             self.record_audit(
                 "source.resume",
@@ -1214,7 +1214,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1222,7 +1222,7 @@ impl CatalogClient {
                     Role::PipelineOwner
                 ),
                 "Request elevated RBAC role (PipelineOwner / Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if !self.sources.contains_key(name) {
@@ -1232,11 +1232,11 @@ impl CatalogClient {
                 Some("source not found"),
                 Some("RS-4009"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_4009,
                 format!("Source '{name}' not found"),
                 "Check the source name and ensure it has been created.",
-            )));
+            ));
         }
 
         let source = self.sources.get_mut(name).unwrap();
@@ -1251,7 +1251,7 @@ impl CatalogClient {
         })
     }
 
-    pub fn drop_source(&mut self, name: &str) -> Result<MutationOutcome, Box<CliError>> {
+    pub fn drop_source(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("source drop") {
             self.record_audit(
                 "source.drop",
@@ -1259,7 +1259,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1267,7 +1267,7 @@ impl CatalogClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if self.sources.remove(name).is_none() {
@@ -1277,11 +1277,11 @@ impl CatalogClient {
                 Some("source not found"),
                 Some("RS-4009"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_4009,
                 format!("Source '{name}' not found"),
                 "Check the source name and ensure it has been created.",
-            )));
+            ));
         }
 
         self.record_audit("source.drop", name, Some("dropped"), None);
@@ -1298,7 +1298,7 @@ impl CatalogClient {
         &mut self,
         name: &str,
         columns_spec: Option<&str>,
-    ) -> Result<MutationOutcome, Box<CliError>> {
+    ) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("schema create") {
             self.record_audit(
                 "schema.create",
@@ -1306,7 +1306,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1314,7 +1314,7 @@ impl CatalogClient {
                     Role::PipelineOwner
                 ),
                 "Request elevated RBAC role (PipelineOwner / Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if self.schemas.contains_key(name) {
@@ -1324,11 +1324,11 @@ impl CatalogClient {
                 Some("schema already exists"),
                 Some("RS-1004"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_1004,
                 format!("Schema/table '{name}' already exists"),
                 "Use a different table/view name or inspect with rockstream schema show.",
-            )));
+            ));
         }
 
         let columns = if let Some(spec) = columns_spec {
@@ -1369,7 +1369,7 @@ impl CatalogClient {
         })
     }
 
-    pub fn drop_schema(&mut self, name: &str) -> Result<MutationOutcome, Box<CliError>> {
+    pub fn drop_schema(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("schema drop") {
             self.record_audit(
                 "schema.drop",
@@ -1377,7 +1377,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1385,7 +1385,7 @@ impl CatalogClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if self.schemas.remove(name).is_none() {
@@ -1395,11 +1395,11 @@ impl CatalogClient {
                 Some("schema not found"),
                 Some("RS-1001"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_1001,
                 format!("Schema/table '{name}' not found"),
                 "Check pipeline name and ensure it has been created.",
-            )));
+            ));
         }
 
         self.record_audit("schema.drop", name, Some("dropped"), None);
@@ -1419,7 +1419,7 @@ impl CatalogClient {
         freshness_slo_ms: Option<u64>,
         memory_limit: Option<u64>,
         max_parallelism: Option<usize>,
-    ) -> Result<MutationOutcome, Box<CliError>> {
+    ) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("workload create") {
             self.record_audit(
                 "workload.create",
@@ -1427,7 +1427,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1435,7 +1435,7 @@ impl CatalogClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if self.workloads.contains_key(name) {
@@ -1445,11 +1445,11 @@ impl CatalogClient {
                 Some("workload already exists"),
                 Some("RS-1006"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_1006,
                 format!("Workload '{name}' already exists"),
                 "Use a different workload name or drop the existing workload first.",
-            )));
+            ));
         }
 
         self.workloads.insert(
@@ -1481,7 +1481,7 @@ impl CatalogClient {
         freshness_slo_ms: Option<u64>,
         memory_limit: Option<u64>,
         max_parallelism: Option<usize>,
-    ) -> Result<MutationOutcome, Box<CliError>> {
+    ) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("workload alter") {
             self.record_audit(
                 "workload.alter",
@@ -1489,7 +1489,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1497,7 +1497,7 @@ impl CatalogClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         if !self.workloads.contains_key(name) {
@@ -1507,11 +1507,11 @@ impl CatalogClient {
                 Some("workload not found"),
                 Some("RS-1005"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_1005,
                 format!("Workload '{name}' not found"),
                 "Check the workload name; ensure it has been created with CREATE WORKLOAD.",
-            )));
+            ));
         }
 
         let workload = self.workloads.get_mut(name).unwrap();
@@ -1539,7 +1539,7 @@ impl CatalogClient {
         })
     }
 
-    pub fn drop_workload(&mut self, name: &str) -> Result<MutationOutcome, Box<CliError>> {
+    pub fn drop_workload(&mut self, name: &str) -> Result<MutationOutcome, CliError> {
         if self.identity.role < required_role("workload drop") {
             self.record_audit(
                 "workload.drop",
@@ -1547,7 +1547,7 @@ impl CatalogClient {
                 Some("unauthorized role"),
                 Some("RS-2401"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1555,7 +1555,7 @@ impl CatalogClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         let workload = self.workloads.get(name).ok_or_else(|| {
@@ -1579,14 +1579,14 @@ impl CatalogClient {
                 Some("workload has assigned views"),
                 Some("RS-1014"),
             );
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_1014,
                 format!(
                     "Workload '{name}' drop rejected because views are still assigned: {:?}",
                     workload.assigned_views
                 ),
                 "Reassign or drop the workload's views before dropping the workload.",
-            )));
+            ));
         }
 
         self.workloads.remove(name);
@@ -1649,14 +1649,14 @@ impl StorageClient {
         &self,
         storage_path: &Path,
         destination: &str,
-    ) -> Result<CheckpointExportOutcome, Box<CliError>> {
+    ) -> Result<CheckpointExportOutcome, CliError> {
         if self.identity.role < required_role("checkpoint export") {
             let event =
                 AuditEvent::now(self.identity.user.clone(), "checkpoint.export", destination)
                     .with_detail("unauthorized role")
                     .with_error_code("RS-2401");
             append_audit_file(storage_path, &event);
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1664,7 +1664,7 @@ impl StorageClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         let source = storage_path.to_string_lossy().into_owned();
@@ -1750,13 +1750,13 @@ impl StorageClient {
         audit_path: &Path,
         source: &str,
         target: &str,
-    ) -> Result<RestoreOutcome, Box<CliError>> {
+    ) -> Result<RestoreOutcome, CliError> {
         if self.identity.role < required_role("checkpoint restore") {
             let event = AuditEvent::now(self.identity.user.clone(), "checkpoint.restore", source)
                 .with_detail("unauthorized role")
                 .with_error_code("RS-2401");
             append_audit_file(audit_path, &event);
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1764,7 +1764,7 @@ impl StorageClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         let source = source.to_string();
@@ -1844,7 +1844,7 @@ impl StorageClient {
         view: Option<&str>,
         _since: Option<&str>,
         out: Option<&Path>,
-    ) -> Result<SupportBundleInfo, Box<CliError>> {
+    ) -> Result<SupportBundleInfo, CliError> {
         self.generate_support_bundle_with_diagnostics(storage_path, view, _since, out, &[])
     }
 
@@ -1855,7 +1855,7 @@ impl StorageClient {
         _since: Option<&str>,
         out: Option<&Path>,
         occurrences: &[DiagnosticOccurrence],
-    ) -> Result<SupportBundleInfo, Box<CliError>> {
+    ) -> Result<SupportBundleInfo, CliError> {
         if self.identity.role < required_role("support bundle") {
             let event = AuditEvent::now(
                 self.identity.user.clone(),
@@ -1865,7 +1865,7 @@ impl StorageClient {
             .with_detail("unauthorized role")
             .with_error_code("RS-2401");
             append_audit_file(storage_path, &event);
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_2401,
                 format!(
                     "permission denied: principal '{}' lacks required role {:?}",
@@ -1873,7 +1873,7 @@ impl StorageClient {
                     Role::Admin
                 ),
                 "Request elevated RBAC role (Admin) or run under an authorized principal.",
-            )));
+            ));
         }
 
         let now_ms = self.support_bundle_time_ms.unwrap_or_else(|| {
@@ -1952,11 +1952,11 @@ impl StorageClient {
             })?;
         }
         if bytes.len() > MAX_DIAGNOSTIC_BUNDLE_BYTES {
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_0003,
                 "support bundle exceeds the 1 MiB diagnostic bundle bound",
                 "Reduce diagnostic history and retry the support bundle command.",
-            )));
+            ));
         }
         if let Some(parent) = out_path
             .parent()
@@ -2031,7 +2031,7 @@ impl StorageClient {
         &self,
         storage_path: &Path,
         checkpoint_id: u64,
-    ) -> Result<CheckpointAlignmentInfo, Box<CliError>> {
+    ) -> Result<CheckpointAlignmentInfo, CliError> {
         if let Some(mock) = self.mock_checkpoint_alignments.get(&checkpoint_id) {
             return Ok(mock.clone());
         }
@@ -2039,11 +2039,11 @@ impl StorageClient {
         let checkpoints_dir = storage_path.join("checkpoints");
         let checkpoint_entry = checkpoints_dir.join(checkpoint_id.to_string());
         if !checkpoint_entry.exists() {
-            return Err(Box::new(CliError::new(
+            return Err(CliError::new(
                 RS_0004,
                 format!("checkpoint {checkpoint_id} not found"),
                 "Verify the checkpoint ID using 'rockstream checkpoint list'.",
-            )));
+            ));
         }
 
         Ok(CheckpointAlignmentInfo {
