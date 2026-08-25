@@ -380,7 +380,7 @@ jobs:
     # times is ~4 minutes on a warm cache; sized generously above that plus
     # checkout/build overhead so a slow CI runner doesn't flake. Recorded in
     # `.claude/v0.45.4-evidence.md`.
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
