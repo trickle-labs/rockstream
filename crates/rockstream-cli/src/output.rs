@@ -112,7 +112,7 @@ pub fn render_error(err: &crate::CliError, format: OutputFormat) -> String {
             let env = CliErrorEnvelope::from_cli_error(err);
             serde_json::to_string_pretty(&env).unwrap_or_else(|_| err.to_string())
         }
-        OutputFormat::Text => err.to_string(),
+        OutputFormat::Text => err.render_diagnostic(),
     }
 }
 
