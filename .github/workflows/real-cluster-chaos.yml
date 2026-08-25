@@ -41,6 +41,7 @@ on:
       - "crates/rockstream-oracle/**"
       - "crates/rockstream-cli/**"
       - "crates/rockstream-diff/**"
+      - "crates/rockstream-docgen/**"
       - "crates/rockstream-test-support/**"
       - "formal/edge_*.fizz"
       - "Dockerfile"
