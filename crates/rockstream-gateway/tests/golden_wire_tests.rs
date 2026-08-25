@@ -126,7 +126,19 @@ fn normalize_exchange(bytes: &[u8]) -> Vec<u8> {
                     for b in &mut msg[start..end] {
                         *b = b'0';
                     }
+                } else if len >= 41 {
+                    for start in 5..=len - 36 {
+                        let uuid = &msg[start..start + 36];
+                        if [8, 13, 18, 23].iter().all(|&i| uuid[i] == b'-')
+                            && uuid.iter().enumerate().all(|(i, byte)| {
+                                [8, 13, 18, 23].contains(&i) || byte.is_ascii_hexdigit()
+                            })
+                        {
+                            msg[start..start + 36].fill(b'0');
+                        }
+                    }
                 }
+            }
             }
             _ => {}
         }
