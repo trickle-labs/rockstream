@@ -7638,16 +7638,14 @@ impl GatewayHandler {
                     .map(|p| p + "drop materialized view".len())
                     .unwrap_or("drop materialized view".len())
             }
+        } else if if_exists {
+            ql.find("if exists")
+                .map(|p| p + "if exists".len())
+                .unwrap_or("drop view if exists".len())
         } else {
-            if if_exists {
-                ql.find("if exists")
-                    .map(|p| p + "if exists".len())
-                    .unwrap_or("drop view if exists".len())
-            } else {
-                ql.find("drop view")
-                    .map(|p| p + "drop view".len())
-                    .unwrap_or("drop view".len())
-            }
+            ql.find("drop view")
+                .map(|p| p + "drop view".len())
+                .unwrap_or("drop view".len())
         };
 
         let rest = q.get(prefix_len..).unwrap_or("").trim();
@@ -10042,14 +10040,12 @@ impl GatewayHandler {
             if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
                 session.cursors.clear();
             }
-        } else {
-            if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
-                if session.cursors.remove(&name).is_none() {
-                    return Ok(vec![promote_response(Response::Error(Box::new(
+        } else if let Some(mut session) = self.sessions.get_mut(conn_id_str) {
+            if session.cursors.remove(&name).is_none() {
+                return Ok(vec![promote_response(Response::Error(Box::new(
                         ErrorInfo::new("ERROR".to_string(), "34000".to_string(),
                             format!("[RS-2051] cursor.not_found: cursor '{name}' does not exist. next_steps: Use DECLARE to open a cursor before FETCH/MOVE/CLOSE.")),
                     )))]);
-                }
             }
         }
 
