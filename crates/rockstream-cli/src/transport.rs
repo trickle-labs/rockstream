@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use rockstream_types::acl::Role;
 use rockstream_types::audit::AuditEvent;
+use rockstream_types::diagnostic::{
+    DiagnosticOccurrence, MAX_DIAGNOSTIC_BUNDLE_BYTES, MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES,
+};
 use rockstream_types::error_code::{
     RS_0003, RS_0004, RS_1001, RS_1004, RS_1005, RS_1006, RS_1007, RS_1008, RS_1014, RS_2006,
     RS_2401, RS_2410, RS_2411, RS_4009, RS_5030, RS_5035,
@@ -1604,6 +1607,7 @@ impl CatalogClient {
 pub struct StorageClient {
     pub identity: ClientIdentity,
     pub mock_checkpoint_alignments: std::collections::BTreeMap<u64, CheckpointAlignmentInfo>,
+    support_bundle_time_ms: Option<u64>,
 }
 
 impl Default for StorageClient {
@@ -1617,6 +1621,7 @@ impl StorageClient {
         Self {
             identity: ClientIdentity::new("admin").with_role(Role::Admin),
             mock_checkpoint_alignments: std::collections::BTreeMap::new(),
+            support_bundle_time_ms: None,
         }
     }
 
@@ -1624,7 +1629,14 @@ impl StorageClient {
         Self {
             identity,
             mock_checkpoint_alignments: std::collections::BTreeMap::new(),
+            support_bundle_time_ms: None,
         }
+    }
+
+    /// Fix the support-bundle timestamp for reproducible output.
+    pub fn with_support_bundle_time_ms(mut self, time_ms: u64) -> Self {
+        self.support_bundle_time_ms = Some(time_ms);
+        self
     }
 
     pub fn with_mock_checkpoint_alignment(mut self, alignment: CheckpointAlignmentInfo) -> Self {
@@ -1833,6 +1845,17 @@ impl StorageClient {
         _since: Option<&str>,
         out: Option<&Path>,
     ) -> Result<SupportBundleInfo, CliError> {
+        self.generate_support_bundle_with_diagnostics(storage_path, view, _since, out, &[])
+    }
+
+    pub fn generate_support_bundle_with_diagnostics(
+        &self,
+        storage_path: &Path,
+        view: Option<&str>,
+        _since: Option<&str>,
+        out: Option<&Path>,
+        occurrences: &[DiagnosticOccurrence],
+    ) -> Result<SupportBundleInfo, CliError> {
         if self.identity.role < required_role("support bundle") {
             let event = AuditEvent::now(
                 self.identity.user.clone(),
@@ -1853,10 +1876,12 @@ impl StorageClient {
             ));
         }
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = self.support_bundle_time_ms.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        });
         let out_path = out
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| storage_path.join(format!("support_bundle_{now_ms}.tar.gz")));
@@ -1869,20 +1894,70 @@ impl StorageClient {
         .with_detail(format!("bundle written to {}", out_path.display()));
         append_audit_file(storage_path, &event);
 
-        let bundle = serde_json::json!({
+        let mut diagnostic_occurrences = occurrences
+            .iter()
+            .take(MAX_DIAGNOSTIC_BUNDLE_OCCURRENCES)
+            .map(DiagnosticOccurrence::redacted)
+            .collect::<Vec<_>>();
+        let mut omitted_occurrences = occurrences
+            .len()
+            .saturating_sub(diagnostic_occurrences.len());
+        let mut bundle = serde_json::json!({
             "generated_at_ms": now_ms,
             "candidate_identity": rockstream_types::candidate_identity::CandidateIdentity::current(),
             "view": view,
             "audit_events": [],
+            "diagnostic_occurrences": diagnostic_occurrences,
             "redaction": "secret values are never included; only metadata and audit events are exported"
         });
-        let bytes = serde_json::to_vec_pretty(&bundle).map_err(|error| {
+        let mut bytes = serde_json::to_vec_pretty(&bundle).map_err(|error| {
             CliError::new(
                 RS_0003,
                 format!("failed to serialize support bundle: {error}"),
                 "Retry after checking the CLI runtime and storage directory.",
             )
         })?;
+        while bytes.len() > MAX_DIAGNOSTIC_BUNDLE_BYTES
+            && bundle["diagnostic_occurrences"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        {
+            diagnostic_occurrences.pop();
+            omitted_occurrences += 1;
+            bundle["diagnostic_occurrences"] = serde_json::to_value(&diagnostic_occurrences)
+                .expect("diagnostic occurrences are serializable");
+            bundle["diagnostic_truncation"] = serde_json::json!({
+                "truncated": true,
+                "omitted_occurrences": omitted_occurrences,
+            });
+            bytes = serde_json::to_vec_pretty(&bundle).map_err(|error| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed to serialize support bundle: {error}"),
+                    "Retry after checking the CLI runtime and storage directory.",
+                )
+            })?;
+        }
+        if omitted_occurrences > 0 {
+            bundle["diagnostic_truncation"] = serde_json::json!({
+                "truncated": true,
+                "omitted_occurrences": omitted_occurrences,
+            });
+            bytes = serde_json::to_vec_pretty(&bundle).map_err(|error| {
+                CliError::new(
+                    RS_0003,
+                    format!("failed to serialize support bundle: {error}"),
+                    "Retry after checking the CLI runtime and storage directory.",
+                )
+            })?;
+        }
+        if bytes.len() > MAX_DIAGNOSTIC_BUNDLE_BYTES {
+            return Err(CliError::new(
+                RS_0003,
+                "support bundle exceeds the 1 MiB diagnostic bundle bound",
+                "Reduce diagnostic history and retry the support bundle command.",
+            ));
+        }
         if let Some(parent) = out_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

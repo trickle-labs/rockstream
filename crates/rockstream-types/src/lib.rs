@@ -19,6 +19,7 @@ pub mod config_validation;
 pub mod connector;
 pub mod cost;
 pub mod data_plane;
+pub mod diagnostic;
 pub mod dlq;
 pub mod error_code;
 pub mod evidence_manifest;

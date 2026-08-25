@@ -4,6 +4,7 @@
 //! conforming to stable JSON schemas.
 
 use rockstream_types::audit::AuditEvent;
+use rockstream_types::diagnostic::DiagnosticOccurrence;
 use rockstream_types::view_lifecycle::{DegradationReason, DominantContributor};
 use serde::{Deserialize, Serialize};
 
@@ -65,17 +66,41 @@ pub struct CliErrorEnvelope {
     pub next_steps: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation_url: Option<String>,
+    pub correlation_id: String,
+    pub severity: String,
+    pub sqlstate: String,
+    pub retry_class: String,
+    pub context: std::collections::BTreeMap<String, String>,
 }
 
 impl CliErrorEnvelope {
     pub fn from_cli_error(err: &crate::CliError) -> Self {
-        let doc_url = format!("https://rockstream.dev/docs/errors#{}", err.code);
+        let occurrence = err.diagnostic_occurrence().redacted();
+        let descriptor = occurrence.descriptor();
+        let retryable = descriptor.is_some_and(|value| {
+            !matches!(
+                value.retry_class,
+                rockstream_types::error_code::RetryClass::NonRetryable
+            )
+        });
         Self {
-            code: err.code.to_string(),
+            code: occurrence.code.to_string(),
             message: err.message.clone(),
-            retryable: false,
+            retryable,
             next_steps: err.next_steps.clone(),
-            documentation_url: Some(doc_url),
+            documentation_url: descriptor
+                .map(|_| format!("https://rockstream.dev/docs/errors#{}", err.code)),
+            correlation_id: occurrence.correlation_id.to_string(),
+            severity: descriptor
+                .map(|value| value.severity.to_string())
+                .unwrap_or_else(|| "ERROR".to_string()),
+            sqlstate: descriptor
+                .map(|value| value.sqlstate.clone())
+                .unwrap_or_else(|| "XX000".to_string()),
+            retry_class: descriptor
+                .map(|value| value.retry_class.to_string())
+                .unwrap_or_else(|| "NonRetryable".to_string()),
+            context: occurrence.context,
         }
     }
 }
@@ -87,7 +112,7 @@ pub fn render_error(err: &crate::CliError, format: OutputFormat) -> String {
             let env = CliErrorEnvelope::from_cli_error(err);
             serde_json::to_string_pretty(&env).unwrap_or_else(|_| err.to_string())
         }
-        OutputFormat::Text => err.to_string(),
+        OutputFormat::Text => err.render_diagnostic(),
     }
 }
 
@@ -1240,6 +1265,22 @@ impl Formattable for SupportBundleInfo {
             self.size_bytes,
             self.redacted_secrets_count,
             self.generated_at_ms
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticSupportInfo {
+    pub occurrence: DiagnosticOccurrence,
+    pub bundle: SupportBundleInfo,
+}
+
+impl Formattable for DiagnosticSupportInfo {
+    fn to_text(&self) -> String {
+        format!(
+            "{}\nSupport bundle generated at {}",
+            self.occurrence.render_text(),
+            self.bundle.bundle_path
         )
     }
 }

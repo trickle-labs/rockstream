@@ -334,6 +334,18 @@ fn main() -> ExitCode {
                     since.as_deref(),
                     out.as_deref(),
                 ),
+                SupportCommand::Diagnose {
+                    code,
+                    correlation_id,
+                    out,
+                } => rockstream_cli::run_support_diagnose(
+                    format,
+                    &storage,
+                    &storage_path,
+                    code.as_deref(),
+                    correlation_id.as_deref(),
+                    out.as_deref(),
+                ),
             };
             handle_result(res, format)
         }

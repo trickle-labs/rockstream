@@ -75,6 +75,10 @@ use rockstream_types::data_plane::{
     DeploymentColumn, DeploymentRequest, DeploymentSchema, RuntimeRow, SourceDeltaRequest,
     WorkloadSnapshot, DEPLOYMENT_DESCRIPTOR_VERSION,
 };
+use rockstream_types::diagnostic::{
+    global_diagnostic_journal, record_diagnostic, DiagnosticOccurrence, MAX_DIAGNOSTIC_OCCURRENCES,
+};
+use rockstream_types::error_code::{ErrorCode, ErrorDescriptor, RS_1012};
 use rockstream_types::explain::ExplainLevel;
 use rockstream_types::frontier::{build_exact_membership_filter, ColumnStats, ShardColumnStats};
 use rockstream_types::ids::{ConnectorId, OperatorId, ShardId, ViewId, WorkloadId};
@@ -4613,14 +4617,32 @@ impl GatewayHandler {
             rockstream_types::metrics::set_session_frontier_age_ms("max_staleness", age_ms);
             if age_ms > max_staleness.as_millis() as u64 {
                 rockstream_types::metrics::inc_session_staleness_exceeded("max_staleness");
-                session.pending_notice = Some(SessionNotice {
-                    severity: "NOTICE".to_string(),
-                    sqlstate: "01000".to_string(),
-                    message: format!(
-                        "[RS-2018] session.staleness_exceeded: published frontier age {age_ms}ms exceeded rockstream.max_staleness={}ms. next_steps: Increase rockstream.max_staleness, reduce publish lag, or switch back to session_wait_for mode.",
-                        max_staleness.as_millis()
-                    ),
-                });
+                let occurrence = DiagnosticOccurrence::new(
+                    rockstream_types::error_code::RS_2018,
+                    uuid::Uuid::new_v4(),
+                    [
+                        (
+                            "event".to_string(),
+                            "session.staleness_exceeded".to_string(),
+                        ),
+                        ("frontier_age_ms".to_string(), age_ms.to_string()),
+                        (
+                            "max_staleness_ms".to_string(),
+                            max_staleness.as_millis().to_string(),
+                        ),
+                    ],
+                    None,
+                    None,
+                )
+                .expect("bounded session diagnostic context");
+                record_diagnostic(occurrence.clone());
+                tracing::warn!(
+                    code = %occurrence.code,
+                    correlation_id = %occurrence.correlation_id,
+                    diagnostic = %occurrence.render_json(),
+                    "session diagnostic"
+                );
+                session.pending_notice = Some(SessionNotice { occurrence });
             }
         } else {
             session.frontier_age_ms = None;
@@ -4640,9 +4662,17 @@ impl GatewayHandler {
             (None, None)
         };
         if let Some(notice) = notice {
+            let occurrence = notice.occurrence.redacted();
+            let descriptor = occurrence
+                .descriptor()
+                .expect("session notice must use a catalog diagnostic");
             client
                 .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                    ErrorInfo::new(notice.severity, notice.sqlstate, notice.message),
+                    ErrorInfo::new(
+                        descriptor.severity.to_string(),
+                        descriptor.sqlstate.clone(),
+                        occurrence.render_text(),
+                    ),
                 )))
                 .await?;
         }
@@ -4805,26 +4835,28 @@ impl GatewayHandler {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        if let Some(response) = diagnostic_query_response(q) {
+            return Some(Ok(vec![response]));
+        }
+
         if is_removed_connector_ddl(&ql) {
             return Some(Ok(vec![connector_removed_error_response()]));
         }
 
         // SERIALIZABLE → RS-2003
         if ql.contains("serializable") && ql.contains("isolation") {
-            return Some(Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "25001".to_owned(),
-                "[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED".to_owned(),
-            )))]));
+            return Some(Ok(vec![diagnostic_error_response(
+                rockstream_types::error_code::RS_2003,
+                Vec::<(String, String)>::new(),
+            )]));
         }
 
         // REPEATABLE READ → RS-2004
         if ql.contains("repeatable read") && ql.contains("isolation") {
-            return Some(Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "25001".to_owned(),
-                "[RS-2004] isolation.repeatable_read_not_supported: REPEATABLE READ isolation is not supported; use READ COMMITTED".to_owned(),
-            )))]));
+            return Some(Ok(vec![diagnostic_error_response(
+                rockstream_types::error_code::RS_2004,
+                Vec::<(String, String)>::new(),
+            )]));
         }
 
         // Catalog stubs
@@ -5232,22 +5264,16 @@ impl GatewayHandler {
             // BEGIN ISOLATION LEVEL SERIALIZABLE / REPEATABLE READ → RS-2003 / RS-2004,
             // the same honest rejection dispatch_sync applies to SET TRANSACTION.
             if ql.contains("isolation") && ql.contains("serializable") {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "25001".to_owned(),
-                        "[RS-2003] isolation.serializable_not_supported: SERIALIZABLE isolation is not supported; use READ COMMITTED".to_owned(),
-                    ),
-                )))]);
+                return Ok(vec![diagnostic_error_response(
+                    rockstream_types::error_code::RS_2003,
+                    Vec::<(String, String)>::new(),
+                )]);
             }
             if ql.contains("isolation") && ql.contains("repeatable read") {
-                return Ok(vec![promote_response(Response::Error(Box::new(
-                    ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "25001".to_owned(),
-                        "[RS-2004] isolation.repeatable_read_not_supported: REPEATABLE READ isolation is not supported; use READ COMMITTED".to_owned(),
-                    ),
-                )))]);
+                return Ok(vec![diagnostic_error_response(
+                    rockstream_types::error_code::RS_2004,
+                    Vec::<(String, String)>::new(),
+                )]);
             }
             if let Some(id) = conn_id {
                 let tx_status = self
@@ -12950,6 +12976,199 @@ fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
     }
 }
 
+const DIAGNOSTIC_DESCRIPTOR_COLUMNS: &[&str] = &[
+    "code",
+    "key",
+    "title",
+    "severity",
+    "sqlstate",
+    "retry_class",
+    "next_steps",
+    "doc_anchor",
+];
+
+const DIAGNOSTIC_OCCURRENCE_COLUMNS: &[&str] = &[
+    "code",
+    "key",
+    "title",
+    "severity",
+    "sqlstate",
+    "retry_class",
+    "message",
+    "correlation_id",
+    "context",
+    "retry_after_ms",
+    "causal_code",
+    "causal_correlation_id",
+    "causal_message",
+    "causal_context",
+    "next_steps",
+    "doc_anchor",
+];
+
+fn diagnostic_error_response(
+    code: ErrorCode,
+    context: impl IntoIterator<Item = (String, String)>,
+) -> Response<'static> {
+    let occurrence = DiagnosticOccurrence::new(code, uuid::Uuid::new_v4(), context, None, None)
+        .expect("bounded diagnostic context");
+    record_diagnostic(occurrence.clone());
+    let (severity, sqlstate) = ErrorDescriptor::lookup(code)
+        .map(|descriptor| (descriptor.severity.to_string(), descriptor.sqlstate.clone()))
+        .unwrap_or_else(|| ("ERROR".to_string(), "XX000".to_string()));
+    Response::Error(Box::new(ErrorInfo::new(
+        severity,
+        sqlstate,
+        occurrence.render_text(),
+    )))
+}
+
+fn diagnostic_query_response(query: &str) -> Option<Response<'static>> {
+    diagnostic_catalog_response(query).map(|response| match response {
+        Ok(response) => catalog_resp_to_response(response),
+        Err((severity, sqlstate, message)) => {
+            Response::Error(Box::new(ErrorInfo::new(severity, sqlstate, message)))
+        }
+    })
+}
+
+fn diagnostic_catalog_response(
+    query: &str,
+) -> Option<Result<CatalogResponse, (String, String, String)>> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "show diagnostic" || lower.starts_with("show diagnostic ") {
+        let mut parts = trimmed.split_whitespace();
+        let _show = parts.next();
+        let _diagnostic = parts.next();
+        let Some(raw_code) = parts.next() else {
+            return Some(Err(diagnostic_syntax_error(
+                "SHOW DIAGNOSTIC requires an RS-XXXX code",
+            )));
+        };
+        if parts.next().is_some() {
+            return Some(Err(diagnostic_syntax_error(
+                "SHOW DIAGNOSTIC accepts exactly one RS-XXXX code",
+            )));
+        }
+        let Some(code) = parse_diagnostic_code(raw_code) else {
+            return Some(Err(diagnostic_syntax_error(
+                "diagnostic code must use the RS-XXXX format",
+            )));
+        };
+        let Some(descriptor) = ErrorDescriptor::lookup(code) else {
+            return Some(Err(diagnostic_syntax_error("unknown diagnostic code")));
+        };
+        return Some(Ok(CatalogResponse::Rows {
+            columns: DIAGNOSTIC_DESCRIPTOR_COLUMNS
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+            rows: vec![vec![
+                Some(descriptor.code.to_string()),
+                Some(descriptor.key.clone()),
+                Some(descriptor.title.clone()),
+                Some(descriptor.severity.to_string()),
+                Some(descriptor.sqlstate.clone()),
+                Some(descriptor.retry_class.to_string()),
+                Some(descriptor.default_next_steps.clone()),
+                Some(descriptor.doc_anchor.clone()),
+            ]],
+        }));
+    }
+
+    if lower == "show diagnostics" || lower.starts_with("show diagnostics ") {
+        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+        let limit = match parts.as_slice() {
+            [_, _] => MAX_DIAGNOSTIC_OCCURRENCES,
+            [_, _, limit_keyword, raw_limit] if limit_keyword.eq_ignore_ascii_case("limit") => {
+                let Ok(limit) = raw_limit.parse::<usize>() else {
+                    return Some(Err(diagnostic_syntax_error(
+                        "SHOW DIAGNOSTICS LIMIT requires a non-negative integer",
+                    )));
+                };
+                limit.min(MAX_DIAGNOSTIC_OCCURRENCES)
+            }
+            _ => {
+                return Some(Err(diagnostic_syntax_error(
+                    "SHOW DIAGNOSTICS accepts only an optional LIMIT n",
+                )))
+            }
+        };
+        let rows = global_diagnostic_journal()
+            .lock()
+            .recent(limit)
+            .into_iter()
+            .filter_map(diagnostic_occurrence_row)
+            .collect();
+        return Some(Ok(CatalogResponse::Rows {
+            columns: DIAGNOSTIC_OCCURRENCE_COLUMNS
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+            rows,
+        }));
+    }
+
+    None
+}
+
+fn parse_diagnostic_code(raw_code: &str) -> Option<ErrorCode> {
+    let number = raw_code
+        .strip_prefix("RS-")
+        .or_else(|| raw_code.strip_prefix("rs-"))?;
+    (number.len() == 4)
+        .then(|| number.parse::<u16>().ok())
+        .flatten()
+        .map(ErrorCode::new)
+}
+
+fn diagnostic_syntax_error(detail: &str) -> (String, String, String) {
+    let descriptor = ErrorDescriptor::lookup(RS_1012);
+    (
+        descriptor
+            .map(|value| value.severity.to_string())
+            .unwrap_or_else(|| "ERROR".to_string()),
+        descriptor
+            .map(|value| value.sqlstate.clone())
+            .unwrap_or_else(|| "42601".to_string()),
+        format!(
+            "[{}] {}: {}. next_steps: {}",
+            RS_1012,
+            descriptor
+                .map(|value| value.key.as_str())
+                .unwrap_or("sql.parse_failed"),
+            detail,
+            descriptor
+                .map(|value| value.default_next_steps.as_str())
+                .unwrap_or("Check the SQL syntax and retry.")
+        ),
+    )
+}
+
+fn diagnostic_occurrence_row(occurrence: DiagnosticOccurrence) -> Option<Vec<Option<String>>> {
+    let descriptor = occurrence.descriptor()?;
+    let cause = occurrence.cause.as_deref();
+    Some(vec![
+        Some(occurrence.code.to_string()),
+        Some(descriptor.key.clone()),
+        Some(descriptor.title.clone()),
+        Some(descriptor.severity.to_string()),
+        Some(descriptor.sqlstate.clone()),
+        Some(descriptor.retry_class.to_string()),
+        Some(occurrence.message.clone()),
+        Some(occurrence.correlation_id.to_string()),
+        Some(serde_json::to_string(&occurrence.context).ok()?),
+        occurrence.retry_after_ms().map(|value| value.to_string()),
+        cause.map(|value| value.code.to_string()),
+        cause.map(|value| value.correlation_id.to_string()),
+        cause.map(|value| value.message.clone()),
+        cause.and_then(|value| serde_json::to_string(&value.context).ok()),
+        Some(descriptor.default_next_steps.clone()),
+        Some(descriptor.doc_anchor.clone()),
+    ])
+}
+
 /// Promote a `Response<'_>` to `Response<'static>` by ensuring all contained
 /// data is owned.  All data produced by our handlers is already owned, so this
 /// is safe via transmute-free coercion through boxing.
@@ -15093,6 +15312,12 @@ fn describe_returning_fields(
 /// Build FieldInfo list for a query (for DESCRIBE).
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
     let ql = q.trim().to_lowercase();
+    if let Some(Ok(CatalogResponse::Rows { columns, .. })) = diagnostic_catalog_response(q) {
+        return columns
+            .into_iter()
+            .map(|column| FieldInfo::new(column, None, None, Type::TEXT, FieldFormat::Text))
+            .collect();
+    }
     if ql.starts_with("update ") {
         if let Ok((table, _, _, Some(ret_cols))) = parse_update(q) {
             return describe_returning_fields(catalog, &table, &ret_cols);
@@ -17307,6 +17532,56 @@ mod s4_tests {
         let catalog = Arc::new(CatalogStubs::new());
         let reader: Arc<dyn ViewReader> = Arc::new(NoopViewReader);
         Arc::new(GatewayHandler::new(catalog, reader))
+    }
+
+    #[test]
+    fn show_diagnostic_returns_the_complete_catalog_row() {
+        let Ok(CatalogResponse::Rows { columns, rows }) =
+            diagnostic_catalog_response("SHOW DIAGNOSTIC RS-2018;").unwrap()
+        else {
+            panic!("SHOW DIAGNOSTIC must return one row");
+        };
+        assert_eq!(
+            columns,
+            vec![
+                "code",
+                "key",
+                "title",
+                "severity",
+                "sqlstate",
+                "retry_class",
+                "next_steps",
+                "doc_anchor"
+            ]
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("RS-2018".to_string()),
+                Some("session.max_staleness_exceeded".to_string()),
+                Some("Published frontier exceeded the session max_staleness bound; query proceeded".to_string()),
+                Some("WARN".to_string()),
+                Some("01000".to_string()),
+                Some("NonRetryable".to_string()),
+                Some("Increase rockstream.max_staleness, reduce publish lag, or switch to session_wait_for mode.".to_string()),
+                Some("rs-2018".to_string()),
+            ]]
+        );
+    }
+
+    #[test]
+    fn diagnostic_lookup_rejects_invalid_input_with_catalog_error() {
+        let Err((severity, sqlstate, message)) =
+            diagnostic_catalog_response("SHOW DIAGNOSTICS LIMIT nope;").unwrap()
+        else {
+            panic!("invalid diagnostic limit must fail");
+        };
+        assert_eq!(severity, "ERROR");
+        assert_eq!(sqlstate, "42601");
+        assert_eq!(
+            message,
+            "[RS-1012] sql.parse_error: SHOW DIAGNOSTICS LIMIT requires a non-negative integer. next_steps: Check SQL syntax; see docs/language-features.md for the supported SQL subset."
+        );
     }
 
     #[test]

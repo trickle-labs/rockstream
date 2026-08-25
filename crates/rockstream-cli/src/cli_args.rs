@@ -659,6 +659,18 @@ pub enum SupportCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Look up one runtime diagnostic and write its support bundle.
+    Diagnose {
+        /// Look up the most recent occurrence for this catalog code.
+        #[arg(long, conflicts_with = "correlation_id")]
+        code: Option<String>,
+        /// Look up an occurrence by its correlation UUID.
+        #[arg(long, conflicts_with = "code")]
+        correlation_id: Option<String>,
+        /// Output file path for the support bundle.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -14,6 +14,9 @@
 use crate::output::OutputFormat;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
+use rockstream_types::diagnostic::{
+    global_diagnostic_journal, record_diagnostic, redact_secrets, DiagnosticOccurrence,
+};
 use rockstream_types::error_code::{
     next_steps, ErrorCode, RS_0001, RS_0002, RS_0003, RS_0005, RS_4017, RS_5001,
 };
@@ -26,6 +29,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 pub mod cli_args;
 pub mod demo;
@@ -60,16 +64,56 @@ pub struct CliError {
     pub message: String,
     /// Actionable guidance for resolving the error.
     pub next_steps: String,
+    /// Catalog-backed occurrence used by every structured CLI renderer.
+    pub occurrence: DiagnosticOccurrence,
 }
 
 impl CliError {
     /// Construct a new CLI error.
     pub fn new(code: ErrorCode, message: impl Into<String>, next_steps: impl Into<String>) -> Self {
+        let message = redact_secrets(&message.into());
+        let next_steps = redact_secrets(&next_steps.into());
+        let correlation_id = Uuid::new_v4();
+        let occurrence = DiagnosticOccurrence::new(
+            code,
+            correlation_id,
+            [("detail".to_string(), message.clone())],
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| DiagnosticOccurrence {
+            code,
+            correlation_id,
+            message: message.clone(),
+            context: std::collections::BTreeMap::new(),
+            retry_after: None,
+            cause: None,
+        });
+        record_diagnostic(occurrence.clone());
+        tracing::error!(
+            code = %occurrence.code,
+            correlation_id = %occurrence.correlation_id,
+            diagnostic = %occurrence.render_json(),
+            "cli diagnostic"
+        );
         Self {
             code,
-            message: message.into(),
-            next_steps: next_steps.into(),
+            message,
+            next_steps,
+            occurrence,
         }
+    }
+
+    pub fn diagnostic_occurrence(&self) -> &DiagnosticOccurrence {
+        &self.occurrence
+    }
+
+    pub fn render_diagnostic(&self) -> String {
+        format!(
+            "{}\n  next steps: {}",
+            self.occurrence.render_text(),
+            self.next_steps
+        )
     }
 }
 
@@ -78,7 +122,7 @@ impl std::fmt::Display for CliError {
         write!(
             f,
             "{} {}\n  next steps: {}",
-            self.code, self.message, self.next_steps
+            self.code, self.message, self.next_steps,
         )
     }
 }
@@ -1602,6 +1646,96 @@ pub fn run_support_bundle(
 ) -> Result<String, CliError> {
     let outcome = storage.generate_support_bundle(storage_path, view, since, out)?;
     Ok(output::render_output(&outcome, format))
+}
+
+pub fn run_support_diagnose(
+    format: output::OutputFormat,
+    storage: &transport::StorageClient,
+    storage_path: &Path,
+    code: Option<&str>,
+    correlation_id: Option<&str>,
+    out: Option<&Path>,
+) -> Result<String, CliError> {
+    let occurrence = match (code, correlation_id) {
+        (Some(_), Some(_)) => {
+            return Err(CliError::new(
+                rockstream_types::error_code::RS_1012,
+                "support diagnose accepts either --code or --correlation-id, not both",
+                "Provide exactly one diagnostic lookup selector and retry.",
+            ))
+        }
+        (Some(raw_code), None) => {
+            let Some(code) = parse_diagnostic_code(raw_code) else {
+                return Err(CliError::new(
+                    rockstream_types::error_code::RS_1012,
+                    format!("invalid diagnostic code: {raw_code}"),
+                    "Use a registered code in the RS-XXXX format.",
+                ));
+            };
+            if rockstream_types::error_code::ErrorDescriptor::lookup(code).is_none() {
+                return Err(CliError::new(
+                    rockstream_types::error_code::RS_1012,
+                    format!("unknown diagnostic code: {raw_code}"),
+                    "Use SHOW DIAGNOSTIC RS-XXXX or provide a registered code.",
+                ));
+            }
+            global_diagnostic_journal()
+                .lock()
+                .by_code(code)
+                .into_iter()
+                .next()
+                .or_else(|| DiagnosticOccurrence::new(code, Uuid::new_v4(), [], None, None).ok())
+        }
+        (None, Some(raw_id)) => {
+            let Ok(correlation_id) = Uuid::parse_str(raw_id) else {
+                return Err(CliError::new(
+                    rockstream_types::error_code::RS_1012,
+                    format!("invalid correlation ID: {raw_id}"),
+                    "Use the UUID printed with the diagnostic occurrence.",
+                ));
+            };
+            global_diagnostic_journal()
+                .lock()
+                .by_correlation_id(correlation_id)
+        }
+        (None, None) => {
+            return Err(CliError::new(
+                rockstream_types::error_code::RS_1012,
+                "support diagnose requires --code or --correlation-id",
+                "Provide one diagnostic lookup selector and retry.",
+            ))
+        }
+    };
+
+    let Some(occurrence) = occurrence else {
+        return Err(CliError::new(
+            rockstream_types::error_code::RS_1012,
+            "diagnostic occurrence was not found",
+            "Run SHOW DIAGNOSTICS and retry with a retained correlation ID.",
+        ));
+    };
+    let occurrence = occurrence.redacted();
+    let bundle = storage.generate_support_bundle_with_diagnostics(
+        storage_path,
+        None,
+        None,
+        out,
+        std::slice::from_ref(&occurrence),
+    )?;
+    Ok(output::render_output(
+        &output::DiagnosticSupportInfo { occurrence, bundle },
+        format,
+    ))
+}
+
+fn parse_diagnostic_code(raw_code: &str) -> Option<rockstream_types::error_code::ErrorCode> {
+    let number = raw_code
+        .strip_prefix("RS-")
+        .or_else(|| raw_code.strip_prefix("rs-"))?;
+    (number.len() == 4)
+        .then(|| number.parse::<u16>().ok())
+        .flatten()
+        .map(rockstream_types::error_code::ErrorCode::new)
 }
 
 fn map_column_type(data_type: &str) -> arrow::datatypes::DataType {

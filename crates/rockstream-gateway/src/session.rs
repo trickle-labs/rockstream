@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use rockstream_types::diagnostic::DiagnosticOccurrence;
+
 /// Maximum GUC parameters stored per connection.
 /// Fill-level metric: `guc_params.len()`.
 /// Backpressure: excess SET commands are silently accepted but not stored.
@@ -107,9 +109,7 @@ pub struct CursorState {
 /// Session-scoped NOTICE queued for the next query response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionNotice {
-    pub severity: String,
-    pub sqlstate: String,
-    pub message: String,
+    pub occurrence: DiagnosticOccurrence,
 }
 
 /// Per-connection session state.

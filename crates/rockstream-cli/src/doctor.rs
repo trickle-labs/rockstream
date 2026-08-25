@@ -147,32 +147,7 @@ impl Default for DoctorOptions {
 
 /// Redact sensitive values (passwords, tokens, keys) from a string.
 pub fn redact_secrets(input: &str) -> String {
-    let mut out = input.to_string();
-    let patterns = [
-        ("password=", r"password=[^\s&,;]+"),
-        ("secret=", r"secret=[^\s&,;]+"),
-        ("token=", r"token=[^\s&,;]+"),
-        ("key=", r"key=[^\s&,;]+"),
-    ];
-    for (prefix, _) in patterns {
-        if let Some(idx) = out.to_lowercase().find(prefix) {
-            let start = idx + prefix.len();
-            let end = out[start..]
-                .find(|c: char| c.is_whitespace() || c == '&' || c == ';' || c == ',')
-                .map(|i| start + i)
-                .unwrap_or(out.len());
-            if start < end {
-                let to_replace = &out[start..end];
-                if !to_replace.is_empty() {
-                    out = format!("{}{}[REDACTED]{}", &out[..idx], prefix, &out[end..]);
-                }
-            }
-        }
-    }
-    if out.contains("-----BEGIN") {
-        out = "[REDACTED_PRIVATE_KEY_MATERIAL]".to_string();
-    }
-    out
+    rockstream_types::diagnostic::redact_secrets(input)
 }
 
 /// Execute all diagnostic checks and construct a `DoctorReport`.
