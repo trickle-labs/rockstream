@@ -4633,16 +4633,17 @@ impl GatewayHandler {
                     ],
                     None,
                     None,
-                )
-                .expect("bounded session diagnostic context");
-                record_diagnostic(occurrence.clone());
-                tracing::warn!(
-                    code = %occurrence.code,
-                    correlation_id = %occurrence.correlation_id,
-                    diagnostic = %occurrence.render_json(),
-                    "session diagnostic"
                 );
-                session.pending_notice = Some(SessionNotice { occurrence });
+                if let Ok(occurrence) = occurrence {
+                    record_diagnostic(occurrence.clone());
+                    tracing::warn!(
+                        code = %occurrence.code,
+                        correlation_id = %occurrence.correlation_id,
+                        diagnostic = %occurrence.render_json(),
+                        "session diagnostic"
+                    );
+                    session.pending_notice = Some(SessionNotice { occurrence });
+                }
             }
         } else {
             session.frontier_age_ms = None;
@@ -4663,18 +4664,17 @@ impl GatewayHandler {
         };
         if let Some(notice) = notice {
             let occurrence = notice.occurrence.redacted();
-            let descriptor = occurrence
-                .descriptor()
-                .expect("session notice must use a catalog diagnostic");
-            client
-                .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                    ErrorInfo::new(
-                        descriptor.severity.to_string(),
-                        descriptor.sqlstate.clone(),
-                        occurrence.render_text(),
-                    ),
-                )))
-                .await?;
+            if let Some(descriptor) = occurrence.descriptor() {
+                client
+                    .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                        ErrorInfo::new(
+                            descriptor.severity.to_string(),
+                            descriptor.sqlstate.clone(),
+                            occurrence.render_text(),
+                        ),
+                    )))
+                    .await?;
+            }
         }
         if let Some(age_ms) = frontier_age_ms {
             client
@@ -13010,8 +13010,20 @@ fn diagnostic_error_response(
     code: ErrorCode,
     context: impl IntoIterator<Item = (String, String)>,
 ) -> Response<'static> {
-    let occurrence = DiagnosticOccurrence::new(code, uuid::Uuid::new_v4(), context, None, None)
-        .expect("bounded diagnostic context");
+    let correlation_id = uuid::Uuid::new_v4();
+    let occurrence = match DiagnosticOccurrence::new(code, correlation_id, context, None, None) {
+        Ok(occurrence) => occurrence,
+        Err(_) => DiagnosticOccurrence {
+            code,
+            correlation_id,
+            message: ErrorDescriptor::lookup(code)
+                .map(|descriptor| descriptor.title.clone())
+                .unwrap_or_else(|| "Unknown error".to_string()),
+            context: BTreeMap::new(),
+            retry_after: None,
+            cause: None,
+        },
+    };
     record_diagnostic(occurrence.clone());
     let (severity, sqlstate) = ErrorDescriptor::lookup(code)
         .map(|descriptor| (descriptor.severity.to_string(), descriptor.sqlstate.clone()))
