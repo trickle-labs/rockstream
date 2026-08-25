@@ -31,7 +31,7 @@ complete. Implementation work on an independent stream may begin once its
 declared prerequisites are complete; the final qualification and sign-off
 sequence remains ordered.
 
-The pre-v1 product program from v0.59.4 through v0.59.24 currently contains 21
+The v0.59 qualification program from v0.59.4 through v0.59.24 contains 21
 planning units and an initial estimate of approximately 126 person-weeks. That
 number is not a binding staffing estimate: the split rule above requires the
 program total to be regenerated after mandatory slices are estimated. The
@@ -48,7 +48,7 @@ SQL contract -> type completeness; lifecycle -> deployment profiles
 architecture evidence + reference workloads -> capacity -> final qualification
 ```
 
-The diagram is explanatory; these are the binding pre-v1 prerequisite edges.
+The diagram is explanatory; these are the binding v0.59 prerequisite edges.
 Implementation prerequisites identify the work that must exist before a stream
 can be implemented. Proof prerequisites identify the harness or contract that
 must exist before that stream can be signed off. The global sign-off order still
@@ -109,17 +109,17 @@ applies even when implementation starts in parallel.
 9. **Design-partner validation is parallel work.** Once the golden path exists,
    independent users exercise local evaluation, Kafka ingestion, PostgreSQL
    CDC, high-cardinality views, and restore or upgrade drills. Findings are
-   classified as `block v1`, documentation, diagnostics/defaults, explicit v1
-   limitation, or v1.x deferment. Only P0/P1 defects or repeated fundamental
-   usability failures block release.
-10. **Pre-v1 scope is frozen after approval.** No new pre-v1 capability
+   classified as `block v0.59 qualification`, documentation, diagnostics/defaults,
+   an explicit v0.59 limitation, or v0.60+ deferment. Only P0/P1 defects or
+   repeated fundamental usability failures block qualification.
+10. **The v0.59 scope is frozen after approval.** No new v0.59 capability
    milestone may be added. The freeze becomes authoritative only after the
    approved roadmap SHA is recorded and the repository's `main` branch or
    equivalent ruleset demonstrably enforces required checks, no force pushes,
    and ownership review for release workflows, formal specifications, security
    policy, and capability contracts. New work must split an oversized
    milestone, correct a violated v1 contract, resolve a P0/P1 defect, or move
-   to v1.x. RC and final release tags remain signed.
+   to v0.60 or later. RC tags remain signed. Promotion to v1.0 is unscheduled.
 
 **Protection admission status (2026-08-19).** The live GitHub checks for
 `trickle-labs/rockstream` report `main` as unprotected and report no repository
@@ -228,7 +228,7 @@ candidate artifacts, fail on skipped prerequisites, and independently check
 the claimed correctness, recovery, upgrade, restore, resource, security, and
 performance outcomes. Scheduled or operator-run multi-hour and multi-day soaks
 remain useful when resources permit, but their absence does not block a version
-or the v1 release.
+or v0.59 qualification.
 
 Waivers are dated debts, not exemptions. Any `Simulation-compensated waiver`
 (e.g. NEW_IMPLEMENTATION_PLAN.md Phase 4's real-network-test waiver) must name
@@ -270,22 +270,22 @@ These names orient readers; they are not calendar commitments.
 | Connector Surface Final | v0.52.5 | RockStream's supported external integration boundary is two sources (PostgreSQL CDC, Kafka) and one sink (Kafka), and everything else is deleted rather than deprecated: the S3 source, the HTTP/webhook source, the object-store sink, the Iceberg and Delta cold-tier sinks, cold-tier GC, and external lakehouse catalog registration are gone from the codebase, along with the dependencies that existed only for them. Every removed surface fails closed with `RS-4017` and a named replacement path instead of silently doing nothing. The three survivors carry a published, machine-checked guarantee table and a real-broker/real-Postgres failure matrix, and a new connector cannot enter the repository without an admission record. The PostgreSQL wire interface and RockStream's own object-storage-backed durable state are untouched. |
 | Operationally Complete | v0.56.1 | The full operator CLI surface (workload/view/schema/source/cluster/resource lifecycle, the IVM arrangement debugger), freshness lag decomposed into separately-attributable causes with an enumerated reason behind every stall, internal mTLS, secrets management, an independent security review, a proven rolling-upgrade path, and a rehearsed disaster-recovery drill are all done; an operator can run, diagnose, upgrade, and heal a cluster using only documented commands. |
 | v1 Contract Published | v0.57.1 | Every capability carries a strategic tier (`Core`/`Maintain`/`Experimental`); every `Core` operator documents its incremental, backfill, recovery, state-growth, and failure semantics; PostgreSQL CDC and Kafka are named as the release-gated connectors; and CI fails if the published capability matrix drifts from this roadmap. |
-| v0.59 Engineering Complete ✅ Done | v0.59 | All v0.1–v0.58.3 implementation work and the short CI gate completed; v1 release qualification remains open because the evidence is not yet artifact-bound or sufficiently end to end. |
-| v1 Release Qualification | v0.59.1–v0.59.3 | Release identity and evidence become immutable and SHA-bound; one mandatory no-skip multi-process suite verifies the real data path, recovery, rolling upgrade, disaster restore, resource bounds, and performance; release engineering, security provenance, and public contracts are reconciled. |
-| Pre-v1 CLI & Configuration | v0.59.4 | CLI usability (demo, doctor, completions), configuration validation/resolution, stable JSON output, and the deterministic workload used to begin honest performance baselining. |
-| Pre-v1 Performance Architecture | v0.59.5–v0.59.9 | Baseline the current engine, make state persistence delta-native, share durable arrangements, factorize and filter high-amplification IVM, share window slices, bound skew with heavy/light execution and micro-migration, then move the hot path to shard-owned actors with SLO-adaptive execution, checkpointing, storage, compaction, and serving. The physical architecture freezes at v0.59.9. |
-| Pre-v1 Product Polish | v0.59.10–v0.59.12 | Runtime introspection over the final engine (capabilities, version, arrangement sharing, amplification, skew, checkpoint, cache, and system catalogs), SQL ergonomics (UPDATE/DELETE RETURNING, IF EXISTS modifiers, common scalar functions), and error-reference generation. |
-| Pre-v1 Product Experience & Quality | v0.59.13–v0.59.23 | Single-source product surface manifest, golden-path project templates, current executable documentation, structured diagnostics across all surfaces, public-path scenario/differential framework, full lifecycle/client/backend test closure, SQL semantics and type completeness, production lifecycle and health contracts, supported deployment profiles, and capacity guidance calibrated against the final shared and factorized architecture. |
+| v0.59 Engineering Complete ✅ Done | v0.59 | All v0.1–v0.58.3 implementation work and the short CI gate completed; final qualification remains open because the evidence is not yet artifact-bound or sufficiently end to end. |
+| v0.59 Release Qualification | v0.59.1–v0.59.3 | Release identity and evidence become immutable and SHA-bound; one mandatory no-skip multi-process suite verifies the real data path, recovery, rolling upgrade, disaster restore, resource bounds, and performance; release engineering, security provenance, and public contracts are reconciled. |
+| v0.59 CLI & Configuration | v0.59.4 | CLI usability (demo, doctor, completions), configuration validation/resolution, stable JSON output, and the deterministic workload used to begin honest performance baselining. |
+| v0.59 Performance Architecture | v0.59.5–v0.59.9 | Baseline the current engine, make state persistence delta-native, share durable arrangements, factorize and filter high-amplification IVM, share window slices, bound skew with heavy/light execution and micro-migration, then move the hot path to shard-owned actors with SLO-adaptive execution, checkpointing, storage, compaction, and serving. The physical architecture freezes at v0.59.9. |
+| v0.59 Product Polish | v0.59.10–v0.59.12 | Runtime introspection over the final engine (capabilities, version, arrangement sharing, amplification, skew, checkpoint, cache, and system catalogs), SQL ergonomics (UPDATE/DELETE RETURNING, IF EXISTS modifiers, common scalar functions), and error-reference generation. |
+| v0.59 Product Experience & Quality | v0.59.13–v0.59.23 | Single-source product surface manifest, golden-path project templates, current executable documentation, structured diagnostics across all surfaces, public-path scenario/differential framework, full lifecycle/client/backend test closure, SQL semantics and type completeness, production lifecycle and health contracts, supported deployment profiles, and capacity guidance calibrated against the final shared and factorized architecture. |
 | Final Horizontal Scale & Performance Qualification | v0.59.24 | Create and freeze `v1.0.0-rc.1`, change no architecture, and qualify those exact signed artifacts for real 1/2/4/8-worker scale, absolute capacity, tail latency, hot-key behavior, state-over-RAM operation, overload recovery, migration, checkpoint, and compaction behavior with an external oracle and immutable raw evidence on fixed reference environments. |
-| v1.0 Release | after v0.59.24 | The exact qualified RC source commit and artifact digests pass every bounded automated gate with zero open P0/P1 defects, including the blocking horizontal scale-out and performance qualification gate; optional extended soaks may supplement, but do not replace or block, the automated evidence; `v1.0.0` is then tagged without rebuilding the artifacts. |
-| Typed Semantics & Feature Delivery | v1.1.4 | Capability Contract v2, typed scalar/key/state semantics, common ordering, typed stateful operators, explicit preview activation, and raw-pgwire reachability gates are complete. |
-| Essential Operators Core | v1.2.4 | Admitted aggregate, grouping, join, set-operation, and analytic-window cells pass public, durability, distributed, upgrade, resource, and capacity qualification. |
-| Ordering & Temporal Analytics | v1.3.5 | Ad hoc sort, maintained bounded ordering, HOP, SESSION, advanced frames, and `NTILE` are public and measured. |
-| LATERAL & Recursion | v1.4.5 | Table-function and bounded correlated `LATERAL`, monotone distributed recursion, and deletion-aware recursion are publicly reachable with explicit limits. |
-| Durable Time & Algebra | v1.5.4 | Durable timers, processing-time retractions, built-in CRDT columns, and restricted custom merge laws pass algebra and recovery qualification. |
-| Serializable Transactions | v2.0.5 | Direct pgwire transactions provide qualified local and distributed serializable execution with complete conflict coverage. |
-| Regional Resilience | v2.1.4 | Replicated checkpoints, warm standby, frontier-pinned reads, and fenced active-passive failover pass regional fault qualification. |
-| Scoped Active-Active | v2.2.4 | Home-region ownership, merge-law multi-writer state, and global serializable mode pass partition, migration, convergence, and history checks. |
+| v1.0 Release | Unscheduled | Promotion is postponed indefinitely. This roadmap assigns no v1.0 version or date, and v0.60 or later work does not depend on promotion. |
+| Typed Semantics & Feature Delivery | v0.64 | Capability Contract v2, typed scalar/key/state semantics, common ordering, typed stateful operators, explicit preview activation, and raw-pgwire reachability gates are complete. |
+| Essential Operators Core | v0.69 | Admitted aggregate, grouping, join, set-operation, and analytic-window cells pass public, durability, distributed, upgrade, resource, and capacity qualification. |
+| Ordering & Temporal Analytics | v0.75 | Ad hoc sort, maintained bounded ordering, HOP, SESSION, advanced frames, and `NTILE` are public and measured. |
+| LATERAL & Recursion | v0.81 | Table-function and bounded correlated `LATERAL`, monotone distributed recursion, and deletion-aware recursion are publicly reachable with explicit limits. |
+| Durable Time & Algebra | v0.86 | Durable timers, processing-time retractions, built-in CRDT columns, and restricted custom merge laws pass algebra and recovery qualification. |
+| Serializable Transactions | v0.92 | Direct pgwire transactions provide qualified local and distributed serializable execution with complete conflict coverage. |
+| Regional Resilience | v0.97 | Replicated checkpoints, warm standby, frontier-pinned reads, and fenced active-passive failover pass regional fault qualification. |
+| Scoped Active-Active | v0.102 | Home-region ownership, merge-law multi-writer state, and global serializable mode pass partition, migration, convergence, and history checks. |
 
 ¹ **Re-opened by the <=v0.42 implementation review (2026-07-10).** "All four FizzBee models green" was never actually true: the `formal-verify` CI job has never successfully installed the `fizzbee` binary (wrong release-asset filename), never runs on pull requests (its `if:` guard tests a non-existent field), and carries `continue-on-error: true`, so nothing has ever blocked a merge on a red or crashing model. Running the models directly for the first time found M1 failing its `M1_S5_IdempotentReplay` invariant and M3/M4 crashing outright (undefined-variable Starlark errors) — only M2 has ever genuinely passed. The distributed-engine Rust implementation and its `SimRuntime`/chaos test suite are unaffected by this finding; only the *formal-verification* proof of v0.18–v0.22 is unverified. **Update (v0.42.1, same day):** the CI toolchain, M1, and M3 are now fixed and genuinely green (M1: 72 states; M3: 1,168 states; both safety+liveness); M2 remains genuinely green (251,889 states); M4's crash and a real self-fencing race are fixed, but exhaustive verification of M4 does not yet terminate in reasonable time, so M4 stays non-blocking pending **v0.42.3**. **Update (v0.42.1, same day, CI-robustness follow-up):** the very first real CI run of this fix showed the M4 step itself get a `cancelled` conclusion (consistent with the runner's OOM killer acting on an exploding process), which `continue-on-error` does not suppress and which flipped the whole hard-gate job to `failure` — the "M4 is non-blocking" contract was not actually true in a real run. Fixed by running M4 under a per-subshell `ulimit -v` memory cap plus a wall-clock `timeout`, swallowing its exit code into a step output instead of the step's own outcome, so the job can never fail because of M4 regardless of how it terminates. **Update (v0.42.3, same day): fully resolved.** `MAX_OUTAGES` (not worker/shard count) was the dominant driver of the explosion; lowering it from 2 to 1 (every other bound unchanged) makes exhaustive BFS complete in ~5.4s (31,456 nodes). This also surfaced a real liveness bug — `GrantLease` could re-grant a lease to a worker its own failure detector had already declared dead, letting an adversarial-but-fair schedule starve every other worker forever — now fixed with an explicit `require worker_id not in cp.dead_workers` guard. `M4_S1`–`M4_S4`, `COV_M4`, `M4_L1_RecoveryProgress`, and `M4_L2_NoPermanentBlock` all now pass under exhaustive BFS; the CI special-casing (`continue-on-error`/`ulimit -v`/`timeout`) is removed and M4 is folded back into the single hard-gate step. See `formal/findings.md` ("Post-v0.42 Review", "Post-v0.42.1 Remediation Results", and "Post-v0.42.3 Remediation Results") and roadmap versions **v0.42.1** and **v0.42.3** below.
 
@@ -824,8 +824,8 @@ several docs don't just lag reality, one of them actively overstates it.
   encryption/KEK config (real target: v0.56, unstarted), user-visible CRDT
   column types (`CREATE TABLE ... (amount COUNTER)`, `MAX_REGISTER`,
   `MIN_REGISTER`, `LWW`, `OR_SET`, `MV_REGISTER` — these directly contradict
-  `README.md`'s own explicit "post-1.0 goal... intentionally out of scope for
-  the current roadmap" framing and `NEW_IMPLEMENTATION_PLAN.md`'s "Out of
+  `README.md`'s then-current explicit "post-1.0 goal... intentionally out of
+  scope for the current roadmap" framing and `NEW_IMPLEMENTATION_PLAN.md`'s "Out of
   Scope" list), `WITH RECURSIVE`/semi-naive/DRed recursion (real target:
   v0.50, unstarted), `SHOW RESOURCE USAGE` and its variants plus the
   `rockstream_catalog.view_resource_usage`/`workload_resource_usage` tables
@@ -1468,7 +1468,7 @@ lifecycle correctness and v0.52.2 deepens an already-shipped connector.
 
 **One structural constraint binds the two.** The snapshot/delta fence built in
 v0.52.1 is the *same primitive* a durable snapshot-plus-live `SUBSCRIBE`
-protocol needs (recorded as a post-1.0 candidate after Phase 17). It ships as a
+protocol needs (recorded as an unscheduled candidate after Phase 17). It ships as a
 named, reusable primitive with its own tests, not as private backfill
 machinery, so it is built once rather than twice with subtly different
 semantics.
@@ -1543,7 +1543,7 @@ unaffected.
 | v0.52.4 | Deletion: Removed Connectors, the Cold-Tier Family & Their Dependencies ✅ Done | The proposal's Phases 3–5 — delete the implementations, the dependencies, and the abstractions that existed only to serve them. From `rockstream-connectors`: `s3_source.rs`, `object_store_sink.rs`, `iceberg_sink.rs`, `delta_sink.rs`, `cold_tier_sink.rs`, `cold_gc.rs`, `partition_spec.rs`, `catalog_registrar.rs` (Glue/Hive/REST/DuckLake registration) and their `lib.rs` re-exports. From `rockstream-gateway`: `webhook_source.rs` and its `server.rs` wiring — the `webhook_sources` registry and the create/pause/resume/drop/ingest handlers. The crate's public surface becomes exactly `source_connector`, `source_epoch`, `source_runtime`, `postgres_cdc`, `kafka_source`, `sink_connector`, `kafka_sink`, plus `fault_injecting_store`, which the retained Kafka and CDC fault tests use. **Dependency audit, arbitrated by `cargo tree`/`cargo deny` rather than judgement**: remove `iceberg`, `deltalake`, `aws-sdk-s3`, `aws-config`, and `csv` from the crate and from the workspace root where nothing else needs them; remove `parquet` and `object_store` *from this crate only* if unused there, and retain them wherever `rockstream-storage` or another core subsystem legitimately requires them — the objective is a smaller **effective** dependency graph, never an artificial architectural change to force a removal. **Dead-abstraction sweep**: every hook on `SinkConnector`/`SourceConnector` that existed only because a removed connector needed it is deleted rather than kept for hypothetical extensibility, explicitly including the `ColdGcCatalog` trait and the per-sink pending-epoch accessors only the removed sinks implemented. Retire `formal/m5_cold_tier_sink.fizz` to `formal/retired/` with a header recording why, and drop M5 from `make verify`. Delete `docs/cold-tier-sinks.md`, redirected from `docs/connector-migration.md`. | `rockstream-connectors`'s `lib.rs` exports exactly the retained modules and the workspace builds under `-D warnings` with **no `#[allow(dead_code)]` added** to absorb the deletion; `cargo tree -i` returns no path from any workspace crate to `iceberg`, `deltalake`, `aws-sdk-s3`, `aws-config`, or `csv`; the sign-off publishes a measured before/after of total dependency count, `cargo build --release` wall time, and CI wall time — a deletion version's value has to be measurable, not merely tidy; the **full retained suite** (exactly-once, recovery, chaos, Nexmark, pgwire conformance) is green on LFS, MinIO, and TC with **zero tests disabled, deleted, or `#[ignore]`d to make the deletion pass** — any test that must go is one whose only subject was a removed connector, enumerated by name in the sign-off; `make verify` is green with M5 retired and M1–M4/M6/M7 byte-for-byte unchanged; a repo-wide grep across `crates/`, `docs/`, `scripts/`, and `formal/` finds zero live reference to a deleted module. | Unit, LFS, MinIO, TC |
 | v0.52.5 | Depth Over Breadth: The Three-Connector Guarantee Matrix ✅ Done | Spend the reclaimed budget on the connectors that remain, and write the result down as a **guarantee** rather than a test count. Publish `docs/connectors.md` stating, for each of PostgreSQL CDC, Kafka source, and Kafka sink, its delivery guarantee, offset/LSN recovery contract, buffering and backpressure bounds, degradation states, and enumerated failure codes — the same five-axis discipline v0.57 requires of every `Core` operator, applied to the three `Core` connectors, so v0.57 cites it instead of re-deriving it. Fill the proposal's redirected test matrix against real systems. **PostgreSQL CDC**: snapshot→stream handoff over v0.52.1's fence, every mutation type, restart at every commit boundary, WAL lag, malformed replication records, replication-slot loss, publication loss, backpressure, long-running recovery. **Kafka source**: consumer rebalance mid-epoch, partition expansion, offset recovery, broker interruption, bounded buffers, duplicate prevention, transactional source/sink interaction. **Kafka sink**: crash before commit, crash during commit, uncertain broker response, transaction timeout, recovery re-run, duplicate prevention, checkpoint coupling. Every cell runs against a real broker and a real PostgreSQL under TestContainers — v0.51.21 removed the mocks and `scripts/check-no-mock-connectors.sh` keeps them out. Make the proposal's **Extensibility Policy enforceable rather than aspirational**: a new source or sink module in `rockstream-connectors` fails CI unless the change carries the six-point admission record (`scripts/check-connector-admission.sh`, built in the same style as the existing `check-no-mock-connectors.sh` and its paired `.test.sh`). | Every cell of the published matrix maps to a named passing test in the sign-off, with no cell marked N/A without a written reason; every failure-injection cell asserts a **recovery outcome** — no loss, no duplicates, bounded recovery time against the v0.22 and v0.31 SLOs — never merely "did not crash"; `docs/connectors.md`'s failure-code table is machine-checked against the `RS-XXXX` registry in both directions, so a documented code that does not exist and a connector code that is undocumented each fail CI; a PR adding a synthetic new sink module fails `check-connector-admission.sh` and passes only once the admission record is present, with `check-connector-admission.test.sh` proving both directions per the repo's script-test convention; `rockstream-connectors` coverage meets the same 70/70 line/region gate the gateway carries. | Unit, LFS, MinIO, TC |
 
-### Phase 17 — Production Readiness & 1.0 Finalization
+### Phase 17 — Production Readiness & Qualification
 
 
 Every version below is a production-readiness gate, sequenced per
@@ -1632,7 +1632,7 @@ that ships an insecure default.
 | v0.58.1 | Real-Backend Failure Proof & Published Recovery Numbers ✅ Done | **Split out of v0.58 by the 2026-08-12 realism review**: every cell of the v0.58 matrix whose failure mode is only observable against a real system gets a real-process, real-backend counterpart in the existing `real-cluster-chaos.yml` job — object-store brownout and throttling, source disconnect with offset/LSN recovery, sink failure during commit **and** during recovery, control-node loss, exchange interruption and retry-budget exhaustion, and resource exhaustion with recovery. Each publishes **absolute** detection, recovery, and freshness numbers against the v0.22 and v0.31 SLOs rather than a relative regression check. **Scheduling correction**: this suite is wall-clock expensive and does not belong on every pull request. It runs on a documented schedule with a per-cell time budget and a published total runtime, and a cell that cannot fit its budget is split rather than quietly dropped — the failure mode this version exists to prevent is a chaos suite so slow that it gets disabled. | Every real-backend cell runs green on the scheduled job, with its absolute numbers published as a checked-in artifact and compared against the previous run; a deliberately injected recovery delay past the SLO fails the job rather than being absorbed as noise; total runtime stays within the documented budget; zero cells enter the v0.59 RC gate marked "not covered" or "simulation only" without an explicit, reasoned exemption recorded in the matrix itself. | Unit, LFS, MinIO, TC |
 | v0.58.2 | Storage-Pressure Admission Signals & the SLO Auto-Tuning Lock ✅ Done | **Split out of v0.58 by the 2026-08-12 realism review**: a control loop is not a test suite and cannot be signed off by the same criteria. Extend the controller v0.45.1 built and v0.51.23 wired to real state bytes with storage-pressure signals — L0 backlog, pending compaction bytes, flush latency, write amplification, and object-store latency and failure rate become admission inputs alongside state bytes — with the documented shedding order: throttle backfills (v0.52.1) first, reduce source ingestion second, refuse parallelism increases that would worsen compaction debt third, so a large backfill can never make already-running views indefinitely stale by overwhelming the storage layer. Finish the shift from bounded defaults to SLO-driven adaptive control **only** to the extent it keeps the IVM freshness SLO healthy: the auto-tuner is a means to the freshness contract, not an elasticity product surface, and no new tuning knobs or control surfaces ship here. The signals stay **separately attributable and individually exported**; the single composite `storage_debt` scalar proposed by the 2026-08-11 future-roadmap review is explicitly rejected, because collapsing five heterogeneous signals into one number produces a control loop that oscillates with no way to explain why, and v0.54.1 requires every degradation to name its dominant cause. | Each of the five storage-pressure signals is induced independently and each triggers the documented shedding step in the documented order, with the acting signal named through v0.54.1's dominant-cause attribution (new `storage_pressure_admission_tests.rs`, MinIO + TC); a large backfill against a compaction-saturated store degrades backfill throughput while already-running views stay inside the freshness SLO; the loop converges rather than oscillates under both a sustained pressure step and an oscillating one, measured over a documented settling window; no new user-facing tuning knob is added, asserted by a configuration-surface lock test. | Unit, LFS, MinIO, TC |
 | v0.58.3 | Unscoped Reachability, Dispatch-Wiring & Silent-Wrong-Answer Sweep ✅ Done | **Moved out of v0.59 by the 2026-08-12 realism review**: an audit whose fix list is unknown when it starts cannot live inside the gate that decides whether the release is ready. Every per-version `implement-version-orient` Pass C audit is deliberately scope-limited to that version's Scope, so no single version has ever re-audited the whole committed SQL surface. Run that same Pass C check **unscoped**, over every keyword, DDL statement, and `SHOW` command `docs/language-features.md` claims as implemented across v0.1–v0.58.2, closing the "code exists but is never wired to dispatch" gap class that shipped in v0.51.2. Re-run the v0.51.27 silent-wrong-answer sweep unscoped over the whole tree: every `unreachable!()`, `todo!()`, silently-wrong constant, and acknowledged-but-discarded branch on a reachable input-dependent path. **Fixing what the sweep finds is this version's work, not a follow-up**: each finding is either fixed, or the capability is retiered and the v0.57 contract updated to match, before this version signs off. | Every SQL/DDL/`SHOW` keyword documented as implemented in `docs/language-features.md` has a passing e2e pgwire reachability test (raw SQL through the real dispatcher, not a unit test importing private modules); the unscoped dispatch-wiring audit reports zero `MISSING` parser→dispatcher→executor→response paths anywhere in the documented surface; the unscoped silent-wrong-answer sweep reports zero reachable branches producing a wrong answer, a panic, or a silent no-op; and the audit itself is checked in as a repeatable script with a paired self-test, so v0.59 re-runs it as an entry criterion instead of re-deriving it by hand. | Unit, LFS, MinIO, TC |
-| v0.59 | v1.0 Release Candidate (RC1) ✅ Done | **Rescoped by the 2026-08-12 realism review to a pure gate.** The unscoped reachability and silent-wrong-answer sweep, and every fix it produces, move to v0.58.3 and become an **entry criterion**: RC1 begins only when that script re-runs clean, so the release candidate contains no discovery work. Two scheduling rules the version left implicit are now stated: the 2-week continuous chaos cycle is **wall-clock bound and its clock restarts** on any P0/P1 fix or any other merged change, so a late fix moves the tag rather than shortening the soak. Activate all features from v0.1 through v0.58.3 simultaneously; run comprehensive chaos, performance, and scaling soak under maximum cluster pressure within a single cloud region. **The gate is the v0.57 contract, not feature completeness** ([ROCKSTREAM_PROJECT_FOCUS.md](ROCKSTREAM_PROJECT_FOCUS.md) §10 Stage 5): RC1 passes on correctness, recovery, bounded resources, operability, upgradeability, security, and performance stability of the core maintained-view workloads — not on how much SQL or how many connectors exist. **The unscoped reachability/dispatch-wiring sweep ships at v0.58.3, not here**, for the reason above; its charter was, and remains: every per-version `implement-version-orient` Pass C audit (`docs/language-features.md` vs. actual parser/dispatch/lowering code) is deliberately scope-limited to that version's Scope, so no single version ever re-audits the whole committed SQL surface — run that same Pass C check unscoped, over every keyword/DDL/`SHOW` command `docs/language-features.md` claims as implemented across v0.1–v0.58, closing exactly the "code exists but is never wired to dispatch" gap class that shipped in v0.51.2. **v1.0 Release** milestone → tag `v1.0.0`. | Entry criteria are met before the soak starts: v0.58.3's audit script re-runs clean, v0.58's matrix has zero uncovered cells, and every version through v0.58.3 is signed off. No P0 or P1 bug is discovered during a 2-week continuous automated chaos cycle whose clock restarted on the last merged change — a P0/P1 fix restarts the soak rather than shortening it. Each of the seven v1 release gates is signed off against a named artifact: no known silent-wrong-answer path (the v0.51.27 sweep re-run unscoped at v0.58.3), no lost or duplicated committed state under the v0.58/v0.58.1 failure matrix, bounded memory and state under v0.51.23/v0.51.24 accounting and spill plus v0.58.2's storage-pressure shedding, every degradation explainable through v0.54.1's enumerated reasons, a rehearsed v0.56 rolling upgrade and v0.56.1 restore drill, a closed v0.55.2 security review with zero open P0/P1 findings — including any engagement carried forward from that version — and a documented performance envelope for the core maintained-view workloads. | Unit, LFS, MinIO, TC |
+| v0.59 | v1.0 Release Candidate (RC1) ✅ Done | **Rescoped by the 2026-08-12 realism review to a pure gate.** The unscoped reachability and silent-wrong-answer sweep, and every fix it produces, move to v0.58.3 and become an **entry criterion**: RC1 begins only when that script re-runs clean, so the release candidate contains no discovery work. Two scheduling rules the version left implicit are now stated: the 2-week continuous chaos cycle is **wall-clock bound and its clock restarts** on any P0/P1 fix or any other merged change, so a late fix moves the tag rather than shortening the soak. Activate all features from v0.1 through v0.58.3 simultaneously; run comprehensive chaos, performance, and scaling soak under maximum cluster pressure within a single cloud region. **The gate is the v0.57 contract, not feature completeness** ([ROCKSTREAM_PROJECT_FOCUS.md](ROCKSTREAM_PROJECT_FOCUS.md) §10 Stage 5): RC1 passes on correctness, recovery, bounded resources, operability, upgradeability, security, and performance stability of the core maintained-view workloads — not on how much SQL or how many connectors exist. **The unscoped reachability/dispatch-wiring sweep ships at v0.58.3, not here**, for the reason above; its charter was, and remains: every per-version `implement-version-orient` Pass C audit (`docs/language-features.md` vs. actual parser/dispatch/lowering code) is deliberately scope-limited to that version's Scope, so no single version ever re-audits the whole committed SQL surface — run that same Pass C check unscoped, over every keyword/DDL/`SHOW` command `docs/language-features.md` claims as implemented across v0.1–v0.58, closing exactly the "code exists but is never wired to dispatch" gap class that shipped in v0.51.2. Qualification evidence remains valid. Promotion to `v1.0.0` is unscheduled. | Entry criteria are met before the soak starts: v0.58.3's audit script re-runs clean, v0.58's matrix has zero uncovered cells, and every version through v0.58.3 is signed off. No P0 or P1 bug is discovered during a 2-week continuous automated chaos cycle whose clock restarted on the last merged change — a P0/P1 fix restarts the soak rather than shortening it. Each of the seven v0.59 qualification gates is signed off against a named artifact: no known silent-wrong-answer path (the v0.51.27 sweep re-run unscoped at v0.58.3), no lost or duplicated committed state under the v0.58/v0.58.1 failure matrix, bounded memory and state under v0.51.23/v0.51.24 accounting and spill plus v0.58.2's storage-pressure shedding, every degradation explainable through v0.54.1's enumerated reasons, a rehearsed v0.56 rolling upgrade and v0.56.1 restore drill, a closed v0.55.2 security review with zero open P0/P1 findings — including any engagement carried forward from that version — and a documented performance envelope for the core maintained-view workloads. | Unit, LFS, MinIO, TC |
 
 **Post-v0.59 qualification correction (2026-08-18).** The v0.59 row above is
 retained as the historical scope that was implemented and signed off, but its
@@ -1845,7 +1845,7 @@ production-profile performance obligations remain binding at R2/v0.59.24.
 | v0.59.21 | Graceful Lifecycle, Shutdown & Health Contract | Define SIGTERM/SIGINT, crash, eviction, drain, and role-shutdown behavior; stop new work, finish or abort epochs safely, flush durable state, release leases, close clients, enforce a configurable deadline, and expose structured `/live`, `/ready`, and `/health` endpoints with startup, draining, dependency, and degraded-state semantics. | Binary-level lifecycle tests start a workload, terminate gateway/control/worker roles, and verify committed rows survive, leases move, subscriptions close cleanly, and the old process exits within its deadline; readiness transitions are asserted during startup, dependency loss, and drain, while health responses include role, version, dependencies, and actionable reasons. | Unit, LFS, MinIO, TC |
 | v0.59.22 | Supported Platforms & Deployment Profiles | Publish supported CPU architectures, Linux distributions and libc expectations, OCI image and `docker run`/Compose profiles, non-root container behavior, ports, storage and object-store requirements, resource recommendations, upgrade-safe configuration, and reference systemd and Kubernetes deployment profiles with a minimal Helm chart. Classify environments as `Supported`, `Compatible, unverified`, or `Unsupported`; `rockstream doctor` warns for the middle category and startup rejects only known unsafe or incompatible combinations. | Clean-machine runs pass for each supported profile; x86-64 and ARM64 binaries and multi-architecture images start the same smoke workload; container, systemd, and Kubernetes profiles run as non-root with documented persistence and networking; the matrix distinguishes tested versions from protocol-compatible but unverified S3-compatible, PostgreSQL, and Kafka versions, and rejects only known incompatibilities. | Unit, LFS, MinIO, Postgres, Kafka, TC |
 | v0.59.23 | Capacity Planning & Estimator Calibration | Add measured small/medium/large sizing profiles over the frozen engine and explain the drivers of unique physical arrangement state, sharing fan-out and saved bytes, factorized payloads, delta and join amplification, window slices, hot-key buckets, cache, spill, commit grouping, checkpoints, compaction, network shuffle, and object-store cost. Make `EXPLAIN INCREMENTAL ESTIMATE` reason from canonical arrangements and selected physical strategies: twenty views sharing three arrangements are estimated as three maintained arrangements plus twenty consumers, never twenty independent copies, and factorized joins estimate compact payload state rather than a flat intermediate that is not materialized. Calibrate against reproducible uniform, high-cardinality, join, window, skew, and state-over-RAM workloads and publish observed error ranges tied to values users can inspect before deployment. Before the first v0.59.24 RC is built, freeze per-reference-profile floors for minimum sustainable rows per second and updates per second per core, plus ceilings for CPU-seconds, object-store requests, and cost per million accepted updates and p99 query latency at declared concurrency. | Every profile compares estimated and measured private/shared state bytes, RSS, spill, cache hit rate, epoch and commit-group duration, p99 freshness, shuffle bytes, logical/physical writes, object-store requests, checkpoint cost, and compaction debt. Estimates change in the correct direction when sharing, factorization, selectivity, skew, or freshness targets change; raw measurements regenerate all sizing guidance and error ranges; deliberately restoring a per-view arrangement multiplier or flat-join cardinality assumption fails calibration before v0.59.24 begins. The absolute floors, ceilings, hardware profile, concurrency, and workload digests are justified by raw measurements, signed into the threshold manifest, and immutable once the RC is built. | Unit, LFS, MinIO, Postgres, Kafka, TC |
-| v0.59.24 | Final Horizontal Scale & Performance Qualification | **Blocking pre-v1 gate; this version changes no engine architecture.** At the start of this version, create `v1.0.0-rc.1` from one protected source SHA and publish the exact signed binary and image artifacts to be qualified. Freeze their digests, toolchain, lockfile, deployment topology, configuration, workload corpus, fault policy, hardware identity, and v0.59.23 thresholds before measurement. Run Kafka/PostgreSQL CDC → real RockStream workers → incremental operators → SlateDB/MinIO → PGWire/Kafka sink on fixed reference hardware at 1, 2, 4, and 8 workers. Exercise uniform and high-cardinality aggregation, factorized and unfactorized shuffle-heavy joins, correlated shared windows, Zipf skew with a sustained 50× hot key, state substantially larger than worker RAM, 120% offered-load recovery, worker loss, online split and micro-migration, checkpoint alignment, and compaction pressure. Requalify the v0.47 elasticity claims and every v0.59.5–v0.59.9 architecture gate through the final v0.59.10 observability and v0.59.23 capacity surfaces. Profile operator CPU, useful work, lock wait, Arrow encode/decode, key construction, SlateDB and object-store I/O, shuffle, checkpoint, compaction, cache, and gateway work. A candidate-identity change creates the next RC number. A qualification-input change creates a new `QualificationProfile` revision and `QualificationRun` for the same candidate. Any threshold change invalidates prior qualification evidence and requires a complete rerun, but does not create a new RC unless the candidate artifacts also changed. A failure that requires redesign returns to the owning architecture version and invalidates affected downstream evidence; thresholds are never relaxed inside the gate to make a candidate pass. | An external benchmark/oracle harness that imports no RockStream crate timestamps generated changes, independently computes complete expected materialized-view multisets, queries PGWire, and consumes Kafka sink output. Maximum sustainable throughput follows the binding benchmark contract and must hold for 30 minutes with p99 freshness ≤1 second, bounded memory, queues, checkpoint backlog, and compaction debt, the declared checkpoint and compaction cycles complete, and no wrong results, lost changes, duplicate sink outputs, failed or rejected committed writes, or OOMs. Proof requires every absolute floor and ceiling frozen by v0.59.23 **and** ≥1.7×, ≥3.2×, and ≥5.6× single-worker sustainable throughput at 2, 4, and 8 workers for partitionable uniform aggregation; ≥4× at 8 workers for the shuffle-heavy join; no worker above 1.5× median sustained CPU under uniform load; hot-key mitigation recovering ≥80% of corresponding non-skew throughput without manual intervention; online split or migration with zero incorrect results and ≤20% temporary throughput loss; and automatic freshness recovery after five minutes at 120% offered load. One-row changes against 1K, 100K, and 10M-state arrangements remain approximately constant in state mutations and SlateDB writes; state larger than RAM remains inside its declared freshness SLO. Raw measurements record throughput, scale factor, p50/p95/p99 freshness, query latency, CPU/core, RSS, shared and private state bytes, spill, cache hit rate, network bytes, object-store requests, checkpoint duration, logical and physical write amplification, queue depth, compaction debt, and per-worker load. Harness mutations must fail when two declared workers are one process, WorkerIds repeat, one worker performs all useful work, a declared worker owns no shard, the generator saturates, the sink consumer falls behind, a result is stale but otherwise correct, output is duplicated or lost, raw timestamps are replaced by constants, a required workload is skipped, or CPU affinity or hardware identity changes mid-run. Inputs, environment, candidate digests, raw observations, and regenerated summaries are immutable evidence; every external bottleneck is demonstrated and quantified; constants or manually supplied samples cannot satisfy a result; future candidates regress by no more than 10% sustainable throughput or p99 freshness without explicit baseline approval. | Unit, LFS, MinIO, Postgres, Kafka, multi-process TC/Kubernetes, fixed multi-host performance environment |
+| v0.59.24 | Final Horizontal Scale & Performance Qualification | **Blocking v0.59 qualification gate; this version changes no engine architecture.** At the start of this version, create `v1.0.0-rc.1` from one protected source SHA and publish the exact signed binary and image artifacts to be qualified. Freeze their digests, toolchain, lockfile, deployment topology, configuration, workload corpus, fault policy, hardware identity, and v0.59.23 thresholds before measurement. Run Kafka/PostgreSQL CDC → real RockStream workers → incremental operators → SlateDB/MinIO → PGWire/Kafka sink on fixed reference hardware at 1, 2, 4, and 8 workers. Exercise uniform and high-cardinality aggregation, factorized and unfactorized shuffle-heavy joins, correlated shared windows, Zipf skew with a sustained 50× hot key, state substantially larger than worker RAM, 120% offered-load recovery, worker loss, online split and micro-migration, checkpoint alignment, and compaction pressure. Requalify the v0.47 elasticity claims and every v0.59.5–v0.59.9 architecture gate through the final v0.59.10 observability and v0.59.23 capacity surfaces. Profile operator CPU, useful work, lock wait, Arrow encode/decode, key construction, SlateDB and object-store I/O, shuffle, checkpoint, compaction, cache, and gateway work. A candidate-identity change creates the next RC number. A qualification-input change creates a new `QualificationProfile` revision and `QualificationRun` for the same candidate. Any threshold change invalidates prior qualification evidence and requires a complete rerun, but does not create a new RC unless the candidate artifacts also changed. A failure that requires redesign returns to the owning architecture version and invalidates affected downstream evidence; thresholds are never relaxed inside the gate to make a candidate pass. | An external benchmark/oracle harness that imports no RockStream crate timestamps generated changes, independently computes complete expected materialized-view multisets, queries PGWire, and consumes Kafka sink output. Maximum sustainable throughput follows the binding benchmark contract and must hold for 30 minutes with p99 freshness ≤1 second, bounded memory, queues, checkpoint backlog, and compaction debt, the declared checkpoint and compaction cycles complete, and no wrong results, lost changes, duplicate sink outputs, failed or rejected committed writes, or OOMs. Proof requires every absolute floor and ceiling frozen by v0.59.23 **and** ≥1.7×, ≥3.2×, and ≥5.6× single-worker sustainable throughput at 2, 4, and 8 workers for partitionable uniform aggregation; ≥4× at 8 workers for the shuffle-heavy join; no worker above 1.5× median sustained CPU under uniform load; hot-key mitigation recovering ≥80% of corresponding non-skew throughput without manual intervention; online split or migration with zero incorrect results and ≤20% temporary throughput loss; and automatic freshness recovery after five minutes at 120% offered load. One-row changes against 1K, 100K, and 10M-state arrangements remain approximately constant in state mutations and SlateDB writes; state larger than RAM remains inside its declared freshness SLO. Raw measurements record throughput, scale factor, p50/p95/p99 freshness, query latency, CPU/core, RSS, shared and private state bytes, spill, cache hit rate, network bytes, object-store requests, checkpoint duration, logical and physical write amplification, queue depth, compaction debt, and per-worker load. Harness mutations must fail when two declared workers are one process, WorkerIds repeat, one worker performs all useful work, a declared worker owns no shard, the generator saturates, the sink consumer falls behind, a result is stale but otherwise correct, output is duplicated or lost, raw timestamps are replaced by constants, a required workload is skipped, or CPU affinity or hardware identity changes mid-run. Inputs, environment, candidate digests, raw observations, and regenerated summaries are immutable evidence; every external bottleneck is demonstrated and quantified; constants or manually supplied samples cannot satisfy a result; future candidates regress by no more than 10% sustainable throughput or p99 freshness without explicit baseline approval. | Unit, LFS, MinIO, Postgres, Kafka, multi-process TC/Kubernetes, fixed multi-host performance environment |
 
 v0.59.24 qualifies the exact signed RC artifact digests created at its start.
 A candidate-identity change creates the next RC number. A qualification-input
@@ -1870,18 +1870,15 @@ not mean rejected forever, and it does not affect anything already shipped.
 | Deferred item | Was | Readmission evidence required |
 |---|---|---|
 | Live adaptive replacement between classic and factorized plans | Removed from v0.59.7 before implementation | A measured production workload where compile/deploy-time selection is insufficient, plus resource-headroom admission, a durable switch generation, crash recovery in every phase, rollback, retention of the old plan until all readers pass the switch, a dedicated formal model, and proof that running two plans does not violate the freshness SLO. Shadow comparison in the benchmark harness does not itself admit production cutover. |
-| `SERIALIZABLE LOCAL` single-shard isolation; per-row version validation for non-CRDT exact-key writes (`RS-2008` optimistic conflict detection); user-visible CRDT column types | v0.54 (Isolation & Validation Hooks) | A concrete target workload that cannot use PostgreSQL or Kafka as its source of truth and genuinely requires RockStream itself to be the transactional authority. Direct DML remains an ingestion and access convenience; full OLTP semantics are not part of the IVM product. |
 | `CREATE EXPECTATION`, the expectation operator, `warn`/`degrade`/`block` state-degradation policies, lineage diagnostics | v0.52 (Inline Expectations & Lineage Diagnostics) | A design partner requiring declarative data-quality policy *in the engine* rather than upstream of it. The operational half — durable, bounded, replayable quarantine — ships at v0.52 regardless. |
 | Additional connector families beyond PostgreSQL CDC and Kafka | never scheduled; recurring pressure | **Tightened 2026-08-12 (Phase 16.6).** The `Maintain`-tier object-store and webhook paths no longer exist as a fallback, so the bar is now the proposal's six-point Extensibility Policy, machine-enforced by `scripts/check-connector-admission.sh` at v0.52.5: the workload must materially improve core IVM, must be unable to reach RockStream through Kafka or PostgreSQL as the integration boundary, must have demonstrated production demand, must have failure/recovery semantics meeting RockStream's correctness standard, must carry acceptable maintenance burden, and must be worth permanently widening the compatibility contract. Default answer: build it outside RockStream. |
 | S3 source, HTTP/webhook source, object-store sink, Iceberg sink, Delta Lake sink, cold-tier sink infrastructure, cold-tier GC, external lakehouse catalog registration (Glue/Hive/REST/DuckLake) | shipped at v0.27–v0.29, v0.44, v0.51.16; classified `Maintain` by the 2026-08-11 rebaseline | **Removed, not deferred** — deleted at v0.52.3–v0.52.5 per [ROCKSTREAM_CONNEXTORS_CLEANUP.md](ROCKSTREAM_CONNEXTORS_CLEANUP.md). Readmission is governed by the connector-admission row above, not by the fact that the code once existed. Replacement paths are documented in `docs/connector-migration.md`: external loader via pgwire/Kafka for file ingestion, an external HTTP→Kafka adapter for webhooks, and RockStream → Kafka → a downstream format-owning writer for lakehouse output. |
-| Iceberg REST catalog server (§13.7), DuckLake catalog server (§13.8), and any further lakehouse-management responsibility | already out of scope in `NEW_IMPLEMENTATION_PLAN.md`; reaffirmed here | Unchanged: post-1.0 at the earliest — and as of Phase 16.6 there is no longer a cold-tier sink to build a catalog server around. RockStream → Kafka → a dedicated lakehouse writer is the supported path. |
-| Retraction-producing temporal filters (`WHERE occurred_at > CURRENT_TIMESTAMP - INTERVAL '1 hour'` emitting negative deltas as rows expire) | proposed as "optional" by the 2026-08-11 future-roadmap review (item 6); never scheduled | A workload whose arrangement growth cannot be bounded by the already-shipped event-time TTL, watermark gating, and window operators (`crates/rockstream-ops/src/time_window.rs`), which already emit retractions on expiry. This is new SQL breadth under [ROCKSTREAM_PROJECT_FOCUS.md](ROCKSTREAM_PROJECT_FOCUS.md) §8, and a filter re-evaluated against wall-clock every epoch is a different cost model from an event-time window — admitting it "narrowly" is how a temporal-SQL initiative starts. |
+| Iceberg REST catalog server (§13.7), DuckLake catalog server (§13.8), and any further lakehouse-management responsibility | already out of scope in `NEW_IMPLEMENTATION_PLAN.md`; reaffirmed here | Unscheduled. Phase 16.6 removed the cold-tier sink that could have justified a catalog server. RockStream → Kafka → a dedicated lakehouse writer is the supported path. |
 | `gcp_kms` and `vault` KEK backends for `CREATE SECRET` envelope encryption | v0.55 (four backends: `env`/`aws_kms`/`gcp_kms`/`vault`), narrowed to two by the 2026-08-12 realism review | A deployment that requires one of them. Both remain cheap to add behind v0.55.1's `KekProvider` trait; what is deferred is release-gating a backend that has no credentials and no live integration target to test against, which would make the contract's `Core` tier mean less than it says. |
-| Multi-region replication and cross-region active/active serving | never scheduled; recorded here so it is neither implied nor silently rejected | A production workload with a region-loss RPO/RTO that v0.56's cross-region checkpoint **export** plus restore-into-a-new-cluster procedure cannot meet. v1 is explicitly a single-region product: v0.59.2 qualifies one single-region topology, with optional extended runs of the same harness when resources permit. |
 
 ---
 
-#### Post-1.0 candidates (accepted direction, no v1 slot)
+#### Unscheduled candidates (accepted direction, no assigned version)
 
 Distinct from the table above: these are not deferred pending evidence — the
 direction is accepted — but they are not v1-gated and hold no roadmap slot
@@ -1926,8 +1923,8 @@ scheduled version owns per-view cost or write-amplification budgets.
 ## Essential features implementation program
 
 This section adopts `rockstream-essential-features-implementation-plan.md` as
-the post-v1 roadmap. The existing v0.x schedule remains unchanged. New release
-trains begin at v1.1.0 after v1.0 qualification and promotion.
+the post-v0.59.24 roadmap. Existing versions through v0.59.24 remain unchanged.
+The next planning unit is v0.60. Promotion to v1.0 is unscheduled.
 
 **Repository baseline:** `trickle-labs/rockstream` `main` at `b9fea7a1ec5ac98824d0ed50b8c9d57c1f20b73b`  
 **Workspace baseline:** `0.59.15`  
@@ -1974,7 +1971,7 @@ A feature is not “implemented” until that path is complete. An internal Plan
 
 The program is divided into eight release trains:
 
-1. Finish the existing pre-v1 closure through `v0.59.24`.
+1. Finish the existing v0.59 closure through `v0.59.24`.
 2. Build the typed semantics and feature-delivery foundation.
 3. Graduate aggregates, joins, set operations, and core analytic windows.
 4. Implement general `ORDER BY`/`LIMIT`, Top-K, HOP, SESSION, and advanced window semantics.
@@ -2448,7 +2445,7 @@ Use the existing roadmap convention:
 #### 6.2 Dependency graph
 
 ```text
-Finish current v1 closure
+Finish v0.59.24 qualification
         |
 Capability Contract v2 + public reachability gate
         |
@@ -2468,9 +2465,9 @@ Timers + CRDT/merge laws --------|----|
                        Scoped active-active consistency modes
 ```
 
-#### 6.3 Existing pre-v1 closure: complete without feature expansion
+#### 6.3 Existing v0.59 closure: complete without feature expansion
 
-Do not derail the current release path by inserting the new feature program into pre-v1 qualification.
+Do not derail the current release path by inserting the new feature program into v0.59 qualification.
 
 | Existing version | Required outcome for this plan |
 |---|---|
@@ -2482,15 +2479,15 @@ Do not derail the current release path by inserting the new feature program into
 | `v0.59.21` | Graceful shutdown and health semantics. |
 | `v0.59.22` | Supported deployment profiles. |
 | `v0.59.23` | Calibrated capacity and estimator. |
-| `v0.59.24` | Exact-artifact multi-worker qualification and v1 promotion. |
+| `v0.59.24` | Exact-artifact multi-worker qualification. No automatic v1 promotion. |
 
-Architecture and ADR work for the post-v1 program may be prepared in parallel, but feature code must rebase onto and requalify against the exact v1 architecture.
+Architecture and ADR work for the post-v0.59.24 program may be prepared in parallel, but feature code must rebase onto and requalify against the exact v0.59.24 architecture.
 
 ---
 
-### Part I — v1.1: Feature delivery and typed semantics foundation
+### Part I — v0.60–v0.64: Feature delivery and typed semantics foundation
 
-### 7. v1.1.0 — Capability Contract v2 and public reachability ledger
+### 7. v0.60 — Capability Contract v2 and public reachability ledger
 
 #### Scope
 
@@ -2556,7 +2553,7 @@ region.active-active.serializable
 
 ---
 
-### 8. v1.1.1 — Typed scalar, equality, hash, and row codecs
+### 8. v0.61 — Typed scalar, equality, hash, and row codecs
 
 #### Scope
 
@@ -2583,7 +2580,7 @@ region.active-active.serializable
 
 ---
 
-### 9. v1.1.2 — Common `SortSpec`, ordered keys, and typed window specification
+### 9. v0.62 — Common `SortSpec`, ordered keys, and typed window specification
 
 #### Scope
 
@@ -2603,7 +2600,7 @@ region.active-active.serializable
 
 ---
 
-### 10. v1.1.3 — Typed stateful operator API and format migration
+### 10. v0.63 — Typed stateful operator API and format migration
 
 #### Scope
 
@@ -2636,7 +2633,7 @@ The refactor must preserve:
 
 ---
 
-### 11. v1.1.4 — Preview activation, public transcript harness, and release gate
+### 11. v0.64 — Preview activation, public transcript harness, and release gate
 
 #### Scope
 
@@ -2658,9 +2655,9 @@ No later feature train begins until:
 
 ---
 
-### Part II — v1.2: Graduate the essential existing operator families
+### Part II — v0.65–v0.69: Graduate the essential existing operator families
 
-### 12. v1.2.0 — Exact aggregates and typed grouping
+### 12. v0.65 — Exact aggregates and typed grouping
 
 #### Public surface
 
@@ -2695,7 +2692,7 @@ No later feature train begins until:
 
 ---
 
-### 13. v1.2.1 — Floating aggregates, DISTINCT, and NULL completeness
+### 13. v0.66 — Floating aggregates, DISTINCT, and NULL completeness
 
 #### Scope
 
@@ -2720,7 +2717,7 @@ No later feature train begins until:
 
 ---
 
-### 14. v1.2.2 — Typed joins and set operations
+### 14. v0.67 — Typed joins and set operations
 
 #### Scope
 
@@ -2753,7 +2750,7 @@ No later feature train begins until:
 
 ---
 
-### 15. v1.2.3 — Core analytic windows
+### 15. v0.68 — Core analytic windows
 
 #### Initial Core contract
 
@@ -2788,7 +2785,7 @@ No later feature train begins until:
 
 ---
 
-### 16. v1.2.4 — Core graduation qualification
+### 16. v0.69 — Core graduation qualification
 
 Promote only the cells that pass:
 
@@ -2804,9 +2801,9 @@ A capability family may contain a mix of Core and Experimental variants. That is
 
 ---
 
-### Part III — v1.3: Ordering, Top-K, advanced windows, HOP, and SESSION
+### Part III — v0.70–v0.75: Ordering, Top-K, advanced windows, HOP, and SESSION
 
-### 17. v1.3.0 — General ad hoc `ORDER BY`
+### 17. v0.70 — General ad hoc `ORDER BY`
 
 #### Plan and execution
 
@@ -2837,7 +2834,7 @@ OFFSET 20;
 
 ---
 
-### 18. v1.3.1 — Maintained `ORDER BY ... LIMIT`
+### 18. v0.71 — Maintained `ORDER BY ... LIMIT`
 
 #### Semantics
 
@@ -2868,7 +2865,7 @@ LIMIT 100;
 
 ---
 
-### 19. v1.3.2 — Public HOP windows
+### 19. v0.72 — Public HOP windows
 
 #### Work
 
@@ -2891,7 +2888,7 @@ LIMIT 100;
 
 ---
 
-### 20. v1.3.3 — Public SESSION windows
+### 20. v0.73 — Public SESSION windows
 
 #### Plan change
 
@@ -2932,7 +2929,7 @@ Do not infer the session key as “all columns except time.”
 
 ---
 
-### 21. v1.3.4 — Advanced window frames and `NTILE`
+### 21. v0.74 — Advanced window frames and `NTILE`
 
 #### Scope
 
@@ -2963,7 +2960,7 @@ Do not infer the session key as “all columns except time.”
 
 ---
 
-### 22. v1.3.5 — Ordering and temporal qualification
+### 22. v0.75 — Ordering and temporal qualification
 
 Publish measured:
 
@@ -2978,9 +2975,9 @@ Publish measured:
 
 ---
 
-### Part IV — v1.4: `LATERAL` and recursive CTEs
+### Part IV — v0.76–v0.81: `LATERAL` and recursive CTEs
 
-### 23. v1.4.0 — Table-function `LATERAL` and compiler wiring
+### 23. v0.76 — Table-function `LATERAL` and compiler wiring
 
 #### Immediate integration closure
 
@@ -3009,7 +3006,7 @@ Publish measured:
 
 ---
 
-### 24. v1.4.1 — Correlation IR and decorrelation
+### 24. v0.77 — Correlation IR and decorrelation
 
 #### Add
 
@@ -3042,7 +3039,7 @@ PlanNode::Apply {
 
 ---
 
-### 25. v1.4.2 — Indexed parameterized `Apply`
+### 25. v0.78 — Indexed parameterized `Apply`
 
 For queries that cannot be decorrelated:
 
@@ -3064,7 +3061,7 @@ Fallback: reject
 
 ---
 
-### 26. v1.4.3 — Monotone recursive CTEs
+### 26. v0.79 — Monotone recursive CTEs
 
 #### Immediate integration closure
 
@@ -3096,7 +3093,7 @@ Fallback: reject
 
 ---
 
-### 27. v1.4.4 — Distributed recursion protocol
+### 27. v0.80 — Distributed recursion protocol
 
 #### Formal work
 
@@ -3124,7 +3121,7 @@ Prove:
 
 ---
 
-### 28. v1.4.5 — Deletion-aware recursion
+### 28. v0.81 — Deletion-aware recursion
 
 #### Strategy
 
@@ -3149,9 +3146,9 @@ Non-stratified, non-convergent, or unbounded recursive forms are rejected with a
 
 ---
 
-### Part V — v1.5: Durable time-driven predicates and algebraic extensibility
+### Part V — v0.82–v0.86: Durable time-driven predicates and algebraic extensibility
 
-### 29. v1.5.0 — Durable timer service
+### 29. v0.82 — Durable timer service
 
 #### Architecture
 
@@ -3189,7 +3186,7 @@ Add a timer ownership/firing model proving:
 
 ---
 
-### 30. v1.5.1 — Processing-time temporal predicates
+### 30. v0.83 — Processing-time temporal predicates
 
 #### Public surface
 
@@ -3224,7 +3221,7 @@ Document:
 
 ---
 
-### 31. v1.5.2 — Built-in CRDT column types
+### 31. v0.84 — Built-in CRDT column types
 
 #### Initial types
 
@@ -3259,7 +3256,7 @@ Operations must be type-specific and explicit.
 
 ---
 
-### 32. v1.5.3 — Safe `CREATE MERGE LAW`
+### 32. v0.85 — Safe `CREATE MERGE LAW`
 
 #### First release: restricted declarative law IR
 
@@ -3310,7 +3307,7 @@ A WASM law ABI may be admitted only after:
 
 ---
 
-### 33. v1.5.4 — Algebra qualification
+### 33. v0.86 — Algebra qualification
 
 - Fault-inject merge ordering.
 - Duplicate and replay operands.
@@ -3324,9 +3321,9 @@ A WASM law ABI may be admitted only after:
 
 ---
 
-### Part VI — v2.0: Serializable transaction authority
+### Part VI — v0.87–v0.92: Serializable transaction authority
 
-Serializable transactions change RockStream’s product role. They should be implemented deliberately as a new major release train, not hidden inside gateway session work.
+Serializable transactions change RockStream’s product role. They require a dedicated release train, not a hidden addition to gateway session work.
 
 ### 34. Transaction contract
 
@@ -3356,7 +3353,7 @@ Recommended contract:
 
 ---
 
-### 35. v2.0.0 — MVCC storage and transaction identity
+### 35. v0.87 — MVCC storage and transaction identity
 
 #### Storage
 
@@ -3381,7 +3378,7 @@ Add:
 
 ---
 
-### 36. v2.0.1 — Snapshot isolation and transaction-local view overlay
+### 36. v0.88 — Snapshot isolation and transaction-local view overlay
 
 #### Gateway/runtime
 
@@ -3402,7 +3399,7 @@ Add:
 
 ---
 
-### 37. v2.0.2 — Single-shard serializable certification
+### 37. v0.89 — Single-shard serializable certification
 
 Recommended initial strategy: optimistic certification with predicate/range tracking.
 
@@ -3426,7 +3423,7 @@ Use a generated history checker, not final-state assertions alone.
 
 ---
 
-### 38. v2.0.3 — Distributed transaction coordinator
+### 38. v0.90 — Distributed transaction coordinator
 
 #### Protocol
 
@@ -3468,7 +3465,7 @@ Prove:
 
 ---
 
-### 39. v2.0.4 — Constraints and complete conflict coverage
+### 39. v0.91 — Constraints and complete conflict coverage
 
 - Unique and primary-key constraints.
 - Transactional secondary indexes.
@@ -3481,7 +3478,7 @@ Prove:
 
 ---
 
-### 40. v2.0.5 — Serializable public qualification
+### 40. v0.92 — Serializable public qualification
 
 Required evidence:
 
@@ -3501,7 +3498,7 @@ Only after this version should `IsolationLevel::Serializable` stop returning the
 
 ---
 
-### Part VII — v2.1 and v2.2: Multi-region
+### Part VII — v0.93–v0.97 and v0.98–v0.102: Multi-region
 
 ### 41. Multi-region consistency profiles
 
@@ -3520,7 +3517,7 @@ Expose explicit profiles:
 
 ---
 
-### 42. v2.1.0 — Region identity and replicated checkpoint manifest
+### 42. v0.93 — Region identity and replicated checkpoint manifest
 
 Add:
 
@@ -3537,7 +3534,7 @@ No write failover yet.
 
 ---
 
-### 43. v2.1.1 — Warm standby
+### 43. v0.94 — Warm standby
 
 - Continuously ingest committed manifests/state changes into a standby.
 - Restore control/catalog state.
@@ -3548,7 +3545,7 @@ No write failover yet.
 
 ---
 
-### 44. v2.1.2 — Frontier-pinned regional read replicas
+### 44. v0.95 — Frontier-pinned regional read replicas
 
 - Serve only data through the region’s applied committed frontier.
 - Report staleness.
@@ -3559,7 +3556,7 @@ No write failover yet.
 
 ---
 
-### 45. v2.1.3 — Active-passive failover and fencing
+### 45. v0.96 — Active-passive failover and fencing
 
 #### Protocol
 
@@ -3593,7 +3590,7 @@ Prove:
 
 ---
 
-### 46. v2.1.4 — Regional resilience qualification
+### 46. v0.97 — Regional resilience qualification
 
 - Region isolation.
 - Control-plane partition.
@@ -3607,7 +3604,7 @@ Prove:
 
 ---
 
-### 47. v2.2.0 — Home-region active-active ownership
+### 47. v0.98 — Home-region active-active ownership
 
 Support ordinary writes in multiple regions by assigning each shard/key range one writer region.
 
@@ -3620,7 +3617,7 @@ Support ordinary writes in multiple regions by assigning each shard/key range on
 
 ---
 
-### 48. v2.2.1 — Merge-law active-active
+### 48. v0.99 — Merge-law active-active
 
 Allow multi-writer only for capability cells whose law supports it.
 
@@ -3632,11 +3629,11 @@ Allow multi-writer only for capability cells whose law supports it.
 - Region-local and global read frontier.
 - Explicit non-support for non-composable laws.
 
-Built-in CRDT work from v1.5 is a prerequisite.
+Built-in CRDT work from v0.82–v0.86 is a prerequisite.
 
 ---
 
-### 49. v2.2.2 — Global serializable mode
+### 49. v0.100 — Global serializable mode
 
 This is separate from merge-law active-active.
 
@@ -3651,7 +3648,7 @@ This mode may be expensive. The product must state the trade-off rather than con
 
 ---
 
-### 50. v2.2.3 — Active-active migration and conflict observability
+### 50. v0.101 — Active-active migration and conflict observability
 
 - Move home ownership safely.
 - Inspect pending cross-region transactions.
@@ -3663,7 +3660,7 @@ This mode may be expensive. The product must state the trade-off rather than con
 
 ---
 
-### 51. v2.2.4 — Active-active qualification
+### 51. v0.102 — Active-active qualification
 
 - Region partition.
 - Simultaneous writes.
@@ -3902,16 +3899,16 @@ Using the current roadmap convention of approximately six person-weeks per plann
 
 | Release train | Initial units | Initial person-weeks |
 |---|---:|---:|
-| Remaining pre-v1 closure (`v0.59.16`–`v0.59.24`) | 9 | 54 |
-| v1.1 typed semantics and delivery foundation | 5 | 30 |
-| v1.2 Core aggregate/join/window graduation | 5 | 30 |
-| v1.3 ordering and temporal analytics | 6 | 36 |
-| v1.4 LATERAL and recursion | 6 | 36 |
-| v1.5 timers and algebra | 5 | 30 |
-| v2.0 serializable transactions | 6 | 36 |
-| v2.1 regional standby/failover | 5 | 30 |
-| v2.2 active-active modes | 5 | 30 |
-| **Post-v1 subtotal** | **43** | **258** |
+| Remaining v0.59 closure (`v0.59.16`–`v0.59.24`) | 9 | 54 |
+| v0.60–v0.64 typed semantics and delivery foundation | 5 | 30 |
+| v0.65–v0.69 Core aggregate/join/window graduation | 5 | 30 |
+| v0.70–v0.75 ordering and temporal analytics | 6 | 36 |
+| v0.76–v0.81 LATERAL and recursion | 6 | 36 |
+| v0.82–v0.86 timers and algebra | 5 | 30 |
+| v0.87–v0.92 serializable transactions | 6 | 36 |
+| v0.93–v0.97 regional standby/failover | 5 | 30 |
+| v0.98–v0.102 active-active modes | 5 | 30 |
+| **Post-v0.59.24 subtotal** | **43** | **258** |
 
 This is an initial program estimate, not a staffing or date commitment. The mandatory split rule will likely increase the count, especially for:
 
@@ -4027,8 +4024,8 @@ A realistic program should reserve 25–40% additional capacity for mandatory du
 
 These actions can begin without adding connector scope:
 
-1. **Keep `v0.59.16`–`v0.59.24` unchanged as the pre-v1 release path.**
-2. **Approve this program as the accepted post-v1 direction** and remove contradictory language that treats the requested SQL/transaction/region work as merely speculative.
+1. **Keep `v0.59.16`–`v0.59.24` unchanged as the v0.59 qualification path.**
+2. **Approve this program as the accepted post-v0.59.24 direction** and remove contradictory language that treats the requested SQL/transaction/region work as merely speculative.
 3. **Draft the Capability Contract v2 ADR** and extend `capabilities.toml`.
 4. **Split the broad aggregate, relational, and analytics records** into operation-specific variants during `v0.59.19`.
 5. **Add a generated end-to-end reachability ledger** and make it detect the present recursion/lateral compiler gaps.
@@ -4065,12 +4062,12 @@ Adopt this as a **program roadmap**, not a single mega-version.
 
 The fastest credible route is:
 
-1. Complete the current v1 qualification.
+1. Complete the current v0.59.24 qualification.
 2. Build the typed semantics and delivery-contract foundation.
 3. Graduate the existing operator families.
 4. Surface ordering, temporal analytics, `LATERAL`, and recursion.
 5. Add durable timers and algebraic extensibility.
-6. Treat serializable transactions and multi-region operation as explicit major-release programs with formal models and public contracts.
+6. Treat serializable transactions and multi-region operation as dedicated programs with formal models and public contracts.
 
 That order maximizes reuse of the architecture RockStream has already built while eliminating the exact failure mode that has repeatedly created ambiguity: code existing somewhere in the repository without the complete, publicly reachable, durable, and proven product path.
 
@@ -4105,10 +4102,10 @@ the design is verified before the implementation exists.
 | v0.59.8 | Extend M6 for bounded chunk copy, migration epochs, dual routing, frontier cutover, and delayed reclamation | `formal/m6_shard_migration.fizz` micro-migration variant | Existing M6 single-authority/no-loss invariants hold for every chunk and routing epoch; heat metadata survives reassignment | Extended M6 green before micro-migration ships; kill/restart at every copy/dual-route/cutover boundary replays as permanent regression cases |
 | v0.59.9 | Extend M1 for logical visibility epochs versus physical commit groups; model checkpoint-mode transition only if unaligned fallback is admitted | `formal/m1_epoch_commit.fizz`; checkpoint transition variant when S5 admission evidence requires it | Commit grouping cannot expose a partial logical epoch or acknowledge non-durable state; aligned/unaligned transition cannot lose or duplicate in-flight data | Extended M1 green for the mandatory core; any admitted unaligned fallback is blocked on its checkpoint-transition model and paired runtime assertions |
 | v0.23–v0.59.24 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all active base models: M1-M4, M6-M7, plus every admitted v0.59.x protocol variant | A coordination-protocol change without a model touch fails CI; the automated qualification suite re-runs the relaxed-bounds sweep against the candidate SHA |
-| v1.4.4–v1.4.5 | M8 recursive-frontier model | `formal/m8_recursive_frontier.fizz` | No early fixed-point publication, no lost derived facts, idempotent iteration replay, safe reassignment, and bounded fallback | M8 and paired `SimRuntime` assertions pass before distributed or deletion-aware recursion becomes public |
-| v1.5.0–v1.5.4 | Durable-timer model and merge-law fault suite | Timer ownership/firing model plus generated algebra checks | No duplicate or lost timer firing, no stale-owner firing, eventual backlog progress, and declared laws hold under replay and compaction | Timer model, paired runtime assertions, and false-law mutation tests pass before temporal predicates or merge laws become public |
-| v2.0.3–v2.0.5 | M9 distributed-transaction model | `formal/m9_distributed_txn.fizz` | Atomic commit, one durable decision, no stale participant apply, idempotent recovery, bounded-failure liveness, and migration safety | M9, history checking, and crash-at-every-phase tests pass before `SERIALIZABLE` becomes public |
-| v2.1.3–v2.2.4 | M10 region-failover model plus admitted active-active protocol variants | `formal/m10_region_failover.fizz` and each later coordination variant | One writer generation, no stale-region commit, safe ownership transfer, convergence where promised, and no silent consistency downgrade | Regional models, paired runtime assertions, partition histories, and resurrection tests pass before each regional mode becomes public |
+| v0.80–v0.81 | M8 recursive-frontier model | `formal/m8_recursive_frontier.fizz` | No early fixed-point publication, no lost derived facts, idempotent iteration replay, safe reassignment, and bounded fallback | M8 and paired `SimRuntime` assertions pass before distributed or deletion-aware recursion becomes public |
+| v0.82–v0.86 | Durable-timer model and merge-law fault suite | Timer ownership/firing model plus generated algebra checks | No duplicate or lost timer firing, no stale-owner firing, eventual backlog progress, and declared laws hold under replay and compaction | Timer model, paired runtime assertions, and false-law mutation tests pass before temporal predicates or merge laws become public |
+| v0.90–v0.92 | M9 distributed-transaction model | `formal/m9_distributed_txn.fizz` | Atomic commit, one durable decision, no stale participant apply, idempotent recovery, bounded-failure liveness, and migration safety | M9, history checking, and crash-at-every-phase tests pass before `SERIALIZABLE` becomes public |
+| v0.96–v0.102 | M10 region-failover model plus admitted active-active protocol variants | `formal/m10_region_failover.fizz` and each later coordination variant | One writer generation, no stale-region commit, safe ownership transfer, convergence where promised, and no silent consistency downgrade | Regional models, paired runtime assertions, partition histories, and resurrection tests pass before each regional mode becomes public |
 
 Every row above maps each FizzBee invariant to a paired runtime `assert!` per
 [FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.7. **Correction (2026-07-11
@@ -4178,21 +4175,21 @@ both into one version under schedule pressure.
 | Phase 16 — Ingestion Failure Containment | v0.52 | Continuous verification (the M3 commit boundary is re-proven for the quarantine write path; no new model) |
 | Phase 16.5 — View Lifecycle & Source Transaction Correctness | v0.52.1 – v0.52.2 | Continuous verification (no new coordination protocol; the M3 commit boundary is re-proven for the snapshot/delta fence and for whole-transaction CDC apply, whose atomicity is a consequence of the already-verified epoch commit rather than a second mechanism) |
 | Phase 16.6 — Connector Surface Reduction | v0.52.3 – v0.52.5 | M5 cold-tier sink model retired at v0.52.4 (its implementation is deleted); M3 sink 2PC unchanged and re-proven against the single remaining sink; no new model |
-| Phase 17 — Production Readiness & 1.0 Finalization | v0.53 – v0.59.24 (including the v0.53.1–v0.59.24 sub-versions added by the 2026-08-12, 2026-08-18, and 2026-08-19 reviews) | Continuous verification + artifact-bound, no-skip automated qualification of RC1; CLI/configuration at v0.59.4; physical performance architecture and per-step benchmark evidence at v0.59.5–v0.59.9; product polish, diagnostics, executable documentation, and public-path proof closure through v0.59.18; SQL semantics and system-limits proof at v0.59.19; type-completeness proof at v0.59.20; lifecycle and deployment work through v0.59.22; capacity-estimator calibration at v0.59.23; and pure blocking horizontal scale-out and performance qualification at v0.59.24; optional extended soaks are supplemental only; v0.56 additionally proven by a `SimRuntime` mixed-version scenario |
-| Post-v1 Part I — Typed semantics and feature delivery | v1.1.0 – v1.1.4 | Existing models plus capability-contract, public-reachability, typed-codec, migration, and raw-pgwire gates |
-| Post-v1 Part II — Essential operator graduation | v1.2.0 – v1.2.4 | Existing commit, frontier, fencing, and migration models plus public differential qualification |
-| Post-v1 Part III — Ordering and temporal analytics | v1.3.0 – v1.3.5 | Existing frontier models plus spill, amplification, recovery, and distributed equivalence proofs |
-| Post-v1 Part IV — LATERAL and recursion | v1.4.0 – v1.4.5 | M8 recursive-frontier model for distributed and deletion-aware recursion |
-| Post-v1 Part V — Durable time and algebra | v1.5.0 – v1.5.4 | Durable-timer ownership/firing model and merge-law fault suite |
-| Post-v1 Part VI — Serializable transactions | v2.0.0 – v2.0.5 | M9 distributed-transaction model plus external serializability histories |
-| Post-v1 Part VII — Multi-region | v2.1.0 – v2.2.4 | M10 regional-failover model plus every admitted active-active coordination variant |
+| Phase 17 — Production Readiness & Qualification | v0.53 – v0.59.24 (including the v0.53.1–v0.59.24 sub-versions added by the 2026-08-12, 2026-08-18, and 2026-08-19 reviews) | Continuous verification + artifact-bound, no-skip automated qualification of RC1; CLI/configuration at v0.59.4; physical performance architecture and per-step benchmark evidence at v0.59.5–v0.59.9; product polish, diagnostics, executable documentation, and public-path proof closure through v0.59.18; SQL semantics and system-limits proof at v0.59.19; type-completeness proof at v0.59.20; lifecycle and deployment work through v0.59.22; capacity-estimator calibration at v0.59.23; and pure blocking horizontal scale-out and performance qualification at v0.59.24; optional extended soaks are supplemental only; v0.56 additionally proven by a `SimRuntime` mixed-version scenario |
+| Post-v0.59.24 Part I — Typed semantics and feature delivery | v0.60 – v0.64 | Existing models plus capability-contract, public-reachability, typed-codec, migration, and raw-pgwire gates |
+| Post-v0.59.24 Part II — Essential operator graduation | v0.65 – v0.69 | Existing commit, frontier, fencing, and migration models plus public differential qualification |
+| Post-v0.59.24 Part III — Ordering and temporal analytics | v0.70 – v0.75 | Existing frontier models plus spill, amplification, recovery, and distributed equivalence proofs |
+| Post-v0.59.24 Part IV — LATERAL and recursion | v0.76 – v0.81 | M8 recursive-frontier model for distributed and deletion-aware recursion |
+| Post-v0.59.24 Part V — Durable time and algebra | v0.82 – v0.86 | Durable-timer ownership/firing model and merge-law fault suite |
+| Post-v0.59.24 Part VI — Serializable transactions | v0.87 – v0.92 | M9 distributed-transaction model plus external serializability histories |
+| Post-v0.59.24 Part VII — Multi-region | v0.93 – v0.102 | M10 regional-failover model plus every admitted active-active coordination variant |
 
 One hundred twenty-three versions at about 6 person-weeks each cover the path
-from an empty repository through the scoped v2.2 program. The order is fixed:
+from an empty repository through v0.102. The order is fixed:
 correctness on one shard is proven before distribution, distribution is made
 fault-tolerant before the Postgres layer depends on it, ingestion connectors
 and crucible soaks validate real-world pressure before HTAP ergonomics, the
 Nexmark suite certifies end-to-end correctness (including retraction/Z-set semantics) on the full stack,
 PostgreSQL wire protocol hardening (v0.37–v0.39) and end-user certification (v0.40–v0.42) ensure any standard driver works without workarounds and that a complete application can be built on the wire protocol alone,
 and the data lake bridge (with its FizzBee pre-model and simulator fidelity foundation at v0.43), control-plane hardening and multi-tenancy (v0.45.1–v0.45.2), invariant and error-code compliance hardening (v0.45.6–v0.45.7), elastic shard migration and hot-key/skew handling (v0.46–v0.47), network optimizations, complex analytics, a live end-to-end wire-protocol pass that makes the serving path standard-PostgreSQL-honest and genuinely incremental (v0.51.1–v0.51.6), a standard-client-reachability and honest-enterprise-enforcement pass that lets a modern `psql` connect, compiles ordinary `int`/`text`/`float` aggregate views, enforces `--auth` and tenant quotas, ships real native ingestion, proves control-plane HA and edge-case recovery against real clusters, makes ad hoc query execution genuinely multi-shard and cap-free, and rounds out first-party ingestion with real Postgres CDC and HTTP webhook/push source connectors (v0.51.7–v0.51.14), and a durable
-connector quarantine, a deliberate reduction of the external connector surface to two sources and one sink (v0.52.3–v0.52.5), an operator-grade CLI and arrangement debugger, explainable freshness, internal mTLS and secrets management, a proven rolling-upgrade/disaster-recovery story, and a written, machine-checked v1 contract establish the v0.59 technical preview. Evidence integrity, true end-to-end automated qualification, reproducible release engineering, security provenance, and contract reconciliation (v0.59.1–v0.59.3) come first; CLI/configuration usability at v0.59.4 then supplies the deterministic baseline surface. Delta-native state, durable shared arrangements, factorized and filtered IVM, shared-window and skew-aware execution, and the SLO-adaptive runtime/storage architecture (v0.59.5–v0.59.9) make the engine fast and scalable before product polish and proof closure (v0.59.10–v0.59.18), SQL semantics and type completeness (v0.59.19–v0.59.20), graceful lifecycle and deployment profiles (v0.59.21–v0.59.22), and capacity-estimator calibration against the final architecture (v0.59.23). Pure blocking horizontal scale-out and performance qualification at v0.59.24 then proves the exact signed RC artifacts before the same source commit and digests are promoted under the final tag.
+connector quarantine, a deliberate reduction of the external connector surface to two sources and one sink (v0.52.3–v0.52.5), an operator-grade CLI and arrangement debugger, explainable freshness, internal mTLS and secrets management, a proven rolling-upgrade/disaster-recovery story, and a written, machine-checked v1 contract establish the v0.59 technical preview. Evidence integrity, true end-to-end automated qualification, reproducible release engineering, security provenance, and contract reconciliation (v0.59.1–v0.59.3) come first; CLI/configuration usability at v0.59.4 then supplies the deterministic baseline surface. Delta-native state, durable shared arrangements, factorized and filtered IVM, shared-window and skew-aware execution, and the SLO-adaptive runtime/storage architecture (v0.59.5–v0.59.9) make the engine fast and scalable before product polish and proof closure (v0.59.10–v0.59.18), SQL semantics and type completeness (v0.59.19–v0.59.20), graceful lifecycle and deployment profiles (v0.59.21–v0.59.22), and capacity-estimator calibration against the final architecture (v0.59.23). Pure blocking horizontal scale-out and performance qualification at v0.59.24 proves the exact signed RC artifacts. Promotion to v1.0 remains unscheduled.
