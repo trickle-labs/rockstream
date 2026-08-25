@@ -278,6 +278,14 @@ These names orient readers; they are not calendar commitments.
 | Pre-v1 Product Experience & Quality | v0.59.13–v0.59.23 | Single-source product surface manifest, golden-path project templates, current executable documentation, structured diagnostics across all surfaces, public-path scenario/differential framework, full lifecycle/client/backend test closure, SQL semantics and type completeness, production lifecycle and health contracts, supported deployment profiles, and capacity guidance calibrated against the final shared and factorized architecture. |
 | Final Horizontal Scale & Performance Qualification | v0.59.24 | Create and freeze `v1.0.0-rc.1`, change no architecture, and qualify those exact signed artifacts for real 1/2/4/8-worker scale, absolute capacity, tail latency, hot-key behavior, state-over-RAM operation, overload recovery, migration, checkpoint, and compaction behavior with an external oracle and immutable raw evidence on fixed reference environments. |
 | v1.0 Release | after v0.59.24 | The exact qualified RC source commit and artifact digests pass every bounded automated gate with zero open P0/P1 defects, including the blocking horizontal scale-out and performance qualification gate; optional extended soaks may supplement, but do not replace or block, the automated evidence; `v1.0.0` is then tagged without rebuilding the artifacts. |
+| Typed Semantics & Feature Delivery | v1.1.4 | Capability Contract v2, typed scalar/key/state semantics, common ordering, typed stateful operators, explicit preview activation, and raw-pgwire reachability gates are complete. |
+| Essential Operators Core | v1.2.4 | Admitted aggregate, grouping, join, set-operation, and analytic-window cells pass public, durability, distributed, upgrade, resource, and capacity qualification. |
+| Ordering & Temporal Analytics | v1.3.5 | Ad hoc sort, maintained bounded ordering, HOP, SESSION, advanced frames, and `NTILE` are public and measured. |
+| LATERAL & Recursion | v1.4.5 | Table-function and bounded correlated `LATERAL`, monotone distributed recursion, and deletion-aware recursion are publicly reachable with explicit limits. |
+| Durable Time & Algebra | v1.5.4 | Durable timers, processing-time retractions, built-in CRDT columns, and restricted custom merge laws pass algebra and recovery qualification. |
+| Serializable Transactions | v2.0.5 | Direct pgwire transactions provide qualified local and distributed serializable execution with complete conflict coverage. |
+| Regional Resilience | v2.1.4 | Replicated checkpoints, warm standby, frontier-pinned reads, and fenced active-passive failover pass regional fault qualification. |
+| Scoped Active-Active | v2.2.4 | Home-region ownership, merge-law multi-writer state, and global serializable mode pass partition, migration, convergence, and history checks. |
 
 ¹ **Re-opened by the <=v0.42 implementation review (2026-07-10).** "All four FizzBee models green" was never actually true: the `formal-verify` CI job has never successfully installed the `fizzbee` binary (wrong release-asset filename), never runs on pull requests (its `if:` guard tests a non-existent field), and carries `continue-on-error: true`, so nothing has ever blocked a merge on a red or crashing model. Running the models directly for the first time found M1 failing its `M1_S5_IdempotentReplay` invariant and M3/M4 crashing outright (undefined-variable Starlark errors) — only M2 has ever genuinely passed. The distributed-engine Rust implementation and its `SimRuntime`/chaos test suite are unaffected by this finding; only the *formal-verification* proof of v0.18–v0.22 is unverified. **Update (v0.42.1, same day):** the CI toolchain, M1, and M3 are now fixed and genuinely green (M1: 72 states; M3: 1,168 states; both safety+liveness); M2 remains genuinely green (251,889 states); M4's crash and a real self-fencing race are fixed, but exhaustive verification of M4 does not yet terminate in reasonable time, so M4 stays non-blocking pending **v0.42.3**. **Update (v0.42.1, same day, CI-robustness follow-up):** the very first real CI run of this fix showed the M4 step itself get a `cancelled` conclusion (consistent with the runner's OOM killer acting on an exploding process), which `continue-on-error` does not suppress and which flipped the whole hard-gate job to `failure` — the "M4 is non-blocking" contract was not actually true in a real run. Fixed by running M4 under a per-subshell `ulimit -v` memory cap plus a wall-clock `timeout`, swallowing its exit code into a step output instead of the step's own outcome, so the job can never fail because of M4 regardless of how it terminates. **Update (v0.42.3, same day): fully resolved.** `MAX_OUTAGES` (not worker/shard count) was the dominant driver of the explosion; lowering it from 2 to 1 (every other bound unchanged) makes exhaustive BFS complete in ~5.4s (31,456 nodes). This also surfaced a real liveness bug — `GrantLease` could re-grant a lease to a worker its own failure detector had already declared dead, letting an adversarial-but-fair schedule starve every other worker forever — now fixed with an explicit `require worker_id not in cp.dead_workers` guard. `M4_S1`–`M4_S4`, `COV_M4`, `M4_L1_RecoveryProgress`, and `M4_L2_NoPermanentBlock` all now pass under exhaustive BFS; the CI special-casing (`continue-on-error`/`ulimit -v`/`timeout`) is removed and M4 is folded back into the single hard-gate step. See `formal/findings.md` ("Post-v0.42 Review", "Post-v0.42.1 Remediation Results", and "Post-v0.42.3 Remediation Results") and roadmap versions **v0.42.1** and **v0.42.3** below.
 
@@ -1915,6 +1923,2159 @@ scheduled version owns per-view cost or write-amplification budgets.
 
 ---
 
+## Essential features implementation program
+
+This section adopts `rockstream-essential-features-implementation-plan.md` as
+the post-v1 roadmap. The existing v0.x schedule remains unchanged. New release
+trains begin at v1.1.0 after v1.0 qualification and promotion.
+
+**Repository baseline:** `trickle-labs/rockstream` `main` at `b9fea7a1ec5ac98824d0ed50b8c9d57c1f20b73b`  
+**Workspace baseline:** `0.59.15`  
+**Primary objective:** Make the essential SQL, incremental-processing, transactional, and regional capabilities real, publicly reachable, durable, bounded, observable, and release-qualified.  
+**Explicit non-goal:** No new connector families. The supported integration boundary remains PostgreSQL CDC and Kafka sources, plus the Kafka sink.
+
+---
+
+### 1. Executive summary
+
+RockStream already has much of the difficult infrastructure required for the requested feature set:
+
+- Delta-native operator state and dirty-key persistence.
+- Durable shared arrangements.
+- Factorized and filtered incremental view maintenance.
+- Shared window slices and skew-aware execution.
+- Bounded spill to SlateDB.
+- Checkpointing, fencing, recovery, shard migration, and formal verification.
+- PostgreSQL wire serving.
+- Internal merge-law metadata.
+- Logical PlanIR nodes and operator implementations for several features that are not yet consistently surfaced.
+
+The remaining problem is not simply “write more operators.” It is that implementation status is fragmented across layers. A feature may exist in PlanIR, in SQL lowering, or as a Rust operator without being compiled by the maintained-view path, reachable through pgwire, documented accurately, or qualified under failure.
+
+This plan therefore starts with two mandatory foundations:
+
+1. **A typed physical semantics layer** shared by grouping, joins, sorting, windows, indexes, state persistence, and exchange.
+2. **An end-to-end feature delivery contract** that proves the complete path:
+
+```text
+SQL grammar
+  -> binding and semantic validation
+  -> DataFusion logical plan
+  -> RockStream PlanIR
+  -> incremental differentiation / physical selection
+  -> maintained-view compiler
+  -> runtime operator
+  -> durable state and recovery
+  -> pgwire result encoding
+  -> catalogs, EXPLAIN, metrics, documentation, and upgrade contract
+```
+
+A feature is not “implemented” until that path is complete. An internal PlanIR node or operator does not count as public availability.
+
+The program is divided into eight release trains:
+
+1. Finish the existing pre-v1 closure through `v0.59.24`.
+2. Build the typed semantics and feature-delivery foundation.
+3. Graduate aggregates, joins, set operations, and core analytic windows.
+4. Implement general `ORDER BY`/`LIMIT`, Top-K, HOP, SESSION, and advanced window semantics.
+5. Surface `LATERAL` and recursive CTEs.
+6. Add durable time-driven predicates and user-visible algebra/CRDT support.
+7. Add single-shard and distributed serializable transactions.
+8. Add multi-region standby, failover, and explicitly scoped active-active modes.
+
+The connector surface remains frozen throughout.
+
+---
+
+### 2. Goals and non-goals
+
+#### 2.1 Goals
+
+The program must deliver all of the following:
+
+- Promote useful, precisely defined aggregate, relational, and analytic capability cells from `Experimental` to `Core`.
+- Support typed equality, hashing, sorting, persistence, and PostgreSQL-compatible semantics across admitted types.
+- Support ad hoc and continuously maintained `ORDER BY`/`LIMIT`.
+- Support deterministic multi-column analytic ordering, richer frames, and `NTILE`.
+- Make HOP and SESSION windows publicly reachable and production-qualified.
+- Support table-function and correlated `LATERAL`.
+- Support recursive CTEs, beginning with monotone recursion and progressing to deletion-aware recursion.
+- Support processing-time temporal predicates that retract rows without new source input.
+- Expose built-in CRDT columns and safe custom merge laws.
+- Support serializable direct transactions.
+- Support staged multi-region resilience and selected active-active operation.
+- Ensure every feature is surfaced through pgwire, catalogs, `EXPLAIN`, metrics, diagnostics, generated documentation, and capability contracts.
+- Preserve bounded memory, state, queues, timers, retries, shuffle, and output amplification.
+- Preserve crash safety, mixed-version safety, rollback boundaries, and object-store durability.
+
+#### 2.2 Non-goals
+
+This program does **not** include:
+
+- New source or sink connector families.
+- A connector marketplace or generic connector SDK expansion program.
+- Lakehouse sink or catalog expansion.
+- PostgreSQL feature parity merely for parity’s sake.
+- Silent fallback from incremental maintenance to full recomputation.
+- Unbounded correlated nested-loop execution.
+- Unbounded ordered materialized relations with implicit full re-emission after every update.
+- Arbitrary unsandboxed native code in storage merge operators.
+- Active-active behavior without a named consistency mode.
+- Features marked “implemented” based only on parser, PlanIR, operator, or documentation presence.
+
+---
+
+### 3. Verified baseline and current discontinuities
+
+The baseline below is the reason the plan is organized as integration and semantic closure rather than a complete rewrite.
+
+| Area | Current asset | Blocking discontinuity |
+|---|---|---|
+| Capability contract | `capabilities.toml`, generated capability matrix, dispatch evidence, semantic ledgers | Aggregates, relational operators, and analytics are represented as broad families. One unsupported type cell demotes the entire family. |
+| SQL type contract | `contracts/sql-type-matrix.toml` | Operation-level statuses are still broader than specific function, key, frame, join-kind, and retraction combinations. |
+| Aggregates | Delta-native mutation emission, group-key packers, distinct lanes, factorized join-to-aggregate, durable recovery | Several paths remain Int64-centric or use surrogate packing; decimal, text, floating, NULL, and multi-lane combinations do not share one complete typed kernel. |
+| Joins | Inner/outer/semi/anti IR and operators, shared arrangements, factorization, amplification governor | Typed equality and row payload support remain uneven. Some join forms and type cells reject late in compilation. |
+| Set operations | Distinct, union, intersect/except semantics in IR and operator history | Typed full-row equality and public operation-specific capability cells are incomplete. |
+| Analytic windows | Ranking, navigation, sliding sum/avg, partition recomputation, state accounting | Generic windows are Int64-oriented, descending order is rejected, only limited `ROWS` frames are admitted, and `NTILE` is rejected. |
+| Top-K | Incremental Top-K with refill and spill support | One Int64 rank column, descending order only, no general multi-column `SortSpec`, no general `OFFSET`/`WITH TIES`. |
+| HOP/SESSION | PlanIR variants, lowering helpers, compiler arms, runtime operators | Public reachability is inconsistent with documentation; typed time and payload support is narrow; session partitioning is inferred; multi-aggregate HOP composition has known gaps. |
+| `LATERAL` | `PlanNode::Lateral`, `LateralOp`, lowering of DataFusion `Unnest` | The maintained-view compiler does not compile `PlanNode::Lateral`; explicit correlated `LATERAL` needs an `Apply` model and decorrelation. |
+| Recursive CTE | `PlanNode::Recursion`, `RecursionOp`, DataFusion `RecursiveQuery` lowering | The maintained-view compiler does not compile recursion. The current operator recomputes the fixed point from base state per epoch and is Int64/set oriented. |
+| Processing-time predicates | Runtime clock abstraction, frontiers, epochs, durable state | No durable timer source exists to emit retractions when wall-clock time passes without new input. |
+| Merge laws | `LawBundle`, law IDs/versions, algebraic properties, compaction/frontier policies | No user-visible CRDT type system or safe `CREATE MERGE LAW` surface. |
+| Transactions | pgwire transaction state machine, savepoints, idempotency envelopes, read-your-writes | `SERIALIZABLE` is explicitly unsupported; no general MVCC/certification or distributed transaction-decision protocol exists. |
+| Multi-region | Checkpoint export/restore and single-region failure machinery | No regional generation/fencing protocol, warm standby frontier, region failover, or active-active consistency model. |
+
+#### 3.1 Baseline source references
+
+The implementation program should keep these files as explicit baseline references:
+
+- `capabilities.toml`
+- `contracts/sql-type-matrix.toml`
+- `docs/capability-matrix.md`
+- `docs/language-features.md`
+- `NEW_ROADMAP.md`
+- `crates/rockstream-plan/src/lib.rs`
+- `crates/rockstream-sql/src/lower.rs`
+- `crates/rockstream-ops/src/compile.rs`
+- `crates/rockstream-ops/src/window.rs`
+- `crates/rockstream-ops/src/topk.rs`
+- `crates/rockstream-ops/src/lateral.rs`
+- `crates/rockstream-ops/src/recursion.rs`
+- `crates/rockstream-types/src/merge_law.rs`
+- `crates/rockstream-gateway/src/session.rs`
+
+---
+
+### 4. Program rules that prevent hidden or half-surfaced features
+
+#### 4.1 Separate implementation state from strategic tier
+
+The current `Core`/`Maintain`/`Experimental` tier is a compatibility commitment. It must not be overloaded to describe whether code is internally present.
+
+Add an independent `availability` field:
+
+```toml
+availability = "absent"       # no implementation
+availability = "internal"     # code exists, not publicly reachable
+availability = "preview"      # publicly reachable with explicit opt-in
+availability = "production"   # publicly reachable by default
+```
+
+The legal combinations are:
+
+| Availability | Tier | Meaning |
+|---|---|---|
+| `absent` | any | Planned or rejected; no public path. |
+| `internal` | `Experimental` | IR/operator/prototype exists, but no public contract. |
+| `preview` | `Experimental` | Public and usable, but opt-in and without continuity/performance guarantees. |
+| `production` | `Core` | Release-gated compatibility contract. |
+| `production` | `Maintain` | Supported and secure, but not a growth area. |
+
+A broad capability must never be demoted solely because one neighboring cell is unsupported. Instead, split it into independently promotable variants.
+
+#### 4.2 Capability Contract v2
+
+Extend `capabilities.toml` rather than creating a competing source of truth.
+
+A capability variant should contain at least:
+
+```toml
+[[capability.variant]]
+id = "aggregate.sum.exact"
+family = "language.aggregates"
+availability = "production"
+tier = "Core"
+semantic_version = 1
+
+syntax = ["SUM(expr)", "SUM(DISTINCT expr)"]
+types_contract = "contracts/sql-type-matrix.toml#aggregate.sum.exact"
+retraction_semantics = "supported"
+distributed_semantics = "partial-combine"
+state_format = "aggregate-state-v3"
+
+dispatch = [
+  "query_async_entry",
+  "sql_lowering",
+  "plan_compilation",
+  "response_encoding",
+]
+
+compiler_symbol = "compile_typed_aggregate"
+operator_symbol = "TypedAggregateOp"
+
+limits = [
+  "workload_state_budget",
+  "group_cardinality_budget",
+]
+
+metrics = [
+  "aggregate_state_bytes",
+  "aggregate_dirty_key_count",
+  "aggregate_spill_bytes",
+]
+
+errors = [
+  "RS-1012",
+  "RS-1019",
+  "RS-5003",
+]
+
+proofs = [
+  "unit",
+  "oracle",
+  "pgwire",
+  "lfs_recovery",
+  "minio_recovery",
+  "multi_worker",
+  "upgrade",
+  "performance",
+]
+
+limitations = [
+  "locale-sensitive collations are not admitted",
+]
+```
+
+The generator must produce:
+
+- `docs/capability-matrix.md`
+- `docs/sql-support.md`
+- `docs/experimental-features.md`
+- `docs/limitations.md`
+- `rockstream_catalog.capabilities`
+- `SHOW ROCKSTREAM CAPABILITIES`
+- validation data used by the SQL planner.
+
+#### 4.3 Mandatory end-to-end reachability record
+
+Every publicly claimed SQL feature must reference concrete anchors for every required layer:
+
+| Layer | Required evidence |
+|---|---|
+| Grammar/parser | Named parser or DataFusion plan shape test |
+| Binding/types | Named type and semantic-validation test |
+| Logical lowering | Named `LogicalPlan -> PlanNode` test |
+| Physical selection | Named `PlanNode -> physical stages` test |
+| Runtime | Named operator or pipeline test |
+| Persistence | State codec/version and recovery test |
+| Public dispatch | Raw pgwire end-to-end test |
+| Encoding | Row description, OID, text/binary result test |
+| Diagnostics | `EXPLAIN`, status, metric, and error-code test |
+| Documentation | Generated capability entry and executable example |
+| Upgrade | N/N+1 state and feature-contract test |
+
+Add:
+
+```text
+scripts/check-feature-completeness.py
+scripts/check-public-reachability.py
+scripts/check-capability-cells.py
+```
+
+These scripts must fail when:
+
+- A public capability has no compiler anchor.
+- A PlanIR variant has no maintained-view compiler arm and is marked preview/production.
+- A compiler arm has no public test.
+- A capability is documented as implemented but has no dispatch path.
+- A required proof is missing or skipped.
+- An unsupported cell falls through to another path instead of returning its declared error.
+- A feature’s state format changes without migration and rollback declarations.
+
+#### 4.4 Explicit preview activation
+
+“Available, but explicitly experimental” should be a real product state.
+
+Add both cluster and session activation:
+
+```toml
+[experimental]
+enabled = ["recursive_cte", "lateral_correlated"]
+```
+
+```sql
+SET rockstream.experimental_features = 'recursive_cte,lateral_correlated';
+```
+
+Rules:
+
+- Preview features are disabled unless activated.
+- `CREATE MATERIALIZED VIEW` using a preview feature emits a `NOTICE`.
+- The view catalog persists the feature IDs and semantic versions used by the plan.
+- `EXPLAIN INCREMENTAL` labels each preview node.
+- `SHOW ROCKSTREAM CAPABILITIES` reports availability, tier, semantic version, required opt-in, and limitations.
+- Startup or upgrade fails closed if a persisted view requires a preview semantic version the binary cannot execute.
+- Preview still requires correctness, boundedness, crash recovery, and coded failure. What it does not require is continuity, complete type coverage, or final performance qualification.
+
+#### 4.5 Feature Definition of Done
+
+A feature or capability cell is complete only when all applicable items pass:
+
+- [ ] Public SQL syntax works through raw pgwire.
+- [ ] Simple, extended, and prepared-statement protocols are tested where parameters apply.
+- [ ] Type and semantic validation happens before state mutation.
+- [ ] Insert, update, delete, duplicate, NULL, retraction, and key-change behavior match an independent oracle.
+- [ ] Backfill uses the snapshot/delta fence and produces the same result as live ingestion.
+- [ ] State is bounded, spillable where appropriate, and observable.
+- [ ] LFS and MinIO recovery pass for durable state.
+- [ ] Multi-worker execution is oracle-identical to single-worker execution.
+- [ ] Failure injection produces no wrong answer, loss, or duplicate.
+- [ ] Mixed-version operation, migration, rollback, and old-export restore are defined.
+- [ ] `EXPLAIN`, status, catalogs, and metrics expose the selected strategy and limits.
+- [ ] Unsupported neighboring cells return the documented `RS-XXXX` code.
+- [ ] Documentation is generated and the runnable example passes.
+- [ ] The capability record names every proof.
+- [ ] Performance and capacity are measured on a declared profile.
+- [ ] The sign-off includes raw evidence and zero hidden skips.
+
+---
+
+### 5. Shared architecture foundation
+
+All major features depend on one typed physical semantics layer. Building separate ad hoc encodings for aggregates, joins, windows, sorting, transactions, and regions would recreate the current unevenness.
+
+#### 5.1 Typed scalar and row model
+
+Add to `rockstream-types`:
+
+```rust
+pub struct TypeDescriptor {
+    pub sql_type: SqlType,
+    pub arrow_type: DataType,
+    pub nullable: bool,
+    pub decimal: Option<DecimalDescriptor>,
+    pub collation: Option<CollationDescriptor>,
+    pub time_zone_policy: Option<TimeZonePolicy>,
+}
+
+pub enum CanonicalScalarRef<'a> {
+    Null,
+    Bool(bool),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Decimal128 { value: i128, precision: u8, scale: i8 },
+    Utf8(&'a str),
+    Bytes(&'a [u8]),
+    Uuid([u8; 16]),
+    Date32(i32),
+    Timestamp { value: i64, unit: TimeUnit, zone: TimeZoneId },
+}
+```
+
+Requirements:
+
+- Preserve SQL type identity; do not infer everything from byte width.
+- Preserve NULL separately from an empty byte string.
+- Preserve decimal precision and scale.
+- Preserve timestamp unit and time-zone policy.
+- Canonicalize values according to the pinned PostgreSQL compatibility contract.
+- Provide zero-copy views over Arrow arrays on hot paths where possible.
+
+#### 5.2 Distinct key concepts
+
+Do not use one byte encoding for every semantic purpose.
+
+Implement:
+
+```rust
+pub trait EqualityKeyCodec
+pub trait HashKeyCodec
+pub trait SortKeyCodec
+pub trait PersistentRowCodec
+```
+
+The same type may have different equality and sort treatment.
+
+Each key must include:
+
+- Type identity.
+- NULL tag and NULL equality mode.
+- Collation ID and version for text.
+- Decimal scale policy.
+- Timestamp/time-zone policy.
+- Floating-point normalization required by the SQL contract.
+- State-codec version.
+
+#### 5.3 Common `SortSpec`
+
+Add to `rockstream-plan`:
+
+```rust
+pub struct SortSpec {
+    pub expressions: Vec<SortExpr>,
+    pub stable_tie_breaker: TieBreaker,
+}
+
+pub struct SortExpr {
+    pub expr: TypedExpr,
+    pub direction: SortDirection,
+    pub nulls: NullPlacement,
+    pub collation: Option<CollationId>,
+}
+```
+
+Every ordering feature must use this one structure:
+
+- Ad hoc sort.
+- Top-K.
+- Window ordering.
+- Index ordered scans.
+- Range partitioning.
+- Merge-sort exchange.
+- Transaction predicate/range conflicts where ordering is relevant.
+
+#### 5.4 Richer PlanIR
+
+Add or extend:
+
+```rust
+PlanNode::Sort {
+    input,
+    spec,
+}
+
+PlanNode::Limit {
+    input,
+    offset,
+    fetch,
+    with_ties,
+}
+
+PlanNode::Apply {
+    outer,
+    inner,
+    kind,
+    bindings,
+    max_matches_per_outer,
+}
+
+PlanNode::TimerFilter {
+    input,
+    predicate,
+    expiry_expr,
+    clock_domain,
+}
+
+PlanNode::RecursiveUnion {
+    base,
+    step,
+    recursive_binding,
+    semantics,
+    max_iterations,
+    max_state_bytes,
+}
+
+WindowExpr {
+    function,
+    partition_by,
+    order_by: SortSpec,
+    frame: WindowFrame,
+}
+```
+
+Every stateful PlanIR node must carry enough typed metadata to compile without guessing an output type from “anything else defaults to Int64.”
+
+#### 5.5 Stateful operator interface
+
+Refactor stateful operators around:
+
+```rust
+pub trait StatefulOperator {
+    fn process_epoch(&mut self, input: EpochInput) -> Result<OperatorEpochResult, OpError>;
+    fn state_descriptor(&self) -> StateDescriptor;
+    fn append_state_delta(&self, batch: &mut WriteBatch) -> Result<(), OpError>;
+    fn restore(&mut self, reader: &DbReader) -> Result<(), OpError>;
+    fn state_bytes(&self) -> u64;
+    fn spill_status(&self) -> SpillStatus;
+}
+```
+
+Keep the existing delta-native mutation stream. Do not reintroduce full-state checkpoint scans.
+
+#### 5.6 Durable format rules
+
+Every new state family must define:
+
+- State format ID and version.
+- Key and value codecs.
+- Mixed N/N+1 read/write policy.
+- Migration algorithm.
+- Crash points.
+- Rollback boundary.
+- Old-export restore behavior.
+- Compaction behavior.
+- Law/collation/time-zone version dependencies.
+- A fail-closed error for unknown versions.
+
+---
+
+### 6. Roadmap structure
+
+#### 6.1 Planning-unit rule
+
+Use the existing roadmap convention:
+
+- One planning unit starts at approximately six person-weeks.
+- Any mandatory slice estimated above two person-weeks becomes its own sub-version.
+- Any new durable format or formal model gets an independently signable sub-version.
+- A release train is complete only when every mandatory sub-version is signed off.
+- Performance qualification is not allowed to introduce architecture.
+
+#### 6.2 Dependency graph
+
+```text
+Finish current v1 closure
+        |
+Capability Contract v2 + public reachability gate
+        |
+Typed value/key/state semantics
+        |-----------------------------|
+        |                             |
+Core aggregate/join/window       Transaction MVCC foundation
+        |                             |
+Sort/Top-K + HOP/SESSION         Serializable certification
+        |                             |
+LATERAL + recursion              Distributed transaction commit
+        |                             |
+Timers + CRDT/merge laws --------|----|
+                                      |
+                         Multi-region standby/failover
+                                      |
+                       Scoped active-active consistency modes
+```
+
+#### 6.3 Existing pre-v1 closure: complete without feature expansion
+
+Do not derail the current release path by inserting the new feature program into pre-v1 qualification.
+
+| Existing version | Required outcome for this plan |
+|---|---|
+| `v0.59.16` | Structured diagnostics used by all later feature errors. |
+| `v0.59.17` | Public-path scenario/differential framework becomes the standard feature proof harness. |
+| `v0.59.18` | Lifecycle, external client, backend, and no-hidden-skip closure. |
+| `v0.59.19` | Exact SQL semantics, limits, collation, time, NULL, numeric, and compatibility contract. Also introduce operation-specific capability cells rather than only broad families. |
+| `v0.59.20` | Implement and prove every admitted common type/operation cell. |
+| `v0.59.21` | Graceful shutdown and health semantics. |
+| `v0.59.22` | Supported deployment profiles. |
+| `v0.59.23` | Calibrated capacity and estimator. |
+| `v0.59.24` | Exact-artifact multi-worker qualification and v1 promotion. |
+
+Architecture and ADR work for the post-v1 program may be prepared in parallel, but feature code must rebase onto and requalify against the exact v1 architecture.
+
+---
+
+### Part I — v1.1: Feature delivery and typed semantics foundation
+
+### 7. v1.1.0 — Capability Contract v2 and public reachability ledger
+
+#### Scope
+
+- Add `availability`, `semantic_version`, `compiler_symbol`, `operator_symbol`, `state_format`, `limits`, `metrics`, `errors`, and `proofs`.
+- Split broad families into variants.
+- Add generated limitations and preview docs.
+- Add CI feature-completeness and reachability checks.
+- Add capability rows to `rockstream_catalog`.
+- Persist feature IDs/versions with materialized-view definitions.
+
+#### Initial family decomposition
+
+At minimum:
+
+```text
+aggregate.count
+aggregate.sum.exact
+aggregate.sum.float
+aggregate.avg.exact
+aggregate.avg.float
+aggregate.minmax
+aggregate.distinct
+grouping.single-key
+grouping.composite
+join.inner.equi
+join.outer.equi
+join.semi-anti
+join.cross
+set.union
+set.intersect
+set.except
+window.ranking
+window.navigation
+window.rolling.rows
+window.advanced-frames
+topk.maintained
+sort.snapshot
+time.tumble
+time.hop
+time.session
+lateral.table-function
+lateral.correlated
+recursion.monotone
+recursion.deletion-aware
+temporal.processing-time
+algebra.builtin-crdt
+algebra.custom-law
+transaction.serializable.local
+transaction.serializable.distributed
+region.warm-standby
+region.active-passive
+region.active-active.merge-law
+region.active-active.serializable
+```
+
+#### Proof
+
+- Mutating any layer anchor makes CI fail.
+- A synthetic parser-only feature cannot be marked preview.
+- A synthetic operator-only feature cannot be marked preview.
+- The current recursion and lateral discontinuities are detected automatically.
+- Generated docs and runtime catalogs agree byte-for-byte.
+
+---
+
+### 8. v1.1.1 — Typed scalar, equality, hash, and row codecs
+
+#### Scope
+
+- Add `TypeDescriptor` and canonical scalar access.
+- Add equality/hash/persistent row codecs.
+- Implement the semantics pinned by `v0.59.19`.
+- Cover integer, Boolean, text, UUID, date, timestamp, timestamptz, decimal/numeric, float, and arrays used as parameters.
+- Replace empty-byte NULL conventions in stateful paths.
+- Introduce `rockstream_binary_v1` collation as a versioned codec.
+
+#### Migration
+
+- Define a new typed arrangement key version.
+- Keep old Int64/surrogate formats readable for one N/N+1 window.
+- Write only the new format after the migration frontier.
+- Make rollback legal only before the first new-format checkpoint is committed.
+
+#### Proof
+
+- Equality and hash are consistent for every admitted type.
+- Sort equality and equality-key equality differ only where the SQL contract requires.
+- PostgreSQL differential corpus covers NaN, signed zero, decimal scales, text bytes, timestamps, DST boundaries, and NULL.
+- LFS/MinIO restore and compaction preserve typed keys.
+
+---
+
+### 9. v1.1.2 — Common `SortSpec`, ordered keys, and typed window specification
+
+#### Scope
+
+- Add multi-column direction and NULL placement.
+- Add deterministic collation and stable tie-breaker.
+- Add range and peer-group semantics.
+- Replace window `order_by: Vec<usize>` with typed `SortSpec`.
+- Add explicit `ROWS`, `RANGE`, and `GROUPS` frame representation.
+- Add typed navigation values and defaults.
+
+#### Proof
+
+- Sort-key order matches the pinned PostgreSQL reference for every admitted type.
+- Mixed ASC/DESC and NULL placement pass.
+- Sort keys survive persistence, exchange, and restart.
+- Peer groups are deterministic across workers.
+
+---
+
+### 10. v1.1.3 — Typed stateful operator API and format migration
+
+#### Scope
+
+Refactor these operators to consume typed row/key codecs:
+
+- Aggregate.
+- Min/Max.
+- Distinct.
+- Inner/outer/semi/anti join.
+- Top-K.
+- Analytic window.
+- TUMBLE/HOP/SESSION.
+- Index arrangements.
+
+The refactor must preserve:
+
+- Delta-native dirty-key mutation counts.
+- Shared arrangement identity.
+- Factorized plan behavior.
+- Spill behavior.
+- State accounting.
+- Existing formal invariants.
+
+#### Proof
+
+- Existing v0.59 architecture benchmarks do not regress beyond the declared threshold.
+- One-key changes stay approximately constant at 1K/100K/10M state.
+- Every old-format checkpoint either migrates or fails closed.
+- No operator silently falls back to batch recomputation.
+
+---
+
+### 11. v1.1.4 — Preview activation, public transcript harness, and release gate
+
+#### Scope
+
+- Implement cluster/session preview activation.
+- Emit preview notices.
+- Persist feature dependencies in view metadata.
+- Add generic raw-pgwire scenario generation from capability records.
+- Add generic negative tests for unsupported cells.
+- Add `EXPLAIN` feature/tier/semantic-version annotations.
+
+#### Exit criteria
+
+No later feature train begins until:
+
+- An internal-only operator cannot be advertised as public.
+- A public preview cannot exist without a raw-pgwire proof.
+- A Core cell cannot exist without all mandatory proof levels.
+- Upgrade tests detect missing preview semantic versions.
+
+---
+
+### Part II — v1.2: Graduate the essential existing operator families
+
+### 12. v1.2.0 — Exact aggregates and typed grouping
+
+#### Public surface
+
+- `COUNT(*)`
+- `COUNT(expr)`
+- `SUM`
+- `AVG`
+- `MIN`
+- `MAX`
+- Global aggregates.
+- Single and composite `GROUP BY`.
+- Grouping keys across admitted exact, text, UUID, decimal, date, and temporal types.
+
+#### Runtime work
+
+- Replace fixed `(i64 key, i64 value)` assumptions.
+- Implement typed accumulator descriptors.
+- Use wide checked state for integer/decimal accumulation.
+- Preserve group disappearance semantics.
+- Restore typed keys without runtime-only surrogate state.
+- Integrate partial combining with merge-law metadata.
+
+#### Acceptance
+
+- Random insert/update/delete/retraction sequences.
+- Empty input and empty group behavior.
+- NULL input behavior.
+- Overflow and cast behavior.
+- Text, UUID, decimal, date, timestamp, and timestamptz groups.
+- Single/multi-worker equivalence.
+- Spill and recovery.
+
+---
+
+### 13. v1.2.1 — Floating aggregates, DISTINCT, and NULL completeness
+
+#### Scope
+
+- Define and implement PostgreSQL-compatible float behavior, including NaN and signed zero.
+- Complete `COUNT(DISTINCT ...)` and `SUM(DISTINCT ...)`.
+- Add typed MIN/MAX multisets.
+- Support multiple aggregate lanes without Int64-only intermediate joins.
+- Eliminate sentinel-based SQL NULL approximations where typed NULL state can be used directly.
+
+#### Boundaries
+
+- Approximate aggregates are out of scope unless separately admitted.
+- Exact distinct remains bounded by state budget and spills rather than silently approximating.
+
+#### Acceptance
+
+- PostgreSQL differential corpus.
+- Duplicate storms and over-retractions.
+- Removal of the current extremum.
+- Multi-aggregate groups where one lane has no matching value.
+- Restart after partial spill.
+
+---
+
+### 14. v1.2.2 — Typed joins and set operations
+
+#### Scope
+
+- Inner, left, right, full, semi, anti, and cross joins.
+- Typed composite equality keys.
+- NULL semantics and `IS NOT DISTINCT FROM` where admitted.
+- Residual predicates after equi-key probing.
+- Typed row payloads in arrangements.
+- `UNION`, `INTERSECT`, `EXCEPT`, and `DISTINCT`, with set and bag variants.
+- Float equality joins only after their exact PostgreSQL semantics are admitted and proven.
+
+#### Runtime work
+
+- Typed shared arrangements.
+- Outer unmatched-row state using typed row identity.
+- Key-changing update handling.
+- Factorized join-to-aggregate over typed payloads.
+- Amplification governor estimates by physical strategy.
+- Spill for heavy keys and outer unmatched state.
+
+#### Acceptance
+
+- NULL-heavy randomized join matrix.
+- Duplicate multiplicity.
+- Matched -> unmatched -> matched transitions.
+- Key changes.
+- High fan-out and skew.
+- Worker loss and micro-migration.
+- Set-operation zero crossings and bag weights.
+
+---
+
+### 15. v1.2.3 — Core analytic windows
+
+#### Initial Core contract
+
+- `ROW_NUMBER`
+- `RANK`
+- `DENSE_RANK`
+- `LAG`
+- `LEAD`
+- Bounded `ROWS` sliding `SUM` and `AVG`
+- Multi-column ordering.
+- ASC/DESC.
+- NULLS FIRST/LAST.
+- Typed partition and order keys.
+- Typed navigation values and defaults.
+
+#### Runtime work
+
+- Replace Int64 rows and outputs.
+- Use the common `SortSpec`.
+- Separate peer-group equality from total row tie-breaking.
+- Replace full partition sorting where possible with an ordered trace.
+- Preserve a bounded partition-recompute fallback with explicit amplification limits.
+
+#### Acceptance
+
+- Insert/delete before and inside a ranked partition.
+- Duplicate peers.
+- Tie-break stability across restart and reshuffle.
+- Navigation with NULL/default.
+- Large partitions, spill, and bounded refusal.
+- Multi-worker deterministic output.
+
+---
+
+### 16. v1.2.4 — Core graduation qualification
+
+Promote only the cells that pass:
+
+- Public pgwire differential tests.
+- LFS and MinIO durability.
+- Multi-worker equivalence.
+- Upgrade and rollback.
+- Resource bounds.
+- Capacity profile.
+- Generated contract consistency.
+
+A capability family may contain a mix of Core and Experimental variants. That is expected.
+
+---
+
+### Part III — v1.3: Ordering, Top-K, advanced windows, HOP, and SESSION
+
+### 17. v1.3.0 — General ad hoc `ORDER BY`
+
+#### Plan and execution
+
+- Lower DataFusion `Sort` to `PlanNode::Sort`.
+- Use distributed local sort plus merge.
+- Use bounded in-memory runs and SlateDB spill.
+- Push `LIMIT` into local Top-K where legal.
+- Preserve snapshot/frontier pinning for every shard.
+- Stream result batches to pgwire rather than materializing the full result.
+
+#### Public surface
+
+```sql
+SELECT ...
+ORDER BY a DESC NULLS LAST, b ASC
+LIMIT 100
+OFFSET 20;
+```
+
+#### Acceptance
+
+- Multi-shard complete ordering.
+- Mixed types and collations.
+- Spill larger than worker memory.
+- CancelRequest and timeout.
+- Stable prepared-statement behavior.
+- No hard demo-sized result cap.
+
+---
+
+### 18. v1.3.1 — Maintained `ORDER BY ... LIMIT`
+
+#### Semantics
+
+A materialized ordered view is admitted only when bounded by `LIMIT`.
+
+```sql
+CREATE MATERIALIZED VIEW top_customers AS
+SELECT customer_id, revenue
+FROM customer_revenue
+ORDER BY revenue DESC, customer_id ASC
+LIMIT 100;
+```
+
+#### Runtime
+
+- Rewrite `Sort + Limit` to generalized typed Top-K.
+- Multi-column `SortSpec`.
+- `OFFSET`.
+- `WITH TIES`.
+- Duplicate multiplicity.
+- Per-shard candidates plus globally merged Top-K.
+- Candidate fringe sufficient for delete refill.
+- Spill instead of fixed fatal buffer overflow.
+
+#### Boundary
+
+`ORDER BY` without `LIMIT` on a materialized view does not imply an incrementally maintained global row sequence. The relation remains logically unordered and is sorted when read, unless a separately admitted ordered-index capability is requested.
+
+---
+
+### 19. v1.3.2 — Public HOP windows
+
+#### Work
+
+- Reconcile actual lowering/compiler reachability with documentation.
+- Define one official SQL syntax and compatibility form.
+- Use typed time columns.
+- Use shared time slices from the v0.59 architecture.
+- Support single and multiple aggregates.
+- Define alignment, origin, time zone, watermark, and late-data semantics.
+- Restore and compact slice state by frontier.
+
+#### Acceptance
+
+- Rows assigned to every correct overlapping window.
+- Inserts, updates, deletes, and late changes.
+- Multiple window widths sharing slices.
+- Recovery at close/expiry boundaries.
+- Multi-aggregate HOP.
+- Multi-worker equivalence and state-sharing measurement.
+
+---
+
+### 20. v1.3.3 — Public SESSION windows
+
+#### Plan change
+
+Make partitioning explicit:
+
+```rust
+PlanNode::SessionWindow {
+    input,
+    partition_by,
+    time_expr,
+    gap,
+    late_data_policy,
+}
+```
+
+Do not infer the session key as “all columns except time.”
+
+#### Runtime
+
+- Ordered event index per partition.
+- Neighbor lookup.
+- Merge sessions on insertion.
+- Split sessions on retraction or key/time update.
+- Stable session identity.
+- Localized affected-component rebuild.
+- Spill for very large sessions.
+- Explicit worst-case amplification refusal.
+
+#### Acceptance
+
+- Bridging insertion merges two sessions.
+- Retraction of a bridging event splits one session.
+- Out-of-order events.
+- Late-data policies.
+- Recovery during merge/split.
+- Skewed session key.
+- Exact output against a batch sessionization oracle.
+
+---
+
+### 21. v1.3.4 — Advanced window frames and `NTILE`
+
+#### Scope
+
+- `ROWS` with bounded/unbounded endpoints.
+- `RANGE`.
+- `GROUPS`.
+- `FIRST_VALUE`.
+- `LAST_VALUE`.
+- `NTH_VALUE`.
+- `NTILE`.
+- Aggregate windows over admitted functions.
+
+#### Runtime
+
+- Peer-group index.
+- Prefix/segment structures for rolling algebraic aggregates.
+- Law-specific inverse or recompute strategy.
+- Explicit handling for one change that affects an unbounded suffix.
+- Amplification budget and refusal/notice.
+
+#### Acceptance
+
+- PostgreSQL differential frame corpus.
+- Peer and NULL ordering.
+- Deletes that change frame membership.
+- Large partitions and spill.
+- Restart and compaction.
+
+---
+
+### 22. v1.3.5 — Ordering and temporal qualification
+
+Publish measured:
+
+- Sort throughput and spill cost.
+- Top-K update amplification.
+- Window partition amplification.
+- HOP slice sharing.
+- SESSION merge/split cost.
+- State-over-RAM behavior.
+- Multi-worker scale.
+- Exact capacity boundaries shown by `EXPLAIN INCREMENTAL ESTIMATE`.
+
+---
+
+### Part IV — v1.4: `LATERAL` and recursive CTEs
+
+### 23. v1.4.0 — Table-function `LATERAL` and compiler wiring
+
+#### Immediate integration closure
+
+- Add `PlanNode::Lateral` to `compile_node`.
+- Add its name to compiler diagnostics.
+- Compile `LateralOp` as a stateless stage.
+- Support current `UNNEST` lowering through the maintained-view path.
+- Add official SQL syntax for:
+  - `UNNEST`.
+  - Literal/typed `GENERATE_SERIES`.
+  - JSON array expansion where admitted.
+
+#### Boundaries
+
+- Per-row expansion has a configurable maximum output count and byte budget.
+- Expansion beyond the bound returns a coded error or applies backpressure; it never accumulates unbounded output.
+- Volatile/non-deterministic table functions are rejected in materialized views.
+
+#### Acceptance
+
+- Input retraction retracts exactly the produced rows.
+- NULL and empty collections.
+- Nested arrays.
+- Typed outputs.
+- Raw pgwire CREATE MATERIALIZED VIEW and recovery.
+
+---
+
+### 24. v1.4.1 — Correlation IR and decorrelation
+
+#### Add
+
+```rust
+PlanNode::Apply {
+    outer,
+    inner,
+    kind: Cross | Left,
+    bindings: Vec<CorrelationBinding>,
+    max_matches_per_outer,
+}
+```
+
+#### Planner
+
+- Resolve correlated references to explicit slots.
+- Decorrelate:
+  - Equality-correlated subqueries to joins.
+  - Correlated aggregates to grouped joins.
+  - Top-1/order subqueries to partitioned Top-K.
+  - `EXISTS`/`NOT EXISTS` to semi/anti joins.
+- Preserve `LEFT JOIN LATERAL` NULL extension.
+
+#### Acceptance
+
+- Planner equivalence tests.
+- Correct behavior with zero, one, and many inner matches.
+- NULL correlated values.
+- Retractions and key changes.
+
+---
+
+### 25. v1.4.2 — Indexed parameterized `Apply`
+
+For queries that cannot be decorrelated:
+
+- Require an indexable bounded inner lookup.
+- Compile parameter bindings into typed arrangement probes.
+- Track dependencies from each outer row to produced inner rows.
+- Retract exactly the previous correlated output.
+- Cache parameterized results under a bounded policy.
+- Reject unindexed/unbounded nested loops before deployment.
+
+Expose in `EXPLAIN`:
+
+```text
+Apply strategy: indexed-parameterized
+Max matches per outer row: 1000
+Arrangement: arr-...
+Fallback: reject
+```
+
+---
+
+### 26. v1.4.3 — Monotone recursive CTEs
+
+#### Immediate integration closure
+
+- Add recursion to `compile_node`.
+- Replace inferred recursive source naming with an explicit `recursive_binding`.
+- Introduce a dedicated recursion stage/pipeline.
+- Persist fixed-point and iteration state.
+- Surface `WITH RECURSIVE` through raw pgwire.
+- Enforce one recursive self-reference in the first production subset.
+
+#### Execution
+
+- True semi-naive delta iteration.
+- `UNION` set semantics.
+- Insert-only recursive facts.
+- Iteration and state budgets.
+- `complete_through` frontier token.
+- Checkpoint and resume an unfinished fixed point.
+
+#### Acceptance
+
+- Reachability/transitive closure.
+- Hierarchy expansion.
+- Cycles.
+- Duplicate edges.
+- Multi-worker convergence.
+- Kill/restart at every iteration.
+- Max-iteration and state-limit errors.
+
+---
+
+### 27. v1.4.4 — Distributed recursion protocol
+
+#### Formal work
+
+Add a new model, for example:
+
+```text
+formal/m8_recursive_frontier.fizz
+```
+
+Prove:
+
+- No fixed point is published before every participating shard reports an empty delta at the same iteration frontier.
+- Restart cannot lose a derived fact or publish a partial iteration.
+- Duplicate iteration messages are idempotent.
+- Reassignment preserves iteration ownership.
+- Bounded fallback cannot silently change semantics.
+
+#### Runtime
+
+- Per-iteration distributed frontier.
+- Deterministic termination detection.
+- Skew handling.
+- Iteration work accounting.
+- Recovery and migration.
+
+---
+
+### 28. v1.4.5 — Deletion-aware recursion
+
+#### Strategy
+
+Implement one of these explicitly; do not mix them invisibly:
+
+1. Support-count/provenance maintenance.
+2. DRed deletion and re-derivation.
+3. Bounded affected-component rebuild.
+
+The planner selects the strategy based on query shape and available bounds.
+
+#### Scope progression
+
+- Positive relational recursion with base deletions.
+- Multiple derivations of one fact.
+- Key-changing updates.
+- Later: stratified negation and admitted aggregates.
+
+#### Boundary
+
+Non-stratified, non-convergent, or unbounded recursive forms are rejected with a specific reason and remediation.
+
+---
+
+### Part V — v1.5: Durable time-driven predicates and algebraic extensibility
+
+### 29. v1.5.0 — Durable timer service
+
+#### Architecture
+
+Add a timer subsystem to `rockstream-runtime`:
+
+```rust
+pub struct DurableTimer {
+    timer_id: TimerId,
+    owner: OperatorId,
+    fire_at: Timestamp,
+    payload_ref: PersistentRowId,
+    generation: u64,
+}
+```
+
+Required behavior:
+
+- Timer registration is committed atomically with operator state.
+- Fired timers enter the ordinary epoch/delta path.
+- A timer fires at most once for one generation.
+- Overdue timers are recovered after restart.
+- Timer ownership migrates with the shard.
+- Timer backlog is bounded and observable.
+- Processing time uses a monotonic runtime clock plus an explicit wall-clock mapping.
+- `SimRuntime` controls time deterministically.
+
+#### Formal model
+
+Add a timer ownership/firing model proving:
+
+- No duplicate firing after crash.
+- No lost expiry.
+- Old owners cannot fire after migration.
+- Backlog recovery eventually progresses.
+
+---
+
+### 30. v1.5.1 — Processing-time temporal predicates
+
+#### Public surface
+
+```sql
+CREATE MATERIALIZED VIEW recent_events AS
+SELECT *
+FROM events
+WHERE occurred_at > CURRENT_TIMESTAMP - INTERVAL '1 hour';
+```
+
+#### Compilation
+
+- Detect time-dependent predicates.
+- Produce `PlanNode::TimerFilter`.
+- On insertion, compute expiry.
+- On update, cancel/re-register by generation.
+- On expiry, emit a synthetic retraction.
+- On deletion, cancel the timer.
+- Backfill schedules future expiries and immediately excludes already-expired rows.
+
+#### Semantics
+
+Document:
+
+- Processing-time versus event-time behavior.
+- Clock jumps and monotonicity.
+- Transaction timestamp semantics.
+- Pause/restart behavior.
+- Time zone and precision.
+- Timer delay under overload.
+- Whether late firing changes correctness or only freshness.
+
+---
+
+### 31. v1.5.2 — Built-in CRDT column types
+
+#### Initial types
+
+- `COUNTER`
+- `MAX_REGISTER`
+- `MIN_REGISTER`
+- `LWW_REGISTER`
+- `OR_SET`
+- Optional `MV_REGISTER` after the first set is proven.
+
+#### SQL surface
+
+```sql
+CREATE TABLE account_counters (
+    account_id UUID PRIMARY KEY,
+    balance_delta COUNTER
+);
+```
+
+Operations must be type-specific and explicit.
+
+#### Runtime
+
+- Stable law ID/version.
+- Typed operand/state codecs.
+- Merge and inverse behavior.
+- Compaction policy.
+- Frontier policy.
+- Cross-shard combinability.
+- Upgrade and rollback.
+- `SHOW MERGE LAWS`.
+
+---
+
+### 32. v1.5.3 — Safe `CREATE MERGE LAW`
+
+#### First release: restricted declarative law IR
+
+Do not accept arbitrary native code.
+
+A law definition references a small set of deterministic typed primitives:
+
+```sql
+CREATE MERGE LAW bounded_counter_v1
+INPUT TYPE BIGINT
+STATE TYPE BIGINT
+CLASS ABELIAN_GROUP
+IDENTITY 0
+MERGE ADD
+INVERSE NEGATE
+VERSION 1;
+```
+
+The allowed IR must be:
+
+- Deterministic.
+- Total over admitted inputs.
+- I/O free.
+- Clock/randomness free.
+- Bounded in time and memory.
+- Versioned.
+- Sandboxed.
+
+#### Admission
+
+- Property tests over a generated domain.
+- Structural verification where possible.
+- Declared law properties are checked against the IR.
+- The planner only enables partial combine, factorization, retraction, or merge-on-compaction when properties justify them.
+- A law change requires a new version and migration.
+
+#### Later extension
+
+A WASM law ABI may be admitted only after:
+
+- Fuel metering.
+- Memory limits.
+- Deterministic host ABI.
+- Reproducible build identity.
+- Signature/trust policy.
+- Crash isolation.
+- State migration protocol.
+
+---
+
+### 33. v1.5.4 — Algebra qualification
+
+- Fault-inject merge ordering.
+- Duplicate and replay operands.
+- Compaction/recovery.
+- Mixed law versions.
+- Cross-shard combine.
+- Hot-key bucket combine.
+- Upgrade and rollback.
+- Deliberately false law declarations must fail the property/structural gate.
+- No law may enter `Core` solely because it compiled.
+
+---
+
+### Part VI — v2.0: Serializable transaction authority
+
+Serializable transactions change RockStream’s product role. They should be implemented deliberately as a new major release train, not hidden inside gateway session work.
+
+### 34. Transaction contract
+
+Define before implementation:
+
+- Which relations participate.
+- Whether materialized views are synchronously transaction-visible.
+- Own-write visibility.
+- Snapshot selection.
+- Commit order.
+- Read-only versus read-write serializable semantics.
+- Constraint timing.
+- Retry and uncertain-commit behavior.
+- Interaction with connector epochs.
+- Interaction with `SUBSCRIBE`.
+- Interaction with shard migration and failover.
+
+Recommended contract:
+
+- Direct pgwire DML participates in RockStream transactions.
+- A transaction reads a globally committed snapshot.
+- Its own buffered writes are overlaid on base-table and affected maintained-view reads.
+- Commit publishes base and derived deltas in one logical visibility epoch.
+- Connector epochs are separate external transactions; they do not join a client transaction.
+- `COMMIT` returns the existing freshness token.
+- Serialization failure uses a stable SQLSTATE and retry classification.
+
+---
+
+### 35. v2.0.0 — MVCC storage and transaction identity
+
+#### Storage
+
+Add:
+
+- `TxnId`.
+- Read timestamp/frontier.
+- Commit timestamp/frontier.
+- Versioned row/index entries.
+- Tombstones.
+- Transaction status record.
+- Oldest-active-snapshot GC frontier.
+- State-format migration.
+
+#### Proof
+
+- Snapshot reads.
+- Own-write overlay.
+- Aborted writes never visible.
+- Restart during write buffering/preparation.
+- Index and base-table visibility agree.
+
+---
+
+### 36. v2.0.1 — Snapshot isolation and transaction-local view overlay
+
+#### Gateway/runtime
+
+- Pin a transaction snapshot.
+- Overlay session writes on base reads.
+- Incrementally evaluate buffered changes through affected view DAGs for own-write view reads.
+- Preserve savepoint rollback.
+- Bound transaction-local overlay state.
+- Spill large transactions.
+
+#### Acceptance
+
+- Read-your-own-write across base tables and views.
+- Savepoint rollback.
+- Concurrent writers.
+- Long transaction GC pressure.
+- Crash and reconnect semantics.
+
+---
+
+### 37. v2.0.2 — Single-shard serializable certification
+
+Recommended initial strategy: optimistic certification with predicate/range tracking.
+
+Track:
+
+- Read versions.
+- Write keys.
+- Predicate/range reads.
+- Index ranges.
+- Phantom conflicts.
+- Dangerous structures or equivalent serializable validation.
+
+On commit:
+
+- Validate under shard ownership/fence.
+- Assign serialization point.
+- Commit base and derived deltas atomically.
+- Return retryable serialization failure when validation fails.
+
+Use a generated history checker, not final-state assertions alone.
+
+---
+
+### 38. v2.0.3 — Distributed transaction coordinator
+
+#### Protocol
+
+Add a control-plane Raft-backed transaction decision log:
+
+```text
+OPEN
+ -> PREPARING
+ -> COMMIT_DECIDED | ABORT_DECIDED
+ -> APPLIED
+ -> GC_ELIGIBLE
+```
+
+Participants:
+
+- Validate and prepare under current shard fence.
+- Persist prepare state.
+- Never commit without a durable decision.
+- Reconcile after coordinator or participant restart.
+- Reject stale owners.
+
+#### Formal model
+
+Add:
+
+```text
+formal/m9_distributed_txn.fizz
+```
+
+Prove:
+
+- Atomic commit.
+- No split decision.
+- No stale participant apply.
+- Decision recovery.
+- Idempotent replay.
+- Liveness after bounded failures.
+- Correct interaction with shard migration.
+
+---
+
+### 39. v2.0.4 — Constraints and complete conflict coverage
+
+- Unique and primary-key constraints.
+- Transactional secondary indexes.
+- Foreign keys only after their cross-shard cost and locking model are accepted.
+- Predicate/range conflicts.
+- DDL/transaction interaction.
+- Deadlock or retry policy.
+- Cancellation and timeout.
+- Transaction size and duration limits.
+
+---
+
+### 40. v2.0.5 — Serializable public qualification
+
+Required evidence:
+
+- Standard pgwire `SERIALIZABLE`.
+- Driver matrix.
+- Generated concurrent histories.
+- External serializability checker.
+- Process kills at every protocol phase.
+- Shard migration during transaction.
+- Control leader failure.
+- LFS/MinIO recovery.
+- Mixed-version upgrade.
+- Bounded conflict metadata.
+- Throughput and p99 commit latency.
+
+Only after this version should `IsolationLevel::Serializable` stop returning the existing unsupported error.
+
+---
+
+### Part VII — v2.1 and v2.2: Multi-region
+
+### 41. Multi-region consistency profiles
+
+Do not ship a single ambiguous “multi-region” mode.
+
+Expose explicit profiles:
+
+| Profile | Writes | Reads | Consistency |
+|---|---|---|---|
+| `dr-export` | Primary region only | Primary only | Cross-region checkpoint RPO/RTO |
+| `warm-standby` | Primary region only | Optional standby health reads | Asynchronous applied frontier |
+| `active-passive` | One fenced writer region | Region-local committed reads | Failover with one global generation |
+| `home-region` | One writer region per shard/key range | Region-local reads at declared frontier | Serializable within ownership model |
+| `merge-law-active-active` | Multi-writer only for admitted merge-law state | Region-local/global merged reads | Law-defined convergence |
+| `global-serializable` | Multi-region writes | Globally ordered reads | WAN consensus / global transaction order |
+
+---
+
+### 42. v2.1.0 — Region identity and replicated checkpoint manifest
+
+Add:
+
+- `RegionId`.
+- `ClusterGeneration`.
+- Region-qualified worker/shard identity.
+- Replicated checkpoint/export manifest.
+- Region applied frontier.
+- Cross-region object verification.
+- Region-aware encryption and secrets.
+- RPO/RTO metrics.
+
+No write failover yet.
+
+---
+
+### 43. v2.1.1 — Warm standby
+
+- Continuously ingest committed manifests/state changes into a standby.
+- Restore control/catalog state.
+- Keep standby workers non-authoritative.
+- Verify complete state at a named frontier.
+- Expose lag, missing objects, and recovery readiness.
+- Regularly query the standby in read-only verification mode.
+
+---
+
+### 44. v2.1.2 — Frontier-pinned regional read replicas
+
+- Serve only data through the region’s applied committed frontier.
+- Report staleness.
+- Preserve tenant/security isolation.
+- Route read-only sessions by requested staleness.
+- Reject a read requiring a frontier the replica has not applied.
+- Keep subscription semantics explicit and region-qualified.
+
+---
+
+### 45. v2.1.3 — Active-passive failover and fencing
+
+#### Protocol
+
+Use a globally durable generation/fencing authority.
+
+Failover:
+
+1. Stop or fence the old region.
+2. Advance cluster generation.
+3. Confirm standby applied frontier.
+4. Acquire connector and sink ownership.
+5. Publish new routing.
+6. Resume writes.
+7. Prevent the old region from rejoining as writer without rebootstrap.
+
+#### Formal model
+
+Add:
+
+```text
+formal/m10_region_failover.fizz
+```
+
+Prove:
+
+- At most one writer generation.
+- No stale-region commit.
+- Safe partial failover recovery.
+- Connector/sink ownership transfer.
+- Eventual progress after a region loss.
+
+---
+
+### 46. v2.1.4 — Regional resilience qualification
+
+- Region isolation.
+- Control-plane partition.
+- Object replication delay.
+- Failover and failback.
+- Old-region resurrection.
+- Data corruption/truncated export.
+- RPO/RTO and freshness.
+- Subscription and client reconnection.
+- Upgrade across standby/primary.
+
+---
+
+### 47. v2.2.0 — Home-region active-active ownership
+
+Support ordinary writes in multiple regions by assigning each shard/key range one writer region.
+
+- Region-aware shard leases.
+- Cross-region routing for non-home writes.
+- Online home-region migration.
+- Transaction coordinator integration.
+- Clear cross-region latency behavior.
+- No concurrent ordinary writers for the same ownership range.
+
+---
+
+### 48. v2.2.1 — Merge-law active-active
+
+Allow multi-writer only for capability cells whose law supports it.
+
+- Region-tagged operands.
+- Deduplication identity.
+- Causal/epoch metadata.
+- Law-version compatibility.
+- Convergent compaction.
+- Region-local and global read frontier.
+- Explicit non-support for non-composable laws.
+
+Built-in CRDT work from v1.5 is a prerequisite.
+
+---
+
+### 49. v2.2.2 — Global serializable mode
+
+This is separate from merge-law active-active.
+
+- Global transaction ordering or WAN consensus.
+- Cross-region prepare/decision.
+- Region failure recovery.
+- Published latency envelope.
+- Explicit availability behavior under partition.
+- No automatic downgrade to weaker semantics.
+
+This mode may be expensive. The product must state the trade-off rather than conceal it.
+
+---
+
+### 50. v2.2.3 — Active-active migration and conflict observability
+
+- Move home ownership safely.
+- Inspect pending cross-region transactions.
+- Inspect merge-law convergence.
+- Region-specific frontiers.
+- Conflict/retry metrics.
+- `EXPLAIN` regional routing.
+- Operator runbooks.
+
+---
+
+### 51. v2.2.4 — Active-active qualification
+
+- Region partition.
+- Simultaneous writes.
+- Region loss during transaction.
+- Old-generation replay.
+- Law-version mismatch.
+- Home-region migration.
+- Global serializable histories.
+- Bounded cross-region queues and object-store cost.
+- No split-brain or silent semantic downgrade.
+
+---
+
+### 52. Feature-specific public surfacing requirements
+
+Every feature train must ship all applicable surfaces.
+
+#### 52.1 SQL and pgwire
+
+- Parser and binder.
+- Simple query.
+- Extended query.
+- Prepared statements.
+- Correct PostgreSQL OIDs.
+- Text and binary result formats.
+- SQLSTATE and `RS-XXXX`.
+- CancelRequest and timeout where long-running.
+- Transaction status.
+
+#### 52.2 `EXPLAIN INCREMENTAL`
+
+Show:
+
+- Capability ID and tier.
+- Preview status.
+- Typed key and sort specification.
+- Physical strategy.
+- State format.
+- Shared arrangement IDs.
+- Estimated state.
+- Spill policy.
+- Amplification budget.
+- Timer/iteration/transaction/region ownership where relevant.
+- Unsupported reason and remediation.
+
+#### 52.3 Runtime catalogs
+
+At minimum:
+
+```text
+rockstream_catalog.capabilities
+rockstream_catalog.feature_limitations
+rockstream_catalog.operator_state
+rockstream_catalog.timers
+rockstream_catalog.recursive_queries
+rockstream_catalog.merge_laws
+rockstream_catalog.transactions
+rockstream_catalog.regions
+rockstream_catalog.region_frontiers
+```
+
+Every table must have cardinality and scan bounds.
+
+#### 52.4 Metrics
+
+Every stateful or queued subsystem exposes:
+
+- Current bytes/rows.
+- Budget.
+- Fill ratio.
+- Spill bytes and fault-ins.
+- Queue age.
+- Input/output/amplification counts.
+- Backpressure/refusal count.
+- Recovery phase.
+- Dominant degradation reason.
+
+Feature-specific examples:
+
+```text
+recursive_iteration
+recursive_delta_rows
+timer_backlog
+timer_fire_lag_ms
+apply_probe_count
+apply_matches_per_outer
+transaction_conflict_count
+transaction_prepare_age_ms
+region_applied_frontier_lag_ms
+region_generation
+```
+
+#### 52.5 Documentation
+
+Generated:
+
+- Availability and tier.
+- SQL syntax.
+- Exact semantics.
+- Supported type cells.
+- State-growth rule.
+- Failure and recovery behavior.
+- Upgrade policy.
+- Limits and errors.
+- Preview activation.
+- Executable examples.
+- Known limitations.
+
+---
+
+### 53. Proof matrix
+
+Legend:
+
+- **U** — unit/property tests.
+- **O** — independent batch/PostgreSQL oracle.
+- **L** — SlateDB local-filesystem durability.
+- **M** — MinIO/S3 durability.
+- **S** — deterministic `SimRuntime`.
+- **F** — FizzBee formal model.
+- **P** — raw pgwire public-path test.
+- **D** — multi-process/distributed test.
+- **Q** — performance/capacity qualification.
+
+| Capability | U | O | L | M | S | F | P | D | Q |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Typed aggregates | ✓ | ✓ | ✓ | ✓ |  |  | ✓ | ✓ | ✓ |
+| Typed joins/set ops | ✓ | ✓ | ✓ | ✓ | ✓ | existing models | ✓ | ✓ | ✓ |
+| Analytic windows | ✓ | ✓ | ✓ | ✓ |  |  | ✓ | ✓ | ✓ |
+| Sort/Top-K | ✓ | ✓ | ✓ | ✓ |  |  | ✓ | ✓ | ✓ |
+| HOP | ✓ | ✓ | ✓ | ✓ | ✓ | existing frontier models | ✓ | ✓ | ✓ |
+| SESSION | ✓ | ✓ | ✓ | ✓ | ✓ | existing frontier models | ✓ | ✓ | ✓ |
+| Table-function LATERAL | ✓ | ✓ |  |  |  |  | ✓ | ✓ | ✓ |
+| Correlated LATERAL | ✓ | ✓ | ✓ | ✓ | ✓ | if new distributed protocol | ✓ | ✓ | ✓ |
+| Monotone recursion | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Deletion recursion | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Durable timers | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Built-in CRDT | ✓ | ✓ | ✓ | ✓ | ✓ | law fault suite | ✓ | ✓ | ✓ |
+| Custom merge laws | ✓ | property oracle | ✓ | ✓ | ✓ | where coordination changes | ✓ | ✓ | ✓ |
+| Serializable local | ✓ | history checker | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ |
+| Serializable distributed | ✓ | history checker | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Warm standby/failover | ✓ | full multiset | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Active-active | ✓ | history/convergence checker | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+A proof cell may not be waived silently. A waiver must name the version that closes it, and the existing exit-criteria tooling must block progress when that version passes without the proof.
+
+---
+
+### 54. Work organization
+
+#### 54.1 Four standing workstreams
+
+##### A. Semantics and SQL
+
+Owns:
+
+- Capability contracts.
+- PostgreSQL semantic reference.
+- Type matrix.
+- Parser/binder/lowering.
+- PlanIR.
+- Public syntax and documentation.
+
+##### B. Operators and state
+
+Owns:
+
+- Typed operator kernels.
+- Spill.
+- State codecs.
+- Migration.
+- Checkpoint/recovery.
+- Performance.
+
+##### C. Transactions and regions
+
+Owns:
+
+- MVCC.
+- Certification.
+- Distributed transaction protocol.
+- Region fencing.
+- Standby/failover.
+- Active-active modes.
+- Formal models.
+
+##### D. Proof and product surface
+
+Owns:
+
+- Scenario DSL.
+- Public pgwire tests.
+- Differential oracles.
+- Catalogs/metrics/EXPLAIN.
+- Generated docs.
+- No-hidden-skip and reachability gates.
+- Release qualification.
+
+Every feature has one feature lead responsible for all four workstreams’ completion. Layer ownership does not allow a feature to be handed off as “done” before the public path closes.
+
+#### 54.2 Pull-request structure
+
+For each feature:
+
+1. Contract and ADR.
+2. PlanIR and semantic validation.
+3. Compiler and operator.
+4. Durable state and migration.
+5. Public pgwire and observability.
+6. Failure, upgrade, and performance proof.
+7. Capability promotion and sign-off.
+
+No PR may mark a feature public before the raw pgwire test exists. No release note may call it implemented before the capability record moves from `internal` to `preview` or `production`.
+
+#### 54.3 Required ADRs
+
+At minimum:
+
+- Typed equality/hash/sort semantics.
+- Stable state key encoding.
+- General ordered execution.
+- Correlated `Apply`.
+- Recursive fixed-point protocol.
+- Durable timer ownership.
+- User-defined merge-law sandbox.
+- MVCC and serializable certification.
+- Distributed transaction decision log.
+- Regional generation and fencing.
+- Active-active consistency profiles.
+
+---
+
+### 55. Initial program estimate
+
+Using the current roadmap convention of approximately six person-weeks per planning unit:
+
+| Release train | Initial units | Initial person-weeks |
+|---|---:|---:|
+| Remaining pre-v1 closure (`v0.59.16`–`v0.59.24`) | 9 | 54 |
+| v1.1 typed semantics and delivery foundation | 5 | 30 |
+| v1.2 Core aggregate/join/window graduation | 5 | 30 |
+| v1.3 ordering and temporal analytics | 6 | 36 |
+| v1.4 LATERAL and recursion | 6 | 36 |
+| v1.5 timers and algebra | 5 | 30 |
+| v2.0 serializable transactions | 6 | 36 |
+| v2.1 regional standby/failover | 5 | 30 |
+| v2.2 active-active modes | 5 | 30 |
+| **Post-v1 subtotal** | **43** | **258** |
+
+This is an initial program estimate, not a staffing or date commitment. The mandatory split rule will likely increase the count, especially for:
+
+- Typed state-format migration.
+- Recursive-distribution formal modeling.
+- Durable timers.
+- Custom-law sandboxing.
+- Distributed transactions.
+- Region failover.
+- Active-active operation.
+
+A realistic program should reserve 25–40% additional capacity for mandatory durable-format and formal-model splits, performance remediation, and findings from public-path differential testing.
+
+---
+
+### 56. Principal risks and controls
+
+#### 56.1 Typed-kernel regression
+
+**Risk:** Replacing Int64-oriented fast paths reduces throughput or destabilizes the proven architecture.
+
+**Control:**
+
+- Keep current benchmarks as immutable baselines.
+- Migrate operator families incrementally.
+- Run old/new typed kernels in the external oracle harness.
+- Do not retain two permanent execution paths; remove the old path after migration.
+- Reopen the owning architecture gate on a material regression.
+
+#### 56.2 Two implementations of one feature
+
+**Risk:** Ad hoc queries use DataFusion while maintained views use a different partial semantics.
+
+**Control:**
+
+- Share type, sort, frame, and semantic validation.
+- Permit different physical execution only behind one contract.
+- Differential tests must compare both paths.
+- `EXPLAIN` must name the physical path.
+
+#### 56.3 Retraction complexity
+
+**Risk:** SESSION, recursion, outer joins, and windows appear correct for append-only workloads but fail under deletes.
+
+**Control:**
+
+- Every feature’s primary oracle corpus includes inserts, updates, deletes, over-retractions, and key changes.
+- Append-only evidence cannot promote a capability to Core.
+- Maintain support counts, indexed multisets, or bounded rebuilds explicitly.
+
+#### 56.4 Recursion explosion
+
+**Risk:** Fixed-point work or state becomes unbounded.
+
+**Control:**
+
+- Iteration, state, delta, and per-epoch work limits.
+- `EXPLAIN` estimates and refusal.
+- Semi-naive execution.
+- Skew-aware distributed iteration.
+- Explicit non-monotone admission.
+
+#### 56.5 Transaction scope creep
+
+**Risk:** Serializable transactions silently turn every connector and external system into one global transaction.
+
+**Control:**
+
+- Direct pgwire DML only.
+- Connector epochs remain separate.
+- Publish the exact derived-view visibility contract.
+- Use retryable serialization errors rather than weakening semantics.
+
+#### 56.6 Split-brain multi-region
+
+**Risk:** An old region continues writing after failover.
+
+**Control:**
+
+- Global generation/fencing.
+- Formal model before implementation.
+- Object-store and control-plane checks on every commit.
+- Old-region resurrection tests.
+- No automatic downgrade from serializable to eventual consistency.
+
+#### 56.7 Preview features become permanent unqualified surface
+
+**Risk:** Experimental opt-in becomes an excuse not to finish the feature.
+
+**Control:**
+
+- Every preview has an owning release train and promotion/removal target.
+- `SHOW ROCKSTREAM CAPABILITIES` reports age and target.
+- Preview semantic versions are persisted.
+- Preview cannot be enabled by default.
+- A preview that misses two target trains requires explicit re-admission.
+
+#### 56.8 Documentation drift
+
+**Risk:** Documentation again claims parser-only or operator-only support.
+
+**Control:**
+
+- Generate public matrices.
+- Parse capability records in CI.
+- Run every executable snippet.
+- Raw pgwire test required for every “available” feature.
+- No hand-edited status tables.
+
+---
+
+### 57. Immediate next actions
+
+These actions can begin without adding connector scope:
+
+1. **Keep `v0.59.16`–`v0.59.24` unchanged as the pre-v1 release path.**
+2. **Approve this program as the accepted post-v1 direction** and remove contradictory language that treats the requested SQL/transaction/region work as merely speculative.
+3. **Draft the Capability Contract v2 ADR** and extend `capabilities.toml`.
+4. **Split the broad aggregate, relational, and analytics records** into operation-specific variants during `v0.59.19`.
+5. **Add a generated end-to-end reachability ledger** and make it detect the present recursion/lateral compiler gaps.
+6. **Write raw pgwire probes for HOP, SESSION, recursive CTE, and UNNEST** to establish the exact current public boundary from executable evidence.
+7. **Add explicit negative tests for current compiler gaps** so an unsupported node cannot silently fall back or produce a misleading success.
+8. **Draft the typed equality/hash/sort/state ADRs** against the pinned PostgreSQL semantic contract.
+9. **Create immutable performance baselines** for aggregate, join, window, Top-K, HOP, and SESSION before the typed refactor.
+10. **Assign one feature lead per release train** with responsibility through public surfacing and sign-off.
+11. **Create formal-model placeholders and invariant IDs** for recursion, distributed transactions, timers, and regional failover before their Rust implementation starts.
+12. **Freeze the connector module inventory in CI** so this program cannot accidentally expand the connector surface.
+
+---
+
+### 58. Program success criteria
+
+The program is successful when:
+
+- Aggregates, joins, set operations, and analytic windows are no longer represented by one coarse Experimental family; each useful capability cell has an honest Core or Experimental status.
+- Every Core cell is publicly reachable through raw pgwire and has complete semantic, durability, failure, upgrade, and capacity evidence.
+- `ORDER BY`/`LIMIT`, Top-K, HOP, SESSION, `LATERAL`, and recursive CTEs are usable in maintained views through the production compiler.
+- Processing-time predicates retract rows correctly without source input.
+- Built-in CRDT columns and custom merge laws have safe, versioned, bounded execution.
+- `SERIALIZABLE` is a real, history-checked isolation level rather than an accepted-but-unenforced session setting.
+- Multi-region modes have explicit consistency names and cannot split-brain or silently weaken semantics.
+- No feature is described as implemented merely because a PlanIR node, parser branch, Rust operator, or design document exists.
+- Every unsupported boundary is visible in capabilities, `EXPLAIN`, documentation, and a stable coded rejection.
+- The supported connector boundary has not expanded.
+
+---
+
+### 59. Final recommendation
+
+Adopt this as a **program roadmap**, not a single mega-version.
+
+The fastest credible route is:
+
+1. Complete the current v1 qualification.
+2. Build the typed semantics and delivery-contract foundation.
+3. Graduate the existing operator families.
+4. Surface ordering, temporal analytics, `LATERAL`, and recursion.
+5. Add durable timers and algebraic extensibility.
+6. Treat serializable transactions and multi-region operation as explicit major-release programs with formal models and public contracts.
+
+That order maximizes reuse of the architecture RockStream has already built while eliminating the exact failure mode that has repeatedly created ambiguity: code existing somewhere in the repository without the complete, publicly reachable, durable, and proven product path.
+
+---
+
 ## Formal Verification Track (FizzBee)
 
 [FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) is the authoritative specification
@@ -1944,6 +4105,10 @@ the design is verified before the implementation exists.
 | v0.59.8 | Extend M6 for bounded chunk copy, migration epochs, dual routing, frontier cutover, and delayed reclamation | `formal/m6_shard_migration.fizz` micro-migration variant | Existing M6 single-authority/no-loss invariants hold for every chunk and routing epoch; heat metadata survives reassignment | Extended M6 green before micro-migration ships; kill/restart at every copy/dual-route/cutover boundary replays as permanent regression cases |
 | v0.59.9 | Extend M1 for logical visibility epochs versus physical commit groups; model checkpoint-mode transition only if unaligned fallback is admitted | `formal/m1_epoch_commit.fizz`; checkpoint transition variant when S5 admission evidence requires it | Commit grouping cannot expose a partial logical epoch or acknowledge non-durable state; aligned/unaligned transition cannot lose or duplicate in-flight data | Extended M1 green for the mandatory core; any admitted unaligned fallback is blocked on its checkpoint-transition model and paired runtime assertions |
 | v0.23–v0.59.24 | Continuous `formal-verify` + path-coupling (DC.1–DC.2); pre-release relaxed-bounds sweep (DC.4) | all `.fizz` specs | all active base models: M1-M4, M6-M7, plus every admitted v0.59.x protocol variant | A coordination-protocol change without a model touch fails CI; the automated qualification suite re-runs the relaxed-bounds sweep against the candidate SHA |
+| v1.4.4–v1.4.5 | M8 recursive-frontier model | `formal/m8_recursive_frontier.fizz` | No early fixed-point publication, no lost derived facts, idempotent iteration replay, safe reassignment, and bounded fallback | M8 and paired `SimRuntime` assertions pass before distributed or deletion-aware recursion becomes public |
+| v1.5.0–v1.5.4 | Durable-timer model and merge-law fault suite | Timer ownership/firing model plus generated algebra checks | No duplicate or lost timer firing, no stale-owner firing, eventual backlog progress, and declared laws hold under replay and compaction | Timer model, paired runtime assertions, and false-law mutation tests pass before temporal predicates or merge laws become public |
+| v2.0.3–v2.0.5 | M9 distributed-transaction model | `formal/m9_distributed_txn.fizz` | Atomic commit, one durable decision, no stale participant apply, idempotent recovery, bounded-failure liveness, and migration safety | M9, history checking, and crash-at-every-phase tests pass before `SERIALIZABLE` becomes public |
+| v2.1.3–v2.2.4 | M10 region-failover model plus admitted active-active protocol variants | `formal/m10_region_failover.fizz` and each later coordination variant | One writer generation, no stale-region commit, safe ownership transfer, convergence where promised, and no silent consistency downgrade | Regional models, paired runtime assertions, partition histories, and resurrection tests pass before each regional mode becomes public |
 
 Every row above maps each FizzBee invariant to a paired runtime `assert!` per
 [FIZZBEE_TEST_PLAN.md](FIZZBEE_TEST_PLAN.md) §3.7. **Correction (2026-07-11
@@ -2014,9 +4179,16 @@ both into one version under schedule pressure.
 | Phase 16.5 — View Lifecycle & Source Transaction Correctness | v0.52.1 – v0.52.2 | Continuous verification (no new coordination protocol; the M3 commit boundary is re-proven for the snapshot/delta fence and for whole-transaction CDC apply, whose atomicity is a consequence of the already-verified epoch commit rather than a second mechanism) |
 | Phase 16.6 — Connector Surface Reduction | v0.52.3 – v0.52.5 | M5 cold-tier sink model retired at v0.52.4 (its implementation is deleted); M3 sink 2PC unchanged and re-proven against the single remaining sink; no new model |
 | Phase 17 — Production Readiness & 1.0 Finalization | v0.53 – v0.59.24 (including the v0.53.1–v0.59.24 sub-versions added by the 2026-08-12, 2026-08-18, and 2026-08-19 reviews) | Continuous verification + artifact-bound, no-skip automated qualification of RC1; CLI/configuration at v0.59.4; physical performance architecture and per-step benchmark evidence at v0.59.5–v0.59.9; product polish, diagnostics, executable documentation, and public-path proof closure through v0.59.18; SQL semantics and system-limits proof at v0.59.19; type-completeness proof at v0.59.20; lifecycle and deployment work through v0.59.22; capacity-estimator calibration at v0.59.23; and pure blocking horizontal scale-out and performance qualification at v0.59.24; optional extended soaks are supplemental only; v0.56 additionally proven by a `SimRuntime` mixed-version scenario |
+| Post-v1 Part I — Typed semantics and feature delivery | v1.1.0 – v1.1.4 | Existing models plus capability-contract, public-reachability, typed-codec, migration, and raw-pgwire gates |
+| Post-v1 Part II — Essential operator graduation | v1.2.0 – v1.2.4 | Existing commit, frontier, fencing, and migration models plus public differential qualification |
+| Post-v1 Part III — Ordering and temporal analytics | v1.3.0 – v1.3.5 | Existing frontier models plus spill, amplification, recovery, and distributed equivalence proofs |
+| Post-v1 Part IV — LATERAL and recursion | v1.4.0 – v1.4.5 | M8 recursive-frontier model for distributed and deletion-aware recursion |
+| Post-v1 Part V — Durable time and algebra | v1.5.0 – v1.5.4 | Durable-timer ownership/firing model and merge-law fault suite |
+| Post-v1 Part VI — Serializable transactions | v2.0.0 – v2.0.5 | M9 distributed-transaction model plus external serializability histories |
+| Post-v1 Part VII — Multi-region | v2.1.0 – v2.2.4 | M10 regional-failover model plus every admitted active-active coordination variant |
 
-Eighty versions at ~6 person-weeks each is the full path from an empty
-repository to a production-ready, enterprise-grade 1.0. The order is fixed:
+One hundred twenty-three versions at about 6 person-weeks each cover the path
+from an empty repository through the scoped v2.2 program. The order is fixed:
 correctness on one shard is proven before distribution, distribution is made
 fault-tolerant before the Postgres layer depends on it, ingestion connectors
 and crucible soaks validate real-world pressure before HTAP ergonomics, the
