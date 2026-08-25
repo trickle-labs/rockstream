@@ -998,6 +998,28 @@ Exit codes
 
 Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
 
+### `rockstream support diagnose`
+
+Look up one runtime diagnostic and write its support bundle
+
+Options
+
+| Name | Short | Long | Value | Required | Default | Values | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| code | — | --code | CODE | no | — | — | Look up the most recent occurrence for this catalog code |
+| correlation_id | — | --correlation-id | CORRELATION_ID | no | — | — | Look up an occurrence by its correlation UUID |
+| out | — | --out | OUT | no | — | — | Output file path for the support bundle |
+
+Exit codes
+
+| Code | Title | Description | Error codes |
+| --- | --- | --- | --- |
+| 0 | Success | Command completed successfully without error | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 1 | Execution Error | Runtime failure or operation error during execution | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+| 2 | Usage Error | Invalid arguments, options, or flags provided to CLI | RS-0001, RS-1001, RS-1012, RS-1013, RS-2001 |
+
+Error codes: `RS-0001`, `RS-1001`, `RS-1012`, `RS-1013`, `RS-2001`
+
 ## `rockstream version`
 
 Print candidate identity and version information

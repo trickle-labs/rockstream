@@ -2377,6 +2377,57 @@
               "RS-1013",
               "RS-2001"
             ]
+          },
+          {
+            "name": "diagnose",
+            "about": "Look up one runtime diagnostic and write its support bundle",
+            "options": [
+              {
+                "name": "code",
+                "long": "code",
+                "help": "Look up the most recent occurrence for this catalog code",
+                "required": false,
+                "value_name": "CODE"
+              },
+              {
+                "name": "correlation_id",
+                "long": "correlation-id",
+                "help": "Look up an occurrence by its correlation UUID",
+                "required": false,
+                "value_name": "CORRELATION_ID"
+              },
+              {
+                "name": "out",
+                "long": "out",
+                "help": "Output file path for the support bundle",
+                "required": false,
+                "value_name": "OUT"
+              }
+            ],
+            "exit_codes": [
+              {
+                "code": 0,
+                "title": "Success",
+                "description": "Command completed successfully without error"
+              },
+              {
+                "code": 1,
+                "title": "Execution Error",
+                "description": "Runtime failure or operation error during execution"
+              },
+              {
+                "code": 2,
+                "title": "Usage Error",
+                "description": "Invalid arguments, options, or flags provided to CLI"
+              }
+            ],
+            "error_codes": [
+              "RS-0001",
+              "RS-1001",
+              "RS-1012",
+              "RS-1013",
+              "RS-2001"
+            ]
           }
         ],
         "exit_codes": [
