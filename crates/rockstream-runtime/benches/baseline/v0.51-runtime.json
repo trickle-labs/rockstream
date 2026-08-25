@@ -1,12 +1,12 @@
 {
-  "exchange_bench_direct_lz4_epoch_cpu_budget/direct_lz4_epoch_cpu_ms": 330866.97559479036,
+  "exchange_bench_direct_lz4_epoch_cpu_budget/direct_lz4_epoch_cpu_ms": 425665.91191337345,
   "exchange_complex_dag_hot_path/legacy_wal_on": 617960474.9,
   "exchange_complex_dag_hot_path/wal_elided_quantum_coupled": 62103639.16992064,
-  "exchange_deserialize_zset/deserialize": 24155.29723847264,
-  "exchange_flow_control/acquire_ack_pair": 259.8634303623993,
-  "exchange_serialize_zset/serialize": 14924.244903665103,
-  "exchange_transport_claims/direct_lz4_codec_v1": 41421.60831244965,
-  "exchange_transport_claims/direct_raw_baseline": 29646.968577285264,
-  "exchange_transport_claims/durable_zstd_codec_v1": 76087.78376957445,
-  "ingest_checked_quota/acquire_release_1k": 80.259
+  "exchange_deserialize_zset/deserialize": 30916.07667331605,
+  "exchange_flow_control/acquire_ack_pair": 334.8476213327586,
+  "exchange_serialize_zset/serialize": 19488.669222047043,
+  "exchange_transport_claims/direct_lz4_codec_v1": 53355.56609357121,
+  "exchange_transport_claims/direct_raw_baseline": 38421.51882763681,
+  "exchange_transport_claims/durable_zstd_codec_v1": 98276.89098255888,
+  "ingest_checked_quota/acquire_release_1k": 97.73914726089984
 }
