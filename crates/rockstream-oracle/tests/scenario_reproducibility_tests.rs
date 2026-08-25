@@ -55,7 +55,7 @@ fn scenario_of(name: &str, sqls: &[&str]) -> Scenario {
 async fn assert_mismatch_artifact_is_minimized_and_reproducible(scenario_name: &str) {
     let sqls = ["SELECT 1", "SELECT 2", "SELECT 3"];
     let scenario = scenario_of(scenario_name, &sqls);
-    let driver = InProcessDriver::default();
+    let driver = InProcessDriver;
 
     let actual = driver.run(&scenario).await.expect("scenario run");
     assert_eq!(actual.events().len(), sqls.len());

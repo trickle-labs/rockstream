@@ -65,7 +65,7 @@ pub struct CliError {
     /// Actionable guidance for resolving the error.
     pub next_steps: String,
     /// Catalog-backed occurrence used by every structured CLI renderer.
-    pub occurrence: DiagnosticOccurrence,
+    pub occurrence: Box<DiagnosticOccurrence>,
 }
 
 impl CliError {
@@ -100,7 +100,7 @@ impl CliError {
             code,
             message,
             next_steps,
-            occurrence,
+            occurrence: Box::new(occurrence),
         }
     }
 
