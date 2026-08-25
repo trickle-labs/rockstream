@@ -968,7 +968,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             // real multi-process control-plane cluster stay up long enough
             // for peers/workers to reach it. Every other combination keeps
             // the pre-v0.45.2 short-sleep-then-exit behavior unchanged.
-            let daemon_mode = (opts.daemon && opts.role == "control") || opts.role == "worker" || opts.daemon;
+            let daemon_mode = opts.daemon || opts.role == "worker";
             if daemon_mode {
                 let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
                     .ok()
