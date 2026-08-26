@@ -4793,7 +4793,7 @@ fn test_all_rs_codes_have_sqlstate() {
                 user: "alice".into(),
             },
         ),
-        ("0A000", GatewayError::NotSupported("x".into())),
+        ("XX000", GatewayError::NotSupported("x".into())),
         ("42601", GatewayError::ParseError("x".into())),
         ("XX000", GatewayError::PgWire("x".into())),
         ("25P02", GatewayError::InFailedSqlTransaction),
