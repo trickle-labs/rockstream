@@ -628,7 +628,7 @@ mod tc {
         }
     }
 
-    pub async fn register_worker(addr: SocketAddr, worker_id: u64) {
+    pub async fn register_worker(addr: SocketAddr, worker_id: u64) -> TcpStream {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let reg = WorkerRegistration::new(
             WorkerId(worker_id),
@@ -636,7 +636,12 @@ mod tc {
             format!("127.0.0.1:{}", 9000 + worker_id),
             CapacityHeadroom::FULL,
         );
-        send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
+        let reply = send_and_recv(&mut stream, &WorkerMessage::Register(reg)).await;
+        assert!(matches!(
+            serde_json::from_str(reply.trim()),
+            Ok(ControlMessage::Registered { .. })
+        ));
+        stream
     }
 
     /// Request a shard lease; returns `Some(lease)` on
@@ -649,13 +654,21 @@ mod tc {
         shard_id: u64,
     ) -> Option<rockstream_types::lease::ShardLease> {
         let mut stream = TcpStream::connect(addr).await.ok()?;
+        request_shard_on_stream(&mut stream, worker_id, shard_id).await
+    }
+
+    pub async fn request_shard_on_stream(
+        stream: &mut TcpStream,
+        worker_id: u64,
+        shard_id: u64,
+    ) -> Option<rockstream_types::lease::ShardLease> {
         let req = WorkerMessage::RequestShard {
             worker_id: WorkerId(worker_id),
             shard_id: ShardId(shard_id),
         };
         let line = serde_json::to_string(&req).unwrap() + "\n";
         stream.write_all(line.as_bytes()).await.ok()?;
-        let mut reader = BufReader::new(&mut stream);
+        let mut reader = BufReader::new(stream);
         let mut resp = String::new();
         tokio::time::timeout(Duration::from_millis(800), reader.read_line(&mut resp))
             .await
@@ -773,8 +786,8 @@ async fn leader_kill_recovers_within_budget_tc() {
     // Pre-kill: a worker acquires shard 7's lease against the original
     // leader — this is the "in-flight" state whose continuity the kill
     // must not corrupt.
-    tc::register_worker(old_leader_addr, 10).await;
-    let lease_before = tc::request_shard(old_leader_addr, 10, 7)
+    let mut worker10 = tc::register_worker(old_leader_addr, 10).await;
+    let lease_before = tc::request_shard_on_stream(&mut worker10, 10, 7)
         .await
         .expect("pre-kill shard-lease request against the real leader must succeed");
     assert_eq!(lease_before.worker_id, WorkerId(10));
@@ -826,8 +839,8 @@ async fn leader_kill_recovers_within_budget_tc() {
          worker 10's pre-kill lease (persisted to the shared control-plane \
          store) is still live: {conflicting:?}"
     );
-    tc::register_worker(new_leader_addr, 20).await;
-    let fresh_lease = tc::request_shard(new_leader_addr, 20, 8)
+    let mut worker20 = tc::register_worker(new_leader_addr, 20).await;
+    let fresh_lease = tc::request_shard_on_stream(&mut worker20, 20, 8)
         .await
         .expect("shard leasing must resume against the new leader for an unleased shard");
     assert_eq!(fresh_lease.worker_id, WorkerId(20));
@@ -968,8 +981,8 @@ async fn rolling_restart_preserves_worker_leases_and_quotas_tc() {
     let leader_addr = cluster.nodes[leader_idx].control_addr;
 
     // A worker acquires a real shard lease before the rolling restart begins.
-    tc::register_worker(leader_addr, 10).await;
-    let lease = tc::request_shard(leader_addr, 10, 3)
+    let mut worker10 = tc::register_worker(leader_addr, 10).await;
+    let lease = tc::request_shard_on_stream(&mut worker10, 10, 3)
         .await
         .expect("pre-restart shard-lease request must succeed");
     assert_eq!(lease.worker_id, WorkerId(10));
