@@ -380,6 +380,8 @@ jobs:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
       - name: run nexmark bench
+        env:
+          ROCKSTREAM_NEXMARK_GATE: "1"
         run: cargo bench -p rockstream-ops --bench nexmark -- --noplot | tee nexmark-bench.out
       - name: compare against v0.36 baseline
         run: cargo run -p rockstream-ops --bin nexmark_regression_gate -- --baseline crates/rockstream-ops/benches/baseline/v0.36.json --output nexmark-bench.out

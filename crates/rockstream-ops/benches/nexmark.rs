@@ -440,6 +440,12 @@ fn bench_nexmark(c: &mut Criterion) {
             measure_commit_latencies_ms(42, DATASET_SIZE, &dml_statements, 5).await
         }));
 
+        // The CI gate consumes the summary metrics above; timed Criterion samples
+        // are too expensive for the CI runner.
+        if std::env::var_os("ROCKSTREAM_NEXMARK_GATE").is_some() {
+            continue;
+        }
+
         // 2. Measure timed transaction commit duration
         group.throughput(Throughput::Elements(input_rows as u64));
         group.bench_with_input(
