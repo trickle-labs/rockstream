@@ -113,6 +113,21 @@ fn normalize_exchange(bytes: &[u8]) -> Vec<u8> {
                     *b = 0;
                 }
             }
+            // ErrorResponse messages include a random correlation UUID in the
+            // human-readable message; preserve length while normalizing it.
+            b'E' => {
+                let marker = b"correlation_id=";
+                if let Some(start) = msg
+                    .windows(marker.len())
+                    .position(|window| window == marker)
+                    .map(|offset| offset + marker.len())
+                {
+                    let end = (start + 36).min(len);
+                    for b in &mut msg[start..end] {
+                        *b = b'0';
+                    }
+                }
+            }
             _ => {}
         }
     }
