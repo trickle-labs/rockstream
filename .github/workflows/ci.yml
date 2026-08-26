@@ -25,6 +25,10 @@ jobs:
           toolchain: "1.88"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Require Docker
+        run: docker info
+      - name: Build unified-binary test image
+        run: docker build -t rockstream-tc-test:latest .
       - name: cargo fmt
         run: cargo fmt --all --check
       - name: cargo clippy
@@ -198,6 +202,10 @@ jobs:
           toolchain: "1.88"
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - name: Require Docker
+        run: docker info
+      - name: Build unified-binary test image
+        run: docker build -t rockstream-tc-test:latest .
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: cargo llvm-cov (workspace lcov)
