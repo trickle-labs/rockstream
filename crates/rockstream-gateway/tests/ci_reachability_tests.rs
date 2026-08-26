@@ -3,7 +3,7 @@ fn ci_workspace_test_runs_explicit_feature_matrix() {
     let workflow = include_str!("../../../.github/workflows/ci.yml");
     assert!(workflow
         .lines()
-        .any(|line| line == "          cargo test --workspace --exclude rockstream-connectors"));
+        .any(|line| line == "          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage"));
     assert!(workflow.lines().any(|line| line.contains(
         "cargo test --quiet --all-features -p rockstream-gateway --test auth_scram_tests --test gateway_dml_tests --test gateway_extended_query_tests --test gateway_integration_tests --test gateway_proof_tests --test golden_wire_tests --test listen_notify_tests --test transaction_savepoint_tests -- -Z unstable-options --format json"
     )));

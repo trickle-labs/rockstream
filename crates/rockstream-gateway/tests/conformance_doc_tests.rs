@@ -199,7 +199,7 @@ fn test_coverage_gates_reuse_complete_workspace_report() {
         .filter_map(|step| step["run"].as_str())
         .collect::<Vec<_>>();
     for command in [
-        "cargo llvm-cov --workspace --exclude rockstream-connectors --lib --tests --no-report",
+        "cargo llvm-cov --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --lib --tests --no-report",
         "cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers",
         "cargo llvm-cov --no-clean -p rockstream-sim --features simulation",
         "cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests",
