@@ -168,7 +168,7 @@ async fn pathological_query_budget_returns_documented_error_without_truncation()
     let message = error.as_db_error().expect("pgwire ErrorResponse").message();
     assert!(message.contains("RS-2029"), "unexpected error: {message}");
     assert!(
-        message.contains("2 rows or 1024 bytes"),
+        message.contains("byte_limit=1024, relation=sales, row_limit=2"),
         "unexpected error: {message}"
     );
     assert!(
