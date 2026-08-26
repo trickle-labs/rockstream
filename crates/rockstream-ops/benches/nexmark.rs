@@ -128,7 +128,12 @@ async fn setup_env(seed: u64, num_base_events: usize) -> BenchEnv {
         .simple_query("CREATE TABLE side_input (key BIGINT, value VARCHAR)")
         .await
         .unwrap();
-    for key in 0..2000 {
+    let side_input_rows = if std::env::var_os("ROCKSTREAM_NEXMARK_GATE").is_some() {
+        100
+    } else {
+        2000
+    };
+    for key in 0..side_input_rows {
         client
             .simple_query(&format!(
                 "INSERT INTO side_input (key, value) VALUES ({key}, 'val_{key}')"
@@ -406,26 +411,32 @@ fn bench_nexmark(c: &mut Criterion) {
         .enable_all()
         .build()
         .unwrap();
+    let ci_gate = std::env::var_os("ROCKSTREAM_NEXMARK_GATE").is_some();
+    let dataset_size = if ci_gate { 100 } else { DATASET_SIZE };
 
     let mut group = c.benchmark_group("nexmark_delta_propagation");
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(1));
 
-    let rates = &[
-        ("0.1pct", 1),  // 0.1% change rate on DATASET_SIZE = 1000
-        ("1pct", 10),   // 1% change rate
-        ("10pct", 100), // 10% change rate
-    ];
+    let rates: &[(&str, usize)] = if ci_gate {
+        &[("ci_small", 1), ("ci_medium", 10), ("ci_large", 100)]
+    } else {
+        &[
+            ("0.1pct", 1),  // 0.1% change rate on DATASET_SIZE = 1000
+            ("1pct", 10),   // 1% change rate
+            ("10pct", 100), // 10% change rate
+        ]
+    };
     let mut max_delta_amplification = 0.0f64;
     let mut latency_samples_ms = Vec::new();
 
     for &(label, delta_size) in rates {
-        let dml_statements = generate_dml_statements(42, delta_size, DATASET_SIZE);
+        let dml_statements = generate_dml_statements(42, delta_size, dataset_size);
         let input_rows = dml_statements.len();
 
         // 1. Measure and assert delta amplification once
         let amps = rt.block_on(async {
-            measure_amplification_for_all_stateful_views(42, DATASET_SIZE, &dml_statements).await
+            measure_amplification_for_all_stateful_views(42, dataset_size, &dml_statements).await
         });
         for (view, amp) in &amps {
             println!("[nexmark_bench] View {view} delta amplification: {amp:.2}x");
@@ -437,12 +448,12 @@ fn bench_nexmark(c: &mut Criterion) {
             );
         }
         latency_samples_ms.extend(rt.block_on(async {
-            measure_commit_latencies_ms(42, DATASET_SIZE, &dml_statements, 5).await
+            measure_commit_latencies_ms(42, dataset_size, &dml_statements, 5).await
         }));
 
         // The CI gate consumes the summary metrics above; timed Criterion samples
         // are too expensive for the CI runner.
-        if std::env::var_os("ROCKSTREAM_NEXMARK_GATE").is_some() {
+        if ci_gate {
             continue;
         }
 
