@@ -982,9 +982,20 @@ async fn rolling_restart_preserves_worker_leases_and_quotas_tc() {
 
     // A worker acquires a real shard lease before the rolling restart begins.
     let mut worker10 = tc::register_worker(leader_addr, 10).await;
-    let lease = tc::request_shard_on_stream(&mut worker10, 10, 3)
-        .await
-        .expect("pre-restart shard-lease request must succeed");
+    let lease = {
+        let mut lease = None;
+        for _ in 0..5 {
+            lease = tc::request_shard_on_stream(&mut worker10, 10, 3).await;
+            if lease.is_some() {
+                break;
+            }
+            let (leader_idx, _) = cluster
+                .wait_for_single_leader(Duration::from_secs(20))
+                .await;
+            worker10 = tc::register_worker(cluster.nodes[leader_idx].control_addr, 10).await;
+        }
+        lease.expect("pre-restart shard-lease request must succeed")
+    };
     assert_eq!(lease.worker_id, WorkerId(10));
 
     // A workload's quota/catalog state is registered directly against the
