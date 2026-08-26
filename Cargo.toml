@@ -26,7 +26,7 @@ strip = "symbols"
 [workspace.package]
 version = "0.59.17"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.94.1"
 license = "Apache-2.0"
 repository = "https://github.com/trickle-labs/rockstream"
 
@@ -46,8 +46,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 datafusion = "53"
 object_store = { version = "0.12", features = ["aws"] }
 tempfile = "3"
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["minio"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["minio"] }
 parking_lot = "0.12"
 regex = "1"
 hex = "0.4"
@@ -56,7 +56,7 @@ base64 = "0.22"
 proptest = "1"
 rand = { version = "0.8", features = ["small_rng"] }
 dashmap = "6"
-lru = "0.12"
+lru = "0.18"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 sha2 = "0.10"

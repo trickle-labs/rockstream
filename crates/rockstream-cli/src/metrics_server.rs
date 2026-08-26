@@ -98,14 +98,12 @@ mod tests {
         let _metrics_lock = METRICS_SERVER_TEST_LOCK.lock().await;
         let handle = start_metrics_server("127.0.0.1:0").await.unwrap();
         let resp = request(handle.local_addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
-        let body = rockstream_types::metrics::generate_prometheus_metrics();
-        assert_eq!(
-            resp,
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-        );
+        let (headers, body) = resp.split_once("\r\n\r\n").unwrap();
+        assert_eq!(headers.lines().next(), Some("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8"));
+        assert!(headers.contains(&format!("Content-Length: {}", body.len())));
+        assert!(headers.ends_with("Connection: close"));
+        assert!(body.starts_with("# HELP rockstream_build_info"));
         handle.shutdown();
     }
 

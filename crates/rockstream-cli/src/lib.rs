@@ -11,6 +11,8 @@
 //! All user/operator-visible failures carry an `RS-XXXX` error code with
 //! actionable `next_steps` text (see [`CliError`]).
 
+#![allow(clippy::result_large_err)]
+
 use crate::output::OutputFormat;
 use rockstream_types::audit::AuditEvent;
 use rockstream_types::config::RockstreamConfig;
@@ -832,19 +834,37 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             ))?;
 
             if opts.role == "all" {
-                // Wait for worker registration handshake
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                // Acquire the real shard-0 lease through the normal
-                // control-plane lease flow (no demo/bypass lease): this is
-                // the single shard both the worker's data-plane DAG and the
-                // gateway's pgwire reads serve from in `--role all`.
-                let shard_id = rockstream_types::ids::ShardId(0);
-                for _ in 0..20 {
+                for _ in 0..200 {
                     if client.worker_id().is_some() {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
+                client.worker_id().ok_or_else(|| {
+                    CliError::new(
+                        RS_0003,
+                        "worker registration did not complete in time",
+                        "Check that the embedded control service is healthy.",
+                    )
+                })?;
+                // Acquire the real shard-0 lease through the normal
+                // control-plane lease flow (no demo/bypass lease): this is
+                // the single shard both the worker's data-plane DAG and the
+                // gateway's pgwire reads serve from in `--role all`.
+                let shard_id = rockstream_types::ids::ShardId(0);
+                for _ in 0..200 {
+                    if client.worker_id().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                client.worker_id().ok_or_else(|| {
+                    CliError::new(
+                        RS_0003,
+                        "worker registration did not complete in time",
+                        "Check that the embedded control service is healthy.",
+                    )
+                })?;
                 client.request_shard(shard_id).await.map_err(|error| {
                     CliError::new(
                         RS_0003,
@@ -856,19 +876,22 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 // processed (client.rs opens the ShardDb asynchronously
                 // when it arrives).
                 let mut shard_db = None;
-                for _ in 0..50 {
+                for _ in 0..200 {
                     if let Some(db) = client.get_shard_db(shard_id) {
                         shard_db = Some(db);
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                if let Some(db) = shard_db {
-                    let shard_path = opts.storage.join("shards").join("0");
-                    let store = rockstream_storage::build_runtime_object_store(
-                        &shard_path,
-                        "shards/0",
+                let db = shard_db.ok_or_else(|| {
+                    CliError::new(
+                        RS_0003,
+                        "shared shard-0 did not become ready in time",
+                        "Check the embedded worker and storage directory.",
                     )
+                })?;
+                let shard_path = opts.storage.join("shards").join("0");
+                let store = rockstream_storage::build_runtime_object_store(&shard_path, "shards/0")
                     .map_err(|error| {
                         CliError::new(
                             RS_0003,
@@ -876,8 +899,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                             "Check storage directory or object-store credentials.",
                         )
                     })?;
-                    shared_gateway_shard = Some((Arc::new(db), store));
-                }
+                shared_gateway_shard = Some((Arc::new(db), store));
             }
             worker_handle = Some(handle);
         }
@@ -1057,86 +1079,107 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
     })
 }
 
-/// Thin v0.46 admin-CLI stub: request a worker drain over the control wire API.
-pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), CliError> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
-    rt.block_on(async move {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::TcpStream;
+/// Request a worker drain over the control wire API asynchronously.
+pub async fn request_worker_drain_async(control: &str, worker_id: u64) -> Result<(), CliError> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
 
-        let mut stream = TcpStream::connect(control).await.map_err(|e| {
+    let mut stream = TcpStream::connect(control).await.map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("failed to connect to control service at {control}: {e}"),
+            "Check that the control node is running and --control points at its worker-facing address.",
+        )
+    })?;
+    let request = serde_json::to_string(&WorkerMessage::RequestDrain {
+        worker_id: rockstream_types::ids::WorkerId(worker_id),
+    })
+    .map_err(|e| CliError::new(RS_0003, format!("failed to encode drain request: {e}"), ""))?
+        + "\n";
+    stream.write_all(request.as_bytes()).await.map_err(|e| {
+        CliError::new(
+            RS_0003,
+            format!("failed to send drain request: {e}"),
+            "Retry the request after verifying network connectivity to the control node.",
+        )
+    })?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).await.map_err(|e| {
             CliError::new(
                 RS_0003,
-                format!("failed to connect to control service at {control}: {e}"),
-                "Check that the control node is running and --control points at its worker-facing address.",
+                format!("failed reading control response: {e}"),
+                "Retry the request after checking the control-plane logs.",
             )
         })?;
-        let request = serde_json::to_string(&WorkerMessage::RequestDrain {
-            worker_id: rockstream_types::ids::WorkerId(worker_id),
-        })
-        .map_err(|e| CliError::new(RS_0003, format!("failed to encode drain request: {e}"), ""))?
-            + "\n";
-        stream.write_all(request.as_bytes()).await.map_err(|e| {
+        if read == 0 {
+            return Err(CliError::new(
+                RS_0003,
+                "control service closed the drain request without a reply",
+                "Retry against the current control leader and inspect the control-plane audit log.",
+            ));
+        }
+        match serde_json::from_str::<ControlMessage>(line.trim()).map_err(|e| {
             CliError::new(
                 RS_0003,
-                format!("failed to send drain request: {e}"),
-                "Retry the request after verifying network connectivity to the control node.",
+                format!("failed to decode control response: {e}"),
+                "Upgrade the CLI and control plane together so they agree on the wire format.",
             )
-        })?;
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = reader.read_line(&mut line).await.map_err(|e| {
-                CliError::new(
-                    RS_0003,
-                    format!("failed reading control response: {e}"),
-                    "Retry the request after checking the control-plane logs.",
-                )
-            })?;
-            if read == 0 {
-                return Err(CliError::new(
-                    RS_0003,
-                    "control service closed the drain request without a reply",
-                    "Retry against the current control leader and inspect the control-plane audit log.",
-                ));
+        })? {
+            ControlMessage::BeginDrain(_) => continue,
+            ControlMessage::DrainStatus { state, .. } => {
+                println!("{state:?}");
+                return Ok(());
             }
-            match serde_json::from_str::<ControlMessage>(line.trim()).map_err(|e| {
-                CliError::new(
-                    RS_0003,
-                    format!("failed to decode control response: {e}"),
-                    "Upgrade the CLI and control plane together so they agree on the wire format.",
-                )
-            })? {
-                ControlMessage::BeginDrain(_) => continue,
-                ControlMessage::DrainStatus { state, .. } => {
-                    println!("{state:?}");
-                    return Ok(());
-                }
-                ControlMessage::OperationFailed {
-                    code,
+            ControlMessage::OperationFailed {
+                code,
+                message,
+                next_steps,
+            } => {
+                return Err(CliError::new(
+                    ErrorCode::new(code.trim_start_matches("RS-").parse().unwrap_or(3)),
                     message,
                     next_steps,
-                } => {
-                    return Err(CliError::new(
-                        ErrorCode::new(code.trim_start_matches("RS-").parse().unwrap_or(3)),
-                        message,
-                        next_steps,
-                    ));
-                }
-                other => {
-                    return Err(CliError::new(
-                        RS_0003,
-                        format!("unexpected control response to drain request: {other:?}"),
-                        "Retry against the current control leader; if the problem persists, inspect the control-plane logs.",
-                    ));
-                }
+                ));
+            }
+            other => {
+                return Err(CliError::new(
+                    RS_0003,
+                    format!("unexpected control response to drain request: {other:?}"),
+                    "Retry against the current control leader; if the problem persists, inspect the control-plane logs.",
+                ));
             }
         }
-    })
+    }
+}
+
+/// Thin v0.46 admin-CLI stub: request a worker drain over the control wire API.
+pub fn request_worker_drain(control: &str, worker_id: u64) -> Result<(), CliError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), "")
+                    })?;
+                rt.block_on(request_worker_drain_async(control, worker_id))
+            })
+            .join()
+            .unwrap()
+        })
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), "")
+            })?;
+        rt.block_on(request_worker_drain_async(control, worker_id))
+    }
 }
 
 // ─── Inspection Command Runners ─────────────────────────────────────────────

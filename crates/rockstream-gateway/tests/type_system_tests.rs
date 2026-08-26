@@ -407,9 +407,9 @@ async fn test_orm_conformance() {
 
     // Determine host IP address reachable from container
     fn get_host_ip() -> String {
-        if let Some(socket) = std::net::UdpSocket::bind("0.0.0.0:0").ok() {
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
             if socket.connect("8.8.8.8:80").is_ok() {
-                if let Some(addr) = socket.local_addr().ok() {
+                if let Ok(addr) = socket.local_addr() {
                     let ip = addr.ip().to_string();
                     if ip != "127.0.0.1" && ip != "0.0.0.0" {
                         return ip;

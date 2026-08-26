@@ -28,6 +28,8 @@ use rockstream_types::metrics::{reset_all, set_freshness_lag, set_pipeline_state
 use rockstream_types::view_lifecycle::ViewState;
 use rockstream_types::workload::{WorkloadDef, WorkloadPriority};
 
+static CONTENTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Cluster-wide state capacity, deliberately smaller than the combined
 /// footprint `low` and `high` would need if both were admitted in full.
 const GLOBAL_CAPACITY_BYTES: u64 = 1_000;
@@ -40,6 +42,9 @@ const HIGH_REQUESTED_BYTES: u64 = 400;
 const HIGH_FRESHNESS_SLO_MS: u64 = 500;
 
 fn run_contention_scenario(seed: u64) {
+    let _lock = CONTENTION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     reset_all();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let log = FileAuditLog::open(tmp.path()).unwrap();

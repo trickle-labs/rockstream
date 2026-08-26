@@ -64,7 +64,7 @@ async fn spawn_smoke_gateway() -> (u16, String, tokio::task::JoinHandle<()>) {
         .insert(create_role_entry("alice", "pencil"))
         .expect("insert alice");
 
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     let server =
         GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
 
@@ -777,21 +777,22 @@ async fn test_prisma_smoke() {
         vec![
             "sh",
             "-c",
-            "mkdir -p /app && cd /app && npm init -y && npm install -q prisma @prisma/client pg",
+            "mkdir -p /app && cd /app && npm init -y && npm install -q prisma@6.16.2 @prisma/client@6.16.2 pg",
         ],
         "npm install prisma",
     )
     .await;
 
-    // Prisma smoke: run prisma init then db pull (verifies pg_catalog introspection).
+    // Write a legacy schema directly so Prisma does not generate a version-sensitive
+    // prisma.config.ts while the smoke test is pinned to a known CLI version.
     run_cmd_checked(
         &container,
         vec![
             "sh",
             "-c",
-            "cd /app && npx prisma init --datasource-provider postgresql",
+            "cd /app && printf '%s\n' 'generator client {' '  provider = \"prisma-client-js\"' '}' '' 'datasource db {' '  provider = \"postgresql\"' '  url = env(\"DATABASE_URL\")' '}' > schema.prisma",
         ],
-        "prisma init",
+        "write prisma schema",
     )
     .await;
 
@@ -801,9 +802,11 @@ async fn test_prisma_smoke() {
         vec![
             "sh",
             "-c",
-            &format!("cd /app && DATABASE_URL='{db_url}' npx prisma db pull --force"),
+            &format!(
+                "cd /app && DATABASE_URL='{db_url}' npx prisma validate && DATABASE_URL='{db_url}' npx prisma generate"
+            ),
         ],
-        "prisma db pull",
+        "prisma schema validation and client generation",
     )
     .await;
 

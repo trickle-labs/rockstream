@@ -13,7 +13,7 @@ fn baseline() -> NexmarkBenchmarkSummary {
 fn comparator_rejects_regression_over_ten_percent() {
     let baseline = baseline();
     let regressed = parse_summary_line(
-        "[nexmark_summary] {\"max_delta_amplification\":17.0,\"propagation_latency_p50_ms\":6200.0,\"propagation_latency_p99_ms\":6800.0}",
+        "[nexmark_summary] {\"max_delta_amplification\":15.6,\"propagation_latency_p50_ms\":17.0,\"propagation_latency_p99_ms\":50.0}",
     )
     .unwrap();
     let check = compare_against_baseline(&baseline, &regressed);

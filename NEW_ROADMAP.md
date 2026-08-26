@@ -898,7 +898,7 @@ test (`test_conformance_doc_has_linked_tests`), confirming that the fix
 pattern proposed for v0.45.5 above is already proven, low-risk, and merely
 needs to be replicated rather than invented; `docs/ivm-operators.md`,
 `scripts/check-error-codes.sh`, and `rust-toolchain.toml`'s version pin
-(matches `ci.yml`'s `toolchain: "1.88"` exactly) all check out; and
+(matches `ci.yml`'s `toolchain: "1.94.1"` exactly) all check out; and
 `AggregateOp`'s per-operator-instance `Mutex<AggState>` is a correct,
 non-bottlenecking design (each operator's epoch processing is already
 inherently sequential, and the mutex never spans shards or operators), not a

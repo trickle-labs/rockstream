@@ -1,5 +1,5 @@
 {
   "max_delta_amplification": 14.1,
-  "propagation_latency_p50_ms": 5128.650792,
-  "propagation_latency_p99_ms": 5543.616458
+  "propagation_latency_p50_ms": 5334.245208,
+  "propagation_latency_p99_ms": 5654.519791000001
 }

@@ -50,6 +50,22 @@ async fn send(addr: std::net::SocketAddr, msg: &WorkerMessage) {
     let _ = tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut buf)).await;
 }
 
+async fn wait_for_shard_worker(manager: &ShardManager, shard_id: ShardId, worker_id: WorkerId) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager
+                .get(shard_id)
+                .is_some_and(|lease| lease.worker_id == worker_id)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("auto-drain did not reassign the shard within 2 seconds");
+}
+
 fn registration_with_location(id: u64, host_id: &str, az: &str) -> WorkerRegistration {
     WorkerRegistration::new(
         WorkerId(id),
@@ -470,8 +486,7 @@ async fn az_domain_rebuild_during_drain_preserves_delivery_sim() {
         },
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(manager.get(ShardId(77)).unwrap().worker_id, WorkerId(3));
+    wait_for_shard_worker(&manager, ShardId(77), WorkerId(3)).await;
 
     let local = worker_info(1, "127.0.0.1:9401".to_string(), "host-a", "az-1");
     let cross_az = worker_info(2, "127.0.0.1:9402".to_string(), "host-b", "az-2");
@@ -579,8 +594,7 @@ async fn exchange_domain_rebuild_releases_row_credits_during_drain_sim() {
         },
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(manager.get(ShardId(88)).unwrap().worker_id, WorkerId(13));
+    wait_for_shard_worker(&manager, ShardId(88), WorkerId(13)).await;
 
     let src_db = shard_db("sim-drain-budget-src").await;
     let sender_shards = make_sender_shards(src_db, WorkerId(11));

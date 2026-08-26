@@ -67,12 +67,7 @@ pub async fn connector_fixture(label: &str) -> ConnectorFixture {
         .unwrap();
     postgres_client.query_one("SELECT 1", &[]).await.unwrap();
 
-    let kafka = apache::Kafka::default()
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
-        .start()
-        .await
-        .unwrap();
+    let kafka = start_kafka_with_retry().await;
     let kafka_bootstrap = format!(
         "127.0.0.1:{}",
         kafka.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
@@ -97,6 +92,29 @@ pub async fn connector_fixture(label: &str) -> ConnectorFixture {
 
 pub fn docker_available() -> bool {
     rockstream_test_support::docker_available()
+}
+
+/// Kafka broker startup occasionally misses its readiness log line under CI
+/// resource contention (container log stream ends before the broker prints
+/// "Kafka Server started"). Retry a few times before failing the test, since
+/// this is transient container-startup flakiness rather than a code defect.
+async fn start_kafka_with_retry() -> ContainerAsync<apache::Kafka> {
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match apache::Kafka::default()
+            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+            .start()
+            .await
+        {
+            Ok(kafka) => return kafka,
+            Err(err) => {
+                eprintln!("kafka container start attempt {attempt} failed: {err}");
+                last_err = Some(err);
+            }
+        }
+    }
+    panic!("kafka container failed to start after retries: {last_err:?}");
 }
 
 pub fn make_cumulative_batch(last_id: i64) -> RecordBatch {

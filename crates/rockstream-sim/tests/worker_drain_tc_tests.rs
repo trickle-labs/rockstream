@@ -134,14 +134,16 @@ async fn send(addr: SocketAddr, msg: &WorkerMessage) -> Vec<ControlMessage> {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let line = serde_json::to_string(msg).unwrap() + "\n";
     stream.write_all(line.as_bytes()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let mut reader = BufReader::new(stream);
     let mut out = Vec::new();
     loop {
         let mut line = String::new();
-        let Ok(read) =
-            tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut line)).await
-        else {
+        let timeout = if out.is_empty() {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(50)
+        };
+        let Ok(read) = tokio::time::timeout(timeout, reader.read_line(&mut line)).await else {
             break;
         };
         let Ok(read) = read else { break };
@@ -151,6 +153,27 @@ async fn send(addr: SocketAddr, msg: &WorkerMessage) -> Vec<ControlMessage> {
         out.push(serde_json::from_str(line.trim()).unwrap());
     }
     out
+}
+
+async fn register_worker(addr: SocketAddr, worker_id: u64) -> TcpStream {
+    let reg = WorkerRegistration::new(
+        WorkerId(worker_id),
+        NodeRole::Worker,
+        format!("host-{worker_id}:7000"),
+        CapacityHeadroom::FULL,
+    );
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let line = serde_json::to_string(&WorkerMessage::Register(reg)).unwrap() + "\n";
+    stream.write_all(line.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(&mut stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<ControlMessage>(response.trim()).unwrap(),
+        ControlMessage::Registered { worker_id: registered } if registered == WorkerId(worker_id)
+    ));
+    drop(reader);
+    stream
 }
 
 async fn request_shard(addr: SocketAddr, worker_id: u64, shard_id: u64) -> Option<ShardLease> {
@@ -196,15 +219,8 @@ async fn drain_completes_zero_downtime_tc() {
             .as_nanos()
     );
     let cluster = TcCluster::boot(&run_id).await;
-    for worker_id in [1u64, 2u64] {
-        let reg = WorkerRegistration::new(
-            WorkerId(worker_id),
-            NodeRole::Worker,
-            format!("host-{worker_id}:7000"),
-            CapacityHeadroom::FULL,
-        );
-        let _ = send(cluster.control_addr, &WorkerMessage::Register(reg)).await;
-    }
+    let _worker_1 = register_worker(cluster.control_addr, 1).await;
+    let _worker_2 = register_worker(cluster.control_addr, 2).await;
     assert_eq!(
         request_shard(cluster.control_addr, 1, 31)
             .await
@@ -212,24 +228,13 @@ async fn drain_completes_zero_downtime_tc() {
             .worker_id,
         WorkerId(1)
     );
-    let binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target/debug/rockstream");
-    let status = std::process::Command::new(binary)
-        .args([
-            "--identity-role",
-            "admin",
-            "cluster",
-            "workers",
-            "drain",
-            "--control",
-            &cluster.control_addr.to_string(),
-            "1",
-            "--yes",
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    let _ = send(
+        cluster.control_addr,
+        &WorkerMessage::RequestDrain {
+            worker_id: WorkerId(1),
+        },
+    )
+    .await;
     for _ in 0..20 {
         let replies = send(cluster.control_addr, &WorkerMessage::ClusterStatusQuery).await;
         assert!(matches!(

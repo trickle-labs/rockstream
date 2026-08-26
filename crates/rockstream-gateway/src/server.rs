@@ -8335,7 +8335,7 @@ impl GatewayHandler {
                 )]);
             }
             return Ok(vec![create_source_error_response(format!(
-                "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
         }
@@ -8409,7 +8409,7 @@ impl GatewayHandler {
                 )]);
             }
             return Ok(vec![create_source_error_response(format!(
-                "[RS-4001] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
+                "[RS-4010] source.already_exists: source '{}' already exists. Next steps: {CREATE_SOURCE_NEXT_STEPS}",
                 parsed.name
             ))]);
         }
@@ -12953,7 +12953,15 @@ fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
         CatalogResponse::Rows { columns, rows } => {
             let fields: Vec<FieldInfo> = columns
                 .iter()
-                .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+                .map(|c| {
+                    FieldInfo::new(
+                        c.clone(),
+                        None,
+                        None,
+                        catalog_column_type(c),
+                        FieldFormat::Text,
+                    )
+                })
                 .collect();
             let schema = Arc::new(fields);
             let schema_ref = schema.clone();
@@ -15317,6 +15325,27 @@ fn describe_returning_fields(
         .collect()
 }
 
+fn catalog_column_type(column: &str) -> Type {
+    match column.to_ascii_lowercase().as_str() {
+        "is_partition"
+        | "has_subclass"
+        | "has_row_level_security"
+        | "is_deferrable"
+        | "is_deferred"
+        | "relhasindex"
+        | "indisprimary"
+        | "indisunique"
+        | "indisvalid"
+        | "attnotnull"
+        | "atthasdef" => Type::BOOL,
+        "oid" | "table_oid" | "relid" | "attrelid" | "atttypid" | "relnamespace" | "relowner" => {
+            Type::INT4
+        }
+        "constraint_type" => Type::CHAR,
+        _ => Type::TEXT,
+    }
+}
+
 /// Build FieldInfo list for a query (for DESCRIBE).
 fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> {
     let ql = q.trim().to_lowercase();
@@ -15349,7 +15378,15 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
     {
         return columns
             .iter()
-            .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+            .map(|c| {
+                FieldInfo::new(
+                    c.clone(),
+                    None,
+                    None,
+                    catalog_column_type(c),
+                    FieldFormat::Text,
+                )
+            })
             .collect();
     }
     if let Some(view_name) = extract_view_name_from_select(q) {

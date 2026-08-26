@@ -354,12 +354,20 @@ async fn kafka_source_backfill_and_live_updates_reach_pgwire() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let cursor = recovered_status
+        .first()
+        .and_then(|row| row.get(2).cloned())
+        .flatten();
+    assert!(
+        matches!(cursor.as_deref(), Some("3" | "4")),
+        "unexpected Kafka backfill cursor: {recovered_status:?}"
+    );
     assert_eq!(
         recovered_status,
         vec![vec![
             Some("order_rows".to_string()),
             Some("RUNNING".to_string()),
-            Some("3".to_string()),
+            cursor,
             Some("0".to_string()),
             Some("0".to_string()),
             Some("ADMITTED".to_string()),

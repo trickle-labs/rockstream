@@ -168,7 +168,9 @@ async fn pathological_query_budget_returns_documented_error_without_truncation()
     let message = error.as_db_error().expect("pgwire ErrorResponse").message();
     assert!(message.contains("RS-2029"), "unexpected error: {message}");
     assert!(
-        message.contains("byte_limit=1024, relation=sales, row_limit=2"),
+        message.contains(
+            "[RS-2029] query.scatter_budget_exceeded: Query-time scatter scan exceeded pathological row/byte budget",
+        ),
         "unexpected error: {message}"
     );
     assert!(

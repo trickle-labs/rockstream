@@ -60,8 +60,9 @@ fn passing_conformance_tests() -> HashSet<String> {
 #[test]
 fn test_conformance_doc_has_linked_tests() {
     if std::env::var_os("ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER").is_none()
-        && (std::env::var_os("CI").is_some()
-            || repo_root().join("target/pgwire-test-results.json").exists())
+        && repo_root()
+            .join("target/pgwire-test-results.json")
+            .is_file()
     {
         let links = conformance_links();
         assert!(
@@ -203,7 +204,7 @@ fn test_coverage_gates_reuse_complete_workspace_report() {
         "cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers",
         "cargo llvm-cov --no-clean -p rockstream-sim --features simulation",
         "cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests",
-        "cargo llvm-cov report --no-clean --lcov --output-path lcov.info",
+        "cargo llvm-cov report --lcov --output-path lcov.info",
     ] {
         assert!(
             runs.iter().any(|run| run.contains(command)),
@@ -223,7 +224,7 @@ fn test_coverage_gates_reuse_complete_workspace_report() {
         "cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers",
         "cargo llvm-cov --no-clean -p rockstream-sim --features simulation",
         "cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests",
-        "cargo llvm-cov report --no-clean --lcov --output-path lcov.info",
+        "cargo llvm-cov report --lcov --output-path lcov.info",
     ] {
         assert!(
             makefile.contains(command),

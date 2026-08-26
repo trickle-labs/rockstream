@@ -3,6 +3,8 @@
 //! Asserts worker service startup, explicit `--worker-id`, heartbeat registration,
 //! shard lease acquisition, and graceful shutdown.
 
+#![allow(clippy::result_large_err)]
+
 use std::time::Duration;
 
 use rockstream_cli::{run_start, StartOptions};

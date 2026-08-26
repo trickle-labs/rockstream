@@ -49,7 +49,7 @@ fi
 grep -Eq 'RUSTSEC-|vulnerabilit' "$audit_output" || fail "cargo audit did not report an advisory"
 
 deny_output="$TMP_ROOT/deny.out"
-if cargo deny --offline --manifest-path "$FIXTURE/Cargo.toml" --config "$DENY" check advisories >"$deny_output" 2>&1; then
+if cargo deny --color never --locked --manifest-path "$FIXTURE/Cargo.toml" --config "$DENY" check advisories >"$deny_output" 2>&1; then
   fail "cargo deny accepted the known-vulnerable fixture"
 fi
 grep -Eq 'RUSTSEC-|advis|vulnerab' "$deny_output" || fail "cargo deny did not report an advisory"

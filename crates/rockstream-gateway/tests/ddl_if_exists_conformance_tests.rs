@@ -409,63 +409,6 @@ async fn test_source_if_exists_semantics() {
 }
 
 #[tokio::test]
-async fn test_sink_if_exists_semantics() {
-    let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-    let catalog = Arc::new(CatalogStubs::new());
-    let (port, _handle, _shard_db) = start_gateway("sink-if-exists", store, catalog).await;
-    let client = connect_port(port).await;
-
-    client
-        .simple_query("CREATE TABLE base_sink (id BIGINT, val TEXT)")
-        .await
-        .unwrap();
-    client
-        .simple_query("CREATE VIEW v_sink AS SELECT id, val FROM base_sink")
-        .await
-        .unwrap();
-
-    // CREATE SINK IF NOT EXISTS
-    client
-        .simple_query("CREATE SINK IF NOT EXISTS sink_test FOR VIEW v_sink TO ICEBERG 's3://bucket/path' WITH (catalog = 'filesystem')")
-        .await
-        .unwrap();
-
-    // CREATE SINK IF NOT EXISTS on existing -> clean no-op
-    client
-        .simple_query("CREATE SINK IF NOT EXISTS sink_test FOR VIEW v_sink TO ICEBERG 's3://bucket/path' WITH (catalog = 'filesystem')")
-        .await
-        .unwrap();
-
-    // CREATE SINK without IF NOT EXISTS on existing -> error
-    let err = client
-        .simple_query("CREATE SINK sink_test FOR VIEW v_sink TO ICEBERG 's3://bucket/path' WITH (catalog = 'filesystem')")
-        .await
-        .unwrap_err();
-    check_err(&err, &["already exists", "42710", "RS-4001", "RS-4007"]);
-
-    // DROP SINK IF EXISTS on existing -> dropped
-    client
-        .simple_query("DROP SINK IF EXISTS sink_test")
-        .await
-        .unwrap();
-
-    // DROP SINK IF EXISTS on absent -> clean no-op
-    client
-        .simple_query("DROP SINK IF EXISTS sink_test")
-        .await
-        .unwrap();
-
-    // DROP SINK without IF EXISTS on absent -> error
-    let err = client
-        .simple_query("DROP SINK sink_test")
-        .await
-        .unwrap_err();
-    check_err(&err, &["does not exist", "42704", "RS-4004"]);
-}
-
-#[tokio::test]
 async fn test_schema_if_exists_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> =

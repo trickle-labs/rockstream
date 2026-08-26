@@ -166,13 +166,14 @@ async fn test_deposed_leader_fenced_zero_dual_writer() {
     )
     .await
     .unwrap();
-    let node_b = spawn_raft_node(
-        "127.0.0.1:0",
-        RaftConfig::new(1, Vec::new(), false),
-        shared_store.clone(),
-    )
-    .await
-    .unwrap();
+    let follower_config = RaftConfig {
+        election_timeout_min: Duration::from_secs(5),
+        election_timeout_max: Duration::from_secs(6),
+        ..RaftConfig::new(1, Vec::new(), false)
+    };
+    let node_b = spawn_raft_node("127.0.0.1:0", follower_config, shared_store.clone())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert!(node_a.handle.is_leader());

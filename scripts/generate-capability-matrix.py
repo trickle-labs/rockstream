@@ -40,8 +40,8 @@ def validate(
     if not isinstance(contract, dict):
         fail("capabilities.toml must define [contract]")
     version = contract.get("version")
-    if version not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7"}:
-        fail("capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, or v0.59.7")
+    if version not in {"v0.57.1", "v0.59.1", "v0.59.3", "v0.59.4", "v0.59.6", "v0.59.7", "v0.59.8", "v0.59.9"}:
+        fail("capabilities.toml contract.version must be v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6, v0.59.7, v0.59.8, or v0.59.9")
 
     roadmap = contract.get("roadmap")
     if not isinstance(roadmap, str):

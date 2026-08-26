@@ -3,6 +3,8 @@
 //! Every node role is a flag on this one binary. At v0.1 it runs an embedded
 //! no-op node; see [`rockstream_cli`] for the command implementations.
 
+#![allow(clippy::result_large_err)]
+
 use std::process::ExitCode;
 
 use clap::Parser;

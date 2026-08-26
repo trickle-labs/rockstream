@@ -161,14 +161,20 @@ async fn send(addr: SocketAddr, msg: &WorkerMessage) -> Vec<ControlMessage> {
     out
 }
 
-async fn register_worker(addr: SocketAddr, worker_id: u64) {
+async fn register_worker(addr: SocketAddr, worker_id: u64) -> TcpStream {
     let reg = WorkerRegistration::new(
         WorkerId(worker_id),
         NodeRole::Worker,
         format!("host-{worker_id}:7000"),
         CapacityHeadroom::FULL,
     );
-    let _ = send(addr, &WorkerMessage::Register(reg)).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let line = serde_json::to_string(&WorkerMessage::Register(reg)).unwrap() + "\n";
+    stream.write_all(line.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(&mut stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    stream
 }
 
 async fn request_shard(addr: SocketAddr, worker_id: u64, shard_id: u64) -> Option<ShardLease> {
@@ -197,25 +203,14 @@ async fn wait_for_lease(addr: SocketAddr, worker_id: u64, shard_id: u64) -> Shar
     }
 }
 
-fn exec_drain(control_addr: SocketAddr, worker_id: u64) {
-    let binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target/debug/rockstream");
-    let status = std::process::Command::new(binary)
-        .args([
-            "cluster",
-            "workers",
-            "drain",
-            "--control",
-            &control_addr.to_string(),
-            "--identity-role",
-            "admin",
-            &worker_id.to_string(),
-            "--yes",
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success(), "drain CLI failed");
+async fn exec_drain(control_addr: SocketAddr, worker_id: u64) {
+    let _ = send(
+        control_addr,
+        &WorkerMessage::RequestDrain {
+            worker_id: WorkerId(worker_id),
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -227,8 +222,8 @@ async fn live_migration_zero_loss_tc() {
         return;
     }
     let cluster = TcCluster::boot("live").await;
-    register_worker(cluster.control_addr, 1).await;
-    register_worker(cluster.control_addr, 2).await;
+    let _worker_1 = register_worker(cluster.control_addr, 1).await;
+    let _worker_2 = register_worker(cluster.control_addr, 2).await;
     assert_eq!(
         request_shard(cluster.control_addr, 1, 11)
             .await
@@ -236,7 +231,7 @@ async fn live_migration_zero_loss_tc() {
             .worker_id,
         WorkerId(1)
     );
-    exec_drain(cluster.control_addr, 1);
+    exec_drain(cluster.control_addr, 1).await;
     for _ in 0..10 {
         let _ = send(cluster.control_addr, &WorkerMessage::ClusterStatusQuery).await;
     }
@@ -256,10 +251,10 @@ async fn donor_killed_mid_dual_writing_tc() {
         return;
     }
     let cluster = TcCluster::boot("dual").await;
-    register_worker(cluster.control_addr, 1).await;
-    register_worker(cluster.control_addr, 2).await;
+    let _worker_1 = register_worker(cluster.control_addr, 1).await;
+    let _worker_2 = register_worker(cluster.control_addr, 2).await;
     let _ = request_shard(cluster.control_addr, 1, 21).await;
-    exec_drain(cluster.control_addr, 1);
+    exec_drain(cluster.control_addr, 1).await;
     let status = std::process::Command::new("docker")
         .args(["rm", "-f", &cluster.donor_name])
         .status()
@@ -281,10 +276,10 @@ async fn donor_killed_mid_cutover_tc() {
         return;
     }
     let cluster = TcCluster::boot("cut").await;
-    register_worker(cluster.control_addr, 1).await;
-    register_worker(cluster.control_addr, 2).await;
+    let _worker_1 = register_worker(cluster.control_addr, 1).await;
+    let _worker_2 = register_worker(cluster.control_addr, 2).await;
     let _ = request_shard(cluster.control_addr, 1, 22).await;
-    exec_drain(cluster.control_addr, 1);
+    exec_drain(cluster.control_addr, 1).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     let status = std::process::Command::new("docker")
         .args(["rm", "-f", &cluster.donor_name])
