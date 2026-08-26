@@ -139,7 +139,6 @@ fn normalize_exchange(bytes: &[u8]) -> Vec<u8> {
                     }
                 }
             }
-            }
             _ => {}
         }
     }
