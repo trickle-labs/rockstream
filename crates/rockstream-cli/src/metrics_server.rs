@@ -3,6 +3,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::oneshot;
 
+#[cfg(test)]
+pub(crate) static METRICS_SERVER_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Handle to the running metrics server.
 pub struct MetricsServerHandle {
     /// The actual address the server is bound to.
@@ -91,7 +95,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint_returns_200_with_prometheus_body() {
-        let _metrics_lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        let _metrics_lock = METRICS_SERVER_TEST_LOCK.lock().await;
         let handle = start_metrics_server("127.0.0.1:0").await.unwrap();
         let resp = request(handle.local_addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
         let body = rockstream_types::metrics::generate_prometheus_metrics();

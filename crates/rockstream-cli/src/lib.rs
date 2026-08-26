@@ -2550,7 +2550,7 @@ mod tests {
 
     #[test]
     fn run_start_writes_audit_log_and_support_bundle() {
-        let _metrics_lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        let _metrics_lock = crate::metrics_server::METRICS_SERVER_TEST_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let opts = StartOptions {
             storage: dir.path().to_path_buf(),
@@ -2601,7 +2601,7 @@ mod tests {
 
     #[test]
     fn run_start_creates_missing_storage_directory() {
-        let _metrics_lock = rockstream_types::metrics::METRICS_TEST_LOCK.lock().unwrap();
+        let _metrics_lock = crate::metrics_server::METRICS_SERVER_TEST_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a").join("b");
         let opts = StartOptions {
