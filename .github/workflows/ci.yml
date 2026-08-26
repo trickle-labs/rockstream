@@ -204,6 +204,7 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
+          ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER: "1"
         run: |
           cargo llvm-cov --workspace --lib --tests --no-report
           cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests --no-report

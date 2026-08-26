@@ -838,15 +838,26 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                 // control-plane lease flow (no demo/bypass lease): this is
                 // the single shard both the worker's data-plane DAG and the
                 // gateway's pgwire reads serve from in `--role all`.
-                let _ = client
-                    .request_shard(rockstream_types::ids::ShardId(0))
-                    .await;
+                let shard_id = rockstream_types::ids::ShardId(0);
+                for _ in 0..20 {
+                    if client.worker_id().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                client.request_shard(shard_id).await.map_err(|error| {
+                    CliError::new(
+                        RS_0003,
+                        format!("worker failed to request shard-0: {error}"),
+                        "Check that the embedded control service is healthy.",
+                    )
+                })?;
                 // Poll briefly for the ShardAssigned response to be
                 // processed (client.rs opens the ShardDb asynchronously
                 // when it arrives).
                 let mut shard_db = None;
                 for _ in 0..50 {
-                    if let Some(db) = client.get_shard_db(rockstream_types::ids::ShardId(0)) {
+                    if let Some(db) = client.get_shard_db(shard_id) {
                         shard_db = Some(db);
                         break;
                     }
