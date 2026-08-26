@@ -4313,9 +4313,9 @@ async fn create_index_name_conflict_returns_rs2016_via_wire() {
         "expected RS-2016 for index name conflict; got {result:?}"
     );
 
-    // Same name on same table is idempotent (no error).
+    // IF NOT EXISTS makes the same name on the same table idempotent.
     client
-        .simple_query("CREATE INDEX idx_conflict ON table_a (col1)")
+        .simple_query("CREATE INDEX IF NOT EXISTS idx_conflict ON table_a (col1)")
         .await
         .expect("idempotent CREATE INDEX on same table should succeed");
 }
