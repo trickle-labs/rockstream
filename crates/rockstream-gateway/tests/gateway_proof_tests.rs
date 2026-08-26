@@ -4757,7 +4757,7 @@ fn test_all_rs_codes_have_sqlstate() {
         ("42P01", GatewayError::ViewNotFound("v".into())),
         ("54000", GatewayError::ResultSetTooLarge),
         (
-            "53100",
+            "53200",
             GatewayError::ShardBackpressure {
                 current_bytes: 1,
                 limit_bytes: 2,

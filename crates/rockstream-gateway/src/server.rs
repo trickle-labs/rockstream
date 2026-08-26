@@ -8862,7 +8862,7 @@ impl GatewayHandler {
                 "ERROR".to_owned(),
                 "42710".to_owned(),
                 format!(
-                    "[RS-4001] Index name conflict: index '{index_name}' already exists. Choose a unique index name or drop the existing index first."
+                    "[RS-2016] Index name conflict: index '{index_name}' already exists. Choose a unique index name or drop the existing index first."
                 ),
             )))]);
         }
@@ -8885,7 +8885,7 @@ impl GatewayHandler {
                 "ERROR".to_owned(),
                 "42710".to_owned(),
                 format!(
-                    "[RS-4001] Index name conflict: index '{index_name}' already exists. Choose a unique index name or drop the existing index first."
+                    "[RS-2016] Index name conflict: index '{index_name}' already exists. Choose a unique index name or drop the existing index first."
                 ),
             )))]);
         }
