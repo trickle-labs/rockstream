@@ -55,13 +55,14 @@ jobs:
         env:
           ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER: "1"
         run: |
-          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim
+          cargo test --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql
           cargo test -p rockstream-connectors --lib --tests -- --test-threads=1
           cargo test -p rockstream-control --lib --tests -- --test-threads=1
           cargo test -p rockstream-gateway --lib --tests -- --test-threads=1
           cargo test -p rockstream-ops --lib --tests -- --test-threads=1
           cargo test -p rockstream-runtime --lib --tests -- --test-threads=1
           cargo test -p rockstream-storage --lib --tests -- --test-threads=1
+          cargo test -p rockstream-sql --lib --tests -- --test-threads=1
           cargo test -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
           cargo test -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
           cargo test -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1
@@ -239,13 +240,14 @@ jobs:
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
           ROCKSTREAM_CONFORMANCE_REPORT_PRODUCER: "1"
         run: |
-          cargo llvm-cov --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --lib --tests --no-report
+          cargo llvm-cov --workspace --exclude rockstream-connectors --exclude rockstream-control --exclude rockstream-gateway --exclude rockstream-ops --exclude rockstream-runtime --exclude rockstream-storage --exclude rockstream-sim --exclude rockstream-sql --lib --tests --no-report
           cargo llvm-cov --no-clean -p rockstream-connectors --lib --tests -- --test-threads=1
           cargo llvm-cov --no-clean -p rockstream-control --lib --tests -- --test-threads=1
           cargo llvm-cov --no-clean -p rockstream-gateway --lib --tests -- --test-threads=1
           cargo llvm-cov --no-clean -p rockstream-ops --lib --tests -- --test-threads=1
           cargo llvm-cov --no-clean -p rockstream-runtime --lib --tests -- --test-threads=1
           cargo llvm-cov --no-clean -p rockstream-storage --lib --tests -- --test-threads=1
+          cargo llvm-cov --no-clean -p rockstream-sql --lib --tests -- --test-threads=1
           cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers --test auth_scram_tests --test driver_matrix_tests --test query_time_multi_shard_scatter_minio_tests --test reference_app_tests -- --test-threads=1
           cargo llvm-cov --no-clean -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests
           cargo llvm-cov --no-clean -p rockstream-sim --features simulation --test control_plane_ha_tests -- --test-threads=1
