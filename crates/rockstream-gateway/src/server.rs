@@ -8852,21 +8852,6 @@ impl GatewayHandler {
             )))]);
         }
 
-        if self.catalog.get_index(&index_name).is_some() {
-            if if_not_exists {
-                return Ok(vec![Response::Execution(
-                    Tag::new("CREATE INDEX").with_rows(0),
-                )]);
-            }
-            return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "42710".to_owned(),
-                format!(
-                    "[RS-2016] Index name conflict: index '{index_name}' already exists. Choose a unique index name or drop the existing index first."
-                ),
-            )))]);
-        }
-
         let entry = CatalogIndexEntry {
             name: index_name.clone(),
             table: table.clone(),

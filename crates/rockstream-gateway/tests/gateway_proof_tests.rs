@@ -4788,7 +4788,7 @@ fn test_all_rs_codes_have_sqlstate() {
             GatewayError::ConnectionLimitExceeded { limit: 10_000 },
         ),
         (
-            "28P01",
+            "28000",
             GatewayError::InvalidPassword {
                 user: "alice".into(),
             },
