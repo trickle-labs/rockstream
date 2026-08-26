@@ -335,7 +335,7 @@ async fn test_source_ddl_negative_cases() {
         .await
         .unwrap();
 
-    // Duplicate CREATE SOURCE -> RS-4010
+    // Duplicate CREATE SOURCE -> RS-4001
     let err = client
         .execute(
             "CREATE SOURCE my_src TYPE kafka (bootstrap.servers='localhost:9092') FORMAT json;",
@@ -344,7 +344,7 @@ async fn test_source_ddl_negative_cases() {
         .await
         .unwrap_err();
     let msg = err.as_db_error().map(|e| e.message()).unwrap_or("");
-    assert!(msg.contains("RS-4010"), "expected RS-4010 in error: {msg}");
+    assert!(msg.contains("RS-4001"), "expected RS-4001 in error: {msg}");
 
     // ALTER non-existent source -> RS-4009
     let err = client
