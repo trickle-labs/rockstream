@@ -11,7 +11,9 @@ use rockstream_control::{
 use rockstream_sim::buggify;
 use rockstream_sim::buggify::{buggify_disable, buggify_init};
 use rockstream_types::ids::{ShardId, WorkerId};
-use rockstream_types::topology::{CapacityHeadroom, NodeRole, WorkerMessage, WorkerRegistration};
+use rockstream_types::topology::{
+    CapacityHeadroom, ControlMessage, NodeRole, WorkerMessage, WorkerRegistration,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -22,6 +24,26 @@ async fn send(addr: std::net::SocketAddr, msg: &WorkerMessage) {
     let mut reader = BufReader::new(stream);
     let mut buf = String::new();
     let _ = tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut buf)).await;
+}
+
+async fn register(
+    addr: std::net::SocketAddr,
+    registration: WorkerRegistration,
+) -> BufReader<TcpStream> {
+    let mut reader = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    let line =
+        serde_json::to_string(&WorkerMessage::Register(registration.clone())).unwrap() + "\n";
+    reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    match serde_json::from_str::<ControlMessage>(response.trim()).unwrap() {
+        ControlMessage::Registered { worker_id } => assert_eq!(worker_id, registration.worker_id),
+        other => panic!("expected registration response, got {other:?}"),
+    }
+    reader
 }
 
 #[tokio::test]
@@ -38,6 +60,7 @@ async fn drain_converges_under_buggify_seed() {
         .start("127.0.0.1:0")
         .await
         .unwrap();
+    let mut worker_streams = Vec::new();
     for worker_id in [1u64, 2u64] {
         let reg = WorkerRegistration::new(
             WorkerId(worker_id),
@@ -45,7 +68,7 @@ async fn drain_converges_under_buggify_seed() {
             format!("127.0.0.1:{}", 7000 + worker_id),
             CapacityHeadroom::FULL,
         );
-        send(handle.addr, &WorkerMessage::Register(reg)).await;
+        worker_streams.push(register(handle.addr, reg).await);
     }
     manager.acquire(ShardId(77), WorkerId(1)).unwrap();
     if buggify!("worker_drain.delay", 1.0) {
@@ -62,6 +85,7 @@ async fn drain_converges_under_buggify_seed() {
 
     assert!(catalog.get(WorkerId(1)).is_some());
     assert_eq!(manager.get(ShardId(77)).unwrap().worker_id, WorkerId(2));
+    drop(worker_streams);
     handle.shutdown();
     buggify_disable();
 }
