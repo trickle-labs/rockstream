@@ -407,9 +407,9 @@ async fn test_orm_conformance() {
 
     // Determine host IP address reachable from container
     fn get_host_ip() -> String {
-        if let Some(socket) = std::net::UdpSocket::bind("0.0.0.0:0").ok() {
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
             if socket.connect("8.8.8.8:80").is_ok() {
-                if let Some(addr) = socket.local_addr().ok() {
+                if let Ok(addr) = socket.local_addr() {
                     let ip = addr.ip().to_string();
                     if ip != "127.0.0.1" && ip != "0.0.0.0" {
                         return ip;
@@ -424,6 +424,10 @@ async fn test_orm_conformance() {
     // 1. SQLAlchemy E2E Test
     let python_container = GenericImage::new("python", "3.11-slim")
         .with_cmd(["sleep", "3600"])
+        .with_host(
+            "host.docker.internal",
+            testcontainers::core::Host::HostGateway,
+        )
         .start()
         .await
         .expect("Failed to start Python container");
@@ -467,6 +471,10 @@ assert 'c_bool' in names",
     // 2. Prisma E2E Test
     let node_container = GenericImage::new("node", "20-slim")
         .with_cmd(["sleep", "3600"])
+        .with_host(
+            "host.docker.internal",
+            testcontainers::core::Host::HostGateway,
+        )
         .start()
         .await
         .expect("Failed to start Node container");
@@ -476,7 +484,7 @@ assert 'c_bool' in names",
         vec![
             "sh",
             "-c",
-            "mkdir -p /app && cd /app && npm init -y && npm install -q prisma @prisma/client",
+            "mkdir -p /app && cd /app && npm init -y && npm install -q prisma@6 @prisma/client@6",
         ],
         "npm install prisma",
     )
@@ -503,6 +511,10 @@ assert 'c_bool' in names",
     // 3. Hibernate / JDBC E2E Test
     let openjdk_container = GenericImage::new("eclipse-temurin", "17-jdk")
         .with_cmd(["sleep", "3600"])
+        .with_host(
+            "host.docker.internal",
+            testcontainers::core::Host::HostGateway,
+        )
         .start()
         .await
         .expect("Failed to start eclipse-temurin container");

@@ -30,7 +30,7 @@ impl ViewReader for NoopViewReader {
 
 async fn start_gateway_noop() -> (u16, tokio::task::JoinHandle<()>) {
     let catalog = Arc::new(CatalogStubs::new());
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     let server = GatewayServer::with_catalog(addr, catalog, Arc::new(NoopViewReader));
     let (local_addr, handle) = server.serve_background().await.unwrap();
     (local_addr.port(), handle)
@@ -299,6 +299,10 @@ print('OK')\n\
 
     let container = GenericImage::new("python", "3.11-slim")
         .with_cmd(["bash", "-c", &script])
+        .with_host(
+            "host.docker.internal",
+            testcontainers::core::Host::HostGateway,
+        )
         .start()
         .await
         .expect("psycopg3 container start");

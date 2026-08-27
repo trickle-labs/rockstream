@@ -1563,6 +1563,30 @@ impl CatalogStubs {
         let q = query.trim();
         let ql = q.to_lowercase();
 
+        // Prisma's PostgreSQL probe combines schema existence, server version,
+        // and the numeric version setting in one extended query.
+        if ql.contains("select exists(")
+            && ql.contains("from pg_namespace")
+            && ql.contains("version()")
+            && ql.contains("current_setting")
+        {
+            return Some(CatalogResponse::rows(
+                vec![
+                    "exists".to_string(),
+                    "version".to_string(),
+                    "numeric_version".to_string(),
+                ],
+                vec![vec![
+                    Some("t".to_string()),
+                    Some(
+                        "PostgreSQL 14.9 (RockStream) on x86_64-unknown-linux-gnu, compiled by rustc, 64-bit"
+                            .to_string(),
+                    ),
+                    Some("140000".to_string()),
+                ]],
+            ));
+        }
+
         // SHOW commands
         if ql.contains("server_version") {
             return Some(CatalogResponse::rows(
@@ -1608,26 +1632,29 @@ impl CatalogStubs {
         if ql.contains("pg_attribute") {
             return Some(self.pg_attribute(&requested_cols));
         }
-        if ql.contains("pg_type") {
-            return Some(self.pg_type(&requested_cols));
-        }
-        if ql.contains("pg_class") {
-            return Some(self.pg_class(&requested_cols));
-        }
-        if ql.contains("pg_proc") {
-            return Some(self.pg_proc(&requested_cols));
+        if ql.contains("pg_constraint") {
+            return Some(self.pg_constraint(&requested_cols));
         }
         if ql.contains("pg_index") {
             return Some(self.pg_index(&requested_cols));
-        }
-        if ql.contains("pg_constraint") {
-            return Some(self.pg_constraint(&requested_cols));
         }
         if ql.contains("pg_description") {
             return Some(self.pg_description(&requested_cols));
         }
         if ql.contains("pg_enum") {
             return Some(self.pg_enum(&requested_cols));
+        }
+        if ql.contains("pg_views") {
+            return Some(self.pg_views(&requested_cols));
+        }
+        if ql.contains("pg_proc") {
+            return Some(self.pg_proc(&requested_cols));
+        }
+        if ql.contains("pg_type") {
+            return Some(self.pg_type(&requested_cols));
+        }
+        if ql.contains("pg_class") {
+            return Some(self.pg_class(&requested_cols));
         }
         if ql.contains("pg_roles") {
             return Some(self.pg_roles(&session_info.principal_name, &requested_cols));
@@ -1640,9 +1667,6 @@ impl CatalogStubs {
         }
         if ql.contains("pg_tables") {
             return Some(self.pg_tables(&requested_cols));
-        }
-        if ql.contains("pg_views") {
-            return Some(self.pg_views(&requested_cols));
         }
 
         // information_schema
@@ -2495,11 +2519,17 @@ impl CatalogStubs {
                 let val = match c.as_str() {
                     "oid" => Some(oid.to_string()),
                     "relname" => Some(name.clone()),
+                    "table_name" => Some(name.clone()),
                     "relnamespace" => Some("2200".to_string()),
+                    "namespace" => Some("public".to_string()),
                     "relkind" => Some(kind.to_string()),
                     "relhasrules" => Some("f".to_string()),
                     "relhastriggers" => Some("f".to_string()),
                     "relispartition" => Some("f".to_string()),
+                    "is_partition" | "has_subclass" | "has_row_level_security" => {
+                        Some("f".to_string())
+                    }
+                    "reloptions" | "description" => None,
                     _ => {
                         if c.contains("id") {
                             Some("0".to_string())
@@ -2625,6 +2655,7 @@ impl CatalogStubs {
             let val = match c.as_str() {
                 "oid" => Some("2200".to_string()),
                 "nspname" => Some("public".to_string()),
+                "namespace_name" => Some("public".to_string()),
                 _ => Some("".to_string()),
             };
             row.push(val);

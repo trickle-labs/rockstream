@@ -104,7 +104,7 @@ async fn spawn_ref_gateway() -> (u16, String) {
         .insert(create_role_entry("alice", "pencil"))
         .expect("insert alice");
 
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     let server =
         GatewayServer::with_scram_auth(addr, catalog, Arc::new(NoopViewReader), role_catalog);
 
@@ -187,6 +187,10 @@ async fn test_prisma_reference_app() {
     // Use a running node:20-alpine container with the app files copied in.
     let container = GenericImage::new("node", "20-alpine")
         .with_cmd(["sleep", "3600"])
+        .with_host(
+            "host.docker.internal",
+            testcontainers::core::Host::HostGateway,
+        )
         .start()
         .await
         .expect("node container start");
@@ -270,6 +274,10 @@ async fn test_sqlalchemy_reference_app() {
 
     let container = GenericImage::new("python", "3.12-slim")
         .with_cmd(["sleep", "3600"])
+        .with_host(
+            "host.docker.internal",
+            testcontainers::core::Host::HostGateway,
+        )
         .start()
         .await
         .expect("python container start");

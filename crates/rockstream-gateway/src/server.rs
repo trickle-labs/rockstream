@@ -12947,22 +12947,43 @@ fn sha256_16(data: &[u8]) -> [u8; 16] {
 }
 
 /// Convert a `CatalogResponse` to a pgwire `Response`.
+fn catalog_field_type(column: &str) -> Type {
+    match column {
+        "exists"
+        | "is_partition"
+        | "has_subclass"
+        | "has_row_level_security"
+        | "relhasrules"
+        | "relhastriggers"
+        | "relispartition"
+        | "indisunique"
+        | "indisprimary"
+        | "attnotnull" => Type::BOOL,
+        _ => Type::TEXT,
+    }
+}
+
 fn catalog_resp_to_response(resp: CatalogResponse) -> Response<'static> {
     match resp {
         CatalogResponse::CommandComplete(tag) => Response::Execution(Tag::new(&tag)),
         CatalogResponse::Rows { columns, rows } => {
             let fields: Vec<FieldInfo> = columns
                 .iter()
-                .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+                .map(|c| {
+                    let datatype = catalog_field_type(c);
+                    FieldInfo::new(c.clone(), None, None, datatype, FieldFormat::Text)
+                })
                 .collect();
             let schema = Arc::new(fields);
             let schema_ref = schema.clone();
             let stream = stream::iter(rows).map(move |row: Vec<Option<String>>| {
                 let mut encoder = DataRowEncoder::new(schema_ref.clone());
-                for field in &row {
-                    encoder
-                        .encode_field(&field.as_deref())
-                        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                for (index, field) in row.iter().enumerate() {
+                    let datatype = schema_ref
+                        .get(index)
+                        .map(|field| field.datatype())
+                        .unwrap_or(&Type::TEXT);
+                    encode_typed_field(&mut encoder, datatype, field.as_deref())?;
                 }
                 encoder.finish()
             });
@@ -15349,7 +15370,10 @@ fn describe_fields_for_query(catalog: &CatalogStubs, q: &str) -> Vec<FieldInfo> 
     {
         return columns
             .iter()
-            .map(|c| FieldInfo::new(c.clone(), None, None, Type::TEXT, FieldFormat::Text))
+            .map(|c| {
+                let datatype = catalog_field_type(c);
+                FieldInfo::new(c.clone(), None, None, datatype, FieldFormat::Text)
+            })
             .collect();
     }
     if let Some(view_name) = extract_view_name_from_select(q) {
