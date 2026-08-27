@@ -263,7 +263,7 @@ async fn test_search_path_unqualified_view() {
     let (local_addr, _handle) = server.serve_background().await.unwrap();
     let port = local_addr.port();
 
-    let (client, conn) = tokio_postgres::connect(
+    let (_client, conn) = tokio_postgres::connect(
         &format!(
             "host=127.0.0.1 port={port} user=alice password=pencil dbname=test sslmode=disable"
         ),
