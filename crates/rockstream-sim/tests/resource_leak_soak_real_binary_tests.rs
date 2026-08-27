@@ -469,7 +469,9 @@ async fn run_soak(inject_teardown_leak: bool, use_minio: bool) {
         .trim()
         .parse::<u32>()
         .unwrap();
-    let host_pid_is_visible = Path::new(&format!("/proc/{pid}/status")).is_file();
+    let host_pid_is_visible = Path::new(&format!("/proc/{pid}/status")).is_file()
+        && rockstream_sim::resource_leak_soak::count_open_fds(pid).is_ok()
+        && rockstream_sim::resource_leak_soak::count_open_sockets(pid).is_ok();
     let mut sampler = host_pid_is_visible
         .then(|| ProcessResourceSampler::new(pid, duration_secs, interval_secs).unwrap());
     let capacity = ResourceGateConfig::max_samples(duration_secs, interval_secs);
