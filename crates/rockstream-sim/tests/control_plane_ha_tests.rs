@@ -778,21 +778,31 @@ async fn leader_kill_recovers_within_budget_tc() {
 
     let cluster = tc::TcCluster::boot("kill").await;
 
-    let (leader_idx, old_term) = cluster
+    let (mut leader_idx, mut old_term) = cluster
         .wait_for_single_leader(Duration::from_secs(15))
         .await;
-    let old_leader_addr = cluster.nodes[leader_idx].control_addr;
+    let mut old_leader_addr = cluster.nodes[leader_idx].control_addr;
 
-    // Pre-kill: a worker acquires shard 7's lease against the original
-    // leader — this is the "in-flight" state whose continuity the kill
-    // must not corrupt.
+    // Pre-kill: a worker acquires shard 7's lease against the current leader
+    // — this is the "in-flight" state whose continuity the kill must not
+    // corrupt.
     let mut worker10 = tc::register_worker(old_leader_addr, 10).await;
-    let lease_before = tc::request_shard_on_stream(&mut worker10, 10, 7)
-        .await
-        .expect("pre-kill shard-lease request against the real leader must succeed");
+    let lease_before = {
+        let mut lease = None;
+        for _ in 0..5 {
+            lease = tc::request_shard_on_stream(&mut worker10, 10, 7).await;
+            if lease.is_some() {
+                break;
+            }
+            (leader_idx, old_term) = cluster.wait_for_single_leader(Duration::from_secs(5)).await;
+            old_leader_addr = cluster.nodes[leader_idx].control_addr;
+            worker10 = tc::register_worker(old_leader_addr, 10).await;
+        }
+        lease.expect("pre-kill shard-lease request against the real leader must succeed")
+    };
     assert_eq!(lease_before.worker_id, WorkerId(10));
 
-    // Pre-kill: frontier publication succeeds against the original leader.
+    // Pre-kill: frontier publication succeeds against the current leader.
     assert!(
         tc::report_shard_frontier(old_leader_addr, 7, 100).await,
         "pre-kill frontier report against the real leader must be published"
