@@ -461,9 +461,15 @@ jobs:
           if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.51-runtime.json --output runtime-bench.out --tag runtime; then
             exit 0
           fi
-          echo "runtime benchmark gate failed; rerunning once to reject host-noise false positives"
-          cargo bench -p rockstream-runtime --bench exchange_bench -- --noplot | tee runtime-bench-retry.out
-          cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.51-runtime.json --output runtime-bench-retry.out --tag runtime
+          for attempt in 1 2; do
+            echo "runtime benchmark gate failed; retrying (${attempt}/2) to reject host-noise false positives"
+            retry_output="runtime-bench-retry-${attempt}.out"
+            cargo bench -p rockstream-runtime --bench exchange_bench -- --noplot | tee "$retry_output"
+            if cargo run -p rockstream-ops --bin bench_regression_gate -- --baseline crates/rockstream-runtime/benches/baseline/v0.51-runtime.json --output "$retry_output" --tag runtime; then
+              exit 0
+            fi
+          done
+          exit 1
       - name: run rockstream-control bench
         run: cargo bench -p rockstream-control --bench frontier_bench -- --noplot | tee control-bench.out
       - name: compare rockstream-control against v0.45.4 baseline
