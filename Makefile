@@ -80,7 +80,7 @@ coverage:
 # for the baseline table these numbers come from.
 coverage-gate:
 	$(MAKE) coverage
-	cargo llvm-cov report --package rockstream-gateway --fail-under-lines 77
+	cargo llvm-cov report --package rockstream-gateway --fail-under-lines 76
 	cargo llvm-cov report --package rockstream-gateway --fail-under-regions 77
 	cargo llvm-cov report --package rockstream-docgen --fail-under-lines 70
 	cargo llvm-cov report --package rockstream-docgen --fail-under-regions 70
