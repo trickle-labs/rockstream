@@ -3365,6 +3365,37 @@ mod tests {
     }
 
     #[test]
+    fn barrier_flight_last_checkpoint_id_advances_only_on_completion() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_all();
+
+        set_barrier_injected_at(41, 4_000);
+        record_checkpoint_completed(41, 4_100);
+        assert_eq!(
+            read_barrier_flight_stats(),
+            BarrierFlightStats {
+                barrier_injected_at_ms: 4_000,
+                barrier_flight_time_ms: 0,
+                checkpoint_completion_time_ms: 100,
+                last_checkpoint_id: 41,
+                samples_count: 1,
+            }
+        );
+
+        set_barrier_injected_at(42, 5_000);
+        assert_eq!(
+            read_barrier_flight_stats(),
+            BarrierFlightStats {
+                barrier_injected_at_ms: 5_000,
+                barrier_flight_time_ms: 0,
+                checkpoint_completion_time_ms: 100,
+                last_checkpoint_id: 41,
+                samples_count: 1,
+            }
+        );
+    }
+
+    #[test]
     fn test_storage_pressure_signals_and_prometheus_export() {
         let _g = TEST_LOCK.lock().unwrap();
         reset_all();
