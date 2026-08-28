@@ -62,15 +62,15 @@ jobs:
         run: docker build -t rockstream-tc-test:latest .
       - name: Run Kafka/MinIO recovery SLO proof
         env:
-          ROCKSTREAM_CHAOS_ARTIFACT_DIR: target/real-cluster-chaos
+          ROCKSTREAM_CHAOS_ARTIFACT_DIR: ${{ github.workspace }}/target/real-cluster-chaos
         run: cargo test -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests real_cluster_chaos_soak_kafka_minio_absolute_slos_and_exact_oracle -- --exact
       - name: Upload real-cluster chaos artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: real-cluster-chaos-slo-summary
-          path: target/real-cluster-chaos/
+          path: ${{ github.workspace }}/target/real-cluster-chaos/
           if-no-files-found: error
       - name: Append chaos summary to job summary
         if: always()
-        run: cat target/real-cluster-chaos/real-cluster-chaos-summary.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat "${{ github.workspace }}/target/real-cluster-chaos/real-cluster-chaos-summary.md" >> "$GITHUB_STEP_SUMMARY"
