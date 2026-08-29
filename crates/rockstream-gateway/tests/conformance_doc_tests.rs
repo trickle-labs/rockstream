@@ -223,7 +223,7 @@ fn test_coverage_gates_reuse_complete_workspace_report() {
         "cargo llvm-cov --no-clean -p rockstream-gateway --features testcontainers",
         "cargo llvm-cov --no-clean -p rockstream-sim --features simulation",
         "cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests",
-        "cargo llvm-cov report --no-clean --lcov --output-path lcov.info",
+        "cargo llvm-cov report --lcov --output-path lcov.info",
     ] {
         assert!(
             makefile.contains(command),
