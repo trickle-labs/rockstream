@@ -70,7 +70,7 @@ coverage:
 	cargo llvm-cov --no-clean -p rockstream-sim --features simulation --lib --no-report -- --test-threads=1
 	cargo llvm-cov --no-clean -p rockstream-sim --features simulation --test az_aware_exchange_sim_tests --test control_plane_ha_tests --test control_sim --test frontier_publisher_election --test hot_key_detection_sim_tests --test lock_poisoning_sim_tests --test query_time_scatter_sim_tests --test recursive_cte_sim_tests --test shard_merge_sim_tests --test shard_migration_sim_tests --test shard_split_sim_tests --test shard_stats_checkpoint_sim_tests --test sim_aggregate_coordination_tests --test skew_control_loop_sim_tests --test worker_drain_sim_tests --no-report
 	cargo llvm-cov --no-clean -p rockstream-sim --features docker_tests --test real_cluster_chaos_soak_tests --test resource_leak_soak_real_binary_tests --no-report
-	cargo llvm-cov report --lcov --output-path lcov.info
+	cargo llvm-cov report --no-clean --lcov --output-path lcov.info
 	@echo "Coverage written to lcov.info"
 
 # Enforce coverage thresholds for every workspace crate from one complete
