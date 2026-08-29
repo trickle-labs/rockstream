@@ -76,7 +76,7 @@ printf '\nmutation\n' >> "$TMP_ROOT/docs/capability-matrix.md"
 run_bad "generated matrix drift"
 cp "$ROOT/docs/capability-matrix.md" "$TMP_ROOT/docs/capability-matrix.md"
 
-python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/NEW_ROADMAP.md"); s=p.read_text(); p.write_text(s.replace("| v0.59.3 |", "| v0.590 |", 1))'
+python3 -c 'from pathlib import Path; import re; root=Path("'"$TMP_ROOT"'"); version=re.search(r"^version = \"([^\"]+)\"$", (root/"capabilities.toml").read_text(), re.M).group(1); p=root/"NEW_ROADMAP.md"; s=p.read_text(); mutated=re.sub(rf"^\| {re.escape(version)} \|(?=.*✅ Done)", "| v0.590 |", s, count=1, flags=re.M); assert mutated != s; p.write_text(mutated)'
 run_bad "roadmap drift"
 cp "$ROOT/NEW_ROADMAP.md" "$TMP_ROOT/NEW_ROADMAP.md"
 
