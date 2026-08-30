@@ -220,7 +220,7 @@ pub mod noop {
                 Ok(())
             } else {
                 Err(format!(
-                    "incremental != batch\nincremental: {actual:?}\nbatch: {batch:?}"
+                    "RS-0001: incremental != batch\nincremental: {actual:?}\nbatch: {batch:?}"
                 ))
             }
         }
