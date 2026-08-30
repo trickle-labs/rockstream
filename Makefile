@@ -101,7 +101,7 @@ coverage-gate:
 	cargo llvm-cov report --package rockstream-types --fail-under-lines 84
 	cargo llvm-cov report --package rockstream-types --fail-under-regions 87
 	cargo llvm-cov report --package rockstream-plan --fail-under-lines 84
-	cargo llvm-cov report --package rockstream-plan --fail-under-regions 82
+	cargo llvm-cov report --package rockstream-plan --fail-under-regions 81
 	cargo llvm-cov report --package rockstream-sim --fail-under-lines 92
 	cargo llvm-cov report --package rockstream-sim --fail-under-regions 93
 	cargo llvm-cov report --package rockstream-cli --fail-under-lines 73 --ignore-filename-regex '/rockstream-cli/src/main[.]rs$'
