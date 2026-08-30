@@ -4,7 +4,7 @@
   "exchange_complex_dag_hot_path/wal_elided_quantum_coupled": 62103639.16992064,
   "exchange_deserialize_zset/deserialize": 39181.10077250259,
   "exchange_flow_control/acquire_ack_pair": 386.68643045906595,
-  "exchange_serialize_zset/serialize": 19488.669222047043,
+  "exchange_serialize_zset/serialize": 22541.859,
   "exchange_transport_claims/direct_lz4_codec_v1": 53355.56609357121,
   "exchange_transport_claims/direct_raw_baseline": 50899.46401137892,
   "exchange_transport_claims/durable_zstd_codec_v1": 98276.89098255888,
