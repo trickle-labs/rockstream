@@ -24,6 +24,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
+      - name: install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
       - name: install cargo-audit
         uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
