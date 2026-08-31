@@ -27,6 +27,7 @@ allow = [
     "CC0-1.0",     # tiny-keccak (const-random-macro via ahash)
     "bzip2-1.0.6", # libbz2-rs-sys (bzip2 compression codec)
 ]
+exceptions = [{ crate = "libfuzzer-sys@0.4.13", allow = ["NCSA"] }]
 
 [bans]
 multiple-versions = "warn"

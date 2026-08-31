@@ -44,23 +44,25 @@ fn role_all_creates_exactly_one_shard_directory() {
 
     let join = std::thread::spawn(move || run_start(&opts));
 
-    // Poll for the shared shard-0 directory to appear (created once the
-    // embedded worker's lease flow completes and the gateway opens it).
+    // Poll until the gateway has installed its signal handler and finished
+    // opening/flushing the shared shard.
     let shard0_dir = storage.join("shards").join("0");
+    let audit_path = storage.join("audit.jsonl");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !shard0_dir.exists() && std::time::Instant::now() < deadline {
+    while !std::fs::read_to_string(&audit_path)
+        .map(|contents| contents.contains("\"gateway.started\""))
+        .unwrap_or(false)
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        shard0_dir.exists(),
-        "expected {} to be created by `--role all`",
-        shard0_dir.display()
+        std::fs::read_to_string(&audit_path)
+            .map(|contents| contents.contains("\"gateway.started\""))
+            .unwrap_or(false),
+        "expected gateway startup event in {}",
+        audit_path.display()
     );
-
-    // Give the gateway a moment to finish binding/flushing before we
-    // request shutdown, and to prove the directory layout is stable (not a
-    // transient partial write).
-    std::thread::sleep(Duration::from_millis(200));
 
     let gateway_shard_dir = storage.join("gateway-shard");
     assert!(

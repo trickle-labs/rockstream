@@ -1439,6 +1439,7 @@ impl SourceConnector for PostgresCdcSource {
             ));
         }
         let allowance = credits_available.min(POSTGRES_CDC_MAX_IN_FLIGHT_RECORDS);
+        let mut records = 0;
         let mut changes = Vec::new();
         while !self.queued.is_empty() {
             let transaction_len = self
@@ -1453,9 +1454,7 @@ impl SourceConnector for PostgresCdcSource {
                 .take(transaction_len)
                 .map(|queued| queued.bytes)
                 .sum::<usize>();
-            if transaction_len > allowance
-                || changes.len().saturating_add(transaction_len) > allowance
-                || transaction_bytes > max_bytes
+            if transaction_len > allowance.saturating_sub(records) || transaction_bytes > max_bytes
             {
                 if changes.is_empty() {
                     return Err(SourceError::PollDeltaFailed {
@@ -1473,6 +1472,7 @@ impl SourceConnector for PostgresCdcSource {
                     changes.push(queued.change);
                 }
             }
+            records += transaction_len;
         }
         if changes.is_empty() {
             return Ok(PollDeltaResult {

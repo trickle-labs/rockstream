@@ -52,6 +52,73 @@ async fn pgoutput_begin_commit_envelope_has_exact_xid_lsn_and_rows() {
     );
 }
 
+#[tokio::test]
+async fn cdc_poll_credits_count_filtered_records_exactly() {
+    let mut source = PostgresCdcSource::new(
+        ConnectorId(525),
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        CdcWireFormat::PgOutput,
+    );
+    let change = |lsn: u64, value: i64| CdcChange {
+        lsn: PgLsn(lsn),
+        table_id: 7,
+        primary_key: value.to_string().into_bytes(),
+        row_id: CdcChange::row_id_for(7, value.to_string().as_bytes()),
+        operation: CdcOperation::Insert,
+        old_values: None,
+        new_values: Some(vec![value]),
+    };
+    for (xid, lsn, value) in [(55, 0x10, 1), (56, 0x20, 2)] {
+        source
+            .enqueue_envelope(
+                CdcTransactionEnvelope {
+                    xid,
+                    end_lsn: PgLsn(lsn),
+                    changes: vec![change(lsn, value)],
+                },
+                16,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        source
+            .poll_delta(PgLsn(0x10).to_offset_token(), 1024, 1, None)
+            .await
+            .unwrap_err(),
+        SourceError::PollDeltaFailed {
+            reason: "[RS-4014] pgoutput transaction exceeds poll credits or byte budget; replication remains paused. Next steps: raise the source epoch budget".to_string(),
+        }
+    );
+    assert_eq!(
+        source.queued_changes().cloned().collect::<Vec<_>>(),
+        vec![change(0x20, 2)]
+    );
+    assert_eq!(
+        (source.buffered_records(), source.buffered_bytes()),
+        (1, 16)
+    );
+
+    let delta = source
+        .poll_delta(PgLsn(0x10).to_offset_token(), 1024, 1, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (delta.new_offset, delta.watermark),
+        (PgLsn(0x20).to_offset_token(), Some(0x20))
+    );
+    assert_eq!(
+        delta.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[2]
+    );
+    assert_eq!((source.buffered_records(), source.buffered_bytes()), (0, 0));
+}
+
 #[test]
 fn cdc_tx_transaction_buffer_full_returns_coded_backpressure() {
     let mut source = PostgresCdcSource::new(

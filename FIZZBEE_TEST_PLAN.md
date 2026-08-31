@@ -660,6 +660,12 @@ interesting state trivially satisfies every `always`), each spec includes
   in-flight write (both the plain and shard-fence write families) is rejected
   (see §3.8 above).
 
+Postgres CDC polling consumes one credit for every queued change in a complete
+transaction, including changes at or before the caller's offset that are
+filtered from the returned batch. The exact boundary is covered by
+`cdc_poll_credits_count_filtered_records_exactly` in
+`crates/rockstream-connectors/tests/cdc_transaction_atomicity_tests.rs`.
+
 A failing `exists` assertion means the fault is not being explored and the
 corresponding `always` proofs are untrustworthy — treated as a build failure.
 
