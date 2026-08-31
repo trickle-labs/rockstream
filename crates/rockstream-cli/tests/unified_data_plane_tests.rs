@@ -33,24 +33,28 @@ fn role_all_creates_exactly_one_shard_directory() {
         .spawn()
         .expect("failed to start rockstream child");
 
-    // Poll until the gateway has installed its signal handler and finished
-    // opening/flushing the shared shard.
+    // Wait until the gateway has flushed, bound, and installed its signal
+    // handler before inspecting storage or sending SIGTERM.
     let shard0_dir = storage.join("shards").join("0");
+    let manifest_dir = shard0_dir.join("db").join("manifest");
     let audit_path = storage.join("audit.jsonl");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !std::fs::read_to_string(&audit_path)
-        .map(|contents| contents.contains("\"gateway.started\""))
-        .unwrap_or(false)
-        && std::time::Instant::now() < deadline
+    while std::fs::read_to_string(&audit_path).map_or(true, |audit| {
+        !audit.contains("\"action\":\"gateway.started\"")
+    }) && std::time::Instant::now() < deadline
     {
         std::thread::sleep(Duration::from_millis(50));
     }
+    let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
     assert!(
-        std::fs::read_to_string(&audit_path)
-            .map(|contents| contents.contains("\"gateway.started\""))
-            .unwrap_or(false),
-        "expected gateway startup event in {}",
+        audit.contains("\"action\":\"gateway.started\""),
+        "expected gateway.started in {}, found {audit:?}",
         audit_path.display()
+    );
+    assert!(
+        std::fs::read_dir(&manifest_dir).is_ok_and(|mut entries| entries.next().is_some()),
+        "expected {} to contain a SlateDB manifest",
+        manifest_dir.display()
     );
 
     let gateway_shard_dir = storage.join("gateway-shard");
@@ -65,23 +69,7 @@ fn role_all_creates_exactly_one_shard_directory() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(
-        entries.len(),
-        1,
-        "expected exactly one shard directory under {}, found {:?}",
-        shards_dir.display(),
-        entries
-    );
-    assert_eq!(entries[0].to_string_lossy(), "0");
-
-    // The shard directory must contain a valid (non-empty) manifest —
-    // ShardDb::flush()/GatewayServer bind wrote at least one object.
-    let has_files = std::fs::read_dir(&shard0_dir).unwrap().next().is_some();
-    assert!(
-        has_files,
-        "expected {} to contain manifest/data files, found none",
-        shard0_dir.display()
-    );
+    assert_eq!(entries, [std::ffi::OsString::from("0")]);
 
     // Trigger the same shutdown path an operator's SIGTERM would.
     let pid = child.id().to_string();
