@@ -33,6 +33,14 @@ if [ -z "$changed_files" ]; then
     exit 0
 fi
 
+# Benchmark baselines calibrate measurements; they do not change coordination.
+changed_files=$(echo "$changed_files" | grep -Ev '^crates/rockstream-runtime/benches/baseline/' || true)
+
+if [ -z "$changed_files" ]; then
+    echo "check-path-coupling: only benchmark baselines changed — OK."
+    exit 0
+fi
+
 # Coordination crates and design doc — changes here require a model touch.
 COORDINATION_PATTERNS=(
     "crates/rockstream-runtime/"

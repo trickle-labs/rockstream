@@ -287,7 +287,7 @@ async fn kafka_source_backfill_and_live_updates_reach_pgwire() {
         Arc::new(NoopViewReader),
         shard_db,
     );
-    let (restarted_address, _restarted_handle) = restarted.serve_background().await.unwrap();
+    let (restarted_address, restarted_handle) = restarted.serve_background().await.unwrap();
     let (restarted_client, restarted_connection) = tokio_postgres::connect(
         &format!(
             "host=127.0.0.1 port={} user=test dbname=test",
@@ -366,6 +366,9 @@ async fn kafka_source_backfill_and_live_updates_reach_pgwire() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(post_restart_live, vec![("a".to_string(), "42".to_string())]);
+    drop(restarted_client);
+    restarted_handle.abort();
+    tokio::time::sleep(Duration::from_millis(150)).await;
 }
 
 #[tokio::test]

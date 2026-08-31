@@ -177,6 +177,23 @@ def check_promises(root: Path, promise: object, errors: list[str]) -> None:
             fail(errors, f"{relative} does not contain the exact product promise once")
 
 
+def check_roadmap(root: Path, contract: dict, errors: list[str]) -> None:
+    version = contract.get("version")
+    roadmap = contract.get("roadmap")
+    if not isinstance(version, str) or not version:
+        return
+    if not isinstance(roadmap, str) or not roadmap:
+        fail(errors, "contract.roadmap must name the roadmap file")
+        return
+    try:
+        text = (root / roadmap).read_text(encoding="utf-8")
+    except OSError as error:
+        fail(errors, f"cannot read {roadmap}: {error}")
+        return
+    if not re.search(rf"^\| {re.escape(version)} \|.*✅ Done", text, re.MULTILINE):
+        fail(errors, f"roadmap does not mark contract version {version} as Done")
+
+
 def check_generated_matrix(root: Path, errors: list[str]) -> None:
     generator = root / "scripts/generate-capability-matrix.py"
     matrix = root / "docs/capability-matrix.md"
@@ -330,6 +347,7 @@ def main() -> int:
             fail(errors, "capabilities.toml contract.version must be v0.57, v0.57.1, v0.59.1, v0.59.3, v0.59.4, v0.59.6 or v0.59.7")
 
         check_promises(root, contract.get("promise"), errors)
+        check_roadmap(root, contract, errors)
     check_external_surface(capabilities, errors)
     check_proof_levels(capabilities, errors)
     check_documented_tiers(root, capabilities, errors)
