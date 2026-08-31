@@ -6,6 +6,6 @@
   "filter_delta_cost/filter_update/0.1pct": 3434.909,
   "filter_delta_cost/filter_update/10pct": 167384.030,
   "filter_delta_cost/filter_update/1pct": 18033.058,
-  "filter_performance/filter_in_memory/10000": 67848.215,
+  "filter_performance/filter_in_memory/10000": 74926.126,
   "join_performance/join_in_memory/10000": 575126795.560
 }
