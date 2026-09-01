@@ -637,6 +637,8 @@ header comments and in `formal/findings.md`.
 The v0.59.9 physical-commit-group extension is modeled by M1-S8 in
 `formal/m1_epoch_commit.fizz`: logical epochs may stage independently, but the
 published physical frontier advances only after a complete group is durable.
+The v0.59.18 lifecycle, client, documentation & backend test closure (TST-007)
+validates real backend restart/recovery against the verified M1-M7 state machine.
 
 To guard against vacuously-passing models (a model that never reaches the
 interesting state trivially satisfies every `always`), each spec includes
