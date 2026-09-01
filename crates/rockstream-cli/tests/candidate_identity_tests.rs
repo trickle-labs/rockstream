@@ -107,7 +107,10 @@ fn test_dockerfile_image_labels_match_identity() {
         .expect("Dockerfile must exist");
 
     assert!(
-        dockerfile.contains("org.opencontainers.image.version=\"0.59.7\""),
+        dockerfile.contains(&format!(
+            "org.opencontainers.image.version=\"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )),
         "Dockerfile must declare OCI version label matching candidate identity"
     );
     assert!(
@@ -131,8 +134,9 @@ fn test_manifest_docs_conformance() {
         .or_else(|_| std::fs::read_to_string("capabilities.toml"))
         .expect("capabilities.toml must exist");
 
+    let expected = format!("version = \"v{}\"", env!("CARGO_PKG_VERSION"));
     assert!(
-        cap_toml.contains("version = \"v0.59.7\""),
-        "capabilities.toml contract version must be v0.59.7"
+        cap_toml.contains(&expected),
+        "capabilities.toml contract version must be {expected}"
     );
 }

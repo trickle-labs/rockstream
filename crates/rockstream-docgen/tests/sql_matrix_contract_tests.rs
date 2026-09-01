@@ -6,7 +6,7 @@ use rockstream_docgen::sql_matrix::SqlMatrixDocument;
 fn test_sql_matrix_toml_parsing_and_validity() {
     let doc =
         SqlMatrixDocument::load_canonical().expect("contracts/sql-type-matrix.toml must parse");
-    assert_eq!(doc.contract.version, "0.59.19");
+    assert_eq!(doc.contract.version, "0.59.20");
     assert_eq!(doc.contract.roadmap, "DOC-001");
     assert!(!doc.types.is_empty(), "Must contain SQL types");
 }

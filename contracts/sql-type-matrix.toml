@@ -1,5 +1,5 @@
 [contract]
-version = "0.59.19"
+version = "0.59.20"
 roadmap = "DOC-001"
 description = "Authoritative SQL Type Compatibility and Operation Contract Matrix"
 

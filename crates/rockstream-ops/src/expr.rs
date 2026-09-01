@@ -82,17 +82,54 @@ pub fn eval_i64(expr: &Expr, batch: &RecordBatch) -> Result<Vec<i64>, OpError> {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                 let l = eval_i64(left, batch)?;
                 let r = eval_i64(right, batch)?;
-                Ok(l.into_iter()
-                    .zip(r)
-                    .map(|(a, b)| match op {
-                        BinaryOp::Add => a.saturating_add(b),
-                        BinaryOp::Sub => a.saturating_sub(b),
-                        BinaryOp::Mul => a.saturating_mul(b),
-                        BinaryOp::Div if b != 0 => a / b,
-                        BinaryOp::Mod if b != 0 => a % b,
+                let mut res = Vec::with_capacity(l.len());
+                for (a, b) in l.into_iter().zip(r) {
+                    let v = match op {
+                        BinaryOp::Add => a.checked_add(b).ok_or_else(|| {
+                            OpError::numeric_overflow(format!(
+                                "BIGINT addition overflow: {} + {}",
+                                a, b
+                            ))
+                        })?,
+                        BinaryOp::Sub => a.checked_sub(b).ok_or_else(|| {
+                            OpError::numeric_overflow(format!(
+                                "BIGINT subtraction overflow: {} - {}",
+                                a, b
+                            ))
+                        })?,
+                        BinaryOp::Mul => a.checked_mul(b).ok_or_else(|| {
+                            OpError::numeric_overflow(format!(
+                                "BIGINT multiplication overflow: {} * {}",
+                                a, b
+                            ))
+                        })?,
+                        BinaryOp::Div => {
+                            if b == 0 {
+                                return Err(OpError::numeric_overflow("division by zero"));
+                            }
+                            a.checked_div(b).ok_or_else(|| {
+                                OpError::numeric_overflow(format!(
+                                    "BIGINT division overflow: {} / {}",
+                                    a, b
+                                ))
+                            })?
+                        }
+                        BinaryOp::Mod => {
+                            if b == 0 {
+                                return Err(OpError::numeric_overflow("division by zero"));
+                            }
+                            a.checked_rem(b).ok_or_else(|| {
+                                OpError::numeric_overflow(format!(
+                                    "BIGINT modulo overflow: {} % {}",
+                                    a, b
+                                ))
+                            })?
+                        }
                         _ => 0,
-                    })
-                    .collect())
+                    };
+                    res.push(v);
+                }
+                Ok(res)
             }
             BinaryOp::Gt
             | BinaryOp::Lt
@@ -1317,6 +1354,68 @@ fn eval_scalar_udf(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Arr
             }
         }
 
+        "is_null" => {
+            let arr = eval_to_array(arg(args, 0)?, batch)?;
+            let num_rows = batch.num_rows();
+            let mut builder = BooleanBuilder::with_capacity(num_rows);
+            for r in 0..num_rows {
+                builder.append_value(arr.is_null(r));
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+
+        "is_not_null" => {
+            let arr = eval_to_array(arg(args, 0)?, batch)?;
+            let num_rows = batch.num_rows();
+            let mut builder = BooleanBuilder::with_capacity(num_rows);
+            for r in 0..num_rows {
+                builder.append_value(!arr.is_null(r));
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+
+        "is_distinct_from" => {
+            let a_arr = eval_to_array(arg(args, 0)?, batch)?;
+            let b_arr = eval_to_array(arg(args, 1)?, batch)?;
+            let num_rows = batch.num_rows();
+            let mut builder = BooleanBuilder::with_capacity(num_rows);
+            for r in 0..num_rows {
+                let a_null = a_arr.is_null(r);
+                let b_null = b_arr.is_null(r);
+                if a_null && b_null {
+                    builder.append_value(false);
+                } else if a_null != b_null {
+                    builder.append_value(true);
+                } else {
+                    let as_str = extract_string_any(&a_arr, r)?;
+                    let bs_str = extract_string_any(&b_arr, r)?;
+                    builder.append_value(as_str != bs_str);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+
+        "is_not_distinct_from" => {
+            let a_arr = eval_to_array(arg(args, 0)?, batch)?;
+            let b_arr = eval_to_array(arg(args, 1)?, batch)?;
+            let num_rows = batch.num_rows();
+            let mut builder = BooleanBuilder::with_capacity(num_rows);
+            for r in 0..num_rows {
+                let a_null = a_arr.is_null(r);
+                let b_null = b_arr.is_null(r);
+                if a_null && b_null {
+                    builder.append_value(true);
+                } else if a_null != b_null {
+                    builder.append_value(false);
+                } else {
+                    let as_str = extract_string_any(&a_arr, r)?;
+                    let bs_str = extract_string_any(&b_arr, r)?;
+                    builder.append_value(as_str == bs_str);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+
         "date_trunc" => {
             let unit_arr = eval_to_array(arg(args, 0)?, batch)?;
             let ts_arr = eval_to_array(arg(args, 1)?, batch)?;
@@ -1712,6 +1811,28 @@ fn eval_cmp_arrays(l: &ArrayRef, r: &ArrayRef, op: BinaryOp) -> Result<Vec<bool>
             })
             .collect());
     }
+    if let (Some(li), Some(ri)) = (
+        l.as_any().downcast_ref::<Int32Array>(),
+        r.as_any().downcast_ref::<Int32Array>(),
+    ) {
+        return Ok((0..num_rows)
+            .map(|i| {
+                if li.is_null(i) || ri.is_null(i) {
+                    false
+                } else {
+                    let lv = li.value(i);
+                    let rv = ri.value(i);
+                    match op {
+                        BinaryOp::Gt => lv > rv,
+                        BinaryOp::Lt => lv < rv,
+                        BinaryOp::Ge => lv >= rv,
+                        BinaryOp::Le => lv <= rv,
+                        _ => false,
+                    }
+                }
+            })
+            .collect());
+    }
     if let (Some(lf), Some(rf)) = (
         l.as_any().downcast_ref::<Float64Array>(),
         r.as_any().downcast_ref::<Float64Array>(),
@@ -1756,6 +1877,50 @@ fn eval_cmp_arrays(l: &ArrayRef, r: &ArrayRef, op: BinaryOp) -> Result<Vec<bool>
             })
             .collect());
     }
+    if let (Some(ld), Some(rd)) = (
+        l.as_any().downcast_ref::<Date32Array>(),
+        r.as_any().downcast_ref::<Date32Array>(),
+    ) {
+        return Ok((0..num_rows)
+            .map(|i| {
+                if ld.is_null(i) || rd.is_null(i) {
+                    false
+                } else {
+                    let lv = ld.value(i);
+                    let rv = rd.value(i);
+                    match op {
+                        BinaryOp::Gt => lv > rv,
+                        BinaryOp::Lt => lv < rv,
+                        BinaryOp::Ge => lv >= rv,
+                        BinaryOp::Le => lv <= rv,
+                        _ => false,
+                    }
+                }
+            })
+            .collect());
+    }
+    if let (Some(lt), Some(rt)) = (
+        l.as_any().downcast_ref::<TimestampMicrosecondArray>(),
+        r.as_any().downcast_ref::<TimestampMicrosecondArray>(),
+    ) {
+        return Ok((0..num_rows)
+            .map(|i| {
+                if lt.is_null(i) || rt.is_null(i) {
+                    false
+                } else {
+                    let lv = lt.value(i);
+                    let rv = rt.value(i);
+                    match op {
+                        BinaryOp::Gt => lv > rv,
+                        BinaryOp::Lt => lv < rv,
+                        BinaryOp::Ge => lv >= rv,
+                        BinaryOp::Le => lv <= rv,
+                        _ => false,
+                    }
+                }
+            })
+            .collect());
+    }
     Err(OpError::expr_type_mismatch(format!(
         "Comparison between unsupported or mismatched Arrow types: {:?} vs {:?}",
         l.data_type(),
@@ -1768,6 +1933,20 @@ fn eval_eq_ne_arrays(l: &ArrayRef, r: &ArrayRef, negate: bool) -> Result<Vec<boo
     if let (Some(li), Some(ri)) = (
         l.as_any().downcast_ref::<Int64Array>(),
         r.as_any().downcast_ref::<Int64Array>(),
+    ) {
+        return Ok((0..num_rows)
+            .map(|i| {
+                if li.is_null(i) || ri.is_null(i) {
+                    false
+                } else {
+                    (li.value(i) == ri.value(i)) != negate
+                }
+            })
+            .collect());
+    }
+    if let (Some(li), Some(ri)) = (
+        l.as_any().downcast_ref::<Int32Array>(),
+        r.as_any().downcast_ref::<Int32Array>(),
     ) {
         return Ok((0..num_rows)
             .map(|i| {
@@ -1803,6 +1982,48 @@ fn eval_eq_ne_arrays(l: &ArrayRef, r: &ArrayRef, negate: bool) -> Result<Vec<boo
                     false
                 } else {
                     (lf.value(i) == rf.value(i)) != negate
+                }
+            })
+            .collect());
+    }
+    if let (Some(lb), Some(rb)) = (
+        l.as_any().downcast_ref::<BooleanArray>(),
+        r.as_any().downcast_ref::<BooleanArray>(),
+    ) {
+        return Ok((0..num_rows)
+            .map(|i| {
+                if lb.is_null(i) || rb.is_null(i) {
+                    false
+                } else {
+                    (lb.value(i) == rb.value(i)) != negate
+                }
+            })
+            .collect());
+    }
+    if let (Some(ld), Some(rd)) = (
+        l.as_any().downcast_ref::<Date32Array>(),
+        r.as_any().downcast_ref::<Date32Array>(),
+    ) {
+        return Ok((0..num_rows)
+            .map(|i| {
+                if ld.is_null(i) || rd.is_null(i) {
+                    false
+                } else {
+                    (ld.value(i) == rd.value(i)) != negate
+                }
+            })
+            .collect());
+    }
+    if let (Some(lt), Some(rt)) = (
+        l.as_any().downcast_ref::<TimestampMicrosecondArray>(),
+        r.as_any().downcast_ref::<TimestampMicrosecondArray>(),
+    ) {
+        return Ok((0..num_rows)
+            .map(|i| {
+                if lt.is_null(i) || rt.is_null(i) {
+                    false
+                } else {
+                    (lt.value(i) == rt.value(i)) != negate
                 }
             })
             .collect());

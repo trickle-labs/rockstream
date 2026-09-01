@@ -40,8 +40,8 @@ fn every_core_capability_meets_min_proof_level() {
 
     assert_eq!(
         core_capabilities.len(),
-        11,
-        "expected exactly 11 Core capabilities, found {}",
+        15,
+        "expected exactly 15 Core capabilities, found {}",
         core_capabilities.len()
     );
 

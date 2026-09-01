@@ -13847,11 +13847,12 @@ fn backfill_not_published_response(view_name: &str) -> Vec<Response<'static>> {
 }
 
 fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response<'static>> {
+    use chrono::TimeZone;
     use datafusion::arrow::array::{
-        Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        StringArray,
+        Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, StringArray, TimestampMicrosecondArray,
     };
-    use datafusion::arrow::datatypes::DataType as ArrowDataType;
+    use datafusion::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 
     if batches.is_empty() {
         let schema = Arc::new(Vec::<FieldInfo>::new());
@@ -13880,6 +13881,11 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                 ArrowDataType::Float32 => Type::FLOAT4,
                 ArrowDataType::Float64 => Type::FLOAT8,
                 ArrowDataType::Boolean => Type::BOOL,
+                ArrowDataType::Date32 | ArrowDataType::Date64 => Type::DATE,
+                ArrowDataType::Timestamp(_, None) => Type::TIMESTAMP,
+                ArrowDataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ,
+                ArrowDataType::Decimal128(_, _) | ArrowDataType::Decimal256(_, _) => Type::NUMERIC,
+                ArrowDataType::FixedSizeBinary(16) => Type::UUID,
                 ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Type::TEXT,
                 _ => Type::TEXT,
             };
@@ -13931,7 +13937,52 @@ fn datafusion_batches_to_query_response(batches: &[RecordBatch]) -> Vec<Response
                             }
                         })
                     }
-                    ArrowDataType::Utf8 => col
+                    ArrowDataType::Date32 => col.as_any().downcast_ref::<Date32Array>().map(|a| {
+                        let days = a.value(row_idx);
+                        let epoch = chrono::DateTime::UNIX_EPOCH.date_naive();
+                        let date = epoch + chrono::Duration::days(days as i64);
+                        date.format("%Y-%m-%d").to_string()
+                    }),
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => col
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .map(|a| {
+                            let ts_micros = a.value(row_idx);
+                            let dt = chrono::Utc
+                                .timestamp_micros(ts_micros)
+                                .single()
+                                .unwrap_or_else(|| {
+                                    chrono::DateTime::from_timestamp(
+                                        ts_micros / 1_000_000,
+                                        ((ts_micros % 1_000_000).unsigned_abs() * 1000) as u32,
+                                    )
+                                    .unwrap_or_default()
+                                });
+                            dt.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string()
+                        }),
+                    ArrowDataType::FixedSizeBinary(16) => col
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::FixedSizeBinaryArray>()
+                        .map(|a| {
+                            let bytes = a.value(row_idx);
+                            if let Ok(u) = uuid::Uuid::from_slice(bytes) {
+                                u.to_string()
+                            } else {
+                                bytes
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<String>()
+                            }
+                        }),
+                    ArrowDataType::Decimal128(_precision, scale) => col
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::Decimal128Array>()
+                        .map(|a| {
+                            let val = a.value(row_idx);
+                            rust_decimal::Decimal::from_i128_with_scale(val, *scale as u32)
+                                .to_string()
+                        }),
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => col
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .map(|a| a.value(row_idx).to_string()),
@@ -14229,9 +14280,10 @@ fn merge_workload_snapshot(snapshot: &WorkloadSnapshot) -> Result<Vec<Vec<u8>>, 
 /// logic.)
 fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatch, String> {
     use datafusion::arrow::array::{
-        ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+        ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryBuilder, Float32Array,
+        Float64Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
     let n = rows.len();
     let num_cols = schema.fields().len();
@@ -14256,6 +14308,13 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
         .enumerate()
         .map(|(i, field)| {
             Ok(match field.data_type() {
+                DataType::Int16 => {
+                    let vals: Vec<Option<i16>> = col_strs[i]
+                        .iter()
+                        .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
+                        .collect();
+                    Arc::new(Int16Array::from(vals)) as ArrayRef
+                }
                 DataType::Int32 => {
                     let vals: Vec<Option<i32>> = col_strs[i]
                         .iter()
@@ -14269,6 +14328,13 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
                         .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
                         .collect();
                     Arc::new(Int64Array::from(vals)) as ArrayRef
+                }
+                DataType::Float32 => {
+                    let vals: Vec<Option<f32>> = col_strs[i]
+                        .iter()
+                        .map(|s| s.as_deref().and_then(|v| v.parse().ok()))
+                        .collect();
+                    Arc::new(Float32Array::from(vals)) as ArrayRef
                 }
                 DataType::Float64 => {
                     let vals: Vec<Option<f64>> = col_strs[i]
@@ -14301,6 +14367,60 @@ fn tsv_to_record_batch(schema: SchemaRef, rows: &[Vec<u8>]) -> Result<RecordBatc
                         })
                         .collect();
                     Arc::new(BooleanArray::from(vals)) as ArrayRef
+                }
+                DataType::Date32 => {
+                    let vals: Vec<Option<i32>> = col_strs[i]
+                        .iter()
+                        .map(|s| {
+                            let s = s.as_deref()?;
+                            if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                                let epoch = chrono::DateTime::UNIX_EPOCH.date_naive();
+                                Some((d - epoch).num_days() as i32)
+                            } else {
+                                s.parse().ok()
+                            }
+                        })
+                        .collect();
+                    Arc::new(Date32Array::from(vals)) as ArrayRef
+                }
+                DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                    let vals: Vec<Option<i64>> = col_strs[i]
+                        .iter()
+                        .map(|s| {
+                            let s = s.as_deref()?;
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                                Some(dt.timestamp_micros())
+                            } else if let Ok(dt) =
+                                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                            {
+                                Some(dt.and_utc().timestamp_micros())
+                            } else if let Ok(dt) =
+                                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                            {
+                                Some(dt.and_utc().timestamp_micros())
+                            } else {
+                                s.parse().ok()
+                            }
+                        })
+                        .collect();
+                    Arc::new(TimestampMicrosecondArray::from(vals)) as ArrayRef
+                }
+                DataType::FixedSizeBinary(16) => {
+                    let mut builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
+                    for opt_s in &col_strs[i] {
+                        if let Some(s) = opt_s {
+                            if let Ok(u) = uuid::Uuid::parse_str(s) {
+                                builder
+                                    .append_value(u.as_bytes())
+                                    .map_err(|e| e.to_string())?;
+                            } else {
+                                builder.append_null();
+                            }
+                        } else {
+                            builder.append_null();
+                        }
+                    }
+                    Arc::new(builder.finish()) as ArrayRef
                 }
                 _ => {
                     let vals: Vec<Option<String>> = col_strs[i]
@@ -17197,7 +17317,21 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
             let part = part.trim();
             let mut tokens = part.split_whitespace();
             let col_name = tokens.next()?.to_lowercase();
-            let pg_type = tokens.next()?.to_uppercase();
+            let mut pg_type = tokens.next()?.to_uppercase();
+            // If pg_type starts with '(' but doesn't end with ')', consume tokens until ')'
+            if (pg_type.starts_with("DECIMAL(")
+                || pg_type.starts_with("NUMERIC(")
+                || pg_type.starts_with("VARCHAR("))
+                && !pg_type.ends_with(')')
+            {
+                for next_tok in tokens.by_ref() {
+                    pg_type.push(' ');
+                    pg_type.push_str(&next_tok.to_uppercase());
+                    if next_tok.ends_with(')') {
+                        break;
+                    }
+                }
+            }
             // Normalize multi-word types (e.g. "DOUBLE PRECISION")
             let full_type = if pg_type == "DOUBLE" {
                 let next = tokens.next().map(|s| s.to_uppercase()).unwrap_or_default();
@@ -17209,9 +17343,10 @@ fn parse_create_table_columns(after_table_name: &str) -> ParsedCreateTableColumn
             } else {
                 pg_type
             };
-            let arrow_type = full_type
+            let compact_type = full_type.replace(' ', "");
+            let arrow_type = compact_type
                 .strip_prefix("NUMERIC")
-                .or_else(|| full_type.strip_prefix("DECIMAL"))
+                .or_else(|| compact_type.strip_prefix("DECIMAL"))
                 .filter(|suffix| suffix.starts_with('(') && suffix.ends_with(')'))
                 .map(|suffix| format!("Decimal{suffix}"))
                 .unwrap_or_else(|| {

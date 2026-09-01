@@ -79,6 +79,12 @@ pub enum OpError {
     )]
     AggregateOverflow { group_key: i64, code: ErrorCode },
 
+    /// Numeric computation overflow or division by zero (RS-1016).
+    #[error(
+        "[{code}] Numeric overflow: {detail}; next_steps: reduce value magnitudes or avoid division by zero"
+    )]
+    NumericOverflow { detail: String, code: ErrorCode },
+
     /// MIN/MAX multiset retraction underflow.
     #[error(
         "[{code}] MIN/MAX retraction underflow for group key {group_key}, value {value}: next_steps: ensure every retraction is matched by a prior insertion; check source event ordering"
@@ -290,6 +296,14 @@ impl OpError {
         use rockstream_types::error_code::RS_1016;
         Self::AggregateOverflow {
             group_key,
+            code: RS_1016,
+        }
+    }
+
+    pub fn numeric_overflow(detail: impl Into<String>) -> Self {
+        use rockstream_types::error_code::RS_1016;
+        Self::NumericOverflow {
+            detail: detail.into(),
             code: RS_1016,
         }
     }

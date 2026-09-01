@@ -1,8 +1,8 @@
 {
   "manifest_metadata": {
     "schema_version": "1.0.0",
-    "engine_version": "0.59.19",
-    "candidate_identity_digest": "ab1f0643daaeab105066e2aaecd0bef208d0284e44fd23d45c79d09126f3616f",
+    "engine_version": "0.59.20",
+    "candidate_identity_digest": "24601009ac23a39d40a6fc3ee1379c04d7662ffbc8e54ce5431bdeaa7194c9d1",
     "generator_version": "1.0.0",
     "generated_at": "2026-08-24T00:00:00Z"
   },
