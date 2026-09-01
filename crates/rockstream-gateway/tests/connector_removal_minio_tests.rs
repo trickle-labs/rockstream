@@ -84,6 +84,7 @@ fn store(port: u16, bucket: &str) -> Arc<dyn ObjectStore> {
 #[tokio::test]
 async fn v0522_removed_connector_catalog_loads_as_removed_exactly() {
     if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP v0522_removed_connector_catalog_loads_as_removed_exactly: Docker is not available locally");
         return;
     }
     use testcontainers::runners::AsyncRunner;

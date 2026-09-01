@@ -163,6 +163,7 @@ async fn create_bucket(port: u16, bucket: &str) {
 #[tokio::test]
 async fn compiled_join_state_persists_across_restart_minio() {
     if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP compiled_join_state_persists_across_restart_minio: Docker is not available locally");
         return;
     }
     use testcontainers::runners::AsyncRunner;
@@ -216,6 +217,7 @@ async fn compiled_join_state_persists_across_restart_minio() {
 #[tokio::test]
 async fn compiled_tumble_window_state_persists_across_restart_minio() {
     if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP compiled_tumble_window_state_persists_across_restart_minio: Docker is not available locally");
         return;
     }
     use testcontainers::runners::AsyncRunner;

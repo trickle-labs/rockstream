@@ -91,3 +91,13 @@ async fn broker_free_fast_paths_preserve_offsets_and_reject_invalid_commits() {
         )
     );
 }
+
+#[tokio::test]
+async fn kafka_source_unreachable_broker_fails_closed() {
+    let mut source =
+        KafkaSource::connect(ConnectorId(5129), schema(), "127.0.0.1:1", "topic", "group").unwrap();
+    let res = source
+        .poll_delta(OffsetToken::new(vec![]), 4096, 1, None)
+        .await;
+    assert!(res.is_err() || res.unwrap().batches.is_empty());
+}

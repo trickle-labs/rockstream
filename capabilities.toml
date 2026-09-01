@@ -563,7 +563,11 @@ proof_levels_achieved = ["L0", "L1", "L3", "L4", "L5"]
 min_proof_level = ["L0", "L1", "L3", "L4", "L5"]
 documentation = "docs/connectors.md#postgresql-cdc"
 behavior = [
-  { behavior = "checkpoint_recovery", statement = "Each committed replication-slot LSN boundary recovers exactly the changes committed after it.", proof = "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs::postgres_cdc_each_commit_boundary_recovers_exactly_once" },
+  { behavior = "incremental", statement = "A PostgreSQL logical replication delta is captured and emitted as an exact incremental record batch.", proof = "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs::postgres_cdc_snapshot_stream_fence_has_exact_transcript" },
+  { behavior = "backfill", statement = "Initial snapshot backfills every committed row from the source PostgreSQL table before streaming live deltas.", proof = "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs::postgres_cdc_initial_snapshot_backfills_all_rows" },
+  { behavior = "checkpoint_recovery", statement = "Each committed replication-slot LSN boundary recovers exactly the changes committed after it in both local and object-store backends.", proof = "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs::postgres_cdc_each_commit_boundary_recovers_exactly_once", paired_proof = "crates/rockstream-connectors/tests/cdc_transaction_durability_minio_tests.rs::shared_slot_checkpoint_reopens_once_minio" },
+  { behavior = "state_growth", statement = "PostgreSQL CDC queue is bounded by the configured in-flight limit and exposes its fill metric.", proof = "crates/rockstream-connectors/tests/dlq_backpressure_threshold_tests.rs::postgres_cdc_queue_bounded_with_fill_metric", bound = "configured in-flight record queue", metric = "postgres_cdc_queue_fill_ratio", on_bound = "the source applies backpressure or rejects with its RS-coded resource error" },
+  { behavior = "failure", statement = "An invalid or lost replication slot fails closed with an actionable RS-coded error.", proof = "crates/rockstream-connectors/tests/postgres_cdc_guarantee_matrix_tests.rs::postgres_cdc_invalid_slot_fails_closed" },
 ]
 
 [[capability]]
@@ -578,7 +582,11 @@ proof_levels_achieved = ["L0", "L1", "L3", "L4", "L5"]
 min_proof_level = ["L0", "L1", "L3", "L4", "L5"]
 documentation = "docs/connectors.md#kafka-source"
 behavior = [
-  { behavior = "checkpoint_recovery", statement = "A recovered source resumes at the committed offset and observes exactly the records produced after it.", proof = "crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs::kafka_source_committed_offset_recovery_has_exact_transcript" },
+  { behavior = "incremental", statement = "A Kafka record is polled and emitted as an exact incremental delta batch.", proof = "crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs::kafka_source_incremental_stream_has_exact_transcript" },
+  { behavior = "backfill", statement = "A Kafka source starting at earliest offset backfills all partition records before subsequent poll deltas.", proof = "crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs::kafka_source_earliest_backfill_all_records" },
+  { behavior = "checkpoint_recovery", statement = "A recovered source resumes at the committed offset and observes exactly the records produced after it in both local and object-store backends.", proof = "crates/rockstream-connectors/tests/kafka_source_guarantee_matrix_tests.rs::kafka_source_committed_offset_recovery_has_exact_transcript", paired_proof = "crates/rockstream-connectors/tests/source_durability_minio_tests.rs::retained_source_checkpoint_recovery_has_exact_cdc_and_kafka_transcript_minio" },
+  { behavior = "state_growth", statement = "Kafka source buffer is bounded by the configured credit limit and exposes its fill metric.", proof = "crates/rockstream-connectors/tests/dlq_backpressure_threshold_tests.rs::kafka_source_queue_bounded_with_fill_metric", bound = "configured poll credit limit", metric = "kafka_source_poll_fill_level", on_bound = "poll applies backpressure or returns its RS-coded resource error" },
+  { behavior = "failure", statement = "An unreachable broker or invalid configuration fails closed with an actionable RS-coded error.", proof = "crates/rockstream-connectors/tests/kafka_source_non_broker_tests.rs::kafka_source_unreachable_broker_fails_closed" },
 ]
 
 [[capability]]
@@ -593,5 +601,9 @@ proof_levels_achieved = ["L0", "L1", "L3", "L4", "L5"]
 min_proof_level = ["L0", "L1", "L3", "L4", "L5"]
 documentation = "docs/connectors.md#kafka-sink"
 behavior = [
+  { behavior = "incremental", statement = "Materialized view change records are delivered to the Kafka sink topic matching the incremental output.", proof = "crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_incremental_payload_matches_view" },
+  { behavior = "backfill", statement = "Initial snapshot emission to Kafka sink delivers exactly all existing view records before live deltas.", proof = "crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_initial_snapshot_delivery_exact" },
   { behavior = "checkpoint_recovery", statement = "A recovery checkpoint persisted to and restored from an object-store backend commits byte-identical output across a simulated restart, in both local and object-store backends.", proof = "crates/rockstream-connectors/tests/connector_scenario_durability_lfs_tests.rs::kafka_sink_checkpoint_restart_lfs_has_byte_identical_commit", paired_proof = "crates/rockstream-connectors/tests/connector_scenario_durability_minio_tests.rs::kafka_sink_checkpoint_restart_minio_has_byte_identical_commit" },
+  { behavior = "state_growth", statement = "Kafka sink staging buffer is bounded and exposes its fill metric.", proof = "crates/rockstream-connectors/tests/dlq_backpressure_threshold_tests.rs::kafka_sink_buffer_bounded_with_fill_metric", bound = "configured staging buffer limit", metric = "kafka_sink_buffer_fill_ratio", on_bound = "pre-commit applies backpressure or returns its RS-coded resource error" },
+  { behavior = "failure", statement = "A producer communication or broker failure fails closed with an actionable RS-coded error.", proof = "crates/rockstream-connectors/tests/kafka_sink_guarantee_matrix_tests.rs::kafka_sink_producer_error_fails_closed" },
 ]

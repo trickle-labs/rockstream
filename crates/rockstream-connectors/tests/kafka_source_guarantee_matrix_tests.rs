@@ -302,3 +302,49 @@ async fn kafka_source_sink_transaction_coupling_has_exact_transcript() {
     assert_eq!(values(&result), vec![(61, 1)]);
     assert_eq!(source.last_committed(), Some((1, result.new_offset)));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kafka_source_incremental_stream_has_exact_transcript() {
+    let fixture = common::connector_fixture("incremental_stream").await;
+    let (topic, producer) = topic(&fixture, "incremental_stream", 1).await;
+    produce(&producer, &topic, 0, 100).await;
+    produce(&producer, &topic, 0, 200).await;
+    let mut source = KafkaSource::connect(
+        ConnectorId(5_308),
+        schema(),
+        &fixture.kafka_bootstrap,
+        &topic,
+        "source-incremental-stream",
+    )
+    .unwrap();
+    let first = poll_until(&mut source, OffsetToken::new(vec![])).await;
+    let second = poll_until(&mut source, first.new_offset.clone()).await;
+    let mut transcript = values(&first);
+    transcript.extend(values(&second));
+    assert_eq!(transcript, vec![(100, 1), (200, 1)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kafka_source_earliest_backfill_all_records() {
+    let fixture = common::connector_fixture("earliest_backfill").await;
+    let (topic, producer) = topic(&fixture, "earliest_backfill", 1).await;
+    for v in [1, 2, 3] {
+        produce(&producer, &topic, 0, v).await;
+    }
+    let mut source = KafkaSource::connect(
+        ConnectorId(5_309),
+        schema(),
+        &fixture.kafka_bootstrap,
+        &topic,
+        "source-earliest-backfill",
+    )
+    .unwrap();
+    let mut transcript = Vec::new();
+    let mut after = OffsetToken::new(vec![]);
+    for _ in 0..3 {
+        let res = poll_until(&mut source, after).await;
+        transcript.extend(values(&res));
+        after = res.new_offset;
+    }
+    assert_eq!(transcript, vec![(1, 1), (2, 1), (3, 1)]);
+}

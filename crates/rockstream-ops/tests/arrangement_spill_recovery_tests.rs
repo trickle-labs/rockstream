@@ -42,6 +42,7 @@ async fn test_spill_recovery_lfs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_spill_recovery_minio() {
     if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP test_spill_recovery_minio: Docker not available locally");
         return;
     }
 }

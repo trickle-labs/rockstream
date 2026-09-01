@@ -461,6 +461,10 @@ async fn test_pgx_smoke() {
 
 #[tokio::test]
 async fn test_psql14_smoke() {
+    if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP test_psql14_smoke: Docker is not available locally");
+        return;
+    }
     use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;
@@ -501,6 +505,10 @@ async fn test_psql14_smoke() {
 
 #[tokio::test]
 async fn test_psql16_smoke() {
+    if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP test_psql16_smoke: Docker is not available locally");
+        return;
+    }
     use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;
@@ -540,6 +548,10 @@ async fn test_psql16_smoke() {
 
 #[tokio::test]
 async fn test_libpq_smoke() {
+    if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP test_libpq_smoke: Docker is not available locally");
+        return;
+    }
     use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;
@@ -575,6 +587,10 @@ async fn test_libpq_smoke() {
 
 #[tokio::test]
 async fn test_psycopg3_smoke() {
+    if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP test_psycopg3_smoke: Docker is not available locally");
+        return;
+    }
     use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;
@@ -620,6 +636,10 @@ async fn test_psycopg3_smoke() {
 
 #[tokio::test]
 async fn test_pgjdbc_smoke() {
+    if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP test_pgjdbc_smoke: Docker is not available locally");
+        return;
+    }
     use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;
@@ -683,6 +703,10 @@ async fn test_pgjdbc_smoke() {
 
 #[tokio::test]
 async fn test_node_postgres_smoke() {
+    if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP test_node_postgres_smoke: Docker is not available locally");
+        return;
+    }
     use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;
@@ -732,6 +756,10 @@ async fn test_node_postgres_smoke() {
 
 #[tokio::test]
 async fn test_sqlalchemy_smoke() {
+    if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP test_sqlalchemy_smoke: Docker is not available locally");
+        return;
+    }
     use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;
@@ -784,6 +812,10 @@ async fn test_sqlalchemy_smoke() {
 
 #[tokio::test]
 async fn test_prisma_smoke() {
+    if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP test_prisma_smoke: Docker is not available locally");
+        return;
+    }
     use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
     use testcontainers::ImageExt;

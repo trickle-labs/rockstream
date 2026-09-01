@@ -160,7 +160,7 @@ def render_semantics(capabilities: list[dict]) -> list[str]:
         (
             item
             for item in capabilities
-            if item["kind"] == "language" and item["tier"] == "Core"
+            if item["tier"] == "Core"
         ),
         key=lambda item: item["id"],
     ):

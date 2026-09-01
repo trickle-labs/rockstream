@@ -214,6 +214,7 @@ static SHARED_MINIO: tokio::sync::OnceCell<
 /// Return the port of a shared MinIO container instance.
 async fn get_shared_minio() -> Option<u16> {
     if !docker_available() {
+        eprintln!("SKIP minio_backend: Docker not available locally");
         return None;
     }
     let res = SHARED_MINIO

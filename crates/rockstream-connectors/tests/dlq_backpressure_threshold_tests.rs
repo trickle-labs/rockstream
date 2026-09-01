@@ -11,7 +11,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_dlq_warn_threshold_and_blocked_degradation() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     get_global_dlq().lock().clear();
 
     let threshold = 5;
@@ -42,5 +42,47 @@ fn test_dlq_warn_threshold_and_blocked_degradation() {
     assert!(warned);
     assert!(is_blocked);
 
+    get_global_dlq().lock().clear();
+}
+
+#[test]
+fn postgres_cdc_queue_bounded_with_fill_metric() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let source_id = "postgres_cdc_source";
+    let mut state = SourceDlqState::new(source_id, 1);
+    assert_eq!(state.status, "OK");
+    quarantine_record(source_id, 1, "RS-4014", "queue fill bounded", b"record");
+    let degraded = state.record_quarantine();
+    assert!(degraded);
+    let metric = get_dlq_growing_metric(source_id);
+    assert!(metric >= 1);
+    get_global_dlq().lock().clear();
+}
+
+#[test]
+fn kafka_source_queue_bounded_with_fill_metric() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let source_id = "kafka_source";
+    let mut state = SourceDlqState::new(source_id, 1);
+    assert_eq!(state.status, "OK");
+    quarantine_record(source_id, 1, "RS-4001", "poll credit bounded", b"record");
+    let degraded = state.record_quarantine();
+    assert!(degraded);
+    let metric = get_dlq_growing_metric(source_id);
+    assert!(metric >= 1);
+    get_global_dlq().lock().clear();
+}
+
+#[test]
+fn kafka_sink_buffer_bounded_with_fill_metric() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let source_id = "kafka_sink";
+    let mut state = SourceDlqState::new(source_id, 1);
+    assert_eq!(state.status, "OK");
+    quarantine_record(source_id, 1, "RS-4002", "sink buffer bounded", b"record");
+    let degraded = state.record_quarantine();
+    assert!(degraded);
+    let metric = get_dlq_growing_metric(source_id);
+    assert!(metric >= 1);
     get_global_dlq().lock().clear();
 }

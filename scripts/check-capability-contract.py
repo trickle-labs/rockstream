@@ -269,7 +269,7 @@ def check_full_semantics(
 
 
     for capability in capabilities:
-        if capability.get("kind") != "language" or capability.get("tier") != "Core":
+        if capability.get("tier") != "Core":
             continue
         rows = capability.get("behavior")
         if not isinstance(rows, list):

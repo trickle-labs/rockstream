@@ -142,6 +142,7 @@ async fn populate(path: &str, store: Arc<dyn ObjectStore>) -> Vec<(bytes::Bytes,
 #[tokio::test]
 async fn migrates_populated_v1_shards_to_v2_bit_identically_tc() {
     if !docker_available() {
+        eprintln!("SKIP migrates_populated_v1_shards_to_v2_bit_identically_tc: Docker is not available locally");
         return;
     }
     let bucket = format!("rockstream-format-{}", std::process::id());
@@ -166,6 +167,7 @@ async fn migrates_populated_v1_shards_to_v2_bit_identically_tc() {
 #[tokio::test]
 async fn interrupted_migration_reruns_exactly_tc() {
     if !docker_available() {
+        eprintln!("SKIP interrupted_migration_reruns_exactly_tc: Docker is not available locally");
         return;
     }
     let bucket = format!("rockstream-format-rerun-{}", std::process::id());

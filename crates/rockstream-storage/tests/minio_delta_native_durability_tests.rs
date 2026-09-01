@@ -166,6 +166,7 @@ static SHARED_MINIO: tokio::sync::OnceCell<
 
 async fn get_shared_minio() -> Option<u16> {
     if !docker_available() {
+        eprintln!("SKIP minio_delta_native_durability: Docker is not available locally");
         return None;
     }
     let res = SHARED_MINIO

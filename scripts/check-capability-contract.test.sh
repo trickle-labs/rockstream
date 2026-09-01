@@ -103,6 +103,18 @@ python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml");
 run_bad "missing_proof_level_is_rejected" "missing required proof level"
 cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
 
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); p.write_text(s.replace("postgres_cdc_invalid_slot_fails_closed", "removed_proof", 1))'
+run_bad "missing connector failure proof" "proof target does not resolve"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); p.write_text(s.replace("{ behavior = \"incremental\", statement = \"A PostgreSQL logical replication delta", "{ behavior = \"dropped_behavior\", statement = \"A PostgreSQL logical replication delta", 1))'
+run_bad "missing connector incremental behavior" "missing Core semantic behavior incremental"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
+python3 -c 'from pathlib import Path; p=Path("'"$TMP_ROOT"'/capabilities.toml"); s=p.read_text(); p.write_text(s.replace("kafka_sink_buffer_bounded_with_fill_metric", "missing_sink_metric", 1))'
+run_bad "missing sink state growth proof" "proof target does not resolve"
+cp "$ROOT/capabilities.toml" "$TMP_ROOT/capabilities.toml"
+
 if ! python3 "$ROOT/scripts/check-capability-contract.py" "$ROOT" >"$OUT" 2>&1; then
   cat "$OUT"
   fail "unmodified tree failed the capability contract check without --full-semantics"

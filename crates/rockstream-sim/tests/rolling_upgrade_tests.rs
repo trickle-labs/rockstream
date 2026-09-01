@@ -30,6 +30,7 @@ async fn start_fixture(image: &str, name: &str) -> ContainerAsync<GenericImage> 
 #[tokio::test]
 async fn three_worker_n_to_n_plus_1_zero_loss_tc() {
     if !rockstream_test_support::docker_available() {
+        eprintln!("SKIP three_worker_n_to_n_plus_1_zero_loss_tc: Docker is not available locally");
         return;
     }
     let n_image = std::env::var(N_IMAGE).unwrap_or_else(|_| "rockstream-tc-test".to_string());
@@ -38,6 +39,7 @@ async fn three_worker_n_to_n_plus_1_zero_loss_tc() {
     let n_ref = format!("{n_image}:latest");
     let n_plus_1_ref = format!("{n_plus_1_image}:latest");
     if !image_available(&n_ref) || !image_available(&n_plus_1_ref) {
+        eprintln!("SKIP three_worker_n_to_n_plus_1_zero_loss_tc: Required images {n_ref} or {n_plus_1_ref} are not available");
         return;
     }
 

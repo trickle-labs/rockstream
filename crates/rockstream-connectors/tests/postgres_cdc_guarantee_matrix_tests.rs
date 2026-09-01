@@ -314,3 +314,48 @@ async fn postgres_cdc_long_running_recovery_is_exact_and_within_slo() {
     );
     assert!(started.elapsed() < Duration::from_secs(60));
 }
+
+#[tokio::test]
+async fn postgres_cdc_initial_snapshot_backfills_all_rows() {
+    let fixture = common::connector_fixture("initial_snapshot_backfill").await;
+    fixture
+        .postgres
+        .batch_execute("INSERT INTO orders VALUES (10), (20), (30)")
+        .await
+        .unwrap();
+    let mut source = PostgresCdcSource::connect_pgoutput(
+        ConnectorId(5_255),
+        schema(),
+        config(&fixture, "initial_snapshot_backfill"),
+    )
+    .await
+    .unwrap();
+    let fence = source.capture_snapshot_delta_fence(None).await.unwrap();
+    let snapshot = source
+        .start_snapshot(&fence, None, None)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>();
+    let mut all_rows = rows(
+        &snapshot
+            .iter()
+            .map(|batch| batch.batch.clone())
+            .collect::<Vec<_>>(),
+    );
+    all_rows.sort_unstable();
+    assert_eq!(all_rows, vec![(10, 1), (20, 1), (30, 1)]);
+}
+
+#[tokio::test]
+async fn postgres_cdc_invalid_slot_fails_closed() {
+    let _fixture = common::connector_fixture("invalid_slot").await;
+    let mut source = source();
+    source.mark_failure(PostgresCdcFailure::SlotInvalidated);
+    assert!(matches!(
+        source.status(),
+        PostgresCdcStatus::Blocked {
+            code: "RS-4011",
+            ..
+        }
+    ));
+}
