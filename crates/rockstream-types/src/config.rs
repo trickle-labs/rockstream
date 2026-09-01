@@ -85,6 +85,10 @@ fn default_max_lag_ms() -> u64 {
     1000
 }
 
+fn default_shutdown_timeout_secs() -> u64 {
+    30
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ClusterConfig {
@@ -101,6 +105,8 @@ pub struct ClusterConfig {
     pub index_prefer_selectivity_threshold: f64,
     #[serde(default = "default_max_lag_ms")]
     pub index_max_lag_ms: u64,
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
 }
 
 impl Default for ClusterConfig {
@@ -114,6 +120,7 @@ impl Default for ClusterConfig {
             scatter_pruning: ScatterPruningConfig::default(),
             index_prefer_selectivity_threshold: 0.01,
             index_max_lag_ms: 1000,
+            shutdown_timeout_secs: 30,
         }
     }
 }
@@ -319,6 +326,7 @@ impl Default for RockstreamConfig {
                 scatter_pruning: ScatterPruningConfig::default(),
                 index_prefer_selectivity_threshold: 0.01,
                 index_max_lag_ms: 1000,
+                shutdown_timeout_secs: 30,
             },
             worker: WorkerConfig {
                 segment_cache_bytes: 536870912, // 512 MB

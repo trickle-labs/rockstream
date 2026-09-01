@@ -153,6 +153,7 @@ pub async fn run_demo_async(format: OutputFormat, opts: &DemoOptions) -> Result<
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: None,
     };
 
     let (bound_addr, gateway_handle) = start_gateway(&start_opts).await?;

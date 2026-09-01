@@ -202,14 +202,19 @@ impl RaftHandle {
         }
     }
 
+    /// Step down from leadership to follower, resetting current leader.
+    pub fn step_down(&self) {
+        let mut guard = self.inner.write();
+        guard.role = RaftRole::Follower;
+        guard.current_leader = None;
+    }
+
     /// Test/ops-only: force this node to step down to `Follower` without
     /// altering its persistent term/vote state. Models `CrashLeader` in
     /// `formal/m7_control_plane_ha.fizz` — ephemeral `node_role` resets on
     /// crash-restart; durable `current_term`/`voted_for` survive.
     pub fn force_step_down_for_test(&self) {
-        let mut guard = self.inner.write();
-        guard.role = RaftRole::Follower;
-        guard.current_leader = None;
+        self.step_down();
     }
 }
 
@@ -356,6 +361,10 @@ pub struct RaftNodeHandleFull {
 impl RaftNodeHandleFull {
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
+    }
+
+    pub fn step_down(&self) {
+        self.handle.step_down();
     }
 }
 

@@ -192,6 +192,9 @@ pub enum Command {
         same_host_shm_segments_per_peer: Option<usize>,
         #[arg(long)]
         max_exchange_compression_states: Option<usize>,
+        /// Configurable shutdown timeout deadline in seconds (default: 30).
+        #[arg(long)]
+        shutdown_timeout_secs: Option<u64>,
     },
     /// View inspection commands.
     View {

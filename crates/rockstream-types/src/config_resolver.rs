@@ -54,6 +54,7 @@ pub struct CliConfigOverrides {
     pub internal_tls_cert_path: Option<PathBuf>,
     pub internal_tls_key_path: Option<PathBuf>,
     pub internal_tls_ca_cert_path: Option<PathBuf>,
+    pub shutdown_timeout_secs: Option<u64>,
 }
 
 /// A resolved configuration with tracked source origins for each parameter.
@@ -210,6 +211,10 @@ fn init_default_origins(origins: &mut BTreeMap<String, ConfigOrigin>) {
         ConfigOrigin::Default,
     );
     origins.insert("cluster.state_budget_gb".to_string(), ConfigOrigin::Default);
+    origins.insert(
+        "cluster.shutdown_timeout_secs".to_string(),
+        ConfigOrigin::Default,
+    );
     origins.insert("execution.join_strategy".to_string(), ConfigOrigin::Default);
     origins.insert(
         "cluster.index_prefer_selectivity_threshold".to_string(),
@@ -374,6 +379,15 @@ fn apply_env_vars(config: &mut RockstreamConfig, origins: &mut BTreeMap<String, 
                     config.cluster.state_budget_gb = val;
                     origins.insert(
                         "cluster.state_budget_gb".to_string(),
+                        ConfigOrigin::Environment(k),
+                    );
+                }
+            }
+            ["CLUSTER", "SHUTDOWN_TIMEOUT_SECS"] => {
+                if let Ok(val) = v.parse::<u64>() {
+                    config.cluster.shutdown_timeout_secs = val;
+                    origins.insert(
+                        "cluster.shutdown_timeout_secs".to_string(),
                         ConfigOrigin::Environment(k),
                     );
                 }
@@ -580,6 +594,13 @@ fn apply_cli_overrides(
         origins.insert(
             "internal_tls.ca_cert_path".to_string(),
             ConfigOrigin::Cli("--internal-tls-ca-cert-path".to_string()),
+        );
+    }
+    if let Some(val) = cli.shutdown_timeout_secs {
+        config.cluster.shutdown_timeout_secs = val;
+        origins.insert(
+            "cluster.shutdown_timeout_secs".to_string(),
+            ConfigOrigin::Cli("--shutdown-timeout-secs".to_string()),
         );
     }
 }

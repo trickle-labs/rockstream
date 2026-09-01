@@ -28,6 +28,7 @@ fn options(storage: &std::path::Path, extra_shards: Vec<std::path::PathBuf>) -> 
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: extra_shards,
+        shutdown_timeout_secs: None,
     }
 }
 

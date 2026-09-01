@@ -947,6 +947,7 @@ Options
 | role | — | --role | ROLE | no | all | — | Node role |
 | same_host_shm_segment_bytes | — | --same-host-shm-segment-bytes | SAME_HOST_SHM_SEGMENT_BYTES | no | — | — |  |
 | same_host_shm_segments_per_peer | — | --same-host-shm-segments-per-peer | SAME_HOST_SHM_SEGMENTS_PER_PEER | no | — | — |  |
+| shutdown_timeout_secs | — | --shutdown-timeout-secs | SHUTDOWN_TIMEOUT_SECS | no | — | — | Configurable shutdown timeout deadline in seconds (default: 30) |
 | state_budget_gb | — | --state-budget-gb | STATE_BUDGET_GB | no | — | — |  |
 | storage | — | --storage | STORAGE | yes | — | — | Local storage directory for node state and artifacts |
 | webhook_listen | — | --webhook-listen | WEBHOOK_LISTEN | no | — | — | Independent HTTP listener for `POST /webhook/<source>` ingestion |

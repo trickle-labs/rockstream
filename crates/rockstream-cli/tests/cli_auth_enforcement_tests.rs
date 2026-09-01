@@ -27,6 +27,7 @@ fn test_options(storage: PathBuf, auth_mode: &str, listen: Option<String>) -> St
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: None,
     }
 }
 

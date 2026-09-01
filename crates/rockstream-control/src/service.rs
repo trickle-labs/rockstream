@@ -434,9 +434,26 @@ impl ControlService {
                     }
                     _ = shutdown_rx.recv() => {
                         tracing::info!("control service shutting down");
+                        if let Some(store) = &ctx.shard_store {
+                            let snapshot = ctx.shard_manager.snapshot();
+                            store.save(&snapshot).await;
+                        }
+                        if let Some(audit) = &ctx.audit {
+                            let event = AuditEvent::now("control", "server.stopping", "control-service");
+                            let _ = audit.append(&event);
+                        }
+                        if let Some(raft) = &ctx.raft {
+                            if raft.is_leader() {
+                                raft.step_down();
+                            }
+                        }
                         break;
                     }
                 }
+            }
+            if let Some(audit) = &ctx.audit {
+                let event = AuditEvent::now("control", "server.stopped", "control-service");
+                let _ = audit.append(&event);
             }
         });
 

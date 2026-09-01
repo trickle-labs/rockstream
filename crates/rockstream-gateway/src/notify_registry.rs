@@ -112,6 +112,12 @@ impl NotifyRegistry {
             None => Vec::new(),
         }
     }
+
+    /// Clear all channel subscriptions and outboxes.
+    pub fn clear(&self) {
+        self.subscriptions.clear();
+        self.outboxes.clear();
+    }
 }
 
 #[cfg(test)]

@@ -26,6 +26,7 @@ fn test_gateway_opts(dir: &TempDir) -> StartOptions {
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: None,
     }
 }
 

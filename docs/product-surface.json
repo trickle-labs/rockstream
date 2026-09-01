@@ -2270,6 +2270,13 @@
             "value_name": "SAME_HOST_SHM_SEGMENTS_PER_PEER"
           },
           {
+            "name": "shutdown_timeout_secs",
+            "long": "shutdown-timeout-secs",
+            "help": "Configurable shutdown timeout deadline in seconds (default: 30)",
+            "required": false,
+            "value_name": "SHUTDOWN_TIMEOUT_SECS"
+          },
+          {
             "name": "state_budget_gb",
             "long": "state-budget-gb",
             "help": "",

@@ -1848,9 +1848,23 @@ pub struct GatewayHandler {
     shard_commit_lock: Arc<tokio::sync::Mutex<()>>,
     pub secret_store: Arc<rockstream_control::SecretStore>,
     join_strategy: JoinStrategy,
+    pub is_draining: Arc<std::sync::atomic::AtomicBool>,
+    pub in_flight_queries: Arc<AtomicUsize>,
 }
 
 impl GatewayHandler {
+    pub fn mark_draining(&self) {
+        self.is_draining.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.is_draining.load(Ordering::SeqCst)
+    }
+
+    pub fn in_flight_queries(&self) -> usize {
+        self.in_flight_queries.load(Ordering::SeqCst)
+    }
+
     fn bind_server(&self, handler: &Arc<Self>) {
         *self.self_ref.lock() = Arc::downgrade(handler);
     }
@@ -2021,6 +2035,8 @@ impl GatewayHandler {
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             secret_store,
             join_strategy: JoinStrategy::Auto,
+            is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight_queries: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -2069,6 +2085,8 @@ impl GatewayHandler {
             shard_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             secret_store,
             join_strategy: JoinStrategy::Auto,
+            is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight_queries: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -11474,6 +11492,14 @@ impl SimpleQueryHandler for GatewayHandler {
             }
         }
 
+        if self.is_draining.load(Ordering::SeqCst) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "57P01".to_string(),
+                "canceling statement due to administrator shutdown (RS-2056)".to_string(),
+            ))));
+        }
+
         let is_empty_query = query.chars().all(|c| c.is_whitespace() || c == ';');
         if is_empty_query {
             return Ok(vec![Response::EmptyQuery]);
@@ -11534,6 +11560,14 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.is_draining.load(Ordering::SeqCst) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "57P01".to_string(),
+                "canceling statement due to administrator shutdown (RS-2056)".to_string(),
+            ))));
+        }
+
         let conn_id = client
             .metadata()
             .get("_rs_conn_id")
@@ -11599,6 +11633,14 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.is_draining.load(Ordering::SeqCst) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "57P01".to_string(),
+                "canceling statement due to administrator shutdown (RS-2056)".to_string(),
+            ))));
+        }
+
         let conn_id = client
             .metadata()
             .get("_rs_conn_id")
@@ -11711,6 +11753,14 @@ impl ExtendedQueryHandler for GatewayHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.is_draining.load(Ordering::SeqCst) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "57P01".to_string(),
+                "canceling statement due to administrator shutdown (RS-2056)".to_string(),
+            ))));
+        }
+
         let conn_id = client
             .metadata()
             .get("_rs_conn_id")
@@ -12566,6 +12616,31 @@ impl GatewayServer {
     }
     pub fn catalog(&self) -> &Arc<CatalogStubs> {
         &self.handler.catalog
+    }
+
+    pub fn mark_draining(&self) {
+        self.handler.mark_draining();
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.handler.is_draining()
+    }
+
+    pub fn in_flight_queries(&self) -> usize {
+        self.handler.in_flight_queries()
+    }
+
+    /// Execute graceful drain and stop sequence:
+    /// 1. Mark server as draining so incoming queries receive 57P01 (RS-2056).
+    /// 2. Wait up to `grace_period` for in-flight queries to finish.
+    /// 3. Close notify and subscription listeners.
+    pub async fn drain_and_stop(&self, grace_period: Duration) {
+        self.mark_draining();
+        let deadline = tokio::time::Instant::now() + grace_period;
+        while self.in_flight_queries() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.handler.notify_registry.clear();
     }
 
     /// Bind the independent HTTP webhook listener.  It intentionally does not

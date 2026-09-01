@@ -45,6 +45,7 @@ async fn test_worker_service_lifecycle_and_explicit_worker_id() {
         control_bind: None,
         control_shared_storage: None,
         query_time_shard_dirs: Vec::new(),
+        shutdown_timeout_secs: None,
     };
 
     // Set a short sleep for test mode so run_start finishes gracefully

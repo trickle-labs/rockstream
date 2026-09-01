@@ -72,6 +72,7 @@ fn main() -> ExitCode {
             same_host_shm_segment_bytes,
             same_host_shm_segments_per_peer,
             max_exchange_compression_states,
+            shutdown_timeout_secs,
         } => {
             let overrides = CliConfigOverrides {
                 min_epoch_ms,
@@ -95,6 +96,7 @@ fn main() -> ExitCode {
                 internal_tls_cert_path: cli.internal_tls_cert_path.clone(),
                 internal_tls_key_path: cli.internal_tls_key_path.clone(),
                 internal_tls_ca_cert_path: cli.internal_tls_ca_cert_path.clone(),
+                shutdown_timeout_secs,
             };
             let config = match rockstream_types::config_resolver::ConfigResolver::resolve(
                 None, &overrides,
@@ -141,6 +143,7 @@ fn main() -> ExitCode {
                 control_bind,
                 control_shared_storage,
                 query_time_shard_dirs,
+                shutdown_timeout_secs,
             };
             match run_start(&opts) {
                 Ok(outcome) => {
@@ -480,6 +483,7 @@ fn main() -> ExitCode {
                     internal_tls_cert_path: cli.internal_tls_cert_path.clone(),
                     internal_tls_key_path: cli.internal_tls_key_path.clone(),
                     internal_tls_ca_cert_path: cli.internal_tls_ca_cert_path.clone(),
+                    shutdown_timeout_secs: None,
                 };
                 handle_result(
                     run_config_print_effective(format, file.as_deref(), show_origins, &overrides),

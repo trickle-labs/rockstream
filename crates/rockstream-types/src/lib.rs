@@ -31,6 +31,7 @@ pub mod ids;
 pub mod key_capsule;
 pub mod laws;
 pub mod lease;
+pub mod lifecycle;
 pub mod limits;
 pub mod merge_law;
 pub mod metrics;
@@ -65,6 +66,10 @@ pub use evidence_manifest::{
 };
 pub use ids::{ArrangementId, TenantId};
 pub use key_capsule::{KeyCapsule, KeyCapsuleError, KeyValue};
+pub use lifecycle::{
+    DependencyHealthReport, DependencyStatus, HealthReason, HealthReport, LifecycleState,
+    LifecycleTracker, LiveResponse, ReadyResponse,
+};
 pub use limits::{SystemLimit, SystemLimitsCatalog};
 pub use shared_window::{SharedWindowSpec, SharedWindowSpecError};
 pub use state_mutation::{EpochStateDelta, OperatorEpochMetrics, StateMutation};

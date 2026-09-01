@@ -37,6 +37,7 @@ pub mod doctor;
 pub mod init;
 pub mod metrics_server;
 pub mod output;
+pub mod shutdown;
 pub mod transport;
 
 pub use cli_args::{Cli, Command, ConfigCommand, ShellType};
@@ -46,6 +47,7 @@ pub use doctor::{
     DoctorReport,
 };
 pub use init::{run_init, scaffold_project, InitOptions, InitOutcome};
+pub use shutdown::{ShutdownCoordinator, SUPPRESS_PROCESS_EXIT};
 
 /// Node roles recognised by the single binary. v0.1 ships only the embedded
 /// `all` profile; the other roles are accepted as valid names so that scripts
@@ -206,6 +208,8 @@ pub struct StartOptions {
     /// path as the local gateway shard (normally `db`). The gateway refreshes
     /// all of them and accepts a query only at a common durable frontier.
     pub query_time_shard_dirs: Vec<PathBuf>,
+    /// Optional shutdown timeout deadline in seconds (default: from config or 30s).
+    pub shutdown_timeout_secs: Option<u64>,
 }
 
 impl Default for StartOptions {
@@ -229,6 +233,7 @@ impl Default for StartOptions {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         }
     }
 }
@@ -635,9 +640,15 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         .map_err(|e| CliError::new(RS_0003, format!("failed to start tokio runtime: {e}"), ""))?;
 
     let serve_result: Result<(), CliError> = rt.block_on(async {
+        let tracker = Arc::new(rockstream_types::lifecycle::LifecycleTracker::new(&opts.role));
+        let timeout_secs = opts
+            .shutdown_timeout_secs
+            .unwrap_or(opts.config.cluster.shutdown_timeout_secs);
+        let coordinator = ShutdownCoordinator::new(tracker.clone(), Duration::from_secs(timeout_secs));
+
         let mut metrics_handle = None;
         if let Some(metrics_addr) = &opts.metrics_addr {
-            let mh = metrics_server::start_metrics_server(metrics_addr)
+            let mh = metrics_server::start_management_server(metrics_addr, tracker.clone())
                 .await
                 .unwrap();
             tracing::info!(metrics_addr = %mh.local_addr, "metrics server started");
@@ -905,12 +916,6 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             // second `gateway-shard/` directory); standalone `--role
             // gateway` opens its own shard, since there's no worker sharing
             // this process with it.
-            #[cfg(unix)]
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            )
-            .unwrap_or_else(|_| panic!("failed to install SIGTERM handler"));
-
             let gateway_result = if let Some((shard_db, store)) = shared_gateway_shard.take() {
                 start_gateway_with_shard(opts, shard_db, store, "db").await
             } else {
@@ -918,6 +923,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             };
             match gateway_result {
                 Ok((local_addr, gw_handle)) => {
+                    tracker.set_state(rockstream_types::lifecycle::LifecycleState::Ready);
                     let _ = audit_log.append(
                         &AuditEvent::now(SYSTEM_ACTOR, "gateway.started", local_addr.to_string())
                             .with_detail(format!("role={}", opts.role)),
@@ -929,19 +935,18 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                         local_addr.port(),
                     );
 
-                    // Block until Ctrl-C (SIGINT) or SIGTERM.
-                    #[cfg(unix)]
-                    {
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {}
-                            _ = sigterm.recv() => {}
-                        }
+                    let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok());
+                    if let Some(sleep_ms) = e2e_sleep {
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    } else {
+                        coordinator.wait_for_signal_or_trigger().await;
                     }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = tokio::signal::ctrl_c().await;
-                    }
+
                     tracing::info!("shutdown signal received — stopping gateway");
+                    let _watchdog = coordinator.spawn_watchdog();
+                    tracker.set_state(rockstream_types::lifecycle::LifecycleState::Draining);
                     gw_handle.abort();
 
                     let _ = audit_log.append(
@@ -949,6 +954,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     );
                 }
                 Err(e) => {
+                    tracker.set_state(rockstream_types::lifecycle::LifecycleState::Fatal);
                     // Clean up already-started services before surfacing the error.
                     if let Some(wh) = worker_handle.take() {
                         wh.abort();
@@ -967,12 +973,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
             }
         } else {
             // ── No-op / test mode ─────────────────────────────────────────
-            // v0.45.2 M7 S4: `--role=control --daemon` blocks on SIGTERM /
-            // Ctrl-C exactly like the live gateway server, instead of
-            // running the short embedded no-op sleep. This is what lets a
-            // real multi-process control-plane cluster stay up long enough
-            // for peers/workers to reach it. Every other combination keeps
-            // the pre-v0.45.2 short-sleep-then-exit behavior unchanged.
+            tracker.set_state(rockstream_types::lifecycle::LifecycleState::Ready);
             let daemon_mode = opts.daemon || opts.role == "worker";
             if daemon_mode {
                 let e2e_sleep = std::env::var("ROCKSTREAM_E2E_SLEEP_MS")
@@ -985,20 +986,7 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                         role = %opts.role,
                         "node running in daemon mode — blocking until shutdown signal"
                     );
-                    #[cfg(unix)]
-                    {
-                        use tokio::signal::unix::{signal, SignalKind};
-                        let mut sigterm = signal(SignalKind::terminate())
-                            .unwrap_or_else(|_| panic!("failed to install SIGTERM handler"));
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {}
-                            _ = sigterm.recv() => {}
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = tokio::signal::ctrl_c().await;
-                    }
+                    coordinator.wait_for_signal_or_trigger().await;
                     tracing::info!("shutdown signal received — stopping daemon");
                 }
             } else {
@@ -1009,6 +997,8 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
                     .unwrap_or(50);
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
             }
+            let _watchdog = coordinator.spawn_watchdog();
+            tracker.set_state(rockstream_types::lifecycle::LifecycleState::Draining);
         }
 
         if let Some(wh) = worker_handle {
@@ -1020,9 +1010,11 @@ pub fn run_start(opts: &StartOptions) -> Result<StartOutcome, CliError> {
         if let Some(rn) = raft_node_guard {
             rn.shutdown();
         }
+        tracker.set_state(rockstream_types::lifecycle::LifecycleState::ShuttingDown);
         if let Some(mh) = metrics_handle {
             mh.shutdown();
         }
+        coordinator.mark_completed();
 
         Ok(())
     });
@@ -2450,6 +2442,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(
@@ -2475,6 +2468,7 @@ mod tests {
                 listen_addr: None, raft_peers: None, raft_node_id: None, raft_bind: None,
                 raft_bootstrap: false, daemon: false, control_bind: None,
                 control_shared_storage: None, query_time_shard_dirs: Vec::new(),
+                shutdown_timeout_secs: None,
             }).unwrap_err();
             assert_eq!(err.to_string(), "RS-4017 connector.removed: cold-tier configuration has been removed\n  next steps: Use RockStream to Kafka to a downstream writer for cold-tier output.");
         }
@@ -2502,6 +2496,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(
@@ -2582,6 +2577,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let outcome = run_start(&opts).unwrap();
 
@@ -2634,6 +2630,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         run_start(&opts).unwrap();
         assert!(nested.join("audit.jsonl").exists());
@@ -2661,6 +2658,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -2690,6 +2688,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         // Should succeed: gateway + no listen_addr → no-op path
         let outcome = run_start(&opts).unwrap();
@@ -2719,6 +2718,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -2768,6 +2768,7 @@ mod tests {
                 control_bind: None,
                 control_shared_storage: None,
                 query_time_shard_dirs: Vec::new(),
+                shutdown_timeout_secs: None,
             };
             let outcome = run_start(&opts).unwrap();
             assert!(outcome.events_written >= 2);
@@ -2796,6 +2797,7 @@ mod tests {
                 control_bind: None,
                 control_shared_storage: None,
                 query_time_shard_dirs: Vec::new(),
+                shutdown_timeout_secs: None,
             };
             let outcome = run_start(&opts).unwrap();
             assert!(outcome.events_written >= 2);
@@ -2827,6 +2829,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
@@ -2857,6 +2860,7 @@ mod tests {
             control_bind: None,
             control_shared_storage: None,
             query_time_shard_dirs: Vec::new(),
+            shutdown_timeout_secs: None,
         };
         let err = run_start(&opts).unwrap_err();
         assert_eq!(err.code.to_string(), "RS-0002");
